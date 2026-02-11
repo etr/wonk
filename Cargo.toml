@@ -65,3 +65,6 @@ tree-sitter-c = "0.23"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.23"
+
+[dev-dependencies]
+tempfile = "3"

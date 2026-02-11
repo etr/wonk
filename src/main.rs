@@ -7,6 +7,7 @@ mod indexer;
 mod router;
 mod search;
 mod types;
+mod walker;
 
 use anyhow::Result;
 
