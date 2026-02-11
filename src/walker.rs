@@ -2,6 +2,8 @@
 //!
 //! Wraps the `ignore` crate's `WalkBuilder` to provide a file walker that:
 //! - Respects `.gitignore` rules
+//! - Respects `.wonkignore` files (same syntax as `.gitignore`)
+//! - Applies additional ignore patterns from config (`[ignore].patterns`)
 //! - Skips common build/dependency directories by default
 //! - Skips hidden files/directories except `.github`
 //! - Supports path restriction (walking from a subdirectory)
@@ -28,11 +30,13 @@ const DEFAULT_EXCLUSIONS: &[&str] = &[
 /// even though hidden directories are otherwise skipped).
 const HIDDEN_ALLOWLIST: &[&str] = &[".github"];
 
-/// A file-system walker that respects `.gitignore` and applies default
-/// exclusions.
+/// A file-system walker that respects `.gitignore`, `.wonkignore`, and
+/// applies default exclusions plus optional config-driven ignore patterns.
 pub struct Walker {
     root: PathBuf,
     threads: usize,
+    /// Additional ignore patterns (gitignore syntax) supplied via config.
+    ignore_patterns: Vec<String>,
 }
 
 impl Walker {
@@ -44,6 +48,7 @@ impl Walker {
         Self {
             root: root.as_ref().to_path_buf(),
             threads: 0, // 0 means ignore crate picks a sensible default
+            ignore_patterns: Vec::new(),
         }
     }
 
@@ -55,6 +60,16 @@ impl Walker {
         self
     }
 
+    /// Supply additional ignore patterns (gitignore syntax) from config.
+    ///
+    /// These patterns are applied as overrides and use the same syntax as
+    /// `.gitignore`.  They are combined with the default exclusions and
+    /// any `.wonkignore` rules.
+    pub fn with_ignore_patterns(mut self, patterns: &[String]) -> Self {
+        self.ignore_patterns = patterns.to_vec();
+        self
+    }
+
     /// Build the underlying `WalkBuilder` with all our configuration applied.
     fn make_builder(&self) -> WalkBuilder {
         let mut builder = WalkBuilder::new(&self.root);
@@ -62,13 +77,17 @@ impl Walker {
         // Let the ignore crate handle .gitignore, .ignore, etc.
         builder.standard_filters(true);
 
+        // Register `.wonkignore` as a custom ignore filename.  The ignore
+        // crate will look for this file in every directory during the walk
+        // and apply its patterns (same syntax as `.gitignore`).
+        builder.add_custom_ignore_filename(".wonkignore");
+
         // We disable the built-in hidden filter because we need a more
         // nuanced policy (skip hidden except for allowlisted names).
         builder.hidden(false);
 
-        // Build overrides that negate (exclude) the default directories.
-        // In the overrides system, a glob WITHOUT `!` means "include only",
-        // and a glob WITH `!` means "exclude".  We want to exclude these dirs.
+        // Build overrides that negate (exclude) the default directories
+        // and any additional config-supplied patterns.
         let mut overrides = OverrideBuilder::new(&self.root);
         for dir in DEFAULT_EXCLUSIONS {
             // The `!` prefix in override globs means "exclude this pattern".
@@ -77,6 +96,15 @@ impl Walker {
                 .add(&pattern)
                 .expect("default exclusion pattern should be valid");
         }
+
+        // Add config-driven ignore patterns as exclusion overrides.
+        for pattern in &self.ignore_patterns {
+            let negated = format!("!{pattern}");
+            overrides
+                .add(&negated)
+                .expect("config ignore pattern should be valid");
+        }
+
         builder.overrides(
             overrides.build().expect("override builder should succeed"),
         );
@@ -312,5 +340,218 @@ mod tests {
         par.sort();
 
         assert_eq!(seq, par, "sequential and parallel walks should find the same files");
+    }
+
+    // ----- .wonkignore tests -----
+
+    #[test]
+    fn wonkignore_excludes_matching_files() {
+        let td = TestDir::new();
+        td.create_file("keep.rs");
+        td.create_file("notes.md");
+        td.create_file("debug.log");
+        td.create_file("sub/trace.log");
+
+        // Write a .wonkignore that excludes *.log files.
+        fs::write(td.path().join(".wonkignore"), "*.log\n").unwrap();
+
+        let walker = Walker::new(td.path());
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(rel.contains(&"keep.rs".to_string()), "keep.rs should be present, got: {rel:?}");
+        assert!(rel.contains(&"notes.md".to_string()), "notes.md should be present, got: {rel:?}");
+        assert!(
+            !rel.iter().any(|p| p.ends_with(".log")),
+            ".log files should be excluded by .wonkignore, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn wonkignore_excludes_directories() {
+        let td = TestDir::new();
+        td.create_file("src/main.rs");
+        td.create_file("generated/output.rs");
+        td.create_file("generated/deep/nested.rs");
+
+        // Write a .wonkignore that excludes the generated/ directory.
+        fs::write(td.path().join(".wonkignore"), "generated/\n").unwrap();
+
+        let walker = Walker::new(td.path());
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(rel.contains(&"src/main.rs".to_string()), "src/main.rs should be present");
+        assert!(
+            !rel.iter().any(|p| p.starts_with("generated")),
+            "generated/ should be excluded by .wonkignore, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn wonkignore_in_subdirectory() {
+        let td = TestDir::new();
+        td.create_file("root.rs");
+        td.create_file("sub/keep.rs");
+        td.create_file("sub/skip.tmp");
+
+        // Write a .wonkignore in the sub/ directory.
+        fs::write(td.path().join("sub/.wonkignore"), "*.tmp\n").unwrap();
+
+        let walker = Walker::new(td.path());
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(rel.contains(&"root.rs".to_string()));
+        assert!(rel.contains(&"sub/keep.rs".to_string()));
+        assert!(
+            !rel.iter().any(|p| p.ends_with(".tmp")),
+            ".tmp files should be excluded by sub/.wonkignore, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn wonkignore_parallel_matches_sequential() {
+        let td = TestDir::new();
+        td.create_file("a.rs");
+        td.create_file("b.log");
+        td.create_file("sub/c.rs");
+        td.create_file("sub/d.log");
+
+        fs::write(td.path().join(".wonkignore"), "*.log\n").unwrap();
+
+        let walker = Walker::new(td.path());
+        let mut seq = sorted_relative(td.path(), &walker.collect_paths());
+        let mut par = sorted_relative(td.path(), &walker.collect_paths_parallel());
+        seq.sort();
+        par.sort();
+
+        assert_eq!(seq, par, "sequential and parallel walks should match with .wonkignore");
+        assert!(!seq.iter().any(|p| p.ends_with(".log")));
+    }
+
+    // ----- Config ignore patterns tests -----
+
+    #[test]
+    fn config_ignore_patterns_exclude_files() {
+        let td = TestDir::new();
+        td.create_file("keep.rs");
+        td.create_file("data.csv");
+        td.create_file("sub/report.csv");
+        td.create_file("notes.txt");
+
+        let patterns = vec!["*.csv".to_string()];
+        let walker = Walker::new(td.path()).with_ignore_patterns(&patterns);
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(rel.contains(&"keep.rs".to_string()));
+        assert!(rel.contains(&"notes.txt".to_string()));
+        assert!(
+            !rel.iter().any(|p| p.ends_with(".csv")),
+            ".csv files should be excluded by config patterns, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn config_ignore_patterns_exclude_directories() {
+        let td = TestDir::new();
+        td.create_file("src/main.rs");
+        td.create_file("tmp/scratch.txt");
+        td.create_file("tmp/deep/file.txt");
+
+        let patterns = vec!["tmp/".to_string()];
+        let walker = Walker::new(td.path()).with_ignore_patterns(&patterns);
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(rel.contains(&"src/main.rs".to_string()));
+        assert!(
+            !rel.iter().any(|p| p.starts_with("tmp")),
+            "tmp/ should be excluded by config patterns, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn config_ignore_multiple_patterns() {
+        let td = TestDir::new();
+        td.create_file("keep.rs");
+        td.create_file("data.csv");
+        td.create_file("debug.log");
+        td.create_file("backup.bak");
+
+        let patterns = vec![
+            "*.csv".to_string(),
+            "*.log".to_string(),
+            "*.bak".to_string(),
+        ];
+        let walker = Walker::new(td.path()).with_ignore_patterns(&patterns);
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert_eq!(rel, vec!["keep.rs".to_string()], "only keep.rs should remain, got: {rel:?}");
+    }
+
+    #[test]
+    fn config_patterns_parallel_matches_sequential() {
+        let td = TestDir::new();
+        td.create_file("a.rs");
+        td.create_file("b.csv");
+        td.create_file("sub/c.rs");
+        td.create_file("sub/d.csv");
+
+        let patterns = vec!["*.csv".to_string()];
+        let walker = Walker::new(td.path()).with_ignore_patterns(&patterns);
+        let mut seq = sorted_relative(td.path(), &walker.collect_paths());
+        let mut par = sorted_relative(td.path(), &walker.collect_paths_parallel());
+        seq.sort();
+        par.sort();
+
+        assert_eq!(seq, par, "sequential and parallel should match with config patterns");
+        assert!(!seq.iter().any(|p| p.ends_with(".csv")));
+    }
+
+    #[test]
+    fn wonkignore_and_config_patterns_combine() {
+        let td = TestDir::new();
+        td.create_file("keep.rs");
+        td.create_file("debug.log");
+        td.create_file("data.csv");
+        td.create_file("notes.txt");
+
+        // .wonkignore excludes *.log
+        fs::write(td.path().join(".wonkignore"), "*.log\n").unwrap();
+
+        // Config patterns exclude *.csv
+        let patterns = vec!["*.csv".to_string()];
+        let walker = Walker::new(td.path()).with_ignore_patterns(&patterns);
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(rel.contains(&"keep.rs".to_string()));
+        assert!(rel.contains(&"notes.txt".to_string()));
+        assert!(
+            !rel.iter().any(|p| p.ends_with(".log")),
+            ".log should be excluded by .wonkignore, got: {rel:?}"
+        );
+        assert!(
+            !rel.iter().any(|p| p.ends_with(".csv")),
+            ".csv should be excluded by config patterns, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn empty_ignore_patterns_changes_nothing() {
+        let td = TestDir::new();
+        td.create_file("a.rs");
+        td.create_file("b.txt");
+
+        let walker_plain = Walker::new(td.path());
+        let walker_empty = Walker::new(td.path()).with_ignore_patterns(&[]);
+
+        let plain = sorted_relative(td.path(), &walker_plain.collect_paths());
+        let empty = sorted_relative(td.path(), &walker_empty.collect_paths());
+
+        assert_eq!(plain, empty, "empty patterns should not change behavior");
     }
 }
