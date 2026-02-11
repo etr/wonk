@@ -17,6 +17,7 @@ use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
 use crate::output::{self, Formatter, SearchOutput};
+use crate::pipeline;
 use crate::search;
 use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
 
@@ -62,11 +63,31 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Rdeps(_args) => {
             output::print_hint("rdeps: not yet implemented");
         }
-        Command::Init(_args) => {
-            output::print_hint("init: not yet implemented");
+        Command::Init(args) => {
+            let repo_root = std::env::current_dir()?;
+            let repo_root = db::find_repo_root(&repo_root)?;
+            eprintln!("Indexing {}...", repo_root.display());
+            let stats = pipeline::build_index(&repo_root, args.local)?;
+            eprintln!(
+                "Indexed {} files ({} symbols, {} refs) in {:.2}s",
+                stats.file_count,
+                stats.symbol_count,
+                stats.ref_count,
+                stats.elapsed.as_secs_f64(),
+            );
         }
         Command::Update => {
-            output::print_hint("update: not yet implemented");
+            let repo_root = std::env::current_dir()?;
+            let repo_root = db::find_repo_root(&repo_root)?;
+            eprintln!("Re-indexing {}...", repo_root.display());
+            let stats = pipeline::rebuild_index(&repo_root, false)?;
+            eprintln!(
+                "Re-indexed {} files ({} symbols, {} refs) in {:.2}s",
+                stats.file_count,
+                stats.symbol_count,
+                stats.ref_count,
+                stats.elapsed.as_secs_f64(),
+            );
         }
         Command::Status => {
             output::print_hint("status: not yet implemented");

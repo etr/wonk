@@ -5,6 +5,7 @@ mod db;
 mod errors;
 mod indexer;
 mod output;
+mod pipeline;
 mod router;
 mod search;
 mod types;
