@@ -11,6 +11,6 @@ mod types;
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    let args = cli::parse();
-    router::dispatch(args)
+    let cli = cli::parse();
+    router::dispatch(cli)
 }
