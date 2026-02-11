@@ -59,3 +59,58 @@ pub struct Symbol {
     /// Language name (e.g. "Rust", "Python").
     pub language: String,
 }
+
+/// The kind of a reference (usage site, not a definition).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReferenceKind {
+    /// A function or method call.
+    Call,
+    /// A type annotation or type reference.
+    Type,
+    /// An import / use statement.
+    Import,
+}
+
+impl fmt::Display for ReferenceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ReferenceKind::Call => "call",
+            ReferenceKind::Type => "type",
+            ReferenceKind::Import => "import",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// A reference (usage site) extracted from a parsed syntax tree.
+///
+/// References include function/method calls, type annotations, and import
+/// statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    /// The referenced name (e.g. function name, type name, imported module).
+    pub name: String,
+    /// What kind of reference this is.
+    pub kind: ReferenceKind,
+    /// Path of the source file containing this reference.
+    pub file: String,
+    /// 1-based line number where the reference occurs.
+    pub line: usize,
+    /// 0-based column offset where the reference occurs.
+    pub col: usize,
+    /// Full source line for display context.
+    pub context: String,
+}
+
+/// Import and export data for a single file.
+///
+/// Used to build file-level dependency graphs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileImports {
+    /// Path of the source file.
+    pub file: String,
+    /// Module/file paths imported by this file.
+    pub imports: Vec<String>,
+    /// Symbols exported from this file (for JS/TS `export` statements).
+    pub exports: Vec<String>,
+}

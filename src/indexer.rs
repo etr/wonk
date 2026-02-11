@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tree_sitter::{Language, Node, Parser, Tree};
 
-use crate::types::{Symbol, SymbolKind};
+use crate::types::{FileImports, Reference, ReferenceKind, Symbol, SymbolKind};
 
 /// Supported programming languages with bundled Tree-sitter grammars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1224,6 +1224,837 @@ fn extract_php(
     }
 }
 
+// ===========================================================================
+// Reference extraction
+// ===========================================================================
+
+/// Extract references (function calls, type annotations, import statements)
+/// from a parsed syntax tree.
+///
+/// Walks the entire tree and collects references with their source context.
+pub fn extract_references(tree: &Tree, source: &str, file: &str, lang: Lang) -> Vec<Reference> {
+    let src = source.as_bytes();
+    let source_lines: Vec<&str> = source.lines().collect();
+    let mut refs = Vec::new();
+    walk_refs(tree.root_node(), src, file, lang, &source_lines, &mut refs);
+    refs
+}
+
+/// Recursively walk a node tree collecting references.
+fn walk_refs(
+    node: Node,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    source_lines: &[&str],
+    refs: &mut Vec<Reference>,
+) {
+    let kind = node.kind();
+
+    // Check for call expressions
+    if let Some(r) = match_call_ref(node, kind, src, file, lang, source_lines) {
+        refs.push(r);
+    }
+
+    // Check for type references
+    if let Some(r) = match_type_ref(node, kind, src, file, lang, source_lines) {
+        refs.push(r);
+    }
+
+    // Check for import references
+    if let Some(r) = match_import_ref(node, kind, src, file, lang, source_lines) {
+        refs.push(r);
+    }
+
+    // Recurse into children
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            walk_refs(child, src, file, lang, source_lines, refs);
+        }
+    }
+}
+
+/// Get the source line at a given 0-based row.
+fn get_context_line(source_lines: &[&str], row: usize) -> String {
+    source_lines
+        .get(row)
+        .unwrap_or(&"")
+        .trim()
+        .to_string()
+}
+
+/// Build a `Reference` from a node.
+fn make_ref(
+    name: &str,
+    kind: ReferenceKind,
+    node: Node,
+    file: &str,
+    source_lines: &[&str],
+) -> Reference {
+    let row = node.start_position().row;
+    Reference {
+        name: name.to_string(),
+        kind,
+        file: file.to_string(),
+        line: row + 1,
+        col: node.start_position().column,
+        context: get_context_line(source_lines, row),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Call reference matching
+// ---------------------------------------------------------------------------
+
+/// Try to extract a call reference from a node.
+fn match_call_ref(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    match lang {
+        Lang::Rust => match_rust_call(node, kind, src, file, source_lines),
+        Lang::Python => match_python_call(node, kind, src, file, source_lines),
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            match_js_call(node, kind, src, file, source_lines)
+        }
+        Lang::Go => match_go_call(node, kind, src, file, source_lines),
+        Lang::Java => match_java_call(node, kind, src, file, source_lines),
+        Lang::C | Lang::Cpp => match_c_call(node, kind, src, file, source_lines),
+        Lang::Ruby => match_ruby_call(node, kind, src, file, source_lines),
+        Lang::Php => match_php_call(node, kind, src, file, source_lines),
+    }
+}
+
+fn match_rust_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    if kind != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    let name = extract_call_name(func, src);
+    if name.is_empty() {
+        return None;
+    }
+    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+}
+
+fn match_python_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    if kind != "call" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    let name = extract_call_name(func, src);
+    if name.is_empty() {
+        return None;
+    }
+    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+}
+
+fn match_js_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    if kind != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    let name = extract_call_name(func, src);
+    if name.is_empty() {
+        return None;
+    }
+    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+}
+
+fn match_go_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    if kind != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    let name = extract_call_name(func, src);
+    if name.is_empty() {
+        return None;
+    }
+    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+}
+
+fn match_java_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    if kind != "method_invocation" {
+        return None;
+    }
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, src);
+    if name.is_empty() {
+        return None;
+    }
+    // Include the object if present: obj.method
+    let full_name = if let Some(obj) = node.child_by_field_name("object") {
+        let obj_text = node_text(obj, src);
+        format!("{obj_text}.{name}")
+    } else {
+        name.to_string()
+    };
+    Some(make_ref(&full_name, ReferenceKind::Call, node, file, source_lines))
+}
+
+fn match_c_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    if kind != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    let name = extract_call_name(func, src);
+    if name.is_empty() {
+        return None;
+    }
+    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+}
+
+fn match_ruby_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    // Ruby uses "call" for method calls with explicit receiver
+    // and "method_call" or just bare identifiers with arguments
+    match kind {
+        "call" => {
+            let method = node.child_by_field_name("method")?;
+            let name = node_text(method, src);
+            if name.is_empty() {
+                return None;
+            }
+            // Include receiver if present
+            let full_name = if let Some(recv) = node.child_by_field_name("receiver") {
+                let recv_text = node_text(recv, src);
+                format!("{recv_text}.{name}")
+            } else {
+                name.to_string()
+            };
+            Some(make_ref(&full_name, ReferenceKind::Call, node, file, source_lines))
+        }
+        "method_call" => {
+            let method = node.child_by_field_name("method")?;
+            let name = node_text(method, src);
+            if name.is_empty() {
+                return None;
+            }
+            Some(make_ref(name, ReferenceKind::Call, node, file, source_lines))
+        }
+        _ => None,
+    }
+}
+
+fn match_php_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    match kind {
+        "function_call_expression" => {
+            let func = node.child_by_field_name("function")?;
+            let name = node_text(func, src);
+            if name.is_empty() {
+                return None;
+            }
+            Some(make_ref(name, ReferenceKind::Call, node, file, source_lines))
+        }
+        "member_call_expression" => {
+            let name_node = node.child_by_field_name("name")?;
+            let name = node_text(name_node, src);
+            if name.is_empty() {
+                return None;
+            }
+            Some(make_ref(name, ReferenceKind::Call, node, file, source_lines))
+        }
+        "scoped_call_expression" => {
+            let name_node = node.child_by_field_name("name")?;
+            let name = node_text(name_node, src);
+            if name.is_empty() {
+                return None;
+            }
+            Some(make_ref(name, ReferenceKind::Call, node, file, source_lines))
+        }
+        _ => None,
+    }
+}
+
+/// Extract the function/method name from a call target node.
+///
+/// Handles `identifier`, `member_expression` (a.b), `field_expression`,
+/// `scoped_identifier` (a::b), etc.
+fn extract_call_name(node: Node, src: &[u8]) -> String {
+    match node.kind() {
+        "identifier" | "field_identifier" => node_text(node, src).to_string(),
+        // `a.b.c` -> just the method name `c` (for member_expression, field_expression)
+        "member_expression" | "field_expression" | "attribute" => {
+            if let Some(prop) = node
+                .child_by_field_name("property")
+                .or_else(|| node.child_by_field_name("field"))
+                .or_else(|| node.child_by_field_name("attribute"))
+            {
+                node_text(prop, src).to_string()
+            } else {
+                node_text(node, src).to_string()
+            }
+        }
+        // Rust: `a::b::c` -> last segment
+        "scoped_identifier" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                node_text(name, src).to_string()
+            } else {
+                node_text(node, src).to_string()
+            }
+        }
+        // Go: selector_expression `pkg.Func`
+        "selector_expression" => {
+            if let Some(field) = node.child_by_field_name("field") {
+                node_text(field, src).to_string()
+            } else {
+                node_text(node, src).to_string()
+            }
+        }
+        // Fallback: use the whole text
+        _ => {
+            let text = node_text(node, src);
+            // Try to get just the last segment for dotted names
+            text.rsplit_once('.')
+                .or_else(|| text.rsplit_once("::"))
+                .map(|(_, last)| last)
+                .unwrap_or(text)
+                .to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type reference matching
+// ---------------------------------------------------------------------------
+
+/// Try to extract a type reference from a node.
+fn match_type_ref(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    match lang {
+        Lang::Rust => match kind {
+            "type_identifier" => {
+                // Only if parent is a type context (not a definition site)
+                let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                // Skip definition sites
+                if matches!(
+                    parent_kind,
+                    "struct_item" | "enum_item" | "trait_item" | "type_item"
+                ) {
+                    return None;
+                }
+                let name = node_text(node, src);
+                if name.is_empty() {
+                    return None;
+                }
+                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+            }
+            _ => None,
+        },
+        Lang::Python => match kind {
+            "type" => {
+                let name = node_text(node, src).trim().to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                // Python type annotations: `x: int`, `def foo() -> str:`
+                Some(make_ref(&name, ReferenceKind::Type, node, file, source_lines))
+            }
+            _ => None,
+        },
+        Lang::TypeScript | Lang::Tsx => match kind {
+            "type_identifier" => {
+                let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                // Skip definition sites
+                if matches!(
+                    parent_kind,
+                    "interface_declaration"
+                        | "type_alias_declaration"
+                        | "enum_declaration"
+                        | "class_declaration"
+                ) {
+                    return None;
+                }
+                let name = node_text(node, src);
+                if name.is_empty() {
+                    return None;
+                }
+                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+            }
+            _ => None,
+        },
+        Lang::JavaScript => None, // JS has no type annotations
+        Lang::Go => match kind {
+            "type_identifier" => {
+                let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                if matches!(parent_kind, "type_spec") {
+                    return None;
+                }
+                let name = node_text(node, src);
+                if name.is_empty() || is_go_builtin_type(name) {
+                    return None;
+                }
+                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+            }
+            _ => None,
+        },
+        Lang::Java => match kind {
+            "type_identifier" => {
+                let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                if matches!(
+                    parent_kind,
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                ) {
+                    return None;
+                }
+                let name = node_text(node, src);
+                if name.is_empty() {
+                    return None;
+                }
+                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+            }
+            _ => None,
+        },
+        Lang::C | Lang::Cpp => match kind {
+            "type_identifier" => {
+                let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                if matches!(
+                    parent_kind,
+                    "struct_specifier"
+                        | "class_specifier"
+                        | "enum_specifier"
+                        | "type_definition"
+                ) {
+                    return None;
+                }
+                let name = node_text(node, src);
+                if name.is_empty() {
+                    return None;
+                }
+                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+            }
+            _ => None,
+        },
+        Lang::Ruby => None, // Ruby is dynamically typed, no type annotations
+        Lang::Php => match kind {
+            "named_type" => {
+                let name = node_text(node, src);
+                if name.is_empty() {
+                    return None;
+                }
+                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+            }
+            _ => None,
+        },
+    }
+}
+
+fn is_go_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "byte"
+            | "complex64"
+            | "complex128"
+            | "error"
+            | "float32"
+            | "float64"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "rune"
+            | "string"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Import reference matching
+// ---------------------------------------------------------------------------
+
+/// Try to extract an import reference from a node.
+fn match_import_ref(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    match lang {
+        Lang::Rust => {
+            if kind != "use_declaration" {
+                return None;
+            }
+            let arg = node.child_by_field_name("argument")?;
+            let name = node_text(arg, src).to_string();
+            Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+        }
+        Lang::Python => {
+            match kind {
+                "import_statement" | "import_from_statement" => {
+                    let name = node_text(node, src).trim().to_string();
+                    Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+                }
+                _ => None,
+            }
+        }
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            if kind != "import_statement" {
+                return None;
+            }
+            let name = node_text(node, src).trim().to_string();
+            Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+        }
+        Lang::Go => {
+            if kind != "import_spec" {
+                return None;
+            }
+            let path = node.child_by_field_name("path")?;
+            let name = node_text(path, src).trim_matches('"').to_string();
+            Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+        }
+        Lang::Java => {
+            if kind != "import_declaration" {
+                return None;
+            }
+            // The text minus the "import " prefix and ";" suffix
+            let text = node_text(node, src).trim().to_string();
+            Some(make_ref(&text, ReferenceKind::Import, node, file, source_lines))
+        }
+        Lang::C | Lang::Cpp => {
+            if kind != "preproc_include" {
+                return None;
+            }
+            let path = node.child_by_field_name("path")?;
+            let name = node_text(path, src)
+                .trim_matches(|c| c == '"' || c == '<' || c == '>')
+                .to_string();
+            Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+        }
+        Lang::Ruby => {
+            match kind {
+                "call" | "method_call" => {
+                    // require 'foo' or require_relative 'foo'
+                    let method = node
+                        .child_by_field_name("method")
+                        .map(|n| node_text(n, src))
+                        .unwrap_or("");
+                    if !matches!(method, "require" | "require_relative") {
+                        return None;
+                    }
+                    let args = node.child_by_field_name("arguments")?;
+                    let arg = args.named_child(0u32)?;
+                    let name = node_text(arg, src)
+                        .trim_matches(|c| c == '\'' || c == '"')
+                        .to_string();
+                    Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+                }
+                _ => None,
+            }
+        }
+        Lang::Php => {
+            match kind {
+                "named_label_statement" => None,
+                _ => {
+                    // PHP: include, require, include_once, require_once
+                    if !matches!(
+                        kind,
+                        "include_expression"
+                            | "include_once_expression"
+                            | "require_expression"
+                            | "require_once_expression"
+                    ) {
+                        return None;
+                    }
+                    // The argument is a string literal child
+                    let text = node_text(node, src).trim().to_string();
+                    Some(make_ref(&text, ReferenceKind::Import, node, file, source_lines))
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Import/export extraction for file dependency graph
+// ===========================================================================
+
+/// Extract import and export data from a parsed syntax tree.
+///
+/// Returns a [`FileImports`] with the list of imported module paths and
+/// exported symbol names for dependency graph construction.
+pub fn extract_imports(tree: &Tree, source: &str, file: &str, lang: Lang) -> FileImports {
+    let src = source.as_bytes();
+    let mut imports = Vec::new();
+    let mut exports = Vec::new();
+    walk_imports(tree.root_node(), src, lang, &mut imports, &mut exports);
+    FileImports {
+        file: file.to_string(),
+        imports,
+        exports,
+    }
+}
+
+/// Recursively walk the tree collecting import paths and export names.
+fn walk_imports(
+    node: Node,
+    src: &[u8],
+    lang: Lang,
+    imports: &mut Vec<String>,
+    exports: &mut Vec<String>,
+) {
+    let kind = node.kind();
+
+    match lang {
+        Lang::Rust => {
+            if kind == "use_declaration" {
+                if let Some(arg) = node.child_by_field_name("argument") {
+                    imports.push(node_text(arg, src).to_string());
+                }
+            }
+            // Rust pub items are exports (simplified: just look for `pub` visibility)
+            if kind == "visibility_modifier" && node_text(node, src).starts_with("pub") {
+                if let Some(parent) = node.parent() {
+                    let export_name = match parent.kind() {
+                        "function_item" | "struct_item" | "enum_item" | "trait_item"
+                        | "type_item" | "const_item" | "static_item" | "mod_item" => {
+                            field_text(parent, "name", src).map(|s| s.to_string())
+                        }
+                        _ => None,
+                    };
+                    if let Some(name) = export_name {
+                        exports.push(name);
+                    }
+                }
+            }
+        }
+        Lang::Python => {
+            match kind {
+                "import_statement" => {
+                    // import foo, bar
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i as u32) {
+                            if child.kind() == "dotted_name" || child.kind() == "aliased_import" {
+                                let name_node = if child.kind() == "aliased_import" {
+                                    child.child_by_field_name("name")
+                                } else {
+                                    Some(child)
+                                };
+                                if let Some(n) = name_node {
+                                    imports.push(node_text(n, src).to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                "import_from_statement" => {
+                    if let Some(module) = node.child_by_field_name("module_name") {
+                        imports.push(node_text(module, src).to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            if kind == "import_statement" {
+                if let Some(source_node) = node.child_by_field_name("source") {
+                    let path = node_text(source_node, src)
+                        .trim_matches(|c| c == '\'' || c == '"')
+                        .to_string();
+                    imports.push(path);
+                }
+            }
+            // Export statements
+            if kind == "export_statement" {
+                // `export function foo() {}` or `export { foo, bar }`
+                // Try to get the declaration's name
+                if let Some(decl) = node.child_by_field_name("declaration") {
+                    if let Some(name) = field_text(decl, "name", src) {
+                        exports.push(name.to_string());
+                    }
+                }
+                // `export { foo, bar }` - look for export_clause
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i as u32) {
+                        if child.kind() == "export_clause" {
+                            for j in 0..child.named_child_count() {
+                                if let Some(spec) = child.named_child(j as u32) {
+                                    if spec.kind() == "export_specifier" {
+                                        if let Some(name) = spec.child_by_field_name("name") {
+                                            exports.push(node_text(name, src).to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // `export default` - add "default"
+                let text = node_text(node, src);
+                if text.contains("export default") {
+                    exports.push("default".to_string());
+                }
+            }
+        }
+        Lang::Go => {
+            if kind == "import_spec" {
+                if let Some(path) = node.child_by_field_name("path") {
+                    imports.push(
+                        node_text(path, src).trim_matches('"').to_string(),
+                    );
+                }
+            }
+            // Go exports: capitalized top-level names (handled by convention,
+            // we capture them for completeness)
+            if matches!(
+                kind,
+                "function_declaration" | "type_declaration" | "const_declaration" | "var_declaration"
+            ) {
+                if let Some(name) = field_text(node, "name", src) {
+                    if name.starts_with(|c: char| c.is_uppercase()) {
+                        exports.push(name.to_string());
+                    }
+                }
+            }
+        }
+        Lang::Java => {
+            if kind == "import_declaration" {
+                // Extract the imported path (skip "import " and ";")
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i as u32) {
+                        if child.kind() == "scoped_identifier" {
+                            imports.push(node_text(child, src).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Lang::C | Lang::Cpp => {
+            if kind == "preproc_include" {
+                if let Some(path) = node.child_by_field_name("path") {
+                    let text = node_text(path, src)
+                        .trim_matches(|c| c == '"' || c == '<' || c == '>')
+                        .to_string();
+                    imports.push(text);
+                }
+            }
+        }
+        Lang::Ruby => {
+            if matches!(kind, "call" | "method_call") {
+                let method = node
+                    .child_by_field_name("method")
+                    .map(|n| node_text(n, src))
+                    .unwrap_or("");
+                if matches!(method, "require" | "require_relative") {
+                    if let Some(args) = node.child_by_field_name("arguments") {
+                        if let Some(arg) = args.named_child(0u32) {
+                            let path = node_text(arg, src)
+                                .trim_matches(|c| c == '\'' || c == '"')
+                                .to_string();
+                            imports.push(path);
+                        }
+                    }
+                }
+            }
+        }
+        Lang::Php => {
+            if matches!(
+                kind,
+                "include_expression"
+                    | "include_once_expression"
+                    | "require_expression"
+                    | "require_once_expression"
+            ) {
+                // Get the string argument
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i as u32) {
+                        if child.kind() == "string" {
+                            let path = node_text(child, src)
+                                .trim_matches(|c| c == '\'' || c == '"')
+                                .to_string();
+                            imports.push(path);
+                        }
+                    }
+                }
+            }
+            // PHP namespace use statements
+            if kind == "namespace_use_declaration" {
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i as u32) {
+                        if child.kind() == "namespace_use_clause" {
+                            imports.push(node_text(child, src).to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into children
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            walk_imports(child, src, lang, imports, exports);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1854,6 +2685,382 @@ mod tests {
     fn empty_source_yields_no_symbols() {
         let syms = extract_from(Lang::Rust, "");
         assert!(syms.is_empty());
+    }
+
+    // ======================================================================
+    // Reference extraction tests
+    // ======================================================================
+
+    /// Parse source and extract references for a given language.
+    fn refs_from(lang: Lang, source: &str) -> Vec<Reference> {
+        let mut parser = get_parser(lang);
+        let tree = parser.parse(source.as_bytes(), None).unwrap();
+        extract_references(&tree, source, "test_file", lang)
+    }
+
+    /// Parse source and extract imports for a given language.
+    fn imports_from(lang: Lang, source: &str) -> FileImports {
+        let mut parser = get_parser(lang);
+        let tree = parser.parse(source.as_bytes(), None).unwrap();
+        extract_imports(&tree, source, "test_file", lang)
+    }
+
+    /// Find a reference by name in a list.
+    fn find_ref<'a>(refs: &'a [Reference], name: &str) -> &'a Reference {
+        refs.iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "reference '{name}' not found in: {:?}",
+                    refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    /// Check that at least one reference with the given name and kind exists.
+    fn has_ref(refs: &[Reference], name: &str, kind: ReferenceKind) -> bool {
+        refs.iter().any(|r| r.name == name && r.kind == kind)
+    }
+
+    // ---------- Rust reference extraction ----------
+
+    #[test]
+    fn rust_call_reference() {
+        let src = "fn main() {\n    foo();\n    bar::baz();\n}";
+        let refs = refs_from(Lang::Rust, src);
+        assert!(has_ref(&refs, "foo", ReferenceKind::Call));
+        assert!(has_ref(&refs, "baz", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn rust_type_reference() {
+        let src = "fn process(x: MyType) -> Result<String, Error> { todo!() }";
+        let refs = refs_from(Lang::Rust, src);
+        assert!(has_ref(&refs, "MyType", ReferenceKind::Type));
+    }
+
+    #[test]
+    fn rust_import_reference() {
+        let src = "use std::collections::HashMap;\nuse crate::types::Symbol;";
+        let refs = refs_from(Lang::Rust, src);
+        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
+        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}", import_refs.len());
+    }
+
+    #[test]
+    fn rust_reference_has_context() {
+        let src = "fn main() {\n    foo(42);\n}";
+        let refs = refs_from(Lang::Rust, src);
+        let r = find_ref(&refs, "foo");
+        assert_eq!(r.kind, ReferenceKind::Call);
+        assert!(r.context.contains("foo(42)"), "context was: {:?}", r.context);
+        assert_eq!(r.file, "test_file");
+        assert!(r.line > 0);
+    }
+
+    // ---------- Python reference extraction ----------
+
+    #[test]
+    fn python_call_reference() {
+        let src = "def main():\n    print('hello')\n    os.path.join('a', 'b')\n";
+        let refs = refs_from(Lang::Python, src);
+        assert!(has_ref(&refs, "print", ReferenceKind::Call));
+        assert!(has_ref(&refs, "join", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn python_import_reference() {
+        let src = "import os\nfrom pathlib import Path\n";
+        let refs = refs_from(Lang::Python, src);
+        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
+        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}: {:?}", import_refs.len(), import_refs);
+    }
+
+    // ---------- JavaScript reference extraction ----------
+
+    #[test]
+    fn js_call_reference() {
+        let src = "function main() {\n  console.log('hello');\n  fetch('/api');\n}";
+        let refs = refs_from(Lang::JavaScript, src);
+        assert!(has_ref(&refs, "log", ReferenceKind::Call));
+        assert!(has_ref(&refs, "fetch", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn js_import_reference() {
+        let src = "import { foo } from './foo';\nimport bar from 'bar';";
+        let refs = refs_from(Lang::JavaScript, src);
+        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
+        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}: {:?}", import_refs.len(), import_refs);
+    }
+
+    // ---------- TypeScript reference extraction ----------
+
+    #[test]
+    fn ts_call_reference() {
+        let src = "function main(): void {\n  greet('world');\n}";
+        let refs = refs_from(Lang::TypeScript, src);
+        assert!(has_ref(&refs, "greet", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn ts_type_reference() {
+        let src = "function process(x: MyType): Result {\n  return x;\n}";
+        let refs = refs_from(Lang::TypeScript, src);
+        assert!(has_ref(&refs, "MyType", ReferenceKind::Type));
+        assert!(has_ref(&refs, "Result", ReferenceKind::Type));
+    }
+
+    #[test]
+    fn ts_import_reference() {
+        let src = "import { Component } from 'react';\nimport axios from 'axios';";
+        let refs = refs_from(Lang::TypeScript, src);
+        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
+        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}", import_refs.len());
+    }
+
+    // ---------- TSX reference extraction ----------
+
+    #[test]
+    fn tsx_call_and_type_reference() {
+        let src = "import React from 'react';\nconst App: FC = () => { useState(0); return <div/>; };";
+        let refs = refs_from(Lang::Tsx, src);
+        assert!(has_ref(&refs, "useState", ReferenceKind::Call));
+        assert!(has_ref(&refs, "FC", ReferenceKind::Type));
+    }
+
+    // ---------- Go reference extraction ----------
+
+    #[test]
+    fn go_call_reference() {
+        let src = "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n";
+        let refs = refs_from(Lang::Go, src);
+        assert!(has_ref(&refs, "Println", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn go_type_reference() {
+        let src = "package main\n\ntype Server struct{}\n\nfunc process(s Server) error {\n\treturn nil\n}\n";
+        let refs = refs_from(Lang::Go, src);
+        assert!(has_ref(&refs, "Server", ReferenceKind::Type));
+    }
+
+    #[test]
+    fn go_import_reference() {
+        let src = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {}\n";
+        let refs = refs_from(Lang::Go, src);
+        assert!(has_ref(&refs, "fmt", ReferenceKind::Import));
+        assert!(has_ref(&refs, "os", ReferenceKind::Import));
+    }
+
+    // ---------- Java reference extraction ----------
+
+    #[test]
+    fn java_call_reference() {
+        let src = "class App {\n    void run() {\n        System.out.println(\"hello\");\n    }\n}";
+        let refs = refs_from(Lang::Java, src);
+        assert!(has_ref(&refs, "System.out.println", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn java_type_reference() {
+        let src = "class App {\n    String name;\n    List<Integer> items;\n}";
+        let refs = refs_from(Lang::Java, src);
+        assert!(has_ref(&refs, "String", ReferenceKind::Type));
+    }
+
+    #[test]
+    fn java_import_reference() {
+        let src = "import java.util.List;\nimport java.io.File;\nclass App {}";
+        let refs = refs_from(Lang::Java, src);
+        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
+        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}", import_refs.len());
+    }
+
+    // ---------- C reference extraction ----------
+
+    #[test]
+    fn c_call_reference() {
+        let src = "#include <stdio.h>\nint main() {\n    printf(\"hello\");\n    return 0;\n}";
+        let refs = refs_from(Lang::C, src);
+        assert!(has_ref(&refs, "printf", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn c_include_reference() {
+        let src = "#include <stdio.h>\n#include \"myheader.h\"\nint main() { return 0; }";
+        let refs = refs_from(Lang::C, src);
+        assert!(has_ref(&refs, "stdio.h", ReferenceKind::Import));
+        assert!(has_ref(&refs, "myheader.h", ReferenceKind::Import));
+    }
+
+    // ---------- C++ reference extraction ----------
+
+    #[test]
+    fn cpp_call_reference() {
+        let src = "#include <iostream>\nint main() {\n    std::cout << \"hello\";\n    foo();\n    return 0;\n}";
+        let refs = refs_from(Lang::Cpp, src);
+        assert!(has_ref(&refs, "foo", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn cpp_include_reference() {
+        let src = "#include <iostream>\n#include <vector>\nint main() { return 0; }";
+        let refs = refs_from(Lang::Cpp, src);
+        assert!(has_ref(&refs, "iostream", ReferenceKind::Import));
+        assert!(has_ref(&refs, "vector", ReferenceKind::Import));
+    }
+
+    // ---------- Ruby reference extraction ----------
+
+    #[test]
+    fn ruby_call_reference() {
+        let src = "def main\n  puts 'hello'\n  arr.push(42)\nend\n";
+        let refs = refs_from(Lang::Ruby, src);
+        assert!(has_ref(&refs, "puts", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn ruby_require_reference() {
+        let src = "require 'json'\nrequire_relative 'helper'\n";
+        let refs = refs_from(Lang::Ruby, src);
+        assert!(has_ref(&refs, "json", ReferenceKind::Import));
+        assert!(has_ref(&refs, "helper", ReferenceKind::Import));
+    }
+
+    // ---------- PHP reference extraction ----------
+
+    #[test]
+    fn php_call_reference() {
+        let src = "<?php\nfunction main() {\n    echo strlen('hello');\n}\n?>";
+        let refs = refs_from(Lang::Php, src);
+        assert!(has_ref(&refs, "strlen", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn php_type_reference() {
+        let src = "<?php\nfunction process(MyType $x): Result {\n    return $x;\n}\n?>";
+        let refs = refs_from(Lang::Php, src);
+        assert!(has_ref(&refs, "MyType", ReferenceKind::Type));
+        assert!(has_ref(&refs, "Result", ReferenceKind::Type));
+    }
+
+    // ======================================================================
+    // Import/export extraction tests
+    // ======================================================================
+
+    #[test]
+    fn rust_imports() {
+        let src = "use std::collections::HashMap;\nuse crate::types::Symbol;\nfn main() {}";
+        let fi = imports_from(Lang::Rust, src);
+        assert_eq!(fi.file, "test_file");
+        assert!(fi.imports.len() >= 2, "imports: {:?}", fi.imports);
+        assert!(fi.imports.iter().any(|i| i.contains("HashMap")));
+        assert!(fi.imports.iter().any(|i| i.contains("Symbol")));
+    }
+
+    #[test]
+    fn rust_exports() {
+        let src = "pub fn hello() {}\npub struct Foo {}\nfn private() {}";
+        let fi = imports_from(Lang::Rust, src);
+        assert!(fi.exports.contains(&"hello".to_string()), "exports: {:?}", fi.exports);
+        assert!(fi.exports.contains(&"Foo".to_string()), "exports: {:?}", fi.exports);
+        assert!(!fi.exports.contains(&"private".to_string()), "should not export private fn");
+    }
+
+    #[test]
+    fn python_imports() {
+        let src = "import os\nfrom pathlib import Path\ndef main(): pass\n";
+        let fi = imports_from(Lang::Python, src);
+        assert!(fi.imports.iter().any(|i| i.contains("os")), "imports: {:?}", fi.imports);
+        assert!(fi.imports.iter().any(|i| i.contains("pathlib")), "imports: {:?}", fi.imports);
+    }
+
+    #[test]
+    fn js_imports_and_exports() {
+        let src = "import { foo } from './foo';\nexport function bar() {}\nexport default function baz() {}";
+        let fi = imports_from(Lang::JavaScript, src);
+        assert!(fi.imports.iter().any(|i| i.contains("./foo")), "imports: {:?}", fi.imports);
+        assert!(fi.exports.contains(&"bar".to_string()), "exports: {:?}", fi.exports);
+    }
+
+    #[test]
+    fn ts_imports_and_exports() {
+        let src = "import { Component } from 'react';\nexport interface Greeter { greet(): void; }";
+        let fi = imports_from(Lang::TypeScript, src);
+        assert!(fi.imports.iter().any(|i| i.contains("react")), "imports: {:?}", fi.imports);
+    }
+
+    #[test]
+    fn go_imports() {
+        let src = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {}\n";
+        let fi = imports_from(Lang::Go, src);
+        assert!(fi.imports.contains(&"fmt".to_string()), "imports: {:?}", fi.imports);
+        assert!(fi.imports.contains(&"os".to_string()), "imports: {:?}", fi.imports);
+    }
+
+    #[test]
+    fn go_exports() {
+        let src = "package main\n\nfunc Exported() {}\nfunc private() {}\n";
+        let fi = imports_from(Lang::Go, src);
+        assert!(fi.exports.contains(&"Exported".to_string()), "exports: {:?}", fi.exports);
+        assert!(!fi.exports.contains(&"private".to_string()));
+    }
+
+    #[test]
+    fn java_imports() {
+        let src = "import java.util.List;\nimport java.io.File;\nclass App {}";
+        let fi = imports_from(Lang::Java, src);
+        assert!(fi.imports.len() >= 2, "imports: {:?}", fi.imports);
+    }
+
+    #[test]
+    fn c_includes() {
+        let src = "#include <stdio.h>\n#include \"myheader.h\"\nint main() { return 0; }";
+        let fi = imports_from(Lang::C, src);
+        assert!(fi.imports.contains(&"stdio.h".to_string()), "imports: {:?}", fi.imports);
+        assert!(fi.imports.contains(&"myheader.h".to_string()), "imports: {:?}", fi.imports);
+    }
+
+    #[test]
+    fn cpp_includes() {
+        let src = "#include <iostream>\n#include <vector>\nint main() { return 0; }";
+        let fi = imports_from(Lang::Cpp, src);
+        assert!(fi.imports.contains(&"iostream".to_string()), "imports: {:?}", fi.imports);
+        assert!(fi.imports.contains(&"vector".to_string()), "imports: {:?}", fi.imports);
+    }
+
+    #[test]
+    fn ruby_requires() {
+        let src = "require 'json'\nrequire_relative 'helper'\ndef main; end\n";
+        let fi = imports_from(Lang::Ruby, src);
+        assert!(fi.imports.contains(&"json".to_string()), "imports: {:?}", fi.imports);
+        assert!(fi.imports.contains(&"helper".to_string()), "imports: {:?}", fi.imports);
+    }
+
+    // ---------- Reference context line ----------
+
+    #[test]
+    fn reference_context_is_full_source_line() {
+        let src = "fn main() {\n    let x = foo(42);\n}";
+        let refs = refs_from(Lang::Rust, src);
+        let r = find_ref(&refs, "foo");
+        assert_eq!(r.context, "let x = foo(42);");
+    }
+
+    // ---------- Empty source yields no refs ----------
+
+    #[test]
+    fn empty_source_yields_no_references() {
+        let refs = refs_from(Lang::Rust, "");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn empty_source_yields_empty_imports() {
+        let fi = imports_from(Lang::Rust, "");
+        assert!(fi.imports.is_empty());
+        assert!(fi.exports.is_empty());
     }
 
     /// Debug helper: print the tree structure to understand node kinds.
