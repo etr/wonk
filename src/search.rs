@@ -51,6 +51,20 @@ pub fn text_search(
     ignore_case: bool,
     paths: &[String],
 ) -> Result<Vec<SearchResult>> {
+    text_search_with_ignores(pattern, regex, ignore_case, paths, &[])
+}
+
+/// Execute a text search over files with additional ignore patterns.
+///
+/// Like [`text_search`], but also accepts ignore patterns (gitignore syntax)
+/// that are forwarded to the file walker.
+pub fn text_search_with_ignores(
+    pattern: &str,
+    regex: bool,
+    ignore_case: bool,
+    paths: &[String],
+    ignore_patterns: &[String],
+) -> Result<Vec<SearchResult>> {
     // Build the regex matcher.
     let mut builder = RegexMatcherBuilder::new();
     builder.case_insensitive(ignore_case);
@@ -82,9 +96,11 @@ pub fn text_search(
     let mut results: Vec<SearchResult> = Vec::new();
 
     for root in roots {
-        // Enumerate files using the walker (respects .gitignore, default
-        // exclusions, etc.)
-        let files = Walker::new(root).collect_paths();
+        // Enumerate files using the walker (respects .gitignore, .wonkignore,
+        // default exclusions, and config ignore patterns).
+        let files = Walker::new(root)
+            .with_ignore_patterns(ignore_patterns)
+            .collect_paths();
 
         for file_path in files {
             let mut sink = CollectSink {
