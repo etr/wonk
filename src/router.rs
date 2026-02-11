@@ -1,11 +1,41 @@
 use anyhow::Result;
 
 use crate::cli::{Cli, Command, DaemonCommand, ReposCommand};
+use crate::search;
 
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Search(_args) => {
-            eprintln!("search: not yet implemented");
+        Command::Search(args) => {
+            let results = search::text_search(
+                &args.pattern,
+                args.regex,
+                args.ignore_case,
+                &args.paths,
+            )?;
+
+            if cli.json {
+                // JSON output: one JSON object per line.
+                for r in &results {
+                    let obj = serde_json::json!({
+                        "file": r.file.to_string_lossy(),
+                        "line": r.line,
+                        "col": r.col,
+                        "content": r.content,
+                    });
+                    println!("{}", obj);
+                }
+            } else {
+                // Human-readable output matching ripgrep style:
+                // file:line:content
+                for r in &results {
+                    println!(
+                        "{}:{}:{}",
+                        r.file.display(),
+                        r.line,
+                        r.content,
+                    );
+                }
+            }
         }
         Command::Sym(_args) => {
             eprintln!("sym: not yet implemented");
