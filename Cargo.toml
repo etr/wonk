@@ -1,0 +1,67 @@
+[package]
+name = "wonk"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "wonk"
+path = "src/main.rs"
+
+[dependencies]
+# CLI parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# SQLite
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+# Tree-sitter core
+tree-sitter = "0.26"
+
+# Text search
+grep = "0.4"
+
+# File filtering
+ignore = "0.4"
+
+# Parallel indexing
+rayon = "1"
+
+# File watching
+notify = "8"
+notify-debouncer-mini = "0.5"
+
+# Channels
+crossbeam-channel = "0.5"
+
+# Content hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Repo path hashing
+sha2 = "0.10"
+
+# Config parsing
+toml = "0.8"
+
+# Serialization / JSON output
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Daemon
+fork = "0.2"
+signal-hook = "0.3"
+
+# Tree-sitter language grammars
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.23"
