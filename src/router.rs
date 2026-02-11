@@ -1,10 +1,28 @@
+//! Query routing layer.
+//!
+//! [`dispatch`] handles CLI command dispatch.  [`QueryRouter`] provides the
+//! core query interface: it tries the SQLite index first and, when the index
+//! is unavailable or returns no results, falls back to grep-based heuristic
+//! search patterns that cover all 10 supported languages.
+
 use std::io;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use rusqlite::Connection;
 
 use crate::cli::{Cli, Command, DaemonCommand, ReposCommand};
+use crate::db;
+use crate::errors::DbError;
+#[cfg(test)]
+use crate::errors::SearchError;
 use crate::output::{self, Formatter, SearchOutput};
 use crate::search;
+use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
+
+// ---------------------------------------------------------------------------
+// CLI dispatch (kept from original router)
+// ---------------------------------------------------------------------------
 
 pub fn dispatch(cli: Cli) -> Result<()> {
     let stdout = io::stdout().lock();
@@ -74,4 +92,1327 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         },
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Heuristic grep patterns
+// ---------------------------------------------------------------------------
+
+/// Build a regex pattern to find symbol definitions via grep.
+///
+/// Covers all 10 supported languages:
+///   Rust:       `fn`, `pub fn`, `pub(crate) fn`, `struct`, `enum`, `trait`
+///   Python:     `def`, `class`
+///   Ruby:       `def`, `class`, `module`
+///   JavaScript: `function`, `class`
+///   TypeScript: `function`, `class`, `interface`, `enum`
+///   Go:         `func`, `type ... struct`, `type ... interface`
+///   Java:       `class`, `interface`, `enum`
+///   C:          function-like patterns (captured by generic regex)
+///   C++:        `class`, `struct`, `enum`, function-like patterns
+///   PHP:        `function`, `class`, `interface`, `trait`
+pub fn symbol_grep_pattern(name: &str) -> String {
+    // Use word boundary around the name to reduce false positives.
+    format!(
+        r"(fn|pub\s+fn|pub\(crate\)\s+fn|def|function|func|class|struct|enum|trait|interface|module|type|const|let|var|val)\s+{}\b",
+        regex_escape(name)
+    )
+}
+
+/// Build a regex pattern to find symbol definitions filtered by kind.
+pub fn symbol_kind_grep_pattern(name: &str, kind: &str) -> String {
+    let keywords = match kind {
+        "function" | "method" => "fn|pub\\s+fn|pub\\(crate\\)\\s+fn|def|function|func",
+        "class" => "class",
+        "struct" => "struct",
+        "interface" => "interface",
+        "enum" => "enum",
+        "trait" => "trait",
+        "type_alias" => "type",
+        "constant" => "const",
+        "variable" => "let|var|val",
+        "module" => "module|mod",
+        _ => return symbol_grep_pattern(name),
+    };
+    format!(r"({})\s+{}\b", keywords, regex_escape(name))
+}
+
+/// Build a regex pattern to find references (usages) of a name via grep.
+///
+/// This is a broad pattern that looks for the name as a word boundary match,
+/// which captures calls, type annotations, and other usages.
+pub fn reference_grep_pattern(name: &str) -> String {
+    format!(r"\b{}\b", regex_escape(name))
+}
+
+/// Build a regex pattern to find import/use statements mentioning a name.
+///
+/// Covers all 10 supported languages:
+///   Rust:       `use ... name`
+///   Python:     `import name`, `from ... import name`
+///   Ruby:       `require ... name`
+///   JavaScript: `import ... name`, `require(... name ...)`
+///   TypeScript: `import ... name`
+///   Go:         `import ... name`
+///   Java:       `import ... name`
+///   C/C++:      `#include ... name`
+///   PHP:        `use ... name`, `require ... name`, `include ... name`
+pub fn import_grep_pattern(name: &str) -> String {
+    format!(
+        r"(import|from|require|use|include)\s+.*{}",
+        regex_escape(name)
+    )
+}
+
+/// Build a regex pattern to find signature lines (function/method declarations).
+pub fn signature_grep_pattern(name: &str) -> String {
+    format!(
+        r"(fn|pub\s+fn|pub\(crate\)\s+fn|def|function|func)\s+{}\s*\(",
+        regex_escape(name)
+    )
+}
+
+/// Escape special regex characters in a literal name.
+fn regex_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']'
+            | '{' | '}' | '|' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+// ---------------------------------------------------------------------------
+// SymbolKind parsing helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a `SymbolKind` from the string stored in the database.
+fn parse_symbol_kind(s: &str) -> SymbolKind {
+    match s {
+        "function" => SymbolKind::Function,
+        "method" => SymbolKind::Method,
+        "class" => SymbolKind::Class,
+        "struct" => SymbolKind::Struct,
+        "interface" => SymbolKind::Interface,
+        "enum" => SymbolKind::Enum,
+        "trait" => SymbolKind::Trait,
+        "type_alias" => SymbolKind::TypeAlias,
+        "constant" => SymbolKind::Constant,
+        "variable" => SymbolKind::Variable,
+        "module" => SymbolKind::Module,
+        _ => SymbolKind::Function, // fallback
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QueryRouter
+// ---------------------------------------------------------------------------
+
+/// Routes queries to the SQLite index when available, falling back to
+/// grep-based heuristic search when the index is missing or returns no
+/// results.
+pub struct QueryRouter {
+    /// Open database connection, or `None` if no index was found.
+    conn: Option<Connection>,
+    /// Repository root directory (used as the base for grep searches).
+    repo_root: PathBuf,
+}
+
+impl QueryRouter {
+    /// Create a new `QueryRouter`.
+    ///
+    /// * `repo_root` - If `Some`, use this as the repo root.  If `None`,
+    ///   attempt to discover it from the current directory.
+    /// * `local` - When `true`, look for a local `.wonk/index.db` inside the
+    ///   repo; otherwise use the central `~/.wonk/repos/<hash>/index.db`.
+    ///
+    /// If no index database is found, the router is still usable -- all
+    /// queries will go through the grep fallback.
+    pub fn new(repo_root: Option<PathBuf>, local: bool) -> Self {
+        let root = repo_root
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| db::find_repo_root(&cwd).ok())
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let conn = db::index_path_for(&root, local)
+            .ok()
+            .filter(|p| p.exists())
+            .and_then(|p| db::open_existing(&p).ok());
+
+        Self {
+            conn,
+            repo_root: root,
+        }
+    }
+
+    /// Create a `QueryRouter` with an explicit connection (useful for testing).
+    #[cfg(test)]
+    pub fn with_conn(conn: Connection, repo_root: PathBuf) -> Self {
+        Self {
+            conn: Some(conn),
+            repo_root,
+        }
+    }
+
+    /// Create a `QueryRouter` with no database (grep-only mode, useful for testing).
+    #[cfg(test)]
+    pub fn grep_only(repo_root: PathBuf) -> Self {
+        Self {
+            conn: None,
+            repo_root,
+        }
+    }
+
+    /// Returns `true` if the router has an open index database.
+    pub fn has_index(&self) -> bool {
+        self.conn.is_some()
+    }
+
+    // -- Symbol queries -----------------------------------------------------
+
+    /// Look up symbols by name.
+    ///
+    /// * `name` - The symbol name to search for.
+    /// * `kind` - Optional filter by symbol kind (e.g. "function", "class").
+    /// * `exact` - When `true`, match the name exactly; otherwise substring match.
+    ///
+    /// Tries the SQLite index first; falls back to grep on `NoIndex` or empty
+    /// results.
+    pub fn query_symbols(
+        &self,
+        name: &str,
+        kind: Option<&str>,
+        exact: bool,
+    ) -> Result<Vec<Symbol>, DbError> {
+        // Try SQLite first.
+        if let Some(conn) = &self.conn {
+            let results = query_symbols_db(conn, name, kind, exact)?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
+        }
+
+        // Fallback to grep.
+        Ok(self.query_symbols_grep(name, kind))
+    }
+
+    /// Grep-based symbol search fallback.
+    fn query_symbols_grep(&self, name: &str, kind: Option<&str>) -> Vec<Symbol> {
+        let pattern = match kind {
+            Some(k) => symbol_kind_grep_pattern(name, k),
+            None => symbol_grep_pattern(name),
+        };
+
+        let root_str = self.repo_root.to_string_lossy().into_owned();
+        let results = search::text_search(&pattern, true, false, &[root_str]);
+
+        match results {
+            Ok(hits) => hits
+                .into_iter()
+                .map(|r| Symbol {
+                    name: name.to_string(),
+                    kind: kind.map(parse_symbol_kind).unwrap_or(SymbolKind::Function),
+                    file: r.file.to_string_lossy().into_owned(),
+                    line: r.line as usize,
+                    col: r.col as usize,
+                    end_line: None,
+                    scope: None,
+                    signature: r.content.clone(),
+                    language: String::new(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // -- Reference queries --------------------------------------------------
+
+    /// Find references to a symbol name.
+    ///
+    /// * `name` - The name to search for references to.
+    /// * `paths` - Optional path restrictions for the search.
+    ///
+    /// Tries the SQLite index first; falls back to grep.
+    pub fn query_references(
+        &self,
+        name: &str,
+        paths: &[String],
+    ) -> Result<Vec<Reference>, DbError> {
+        // Try SQLite first.
+        if let Some(conn) = &self.conn {
+            let results = query_references_db(conn, name)?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
+        }
+
+        // Fallback to grep.
+        Ok(self.query_references_grep(name, paths))
+    }
+
+    /// Grep-based reference search fallback.
+    fn query_references_grep(&self, name: &str, paths: &[String]) -> Vec<Reference> {
+        let pattern = reference_grep_pattern(name);
+        let search_paths = if paths.is_empty() {
+            vec![self.repo_root.to_string_lossy().into_owned()]
+        } else {
+            paths.to_vec()
+        };
+
+        let results = search::text_search(&pattern, true, false, &search_paths);
+
+        match results {
+            Ok(hits) => hits
+                .into_iter()
+                .map(|r| Reference {
+                    name: name.to_string(),
+                    kind: ReferenceKind::Call,
+                    file: r.file.to_string_lossy().into_owned(),
+                    line: r.line as usize,
+                    col: r.col as usize,
+                    context: r.content.clone(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // -- Signature queries --------------------------------------------------
+
+    /// Look up function/method signatures by name.
+    ///
+    /// Tries the SQLite index first; falls back to grep.
+    pub fn query_signatures(&self, name: &str) -> Result<Vec<Symbol>, DbError> {
+        // Try SQLite first (signatures are symbols with kind=function/method).
+        if let Some(conn) = &self.conn {
+            let results = query_signatures_db(conn, name)?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
+        }
+
+        // Fallback to grep.
+        Ok(self.query_signatures_grep(name))
+    }
+
+    /// Grep-based signature search fallback.
+    fn query_signatures_grep(&self, name: &str) -> Vec<Symbol> {
+        let pattern = signature_grep_pattern(name);
+        let root_str = self.repo_root.to_string_lossy().into_owned();
+        let results = search::text_search(&pattern, true, false, &[root_str]);
+
+        match results {
+            Ok(hits) => hits
+                .into_iter()
+                .map(|r| Symbol {
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    file: r.file.to_string_lossy().into_owned(),
+                    line: r.line as usize,
+                    col: r.col as usize,
+                    end_line: None,
+                    scope: None,
+                    signature: r.content.clone(),
+                    language: String::new(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // -- File symbol listing ------------------------------------------------
+
+    /// List all symbols in a given file.
+    ///
+    /// * `path` - File path to list symbols for.
+    /// * `tree` - When `true`, attempt to use tree-sitter parsing as fallback
+    ///   instead of grep (currently not implemented; placeholder for future).
+    ///
+    /// Tries the SQLite index first; falls back to grep for function/class
+    /// definitions.
+    pub fn query_symbols_in_file(
+        &self,
+        path: &str,
+        _tree: bool,
+    ) -> Result<Vec<Symbol>, DbError> {
+        // Try SQLite first.
+        if let Some(conn) = &self.conn {
+            let results = query_symbols_in_file_db(conn, path)?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
+        }
+
+        // Fallback: grep for common definition patterns in the specific file.
+        Ok(self.query_symbols_in_file_grep(path))
+    }
+
+    /// Grep-based file symbol listing fallback.
+    fn query_symbols_in_file_grep(&self, path: &str) -> Vec<Symbol> {
+        let pattern = r"(fn|pub\s+fn|pub\(crate\)\s+fn|def|function|func|class|struct|enum|trait|interface|module)\s+\w+".to_string();
+        let results = search::text_search(&pattern, true, false, &[path.to_string()]);
+
+        match results {
+            Ok(hits) => hits
+                .into_iter()
+                .map(|r| Symbol {
+                    name: extract_symbol_name(&r.content),
+                    kind: SymbolKind::Function,
+                    file: r.file.to_string_lossy().into_owned(),
+                    line: r.line as usize,
+                    col: r.col as usize,
+                    end_line: None,
+                    scope: None,
+                    signature: r.content.clone(),
+                    language: String::new(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // -- Dependency queries -------------------------------------------------
+
+    /// Find dependencies of a file (files it imports/uses).
+    ///
+    /// Tries the SQLite index first; falls back to grep for import statements.
+    pub fn query_deps(&self, file: &str) -> Result<Vec<String>, DbError> {
+        // Try SQLite first.
+        if let Some(conn) = &self.conn {
+            let results = query_deps_db(conn, file)?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
+        }
+
+        // Fallback to grep for import patterns.
+        Ok(self.query_deps_grep(file))
+    }
+
+    /// Grep-based dependency search fallback.
+    fn query_deps_grep(&self, file: &str) -> Vec<String> {
+        let pattern = r"(import|from|require|use|include)\s+".to_string();
+        let results = search::text_search(&pattern, true, false, &[file.to_string()]);
+
+        match results {
+            Ok(hits) => hits
+                .into_iter()
+                .map(|r| r.content.trim().to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    // -- Reverse dependency queries -----------------------------------------
+
+    /// Find reverse dependencies of a file (files that import/use it).
+    ///
+    /// Tries the SQLite index first; falls back to grep for import statements
+    /// mentioning the file's name.
+    pub fn query_rdeps(&self, file: &str) -> Result<Vec<String>, DbError> {
+        // Try SQLite first.
+        if let Some(conn) = &self.conn {
+            let results = query_rdeps_db(conn, file)?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
+        }
+
+        // Fallback to grep: search for imports mentioning this file's stem.
+        Ok(self.query_rdeps_grep(file))
+    }
+
+    /// Grep-based reverse dependency search fallback.
+    fn query_rdeps_grep(&self, file: &str) -> Vec<String> {
+        // Extract the file stem (e.g. "foo" from "src/foo.rs").
+        let stem = Path::new(file)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.to_string());
+
+        let pattern = import_grep_pattern(&stem);
+        let root_str = self.repo_root.to_string_lossy().into_owned();
+        let results = search::text_search(&pattern, true, false, &[root_str]);
+
+        match results {
+            Ok(hits) => {
+                let mut files: Vec<String> = hits
+                    .into_iter()
+                    .map(|r| r.file.to_string_lossy().into_owned())
+                    .collect();
+                files.sort();
+                files.dedup();
+                files
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQLite query functions
+// ---------------------------------------------------------------------------
+
+/// Query symbols from the SQLite index.
+fn query_symbols_db(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    exact: bool,
+) -> Result<Vec<Symbol>, DbError> {
+    let mut sql = String::from(
+        "SELECT name, kind, file, line, col, end_line, scope, signature, language FROM symbols",
+    );
+    let mut conditions = Vec::new();
+
+    if exact {
+        conditions.push("name = ?1".to_string());
+    } else {
+        conditions.push("name LIKE ?1".to_string());
+    }
+
+    if kind.is_some() {
+        conditions.push("kind = ?2".to_string());
+    }
+
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+
+    let name_param = if exact {
+        name.to_string()
+    } else {
+        format!("%{}%", name)
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows = if let Some(k) = kind {
+        stmt.query_map(rusqlite::params![name_param, k], row_to_symbol)?
+    } else {
+        stmt.query_map(rusqlite::params![name_param], row_to_symbol)?
+    };
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Query references from the SQLite index.
+fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Reference>, DbError> {
+    let sql = "SELECT name, file, line, col, context FROM \"references\" WHERE name LIKE ?1";
+    let name_param = format!("%{}%", name);
+    let mut stmt = conn.prepare(sql)?;
+
+    let rows = stmt.query_map(rusqlite::params![name_param], |row| {
+        let line: i64 = row.get(2)?;
+        let col: i64 = row.get(3)?;
+        Ok(Reference {
+            name: row.get(0)?,
+            kind: ReferenceKind::Call,
+            file: row.get(1)?,
+            line: line as usize,
+            col: col as usize,
+            context: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Query function/method signatures from the SQLite index.
+fn query_signatures_db(conn: &Connection, name: &str) -> Result<Vec<Symbol>, DbError> {
+    let sql = "SELECT name, kind, file, line, col, end_line, scope, signature, language \
+               FROM symbols WHERE name LIKE ?1 AND kind IN ('function', 'method')";
+    let name_param = format!("%{}%", name);
+    let mut stmt = conn.prepare(sql)?;
+
+    let rows = stmt.query_map(rusqlite::params![name_param], row_to_symbol)?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Query all symbols in a specific file from the SQLite index.
+fn query_symbols_in_file_db(conn: &Connection, path: &str) -> Result<Vec<Symbol>, DbError> {
+    let sql = "SELECT name, kind, file, line, col, end_line, scope, signature, language \
+               FROM symbols WHERE file = ?1 ORDER BY line";
+    let mut stmt = conn.prepare(sql)?;
+
+    let rows = stmt.query_map(rusqlite::params![path], row_to_symbol)?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Query file dependencies from the references table.
+///
+/// This looks for import-kind references within the given file and returns
+/// the imported names.
+fn query_deps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> {
+    // Look for references within this file that look like imports.
+    // We search the context column for import patterns.
+    let sql = "SELECT DISTINCT context FROM \"references\" WHERE file = ?1 AND \
+               context LIKE '%import%' OR context LIKE '%require%' OR \
+               context LIKE '%use %' OR context LIKE '%include%' OR context LIKE '%from%'";
+    let mut stmt = conn.prepare(sql)?;
+
+    let rows = stmt.query_map(rusqlite::params![file], |row| {
+        row.get::<_, Option<String>>(0)
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        if let Some(ctx) = row? {
+            results.push(ctx.trim().to_string());
+        }
+    }
+    Ok(results)
+}
+
+/// Query reverse dependencies: files that import/reference something from `file`.
+fn query_rdeps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> {
+    // Find the file's stem to search for in references.
+    let stem = Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file.to_string());
+
+    let sql = "SELECT DISTINCT file FROM \"references\" WHERE name LIKE ?1 AND file != ?2";
+    let stem_param = format!("%{}%", stem);
+    let mut stmt = conn.prepare(sql)?;
+
+    let rows = stmt.query_map(rusqlite::params![stem_param, file], |row| {
+        row.get::<_, String>(0)
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    results.sort();
+    results.dedup();
+    Ok(results)
+}
+
+/// Convert a rusqlite row to a `Symbol`.
+fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
+    let kind_str: String = row.get(1)?;
+    let line: i64 = row.get(3)?;
+    let col: i64 = row.get(4)?;
+    let end_line: Option<i64> = row.get(5)?;
+    Ok(Symbol {
+        name: row.get(0)?,
+        kind: parse_symbol_kind(&kind_str),
+        file: row.get(2)?,
+        line: line as usize,
+        col: col as usize,
+        end_line: end_line.map(|v| v as usize),
+        scope: row.get(6)?,
+        signature: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+        language: row.get(8)?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract a symbol name from a matched line content.
+///
+/// Given a line like `fn my_func(...)`, tries to extract `my_func`.
+fn extract_symbol_name(content: &str) -> String {
+    // Split on whitespace, find the token after a keyword.
+    let keywords = [
+        "fn", "def", "function", "func", "class", "struct", "enum", "trait",
+        "interface", "module",
+    ];
+
+    let tokens: Vec<&str> = content.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        let clean = tok.trim_start_matches("pub(crate)").trim_start_matches("pub").trim();
+        if keywords.contains(&clean) {
+            if let Some(next) = tokens.get(i + 1) {
+                // Take only the identifier part: alphanumeric and underscores.
+                let name: String = next
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+        }
+    }
+
+    // Last resort: extract the last word-like token.
+    content
+        .split_whitespace()
+        .last()
+        .unwrap_or("unknown")
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // -- Pattern tests ------------------------------------------------------
+
+    #[test]
+    fn test_symbol_grep_pattern() {
+        let pat = symbol_grep_pattern("my_func");
+        assert!(pat.contains("fn"));
+        assert!(pat.contains("def"));
+        assert!(pat.contains("function"));
+        assert!(pat.contains("func"));
+        assert!(pat.contains("class"));
+        assert!(pat.contains("struct"));
+        assert!(pat.contains("enum"));
+        assert!(pat.contains("trait"));
+        assert!(pat.contains("interface"));
+        assert!(pat.contains("my_func"));
+    }
+
+    #[test]
+    fn test_symbol_kind_grep_pattern_function() {
+        let pat = symbol_kind_grep_pattern("handler", "function");
+        assert!(pat.contains("fn"));
+        assert!(pat.contains("def"));
+        assert!(pat.contains("function"));
+        assert!(pat.contains("func"));
+        assert!(pat.contains("handler"));
+        // Should NOT contain class/struct etc.
+        assert!(!pat.contains("class"));
+    }
+
+    #[test]
+    fn test_symbol_kind_grep_pattern_class() {
+        let pat = symbol_kind_grep_pattern("MyClass", "class");
+        assert!(pat.contains("class"));
+        assert!(pat.contains("MyClass"));
+        // Should NOT contain function keywords.
+        assert!(!pat.contains("def"));
+    }
+
+    #[test]
+    fn test_import_grep_pattern() {
+        let pat = import_grep_pattern("utils");
+        assert!(pat.contains("import"));
+        assert!(pat.contains("from"));
+        assert!(pat.contains("require"));
+        assert!(pat.contains("use"));
+        assert!(pat.contains("include"));
+        assert!(pat.contains("utils"));
+    }
+
+    #[test]
+    fn test_reference_grep_pattern() {
+        let pat = reference_grep_pattern("calculate");
+        assert!(pat.contains("calculate"));
+        assert!(pat.contains(r"\b"));
+    }
+
+    #[test]
+    fn test_signature_grep_pattern() {
+        let pat = signature_grep_pattern("process");
+        assert!(pat.contains("fn"));
+        assert!(pat.contains("def"));
+        assert!(pat.contains("function"));
+        assert!(pat.contains("func"));
+        assert!(pat.contains("process"));
+        assert!(pat.contains(r"\("));
+    }
+
+    #[test]
+    fn test_regex_escape() {
+        assert_eq!(regex_escape("hello"), "hello");
+        assert_eq!(regex_escape("a.b"), r"a\.b");
+        assert_eq!(regex_escape("fn()"), r"fn\(\)");
+        assert_eq!(regex_escape("a+b*c"), r"a\+b\*c");
+    }
+
+    // -- extract_symbol_name tests ------------------------------------------
+
+    #[test]
+    fn test_extract_symbol_name_fn() {
+        assert_eq!(extract_symbol_name("fn my_func() {"), "my_func");
+    }
+
+    #[test]
+    fn test_extract_symbol_name_pub_fn() {
+        assert_eq!(extract_symbol_name("pub fn handler(req: Request)"), "handler");
+    }
+
+    #[test]
+    fn test_extract_symbol_name_class() {
+        assert_eq!(extract_symbol_name("class MyClass:"), "MyClass");
+    }
+
+    #[test]
+    fn test_extract_symbol_name_def() {
+        assert_eq!(extract_symbol_name("def calculate(x, y):"), "calculate");
+    }
+
+    // -- QueryRouter grep fallback tests ------------------------------------
+
+    #[test]
+    fn test_router_grep_only_mode() {
+        let dir = TempDir::new().unwrap();
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        assert!(!router.has_index());
+    }
+
+    #[test]
+    fn test_router_query_symbols_grep_fallback() {
+        let dir = TempDir::new().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("main.rs"),
+            "fn main() {}\npub fn helper() {}\nlet x = 42;\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_symbols("main", None, false).unwrap();
+        assert!(
+            !results.is_empty(),
+            "grep fallback should find 'fn main'"
+        );
+        assert!(results.iter().any(|s| s.name == "main"));
+    }
+
+    #[test]
+    fn test_router_query_symbols_grep_kind_filter() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("test.py"),
+            "def helper():\n    pass\n\nclass Helper:\n    pass\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        // Should find only the class when filtering by kind.
+        let results = router.query_symbols("Helper", Some("class"), false).unwrap();
+        assert!(
+            !results.is_empty(),
+            "grep fallback should find 'class Helper'"
+        );
+    }
+
+    #[test]
+    fn test_router_query_references_grep_fallback() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn calc() {}\nfn main() { calc(); }\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_references("calc", &[]).unwrap();
+        assert!(
+            !results.is_empty(),
+            "grep fallback should find references to 'calc'"
+        );
+    }
+
+    #[test]
+    fn test_router_query_signatures_grep_fallback() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("code.rs"),
+            "pub fn process(input: &str) -> Result<()> {\n    Ok(())\n}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_signatures("process").unwrap();
+        assert!(
+            !results.is_empty(),
+            "grep fallback should find signature for 'process'"
+        );
+        assert!(results[0].signature.contains("process"));
+    }
+
+    #[test]
+    fn test_router_query_deps_grep_fallback() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("main.py");
+        fs::write(&file_path, "import os\nfrom sys import argv\nprint('hello')\n").unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let file_str = file_path.to_string_lossy().into_owned();
+        let results = router.query_deps(&file_str).unwrap();
+        assert!(
+            !results.is_empty(),
+            "grep fallback should find import statements"
+        );
+    }
+
+    #[test]
+    fn test_router_query_rdeps_grep_fallback() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "from utils import helper\nhelper()\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("utils.py"),
+            "def helper():\n    pass\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_rdeps("utils.py").unwrap();
+        assert!(
+            !results.is_empty(),
+            "grep fallback should find files that import 'utils'"
+        );
+    }
+
+    // -- SQLite query tests -------------------------------------------------
+
+    #[test]
+    fn test_router_query_symbols_from_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["my_func", "function", "src/main.rs", 10, 0, "rust", "fn my_func()"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        assert!(router.has_index());
+
+        let results = router.query_symbols("my_func", None, true).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "my_func");
+        assert_eq!(results[0].kind, SymbolKind::Function);
+        assert_eq!(results[0].file, "src/main.rs");
+        assert_eq!(results[0].line, 10);
+    }
+
+    #[test]
+    fn test_router_query_symbols_from_db_substring() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["calculate_sum", "function", "lib.rs", 5, 0, "rust", "fn calculate_sum()"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["calculate_avg", "function", "lib.rs", 15, 0, "rust", "fn calculate_avg()"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+
+        // Substring search should find both.
+        let results = router.query_symbols("calculate", None, false).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_router_query_symbols_from_db_with_kind() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["Item", "struct", "types.rs", 1, 0, "rust", "struct Item"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["Item", "function", "factory.rs", 10, 0, "rust", "fn Item()"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+
+        // Filter by kind should only return the struct.
+        let results = router
+            .query_symbols("Item", Some("struct"), true)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].kind, SymbolKind::Struct);
+    }
+
+    #[test]
+    fn test_router_query_references_from_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["my_func", "src/main.rs", 20, 4, "let x = my_func();"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let results = router.query_references("my_func", &[]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "my_func");
+        assert_eq!(results[0].context, "let x = my_func();");
+    }
+
+    #[test]
+    fn test_router_query_signatures_from_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "process",
+                "function",
+                "engine.rs",
+                15,
+                0,
+                "rust",
+                "fn process(input: &str) -> Result<()>"
+            ],
+        )
+        .unwrap();
+        // Also insert a struct with same name -- signatures should not include it.
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["process", "struct", "types.rs", 1, 0, "rust", "struct process"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let results = router.query_signatures("process").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].kind, SymbolKind::Function);
+        assert!(results[0].signature.contains("fn process"));
+    }
+
+    #[test]
+    fn test_router_query_symbols_in_file_from_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["main", "function", "src/main.rs", 1, 0, "rust", "fn main()"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "helper",
+                "function",
+                "src/main.rs",
+                10,
+                0,
+                "rust",
+                "fn helper()"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "other",
+                "function",
+                "src/other.rs",
+                1,
+                0,
+                "rust",
+                "fn other()"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let results = router.query_symbols_in_file("src/main.rs", false).unwrap();
+        assert_eq!(results.len(), 2);
+        // Should be ordered by line number.
+        assert_eq!(results[0].name, "main");
+        assert_eq!(results[1].name, "helper");
+    }
+
+    #[test]
+    fn test_router_db_fallback_on_empty_results() {
+        // When the DB has no matching results, the router should fall back to grep.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        // DB is empty -- no symbols inserted.
+
+        // Create a file that grep can find.
+        fs::write(
+            dir.path().join("code.rs"),
+            "fn target_func() {}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        assert!(router.has_index());
+
+        let results = router.query_symbols("target_func", None, true).unwrap();
+        // DB returned nothing, so grep fallback should have found it.
+        assert!(
+            !results.is_empty(),
+            "should fall back to grep when DB returns empty results"
+        );
+    }
+
+    // -- Error type tests ---------------------------------------------------
+
+    #[test]
+    fn test_db_error_no_index_display() {
+        let err = DbError::NoIndex;
+        assert_eq!(format!("{err}"), "no index found for this repository");
+    }
+
+    #[test]
+    fn test_search_error_display() {
+        let err = SearchError::SearchFailed("bad pattern".to_string());
+        assert_eq!(format!("{err}"), "search failed: bad pattern");
+    }
+
+    #[test]
+    fn test_wonk_error_from_db_error() {
+        use crate::errors::WonkError;
+        let db_err = DbError::NoIndex;
+        let wonk_err: WonkError = db_err.into();
+        assert!(matches!(wonk_err, WonkError::Db(DbError::NoIndex)));
+    }
+
+    #[test]
+    fn test_wonk_error_from_search_error() {
+        use crate::errors::WonkError;
+        let search_err = SearchError::SearchFailed("oops".to_string());
+        let wonk_err: WonkError = search_err.into();
+        assert!(matches!(wonk_err, WonkError::Search(_)));
+    }
+
+    #[test]
+    fn test_wonk_error_from_io_error() {
+        use crate::errors::WonkError;
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let wonk_err: WonkError = io_err.into();
+        assert!(matches!(wonk_err, WonkError::Io(_)));
+    }
+
+    // -- Multi-language heuristic pattern coverage tests ---------------------
+
+    #[test]
+    fn test_symbol_pattern_matches_rust() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn handler() {}\npub(crate) fn internal() {}\nstruct Config {}\nenum State {}\ntrait Runnable {}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        assert!(!router.query_symbols("handler", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("internal", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Config", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("State", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Runnable", None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_symbol_pattern_matches_python() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "def process(data):\n    pass\n\nclass Worker:\n    pass\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        assert!(!router.query_symbols("process", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Worker", None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_symbol_pattern_matches_javascript() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.js"),
+            "function render() {}\nclass Component {}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        assert!(!router.query_symbols("render", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Component", None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_symbol_pattern_matches_go() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.go"),
+            "func Handle(w http.ResponseWriter) {}\ntype Server struct {}\ntype Handler interface {}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        assert!(!router.query_symbols("Handle", None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_symbol_pattern_matches_typescript() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.ts"),
+            "function execute() {}\ninterface Config {}\nenum Direction {}\nclass Service {}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        assert!(!router.query_symbols("execute", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Config", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Direction", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Service", None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_symbol_pattern_matches_ruby() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.rb"),
+            "def process\nend\n\nclass Worker\nend\n\nmodule Utils\nend\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        assert!(!router.query_symbols("process", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Worker", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Utils", None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_symbol_pattern_matches_php() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.php"),
+            "function handle() {}\nclass Controller {}\ntrait Cacheable {}\ninterface Renderable {}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        assert!(!router.query_symbols("handle", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Controller", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Cacheable", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Renderable", None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_symbol_pattern_matches_java() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("App.java"),
+            "class Application {}\ninterface Service {}\nenum Priority {}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        assert!(!router.query_symbols("Application", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Service", None, false).unwrap().is_empty());
+        assert!(!router.query_symbols("Priority", None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_import_pattern_matches_multiple_languages() {
+        let dir = TempDir::new().unwrap();
+
+        // Python imports
+        fs::write(
+            dir.path().join("py_app.py"),
+            "import os\nfrom sys import argv\n",
+        )
+        .unwrap();
+
+        // JavaScript requires
+        fs::write(
+            dir.path().join("js_app.js"),
+            "const fs = require('fs');\nimport utils from './utils';\n",
+        )
+        .unwrap();
+
+        // Rust use
+        fs::write(
+            dir.path().join("rs_app.rs"),
+            "use std::io;\nuse crate::utils;\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        let results = router.query_rdeps("utils.py").unwrap();
+        // Should find at least the JS and Rust files that reference "utils"
+        assert!(!results.is_empty(), "import patterns should find files referencing 'utils'");
+    }
 }
