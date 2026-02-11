@@ -74,8 +74,9 @@ jobs:
       - name: Rename binary
         shell: bash
         run: |
+          version="${GITHUB_REF_NAME#v}"
           src="target/${{ matrix.target }}/release/${BINARY_NAME}${{ matrix.ext }}"
-          dst="${BINARY_NAME}-${{ matrix.target }}${{ matrix.ext }}"
+          dst="${BINARY_NAME}-${version}-${{ matrix.target }}${{ matrix.ext }}"
           cp "$src" "$dst"
           echo "ARTIFACT_PATH=$dst" >> "$GITHUB_ENV"
 
@@ -94,7 +95,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          name: ${{ env.ARTIFACT_PATH }}
           path: ${{ env.ARTIFACT_PATH }}
           retention-days: 7
 
