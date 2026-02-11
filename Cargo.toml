@@ -53,6 +53,7 @@ thiserror = "2"
 # Daemon
 fork = "0.2"
 signal-hook = "0.3"
+libc = "0.2"
 
 # Tree-sitter language grammars
 tree-sitter-typescript = "0.23"

@@ -1669,6 +1669,7 @@ dependencies = [
  "fork",
  "grep",
  "ignore",
+ "libc",
  "notify 8.2.0",
  "notify-debouncer-mini",
  "rayon",
