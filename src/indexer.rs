@@ -2,10 +2,14 @@
 //!
 //! Provides multi-language parsing infrastructure: language detection by file
 //! extension, parser construction with the correct grammar, and file parsing.
+//! Also extracts symbol definitions (functions, classes, types, etc.) from
+//! parsed syntax trees across all supported languages.
 
 use std::path::Path;
 
-use tree_sitter::{Language, Parser, Tree};
+use tree_sitter::{Language, Node, Parser, Tree};
+
+use crate::types::{Symbol, SymbolKind};
 
 /// Supported programming languages with bundled Tree-sitter grammars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,6 +105,1123 @@ pub fn parse_file(path: &Path) -> Option<(Tree, Lang)> {
     let mut parser = get_parser(lang);
     let tree = parser.parse(&source, None)?;
     Some((tree, lang))
+}
+
+// ---------------------------------------------------------------------------
+// Symbol extraction
+// ---------------------------------------------------------------------------
+
+/// Extract symbol definitions from a parsed syntax tree.
+///
+/// Walks the tree with a cursor and matches node kinds specific to each
+/// language to find function, class, struct, enum, trait, type alias,
+/// constant and variable definitions.
+pub fn extract_symbols(tree: &Tree, source: &str, file: &str, lang: Lang) -> Vec<Symbol> {
+    let src = source.as_bytes();
+    let mut symbols = Vec::new();
+    let root = tree.root_node();
+
+    walk_node(root, src, file, lang, None, &mut symbols);
+    symbols
+}
+
+/// Recursively walk a node and its children, collecting symbols.
+fn walk_node(
+    node: Node,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    scope: Option<&str>,
+    symbols: &mut Vec<Symbol>,
+) {
+    let kind = node.kind();
+
+    // Attempt to extract a symbol from this node.
+    if let Some(sym) = match_node(node, kind, src, file, lang, scope) {
+        let new_scope = sym.name.clone();
+        symbols.push(sym);
+
+        // For container nodes (class, struct, impl, trait, module, etc.),
+        // recurse with updated scope.
+        if is_container(kind, lang) {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    walk_node(child, src, file, lang, Some(&new_scope), symbols);
+                }
+            }
+            return; // already recursed children
+        }
+    }
+
+    // Default: recurse into children with same scope.
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            walk_node(child, src, file, lang, scope, symbols);
+        }
+    }
+}
+
+/// Returns true if a node kind represents a container whose children should
+/// be scoped under this symbol's name.
+fn is_container(kind: &str, lang: Lang) -> bool {
+    match lang {
+        Lang::Rust => matches!(
+            kind,
+            "impl_item" | "trait_item" | "mod_item" | "struct_item" | "enum_item"
+        ),
+        Lang::Python => matches!(kind, "class_definition"),
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            matches!(kind, "class_declaration" | "class")
+        }
+        Lang::Java => matches!(
+            kind,
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+        ),
+        Lang::Go => false, // Go has no nested containers
+        Lang::C | Lang::Cpp => matches!(
+            kind,
+            "class_specifier" | "struct_specifier" | "namespace_definition"
+        ),
+        Lang::Ruby => matches!(kind, "class" | "module"),
+        Lang::Php => matches!(
+            kind,
+            "class_declaration" | "interface_declaration" | "trait_declaration"
+        ),
+    }
+}
+
+/// Try to extract a `Symbol` from a tree-sitter node.
+fn match_node(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match lang {
+        Lang::Rust => extract_rust(node, kind, src, file, scope),
+        Lang::Python => extract_python(node, kind, src, file, scope),
+        Lang::JavaScript => extract_javascript(node, kind, src, file, scope),
+        Lang::TypeScript | Lang::Tsx => extract_typescript(node, kind, src, file, lang, scope),
+        Lang::Go => extract_go(node, kind, src, file, scope),
+        Lang::Java => extract_java(node, kind, src, file, scope),
+        Lang::C => extract_c(node, kind, src, file, scope),
+        Lang::Cpp => extract_cpp(node, kind, src, file, scope),
+        Lang::Ruby => extract_ruby(node, kind, src, file, scope),
+        Lang::Php => extract_php(node, kind, src, file, scope),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Get the text content of a node.
+fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
+    node.utf8_text(src).unwrap_or("")
+}
+
+/// Find a named child by its field name and return its text.
+fn field_text<'a>(node: Node, field: &str, src: &'a [u8]) -> Option<&'a str> {
+    node.child_by_field_name(field)
+        .map(|n| node_text(n, src))
+}
+
+/// Extract the first line of a node's text as the signature.
+fn first_line(node: Node, src: &[u8]) -> String {
+    let text = node_text(node, src);
+    // Take everything up to the first '{' or newline, trimmed.
+    let sig = text
+        .split_once('{')
+        .map(|(before, _)| before.trim())
+        .unwrap_or_else(|| text.lines().next().unwrap_or("").trim());
+    sig.to_string()
+}
+
+/// Build a `Symbol` with common fields pre-filled.
+fn make_symbol(
+    name: &str,
+    kind: SymbolKind,
+    node: Node,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    scope: Option<&str>,
+) -> Symbol {
+    Symbol {
+        name: name.to_string(),
+        kind,
+        file: file.to_string(),
+        line: node.start_position().row + 1,
+        col: node.start_position().column,
+        end_line: Some(node.end_position().row + 1),
+        scope: scope.map(|s| s.to_string()),
+        signature: first_line(node, src),
+        language: lang.name().to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rust
+// ---------------------------------------------------------------------------
+
+fn extract_rust(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "function_item" => {
+            let name = field_text(node, "name", src)?;
+            let sk = if scope.is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            };
+            Some(make_symbol(name, sk, node, src, file, Lang::Rust, scope))
+        }
+        "function_signature_item" => {
+            // Trait method signature: `fn foo(&self);`
+            let name = field_text(node, "name", src)?;
+            let sk = if scope.is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            };
+            Some(make_symbol(name, sk, node, src, file, Lang::Rust, scope))
+        }
+        "struct_item" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Struct,
+                node,
+                src,
+                file,
+                Lang::Rust,
+                scope,
+            ))
+        }
+        "enum_item" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Enum,
+                node,
+                src,
+                file,
+                Lang::Rust,
+                scope,
+            ))
+        }
+        "trait_item" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Trait,
+                node,
+                src,
+                file,
+                Lang::Rust,
+                scope,
+            ))
+        }
+        "impl_item" => {
+            // `impl Foo { ... }` or `impl Trait for Foo { ... }`
+            // The "type" field holds the implementing type.
+            let type_name = field_text(node, "type", src)?;
+            // For `impl Trait for Type`, use "Type" as the scope name.
+            let trait_name = field_text(node, "trait", src);
+            let display_name = if let Some(tr) = trait_name {
+                format!("{tr} for {type_name}")
+            } else {
+                type_name.to_string()
+            };
+            Some(make_symbol(
+                &display_name,
+                SymbolKind::Module, // impl block acts as a scope container
+                node,
+                src,
+                file,
+                Lang::Rust,
+                scope,
+            ))
+        }
+        "type_item" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::TypeAlias,
+                node,
+                src,
+                file,
+                Lang::Rust,
+                scope,
+            ))
+        }
+        "const_item" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Constant,
+                node,
+                src,
+                file,
+                Lang::Rust,
+                scope,
+            ))
+        }
+        "static_item" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Variable,
+                node,
+                src,
+                file,
+                Lang::Rust,
+                scope,
+            ))
+        }
+        "mod_item" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Module,
+                node,
+                src,
+                file,
+                Lang::Rust,
+                scope,
+            ))
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Python
+// ---------------------------------------------------------------------------
+
+fn extract_python(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "function_definition" => {
+            let name = field_text(node, "name", src)?;
+            let sk = if scope.is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            };
+            Some(make_symbol(name, sk, node, src, file, Lang::Python, scope))
+        }
+        "class_definition" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Class,
+                node,
+                src,
+                file,
+                Lang::Python,
+                scope,
+            ))
+        }
+        "decorated_definition" => {
+            // A decorated definition wraps a function_definition or class_definition.
+            // The inner definition will be visited when we recurse, so skip here.
+            None
+        }
+        "assignment" => {
+            // Module-level variable: `FOO = 42`
+            if scope.is_none() {
+                // Only capture simple name = value at module level
+                if let Some(left) = node.child_by_field_name("left") {
+                    if left.kind() == "identifier" {
+                        let name = node_text(left, src);
+                        // Heuristic: ALL_CAPS = constant, otherwise variable
+                        let is_const = name.chars().all(|c| c.is_uppercase() || c == '_');
+                        let sk = if is_const {
+                            SymbolKind::Constant
+                        } else {
+                            SymbolKind::Variable
+                        };
+                        return Some(make_symbol(
+                            name,
+                            sk,
+                            node,
+                            src,
+                            file,
+                            Lang::Python,
+                            scope,
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JavaScript
+// ---------------------------------------------------------------------------
+
+fn extract_javascript(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    extract_js_common(node, kind, src, file, Lang::JavaScript, scope)
+}
+
+/// Shared extraction logic for JavaScript, TypeScript, and TSX.
+fn extract_js_common(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "function_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(name, SymbolKind::Function, node, src, file, lang, scope))
+        }
+        "generator_function_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(name, SymbolKind::Function, node, src, file, lang, scope))
+        }
+        "class_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(name, SymbolKind::Class, node, src, file, lang, scope))
+        }
+        "method_definition" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(name, SymbolKind::Method, node, src, file, lang, scope))
+        }
+        "variable_declaration" | "lexical_declaration" => {
+            // `const foo = () => {}` or `let bar = function() {}`
+            // Look for declarators with arrow_function or function values
+            extract_js_var_decl(node, src, file, lang, scope)
+        }
+        _ => None,
+    }
+}
+
+/// Extract a symbol from `const foo = ...` / `let bar = ...` declarations.
+fn extract_js_var_decl(
+    node: Node,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    // Look through variable_declarator children
+    for i in 0..node.named_child_count() {
+        let child = node.named_child(i as u32)?;
+        if child.kind() == "variable_declarator" {
+            let name_node = child.child_by_field_name("name")?;
+            let name = node_text(name_node, src);
+            let value = child.child_by_field_name("value");
+
+            let sk = if let Some(val) = value {
+                match val.kind() {
+                    "arrow_function" | "function" | "function_expression" => SymbolKind::Function,
+                    "class" => SymbolKind::Class,
+                    _ => {
+                        // Check if ALL_CAPS => constant
+                        if is_upper_snake(name) {
+                            SymbolKind::Constant
+                        } else {
+                            SymbolKind::Variable
+                        }
+                    }
+                }
+            } else if is_upper_snake(name) {
+                SymbolKind::Constant
+            } else {
+                SymbolKind::Variable
+            };
+
+            return Some(make_symbol(name, sk, node, src, file, lang, scope));
+        }
+    }
+    None
+}
+
+fn is_upper_snake(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+}
+
+// ---------------------------------------------------------------------------
+// TypeScript / TSX
+// ---------------------------------------------------------------------------
+
+fn extract_typescript(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    lang: Lang,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    // TypeScript has all JS constructs plus some extras.
+    match kind {
+        "interface_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(name, SymbolKind::Interface, node, src, file, lang, scope))
+        }
+        "type_alias_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(name, SymbolKind::TypeAlias, node, src, file, lang, scope))
+        }
+        "enum_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(name, SymbolKind::Enum, node, src, file, lang, scope))
+        }
+        "module" => {
+            // `namespace Foo { ... }` or `module Foo { ... }`
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(name, SymbolKind::Module, node, src, file, lang, scope))
+        }
+        _ => extract_js_common(node, kind, src, file, lang, scope),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Go
+// ---------------------------------------------------------------------------
+
+fn extract_go(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "function_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Function,
+                node,
+                src,
+                file,
+                Lang::Go,
+                scope,
+            ))
+        }
+        "method_declaration" => {
+            let name = field_text(node, "name", src)?;
+            // Try to get the receiver type as scope
+            let receiver_scope = node
+                .child_by_field_name("receiver")
+                .and_then(|r| {
+                    // receiver is a parameter_list, get the type from its child
+                    r.named_child(0u32)
+                        .and_then(|param| param.child_by_field_name("type"))
+                        .map(|t| {
+                            let text = node_text(t, src);
+                            // Strip pointer prefix
+                            text.trim_start_matches('*').to_string()
+                        })
+                });
+            let scope_str = receiver_scope.as_deref().or(scope);
+            Some(make_symbol(
+                name,
+                SymbolKind::Method,
+                node,
+                src,
+                file,
+                Lang::Go,
+                scope_str,
+            ))
+        }
+        "type_declaration" => {
+            // `type Foo struct { ... }` or `type Bar interface { ... }`
+            // Look at the type_spec children
+            for i in 0..node.named_child_count() {
+                if let Some(spec) = node.named_child(i as u32) {
+                    if spec.kind() == "type_spec" {
+                        return extract_go_type_spec(spec, src, file, scope);
+                    }
+                }
+            }
+            None
+        }
+        "const_declaration" | "var_declaration" => {
+            // Can have multiple specs
+            let sk = if kind == "const_declaration" {
+                SymbolKind::Constant
+            } else {
+                SymbolKind::Variable
+            };
+            for i in 0..node.named_child_count() {
+                if let Some(spec) = node.named_child(i as u32) {
+                    if spec.kind() == "const_spec" || spec.kind() == "var_spec" {
+                        let name = field_text(spec, "name", src)
+                            .or_else(|| {
+                                spec.named_child(0u32).map(|n| node_text(n, src))
+                            });
+                        if let Some(n) = name {
+                            return Some(make_symbol(n, sk, node, src, file, Lang::Go, scope));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_go_type_spec(
+    spec: Node,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    let name = field_text(spec, "name", src)?;
+    let type_node = spec.child_by_field_name("type")?;
+    let sk = match type_node.kind() {
+        "struct_type" => SymbolKind::Struct,
+        "interface_type" => SymbolKind::Interface,
+        _ => SymbolKind::TypeAlias,
+    };
+    Some(make_symbol(name, sk, spec, src, file, Lang::Go, scope))
+}
+
+// ---------------------------------------------------------------------------
+// Java
+// ---------------------------------------------------------------------------
+
+fn extract_java(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "class_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Class,
+                node,
+                src,
+                file,
+                Lang::Java,
+                scope,
+            ))
+        }
+        "interface_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Interface,
+                node,
+                src,
+                file,
+                Lang::Java,
+                scope,
+            ))
+        }
+        "enum_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Enum,
+                node,
+                src,
+                file,
+                Lang::Java,
+                scope,
+            ))
+        }
+        "method_declaration" | "constructor_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Method,
+                node,
+                src,
+                file,
+                Lang::Java,
+                scope,
+            ))
+        }
+        "field_declaration" => {
+            // `static final int FOO = 42;`
+            let declarator = node
+                .named_child(node.named_child_count().saturating_sub(1) as u32)?;
+            if declarator.kind() == "variable_declarator" {
+                let name_node = declarator.child_by_field_name("name")?;
+                let name = node_text(name_node, src);
+                // Check for final keyword in modifiers to determine constant vs variable
+                let text = node_text(node, src);
+                let sk = if text.contains("final") {
+                    SymbolKind::Constant
+                } else {
+                    SymbolKind::Variable
+                };
+                return Some(make_symbol(name, sk, node, src, file, Lang::Java, scope));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C
+// ---------------------------------------------------------------------------
+
+fn extract_c(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "function_definition" => {
+            let declarator = node.child_by_field_name("declarator")?;
+            let name = find_identifier_in_declarator(declarator, src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Function,
+                node,
+                src,
+                file,
+                Lang::C,
+                scope,
+            ))
+        }
+        "declaration" => {
+            // Could be a function prototype, variable, or typedef
+            let text = node_text(node, src);
+            if text.starts_with("typedef") {
+                // Extract the name from typedef
+                if let Some(declarator) = node.child_by_field_name("declarator") {
+                    let name = find_identifier_in_declarator(declarator, src)?;
+                    return Some(make_symbol(
+                        name,
+                        SymbolKind::TypeAlias,
+                        node,
+                        src,
+                        file,
+                        Lang::C,
+                        scope,
+                    ));
+                }
+            }
+            None
+        }
+        "struct_specifier" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Struct,
+                node,
+                src,
+                file,
+                Lang::C,
+                scope,
+            ))
+        }
+        "enum_specifier" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Enum,
+                node,
+                src,
+                file,
+                Lang::C,
+                scope,
+            ))
+        }
+        "preproc_def" => {
+            // `#define FOO 42`
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Constant,
+                node,
+                src,
+                file,
+                Lang::C,
+                scope,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Walk a declarator tree to find the identifier name.
+/// C declarators can be nested: `function_declarator` -> `identifier`,
+/// or `pointer_declarator` -> `function_declarator` -> `identifier`.
+fn find_identifier_in_declarator<'a>(node: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
+    if node.kind() == "identifier" || node.kind() == "type_identifier" || node.kind() == "field_identifier" {
+        return Some(node_text(node, src));
+    }
+    // Try the "declarator" field first (common for function_declarator, pointer_declarator)
+    if let Some(inner) = node.child_by_field_name("declarator") {
+        return find_identifier_in_declarator(inner, src);
+    }
+    // Fallback: try "name" field
+    if let Some(name) = node.child_by_field_name("name") {
+        return Some(node_text(name, src));
+    }
+    // Walk named children
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            if let Some(name) = find_identifier_in_declarator(child, src) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// C++
+// ---------------------------------------------------------------------------
+
+fn extract_cpp(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "function_definition" => {
+            let declarator = node.child_by_field_name("declarator")?;
+            let name = find_identifier_in_declarator(declarator, src)?;
+            // Only treat as Method if inside a class/struct body
+            // (field_declaration_list), not inside a namespace (declaration_list).
+            let is_method = node.parent().is_some_and(|p| {
+                p.kind() == "field_declaration_list"
+            });
+            let sk = if is_method {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            };
+            Some(make_symbol(name, sk, node, src, file, Lang::Cpp, scope))
+        }
+        "class_specifier" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Class,
+                node,
+                src,
+                file,
+                Lang::Cpp,
+                scope,
+            ))
+        }
+        "struct_specifier" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Struct,
+                node,
+                src,
+                file,
+                Lang::Cpp,
+                scope,
+            ))
+        }
+        "enum_specifier" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Enum,
+                node,
+                src,
+                file,
+                Lang::Cpp,
+                scope,
+            ))
+        }
+        "namespace_definition" => {
+            let name = field_text(node, "name", src).unwrap_or("anonymous");
+            Some(make_symbol(
+                name,
+                SymbolKind::Module,
+                node,
+                src,
+                file,
+                Lang::Cpp,
+                scope,
+            ))
+        }
+        "declaration" => {
+            let text = node_text(node, src);
+            if text.starts_with("typedef") || text.contains("using ") {
+                if let Some(declarator) = node.child_by_field_name("declarator") {
+                    if let Some(name) = find_identifier_in_declarator(declarator, src) {
+                        return Some(make_symbol(
+                            name,
+                            SymbolKind::TypeAlias,
+                            node,
+                            src,
+                            file,
+                            Lang::Cpp,
+                            scope,
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        "type_definition" | "alias_declaration" => {
+            // `using Foo = Bar;` or `typedef ... Foo;`
+            let name = field_text(node, "name", src)
+                .or_else(|| {
+                    node.child_by_field_name("declarator")
+                        .and_then(|d| find_identifier_in_declarator(d, src))
+                })?;
+            Some(make_symbol(
+                name,
+                SymbolKind::TypeAlias,
+                node,
+                src,
+                file,
+                Lang::Cpp,
+                scope,
+            ))
+        }
+        "preproc_def" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Constant,
+                node,
+                src,
+                file,
+                Lang::Cpp,
+                scope,
+            ))
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ruby
+// ---------------------------------------------------------------------------
+
+fn extract_ruby(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "method" => {
+            let name = field_text(node, "name", src)?;
+            let sk = if scope.is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            };
+            Some(make_symbol(name, sk, node, src, file, Lang::Ruby, scope))
+        }
+        "singleton_method" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Method,
+                node,
+                src,
+                file,
+                Lang::Ruby,
+                scope,
+            ))
+        }
+        "class" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Class,
+                node,
+                src,
+                file,
+                Lang::Ruby,
+                scope,
+            ))
+        }
+        "module" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Module,
+                node,
+                src,
+                file,
+                Lang::Ruby,
+                scope,
+            ))
+        }
+        "assignment" => {
+            // Module-level constant (UPPER_CASE = ...)
+            if let Some(left) = node.child_by_field_name("left") {
+                if left.kind() == "constant" {
+                    let name = node_text(left, src);
+                    return Some(make_symbol(
+                        name,
+                        SymbolKind::Constant,
+                        node,
+                        src,
+                        file,
+                        Lang::Ruby,
+                        scope,
+                    ));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PHP
+// ---------------------------------------------------------------------------
+
+fn extract_php(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "function_definition" => {
+            let name = field_text(node, "name", src)?;
+            let sk = if scope.is_some() {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            };
+            Some(make_symbol(name, sk, node, src, file, Lang::Php, scope))
+        }
+        "method_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Method,
+                node,
+                src,
+                file,
+                Lang::Php,
+                scope,
+            ))
+        }
+        "class_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Class,
+                node,
+                src,
+                file,
+                Lang::Php,
+                scope,
+            ))
+        }
+        "interface_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Interface,
+                node,
+                src,
+                file,
+                Lang::Php,
+                scope,
+            ))
+        }
+        "trait_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Trait,
+                node,
+                src,
+                file,
+                Lang::Php,
+                scope,
+            ))
+        }
+        "enum_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Enum,
+                node,
+                src,
+                file,
+                Lang::Php,
+                scope,
+            ))
+        }
+        "const_declaration" => {
+            // `const FOO = 42;`
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i as u32) {
+                    if child.kind() == "const_element" {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            let name = node_text(name_node, src);
+                            return Some(make_symbol(
+                                name,
+                                SymbolKind::Constant,
+                                node,
+                                src,
+                                file,
+                                Lang::Php,
+                                scope,
+                            ));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "namespace_definition" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Module,
+                node,
+                src,
+                file,
+                Lang::Php,
+                scope,
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -320,5 +1441,470 @@ mod tests {
     #[test]
     fn parse_missing_file_returns_none() {
         assert!(parse_file(Path::new("/nonexistent/file.rs")).is_none());
+    }
+
+    // ---------- symbol extraction helper ----------
+
+    /// Parse source code for a given language and extract symbols.
+    fn extract_from(lang: Lang, source: &str) -> Vec<Symbol> {
+        let mut parser = get_parser(lang);
+        let tree = parser.parse(source.as_bytes(), None).unwrap();
+        extract_symbols(&tree, source, "test_file", lang)
+    }
+
+    /// Find a symbol by name in a list.
+    fn find_sym<'a>(syms: &'a [Symbol], name: &str) -> &'a Symbol {
+        syms.iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("symbol '{name}' not found in: {:?}", syms.iter().map(|s| &s.name).collect::<Vec<_>>()))
+    }
+
+    // ---------- Rust symbol extraction ----------
+
+    #[test]
+    fn rust_function() {
+        let syms = extract_from(Lang::Rust, "fn hello(x: i32) -> bool { true }");
+        let s = find_sym(&syms, "hello");
+        assert_eq!(s.kind, SymbolKind::Function);
+        assert_eq!(s.line, 1);
+        assert_eq!(s.language, "Rust");
+        assert!(s.signature.contains("fn hello"));
+    }
+
+    #[test]
+    fn rust_struct_and_enum() {
+        let src = "struct Foo { x: i32 }\nenum Bar { A, B }";
+        let syms = extract_from(Lang::Rust, src);
+        let foo = find_sym(&syms, "Foo");
+        assert_eq!(foo.kind, SymbolKind::Struct);
+        let bar = find_sym(&syms, "Bar");
+        assert_eq!(bar.kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn rust_trait() {
+        let src = "trait MyTrait { fn do_thing(&self); }";
+        let syms = extract_from(Lang::Rust, src);
+        let t = find_sym(&syms, "MyTrait");
+        assert_eq!(t.kind, SymbolKind::Trait);
+        // The method inside the trait should be scoped
+        let m = find_sym(&syms, "do_thing");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.scope.as_deref(), Some("MyTrait"));
+    }
+
+    #[test]
+    fn rust_impl_methods() {
+        let src = "struct Point { x: f64 }\nimpl Point {\n    fn new() -> Self { todo!() }\n    fn distance(&self) -> f64 { 0.0 }\n}";
+        let syms = extract_from(Lang::Rust, src);
+        let new_fn = find_sym(&syms, "new");
+        assert_eq!(new_fn.kind, SymbolKind::Method);
+        assert_eq!(new_fn.scope.as_deref(), Some("Point"));
+        let dist = find_sym(&syms, "distance");
+        assert_eq!(dist.kind, SymbolKind::Method);
+        assert_eq!(dist.scope.as_deref(), Some("Point"));
+    }
+
+    #[test]
+    fn rust_const_static_type_mod() {
+        let src = "const MAX: usize = 100;\nstatic GLOBAL: i32 = 42;\ntype Result<T> = std::result::Result<T, MyError>;\nmod inner {}";
+        let syms = extract_from(Lang::Rust, src);
+        let c = find_sym(&syms, "MAX");
+        assert_eq!(c.kind, SymbolKind::Constant);
+        let s = find_sym(&syms, "GLOBAL");
+        assert_eq!(s.kind, SymbolKind::Variable);
+        let t = find_sym(&syms, "Result");
+        assert_eq!(t.kind, SymbolKind::TypeAlias);
+        let m = find_sym(&syms, "inner");
+        assert_eq!(m.kind, SymbolKind::Module);
+    }
+
+    // ---------- Python symbol extraction ----------
+
+    #[test]
+    fn python_function_and_class() {
+        let src = "def greet(name):\n    print(name)\n\nclass Animal:\n    def speak(self):\n        pass\n";
+        let syms = extract_from(Lang::Python, src);
+        let greet = find_sym(&syms, "greet");
+        assert_eq!(greet.kind, SymbolKind::Function);
+        assert!(greet.scope.is_none());
+        let animal = find_sym(&syms, "Animal");
+        assert_eq!(animal.kind, SymbolKind::Class);
+        let speak = find_sym(&syms, "speak");
+        assert_eq!(speak.kind, SymbolKind::Method);
+        assert_eq!(speak.scope.as_deref(), Some("Animal"));
+    }
+
+    #[test]
+    fn python_module_level_constants() {
+        let src = "MAX_SIZE = 100\nDEBUG = True\nmy_var = 42\n";
+        let syms = extract_from(Lang::Python, src);
+        let max = find_sym(&syms, "MAX_SIZE");
+        assert_eq!(max.kind, SymbolKind::Constant);
+        let debug = find_sym(&syms, "DEBUG");
+        assert_eq!(debug.kind, SymbolKind::Constant);
+        let var = find_sym(&syms, "my_var");
+        assert_eq!(var.kind, SymbolKind::Variable);
+    }
+
+    // ---------- JavaScript symbol extraction ----------
+
+    #[test]
+    fn js_function_declaration() {
+        let src = "function add(a, b) { return a + b; }";
+        let syms = extract_from(Lang::JavaScript, src);
+        let f = find_sym(&syms, "add");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.language, "JavaScript");
+    }
+
+    #[test]
+    fn js_class_with_methods() {
+        let src = "class Dog {\n  constructor(name) { this.name = name; }\n  bark() { return 'woof'; }\n}";
+        let syms = extract_from(Lang::JavaScript, src);
+        let dog = find_sym(&syms, "Dog");
+        assert_eq!(dog.kind, SymbolKind::Class);
+        let bark = find_sym(&syms, "bark");
+        assert_eq!(bark.kind, SymbolKind::Method);
+        assert_eq!(bark.scope.as_deref(), Some("Dog"));
+    }
+
+    #[test]
+    fn js_arrow_function_const() {
+        let src = "const greet = (name) => `hello ${name}`;";
+        let syms = extract_from(Lang::JavaScript, src);
+        let g = find_sym(&syms, "greet");
+        assert_eq!(g.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn js_const_variable() {
+        let src = "const MAX_SIZE = 100;\nlet count = 0;";
+        let syms = extract_from(Lang::JavaScript, src);
+        let max = find_sym(&syms, "MAX_SIZE");
+        assert_eq!(max.kind, SymbolKind::Constant);
+        let count = find_sym(&syms, "count");
+        assert_eq!(count.kind, SymbolKind::Variable);
+    }
+
+    // ---------- TypeScript symbol extraction ----------
+
+    #[test]
+    fn ts_function_and_interface() {
+        let src = "function greet(name: string): void {}\ninterface Greeter { greet(name: string): void; }";
+        let syms = extract_from(Lang::TypeScript, src);
+        let f = find_sym(&syms, "greet");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.language, "TypeScript");
+        let i = find_sym(&syms, "Greeter");
+        assert_eq!(i.kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn ts_type_alias_and_enum() {
+        let src = "type ID = string | number;\nenum Color { Red, Green, Blue }";
+        let syms = extract_from(Lang::TypeScript, src);
+        let ta = find_sym(&syms, "ID");
+        assert_eq!(ta.kind, SymbolKind::TypeAlias);
+        let e = find_sym(&syms, "Color");
+        assert_eq!(e.kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn ts_class_with_methods() {
+        let src = "class MyService {\n  private name: string;\n  constructor(name: string) { this.name = name; }\n  getName(): string { return this.name; }\n}";
+        let syms = extract_from(Lang::TypeScript, src);
+        let cls = find_sym(&syms, "MyService");
+        assert_eq!(cls.kind, SymbolKind::Class);
+        let method = find_sym(&syms, "getName");
+        assert_eq!(method.kind, SymbolKind::Method);
+        assert_eq!(method.scope.as_deref(), Some("MyService"));
+    }
+
+    // ---------- TSX symbol extraction ----------
+
+    #[test]
+    fn tsx_arrow_component() {
+        let src = "const App = () => { return <div>hello</div>; };";
+        let syms = extract_from(Lang::Tsx, src);
+        let app = find_sym(&syms, "App");
+        assert_eq!(app.kind, SymbolKind::Function);
+        assert_eq!(app.language, "TSX");
+    }
+
+    // ---------- Go symbol extraction ----------
+
+    #[test]
+    fn go_function_and_struct() {
+        let src = "package main\n\nfunc main() {}\n\ntype Config struct {\n\tHost string\n}\n";
+        let syms = extract_from(Lang::Go, src);
+        let f = find_sym(&syms, "main");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.language, "Go");
+        let s = find_sym(&syms, "Config");
+        assert_eq!(s.kind, SymbolKind::Struct);
+    }
+
+    #[test]
+    fn go_method_with_receiver() {
+        let src = "package main\n\ntype Server struct{}\n\nfunc (s *Server) Start() error { return nil }\n";
+        let syms = extract_from(Lang::Go, src);
+        let m = find_sym(&syms, "Start");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.scope.as_deref(), Some("Server"));
+    }
+
+    #[test]
+    fn go_interface() {
+        let src = "package main\n\ntype Reader interface {\n\tRead(p []byte) (int, error)\n}\n";
+        let syms = extract_from(Lang::Go, src);
+        let i = find_sym(&syms, "Reader");
+        assert_eq!(i.kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn go_const_and_var() {
+        let src = "package main\n\nconst MaxSize = 100\nvar Debug = false\n";
+        let syms = extract_from(Lang::Go, src);
+        let c = find_sym(&syms, "MaxSize");
+        assert_eq!(c.kind, SymbolKind::Constant);
+        let v = find_sym(&syms, "Debug");
+        assert_eq!(v.kind, SymbolKind::Variable);
+    }
+
+    // ---------- Java symbol extraction ----------
+
+    #[test]
+    fn java_class_and_methods() {
+        let src = "public class Calculator {\n    public int add(int a, int b) { return a + b; }\n    public Calculator() {}\n}";
+        let syms = extract_from(Lang::Java, src);
+        let cls = find_sym(&syms, "Calculator");
+        assert_eq!(cls.kind, SymbolKind::Class);
+        let m = find_sym(&syms, "add");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.scope.as_deref(), Some("Calculator"));
+    }
+
+    #[test]
+    fn java_interface() {
+        let src = "interface Comparable {\n    int compareTo(Object o);\n}";
+        let syms = extract_from(Lang::Java, src);
+        let i = find_sym(&syms, "Comparable");
+        assert_eq!(i.kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn java_enum() {
+        let src = "enum Direction { NORTH, SOUTH, EAST, WEST }";
+        let syms = extract_from(Lang::Java, src);
+        let e = find_sym(&syms, "Direction");
+        assert_eq!(e.kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn java_final_field() {
+        let src = "class Config {\n    static final int MAX = 100;\n    int count;\n}";
+        let syms = extract_from(Lang::Java, src);
+        let c = find_sym(&syms, "MAX");
+        assert_eq!(c.kind, SymbolKind::Constant);
+        assert_eq!(c.scope.as_deref(), Some("Config"));
+        let v = find_sym(&syms, "count");
+        assert_eq!(v.kind, SymbolKind::Variable);
+    }
+
+    // ---------- C symbol extraction ----------
+
+    #[test]
+    fn c_function() {
+        let src = "int main(int argc, char **argv) { return 0; }";
+        let syms = extract_from(Lang::C, src);
+        let f = find_sym(&syms, "main");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.language, "C");
+    }
+
+    #[test]
+    fn c_struct_and_enum() {
+        let src = "struct Point { int x; int y; };\nenum Color { RED, GREEN, BLUE };";
+        let syms = extract_from(Lang::C, src);
+        let s = find_sym(&syms, "Point");
+        assert_eq!(s.kind, SymbolKind::Struct);
+        let e = find_sym(&syms, "Color");
+        assert_eq!(e.kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn c_define_constant() {
+        let src = "#define MAX_SIZE 1024\nint foo() { return 0; }";
+        let syms = extract_from(Lang::C, src);
+        let c = find_sym(&syms, "MAX_SIZE");
+        assert_eq!(c.kind, SymbolKind::Constant);
+    }
+
+    // ---------- C++ symbol extraction ----------
+
+    #[test]
+    fn cpp_class_with_method() {
+        let src = "class Dog {\npublic:\n    void bark() { }\n};";
+        let syms = extract_from(Lang::Cpp, src);
+        let cls = find_sym(&syms, "Dog");
+        assert_eq!(cls.kind, SymbolKind::Class);
+        let m = find_sym(&syms, "bark");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.scope.as_deref(), Some("Dog"));
+    }
+
+    #[test]
+    fn cpp_namespace() {
+        let src = "namespace mylib {\n    void helper() {}\n}";
+        let syms = extract_from(Lang::Cpp, src);
+        let ns = find_sym(&syms, "mylib");
+        assert_eq!(ns.kind, SymbolKind::Module);
+        let f = find_sym(&syms, "helper");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.scope.as_deref(), Some("mylib"));
+    }
+
+    #[test]
+    fn cpp_struct_and_enum() {
+        let src = "struct Vec3 { float x, y, z; };\nenum Season { SPRING, SUMMER };";
+        let syms = extract_from(Lang::Cpp, src);
+        let s = find_sym(&syms, "Vec3");
+        assert_eq!(s.kind, SymbolKind::Struct);
+        let e = find_sym(&syms, "Season");
+        assert_eq!(e.kind, SymbolKind::Enum);
+    }
+
+    // ---------- Ruby symbol extraction ----------
+
+    #[test]
+    fn ruby_method_and_class() {
+        let src = "def greet(name)\n  puts name\nend\n\nclass Animal\n  def speak\n    'hello'\n  end\nend\n";
+        let syms = extract_from(Lang::Ruby, src);
+        let f = find_sym(&syms, "greet");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.language, "Ruby");
+        let cls = find_sym(&syms, "Animal");
+        assert_eq!(cls.kind, SymbolKind::Class);
+        let m = find_sym(&syms, "speak");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.scope.as_deref(), Some("Animal"));
+    }
+
+    #[test]
+    fn ruby_module() {
+        let src = "module Utils\n  def self.helper\n    true\n  end\nend\n";
+        let syms = extract_from(Lang::Ruby, src);
+        let m = find_sym(&syms, "Utils");
+        assert_eq!(m.kind, SymbolKind::Module);
+    }
+
+    // ---------- PHP symbol extraction ----------
+
+    #[test]
+    fn php_function_and_class() {
+        let src = "<?php\nfunction greet($name) { echo $name; }\n\nclass Dog {\n    public function bark() { return 'woof'; }\n}\n?>";
+        let syms = extract_from(Lang::Php, src);
+        let f = find_sym(&syms, "greet");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.language, "PHP");
+        let cls = find_sym(&syms, "Dog");
+        assert_eq!(cls.kind, SymbolKind::Class);
+        let m = find_sym(&syms, "bark");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.scope.as_deref(), Some("Dog"));
+    }
+
+    #[test]
+    fn php_interface_and_trait() {
+        let src = "<?php\ninterface Printable {\n    public function print();\n}\n\ntrait Loggable {\n    public function log() {}\n}\n?>";
+        let syms = extract_from(Lang::Php, src);
+        let i = find_sym(&syms, "Printable");
+        assert_eq!(i.kind, SymbolKind::Interface);
+        let t = find_sym(&syms, "Loggable");
+        assert_eq!(t.kind, SymbolKind::Trait);
+    }
+
+    // ---------- Cross-cutting: line/col/end_line/file ----------
+
+    #[test]
+    fn symbol_has_correct_position() {
+        let src = "fn first() {}\n\nfn second() {}";
+        let syms = extract_from(Lang::Rust, src);
+        let first = find_sym(&syms, "first");
+        assert_eq!(first.line, 1);
+        assert_eq!(first.col, 0);
+        assert_eq!(first.file, "test_file");
+        let second = find_sym(&syms, "second");
+        assert_eq!(second.line, 3);
+    }
+
+    #[test]
+    fn symbol_end_line_present() {
+        let src = "fn multi_line(\n    x: i32,\n    y: i32,\n) -> i32 {\n    x + y\n}";
+        let syms = extract_from(Lang::Rust, src);
+        let f = find_sym(&syms, "multi_line");
+        assert!(f.end_line.is_some());
+        assert!(f.end_line.unwrap() > f.line);
+    }
+
+    // ---------- Empty source ----------
+
+    #[test]
+    fn empty_source_yields_no_symbols() {
+        let syms = extract_from(Lang::Rust, "");
+        assert!(syms.is_empty());
+    }
+
+    /// Debug helper: print the tree structure to understand node kinds.
+    #[allow(dead_code)]
+    fn dump_tree(node: Node, src: &str, indent: usize) {
+        let text = node.utf8_text(src.as_bytes()).unwrap_or("");
+        let short_text = if text.len() > 60 {
+            &text[..60]
+        } else {
+            text
+        };
+        eprintln!(
+            "{:indent$}{} [{}:{}] {:?}",
+            "",
+            node.kind(),
+            node.start_position().row,
+            node.start_position().column,
+            short_text,
+            indent = indent,
+        );
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                dump_tree(child, src, indent + 2);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_rust_trait_tree() {
+        let src = "trait MyTrait { fn do_thing(&self); }";
+        let mut parser = get_parser(Lang::Rust);
+        let tree = parser.parse(src.as_bytes(), None).unwrap();
+        dump_tree(tree.root_node(), src, 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_cpp_class_tree() {
+        let src = "class Dog {\npublic:\n    void bark() { }\n};";
+        let mut parser = get_parser(Lang::Cpp);
+        let tree = parser.parse(src.as_bytes(), None).unwrap();
+        dump_tree(tree.root_node(), src, 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_cpp_namespace_tree() {
+        let src = "namespace mylib {\n    void helper() {}\n}";
+        let mut parser = get_parser(Lang::Cpp);
+        let tree = parser.parse(src.as_bytes(), None).unwrap();
+        dump_tree(tree.root_node(), src, 0);
     }
 }
