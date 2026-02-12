@@ -16,7 +16,7 @@ use crate::db;
 use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
-use crate::output::{self, Formatter, SearchOutput};
+use crate::output::{self, Formatter, SearchOutput, SignatureOutput};
 use crate::pipeline;
 use crate::search;
 use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
@@ -51,8 +51,19 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Ref(_args) => {
             output::print_hint("ref: not yet implemented");
         }
-        Command::Sig(_args) => {
-            output::print_hint("sig: not yet implemented");
+        Command::Sig(args) => {
+            let router = QueryRouter::new(None, false);
+            let results = router.query_signatures(&args.name)?;
+            for sym in &results {
+                let out = SignatureOutput {
+                    name: sym.name.clone(),
+                    file: sym.file.clone(),
+                    line: sym.line,
+                    signature: sym.signature.clone(),
+                    language: sym.language.clone(),
+                };
+                fmt.format_signature(&out)?;
+            }
         }
         Command::Ls(_args) => {
             output::print_hint("ls: not yet implemented");
@@ -1435,5 +1446,141 @@ mod tests {
         let results = router.query_rdeps("utils.py").unwrap();
         // Should find at least the JS and Rust files that reference "utils"
         assert!(!results.is_empty(), "import patterns should find files referencing 'utils'");
+    }
+
+    // -- Sig dispatch integration tests -------------------------------------
+
+    #[test]
+    fn test_sig_dispatch_grep_format() {
+        // Verify that signatures are formatted as file:line:  signature
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("code.rs"),
+            "pub fn process(input: &str) -> Result<()> {\n    Ok(())\n}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_signatures("process").unwrap();
+        assert!(!results.is_empty(), "should find signature for 'process'");
+
+        // Format as grep-style text
+        let mut buf = Vec::new();
+        {
+            let mut fmt = output::Formatter::new(&mut buf, false);
+            for sym in &results {
+                let out = SignatureOutput {
+                    name: sym.name.clone(),
+                    file: sym.file.clone(),
+                    line: sym.line,
+                    signature: sym.signature.clone(),
+                    language: sym.language.clone(),
+                };
+                fmt.format_signature(&out).unwrap();
+            }
+        }
+        let text = String::from_utf8(buf).unwrap();
+        // Should be in file:line:  signature format
+        assert!(text.contains("process"), "output should contain the function name");
+        assert!(text.contains(":"), "output should be in file:line:  sig format");
+    }
+
+    #[test]
+    fn test_sig_dispatch_json_format() {
+        // Verify that signatures are formatted as JSON
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("code.rs"),
+            "fn handler(req: Request) -> Response {\n    todo!()\n}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_signatures("handler").unwrap();
+        assert!(!results.is_empty(), "should find signature for 'handler'");
+
+        // Format as JSON
+        let mut buf = Vec::new();
+        {
+            let mut fmt = output::Formatter::new(&mut buf, true);
+            for sym in &results {
+                let out = SignatureOutput {
+                    name: sym.name.clone(),
+                    file: sym.file.clone(),
+                    line: sym.line,
+                    signature: sym.signature.clone(),
+                    language: sym.language.clone(),
+                };
+                fmt.format_signature(&out).unwrap();
+            }
+        }
+        let text = String::from_utf8(buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["name"], "handler");
+        assert!(v["signature"].as_str().unwrap().contains("handler"));
+    }
+
+    #[test]
+    fn test_sig_dispatch_from_db() {
+        // Verify sig command works when data is in the database
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "dispatch",
+                "function",
+                "src/router.rs",
+                28,
+                0,
+                "rust",
+                "pub fn dispatch(cli: Cli) -> Result<()>"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let results = router.query_signatures("dispatch").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "dispatch");
+        assert_eq!(results[0].signature, "pub fn dispatch(cli: Cli) -> Result<()>");
+
+        // Format as grep text
+        let mut buf = Vec::new();
+        {
+            let mut fmt = output::Formatter::new(&mut buf, false);
+            let sym = &results[0];
+            let out = SignatureOutput {
+                name: sym.name.clone(),
+                file: sym.file.clone(),
+                line: sym.line,
+                signature: sym.signature.clone(),
+                language: sym.language.clone(),
+            };
+            fmt.format_signature(&out).unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            text,
+            "src/router.rs:28:  pub fn dispatch(cli: Cli) -> Result<()>\n"
+        );
+    }
+
+    #[test]
+    fn test_sig_dispatch_no_results() {
+        // When no matching signatures exist, output should be empty
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("code.rs"),
+            "struct Config {}\nlet x = 42;\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_signatures("nonexistent_func").unwrap();
+        assert!(results.is_empty(), "should return no results for non-existent function");
     }
 }
