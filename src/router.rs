@@ -31,7 +31,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     let quiet = cli.quiet;
     let suppress = json || quiet;
     let stdout = io::stdout().lock();
-    let mut fmt = Formatter::new(stdout, json);
+
+    // Resolve color: load config and check env/TTY.
+    let color = if json {
+        false
+    } else {
+        let repo_root_for_config = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| db::find_repo_root(&cwd).ok());
+        let config = crate::config::Config::load(repo_root_for_config.as_deref())
+            .unwrap_or_default();
+        crate::color::resolve_color(&config.output.color)
+    };
+
+    let mut fmt = Formatter::new(stdout, json, color);
 
     // Auto-init: if this is a query command and no index exists, build one.
     if is_query_command(&cli.command) {
@@ -50,6 +63,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Search(args) => {
+            // Set up match highlighting for search results.
+            fmt.set_highlight(&args.pattern, args.regex, args.ignore_case);
+
             let results = search::text_search(
                 &args.pattern,
                 args.regex,
@@ -1593,7 +1609,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, false);
+            let mut fmt = output::Formatter::new(&mut buf, false, false);
             for dep in &deps {
                 let out = output::DepOutput {
                     file: "src/main.ts".to_string(),
@@ -1623,7 +1639,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, true);
+            let mut fmt = output::Formatter::new(&mut buf, true, false);
             for dep in &deps {
                 let out = output::DepOutput {
                     file: "src/main.ts".to_string(),
@@ -1955,7 +1971,7 @@ mod tests {
         // Format as grep-style text
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, false);
+            let mut fmt = output::Formatter::new(&mut buf, false, false);
             for sym in &results {
                 let out = SignatureOutput {
                     name: sym.name.clone(),
@@ -1990,7 +2006,7 @@ mod tests {
         // Format as JSON
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, true);
+            let mut fmt = output::Formatter::new(&mut buf, true, false);
             for sym in &results {
                 let out = SignatureOutput {
                     name: sym.name.clone(),
@@ -2039,7 +2055,7 @@ mod tests {
         // Format as grep text
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, false);
+            let mut fmt = output::Formatter::new(&mut buf, false, false);
             let sym = &results[0];
             let out = SignatureOutput {
                 name: sym.name.clone(),
@@ -2085,7 +2101,7 @@ mod tests {
         let results = router.query_symbols(name, kind, exact).unwrap();
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, json);
+            let mut fmt = Formatter::new(&mut buf, json, false);
             for sym in &results {
                 let out = SymbolOutput {
                     name: sym.name.clone(),
@@ -2431,7 +2447,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, false);
+            let mut fmt = Formatter::new(&mut buf, false, false);
             fmt.format_reference(&reference).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
@@ -2453,7 +2469,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, true);
+            let mut fmt = Formatter::new(&mut buf, true, false);
             fmt.format_reference(&reference).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
@@ -2697,7 +2713,7 @@ mod tests {
         let results = router.query_symbols_in_file(path, tree).unwrap();
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, json);
+            let mut fmt = Formatter::new(&mut buf, json, false);
             if tree {
                 let entries = build_tree_entries(&results);
                 for entry in &entries {
