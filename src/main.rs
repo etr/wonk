@@ -6,6 +6,7 @@ mod errors;
 mod indexer;
 mod output;
 mod pipeline;
+mod progress;
 mod router;
 mod search;
 mod types;
