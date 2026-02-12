@@ -20,6 +20,9 @@ tree-sitter = "0.26"
 # Text search
 grep = "0.4"
 
+# Regex (for match highlighting in color output)
+regex = "1"
+
 # File filtering
 ignore = "0.4"
 

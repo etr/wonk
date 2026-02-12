@@ -4,10 +4,14 @@
 //! arbitrary [`std::io::Write`] destination (typically stdout).
 //! Hints and errors always go to stderr via [`print_hint`] and [`print_error`].
 
+use std::fmt::Display;
 use std::io::Write;
 use std::path::PathBuf;
 
+use regex::Regex;
 use serde::Serialize;
+
+use crate::color;
 
 // ---------------------------------------------------------------------------
 // Serializable output types
@@ -107,11 +111,18 @@ impl SearchOutput {
 // Formatter
 // ---------------------------------------------------------------------------
 
+/// A compiled highlight pattern for match highlighting in search results.
+pub struct HighlightPattern {
+    re: Regex,
+}
+
 /// Output formatter that can render results in either grep-compatible text
 /// or JSON Lines (one JSON object per line).
 pub struct Formatter<W: Write> {
     writer: W,
     json: bool,
+    color: bool,
+    highlight: Option<HighlightPattern>,
 }
 
 impl<W: Write> Formatter<W> {
@@ -119,8 +130,68 @@ impl<W: Write> Formatter<W> {
     ///
     /// * `writer` - The destination for output (e.g. `std::io::stdout()`).
     /// * `json`   - When `true`, emit JSON Lines; otherwise, emit grep-style text.
-    pub fn new(writer: W, json: bool) -> Self {
-        Self { writer, json }
+    /// * `color`  - When `true`, emit ANSI color codes in grep-style output.
+    pub fn new(writer: W, json: bool, color: bool) -> Self {
+        Self { writer, json, color, highlight: None }
+    }
+
+    /// Set a highlight pattern for match highlighting in search results.
+    ///
+    /// When color is enabled and a highlight pattern is set, matching portions
+    /// of content will be wrapped in ANSI bold+red codes.
+    pub fn set_highlight(&mut self, pattern: &str, is_regex: bool, ignore_case: bool) {
+        let pattern_str = if is_regex {
+            pattern.to_string()
+        } else {
+            regex::escape(pattern)
+        };
+        let pattern_str = if ignore_case {
+            format!("(?i){pattern_str}")
+        } else {
+            pattern_str
+        };
+        if let Ok(re) = Regex::new(&pattern_str) {
+            self.highlight = Some(HighlightPattern { re });
+        }
+    }
+
+    // -- Color helper methods -----------------------------------------------
+
+    /// Write a file path, colorized if color is enabled.
+    fn write_file(&mut self, path: &str) -> std::io::Result<()> {
+        if self.color {
+            write!(self.writer, "{}{}{}", color::FILE, path, color::RESET)
+        } else {
+            write!(self.writer, "{}", path)
+        }
+    }
+
+    /// Write a line number, colorized if color is enabled.
+    fn write_line_no(&mut self, line: impl Display) -> std::io::Result<()> {
+        if self.color {
+            write!(self.writer, "{}{}{}", color::LINE_NO, line, color::RESET)
+        } else {
+            write!(self.writer, "{}", line)
+        }
+    }
+
+    /// Write a separator (`:`) colorized if color is enabled.
+    fn write_sep(&mut self) -> std::io::Result<()> {
+        if self.color {
+            write!(self.writer, "{}:{}", color::SEP, color::RESET)
+        } else {
+            write!(self.writer, ":")
+        }
+    }
+
+    /// Write content with match highlighting if a highlight pattern is set.
+    fn write_content(&mut self, content: &str) -> std::io::Result<()> {
+        if self.color {
+            if let Some(ref hl) = self.highlight {
+                return write_highlighted(&mut self.writer, content, &hl.re);
+            }
+        }
+        write!(self.writer, "{}", content)
     }
 
     /// Format a single text-search result.
@@ -130,11 +201,12 @@ impl<W: Write> Formatter<W> {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             writeln!(self.writer, "{line}")
         } else {
-            writeln!(
-                self.writer,
-                "{}:{}:{}",
-                result.file, result.line, result.content
-            )
+            self.write_file(&result.file)?;
+            self.write_sep()?;
+            self.write_line_no(result.line)?;
+            self.write_sep()?;
+            self.write_content(&result.content)?;
+            writeln!(self.writer)
         }
     }
 
@@ -146,11 +218,11 @@ impl<W: Write> Formatter<W> {
             writeln!(self.writer, "{line}")
         } else {
             // file:line:  signature
-            writeln!(
-                self.writer,
-                "{}:{}:  {}",
-                sym.file, sym.line, sym.signature
-            )
+            self.write_file(&sym.file)?;
+            self.write_sep()?;
+            self.write_line_no(sym.line)?;
+            self.write_sep()?;
+            writeln!(self.writer, "  {}", sym.signature)
         }
     }
 
@@ -162,11 +234,11 @@ impl<W: Write> Formatter<W> {
             writeln!(self.writer, "{line}")
         } else {
             // file:line:content  (grep style)
-            writeln!(
-                self.writer,
-                "{}:{}:{}",
-                reference.file, reference.line, reference.context
-            )
+            self.write_file(&reference.file)?;
+            self.write_sep()?;
+            self.write_line_no(reference.line)?;
+            self.write_sep()?;
+            writeln!(self.writer, "{}", reference.context)
         }
     }
 
@@ -177,11 +249,11 @@ impl<W: Write> Formatter<W> {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             writeln!(self.writer, "{line}")
         } else {
-            writeln!(
-                self.writer,
-                "{}:{}:  {}",
-                sig.file, sig.line, sig.signature
-            )
+            self.write_file(&sig.file)?;
+            self.write_sep()?;
+            self.write_line_no(sig.line)?;
+            self.write_sep()?;
+            writeln!(self.writer, "  {}", sig.signature)
         }
     }
 
@@ -197,11 +269,11 @@ impl<W: Write> Formatter<W> {
         } else {
             // Two spaces base indent, then two more per nesting level.
             let padding = "  ".repeat(entry.indent + 1);
-            writeln!(
-                self.writer,
-                "{}:{}:{}{} {}",
-                entry.file, entry.line, padding, entry.kind, entry.name
-            )
+            self.write_file(&entry.file)?;
+            self.write_sep()?;
+            self.write_line_no(entry.line)?;
+            self.write_sep()?;
+            writeln!(self.writer, "{}{} {}", padding, entry.kind, entry.name)
         }
     }
 
@@ -212,7 +284,8 @@ impl<W: Write> Formatter<W> {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             writeln!(self.writer, "{line}")
         } else {
-            writeln!(self.writer, "{}", entry.path)
+            self.write_file(&entry.path)?;
+            writeln!(self.writer)
         }
     }
 
@@ -223,9 +296,34 @@ impl<W: Write> Formatter<W> {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             writeln!(self.writer, "{line}")
         } else {
-            writeln!(self.writer, "{} -> {}", dep.file, dep.depends_on)
+            self.write_file(&dep.file)?;
+            write!(self.writer, " -> ")?;
+            self.write_file(&dep.depends_on)?;
+            writeln!(self.writer)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Highlight helper (free function to avoid borrow conflicts)
+// ---------------------------------------------------------------------------
+
+/// Write content with regex matches highlighted in bold+underline+red ANSI codes.
+/// Bold and underline provide non-color indicators for color-blind accessibility.
+fn write_highlighted<W: Write>(writer: &mut W, content: &str, re: &Regex) -> std::io::Result<()> {
+    let mut last_end = 0;
+    for mat in re.find_iter(content) {
+        write!(writer, "{}", &content[last_end..mat.start()])?;
+        write!(
+            writer,
+            "{}{}{}",
+            color::MATCH,
+            &content[mat.start()..mat.end()],
+            color::RESET
+        )?;
+        last_end = mat.end();
+    }
+    write!(writer, "{}", &content[last_end..])
 }
 
 // ---------------------------------------------------------------------------
@@ -266,14 +364,27 @@ pub fn format_error(err: &crate::errors::WonkError, json: bool) -> i32 {
 mod tests {
     use super::*;
 
-    /// Helper: renders output into a String.
+    /// Helper: renders output into a String (no color).
     fn render<F>(json: bool, f: F) -> String
     where
         F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<()>,
     {
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, json);
+            let mut fmt = Formatter::new(&mut buf, json, false);
+            f(&mut fmt).unwrap();
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Helper: renders output into a String with color enabled.
+    fn render_color<F>(f: F) -> String
+    where
+        F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<()>,
+    {
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, false, true);
             f(&mut fmt).unwrap();
         }
         String::from_utf8(buf).unwrap()
@@ -687,5 +798,216 @@ mod tests {
         assert!(!out.contains("indent"));
         // scope should be omitted when None
         assert!(!out.contains("scope"));
+    }
+
+    // -- Color output tests -------------------------------------------------
+
+    #[test]
+    fn color_false_produces_identical_search_output() {
+        // Verify that color=false matches the original non-colored output exactly.
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+        };
+        let out = render(false, |fmt| fmt.format_search_result(&result));
+        assert_eq!(out, "src/main.rs:42:fn main() {}\n");
+    }
+
+    #[test]
+    fn color_wraps_file_path_in_magenta_bold() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+        };
+        let out = render_color(|fmt| fmt.format_search_result(&result));
+        // File path should be wrapped in magenta+bold
+        assert!(
+            out.contains(&format!("{}src/main.rs{}", crate::color::FILE, crate::color::RESET)),
+            "expected magenta+bold file path, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn color_wraps_line_number_in_green() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+        };
+        let out = render_color(|fmt| fmt.format_search_result(&result));
+        // Line number should be wrapped in green
+        assert!(
+            out.contains(&format!("{}42{}", crate::color::LINE_NO, crate::color::RESET)),
+            "expected green line number, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn color_wraps_separator_in_cyan() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+        };
+        let out = render_color(|fmt| fmt.format_search_result(&result));
+        // Separator should be wrapped in cyan
+        assert!(
+            out.contains(&format!("{}:{}", crate::color::SEP, crate::color::RESET)),
+            "expected cyan separator, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn json_output_has_no_ansi_codes_even_with_color() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+        };
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, true, true);
+            fmt.format_search_result(&result).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains('\x1b'),
+            "JSON output should never contain ANSI escape codes, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn match_highlighting_wraps_literal_matches() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+        };
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, false, true);
+            fmt.set_highlight("main", false, false);
+            fmt.format_search_result(&result).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        let expected_match = format!("{}main{}", crate::color::MATCH, crate::color::RESET);
+        assert!(
+            out.contains(&expected_match),
+            "expected highlighted match, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn match_highlighting_works_for_regex_patterns() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+        };
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, false, true);
+            fmt.set_highlight("ma.n", true, false);
+            fmt.format_search_result(&result).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        let expected_match = format!("{}main{}", crate::color::MATCH, crate::color::RESET);
+        assert!(
+            out.contains(&expected_match),
+            "expected highlighted regex match, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn no_highlighting_when_pattern_does_not_match() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+        };
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, false, true);
+            fmt.set_highlight("zzzzz", false, false);
+            fmt.format_search_result(&result).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        // Content should appear without MATCH codes (but file/line still get color)
+        assert!(
+            !out.contains(crate::color::MATCH),
+            "should not have match highlighting when pattern doesn't match, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn color_symbol_format() {
+        let sym = SymbolOutput {
+            name: "main".into(),
+            kind: "function".into(),
+            file: "src/main.rs".into(),
+            line: 10,
+            col: 0,
+            end_line: Some(20),
+            scope: None,
+            signature: "fn main()".into(),
+            language: "Rust".into(),
+        };
+        let out = render_color(|fmt| fmt.format_symbol(&sym));
+        assert!(out.contains(&format!("{}src/main.rs{}", crate::color::FILE, crate::color::RESET)));
+        assert!(out.contains(&format!("{}10{}", crate::color::LINE_NO, crate::color::RESET)));
+    }
+
+    #[test]
+    fn color_file_list_format() {
+        let entry = FileEntry {
+            path: "src/output.rs".into(),
+        };
+        let out = render_color(|fmt| fmt.format_file_list(&entry));
+        assert!(out.contains(&format!("{}src/output.rs{}", crate::color::FILE, crate::color::RESET)));
+    }
+
+    #[test]
+    fn color_dep_format() {
+        let dep = DepOutput {
+            file: "src/main.rs".into(),
+            depends_on: "src/lib.rs".into(),
+        };
+        let out = render_color(|fmt| fmt.format_dep(&dep));
+        assert!(out.contains(&format!("{}src/main.rs{}", crate::color::FILE, crate::color::RESET)));
+        assert!(out.contains(&format!("{}src/lib.rs{}", crate::color::FILE, crate::color::RESET)));
+    }
+
+    #[test]
+    fn match_highlighting_case_insensitive() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 1,
+            col: 1,
+            content: "Hello WORLD hello".into(),
+        };
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, false, true);
+            fmt.set_highlight("hello", false, true);
+            fmt.format_search_result(&result).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        // Both "Hello" and "hello" should be highlighted
+        let hl_hello = format!("{}Hello{}", crate::color::MATCH, crate::color::RESET);
+        let hl_hello2 = format!("{}hello{}", crate::color::MATCH, crate::color::RESET);
+        assert!(
+            out.contains(&hl_hello) && out.contains(&hl_hello2),
+            "expected both case variants highlighted, got: {out:?}"
+        );
     }
 }
