@@ -12,9 +12,20 @@ mod types;
 mod walker;
 mod watcher;
 
-use anyhow::Result;
+use std::process;
 
-fn main() -> Result<()> {
+fn main() {
+    // Parse CLI first so we know whether --json was requested.
+    // clap handles its own usage errors (exit code 2) before we get here.
     let cli = cli::parse();
-    router::dispatch(cli)
+    let json = cli.json;
+
+    match router::dispatch(cli) {
+        Ok(()) => process::exit(errors::EXIT_SUCCESS),
+        Err(err) => {
+            let wonk_err: errors::WonkError = err.into();
+            let code = output::format_error(&wonk_err, json);
+            process::exit(code);
+        }
+    }
 }

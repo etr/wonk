@@ -26,8 +26,9 @@ use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
 // ---------------------------------------------------------------------------
 
 pub fn dispatch(cli: Cli) -> Result<()> {
+    let json = cli.json;
     let stdout = io::stdout().lock();
-    let mut fmt = Formatter::new(stdout, cli.json);
+    let mut fmt = Formatter::new(stdout, json);
 
     match cli.command {
         Command::Search(args) => {
@@ -37,6 +38,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 args.ignore_case,
                 &args.paths,
             )?;
+
+            if results.is_empty() {
+                output::print_hint("no results found; try a broader pattern or different paths", json);
+            }
 
             for r in &results {
                 let out = SearchOutput::from_search_result(
@@ -51,8 +56,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             )
             .ok();
             let router = QueryRouter::new(repo_root, false);
+
+            if !router.has_index() {
+                output::print_hint(
+                    "no index found; falling back to grep (run `wonk init` for faster results)",
+                    json,
+                );
+            }
+
             let kind_str = args.kind.as_deref();
             let results = router.query_symbols(&args.name, kind_str, args.exact)?;
+
+            if results.is_empty() {
+                output::print_hint("no symbols found; try a broader query or omit --exact", json);
+            }
 
             for sym in &results {
                 let out = SymbolOutput {
@@ -71,7 +88,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Ref(args) => {
             let router = QueryRouter::new(None, false);
+
+            if !router.has_index() {
+                output::print_hint(
+                    "no index found; falling back to grep (run `wonk init` for faster results)",
+                    json,
+                );
+            }
+
             let results = router.query_references(&args.name, &args.paths)?;
+
+            if results.is_empty() {
+                output::print_hint("no references found", json);
+            }
+
             for r in &results {
                 let out = RefOutput {
                     name: r.name.clone(),
@@ -86,7 +116,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Sig(args) => {
             let router = QueryRouter::new(None, false);
+
+            if !router.has_index() {
+                output::print_hint(
+                    "no index found; falling back to grep (run `wonk init` for faster results)",
+                    json,
+                );
+            }
+
             let results = router.query_signatures(&args.name)?;
+
+            if results.is_empty() {
+                output::print_hint("no signatures found", json);
+            }
+
             for sym in &results {
                 let out = SignatureOutput {
                     name: sym.name.clone(),
@@ -99,13 +142,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Ls(_args) => {
-            output::print_hint("ls: not yet implemented");
+            output::print_hint("ls: not yet implemented", json);
         }
         Command::Deps(_args) => {
-            output::print_hint("deps: not yet implemented");
+            output::print_hint("deps: not yet implemented", json);
         }
         Command::Rdeps(_args) => {
-            output::print_hint("rdeps: not yet implemented");
+            output::print_hint("rdeps: not yet implemented", json);
         }
         Command::Init(args) => {
             let repo_root = std::env::current_dir()?;
@@ -134,25 +177,25 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             );
         }
         Command::Status => {
-            output::print_hint("status: not yet implemented");
+            output::print_hint("status: not yet implemented", json);
         }
         Command::Daemon(args) => match args.command {
             DaemonCommand::Start => {
-                output::print_hint("daemon start: not yet implemented");
+                output::print_hint("daemon start: not yet implemented", json);
             }
             DaemonCommand::Stop => {
-                output::print_hint("daemon stop: not yet implemented");
+                output::print_hint("daemon stop: not yet implemented", json);
             }
             DaemonCommand::Status => {
-                output::print_hint("daemon status: not yet implemented");
+                output::print_hint("daemon status: not yet implemented", json);
             }
         },
         Command::Repos(args) => match args.command {
             ReposCommand::List => {
-                output::print_hint("repos list: not yet implemented");
+                output::print_hint("repos list: not yet implemented", json);
             }
             ReposCommand::Clean => {
-                output::print_hint("repos clean: not yet implemented");
+                output::print_hint("repos clean: not yet implemented", json);
             }
         },
     }
