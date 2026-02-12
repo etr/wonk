@@ -171,11 +171,61 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Ls(args) => {
             dispatch_ls(args, suppress, &mut fmt)?;
         }
-        Command::Deps(_args) => {
-            output::print_hint("deps: not yet implemented", suppress);
+        Command::Deps(args) => {
+            let repo_root = db::find_repo_root(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )
+            .ok();
+            let router = QueryRouter::new(repo_root, false);
+
+            if !router.has_index() {
+                output::print_hint(
+                    "no index found; falling back to grep (run `wonk init` for faster results)",
+                    suppress,
+                );
+            }
+
+            let results = router.query_deps(&args.file)?;
+
+            if results.is_empty() {
+                output::print_hint("no dependencies found", suppress);
+            }
+
+            for dep in &results {
+                let out = output::DepOutput {
+                    file: args.file.clone(),
+                    depends_on: dep.clone(),
+                };
+                fmt.format_dep(&out)?;
+            }
         }
-        Command::Rdeps(_args) => {
-            output::print_hint("rdeps: not yet implemented", suppress);
+        Command::Rdeps(args) => {
+            let repo_root = db::find_repo_root(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )
+            .ok();
+            let router = QueryRouter::new(repo_root, false);
+
+            if !router.has_index() {
+                output::print_hint(
+                    "no index found; falling back to grep (run `wonk init` for faster results)",
+                    suppress,
+                );
+            }
+
+            let results = router.query_rdeps(&args.file)?;
+
+            if results.is_empty() {
+                output::print_hint("no reverse dependencies found", suppress);
+            }
+
+            for source in &results {
+                let out = output::DepOutput {
+                    file: source.clone(),
+                    depends_on: args.file.clone(),
+                };
+                fmt.format_dep(&out)?;
+            }
         }
         Command::Init(args) => {
             let repo_root = std::env::current_dir()?;
@@ -900,41 +950,38 @@ fn query_symbols_in_file_db(conn: &Connection, path: &str) -> Result<Vec<Symbol>
     Ok(results)
 }
 
-/// Query file dependencies from the references table.
+/// Query file dependencies from the `file_imports` table.
 ///
-/// This looks for import-kind references within the given file and returns
-/// the imported names.
+/// Returns the list of import paths for the given source file.
 fn query_deps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> {
-    // Look for references within this file that look like imports.
-    // We search the context column for import patterns.
-    let sql = "SELECT DISTINCT context FROM \"references\" WHERE file = ?1 AND \
-               context LIKE '%import%' OR context LIKE '%require%' OR \
-               context LIKE '%use %' OR context LIKE '%include%' OR context LIKE '%from%'";
+    let sql = "SELECT DISTINCT import_path FROM file_imports WHERE source_file = ?1";
     let mut stmt = conn.prepare(sql)?;
 
     let rows = stmt.query_map(rusqlite::params![file], |row| {
-        row.get::<_, Option<String>>(0)
+        row.get::<_, String>(0)
     })?;
 
     let mut results = Vec::new();
     for row in rows {
-        if let Some(ctx) = row? {
-            results.push(ctx.trim().to_string());
-        }
+        results.push(row?);
     }
     Ok(results)
 }
 
-/// Query reverse dependencies: files that import/reference something from `file`.
+/// Query reverse dependencies from the `file_imports` table.
+///
+/// Finds all files whose import paths contain the target file's stem
+/// (e.g. searching for "utils.ts" matches imports like "./utils",
+/// "../utils", "utils" etc.).
 fn query_rdeps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> {
-    // Find the file's stem to search for in references.
     let stem = Path::new(file)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| file.to_string());
 
-    let sql = "SELECT DISTINCT file FROM \"references\" WHERE name LIKE ?1 AND file != ?2";
-    let stem_param = format!("%{}%", stem);
+    let sql = "SELECT DISTINCT source_file FROM file_imports \
+               WHERE import_path LIKE ?1 AND source_file != ?2";
+    let stem_param = format!("%{}", stem);
     let mut stmt = conn.prepare(sql)?;
 
     let rows = stmt.query_map(rusqlite::params![stem_param, file], |row| {
@@ -1485,6 +1532,229 @@ mod tests {
             !results.is_empty(),
             "should fall back to grep when DB returns empty results"
         );
+    }
+
+    // -- Deps/Rdeps dispatch tests -------------------------------------------
+
+    #[test]
+    fn test_deps_dispatch_from_db() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+
+        // Create a TypeScript file with imports.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/main.ts"),
+            "import { foo } from './utils';\nimport { bar } from './config';\nconsole.log(foo, bar);\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/utils.ts"), "export function foo() {}\n").unwrap();
+        fs::write(root.join("src/config.ts"), "export const bar = 42;\n").unwrap();
+
+        // Build index.
+        pipeline::build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+        let router = QueryRouter::with_conn(conn, root.to_path_buf());
+
+        // Query deps for src/main.ts.
+        let results = router.query_deps("src/main.ts").unwrap();
+        assert!(results.len() >= 2, "should find at least 2 imports, got {}", results.len());
+        assert!(results.iter().any(|r| r.contains("utils")), "should include utils import");
+        assert!(results.iter().any(|r| r.contains("config")), "should include config import");
+    }
+
+    #[test]
+    fn test_rdeps_dispatch_from_db() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/main.ts"),
+            "import { foo } from './utils';\nconsole.log(foo);\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/app.ts"),
+            "import { helper } from './utils';\nhelper();\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/utils.ts"), "export function foo() {}\nexport function helper() {}\n").unwrap();
+
+        // Build index.
+        pipeline::build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+        let router = QueryRouter::with_conn(conn, root.to_path_buf());
+
+        // Query rdeps for src/utils.ts.
+        let results = router.query_rdeps("src/utils.ts").unwrap();
+        assert!(results.len() >= 2, "should find at least 2 reverse deps, got {}", results.len());
+    }
+
+    #[test]
+    fn test_deps_output_grep_format() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/main.ts", "./utils"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let deps = router.query_deps("src/main.ts").unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut fmt = output::Formatter::new(&mut buf, false);
+            for dep in &deps {
+                let out = output::DepOutput {
+                    file: "src/main.ts".to_string(),
+                    depends_on: dep.clone(),
+                };
+                fmt.format_dep(&out).unwrap();
+            }
+        }
+        let output_str = String::from_utf8(buf).unwrap();
+        assert!(output_str.contains("src/main.ts -> ./utils"), "grep format: {output_str}");
+    }
+
+    #[test]
+    fn test_deps_output_json_format() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/main.ts", "./utils"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let deps = router.query_deps("src/main.ts").unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut fmt = output::Formatter::new(&mut buf, true);
+            for dep in &deps {
+                let out = output::DepOutput {
+                    file: "src/main.ts".to_string(),
+                    depends_on: dep.clone(),
+                };
+                fmt.format_dep(&out).unwrap();
+            }
+        }
+        let output_str = String::from_utf8(buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(output_str.trim()).unwrap();
+        assert_eq!(v["file"], "src/main.ts");
+        assert_eq!(v["depends_on"], "./utils");
+    }
+
+    // -- Deps/Rdeps DB query tests (using file_imports table) ----------------
+
+    #[test]
+    fn test_router_query_deps_from_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        // Insert file_imports data.
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/main.ts", "./utils"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/main.ts", "./config"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let results = router.query_deps("src/main.ts").unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&"./utils".to_string()));
+        assert!(results.contains(&"./config".to_string()));
+    }
+
+    #[test]
+    fn test_router_query_rdeps_from_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        // src/app.ts imports ./utils
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/app.ts", "./utils"],
+        )
+        .unwrap();
+        // src/main.ts imports ./utils
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/main.ts", "./utils"],
+        )
+        .unwrap();
+        // src/main.ts also imports ./config (not utils)
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/main.ts", "./config"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let results = router.query_rdeps("src/utils.ts").unwrap();
+        // Both app.ts and main.ts import something matching "utils" stem.
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&"src/app.ts".to_string()));
+        assert!(results.contains(&"src/main.ts".to_string()));
+    }
+
+    #[test]
+    fn test_router_query_rdeps_excludes_self() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        // utils.ts imports ./helper (but has "utils" in its own imports table as source)
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/utils.ts", "./helper"],
+        )
+        .unwrap();
+        // app.ts imports ./utils
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/app.ts", "./utils"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let results = router.query_rdeps("src/utils.ts").unwrap();
+        // Should not include utils.ts itself.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "src/app.ts");
+    }
+
+    #[test]
+    fn test_router_query_deps_empty_when_no_imports() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        // File has no imports in the DB.
+        let results = router.query_deps("src/standalone.ts").unwrap();
+        assert!(results.is_empty());
     }
 
     // -- Error type tests ---------------------------------------------------
