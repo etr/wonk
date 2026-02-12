@@ -217,6 +217,23 @@ pub fn index_path_for(repo_root: &Path, local: bool) -> Result<PathBuf> {
     }
 }
 
+/// Check whether an index exists for the given repo root.
+///
+/// Checks the local path first (`.wonk/index.db`), then the central path
+/// (`~/.wonk/repos/<hash>/index.db`).  Returns the path if found.
+pub fn find_existing_index(repo_root: &Path) -> Option<PathBuf> {
+    let local = local_index_path(repo_root);
+    if local.exists() {
+        return Some(local);
+    }
+    if let Ok(central) = central_index_path(repo_root) {
+        if central.exists() {
+            return Some(central);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // meta.json
 // ---------------------------------------------------------------------------
@@ -581,5 +598,46 @@ mod tests {
         let path = index_path_for(repo, false).unwrap();
         assert!(path.to_string_lossy().contains(".wonk/repos/"));
         assert!(path.to_string_lossy().ends_with("index.db"));
+    }
+
+    #[test]
+    fn test_find_existing_index_none() {
+        let dir = TempDir::new().unwrap();
+        assert!(find_existing_index(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_find_existing_index_local() {
+        let dir = TempDir::new().unwrap();
+        let wonk = dir.path().join(".wonk");
+        fs::create_dir(&wonk).unwrap();
+        let db_path = wonk.join("index.db");
+        fs::write(&db_path, b"fake").unwrap();
+        assert_eq!(find_existing_index(dir.path()), Some(db_path));
+    }
+
+    #[test]
+    fn test_find_existing_index_central() {
+        let dir = TempDir::new().unwrap();
+        // Create a central index path and ensure it exists.
+        let central = central_index_path(dir.path()).unwrap();
+        fs::create_dir_all(central.parent().unwrap()).unwrap();
+        fs::write(&central, b"fake").unwrap();
+        assert_eq!(find_existing_index(dir.path()), Some(central));
+    }
+
+    #[test]
+    fn test_find_existing_index_prefers_local() {
+        let dir = TempDir::new().unwrap();
+        // Create both local and central.
+        let wonk = dir.path().join(".wonk");
+        fs::create_dir(&wonk).unwrap();
+        let local = wonk.join("index.db");
+        fs::write(&local, b"local").unwrap();
+        let central = central_index_path(dir.path()).unwrap();
+        fs::create_dir_all(central.parent().unwrap()).unwrap();
+        fs::write(&central, b"central").unwrap();
+        // Local should win.
+        assert_eq!(find_existing_index(dir.path()), Some(local));
     }
 }
