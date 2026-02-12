@@ -8,6 +8,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Suppress hint messages on stderr
+    #[arg(short = 'q', long, global = true)]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

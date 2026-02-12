@@ -27,8 +27,35 @@ use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
 
 pub fn dispatch(cli: Cli) -> Result<()> {
     let json = cli.json;
+    let quiet = cli.quiet;
+    let suppress = json || quiet;
     let stdout = io::stdout().lock();
     let mut fmt = Formatter::new(stdout, json);
+
+    // Auto-init: if this is a query command and no index exists, build one.
+    if is_query_command(&cli.command) {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(repo_root) = db::find_repo_root(&cwd) {
+                if db::find_existing_index(&repo_root).is_none() {
+                    if !suppress {
+                        eprint!("Indexing {}...", repo_root.display());
+                    }
+                    let stats = pipeline::build_index(&repo_root, false)?;
+                    if !suppress {
+                        eprintln!(
+                            "\rIndexed {} files ({} symbols, {} refs) in {:.1}s. Daemon started.",
+                            stats.file_count,
+                            stats.symbol_count,
+                            stats.ref_count,
+                            stats.elapsed.as_secs_f64(),
+                        );
+                    }
+                    // Spawn daemon after auto-init (best-effort).
+                    spawn_daemon_background(&repo_root);
+                }
+            }
+        }
+    }
 
     match cli.command {
         Command::Search(args) => {
@@ -40,7 +67,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             )?;
 
             if results.is_empty() {
-                output::print_hint("no results found; try a broader pattern or different paths", json);
+                output::print_hint("no results found; try a broader pattern or different paths", suppress);
             }
 
             for r in &results {
@@ -60,7 +87,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             if !router.has_index() {
                 output::print_hint(
                     "no index found; falling back to grep (run `wonk init` for faster results)",
-                    json,
+                    suppress,
                 );
             }
 
@@ -68,7 +95,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let results = router.query_symbols(&args.name, kind_str, args.exact)?;
 
             if results.is_empty() {
-                output::print_hint("no symbols found; try a broader query or omit --exact", json);
+                output::print_hint("no symbols found; try a broader query or omit --exact", suppress);
             }
 
             for sym in &results {
@@ -92,14 +119,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             if !router.has_index() {
                 output::print_hint(
                     "no index found; falling back to grep (run `wonk init` for faster results)",
-                    json,
+                    suppress,
                 );
             }
 
             let results = router.query_references(&args.name, &args.paths)?;
 
             if results.is_empty() {
-                output::print_hint("no references found", json);
+                output::print_hint("no references found", suppress);
             }
 
             for r in &results {
@@ -120,14 +147,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             if !router.has_index() {
                 output::print_hint(
                     "no index found; falling back to grep (run `wonk init` for faster results)",
-                    json,
+                    suppress,
                 );
             }
 
             let results = router.query_signatures(&args.name)?;
 
             if results.is_empty() {
-                output::print_hint("no signatures found", json);
+                output::print_hint("no signatures found", suppress);
             }
 
             for sym in &results {
@@ -142,13 +169,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Ls(args) => {
-            dispatch_ls(args, json, &mut fmt)?;
+            dispatch_ls(args, suppress, &mut fmt)?;
         }
         Command::Deps(_args) => {
-            output::print_hint("deps: not yet implemented", json);
+            output::print_hint("deps: not yet implemented", suppress);
         }
         Command::Rdeps(_args) => {
-            output::print_hint("rdeps: not yet implemented", json);
+            output::print_hint("rdeps: not yet implemented", suppress);
         }
         Command::Init(args) => {
             let repo_root = std::env::current_dir()?;
@@ -177,29 +204,59 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             );
         }
         Command::Status => {
-            output::print_hint("status: not yet implemented", json);
+            output::print_hint("status: not yet implemented", suppress);
         }
         Command::Daemon(args) => match args.command {
             DaemonCommand::Start => {
-                output::print_hint("daemon start: not yet implemented", json);
+                output::print_hint("daemon start: not yet implemented", suppress);
             }
             DaemonCommand::Stop => {
-                output::print_hint("daemon stop: not yet implemented", json);
+                output::print_hint("daemon stop: not yet implemented", suppress);
             }
             DaemonCommand::Status => {
-                output::print_hint("daemon status: not yet implemented", json);
+                output::print_hint("daemon status: not yet implemented", suppress);
             }
         },
         Command::Repos(args) => match args.command {
             ReposCommand::List => {
-                output::print_hint("repos list: not yet implemented", json);
+                output::print_hint("repos list: not yet implemented", suppress);
             }
             ReposCommand::Clean => {
-                output::print_hint("repos clean: not yet implemented", json);
+                output::print_hint("repos clean: not yet implemented", suppress);
             }
         },
     }
     Ok(())
+}
+
+/// Returns `true` for commands that query the index and should trigger
+/// auto-initialization when no index exists.
+fn is_query_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Search(_)
+            | Command::Sym(_)
+            | Command::Ref(_)
+            | Command::Sig(_)
+            | Command::Ls(_)
+            | Command::Deps(_)
+            | Command::Rdeps(_)
+    )
+}
+
+/// Spawn the daemon as a background subprocess (best-effort).
+///
+/// Uses `std::process::Command` to launch `wonk daemon start` as a detached
+/// child process.  Errors are silently ignored since the daemon is optional.
+fn spawn_daemon_background(repo_root: &Path) {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .args(["daemon", "start"])
+            .current_dir(repo_root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
 }
 
 /// Handle `wonk ls <path>` dispatch.
@@ -207,7 +264,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 /// Lists symbols in a single file or recursively for a directory.
 /// When `--tree` is set, groups symbols by scope hierarchy (e.g. methods
 /// under their parent class).
-fn dispatch_ls<W: io::Write>(args: LsArgs, json: bool, fmt: &mut Formatter<W>) -> Result<()> {
+fn dispatch_ls<W: io::Write>(args: LsArgs, suppress: bool, fmt: &mut Formatter<W>) -> Result<()> {
     let path = PathBuf::from(&args.path);
     let repo_root = db::find_repo_root(
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -218,7 +275,7 @@ fn dispatch_ls<W: io::Write>(args: LsArgs, json: bool, fmt: &mut Formatter<W>) -
     if !router.has_index() {
         output::print_hint(
             "no index found; falling back to grep (run `wonk init` for faster results)",
-            json,
+            suppress,
         );
     }
 
@@ -242,7 +299,7 @@ fn dispatch_ls<W: io::Write>(args: LsArgs, json: bool, fmt: &mut Formatter<W>) -
     }
 
     if all_symbols.is_empty() {
-        output::print_hint("no symbols found", json);
+        output::print_hint("no symbols found", suppress);
     }
 
     if args.tree {
@@ -997,6 +1054,7 @@ pub fn build_tree_entries(symbols: &[Symbol]) -> Vec<LsSymbolEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{DepsArgs, InitArgs, SearchArgs, SymArgs};
     use std::fs;
     use tempfile::TempDir;
 
@@ -2546,5 +2604,61 @@ mod tests {
                 r.context
             );
         }
+    }
+
+    // -- is_query_command tests -----------------------------------------------
+
+    #[test]
+    fn test_is_query_command_search() {
+        let cmd = Command::Search(SearchArgs {
+            pattern: "test".into(),
+            regex: false,
+            ignore_case: false,
+            paths: vec![],
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_sym() {
+        let cmd = Command::Sym(SymArgs {
+            name: "foo".into(),
+            kind: None,
+            exact: false,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_ls() {
+        let cmd = Command::Ls(LsArgs {
+            path: ".".into(),
+            tree: false,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_deps() {
+        let cmd = Command::Deps(DepsArgs {
+            file: "src/main.rs".into(),
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_not_init() {
+        let cmd = Command::Init(InitArgs { local: false });
+        assert!(!is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_not_update() {
+        assert!(!is_query_command(&Command::Update));
+    }
+
+    #[test]
+    fn test_is_query_command_not_status() {
+        assert!(!is_query_command(&Command::Status));
     }
 }
