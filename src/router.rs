@@ -16,7 +16,7 @@ use crate::db;
 use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
-use crate::output::{self, Formatter, SearchOutput, SignatureOutput, SymbolOutput};
+use crate::output::{self, Formatter, RefOutput, SearchOutput, SignatureOutput, SymbolOutput};
 use crate::pipeline;
 use crate::search;
 use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
@@ -69,8 +69,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 fmt.format_symbol(&out)?;
             }
         }
-        Command::Ref(_args) => {
-            output::print_hint("ref: not yet implemented");
+        Command::Ref(args) => {
+            let router = QueryRouter::new(None, false);
+            let results = router.query_references(&args.name, &args.paths)?;
+            for r in &results {
+                let out = RefOutput {
+                    name: r.name.clone(),
+                    kind: r.kind.to_string(),
+                    file: r.file.clone(),
+                    line: r.line,
+                    col: r.col,
+                    context: r.context.clone(),
+                };
+                fmt.format_reference(&out)?;
+            }
         }
         Command::Sig(args) => {
             let router = QueryRouter::new(None, false);
@@ -1883,5 +1895,217 @@ mod tests {
         // end_line and scope should be omitted when None.
         assert!(!output.contains("end_line"));
         assert!(!output.contains("scope"));
+    }
+
+    // -- Ref dispatch integration tests -------------------------------------
+
+    #[test]
+    fn test_ref_dispatch_grep_fallback_finds_references() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("app.rs"),
+            "fn processPayment() {}\nfn main() { processPayment(); }\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_references("processPayment", &[]).unwrap();
+        assert!(
+            !results.is_empty(),
+            "grep fallback should find references to 'processPayment'"
+        );
+        assert!(results.iter().all(|r| r.name == "processPayment"));
+        // Should find at least 2: the definition line and the call site
+        assert!(
+            results.len() >= 2,
+            "expected at least 2 references, got {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn test_ref_dispatch_path_restriction() {
+        let dir = TempDir::new().unwrap();
+        let src_dir = dir.path().join("src");
+        let tests_dir = dir.path().join("tests");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&tests_dir).unwrap();
+
+        fs::write(
+            src_dir.join("lib.rs"),
+            "fn processPayment() {}\nfn handle() { processPayment(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            tests_dir.join("test.rs"),
+            "fn test_it() { processPayment(); }\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+
+        // Restrict to src/ only
+        let src_path = src_dir.to_string_lossy().into_owned();
+        let results = router.query_references("processPayment", &[src_path]).unwrap();
+        assert!(
+            !results.is_empty(),
+            "should find references in src/"
+        );
+        // All results should be from src/ directory
+        for r in &results {
+            assert!(
+                r.file.contains("src"),
+                "result file '{}' should be in src/",
+                r.file
+            );
+        }
+    }
+
+    #[test]
+    fn test_ref_output_grep_format() {
+        use crate::output::{Formatter, RefOutput};
+
+        let reference = RefOutput {
+            name: "processPayment".into(),
+            kind: "call".into(),
+            file: "src/billing.rs".into(),
+            line: 42,
+            col: 8,
+            context: "    processPayment(order);".into(),
+        };
+
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, false);
+            fmt.format_reference(&reference).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "src/billing.rs:42:    processPayment(order);\n");
+    }
+
+    #[test]
+    fn test_ref_output_json_format() {
+        use crate::output::{Formatter, RefOutput};
+
+        let reference = RefOutput {
+            name: "processPayment".into(),
+            kind: "call".into(),
+            file: "src/billing.rs".into(),
+            line: 42,
+            col: 8,
+            context: "    processPayment(order);".into(),
+        };
+
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, true);
+            fmt.format_reference(&reference).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["name"], "processPayment");
+        assert_eq!(v["kind"], "call");
+        assert_eq!(v["file"], "src/billing.rs");
+        assert_eq!(v["line"], 42);
+        assert_eq!(v["col"], 8);
+        assert_eq!(v["context"], "    processPayment(order);");
+    }
+
+    #[test]
+    fn test_ref_db_fallback_to_grep_on_empty() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        // DB is empty -- no references inserted.
+
+        // Create a file that grep can find.
+        fs::write(
+            dir.path().join("app.rs"),
+            "fn processPayment() {}\nlet _ = processPayment();\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        assert!(router.has_index());
+
+        let results = router.query_references("processPayment", &[]).unwrap();
+        assert!(
+            !results.is_empty(),
+            "should fall back to grep when DB returns empty ref results"
+        );
+    }
+
+    #[test]
+    fn test_ref_db_returns_results_without_fallback() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "processPayment",
+                "src/billing.rs",
+                42,
+                8,
+                "    processPayment(order);"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "processPayment",
+                "src/main.rs",
+                10,
+                4,
+                "    processPayment(item);"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let results = router.query_references("processPayment", &[]).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "processPayment");
+        assert_eq!(results[0].file, "src/billing.rs");
+        assert_eq!(results[0].line, 42);
+        assert_eq!(results[0].context, "    processPayment(order);");
+        assert_eq!(results[1].name, "processPayment");
+        assert_eq!(results[1].file, "src/main.rs");
+    }
+
+    #[test]
+    fn test_ref_context_lines_included() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("code.rs"),
+            "fn calc(x: i32) -> i32 { x + 1 }\nfn main() {\n    let y = calc(42);\n}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::grep_only(dir.path().to_path_buf());
+        let results = router.query_references("calc", &[]).unwrap();
+        assert!(
+            !results.is_empty(),
+            "should find references to 'calc'"
+        );
+        // Every reference should have a non-empty context line
+        for r in &results {
+            assert!(
+                !r.context.is_empty(),
+                "context line should not be empty for reference at {}:{}",
+                r.file,
+                r.line
+            );
+            assert!(
+                r.context.contains("calc"),
+                "context '{}' should contain 'calc'",
+                r.context
+            );
+        }
     }
 }
