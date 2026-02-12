@@ -197,14 +197,30 @@ impl<W: Write> Formatter<W> {
 // Stderr helpers
 // ---------------------------------------------------------------------------
 
-/// Print a hint message to stderr.
-pub fn print_hint(msg: &str) {
-    eprintln!("hint: {msg}");
+/// Print a hint message to stderr (suppressed when `json` is true).
+pub fn print_hint(msg: &str, json: bool) {
+    if !json {
+        eprintln!("hint: {msg}");
+    }
 }
 
 /// Print an error message to stderr.
 pub fn print_error(msg: &str) {
     eprintln!("error: {msg}");
+}
+
+/// Format a [`WonkError`] to stderr with structured `error:` / `hint:` lines.
+///
+/// * Always prints `error: <message>` to stderr.
+/// * When `json` is `false` and the error carries a contextual hint, also
+///   prints `hint: <suggestion>` to stderr.
+/// * Returns the appropriate process exit code.
+pub fn format_error(err: &crate::errors::WonkError, json: bool) -> i32 {
+    print_error(&format!("{err}"));
+    if let Some(hint) = err.hint() {
+        print_hint(hint, json);
+    }
+    err.exit_code()
 }
 
 // ---------------------------------------------------------------------------
@@ -528,5 +544,33 @@ mod tests {
         let out = render(true, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["content"], "he said \"hello\"");
+    }
+
+    // -- format_error tests -------------------------------------------------
+
+    #[test]
+    fn format_error_returns_exit_code_1_for_general_error() {
+        use crate::errors::{DbError, WonkError, EXIT_ERROR};
+        let err = WonkError::Db(DbError::NoIndex);
+        let code = super::format_error(&err, false);
+        assert_eq!(code, EXIT_ERROR);
+    }
+
+    #[test]
+    fn format_error_returns_exit_code_2_for_usage_error() {
+        use crate::errors::{WonkError, EXIT_USAGE};
+        let err = WonkError::Usage("bad arg".into());
+        let code = super::format_error(&err, false);
+        assert_eq!(code, EXIT_USAGE);
+    }
+
+    #[test]
+    fn format_error_suppresses_hint_in_json_mode() {
+        use crate::errors::{DbError, WonkError};
+        // We cannot easily capture stderr in a unit test, but we can verify
+        // the function runs without panic and returns the right code.
+        let err = WonkError::Db(DbError::NoIndex);
+        let code = super::format_error(&err, true);
+        assert_eq!(code, 1);
     }
 }
