@@ -1,21 +1,144 @@
 //! Background daemon for file watching and incremental indexing.
 //!
 //! Provides daemon spawning via double-fork, PID file management,
-//! single-instance enforcement, and graceful shutdown via SIGTERM.
+//! single-instance enforcement, graceful shutdown via SIGTERM, and
+//! daemon status reporting via the `daemon_status` SQLite table.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fork::{Fork, fork, setsid};
+use rusqlite::Connection;
 use signal_hook::flag;
 
 use crate::db;
+
+// ---------------------------------------------------------------------------
+// Timestamp helper
+// ---------------------------------------------------------------------------
+
+/// Return the current Unix epoch timestamp in seconds.
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+// ---------------------------------------------------------------------------
+// Daemon status table helpers
+// ---------------------------------------------------------------------------
+
+/// Aggregated daemon information read from the `daemon_status` table.
+#[derive(Debug, Clone, Default)]
+pub struct DaemonInfo {
+    pub pid: Option<String>,
+    pub state: Option<String>,
+    pub uptime_start: Option<String>,
+    pub last_activity: Option<String>,
+    pub files_queued: Option<String>,
+    pub last_error: Option<String>,
+    pub heartbeat: Option<String>,
+}
+
+/// Write a single key/value pair into the `daemon_status` table.
+///
+/// Uses `INSERT OR REPLACE` so the call is idempotent.
+pub fn write_status(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO daemon_status (key, value, updated_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![key, value, now_epoch()],
+    )
+    .with_context(|| format!("writing daemon_status key '{key}'"))?;
+    Ok(())
+}
+
+/// Read a single value from the `daemon_status` table.
+pub fn read_status(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut stmt = conn
+        .prepare("SELECT value FROM daemon_status WHERE key = ?1")
+        .context("preparing read_status query")?;
+    let mut rows = stmt
+        .query_map(rusqlite::params![key], |row| row.get::<_, String>(0))
+        .context("executing read_status query")?;
+    match rows.next() {
+        Some(Ok(val)) => Ok(Some(val)),
+        Some(Err(e)) => Err(e).context("reading daemon_status value"),
+        None => Ok(None),
+    }
+}
+
+/// Write startup status: pid, state=running, uptime_start.
+pub fn write_startup_status(conn: &Connection, pid: u32) -> Result<()> {
+    let now = now_epoch().to_string();
+    write_status(conn, "pid", &pid.to_string())?;
+    write_status(conn, "state", "running")?;
+    write_status(conn, "uptime_start", &now)?;
+    write_status(conn, "heartbeat", &now)?;
+    Ok(())
+}
+
+/// Update the `last_activity` timestamp (call on each index update).
+pub fn update_activity(conn: &Connection) -> Result<()> {
+    write_status(conn, "last_activity", &now_epoch().to_string())
+}
+
+/// Update the `files_queued` count (call when processing batches).
+pub fn update_queue_depth(conn: &Connection, count: usize) -> Result<()> {
+    write_status(conn, "files_queued", &count.to_string())
+}
+
+/// Write the last error message.
+pub fn write_error(conn: &Connection, error_msg: &str) -> Result<()> {
+    write_status(conn, "last_error", error_msg)
+}
+
+/// Update the heartbeat timestamp (call periodically, e.g. every 30s).
+pub fn write_heartbeat(conn: &Connection) -> Result<()> {
+    write_status(conn, "heartbeat", &now_epoch().to_string())
+}
+
+/// Clear all rows from the `daemon_status` table (call on clean shutdown).
+pub fn clear_status(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM daemon_status", [])
+        .context("clearing daemon_status table")?;
+    Ok(())
+}
+
+/// Read all daemon status rows into a [`DaemonInfo`] struct.
+pub fn read_all_status(conn: &Connection) -> Result<DaemonInfo> {
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM daemon_status")
+        .context("preparing read_all_status query")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("executing read_all_status query")?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        let (k, v) = row.context("reading daemon_status row")?;
+        map.insert(k, v);
+    }
+
+    Ok(DaemonInfo {
+        pid: map.remove("pid"),
+        state: map.remove("state"),
+        uptime_start: map.remove("uptime_start"),
+        last_activity: map.remove("last_activity"),
+        files_queued: map.remove("files_queued"),
+        last_error: map.remove("last_error"),
+        heartbeat: map.remove("heartbeat"),
+    })
+}
 
 // ---------------------------------------------------------------------------
 // PID file path
@@ -204,17 +327,31 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     // Write PID file (we are now the daemon process).
     write_pid(&index_dir)?;
 
+    // Open the database so we can write status.
+    let conn = db::open(&index_path)?;
+
+    // Write startup status to daemon_status table.
+    write_startup_status(&conn, process::id())?;
+
     // Register signal handler for graceful shutdown.
     let shutdown = register_signal_handler()?;
 
     // --- Event loop placeholder ---
     // The real file-watching loop will be implemented in TASK-018.
-    // For now, just sleep until SIGTERM/SIGINT.
+    // For now, just sleep until SIGTERM/SIGINT with periodic heartbeat.
+    let mut heartbeat_counter: u32 = 0;
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(200));
+        heartbeat_counter += 1;
+        // Heartbeat every ~30 seconds (150 * 200ms = 30s).
+        if heartbeat_counter >= 150 {
+            heartbeat_counter = 0;
+            let _ = write_heartbeat(&conn);
+        }
     }
 
     // --- Graceful shutdown ---
+    clear_status(&conn)?;
     remove_pid(&index_dir)?;
 
     Ok(())
@@ -455,5 +592,221 @@ mod tests {
         assert!(contents.ends_with('\n'));
         let trimmed = contents.trim();
         assert!(trimmed.parse::<u32>().is_ok());
+    }
+
+    // -- Daemon status table tests ------------------------------------------
+
+    fn open_test_db() -> Connection {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+        // Keep the dir alive by leaking it (tests are short-lived).
+        std::mem::forget(dir);
+        conn
+    }
+
+    #[test]
+    fn test_write_and_read_status() {
+        let conn = open_test_db();
+        write_status(&conn, "foo", "bar").unwrap();
+        let val = read_status(&conn, "foo").unwrap();
+        assert_eq!(val, Some("bar".to_string()));
+    }
+
+    #[test]
+    fn test_read_status_missing_key() {
+        let conn = open_test_db();
+        let val = read_status(&conn, "nonexistent").unwrap();
+        assert_eq!(val, None);
+    }
+
+    #[test]
+    fn test_write_status_upsert() {
+        let conn = open_test_db();
+        write_status(&conn, "key", "first").unwrap();
+        write_status(&conn, "key", "second").unwrap();
+        let val = read_status(&conn, "key").unwrap();
+        assert_eq!(val, Some("second".to_string()));
+    }
+
+    #[test]
+    fn test_write_startup_status() {
+        let conn = open_test_db();
+        let pid = 12345_u32;
+        write_startup_status(&conn, pid).unwrap();
+
+        assert_eq!(read_status(&conn, "pid").unwrap(), Some("12345".to_string()));
+        assert_eq!(read_status(&conn, "state").unwrap(), Some("running".to_string()));
+
+        let uptime = read_status(&conn, "uptime_start").unwrap().unwrap();
+        let ts: i64 = uptime.parse().unwrap();
+        assert!(ts > 0, "uptime_start should be a positive timestamp");
+
+        let hb = read_status(&conn, "heartbeat").unwrap().unwrap();
+        let hb_ts: i64 = hb.parse().unwrap();
+        assert!(hb_ts > 0, "heartbeat should be set on startup");
+    }
+
+    #[test]
+    fn test_update_activity() {
+        let conn = open_test_db();
+        update_activity(&conn).unwrap();
+        let val = read_status(&conn, "last_activity").unwrap().unwrap();
+        let ts: i64 = val.parse().unwrap();
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn test_update_queue_depth() {
+        let conn = open_test_db();
+        update_queue_depth(&conn, 42).unwrap();
+        assert_eq!(
+            read_status(&conn, "files_queued").unwrap(),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_update_queue_depth_zero() {
+        let conn = open_test_db();
+        update_queue_depth(&conn, 0).unwrap();
+        assert_eq!(
+            read_status(&conn, "files_queued").unwrap(),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_write_error() {
+        let conn = open_test_db();
+        write_error(&conn, "something broke").unwrap();
+        assert_eq!(
+            read_status(&conn, "last_error").unwrap(),
+            Some("something broke".to_string())
+        );
+    }
+
+    #[test]
+    fn test_write_heartbeat() {
+        let conn = open_test_db();
+        write_heartbeat(&conn).unwrap();
+        let val = read_status(&conn, "heartbeat").unwrap().unwrap();
+        let ts: i64 = val.parse().unwrap();
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn test_clear_status() {
+        let conn = open_test_db();
+        write_status(&conn, "a", "1").unwrap();
+        write_status(&conn, "b", "2").unwrap();
+        write_status(&conn, "c", "3").unwrap();
+
+        clear_status(&conn).unwrap();
+
+        assert_eq!(read_status(&conn, "a").unwrap(), None);
+        assert_eq!(read_status(&conn, "b").unwrap(), None);
+        assert_eq!(read_status(&conn, "c").unwrap(), None);
+    }
+
+    #[test]
+    fn test_clear_status_empty_table_ok() {
+        let conn = open_test_db();
+        // Should not error on an already-empty table.
+        clear_status(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_read_all_status_empty() {
+        let conn = open_test_db();
+        let info = read_all_status(&conn).unwrap();
+        assert!(info.pid.is_none());
+        assert!(info.state.is_none());
+        assert!(info.uptime_start.is_none());
+        assert!(info.last_activity.is_none());
+        assert!(info.files_queued.is_none());
+        assert!(info.last_error.is_none());
+        assert!(info.heartbeat.is_none());
+    }
+
+    #[test]
+    fn test_read_all_status_populated() {
+        let conn = open_test_db();
+        write_startup_status(&conn, 9999).unwrap();
+        update_activity(&conn).unwrap();
+        update_queue_depth(&conn, 7).unwrap();
+        write_error(&conn, "disk full").unwrap();
+
+        let info = read_all_status(&conn).unwrap();
+        assert_eq!(info.pid, Some("9999".to_string()));
+        assert_eq!(info.state, Some("running".to_string()));
+        assert!(info.uptime_start.is_some());
+        assert!(info.last_activity.is_some());
+        assert_eq!(info.files_queued, Some("7".to_string()));
+        assert_eq!(info.last_error, Some("disk full".to_string()));
+        assert!(info.heartbeat.is_some());
+    }
+
+    #[test]
+    fn test_startup_then_clear_lifecycle() {
+        let conn = open_test_db();
+        // Startup writes status.
+        write_startup_status(&conn, 5555).unwrap();
+        update_activity(&conn).unwrap();
+        update_queue_depth(&conn, 3).unwrap();
+
+        // Verify we can read it all.
+        let info = read_all_status(&conn).unwrap();
+        assert_eq!(info.pid, Some("5555".to_string()));
+        assert_eq!(info.state, Some("running".to_string()));
+        assert_eq!(info.files_queued, Some("3".to_string()));
+
+        // Shutdown clears everything.
+        clear_status(&conn).unwrap();
+        let info = read_all_status(&conn).unwrap();
+        assert!(info.pid.is_none());
+        assert!(info.state.is_none());
+    }
+
+    #[test]
+    fn test_write_status_updates_timestamp() {
+        let conn = open_test_db();
+        write_status(&conn, "test_key", "val1").unwrap();
+
+        let ts1: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM daemon_status WHERE key = 'test_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ts1 > 0);
+
+        // Sleep briefly to ensure the timestamp can change.
+        thread::sleep(Duration::from_millis(10));
+
+        write_status(&conn, "test_key", "val2").unwrap();
+        let ts2: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM daemon_status WHERE key = 'test_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Timestamps have second resolution, so ts2 >= ts1.
+        assert!(ts2 >= ts1);
+    }
+
+    #[test]
+    fn test_daemon_info_default() {
+        let info = DaemonInfo::default();
+        assert!(info.pid.is_none());
+        assert!(info.state.is_none());
+        assert!(info.uptime_start.is_none());
+        assert!(info.last_activity.is_none());
+        assert!(info.files_queued.is_none());
+        assert!(info.last_error.is_none());
+        assert!(info.heartbeat.is_none());
     }
 }
