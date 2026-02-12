@@ -18,6 +18,7 @@ use crate::errors::DbError;
 use crate::errors::SearchError;
 use crate::output::{self, Formatter, LsSymbolEntry, RefOutput, SearchOutput, SignatureOutput, SymbolOutput};
 use crate::pipeline;
+use crate::progress::{self, Progress};
 use crate::search;
 use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
 
@@ -37,19 +38,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         if let Ok(cwd) = std::env::current_dir() {
             if let Ok(repo_root) = db::find_repo_root(&cwd) {
                 if db::find_existing_index(&repo_root).is_none() {
-                    if !suppress {
-                        eprint!("Indexing {}...", repo_root.display());
-                    }
-                    let stats = pipeline::build_index(&repo_root, false)?;
-                    if !suppress {
-                        eprintln!(
-                            "\rIndexed {} files ({} symbols, {} refs) in {:.1}s. Daemon started.",
-                            stats.file_count,
-                            stats.symbol_count,
-                            stats.ref_count,
-                            stats.elapsed.as_secs_f64(),
-                        );
-                    }
+                    let progress = Progress::new("Indexing", "Indexed", progress::detect_mode(suppress));
+                    let stats = pipeline::build_index_with_progress(&repo_root, false, &progress)?;
+                    progress.finish(&stats);
                     // Spawn daemon after auto-init (best-effort).
                     spawn_daemon_background(&repo_root);
                 }
@@ -230,28 +221,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Init(args) => {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
-            eprintln!("Indexing {}...", repo_root.display());
-            let stats = pipeline::build_index(&repo_root, args.local)?;
-            eprintln!(
-                "Indexed {} files ({} symbols, {} refs) in {:.2}s",
-                stats.file_count,
-                stats.symbol_count,
-                stats.ref_count,
-                stats.elapsed.as_secs_f64(),
-            );
+            let progress = Progress::new("Indexing", "Indexed", progress::detect_mode(suppress));
+            let stats = pipeline::build_index_with_progress(&repo_root, args.local, &progress)?;
+            progress.finish(&stats);
         }
         Command::Update => {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
-            eprintln!("Re-indexing {}...", repo_root.display());
-            let stats = pipeline::rebuild_index(&repo_root, false)?;
-            eprintln!(
-                "Re-indexed {} files ({} symbols, {} refs) in {:.2}s",
-                stats.file_count,
-                stats.symbol_count,
-                stats.ref_count,
-                stats.elapsed.as_secs_f64(),
-            );
+            let progress = Progress::new("Re-indexing", "Re-indexed", progress::detect_mode(suppress));
+            let stats = pipeline::rebuild_index_with_progress(&repo_root, false, &progress)?;
+            progress.finish(&stats);
         }
         Command::Status => {
             output::print_hint("status: not yet implemented", suppress);

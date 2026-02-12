@@ -21,6 +21,7 @@ use rusqlite::Connection;
 
 use crate::db;
 use crate::indexer;
+use crate::progress::Progress;
 use crate::types::{Reference, Symbol};
 use crate::walker::Walker;
 use crate::watcher::FileEvent;
@@ -80,6 +81,18 @@ struct FileResult {
 /// 6. Write `meta.json`.
 /// 7. Return [`IndexStats`].
 pub fn build_index(repo_root: &Path, local: bool) -> Result<IndexStats> {
+    build_index_with_progress(repo_root, local, &Progress::silent())
+}
+
+/// Build a fresh index with progress reporting.
+///
+/// Same as [`build_index`] but calls `progress.set_total()` after the walker
+/// pre-scan and `progress.inc()` after each file is parsed.
+pub fn build_index_with_progress(
+    repo_root: &Path,
+    local: bool,
+    progress: &Progress,
+) -> Result<IndexStats> {
     let start = Instant::now();
 
     // 1. Determine index path.
@@ -91,10 +104,17 @@ pub fn build_index(repo_root: &Path, local: bool) -> Result<IndexStats> {
     // 3. Walk files.
     let paths = Walker::new(repo_root).collect_paths();
 
+    // Set total for progress reporting.
+    progress.set_total(paths.len());
+
     // 4. Parse in parallel.
     let results: Vec<FileResult> = paths
         .par_iter()
-        .filter_map(|path| parse_one_file(path, repo_root))
+        .filter_map(|path| {
+            let result = parse_one_file(path, repo_root);
+            progress.inc();
+            result
+        })
         .collect();
 
     // 5. Batch insert.
@@ -124,6 +144,18 @@ pub fn build_index(repo_root: &Path, local: bool) -> Result<IndexStats> {
 ///
 /// This is used by `wonk update` to force a full re-index.
 pub fn rebuild_index(repo_root: &Path, local: bool) -> Result<IndexStats> {
+    rebuild_index_with_progress(repo_root, local, &Progress::silent())
+}
+
+/// Drop all data and rebuild the index with progress reporting.
+///
+/// Same as [`rebuild_index`] but forwards `progress` to
+/// [`build_index_with_progress`].
+pub fn rebuild_index_with_progress(
+    repo_root: &Path,
+    local: bool,
+    progress: &Progress,
+) -> Result<IndexStats> {
     let index_path = db::index_path_for(repo_root, local)?;
 
     // If the database exists, drop all data.
@@ -133,7 +165,7 @@ pub fn rebuild_index(repo_root: &Path, local: bool) -> Result<IndexStats> {
         drop(conn);
     }
 
-    build_index(repo_root, local)
+    build_index_with_progress(repo_root, local, progress)
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,6 +1385,52 @@ class Component {
             )
             .unwrap();
         assert!(has_changed > 0, "lib.rs should be re-indexed despite earlier error");
+    }
+
+    #[test]
+    fn test_build_index_with_progress_sets_total_and_done() {
+        use crate::progress::{Progress, ProgressMode};
+        use std::sync::Arc;
+
+        let dir = make_test_repo();
+        let progress = Arc::new(Progress::new("Indexing", "Indexed", ProgressMode::Silent));
+
+        let stats = build_index_with_progress(dir.path(), true, &progress).unwrap();
+
+        // Progress total should equal the number of walker paths (>= file_count since
+        // some paths may be unsupported languages).
+        assert!(progress.total() > 0, "progress total should be set");
+        // Done should equal total (all files processed).
+        assert_eq!(progress.done(), progress.total(), "all files should be processed");
+        // Stats should still be correct.
+        assert!(stats.file_count >= 3);
+        assert!(stats.symbol_count > 0);
+    }
+
+    #[test]
+    fn test_rebuild_index_with_progress() {
+        use crate::progress::{Progress, ProgressMode};
+        use std::sync::Arc;
+
+        let dir = make_test_repo();
+        // Build first.
+        let _stats1 = build_index(dir.path(), true).unwrap();
+
+        let progress = Arc::new(Progress::new("Re-indexing", "Re-indexed", ProgressMode::Silent));
+        let stats2 = rebuild_index_with_progress(dir.path(), true, &progress).unwrap();
+
+        assert!(progress.total() > 0, "progress total should be set for rebuild");
+        assert_eq!(progress.done(), progress.total(), "all files processed in rebuild");
+        assert!(stats2.symbol_count > 0);
+    }
+
+    #[test]
+    fn test_build_index_delegates_to_with_progress() {
+        // Ensure the non-progress build_index still works (it delegates internally)
+        let dir = make_test_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+        assert!(stats.file_count >= 3);
+        assert!(stats.symbol_count > 0);
     }
 
     #[test]
