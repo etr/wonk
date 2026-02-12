@@ -19,6 +19,7 @@ use rusqlite::Connection;
 use signal_hook::flag;
 
 use crate::db;
+use crate::pipeline;
 use crate::watcher::{self, FileWatcher};
 
 // ---------------------------------------------------------------------------
@@ -342,11 +343,21 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     let (_watcher, rx) = FileWatcher::new(repo_root, 500)
         .context("starting file watcher")?;
 
+    let repo_root_buf = repo_root.to_path_buf();
     watcher::run_event_loop(&rx, &shutdown, |events| {
-        // TODO(TASK-019+): dispatch events to the incremental re-indexer.
-        // For now we silently consume events; the watcher infrastructure is
-        // in place and ready for the re-indexing handler to be plugged in.
-        let _ = events;
+        update_queue_depth(&conn, events.len()).ok();
+
+        match pipeline::process_events(&conn, events, &repo_root_buf) {
+            Ok(count) => {
+                if count > 0 {
+                    update_activity(&conn).ok();
+                }
+                update_queue_depth(&conn, 0).ok();
+            }
+            Err(e) => {
+                write_error(&conn, &format!("{e:#}")).ok();
+            }
+        }
     });
 
     // --- Graceful shutdown ---
