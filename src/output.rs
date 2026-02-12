@@ -65,6 +65,21 @@ pub struct FileEntry {
     pub path: String,
 }
 
+/// A symbol entry for `ls --tree` results, with an indent level for nesting.
+#[derive(Debug, Clone, Serialize)]
+pub struct LsSymbolEntry {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    /// Nesting depth (0 = top-level). Skipped in JSON output.
+    #[serde(skip)]
+    pub indent: usize,
+    /// Parent scope name (e.g. class name for a method). Skipped when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
 /// A dependency edge for `deps` / `rdeps` results.
 #[derive(Debug, Clone, Serialize)]
 pub struct DepOutput {
@@ -166,6 +181,26 @@ impl<W: Write> Formatter<W> {
                 self.writer,
                 "{}:{}:  {}",
                 sig.file, sig.line, sig.signature
+            )
+        }
+    }
+
+    /// Format a single ls-symbol entry (used by `wonk ls --tree`).
+    ///
+    /// Grep format: `file:line:  [indent]kind name`
+    /// JSON: all fields except `indent`.
+    pub fn format_ls_symbol(&mut self, entry: &LsSymbolEntry) -> std::io::Result<()> {
+        if self.json {
+            let line = serde_json::to_string(entry)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(self.writer, "{line}")
+        } else {
+            // Two spaces base indent, then two more per nesting level.
+            let padding = "  ".repeat(entry.indent + 1);
+            writeln!(
+                self.writer,
+                "{}:{}:{}{} {}",
+                entry.file, entry.line, padding, entry.kind, entry.name
             )
         }
     }
@@ -572,5 +607,85 @@ mod tests {
         let err = WonkError::Db(DbError::NoIndex);
         let code = super::format_error(&err, true);
         assert_eq!(code, 1);
+    }
+
+    // -- LsSymbolEntry -------------------------------------------------------
+
+    #[test]
+    fn ls_symbol_grep_format_flat() {
+        let entry = LsSymbolEntry {
+            name: "main".into(),
+            kind: "function".into(),
+            file: "src/main.rs".into(),
+            line: 1,
+            indent: 0,
+            scope: None,
+        };
+        let out = render(false, |fmt| fmt.format_ls_symbol(&entry));
+        assert_eq!(out, "src/main.rs:1:  function main\n");
+    }
+
+    #[test]
+    fn ls_symbol_grep_format_indented() {
+        let entry = LsSymbolEntry {
+            name: "process".into(),
+            kind: "method".into(),
+            file: "src/lib.rs".into(),
+            line: 15,
+            indent: 1,
+            scope: Some("Worker".into()),
+        };
+        let out = render(false, |fmt| fmt.format_ls_symbol(&entry));
+        assert_eq!(out, "src/lib.rs:15:    method process\n");
+    }
+
+    #[test]
+    fn ls_symbol_grep_format_deeply_nested() {
+        let entry = LsSymbolEntry {
+            name: "inner".into(),
+            kind: "function".into(),
+            file: "src/lib.rs".into(),
+            line: 30,
+            indent: 2,
+            scope: Some("Outer".into()),
+        };
+        let out = render(false, |fmt| fmt.format_ls_symbol(&entry));
+        assert_eq!(out, "src/lib.rs:30:      function inner\n");
+    }
+
+    #[test]
+    fn ls_symbol_json_format_includes_all_fields() {
+        let entry = LsSymbolEntry {
+            name: "process".into(),
+            kind: "method".into(),
+            file: "src/lib.rs".into(),
+            line: 15,
+            indent: 1,
+            scope: Some("Worker".into()),
+        };
+        let out = render(true, |fmt| fmt.format_ls_symbol(&entry));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["name"], "process");
+        assert_eq!(v["kind"], "method");
+        assert_eq!(v["file"], "src/lib.rs");
+        assert_eq!(v["line"], 15);
+        assert_eq!(v["scope"], "Worker");
+    }
+
+    #[test]
+    fn ls_symbol_json_format_skips_indent() {
+        let entry = LsSymbolEntry {
+            name: "main".into(),
+            kind: "function".into(),
+            file: "src/main.rs".into(),
+            line: 1,
+            indent: 2,
+            scope: None,
+        };
+        let out = render(true, |fmt| fmt.format_ls_symbol(&entry));
+        // indent should NOT appear in JSON
+        assert!(!out.contains("indent"));
+        // scope should be omitted when None
+        assert!(!out.contains("scope"));
     }
 }
