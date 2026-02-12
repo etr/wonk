@@ -60,6 +60,8 @@ struct FileResult {
     symbols: Vec<Symbol>,
     /// Extracted references.
     refs: Vec<Reference>,
+    /// Extracted import paths for dependency graph.
+    imports: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +197,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
 
     let symbols = indexer::extract_symbols(&tree, &content, &rel_path, lang);
     let refs = indexer::extract_references(&tree, &content, &rel_path, lang);
+    let file_imports = indexer::extract_imports(&tree, &content, &rel_path, lang);
     let line_count = content.lines().count();
 
     // Single transaction: delete old data, insert new data.
@@ -205,6 +208,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
         line_count,
         symbols,
         refs,
+        imports: file_imports.imports,
     })?;
 
     Ok(true)
@@ -301,6 +305,10 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         rusqlite::params![rel_path],
     )?;
     tx.execute(
+        "DELETE FROM file_imports WHERE source_file = ?1",
+        rusqlite::params![rel_path],
+    )?;
+    tx.execute(
         "DELETE FROM files WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
@@ -321,13 +329,17 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         .unchecked_transaction()
         .context("starting upsert transaction")?;
 
-    // Delete old symbols and references for this file.
+    // Delete old symbols, references, and imports for this file.
     tx.execute(
         "DELETE FROM symbols WHERE file = ?1",
         rusqlite::params![result.rel_path],
     )?;
     tx.execute(
         "DELETE FROM \"references\" WHERE file = ?1",
+        rusqlite::params![result.rel_path],
+    )?;
+    tx.execute(
+        "DELETE FROM file_imports WHERE source_file = ?1",
         rusqlite::params![result.rel_path],
     )?;
 
@@ -383,6 +395,16 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         }
     }
 
+    // Insert new imports.
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+        )?;
+        for import in &result.imports {
+            stmt.execute(rusqlite::params![result.rel_path, import])?;
+        }
+    }
+
     tx.commit().context("committing upsert transaction")?;
     Ok(())
 }
@@ -418,6 +440,9 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
     // Extract references.
     let refs = indexer::extract_references(&tree, &content, &rel_path, lang);
 
+    // Extract imports for dependency graph.
+    let file_imports = indexer::extract_imports(&tree, &content, &rel_path, lang);
+
     let line_count = content.lines().count();
 
     Some(FileResult {
@@ -427,6 +452,7 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
         line_count,
         symbols,
         refs,
+        imports: file_imports.imports,
     })
 }
 
@@ -507,6 +533,18 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
         }
     }
 
+    // Insert file imports.
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+        )?;
+        for r in results {
+            for import in &r.imports {
+                stmt.execute(rusqlite::params![r.rel_path, import])?;
+            }
+        }
+    }
+
     tx.commit().context("committing transaction")?;
     Ok((total_syms, total_refs))
 }
@@ -516,6 +554,7 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM symbols;
          DELETE FROM \"references\";
+         DELETE FROM file_imports;
          DELETE FROM files;",
     )
     .context("clearing index data")?;
@@ -755,6 +794,125 @@ class Component {
         assert_eq!(stats.file_count, 0);
         assert_eq!(stats.symbol_count, 0);
         assert_eq!(stats.ref_count, 0);
+    }
+
+    #[test]
+    fn test_build_index_stores_imports() {
+        let dir = make_test_repo();
+        let _stats = build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // The Rust file has `use std::io;` so we should find at least one import.
+        let import_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE source_file = 'src/main.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            import_count > 0,
+            "should store imports from src/main.rs, got {import_count}"
+        );
+
+        // Python file has `import os` so should have imports too.
+        let py_imports: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE source_file = 'app.py'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            py_imports > 0,
+            "should store imports from app.py, got {py_imports}"
+        );
+    }
+
+    #[test]
+    fn test_reindex_file_updates_imports() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        // Initially lib.rs has no imports.
+        let orig_imports: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE source_file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orig_imports, 0, "lib.rs should have no imports initially");
+
+        // Rewrite lib.rs to include an import.
+        fs::write(root.join("lib.rs"), "use std::io;\nfn hello() { 1 }").unwrap();
+        reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+
+        let new_imports: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE source_file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            new_imports > 0,
+            "lib.rs should have imports after rewrite, got {new_imports}"
+        );
+    }
+
+    #[test]
+    fn test_remove_file_deletes_imports() {
+        let dir = make_test_repo();
+        let _stats = build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Verify imports exist before removal.
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE source_file = 'src/main.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(before > 0, "should have imports before removal");
+
+        remove_file(&conn, &dir.path().join("src/main.rs"), dir.path()).unwrap();
+
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE source_file = 'src/main.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0, "imports should be removed after file removal");
+    }
+
+    #[test]
+    fn test_rebuild_clears_imports() {
+        let dir = make_test_repo();
+        let _stats1 = build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn1 = db::open_existing(&index_path).unwrap();
+        let count1: i64 = conn1
+            .query_row("SELECT COUNT(*) FROM file_imports", [], |row| row.get(0))
+            .unwrap();
+        assert!(count1 > 0);
+        drop(conn1);
+
+        // Rebuild should not double the imports.
+        let _stats2 = rebuild_index(dir.path(), true).unwrap();
+        let conn2 = db::open_existing(&index_path).unwrap();
+        let count2: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM file_imports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count1, count2, "rebuild should not duplicate imports");
     }
 
     #[test]

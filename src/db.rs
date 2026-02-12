@@ -59,6 +59,15 @@ CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_references_name ON "references"(name);
 CREATE INDEX IF NOT EXISTS idx_references_file ON "references"(file);
+
+-- File-level import tracking for dependency graph
+CREATE TABLE IF NOT EXISTS file_imports (
+    id INTEGER PRIMARY KEY,
+    source_file TEXT NOT NULL,
+    import_path TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_imports_source ON file_imports(source_file);
+CREATE INDEX IF NOT EXISTS idx_file_imports_target ON file_imports(import_path);
 "#;
 
 const FTS_SQL: &str = r#"
@@ -323,6 +332,46 @@ mod tests {
         assert!(tables.contains(&"files".to_string()));
         assert!(tables.contains(&"daemon_status".to_string()));
         assert!(tables.contains(&"symbols_fts".to_string()));
+        assert!(tables.contains(&"file_imports".to_string()));
+    }
+
+    #[test]
+    fn test_file_imports_table_insert_and_query() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/main.ts", "./utils"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params!["src/main.ts", "./config"],
+        )
+        .unwrap();
+
+        // Query forward deps.
+        let imports: Vec<String> = conn
+            .prepare("SELECT DISTINCT import_path FROM file_imports WHERE source_file = ?1")
+            .unwrap()
+            .query_map(rusqlite::params!["src/main.ts"], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(imports.len(), 2);
+
+        // Query reverse deps.
+        let rdeps: Vec<String> = conn
+            .prepare("SELECT DISTINCT source_file FROM file_imports WHERE import_path = ?1")
+            .unwrap()
+            .query_map(rusqlite::params!["./utils"], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(rdeps.len(), 1);
+        assert_eq!(rdeps[0], "src/main.ts");
     }
 
     #[test]
