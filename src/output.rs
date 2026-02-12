@@ -308,7 +308,8 @@ impl<W: Write> Formatter<W> {
 // Highlight helper (free function to avoid borrow conflicts)
 // ---------------------------------------------------------------------------
 
-/// Write content with regex matches highlighted in bold+red ANSI codes.
+/// Write content with regex matches highlighted in bold+underline+red ANSI codes.
+/// Bold and underline provide non-color indicators for color-blind accessibility.
 fn write_highlighted<W: Write>(writer: &mut W, content: &str, re: &Regex) -> std::io::Result<()> {
     let mut last_end = 0;
     for mat in re.find_iter(content) {

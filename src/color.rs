@@ -11,6 +11,13 @@
 // ---------------------------------------------------------------------------
 // ANSI escape constants (matching ripgrep conventions)
 // ---------------------------------------------------------------------------
+//
+// Accessibility note (deuteranopia / protanopia):
+// Red (MATCH) and green (LINE_NO) appear on structurally distinct elements —
+// line numbers vs inline content highlights — so they are never used to
+// distinguish between two states of the same element. Additionally, MATCH
+// uses bold + underline as non-color indicators, ensuring that match
+// highlights remain visually distinct even without color perception.
 
 /// Reset all attributes.
 pub const RESET: &str = "\x1b[0m";
@@ -18,8 +25,9 @@ pub const RESET: &str = "\x1b[0m";
 pub const FILE: &str = "\x1b[35m\x1b[1m";
 /// Line numbers: green.
 pub const LINE_NO: &str = "\x1b[32m";
-/// Match highlights: red + bold.
-pub const MATCH: &str = "\x1b[1m\x1b[31m";
+/// Match highlights: red + bold + underline.
+/// Bold and underline serve as non-color indicators for accessibility.
+pub const MATCH: &str = "\x1b[1m\x1b[4m\x1b[31m";
 /// Separators (colons): cyan.
 pub const SEP: &str = "\x1b[36m";
 
