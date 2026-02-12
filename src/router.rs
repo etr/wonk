@@ -16,7 +16,7 @@ use crate::db;
 use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
-use crate::output::{self, Formatter, SearchOutput, SignatureOutput};
+use crate::output::{self, Formatter, SearchOutput, SignatureOutput, SymbolOutput};
 use crate::pipeline;
 use crate::search;
 use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
@@ -45,8 +45,29 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 fmt.format_search_result(&out)?;
             }
         }
-        Command::Sym(_args) => {
-            output::print_hint("sym: not yet implemented");
+        Command::Sym(args) => {
+            let repo_root = db::find_repo_root(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )
+            .ok();
+            let router = QueryRouter::new(repo_root, false);
+            let kind_str = args.kind.as_deref();
+            let results = router.query_symbols(&args.name, kind_str, args.exact)?;
+
+            for sym in &results {
+                let out = SymbolOutput {
+                    name: sym.name.clone(),
+                    kind: sym.kind.to_string(),
+                    file: sym.file.clone(),
+                    line: sym.line,
+                    col: sym.col,
+                    end_line: sym.end_line,
+                    scope: sym.scope.clone(),
+                    signature: sym.signature.clone(),
+                    language: sym.language.clone(),
+                };
+                fmt.format_symbol(&out)?;
+            }
         }
         Command::Ref(_args) => {
             output::print_hint("ref: not yet implemented");
@@ -1582,5 +1603,285 @@ mod tests {
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
         let results = router.query_signatures("nonexistent_func").unwrap();
         assert!(results.is_empty(), "should return no results for non-existent function");
+    }
+
+    // -- Sym dispatch integration tests -------------------------------------
+
+    /// Helper: run sym query through QueryRouter and format results like dispatch does.
+    fn run_sym_query(
+        router: &QueryRouter,
+        name: &str,
+        kind: Option<&str>,
+        exact: bool,
+        json: bool,
+    ) -> String {
+        let results = router.query_symbols(name, kind, exact).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, json);
+            for sym in &results {
+                let out = SymbolOutput {
+                    name: sym.name.clone(),
+                    kind: sym.kind.to_string(),
+                    file: sym.file.clone(),
+                    line: sym.line,
+                    col: sym.col,
+                    end_line: sym.end_line,
+                    scope: sym.scope.clone(),
+                    signature: sym.signature.clone(),
+                    language: sym.language.clone(),
+                };
+                fmt.format_symbol(&out).unwrap();
+            }
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn test_sym_dispatch_grep_format() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "processPayment",
+                "function",
+                "src/billing.rs",
+                42,
+                0,
+                "rust",
+                "fn processPayment(amount: f64)"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let output = run_sym_query(&router, "processPayment", None, false, false);
+        assert_eq!(
+            output.trim(),
+            "src/billing.rs:42:  fn processPayment(amount: f64)"
+        );
+    }
+
+    #[test]
+    fn test_sym_dispatch_json_format_all_fields() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "processPayment",
+                "method",
+                "src/billing.rs",
+                42,
+                4,
+                55,
+                "BillingService",
+                "rust",
+                "fn processPayment(&self, amount: f64)"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let output = run_sym_query(&router, "processPayment", None, false, true);
+        let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(v["name"], "processPayment");
+        assert_eq!(v["kind"], "method");
+        assert_eq!(v["file"], "src/billing.rs");
+        assert_eq!(v["line"], 42);
+        assert_eq!(v["col"], 4);
+        assert_eq!(v["end_line"], 55);
+        assert_eq!(v["scope"], "BillingService");
+        assert_eq!(v["signature"], "fn processPayment(&self, amount: f64)");
+        assert_eq!(v["language"], "rust");
+    }
+
+    #[test]
+    fn test_sym_dispatch_substring_match() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "processPayment",
+                "function",
+                "src/billing.rs",
+                10,
+                0,
+                "rust",
+                "fn processPayment()"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "processRefund",
+                "function",
+                "src/billing.rs",
+                20,
+                0,
+                "rust",
+                "fn processRefund()"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+
+        // Substring match should find both.
+        let output = run_sym_query(&router, "process", None, false, false);
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 2, "substring 'process' should match both symbols");
+        assert!(output.contains("processPayment"));
+        assert!(output.contains("processRefund"));
+    }
+
+    #[test]
+    fn test_sym_dispatch_exact_match() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "processPayment",
+                "function",
+                "src/billing.rs",
+                10,
+                0,
+                "rust",
+                "fn processPayment()"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "processRefund",
+                "function",
+                "src/billing.rs",
+                20,
+                0,
+                "rust",
+                "fn processRefund()"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+
+        // Exact match should find only processPayment.
+        let output = run_sym_query(&router, "processPayment", None, true, false);
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 1, "--exact should return only exact matches");
+        assert!(output.contains("processPayment"));
+        assert!(!output.contains("processRefund"));
+    }
+
+    #[test]
+    fn test_sym_dispatch_kind_filter() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "Payment",
+                "function",
+                "src/billing.rs",
+                10,
+                0,
+                "rust",
+                "fn Payment()"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "Payment",
+                "struct",
+                "src/types.rs",
+                5,
+                0,
+                "rust",
+                "struct Payment"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+
+        // --kind function should only return the function.
+        let output = run_sym_query(&router, "Payment", Some("function"), true, false);
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 1, "--kind function should filter to functions only");
+        assert!(output.contains("fn Payment()"));
+        assert!(!output.contains("struct Payment"));
+    }
+
+    #[test]
+    fn test_sym_dispatch_grep_fallback() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+        // DB is empty -- no symbols inserted.
+
+        // Create a file that grep can find.
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("billing.rs"),
+            "fn processPayment(amount: f64) -> bool {\n    true\n}\n",
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let output = run_sym_query(&router, "processPayment", None, false, false);
+        assert!(
+            !output.is_empty(),
+            "should fall back to grep when DB returns empty"
+        );
+        assert!(output.contains("processPayment"));
+    }
+
+    #[test]
+    fn test_sym_dispatch_json_optional_fields_omitted() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "processPayment",
+                "function",
+                "src/billing.rs",
+                42,
+                0,
+                "rust",
+                "fn processPayment()"
+            ],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+        let output = run_sym_query(&router, "processPayment", None, true, true);
+        // end_line and scope should be omitted when None.
+        assert!(!output.contains("end_line"));
+        assert!(!output.contains("scope"));
     }
 }
