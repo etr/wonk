@@ -10,6 +10,7 @@ mod router;
 mod search;
 mod types;
 mod walker;
+mod watcher;
 
 use anyhow::Result;
 

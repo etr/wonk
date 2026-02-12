@@ -19,6 +19,7 @@ use rusqlite::Connection;
 use signal_hook::flag;
 
 use crate::db;
+use crate::watcher::{self, FileWatcher};
 
 // ---------------------------------------------------------------------------
 // Timestamp helper
@@ -336,19 +337,17 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     // Register signal handler for graceful shutdown.
     let shutdown = register_signal_handler()?;
 
-    // --- Event loop placeholder ---
-    // The real file-watching loop will be implemented in TASK-018.
-    // For now, just sleep until SIGTERM/SIGINT with periodic heartbeat.
-    let mut heartbeat_counter: u32 = 0;
-    while !shutdown.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(200));
-        heartbeat_counter += 1;
-        // Heartbeat every ~30 seconds (150 * 200ms = 30s).
-        if heartbeat_counter >= 150 {
-            heartbeat_counter = 0;
-            let _ = write_heartbeat(&conn);
-        }
-    }
+    // --- File watcher event loop ---
+    // Set up debounced file watching (500ms window) and run the event loop.
+    let (_watcher, rx) = FileWatcher::new(repo_root, 500)
+        .context("starting file watcher")?;
+
+    watcher::run_event_loop(&rx, &shutdown, |events| {
+        // TODO(TASK-019+): dispatch events to the incremental re-indexer.
+        // For now we silently consume events; the watcher infrastructure is
+        // in place and ready for the re-indexing handler to be plugged in.
+        let _ = events;
+    });
 
     // --- Graceful shutdown ---
     clear_status(&conn)?;
