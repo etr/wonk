@@ -11,8 +11,8 @@
 
 ## Overview
 
-**Total Tasks:** 34
-**Milestones:** 7
+**Total Tasks:** 37
+**Milestones:** 8
 
 ### Milestone Summary
 
@@ -25,6 +25,7 @@
 | M5 | Auto-Init, Dependencies & Configuration | 4 | In Progress |
 | M6 | Smart Search | 4 | Not Started |
 | M7 | Polish & Distribution | 5 | In Progress |
+| M8 | Git Worktree Support | 3 | Not Started |
 
 ### Dependency Graph
 
@@ -64,6 +65,10 @@ M7: Polish & Distribution (depends: M6)
 ├── TASK-027
 ├── TASK-028
 ├── TASK-029 ── TASK-030
+│
+M8: Git Worktree Support (depends: M1)
+├── TASK-035 ──┐
+├── TASK-036 ──┼── TASK-037
 ```
 
 ### Critical Path
@@ -1354,6 +1359,116 @@ Automate GitHub Releases with platform binaries and set up Homebrew tap and inst
 
 ---
 
+## Milestone 8: Git Worktree Support
+
+**Goal:** Worktrees are fully isolated — each worktree gets its own index and daemon, with no cross-worktree contamination during indexing or file watching.
+**Exit Criteria:** Two worktrees of the same repo produce separate indexes. A nested worktree does not pollute the parent's index. The parent daemon ignores events from nested worktree files.
+
+### TASK-035: Walker worktree boundary exclusion
+
+**Milestone:** M8 - Git Worktree Support
+**Component:** Structural Index
+**Estimate:** S
+
+**Goal:**
+Add a `filter_entry` callback to the `WalkBuilder` that skips subdirectories containing a `.git` entry, preventing cross-worktree contamination during indexing.
+
+**Action Items:**
+- [x] Add `filter_entry` callback to `WalkBuilder` in `walker.rs` that checks each directory for `.git` existence
+- [x] Skip the directory if `.git` is found AND the directory is not the repo root itself
+- [x] Handle both `.git` as file (linked worktree) and `.git` as directory (nested repo)
+- [x] Add unit tests with a mock nested `.git` directory structure
+- [x] Verify default exclusions (node_modules, etc.) still work alongside worktree exclusion
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-037
+
+**Acceptance Criteria:**
+- Walker skips directories containing `.git` that are not the repo root
+- Both `.git` files and `.git` directories are detected as boundaries
+- Existing exclusions (gitignore, default exclusions) still work
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-WKT-REQ-003
+**Related Decisions:** DR-008
+
+**Status:** Complete
+
+---
+
+### TASK-036: Watcher worktree boundary filtering
+
+**Milestone:** M8 - Git Worktree Support
+**Component:** Background Daemon
+**Estimate:** S
+
+**Goal:**
+Extend the `should_process` event filter to discard filesystem events originating from within a nested worktree boundary.
+
+**Action Items:**
+- [ ] Add ancestor-path boundary check to `should_process` in `watcher.rs`
+- [ ] For each event path, walk ancestor directories between the event path and repo root
+- [ ] If any ancestor directory contains a `.git` entry (file or directory), discard the event
+- [ ] Accept repo root as parameter so the root's own `.git` is not treated as a boundary
+- [ ] Add unit tests simulating nested worktree events
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-037
+
+**Acceptance Criteria:**
+- Events from files inside nested worktree boundaries are discarded
+- Events from the repo's own files are processed normally
+- Events from the repo root's `.git` are still filtered (existing behavior preserved)
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-WKT-REQ-004
+**Related Decisions:** DR-008
+
+**Status:** Not Started
+
+---
+
+### TASK-037: Git worktree integration tests
+
+**Milestone:** M8 - Git Worktree Support
+**Component:** All
+**Estimate:** M
+
+**Goal:**
+Verify end-to-end worktree support: repo root detection accepts `.git` files, nearest root wins when nested, indexes are independent per worktree, and cross-worktree contamination is prevented.
+
+**Action Items:**
+- [ ] Create test fixture: initialize a git repo, add a linked worktree via `git worktree add`
+- [ ] Test REQ-001: `find_repo_root` correctly identifies the worktree root when `.git` is a file
+- [ ] Test REQ-002: When CWD is inside a nested worktree, `find_repo_root` returns the worktree root (not the parent)
+- [ ] Test REQ-003: Running `wonk init` from the parent repo does not index files from the nested worktree
+- [ ] Test REQ-004: The parent repo's daemon ignores file changes inside the nested worktree
+- [ ] Test REQ-005: Two worktrees of the same repo produce separate index directories with different content
+
+**Dependencies:**
+- Blocked by: TASK-035, TASK-036
+- Blocks: None
+
+**Acceptance Criteria:**
+- All 5 PRD-WKT requirements verified with integration tests
+- Tests use real `git worktree` commands (not mocks)
+- Running `wonk search` inside a linked worktree returns only that worktree's results
+- Two worktrees produce separate indexes
+- A nested worktree does not pollute the parent's index
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-WKT-REQ-001 through PRD-WKT-REQ-005
+**Related Decisions:** DR-008
+
+**Status:** Not Started
+
+---
+
 ## Parking Lot
 
 Tasks identified but not yet scheduled:
@@ -1376,3 +1491,4 @@ Tasks identified but not yet scheduled:
 |------|--------|--------|
 | 2026-02-11 | Initial task breakdown — 30 tasks across 6 milestones | TBD |
 | 2026-02-11 | Added Smart Search milestone (M6, TASK-031 to TASK-034). Renumbered Polish to M7. Updated milestone statuses. Total tasks: 34 across 7 milestones. Reframed around token-efficiency value proposition. | TBD |
+| 2026-02-12 | Added Git Worktree Support milestone (M8, TASK-035 to TASK-037). 3 tasks: walker boundary exclusion, watcher boundary filtering, integration tests. Total tasks: 37 across 8 milestones. | TBD |

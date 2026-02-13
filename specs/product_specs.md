@@ -16,16 +16,18 @@
 
 ## 1) Product context
 
-- **Vision:** A single-binary CLI tool that provides fast, structure-aware code search for LLM coding agents. It pre-indexes a codebase using Tree-sitter, maintains the index via a background file watcher, and exposes results through a grep-compatible interface that existing tools can use with zero integration work.
+- **Vision:** A single-binary CLI tool that provides structure-aware code search optimized for LLM coding agents. The core problem it solves is **token burn**: agents like Claude Code grep aggressively, stuffing hundreds of noisy, unranked lines into their context window. Wonk pre-indexes a codebase using Tree-sitter, understands code structure (definitions vs. usages, symbol kinds, scopes, imports), and returns results that are **filtered, ranked, and deduplicated** — delivering higher signal in fewer tokens. It maintains the index via a background file watcher and exposes results through a grep-compatible interface that existing tools can use with zero integration work.
 - **Target users / segments:**
   - **Primary:** LLM coding agents (Claude Code, Aider, Continue, Cursor agent mode) that invoke CLI tools for codebase navigation.
   - **Secondary:** Developers who want fast structural code search from the terminal.
 - **Key JTBDs:**
+  - Reduce token consumption by returning ranked, deduplicated, structure-aware search results instead of raw grep output.
   - Find symbol definitions instantly without scanning every file.
   - Find all usages of a symbol name across the codebase.
   - Understand file-level dependency relationships.
   - Get grep-compatible output that LLM agents can parse without changes.
 - **North-star metrics:**
+  - Token reduction: `wonk search` returns ≥ 50% fewer lines than equivalent `rg` for the same query, while preserving ≥ 95% of relevant results.
   - Time to first result (warm index) < 100ms
   - Precision of `wonk sym` (correct definitions returned) > 90%
   - Recall of `wonk ref` (usages found vs grep baseline) > 80%
@@ -73,7 +75,41 @@ LLM agents and developers need fast, grep-compatible text search across indexed 
 
 ---
 
-### 3.2 Symbol Lookup (PRD-SYM)
+### 3.2 Smart Search (PRD-SSRCH)
+
+**Problem / outcome**
+Raw grep results are the #1 source of token burn for LLM coding agents. A search for a common symbol name returns every occurrence — definitions, usages, imports, re-exports, comments, test fixtures — with no ranking or deduplication. The agent stuffs all of this into its context window, wasting tokens on noise.
+
+**In scope**
+- Structure-aware result ranking (definitions first, then call sites, then other usages)
+- Result grouping by symbol kind (definitions, references, imports, comments, tests)
+- Deduplication (same symbol re-exported or aliased appears once)
+- Token-budget mode: limit output to an approximate token count
+- Automatic detection of whether a query matches a known symbol (use structural results) or is a plain string (use text search)
+
+**Out of scope**
+- Semantic/embedding search (V2)
+- Type-aware deduplication (V2 — requires LSP)
+
+**EARS Requirements**
+- `PRD-SSRCH-REQ-001` When the user runs `wonk search <pattern>` and the pattern matches known symbol names in the index then the system shall return results ranked by relevance: definitions first, then call sites, then imports, then other usages, then comments and test files.
+- `PRD-SSRCH-REQ-002` When returning ranked results then the system shall group results by category and display a category header (e.g., `-- definitions --`, `-- usages --`, `-- tests --`).
+- `PRD-SSRCH-REQ-003` When the same symbol appears multiple times due to re-exports, type declarations, or import aliases then the system shall deduplicate results, showing the canonical definition and noting the count of duplicates.
+- `PRD-SSRCH-REQ-004` When the user provides `--budget <n>` then the system shall limit output to approximately `n` tokens, prioritizing higher-ranked results.
+- `PRD-SSRCH-REQ-005` When the pattern does not match any known symbol names then the system shall fall back to unranked text search (equivalent to grep).
+- `PRD-SSRCH-REQ-006` When the user provides `--raw` then the system shall skip ranking and deduplication, returning unranked grep-style results.
+
+**Acceptance criteria**
+- For queries matching known symbols, output contains ≥ 50% fewer lines than equivalent `rg` while preserving ≥ 95% of relevant results
+- Definitions always appear before usages in ranked output
+- Duplicate re-exports are collapsed
+- `--budget` limits output length
+- `--raw` bypasses smart filtering
+- Test files and comments are ranked lowest
+
+---
+
+### 3.3 Symbol Lookup (PRD-SYM)
 
 **Problem / outcome**
 Users need to quickly find symbol definitions (functions, classes, types) by name without scanning entire files.
@@ -99,7 +135,7 @@ Users need to quickly find symbol definitions (functions, classes, types) by nam
 
 ---
 
-### 3.3 Reference Finding (PRD-REF)
+### 3.4 Reference Finding (PRD-REF)
 
 **Problem / outcome**
 Users need to find all usages of a symbol name across the codebase.
@@ -122,7 +158,7 @@ Users need to find all usages of a symbol name across the codebase.
 
 ---
 
-### 3.4 Signature Display (PRD-SIG)
+### 3.5 Signature Display (PRD-SIG)
 
 **Problem / outcome**
 Users need to view function/method signatures without opening files.
@@ -142,7 +178,7 @@ Users need to view function/method signatures without opening files.
 
 ---
 
-### 3.5 Symbol Listing (PRD-LST)
+### 3.6 Symbol Listing (PRD-LST)
 
 **Problem / outcome**
 Users need to see all symbols defined in a file or directory for navigation.
@@ -164,7 +200,7 @@ Users need to see all symbols defined in a file or directory for navigation.
 
 ---
 
-### 3.6 Dependency Graph (PRD-DEP)
+### 3.7 Dependency Graph (PRD-DEP)
 
 **Problem / outcome**
 Users need to understand file-level dependency relationships.
@@ -186,7 +222,7 @@ Users need to understand file-level dependency relationships.
 
 ---
 
-### 3.7 Index Build (PRD-IDX)
+### 3.8 Index Build (PRD-IDX)
 
 **Problem / outcome**
 The system needs to build and maintain a structural index of the codebase using Tree-sitter parsing and persistent storage.
@@ -226,7 +262,7 @@ The system needs to build and maintain a structural index of the codebase using 
 
 ---
 
-### 3.8 Background Daemon (PRD-DMN)
+### 3.9 Background Daemon (PRD-DMN)
 
 **Problem / outcome**
 The index must stay current as files change without requiring manual re-indexing.
@@ -263,7 +299,7 @@ The index must stay current as files change without requiring manual re-indexing
 
 ---
 
-### 3.9 Auto-Initialization (PRD-AUT)
+### 3.10 Auto-Initialization (PRD-AUT)
 
 **Problem / outcome**
 Users should get results on first use without explicit setup steps, regardless of repo size.
@@ -286,7 +322,7 @@ Users should get results on first use without explicit setup steps, regardless o
 
 ---
 
-### 3.10 Query Fallback (PRD-FBK)
+### 3.11 Query Fallback (PRD-FBK)
 
 **Problem / outcome**
 The tool must always return useful results even when the index is incomplete or structural data is unavailable.
@@ -314,7 +350,7 @@ The tool must always return useful results even when the index is incomplete or 
 
 ---
 
-### 3.11 Configuration (PRD-CFG)
+### 3.12 Configuration (PRD-CFG)
 
 **Problem / outcome**
 Users need to customize behavior without requiring config for default usage.
@@ -346,7 +382,7 @@ Users need to customize behavior without requiring config for default usage.
 
 ---
 
-### 3.12 Distribution (PRD-DST)
+### 3.13 Distribution (PRD-DST)
 
 **Problem / outcome**
 The tool must be easily installable across platforms as a single binary with no dependencies.
@@ -375,7 +411,7 @@ The tool must be easily installable across platforms as a single binary with no 
 
 ---
 
-### 3.13 Output Formats (PRD-OUT)
+### 3.14 Output Formats (PRD-OUT)
 
 **Problem / outcome**
 All commands must support consistent output formats for both human and machine consumers.
@@ -399,11 +435,42 @@ All commands must support consistent output formats for both human and machine c
 
 ---
 
+### 3.15 Git Worktree Support (PRD-WKT)
+
+**Problem / outcome**
+Developers who use git worktrees to work on multiple branches simultaneously cannot use wonk reliably. A linked worktree has a `.git` file (not directory) pointing to the main repo's git directory. Without explicit worktree awareness, the tool may conflate worktrees — indexing files from one worktree into another's index, or returning search results from a different branch's checkout.
+
+**In scope**
+- Correct repo root detection for linked worktrees (`.git` file)
+- Separate index per worktree (natural from path-based hashing)
+- Separate daemon per worktree
+- Exclusion of nested worktree directories during indexing and file watching
+
+**Out of scope**
+- Shared/branch-aware indexes across worktrees
+- Cross-worktree search or reference finding
+
+**EARS Requirements**
+- `PRD-WKT-REQ-001` When the system discovers a `.git` entry during repo root detection then it shall accept both a `.git` directory (regular repo) and a `.git` file (linked worktree) as valid repo root markers.
+- `PRD-WKT-REQ-002` When a worktree is nested inside another repository's directory tree then the system shall use the nearest worktree root (the first `.git` or `.wonk` encountered walking upward from the working directory).
+- `PRD-WKT-REQ-003` When indexing a repository then the system shall skip any subdirectory that contains a `.git` entry (file or directory), treating it as a separate repository or worktree boundary.
+- `PRD-WKT-REQ-004` When the file watcher receives events from a path within a nested worktree boundary then the system shall ignore those events.
+- `PRD-WKT-REQ-005` When a linked worktree is indexed then the system shall store its index independently, keyed by the worktree's own root path (not the main repository's path).
+
+**Acceptance criteria**
+- Running `wonk search` inside a linked worktree returns only results from that worktree's checked-out files
+- Two worktrees of the same repo produce separate indexes with different content
+- A worktree nested inside another repo's directory does not pollute the parent repo's index
+- The daemon for a parent repo does not re-index files belonging to a nested worktree
+
+---
+
 ## 4) Traceability
 
 | Feature | Requirement IDs | Count |
 |---|---|---|
 | Text Search | PRD-SRCH-REQ-001 to 005 | 5 |
+| Smart Search | PRD-SSRCH-REQ-001 to 006 | 6 |
 | Symbol Lookup | PRD-SYM-REQ-001 to 004 | 4 |
 | Reference Finding | PRD-REF-REQ-001 to 003 | 3 |
 | Signature Display | PRD-SIG-REQ-001 | 1 |
@@ -416,7 +483,8 @@ All commands must support consistent output formats for both human and machine c
 | Configuration | PRD-CFG-REQ-001 to 010 | 10 |
 | Distribution | PRD-DST-REQ-001 to 007 | 7 |
 | Output Formats | PRD-OUT-REQ-001 to 003 | 3 |
-| **Total** | | **74** |
+| Git Worktree Support | PRD-WKT-REQ-001 to 005 | 5 |
+| **Total** | | **85** |
 
 ---
 
@@ -430,6 +498,7 @@ All original open questions have been resolved:
 | OQ-002 | Reference accuracy | Name-based only, no heuristic disambiguation for V1 |
 | OQ-003 | Auto-init threshold | No cap; always auto-init with progress indicator |
 | OQ-004 | Tool name | Renamed from `csi` to `wonk` |
+| OQ-005 | Smart search ranking weights | How should results be weighted between definitions, call sites, imports, comments, and test files? Needs validation with real Claude Code sessions to calibrate. | Open |
 
 ---
 

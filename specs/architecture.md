@@ -9,7 +9,9 @@
 
 ## 1) Executive Summary
 
-Wonk is a single-binary Rust CLI tool that provides fast, structure-aware code search for LLM coding agents. It combines a Tree-sitter-based structural indexer with the `grep` crate (ripgrep internals) for text search, backed by SQLite for persistent storage.
+Wonk is a single-binary Rust CLI tool that provides structure-aware code search optimized for LLM coding agents. Its core value is **reducing token burn**: where raw grep returns hundreds of noisy, unranked lines that consume an agent's context window, Wonk uses structural understanding to filter, rank, and deduplicate results — delivering higher signal in fewer tokens.
+
+It combines a Tree-sitter-based structural indexer with the `grep` crate (ripgrep internals) for text search, backed by SQLite for persistent storage. A Smart Search layer sits between the query router and the output, using index metadata to rank results (definitions before usages, deduplication of re-exports, deprioritization of tests and comments) and optionally enforcing a token budget.
 
 The architecture prioritizes simplicity and low resource usage. A single Rust crate organized into modules handles both CLI queries and background indexing. The daemon process shares the SQLite database with CLI invocations — no IPC protocol is needed. Concurrency uses sync Rust with `rayon` for parallel indexing; no async runtime is required since all workloads are CPU-bound or event-driven (filesystem watching).
 
@@ -20,6 +22,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 ## 2) Architectural Drivers
 
 ### 2.1 Business Drivers
+- **Token efficiency:** Raw grep is the #1 token burner in LLM coding agents. Wonk returns ranked, deduplicated, structure-aware results that use ≥ 50% fewer tokens while preserving ≥ 95% of relevant results.
 - Drop-in grep replacement for LLM coding agents — zero integration work
 - Zero-config first use — auto-initializes on first query
 - Single binary, no external dependencies — trivial to install and distribute
@@ -41,7 +44,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Language:** Rust (required for single static binary, native Tree-sitter FFI, grep crate access)
 - **No async runtime:** Sync Rust + rayon only (DR-002)
 - **No IPC:** CLI and daemon communicate only via shared SQLite (DR-003)
-- **Rollback journal:** SQLite default journal mode, not WAL (DR-004)
+- **WAL mode:** SQLite WAL journal mode for concurrent reader/writer access (DR-004)
 
 ---
 
@@ -56,6 +59,9 @@ Key technology choices: Rust for single static binary distribution and native Tr
 ├─────────────────────────────────────────────────┤
 │               Query Router                       │
 │  Routes queries to index or grep fallback        │
+├─────────────────────────────────────────────────┤
+│           Smart Search Ranker                    │
+│  Ranks, deduplicates, and budget-caps results    │
 ├────────────────────┬────────────────────────────┤
 │  Structural Index  │      Text Search            │
 │  (Tree-sitter +    │      (grep crate)           │
@@ -77,6 +83,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 |-----------|---------------|------------|
 | CLI | Parse commands, dispatch to query router, format output | clap 4.5 (derive), serde_json |
 | Query Router | Route queries to SQLite index or grep fallback | Custom module |
+| Smart Search Ranker | Rank, deduplicate, and budget-cap search results using structural metadata | Custom module |
 | Structural Index | Parse files, extract symbols/references, manage index | tree-sitter 0.26, rusqlite 0.38 |
 | Text Search | Grep-compatible text search across files | grep 0.4, ignore 0.4 |
 | SQLite Database | Persistent storage for symbols, references, metadata | rusqlite 0.38 (bundled + FTS5) |
@@ -131,7 +138,33 @@ Key technology choices: Rust for single static binary distribution and native Tr
 
 **Related Requirements:** PRD-FBK-REQ-001 through PRD-FBK-REQ-005, PRD-SIG-REQ-001, PRD-LST-REQ-001, PRD-LST-REQ-002, PRD-DEP-REQ-001, PRD-DEP-REQ-002
 
-### 4.3 Structural Index (Indexer)
+### 4.3 Smart Search Ranker
+
+**Responsibility:** Take raw search results (from either SQLite index or grep fallback), enrich them with structural metadata, rank by relevance, deduplicate, and enforce token budgets.
+
+**Technology:** Custom Rust module, no additional dependencies
+
+**Interfaces:**
+- Exposes: `rank_results(raw_results, index_metadata, options) -> RankedResults`
+- Consumes: SQLite Database (for symbol/reference metadata), raw grep results
+
+**Key Design Notes:**
+- **Ranking tiers** (highest to lowest priority):
+  1. Symbol definitions (function, class, type declarations)
+  2. Call sites / direct usages
+  3. Import/export statements
+  4. Comments and documentation
+  5. Test files (detected by path heuristics: `test/`, `tests/`, `*_test.*`, `*.test.*`, `*.spec.*`)
+- **Deduplication:** When the same symbol appears in multiple locations due to re-exports, barrel files, or type declaration files, collapse to the canonical definition and note `(+N other locations)`
+- **Token budget mode (`--budget <n>`):** Estimate tokens per result line (~4 chars/token heuristic), emit results in rank order until budget exhausted, append `-- N more results truncated --` summary
+- **Category headers:** When ranked mode is active, insert headers between tiers: `-- definitions --`, `-- usages --`, `-- imports --`, `-- tests --`
+- **Bypass:** `--raw` flag skips the ranker entirely, returning unranked grep-style output
+- **Symbol detection:** On `wonk search <pattern>`, check if pattern matches any symbol name in the index. If yes, use ranked mode. If no, use plain text search (no ranking).
+- Applied as a post-processing step — does not change the underlying search engines
+
+**Related Requirements:** PRD-SSRCH-REQ-001 through PRD-SSRCH-REQ-006
+
+### 4.4 Structural Index (Indexer)
 
 **Responsibility:** Parse source files with Tree-sitter, extract symbols and references, write to SQLite.
 
@@ -147,10 +180,11 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - Extracts per the PRD: functions, methods, classes, structs, interfaces, enums, traits, type aliases, constants, exported symbols, function calls, type annotations, import statements
 - Records file metadata: language, line count, content hash (xxhash), import/export list
 - Tree-sitter grammars bundled at compile time — one `tree-sitter-{lang}` crate per language
+- **Worktree boundary exclusion (DR-008):** The `WalkBuilder` uses a `filter_entry` callback that checks each directory for a `.git` entry (file or directory). If found and the directory is not the repo root itself, the entire subtree is skipped — treating it as a separate repository or worktree boundary.
 
-**Related Requirements:** PRD-IDX-REQ-001 through PRD-IDX-REQ-011, PRD-SYM-REQ-001 through PRD-SYM-REQ-004, PRD-REF-REQ-001 through PRD-REF-REQ-003
+**Related Requirements:** PRD-IDX-REQ-001 through PRD-IDX-REQ-011, PRD-SYM-REQ-001 through PRD-SYM-REQ-004, PRD-REF-REQ-001 through PRD-REF-REQ-003, PRD-WKT-REQ-003
 
-### 4.4 Text Search
+### 4.5 Text Search
 
 **Responsibility:** Grep-compatible text search across files, used as primary backend for `wonk search` and as fallback for structural queries.
 
@@ -168,7 +202,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 
 **Related Requirements:** PRD-SRCH-REQ-001 through PRD-SRCH-REQ-005, PRD-FBK-REQ-001 through PRD-FBK-REQ-003
 
-### 4.5 Background Daemon
+### 4.6 Background Daemon
 
 **Responsibility:** Watch filesystem for changes and keep the index current via incremental re-indexing.
 
@@ -188,10 +222,11 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - Auto-exits after configurable idle timeout (default 30 minutes)
 - Single instance per repo enforced via PID file
 - Detaches from parent process (daemonizes) so CLI can exit immediately
+- **Worktree boundary filtering (DR-008):** The `should_process` event filter checks whether an event path falls within a nested worktree boundary by walking ancestor directories (between the event path and the repo root) for `.git` entries. Events inside a nested boundary are discarded. Cost is O(depth) `exists()` calls per event, negligible since events are debounced.
 
-**Related Requirements:** PRD-DMN-REQ-001 through PRD-DMN-REQ-014
+**Related Requirements:** PRD-DMN-REQ-001 through PRD-DMN-REQ-014, PRD-WKT-REQ-004
 
-### 4.6 Configuration
+### 4.7 Configuration
 
 **Responsibility:** Load, merge, and provide configuration values to all components.
 
@@ -321,8 +356,9 @@ Local mode (`wonk init --local`):
   config.toml       # per-repo overrides
 ```
 
-Repo root discovery: walk up from CWD looking for `.git` or `.wonk`.
-Repo path hash: SHA256 of the canonical repo root path, truncated to first 16 hex chars.
+Repo root discovery: walk up from CWD looking for `.git` or `.wonk`. Accepts both `.git` directories (regular repos) and `.git` files (linked worktrees) as valid markers (PRD-WKT-REQ-001). The nearest match wins, so a worktree nested inside another repo resolves to the worktree's own root (PRD-WKT-REQ-002).
+
+Repo path hash: SHA256 of the canonical repo root path, truncated to first 16 hex chars. Each worktree has its own root path and therefore its own hash — producing a separate index directory automatically (PRD-WKT-REQ-005).
 
 ---
 
@@ -548,15 +584,15 @@ GitHub Actions workflow:
    - Pros: Zero configuration, simplest possible
    - Cons: Writers block readers during commits (brief, ~5-20ms per file transaction)
 
-**Decision:** Option 3 — Rollback journal with busy timeout
+**Decision:** Option 1 — WAL mode with busy timeout
 
-**Rationale:** Simplest approach. Write transactions are small (one file's symbols at a time, ~5-20ms), so CLI queries only block briefly if they coincide with a daemon commit. `PRAGMA busy_timeout=5000` ensures retries rather than failures. Product spec updated to accept brief blocking (< 50ms) during concurrent daemon writes.
+**Rationale:** WAL mode allows concurrent readers and a single writer without blocking. Write transactions are small (one file's symbols at a time, ~5-20ms), so contention is minimal. `PRAGMA busy_timeout=5000` ensures retries rather than failures if two writers coincide. This is the proven pattern for daemon+CLI workloads sharing a SQLite database.
 
 **Consequences:**
-- CLI queries may experience brief blocking (~5-20ms) during daemon writes
-- `busy_timeout=5000` set on all connections to handle contention gracefully
-- Product spec NFR updated: "Brief blocking (< 50ms) is acceptable during concurrent daemon writes"
-- Can upgrade to WAL mode later if contention proves problematic in practice
+- CLI queries proceed without blocking during daemon writes (readers never block)
+- `busy_timeout=5000` set on all connections to handle writer contention gracefully
+- WAL file may grow during sustained writes; SQLite checkpoints automatically
+- Slightly more disk usage than rollback journal (WAL + shared-memory files)
 
 ---
 
@@ -564,7 +600,7 @@ GitHub Actions workflow:
 
 **Status:** Accepted
 **Date:** 2026-02-11
-**Context:** Need to select key Rust dependencies aligned with architecture decisions (sync + rayon, rollback journal SQLite, single binary).
+**Context:** Need to select key Rust dependencies aligned with architecture decisions (sync + rayon, WAL mode SQLite, single binary).
 
 **Options Considered:** For each role, the selected crate is the ecosystem standard. Alternatives considered and rejected inline.
 
@@ -658,12 +694,41 @@ GitHub Actions workflow:
 
 ---
 
+### DR-008: Worktree Boundary Detection Strategy
+
+**Status:** Accepted
+**Date:** 2026-02-12
+**Context:** Git worktrees and nested repositories inside a parent repo's directory tree must not be indexed or watched by the parent. The walker and file watcher need a mechanism to detect `.git` entries in subdirectories and treat them as boundaries. (PRD-WKT-REQ-003, PRD-WKT-REQ-004)
+
+**Options Considered:**
+1. **Inline boundary check (filter callback)** — Per-directory `exists()` check in walker's `filter_entry()` and watcher's `should_process()`
+   - Pros: Simplest (~20 lines per component), no cache, always correct when worktrees are added/removed
+   - Cons: One `exists()` syscall per directory in walker; O(depth) checks per watcher event batch
+2. **Pre-computed boundary set** — Scan for nested `.git` entries at startup, maintain `HashSet<PathBuf>`
+   - Pros: O(1) per-event lookup
+   - Cons: Stale when worktrees created/deleted, extra startup cost, more state to manage
+3. **Hybrid (inline walker, pre-computed watcher)** — Different mechanisms per component
+   - Pros: Fast watcher lookups
+   - Cons: Two mechanisms for same concept, over-engineered for V1
+
+**Decision:** Option 1 — Inline boundary check
+
+**Rationale:** The cost is negligible — the walker already performs stat calls for gitignore processing, and watcher events are debounced (batched over 500ms). Always correct without caching concerns. If profiling later shows the watcher check is a bottleneck, upgrading to Option 3 is a backward-compatible change.
+
+**Consequences:**
+- Walker's `WalkBuilder` gains a `filter_entry` callback that skips directories containing `.git` (unless it's the repo root)
+- Watcher's `should_process` gains ancestor-path checking for `.git` boundaries between the event path and repo root
+- No new data structures or caches
+- Automatically handles dynamic worktree creation/deletion
+
+---
+
 ## 12) Open Questions & Risks
 
 | ID | Question/Risk | Impact | Mitigation | Owner |
 |----|---------------|--------|------------|-------|
 | AR-001 | grep crate documentation is sparse — may be hard to use correctly | M | Reference ripgrep source code for usage patterns | Eng |
-| AR-002 | Rollback journal contention under heavy writes (e.g., initial index of 50k files while CLI queries) | L | busy_timeout handles it; can upgrade to WAL if needed | Eng |
+| AR-002 | WAL file growth under sustained heavy writes (e.g., initial index of 50k files) | L | SQLite auto-checkpoints; busy_timeout handles writer contention | Eng |
 | AR-003 | Binary size budget (30 MB) with 10 bundled grammars + SQLite + grep engine | M | Monitor in CI; strip binaries; consider LTO | Eng |
 | AR-004 | Windows cross-compilation with C FFI deps (SQLite, Tree-sitter) | L | P2 priority; can switch to native Windows runner if cross fails | Eng |
 | AR-005 | tree-sitter 0.26 deprecated APIs (set_timeout_micros, set_allocator) | L | Use progress callbacks instead; monitor for 0.27 migration | Eng |
@@ -680,8 +745,8 @@ GitHub Actions workflow:
 | Reference | A usage/mention of a symbol name in source code |
 | FTS5 | SQLite Full-Text Search extension version 5 |
 | Tree-sitter | Incremental parsing library that builds concrete syntax trees |
-| WAL | Write-Ahead Logging — SQLite journal mode (not used in V1, see DR-004) |
-| Rollback journal | SQLite's default journal mode — serializes writes |
+| WAL | Write-Ahead Logging — SQLite journal mode enabling concurrent reads during writes (see DR-004) |
+| Rollback journal | SQLite's default journal mode — serializes reads and writes |
 
 ### B. Module Layout (initial)
 
@@ -690,6 +755,7 @@ src/
   main.rs           # Entry point, clap setup, dispatch
   cli.rs            # Command definitions and output formatting
   router.rs         # Query routing and fallback logic
+  ranker.rs         # Smart search ranking, deduplication, token budgeting
   db.rs             # SQLite connection management, schema, queries
   indexer.rs         # Tree-sitter parsing, symbol/reference extraction
   search.rs          # grep crate text search wrapper
