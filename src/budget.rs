@@ -8,13 +8,13 @@
 ///
 /// Returns `(text.len() + 3) / 4` (ceiling division by 4).
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Estimate the number of tokens from a byte length using the ~4 bytes/token
 /// heuristic. Equivalent to `estimate_tokens` but avoids requiring a `&str`.
 pub fn estimate_tokens_from_len(byte_len: usize) -> usize {
-    (byte_len + 3) / 4
+    byte_len.div_ceil(4)
 }
 
 /// Tracks cumulative token consumption against a fixed limit.

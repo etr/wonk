@@ -140,10 +140,7 @@ mod tests {
 
     #[test]
     fn exit_code_io() {
-        let err = WonkError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "gone",
-        ));
+        let err = WonkError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
         assert_eq!(err.exit_code(), EXIT_ERROR);
     }
 
@@ -161,10 +158,7 @@ mod tests {
 
     #[test]
     fn hint_io_not_found() {
-        let err = WonkError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "gone",
-        ));
+        let err = WonkError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
         assert!(err.hint().unwrap().contains("exists"));
     }
 
@@ -234,10 +228,8 @@ mod tests {
 
     #[test]
     fn hint_query_failed() {
-        let inner = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(1),
-            Some("test".into()),
-        );
+        let inner =
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(1), Some("test".into()));
         let err = WonkError::Db(DbError::QueryFailed(inner));
         assert!(err.hint().unwrap().contains("rebuild"));
     }

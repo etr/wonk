@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use grep::regex::RegexMatcherBuilder;
-use grep::searcher::{BinaryDetection, SearcherBuilder, Searcher, Sink, SinkMatch};
+use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 
 use crate::walker::Walker;
 
@@ -35,11 +35,11 @@ pub struct SearchResult {
 ///
 /// * `pattern` - The search pattern (literal string or regex).
 /// * `regex` - When `true`, treat `pattern` as a regular expression.
-///             When `false`, metacharacters are escaped so the pattern is
-///             matched literally.
+///   When `false`, metacharacters are escaped so the pattern is
+///   matched literally.
 /// * `ignore_case` - When `true`, match case-insensitively.
 /// * `paths` - Directories/files to search. If empty, searches the current
-///             directory (`.`).
+///   directory (`.`).
 ///
 /// # Returns
 ///
@@ -125,11 +125,7 @@ struct CollectSink<'a> {
 impl<'a> Sink for CollectSink<'a> {
     type Error = std::io::Error;
 
-    fn matched(
-        &mut self,
-        _searcher: &Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         let line_number = mat.line_number().unwrap_or(0);
 
         // Convert matched bytes to a string, stripping trailing newline(s).
@@ -218,7 +214,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(results.len(), 3, "expected 3 case-insensitive matches, got: {results:?}");
+        assert_eq!(
+            results.len(),
+            3,
+            "expected 3 case-insensitive matches, got: {results:?}"
+        );
     }
 
     #[test]
@@ -234,7 +234,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(results.len(), 1, "expected 1 case-sensitive match, got: {results:?}");
+        assert_eq!(
+            results.len(),
+            1,
+            "expected 1 case-sensitive match, got: {results:?}"
+        );
         assert_eq!(results[0].content, "hello");
     }
 
@@ -251,7 +255,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(results.len(), 2, "expected 2 regex matches, got: {results:?}");
+        assert_eq!(
+            results.len(),
+            2,
+            "expected 2 regex matches, got: {results:?}"
+        );
         assert!(results[0].content.contains("fn main()"));
         assert!(results[1].content.contains("fn helper()"));
     }
@@ -270,7 +278,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(results.len(), 1, "expected 1 literal match for 'a.b', got: {results:?}");
+        assert_eq!(
+            results.len(),
+            1,
+            "expected 1 literal match for 'a.b', got: {results:?}"
+        );
         assert_eq!(results[0].content, "a.b");
     }
 
@@ -289,7 +301,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(results.len(), 3, "expected 3 regex matches for 'a.b', got: {results:?}");
+        assert_eq!(
+            results.len(),
+            3,
+            "expected 3 regex matches for 'a.b', got: {results:?}"
+        );
     }
 
     #[test]
@@ -302,7 +318,11 @@ mod tests {
         let src_path = td.path().join("src").to_string_lossy().into_owned();
         let results = text_search("fn main", false, false, &[src_path]).unwrap();
 
-        assert_eq!(results.len(), 1, "expected 1 match restricted to src/, got: {results:?}");
+        assert_eq!(
+            results.len(),
+            1,
+            "expected 1 match restricted to src/, got: {results:?}"
+        );
         assert!(
             results[0].file.to_string_lossy().contains("src"),
             "match should be in src/ directory"
@@ -318,10 +338,13 @@ mod tests {
 
         let a_path = td.path().join("a").to_string_lossy().into_owned();
         let b_path = td.path().join("b").to_string_lossy().into_owned();
-        let results =
-            text_search("needle", false, false, &[a_path, b_path]).unwrap();
+        let results = text_search("needle", false, false, &[a_path, b_path]).unwrap();
 
-        assert_eq!(results.len(), 2, "expected 2 matches from a/ and b/, got: {results:?}");
+        assert_eq!(
+            results.len(),
+            2,
+            "expected 2 matches from a/ and b/, got: {results:?}"
+        );
     }
 
     #[test]
@@ -381,7 +404,11 @@ mod tests {
         .unwrap();
 
         // Only the text file should match; the binary file is skipped.
-        assert_eq!(results.len(), 1, "expected only text file match, got: {results:?}");
+        assert_eq!(
+            results.len(),
+            1,
+            "expected only text file match, got: {results:?}"
+        );
         assert!(results[0].file.ends_with("text.txt"));
     }
 
@@ -399,6 +426,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "hello world", "trailing newline should be stripped");
+        assert_eq!(
+            results[0].content, "hello world",
+            "trailing newline should be stripped"
+        );
     }
 }

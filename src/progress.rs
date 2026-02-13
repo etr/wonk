@@ -110,7 +110,7 @@ impl Progress {
         match self.mode {
             ProgressMode::Silent => {}
             ProgressMode::InPlace => {
-                if current == total || current % 50 == 0 {
+                if current == total || current.is_multiple_of(50) {
                     self.render_in_place(current, total);
                 }
             }
@@ -152,7 +152,7 @@ impl Progress {
                     stats.elapsed.as_secs_f64(),
                 );
                 // Pad with spaces to clear any leftover characters from progress line
-                eprint!("{:<80}\n", msg);
+                eprintln!("{:<80}", msg);
             }
             ProgressMode::LineBased => {
                 eprintln!(

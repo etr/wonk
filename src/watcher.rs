@@ -7,14 +7,14 @@
 //! and dispatches to a caller-supplied handler.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use notify_debouncer_mini::notify::RecursiveMode;
-use notify_debouncer_mini::{DebouncedEvent, DebounceEventResult, new_debouncer};
+use notify_debouncer_mini::{DebounceEventResult, DebouncedEvent, new_debouncer};
 
 // ---------------------------------------------------------------------------
 // File event types
@@ -108,10 +108,11 @@ pub fn should_process(path: &Path, repo_root: &Path) -> bool {
 
         // Check hidden directories/files (starting with `.`), excluding
         // allowlisted names.
-        if name.starts_with('.') && !HIDDEN_ALLOWLIST.iter().any(|a| *a == &*name) {
-            if let std::path::Component::Normal(_) = component {
-                return false;
-            }
+        if name.starts_with('.')
+            && !HIDDEN_ALLOWLIST.iter().any(|a| *a == &*name)
+            && let std::path::Component::Normal(_) = component
+        {
+            return false;
         }
     }
 
@@ -150,10 +151,7 @@ impl FileWatcher {
     /// Returns the watcher (which must be kept alive) and a receiver for
     /// batches of classified `FileEvent`s.  Events for paths that fail the
     /// `should_process` filter are silently dropped before being sent.
-    pub fn new(
-        repo_root: &Path,
-        debounce_ms: u64,
-    ) -> Result<(Self, Receiver<Vec<FileEvent>>)> {
+    pub fn new(repo_root: &Path, debounce_ms: u64) -> Result<(Self, Receiver<Vec<FileEvent>>)> {
         let (tx, rx): (Sender<Vec<FileEvent>>, Receiver<Vec<FileEvent>>) =
             crossbeam_channel::unbounded();
 
@@ -188,14 +186,14 @@ impl FileWatcher {
         debouncer
             .watcher()
             .watch(repo_root, RecursiveMode::Recursive)
-            .with_context(|| {
-                format!(
-                    "starting recursive watch on {}",
-                    repo_root.display()
-                )
-            })?;
+            .with_context(|| format!("starting recursive watch on {}", repo_root.display()))?;
 
-        Ok((FileWatcher { _debouncer: debouncer }, rx))
+        Ok((
+            FileWatcher {
+                _debouncer: debouncer,
+            },
+            rx,
+        ))
     }
 }
 
@@ -211,11 +209,8 @@ impl FileWatcher {
 ///
 /// `handler` receives a slice of events per batch.  It is expected to perform
 /// incremental re-indexing (upsert for Created/Modified, removal for Deleted).
-pub fn run_event_loop<F>(
-    rx: &Receiver<Vec<FileEvent>>,
-    shutdown: &Arc<AtomicBool>,
-    mut handler: F,
-) where
+pub fn run_event_loop<F>(rx: &Receiver<Vec<FileEvent>>, shutdown: &Arc<AtomicBool>, mut handler: F)
+where
     F: FnMut(&[FileEvent]),
 {
     // Use a short timeout so we can check the shutdown flag periodically.
@@ -266,62 +261,98 @@ mod tests {
 
     #[test]
     fn test_should_process_nested_source_file() {
-        assert!(should_process(Path::new("src/utils/helpers.rs"), Path::new(NO_ROOT)));
+        assert!(should_process(
+            Path::new("src/utils/helpers.rs"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_node_modules() {
-        assert!(!should_process(Path::new("node_modules/pkg/index.js"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new("node_modules/pkg/index.js"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_vendor() {
-        assert!(!should_process(Path::new("vendor/lib.go"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new("vendor/lib.go"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_target() {
-        assert!(!should_process(Path::new("target/debug/binary"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new("target/debug/binary"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_build() {
-        assert!(!should_process(Path::new("build/output.js"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new("build/output.js"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_dist() {
-        assert!(!should_process(Path::new("dist/bundle.js"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new("dist/bundle.js"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_pycache() {
-        assert!(!should_process(Path::new("__pycache__/module.pyc"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new("__pycache__/module.pyc"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_venv() {
-        assert!(!should_process(Path::new(".venv/bin/python"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new(".venv/bin/python"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_git_dir() {
-        assert!(!should_process(Path::new(".git/objects/pack/abc"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new(".git/objects/pack/abc"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_hidden_directory() {
-        assert!(!should_process(Path::new(".hidden/secret.txt"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new(".hidden/secret.txt"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_hidden_config_dir() {
-        assert!(!should_process(Path::new(".config/settings.toml"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new(".config/settings.toml"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
     fn test_should_process_allows_github_directory() {
-        assert!(should_process(Path::new(".github/workflows/ci.yml"), Path::new(NO_ROOT)));
+        assert!(should_process(
+            Path::new(".github/workflows/ci.yml"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
@@ -336,7 +367,10 @@ mod tests {
 
     #[test]
     fn test_should_process_rejects_deep_hidden() {
-        assert!(!should_process(Path::new("src/.cache/data"), Path::new(NO_ROOT)));
+        assert!(!should_process(
+            Path::new("src/.cache/data"),
+            Path::new(NO_ROOT)
+        ));
     }
 
     #[test]
@@ -363,10 +397,7 @@ mod tests {
 
         // Path inside nested repo should be rejected
         assert!(
-            !should_process(
-                Path::new("libs/nested-repo/src/lib.rs"),
-                dir.path()
-            ),
+            !should_process(Path::new("libs/nested-repo/src/lib.rs"), dir.path()),
             "events inside nested worktree boundary (.git dir) should be rejected"
         );
     }
@@ -385,10 +416,7 @@ mod tests {
         fs::write(dir.path().join("libs/linked-wt/src/lib.rs"), "").unwrap();
 
         assert!(
-            !should_process(
-                Path::new("libs/linked-wt/src/lib.rs"),
-                dir.path()
-            ),
+            !should_process(Path::new("libs/linked-wt/src/lib.rs"), dir.path()),
             "events inside nested worktree boundary (.git file) should be rejected"
         );
     }
@@ -433,24 +461,17 @@ mod tests {
         fs::write(dir.path().join("a/b/c/nested/deep/src/lib.rs"), "").unwrap();
 
         assert!(
-            !should_process(
-                Path::new("a/b/c/nested/deep/src/lib.rs"),
-                dir.path()
-            ),
+            !should_process(Path::new("a/b/c/nested/deep/src/lib.rs"), dir.path()),
             "events from deeply nested worktree boundary should be rejected"
         );
     }
 
     #[test]
     fn test_should_process_preserves_git_dir_rejection() {
-        use std::fs;
         let dir = tempfile::tempdir().unwrap();
         // Existing behavior: .git dir in path components should still be rejected
         assert!(
-            !should_process(
-                Path::new(".git/objects/pack/abc"),
-                dir.path()
-            ),
+            !should_process(Path::new(".git/objects/pack/abc"), dir.path()),
             ".git directory events should still be rejected (existing behavior)"
         );
     }
@@ -543,7 +564,10 @@ mod tests {
             called = true;
         });
 
-        assert!(!called, "handler should not be called when shutdown is immediate");
+        assert!(
+            !called,
+            "handler should not be called when shutdown is immediate"
+        );
     }
 
     #[test]
@@ -559,7 +583,10 @@ mod tests {
             called = true;
         });
 
-        assert!(!called, "handler should not be called when channel is disconnected");
+        assert!(
+            !called,
+            "handler should not be called when channel is disconnected"
+        );
     }
 
     #[test]
@@ -569,7 +596,8 @@ mod tests {
 
         // Send an empty batch followed by a non-empty one.
         tx.send(vec![]).unwrap();
-        tx.send(vec![FileEvent::Modified(PathBuf::from("a.rs"))]).unwrap();
+        tx.send(vec![FileEvent::Modified(PathBuf::from("a.rs"))])
+            .unwrap();
 
         let shutdown_clone = Arc::clone(&shutdown);
         std::thread::spawn(move || {
@@ -608,7 +636,9 @@ mod tests {
         assert!(!events.is_empty(), "event batch should not be empty");
         // The file exists so it should be Modified (our classification).
         assert!(
-            events.iter().any(|e| matches!(e, FileEvent::Modified(p) if p == &file_path)),
+            events
+                .iter()
+                .any(|e| matches!(e, FileEvent::Modified(p) if p == &file_path)),
             "should see Modified event for the created file, got: {events:?}"
         );
 
@@ -661,7 +691,10 @@ mod tests {
             .iter()
             .any(|e| e.path().to_string_lossy().contains("node_modules"));
 
-        assert!(has_lib, "should receive event for src/lib.rs, got: {all_events:?}");
+        assert!(
+            has_lib,
+            "should receive event for src/lib.rs, got: {all_events:?}"
+        );
         assert!(
             !has_node_modules,
             "should NOT receive events for node_modules, got: {all_events:?}"

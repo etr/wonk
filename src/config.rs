@@ -18,7 +18,7 @@ use serde::Deserialize;
 // ---------------------------------------------------------------------------
 
 /// Top-level configuration, fully resolved with defaults applied.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Config {
     pub daemon: DaemonConfig,
     pub index: IndexConfig,
@@ -54,7 +54,7 @@ pub struct OutputConfig {
 }
 
 /// Ignore / exclusion settings.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct IgnoreConfig {
     /// Extra glob patterns to exclude from walks and indexing.
     pub patterns: Vec<String>,
@@ -63,17 +63,6 @@ pub struct IgnoreConfig {
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            daemon: DaemonConfig::default(),
-            index: IndexConfig::default(),
-            output: OutputConfig::default(),
-            ignore: IgnoreConfig::default(),
-        }
-    }
-}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -98,14 +87,6 @@ impl Default for OutputConfig {
         Self {
             default_format: "grep".to_string(),
             color: "auto".to_string(),
-        }
-    }
-}
-
-impl Default for IgnoreConfig {
-    fn default() -> Self {
-        Self {
-            patterns: Vec::new(),
         }
     }
 }
@@ -185,10 +166,10 @@ impl Config {
                 self.output.color = v;
             }
         }
-        if let Some(ign) = overlay.ignore {
-            if let Some(v) = ign.patterns {
-                self.ignore.patterns = v;
-            }
+        if let Some(ign) = overlay.ignore
+            && let Some(v) = ign.patterns
+        {
+            self.ignore.patterns = v;
         }
     }
 }
@@ -242,10 +223,7 @@ impl Config {
     ///
     /// This allows tests to supply a temporary directory instead of the
     /// real `~/.wonk` without mutating environment variables.
-    fn load_with_global_dir(
-        global_dir: Option<&Path>,
-        repo_root: Option<&Path>,
-    ) -> Result<Config> {
+    fn load_with_global_dir(global_dir: Option<&Path>, repo_root: Option<&Path>) -> Result<Config> {
         let mut config = Config::default();
 
         // Layer 2: global config
@@ -323,10 +301,7 @@ mod tests {
 
         /// Load config using this test environment's directories.
         fn load(&self) -> Result<Config> {
-            Config::load_with_global_dir(
-                Some(&self.global_path),
-                self.repo_path.as_deref(),
-            )
+            Config::load_with_global_dir(Some(&self.global_path), self.repo_path.as_deref())
         }
     }
 
@@ -394,11 +369,7 @@ additional_extensions = ["toml", "yaml"]
 "#,
         );
 
-        let config = Config::load_with_global_dir(
-            Some(&env.global_path),
-            Some(&repo),
-        )
-        .unwrap();
+        let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
         // Per-repo overrides global:
         assert_eq!(config.daemon.idle_timeout_minutes, 10);
         // Per-repo sets index fields:
@@ -448,11 +419,7 @@ patterns = ["*.bak"]
 "#,
         );
 
-        let config = Config::load_with_global_dir(
-            Some(&env.global_path),
-            Some(&repo),
-        )
-        .unwrap();
+        let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
         // Per-repo replaces the global patterns (last wins for the whole list).
         assert_eq!(config.ignore.patterns, vec!["*.bak".to_string()]);
     }
@@ -517,11 +484,7 @@ idle_timeout_minutes = "not a number"
         let repo = env.create_repo();
         env.write_repo_config("");
 
-        let config = Config::load_with_global_dir(
-            Some(&env.global_path),
-            Some(&repo),
-        )
-        .unwrap();
+        let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
         assert_eq!(config, Config::default());
     }
 
@@ -538,11 +501,7 @@ color = "never"
 "#,
         );
 
-        let config = Config::load_with_global_dir(
-            Some(&env.global_path),
-            Some(&repo),
-        )
-        .unwrap();
+        let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
         assert_eq!(config.output.default_format, "json");
         assert_eq!(config.output.color, "never");
         // Everything else should be defaults.
@@ -627,11 +586,7 @@ color = "never"
 "#,
         );
 
-        let config = Config::load_with_global_dir(
-            Some(&env.global_path),
-            Some(&repo),
-        )
-        .unwrap();
+        let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
 
         // From global:
         assert_eq!(config.daemon.idle_timeout_minutes, 60);

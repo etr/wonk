@@ -224,8 +224,7 @@ fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
 
 /// Find a named child by its field name and return its text.
 fn field_text<'a>(node: Node, field: &str, src: &'a [u8]) -> Option<&'a str> {
-    node.child_by_field_name(field)
-        .map(|n| node_text(n, src))
+    node.child_by_field_name(field).map(|n| node_text(n, src))
 }
 
 /// Extract the first line of a node's text as the signature.
@@ -444,26 +443,18 @@ fn extract_python(
             // Module-level variable: `FOO = 42`
             if scope.is_none() {
                 // Only capture simple name = value at module level
-                if let Some(left) = node.child_by_field_name("left") {
-                    if left.kind() == "identifier" {
-                        let name = node_text(left, src);
-                        // Heuristic: ALL_CAPS = constant, otherwise variable
-                        let is_const = name.chars().all(|c| c.is_uppercase() || c == '_');
-                        let sk = if is_const {
-                            SymbolKind::Constant
-                        } else {
-                            SymbolKind::Variable
-                        };
-                        return Some(make_symbol(
-                            name,
-                            sk,
-                            node,
-                            src,
-                            file,
-                            Lang::Python,
-                            scope,
-                        ));
-                    }
+                if let Some(left) = node.child_by_field_name("left")
+                    && left.kind() == "identifier"
+                {
+                    let name = node_text(left, src);
+                    // Heuristic: ALL_CAPS = constant, otherwise variable
+                    let is_const = name.chars().all(|c| c.is_uppercase() || c == '_');
+                    let sk = if is_const {
+                        SymbolKind::Constant
+                    } else {
+                        SymbolKind::Variable
+                    };
+                    return Some(make_symbol(name, sk, node, src, file, Lang::Python, scope));
                 }
             }
             None
@@ -498,19 +489,51 @@ fn extract_js_common(
     match kind {
         "function_declaration" => {
             let name = field_text(node, "name", src)?;
-            Some(make_symbol(name, SymbolKind::Function, node, src, file, lang, scope))
+            Some(make_symbol(
+                name,
+                SymbolKind::Function,
+                node,
+                src,
+                file,
+                lang,
+                scope,
+            ))
         }
         "generator_function_declaration" => {
             let name = field_text(node, "name", src)?;
-            Some(make_symbol(name, SymbolKind::Function, node, src, file, lang, scope))
+            Some(make_symbol(
+                name,
+                SymbolKind::Function,
+                node,
+                src,
+                file,
+                lang,
+                scope,
+            ))
         }
         "class_declaration" => {
             let name = field_text(node, "name", src)?;
-            Some(make_symbol(name, SymbolKind::Class, node, src, file, lang, scope))
+            Some(make_symbol(
+                name,
+                SymbolKind::Class,
+                node,
+                src,
+                file,
+                lang,
+                scope,
+            ))
         }
         "method_definition" => {
             let name = field_text(node, "name", src)?;
-            Some(make_symbol(name, SymbolKind::Method, node, src, file, lang, scope))
+            Some(make_symbol(
+                name,
+                SymbolKind::Method,
+                node,
+                src,
+                file,
+                lang,
+                scope,
+            ))
         }
         "variable_declaration" | "lexical_declaration" => {
             // `const foo = () => {}` or `let bar = function() {}`
@@ -563,7 +586,9 @@ fn extract_js_var_decl(
 }
 
 fn is_upper_snake(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------------------
@@ -582,20 +607,52 @@ fn extract_typescript(
     match kind {
         "interface_declaration" => {
             let name = field_text(node, "name", src)?;
-            Some(make_symbol(name, SymbolKind::Interface, node, src, file, lang, scope))
+            Some(make_symbol(
+                name,
+                SymbolKind::Interface,
+                node,
+                src,
+                file,
+                lang,
+                scope,
+            ))
         }
         "type_alias_declaration" => {
             let name = field_text(node, "name", src)?;
-            Some(make_symbol(name, SymbolKind::TypeAlias, node, src, file, lang, scope))
+            Some(make_symbol(
+                name,
+                SymbolKind::TypeAlias,
+                node,
+                src,
+                file,
+                lang,
+                scope,
+            ))
         }
         "enum_declaration" => {
             let name = field_text(node, "name", src)?;
-            Some(make_symbol(name, SymbolKind::Enum, node, src, file, lang, scope))
+            Some(make_symbol(
+                name,
+                SymbolKind::Enum,
+                node,
+                src,
+                file,
+                lang,
+                scope,
+            ))
         }
         "module" => {
             // `namespace Foo { ... }` or `module Foo { ... }`
             let name = field_text(node, "name", src)?;
-            Some(make_symbol(name, SymbolKind::Module, node, src, file, lang, scope))
+            Some(make_symbol(
+                name,
+                SymbolKind::Module,
+                node,
+                src,
+                file,
+                lang,
+                scope,
+            ))
         }
         _ => extract_js_common(node, kind, src, file, lang, scope),
     }
@@ -628,18 +685,16 @@ fn extract_go(
         "method_declaration" => {
             let name = field_text(node, "name", src)?;
             // Try to get the receiver type as scope
-            let receiver_scope = node
-                .child_by_field_name("receiver")
-                .and_then(|r| {
-                    // receiver is a parameter_list, get the type from its child
-                    r.named_child(0u32)
-                        .and_then(|param| param.child_by_field_name("type"))
-                        .map(|t| {
-                            let text = node_text(t, src);
-                            // Strip pointer prefix
-                            text.trim_start_matches('*').to_string()
-                        })
-                });
+            let receiver_scope = node.child_by_field_name("receiver").and_then(|r| {
+                // receiver is a parameter_list, get the type from its child
+                r.named_child(0u32)
+                    .and_then(|param| param.child_by_field_name("type"))
+                    .map(|t| {
+                        let text = node_text(t, src);
+                        // Strip pointer prefix
+                        text.trim_start_matches('*').to_string()
+                    })
+            });
             let scope_str = receiver_scope.as_deref().or(scope);
             Some(make_symbol(
                 name,
@@ -655,10 +710,10 @@ fn extract_go(
             // `type Foo struct { ... }` or `type Bar interface { ... }`
             // Look at the type_spec children
             for i in 0..node.named_child_count() {
-                if let Some(spec) = node.named_child(i as u32) {
-                    if spec.kind() == "type_spec" {
-                        return extract_go_type_spec(spec, src, file, scope);
-                    }
+                if let Some(spec) = node.named_child(i as u32)
+                    && spec.kind() == "type_spec"
+                {
+                    return extract_go_type_spec(spec, src, file, scope);
                 }
             }
             None
@@ -671,15 +726,13 @@ fn extract_go(
                 SymbolKind::Variable
             };
             for i in 0..node.named_child_count() {
-                if let Some(spec) = node.named_child(i as u32) {
-                    if spec.kind() == "const_spec" || spec.kind() == "var_spec" {
-                        let name = field_text(spec, "name", src)
-                            .or_else(|| {
-                                spec.named_child(0u32).map(|n| node_text(n, src))
-                            });
-                        if let Some(n) = name {
-                            return Some(make_symbol(n, sk, node, src, file, Lang::Go, scope));
-                        }
+                if let Some(spec) = node.named_child(i as u32)
+                    && (spec.kind() == "const_spec" || spec.kind() == "var_spec")
+                {
+                    let name = field_text(spec, "name", src)
+                        .or_else(|| spec.named_child(0u32).map(|n| node_text(n, src)));
+                    if let Some(n) = name {
+                        return Some(make_symbol(n, sk, node, src, file, Lang::Go, scope));
                     }
                 }
             }
@@ -689,12 +742,7 @@ fn extract_go(
     }
 }
 
-fn extract_go_type_spec(
-    spec: Node,
-    src: &[u8],
-    file: &str,
-    scope: Option<&str>,
-) -> Option<Symbol> {
+fn extract_go_type_spec(spec: Node, src: &[u8], file: &str, scope: Option<&str>) -> Option<Symbol> {
     let name = field_text(spec, "name", src)?;
     let type_node = spec.child_by_field_name("type")?;
     let sk = match type_node.kind() {
@@ -767,8 +815,7 @@ fn extract_java(
         }
         "field_declaration" => {
             // `static final int FOO = 42;`
-            let declarator = node
-                .named_child(node.named_child_count().saturating_sub(1) as u32)?;
+            let declarator = node.named_child(node.named_child_count().saturating_sub(1) as u32)?;
             if declarator.kind() == "variable_declarator" {
                 let name_node = declarator.child_by_field_name("name")?;
                 let name = node_text(name_node, src);
@@ -877,7 +924,10 @@ fn extract_c(
 /// C declarators can be nested: `function_declarator` -> `identifier`,
 /// or `pointer_declarator` -> `function_declarator` -> `identifier`.
 fn find_identifier_in_declarator<'a>(node: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
-    if node.kind() == "identifier" || node.kind() == "type_identifier" || node.kind() == "field_identifier" {
+    if node.kind() == "identifier"
+        || node.kind() == "type_identifier"
+        || node.kind() == "field_identifier"
+    {
         return Some(node_text(node, src));
     }
     // Try the "declarator" field first (common for function_declarator, pointer_declarator)
@@ -890,10 +940,10 @@ fn find_identifier_in_declarator<'a>(node: Node<'a>, src: &'a [u8]) -> Option<&'
     }
     // Walk named children
     for i in 0..node.named_child_count() {
-        if let Some(child) = node.named_child(i as u32) {
-            if let Some(name) = find_identifier_in_declarator(child, src) {
-                return Some(name);
-            }
+        if let Some(child) = node.named_child(i as u32)
+            && let Some(name) = find_identifier_in_declarator(child, src)
+        {
+            return Some(name);
         }
     }
     None
@@ -916,9 +966,9 @@ fn extract_cpp(
             let name = find_identifier_in_declarator(declarator, src)?;
             // Only treat as Method if inside a class/struct body
             // (field_declaration_list), not inside a namespace (declaration_list).
-            let is_method = node.parent().is_some_and(|p| {
-                p.kind() == "field_declaration_list"
-            });
+            let is_method = node
+                .parent()
+                .is_some_and(|p| p.kind() == "field_declaration_list");
             let sk = if is_method {
                 SymbolKind::Method
             } else {
@@ -976,30 +1026,28 @@ fn extract_cpp(
         }
         "declaration" => {
             let text = node_text(node, src);
-            if text.starts_with("typedef") || text.contains("using ") {
-                if let Some(declarator) = node.child_by_field_name("declarator") {
-                    if let Some(name) = find_identifier_in_declarator(declarator, src) {
-                        return Some(make_symbol(
-                            name,
-                            SymbolKind::TypeAlias,
-                            node,
-                            src,
-                            file,
-                            Lang::Cpp,
-                            scope,
-                        ));
-                    }
-                }
+            if (text.starts_with("typedef") || text.contains("using "))
+                && let Some(declarator) = node.child_by_field_name("declarator")
+                && let Some(name) = find_identifier_in_declarator(declarator, src)
+            {
+                return Some(make_symbol(
+                    name,
+                    SymbolKind::TypeAlias,
+                    node,
+                    src,
+                    file,
+                    Lang::Cpp,
+                    scope,
+                ));
             }
             None
         }
         "type_definition" | "alias_declaration" => {
             // `using Foo = Bar;` or `typedef ... Foo;`
-            let name = field_text(node, "name", src)
-                .or_else(|| {
-                    node.child_by_field_name("declarator")
-                        .and_then(|d| find_identifier_in_declarator(d, src))
-                })?;
+            let name = field_text(node, "name", src).or_else(|| {
+                node.child_by_field_name("declarator")
+                    .and_then(|d| find_identifier_in_declarator(d, src))
+            })?;
             Some(make_symbol(
                 name,
                 SymbolKind::TypeAlias,
@@ -1085,19 +1133,19 @@ fn extract_ruby(
         }
         "assignment" => {
             // Module-level constant (UPPER_CASE = ...)
-            if let Some(left) = node.child_by_field_name("left") {
-                if left.kind() == "constant" {
-                    let name = node_text(left, src);
-                    return Some(make_symbol(
-                        name,
-                        SymbolKind::Constant,
-                        node,
-                        src,
-                        file,
-                        Lang::Ruby,
-                        scope,
-                    ));
-                }
+            if let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "constant"
+            {
+                let name = node_text(left, src);
+                return Some(make_symbol(
+                    name,
+                    SymbolKind::Constant,
+                    node,
+                    src,
+                    file,
+                    Lang::Ruby,
+                    scope,
+                ));
             }
             None
         }
@@ -1189,21 +1237,20 @@ fn extract_php(
         "const_declaration" => {
             // `const FOO = 42;`
             for i in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(i as u32) {
-                    if child.kind() == "const_element" {
-                        if let Some(name_node) = child.child_by_field_name("name") {
-                            let name = node_text(name_node, src);
-                            return Some(make_symbol(
-                                name,
-                                SymbolKind::Constant,
-                                node,
-                                src,
-                                file,
-                                Lang::Php,
-                                scope,
-                            ));
-                        }
-                    }
+                if let Some(child) = node.named_child(i as u32)
+                    && child.kind() == "const_element"
+                    && let Some(name_node) = child.child_by_field_name("name")
+                {
+                    let name = node_text(name_node, src);
+                    return Some(make_symbol(
+                        name,
+                        SymbolKind::Constant,
+                        node,
+                        src,
+                        file,
+                        Lang::Php,
+                        scope,
+                    ));
                 }
             }
             None
@@ -1276,11 +1323,7 @@ fn walk_refs(
 
 /// Get the source line at a given 0-based row.
 fn get_context_line(source_lines: &[&str], row: usize) -> String {
-    source_lines
-        .get(row)
-        .unwrap_or(&"")
-        .trim()
-        .to_string()
+    source_lines.get(row).unwrap_or(&"").trim().to_string()
 }
 
 /// Build a `Reference` from a node.
@@ -1344,7 +1387,13 @@ fn match_rust_call(
     if name.is_empty() {
         return None;
     }
-    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+    Some(make_ref(
+        &name,
+        ReferenceKind::Call,
+        node,
+        file,
+        source_lines,
+    ))
 }
 
 fn match_python_call(
@@ -1362,7 +1411,13 @@ fn match_python_call(
     if name.is_empty() {
         return None;
     }
-    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+    Some(make_ref(
+        &name,
+        ReferenceKind::Call,
+        node,
+        file,
+        source_lines,
+    ))
 }
 
 fn match_js_call(
@@ -1380,7 +1435,13 @@ fn match_js_call(
     if name.is_empty() {
         return None;
     }
-    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+    Some(make_ref(
+        &name,
+        ReferenceKind::Call,
+        node,
+        file,
+        source_lines,
+    ))
 }
 
 fn match_go_call(
@@ -1398,7 +1459,13 @@ fn match_go_call(
     if name.is_empty() {
         return None;
     }
-    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+    Some(make_ref(
+        &name,
+        ReferenceKind::Call,
+        node,
+        file,
+        source_lines,
+    ))
 }
 
 fn match_java_call(
@@ -1423,7 +1490,13 @@ fn match_java_call(
     } else {
         name.to_string()
     };
-    Some(make_ref(&full_name, ReferenceKind::Call, node, file, source_lines))
+    Some(make_ref(
+        &full_name,
+        ReferenceKind::Call,
+        node,
+        file,
+        source_lines,
+    ))
 }
 
 fn match_c_call(
@@ -1441,7 +1514,13 @@ fn match_c_call(
     if name.is_empty() {
         return None;
     }
-    Some(make_ref(&name, ReferenceKind::Call, node, file, source_lines))
+    Some(make_ref(
+        &name,
+        ReferenceKind::Call,
+        node,
+        file,
+        source_lines,
+    ))
 }
 
 fn match_ruby_call(
@@ -1467,7 +1546,13 @@ fn match_ruby_call(
             } else {
                 name.to_string()
             };
-            Some(make_ref(&full_name, ReferenceKind::Call, node, file, source_lines))
+            Some(make_ref(
+                &full_name,
+                ReferenceKind::Call,
+                node,
+                file,
+                source_lines,
+            ))
         }
         "method_call" => {
             let method = node.child_by_field_name("method")?;
@@ -1475,7 +1560,13 @@ fn match_ruby_call(
             if name.is_empty() {
                 return None;
             }
-            Some(make_ref(name, ReferenceKind::Call, node, file, source_lines))
+            Some(make_ref(
+                name,
+                ReferenceKind::Call,
+                node,
+                file,
+                source_lines,
+            ))
         }
         _ => None,
     }
@@ -1495,7 +1586,13 @@ fn match_php_call(
             if name.is_empty() {
                 return None;
             }
-            Some(make_ref(name, ReferenceKind::Call, node, file, source_lines))
+            Some(make_ref(
+                name,
+                ReferenceKind::Call,
+                node,
+                file,
+                source_lines,
+            ))
         }
         "member_call_expression" => {
             let name_node = node.child_by_field_name("name")?;
@@ -1503,7 +1600,13 @@ fn match_php_call(
             if name.is_empty() {
                 return None;
             }
-            Some(make_ref(name, ReferenceKind::Call, node, file, source_lines))
+            Some(make_ref(
+                name,
+                ReferenceKind::Call,
+                node,
+                file,
+                source_lines,
+            ))
         }
         "scoped_call_expression" => {
             let name_node = node.child_by_field_name("name")?;
@@ -1511,7 +1614,13 @@ fn match_php_call(
             if name.is_empty() {
                 return None;
             }
-            Some(make_ref(name, ReferenceKind::Call, node, file, source_lines))
+            Some(make_ref(
+                name,
+                ReferenceKind::Call,
+                node,
+                file,
+                source_lines,
+            ))
         }
         _ => None,
     }
@@ -1594,7 +1703,13 @@ fn match_type_ref(
                 if name.is_empty() {
                     return None;
                 }
-                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+                Some(make_ref(
+                    name,
+                    ReferenceKind::Type,
+                    node,
+                    file,
+                    source_lines,
+                ))
             }
             _ => None,
         },
@@ -1605,7 +1720,13 @@ fn match_type_ref(
                     return None;
                 }
                 // Python type annotations: `x: int`, `def foo() -> str:`
-                Some(make_ref(&name, ReferenceKind::Type, node, file, source_lines))
+                Some(make_ref(
+                    &name,
+                    ReferenceKind::Type,
+                    node,
+                    file,
+                    source_lines,
+                ))
             }
             _ => None,
         },
@@ -1626,7 +1747,13 @@ fn match_type_ref(
                 if name.is_empty() {
                     return None;
                 }
-                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+                Some(make_ref(
+                    name,
+                    ReferenceKind::Type,
+                    node,
+                    file,
+                    source_lines,
+                ))
             }
             _ => None,
         },
@@ -1641,7 +1768,13 @@ fn match_type_ref(
                 if name.is_empty() || is_go_builtin_type(name) {
                     return None;
                 }
-                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+                Some(make_ref(
+                    name,
+                    ReferenceKind::Type,
+                    node,
+                    file,
+                    source_lines,
+                ))
             }
             _ => None,
         },
@@ -1650,9 +1783,7 @@ fn match_type_ref(
                 let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
                 if matches!(
                     parent_kind,
-                    "class_declaration"
-                        | "interface_declaration"
-                        | "enum_declaration"
+                    "class_declaration" | "interface_declaration" | "enum_declaration"
                 ) {
                     return None;
                 }
@@ -1660,7 +1791,13 @@ fn match_type_ref(
                 if name.is_empty() {
                     return None;
                 }
-                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+                Some(make_ref(
+                    name,
+                    ReferenceKind::Type,
+                    node,
+                    file,
+                    source_lines,
+                ))
             }
             _ => None,
         },
@@ -1669,10 +1806,7 @@ fn match_type_ref(
                 let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
                 if matches!(
                     parent_kind,
-                    "struct_specifier"
-                        | "class_specifier"
-                        | "enum_specifier"
-                        | "type_definition"
+                    "struct_specifier" | "class_specifier" | "enum_specifier" | "type_definition"
                 ) {
                     return None;
                 }
@@ -1680,7 +1814,13 @@ fn match_type_ref(
                 if name.is_empty() {
                     return None;
                 }
-                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+                Some(make_ref(
+                    name,
+                    ReferenceKind::Type,
+                    node,
+                    file,
+                    source_lines,
+                ))
             }
             _ => None,
         },
@@ -1691,7 +1831,13 @@ fn match_type_ref(
                 if name.is_empty() {
                     return None;
                 }
-                Some(make_ref(name, ReferenceKind::Type, node, file, source_lines))
+                Some(make_ref(
+                    name,
+                    ReferenceKind::Type,
+                    node,
+                    file,
+                    source_lines,
+                ))
             }
             _ => None,
         },
@@ -1744,23 +1890,39 @@ fn match_import_ref(
             }
             let arg = node.child_by_field_name("argument")?;
             let name = node_text(arg, src).to_string();
-            Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+            Some(make_ref(
+                &name,
+                ReferenceKind::Import,
+                node,
+                file,
+                source_lines,
+            ))
         }
-        Lang::Python => {
-            match kind {
-                "import_statement" | "import_from_statement" => {
-                    let name = node_text(node, src).trim().to_string();
-                    Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
-                }
-                _ => None,
+        Lang::Python => match kind {
+            "import_statement" | "import_from_statement" => {
+                let name = node_text(node, src).trim().to_string();
+                Some(make_ref(
+                    &name,
+                    ReferenceKind::Import,
+                    node,
+                    file,
+                    source_lines,
+                ))
             }
-        }
+            _ => None,
+        },
         Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
             if kind != "import_statement" {
                 return None;
             }
             let name = node_text(node, src).trim().to_string();
-            Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+            Some(make_ref(
+                &name,
+                ReferenceKind::Import,
+                node,
+                file,
+                source_lines,
+            ))
         }
         Lang::Go => {
             if kind != "import_spec" {
@@ -1768,7 +1930,13 @@ fn match_import_ref(
             }
             let path = node.child_by_field_name("path")?;
             let name = node_text(path, src).trim_matches('"').to_string();
-            Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+            Some(make_ref(
+                &name,
+                ReferenceKind::Import,
+                node,
+                file,
+                source_lines,
+            ))
         }
         Lang::Java => {
             if kind != "import_declaration" {
@@ -1776,7 +1944,13 @@ fn match_import_ref(
             }
             // The text minus the "import " prefix and ";" suffix
             let text = node_text(node, src).trim().to_string();
-            Some(make_ref(&text, ReferenceKind::Import, node, file, source_lines))
+            Some(make_ref(
+                &text,
+                ReferenceKind::Import,
+                node,
+                file,
+                source_lines,
+            ))
         }
         Lang::C | Lang::Cpp => {
             if kind != "preproc_include" {
@@ -1786,7 +1960,13 @@ fn match_import_ref(
             let name = node_text(path, src)
                 .trim_matches(|c| c == '"' || c == '<' || c == '>')
                 .to_string();
-            Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+            Some(make_ref(
+                &name,
+                ReferenceKind::Import,
+                node,
+                file,
+                source_lines,
+            ))
         }
         Lang::Ruby => {
             match kind {
@@ -1804,7 +1984,13 @@ fn match_import_ref(
                     let name = node_text(arg, src)
                         .trim_matches(|c| c == '\'' || c == '"')
                         .to_string();
-                    Some(make_ref(&name, ReferenceKind::Import, node, file, source_lines))
+                    Some(make_ref(
+                        &name,
+                        ReferenceKind::Import,
+                        node,
+                        file,
+                        source_lines,
+                    ))
                 }
                 _ => None,
             }
@@ -1825,7 +2011,13 @@ fn match_import_ref(
                     }
                     // The argument is a string literal child
                     let text = node_text(node, src).trim().to_string();
-                    Some(make_ref(&text, ReferenceKind::Import, node, file, source_lines))
+                    Some(make_ref(
+                        &text,
+                        ReferenceKind::Import,
+                        node,
+                        file,
+                        source_lines,
+                    ))
                 }
             }
         }
@@ -1864,24 +2056,25 @@ fn walk_imports(
 
     match lang {
         Lang::Rust => {
-            if kind == "use_declaration" {
-                if let Some(arg) = node.child_by_field_name("argument") {
-                    imports.push(node_text(arg, src).to_string());
-                }
+            if kind == "use_declaration"
+                && let Some(arg) = node.child_by_field_name("argument")
+            {
+                imports.push(node_text(arg, src).to_string());
             }
             // Rust pub items are exports (simplified: just look for `pub` visibility)
-            if kind == "visibility_modifier" && node_text(node, src).starts_with("pub") {
-                if let Some(parent) = node.parent() {
-                    let export_name = match parent.kind() {
-                        "function_item" | "struct_item" | "enum_item" | "trait_item"
-                        | "type_item" | "const_item" | "static_item" | "mod_item" => {
-                            field_text(parent, "name", src).map(|s| s.to_string())
-                        }
-                        _ => None,
-                    };
-                    if let Some(name) = export_name {
-                        exports.push(name);
+            if kind == "visibility_modifier"
+                && node_text(node, src).starts_with("pub")
+                && let Some(parent) = node.parent()
+            {
+                let export_name = match parent.kind() {
+                    "function_item" | "struct_item" | "enum_item" | "trait_item" | "type_item"
+                    | "const_item" | "static_item" | "mod_item" => {
+                        field_text(parent, "name", src).map(|s| s.to_string())
                     }
+                    _ => None,
+                };
+                if let Some(name) = export_name {
+                    exports.push(name);
                 }
             }
         }
@@ -1890,16 +2083,16 @@ fn walk_imports(
                 "import_statement" => {
                     // import foo, bar
                     for i in 0..node.named_child_count() {
-                        if let Some(child) = node.named_child(i as u32) {
-                            if child.kind() == "dotted_name" || child.kind() == "aliased_import" {
-                                let name_node = if child.kind() == "aliased_import" {
-                                    child.child_by_field_name("name")
-                                } else {
-                                    Some(child)
-                                };
-                                if let Some(n) = name_node {
-                                    imports.push(node_text(n, src).to_string());
-                                }
+                        if let Some(child) = node.named_child(i as u32)
+                            && (child.kind() == "dotted_name" || child.kind() == "aliased_import")
+                        {
+                            let name_node = if child.kind() == "aliased_import" {
+                                child.child_by_field_name("name")
+                            } else {
+                                Some(child)
+                            };
+                            if let Some(n) = name_node {
+                                imports.push(node_text(n, src).to_string());
                             }
                         }
                     }
@@ -1913,35 +2106,34 @@ fn walk_imports(
             }
         }
         Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
-            if kind == "import_statement" {
-                if let Some(source_node) = node.child_by_field_name("source") {
-                    let path = node_text(source_node, src)
-                        .trim_matches(|c| c == '\'' || c == '"')
-                        .to_string();
-                    imports.push(path);
-                }
+            if kind == "import_statement"
+                && let Some(source_node) = node.child_by_field_name("source")
+            {
+                let path = node_text(source_node, src)
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_string();
+                imports.push(path);
             }
             // Export statements
             if kind == "export_statement" {
                 // `export function foo() {}` or `export { foo, bar }`
                 // Try to get the declaration's name
-                if let Some(decl) = node.child_by_field_name("declaration") {
-                    if let Some(name) = field_text(decl, "name", src) {
-                        exports.push(name.to_string());
-                    }
+                if let Some(decl) = node.child_by_field_name("declaration")
+                    && let Some(name) = field_text(decl, "name", src)
+                {
+                    exports.push(name.to_string());
                 }
                 // `export { foo, bar }` - look for export_clause
                 for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32) {
-                        if child.kind() == "export_clause" {
-                            for j in 0..child.named_child_count() {
-                                if let Some(spec) = child.named_child(j as u32) {
-                                    if spec.kind() == "export_specifier" {
-                                        if let Some(name) = spec.child_by_field_name("name") {
-                                            exports.push(node_text(name, src).to_string());
-                                        }
-                                    }
-                                }
+                    if let Some(child) = node.named_child(i as u32)
+                        && child.kind() == "export_clause"
+                    {
+                        for j in 0..child.named_child_count() {
+                            if let Some(spec) = child.named_child(j as u32)
+                                && spec.kind() == "export_specifier"
+                                && let Some(name) = spec.child_by_field_name("name")
+                            {
+                                exports.push(node_text(name, src).to_string());
                             }
                         }
                     }
@@ -1954,46 +2146,45 @@ fn walk_imports(
             }
         }
         Lang::Go => {
-            if kind == "import_spec" {
-                if let Some(path) = node.child_by_field_name("path") {
-                    imports.push(
-                        node_text(path, src).trim_matches('"').to_string(),
-                    );
-                }
+            if kind == "import_spec"
+                && let Some(path) = node.child_by_field_name("path")
+            {
+                imports.push(node_text(path, src).trim_matches('"').to_string());
             }
             // Go exports: capitalized top-level names (handled by convention,
             // we capture them for completeness)
             if matches!(
                 kind,
-                "function_declaration" | "type_declaration" | "const_declaration" | "var_declaration"
-            ) {
-                if let Some(name) = field_text(node, "name", src) {
-                    if name.starts_with(|c: char| c.is_uppercase()) {
-                        exports.push(name.to_string());
-                    }
-                }
+                "function_declaration"
+                    | "type_declaration"
+                    | "const_declaration"
+                    | "var_declaration"
+            ) && let Some(name) = field_text(node, "name", src)
+                && name.starts_with(|c: char| c.is_uppercase())
+            {
+                exports.push(name.to_string());
             }
         }
         Lang::Java => {
             if kind == "import_declaration" {
                 // Extract the imported path (skip "import " and ";")
                 for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32) {
-                        if child.kind() == "scoped_identifier" {
-                            imports.push(node_text(child, src).to_string());
-                        }
+                    if let Some(child) = node.named_child(i as u32)
+                        && child.kind() == "scoped_identifier"
+                    {
+                        imports.push(node_text(child, src).to_string());
                     }
                 }
             }
         }
         Lang::C | Lang::Cpp => {
-            if kind == "preproc_include" {
-                if let Some(path) = node.child_by_field_name("path") {
-                    let text = node_text(path, src)
-                        .trim_matches(|c| c == '"' || c == '<' || c == '>')
-                        .to_string();
-                    imports.push(text);
-                }
+            if kind == "preproc_include"
+                && let Some(path) = node.child_by_field_name("path")
+            {
+                let text = node_text(path, src)
+                    .trim_matches(|c| c == '"' || c == '<' || c == '>')
+                    .to_string();
+                imports.push(text);
             }
         }
         Lang::Ruby => {
@@ -2002,15 +2193,14 @@ fn walk_imports(
                     .child_by_field_name("method")
                     .map(|n| node_text(n, src))
                     .unwrap_or("");
-                if matches!(method, "require" | "require_relative") {
-                    if let Some(args) = node.child_by_field_name("arguments") {
-                        if let Some(arg) = args.named_child(0u32) {
-                            let path = node_text(arg, src)
-                                .trim_matches(|c| c == '\'' || c == '"')
-                                .to_string();
-                            imports.push(path);
-                        }
-                    }
+                if matches!(method, "require" | "require_relative")
+                    && let Some(args) = node.child_by_field_name("arguments")
+                    && let Some(arg) = args.named_child(0u32)
+                {
+                    let path = node_text(arg, src)
+                        .trim_matches(|c| c == '\'' || c == '"')
+                        .to_string();
+                    imports.push(path);
                 }
             }
         }
@@ -2024,23 +2214,23 @@ fn walk_imports(
             ) {
                 // Get the string argument
                 for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32) {
-                        if child.kind() == "string" {
-                            let path = node_text(child, src)
-                                .trim_matches(|c| c == '\'' || c == '"')
-                                .to_string();
-                            imports.push(path);
-                        }
+                    if let Some(child) = node.named_child(i as u32)
+                        && child.kind() == "string"
+                    {
+                        let path = node_text(child, src)
+                            .trim_matches(|c| c == '\'' || c == '"')
+                            .to_string();
+                        imports.push(path);
                     }
                 }
             }
             // PHP namespace use statements
             if kind == "namespace_use_declaration" {
                 for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32) {
-                        if child.kind() == "namespace_use_clause" {
-                            imports.push(node_text(child, src).to_string());
-                        }
+                    if let Some(child) = node.named_child(i as u32)
+                        && child.kind() == "namespace_use_clause"
+                    {
+                        imports.push(node_text(child, src).to_string());
                     }
                 }
             }
@@ -2285,9 +2475,12 @@ mod tests {
 
     /// Find a symbol by name in a list.
     fn find_sym<'a>(syms: &'a [Symbol], name: &str) -> &'a Symbol {
-        syms.iter()
-            .find(|s| s.name == name)
-            .unwrap_or_else(|| panic!("symbol '{name}' not found in: {:?}", syms.iter().map(|s| &s.name).collect::<Vec<_>>()))
+        syms.iter().find(|s| s.name == name).unwrap_or_else(|| {
+            panic!(
+                "symbol '{name}' not found in: {:?}",
+                syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+            )
+        })
     }
 
     // ---------- Rust symbol extraction ----------
@@ -2707,14 +2900,12 @@ mod tests {
 
     /// Find a reference by name in a list.
     fn find_ref<'a>(refs: &'a [Reference], name: &str) -> &'a Reference {
-        refs.iter()
-            .find(|r| r.name == name)
-            .unwrap_or_else(|| {
-                panic!(
-                    "reference '{name}' not found in: {:?}",
-                    refs.iter().map(|r| &r.name).collect::<Vec<_>>()
-                )
-            })
+        refs.iter().find(|r| r.name == name).unwrap_or_else(|| {
+            panic!(
+                "reference '{name}' not found in: {:?}",
+                refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+            )
+        })
     }
 
     /// Check that at least one reference with the given name and kind exists.
@@ -2743,8 +2934,15 @@ mod tests {
     fn rust_import_reference() {
         let src = "use std::collections::HashMap;\nuse crate::types::Symbol;";
         let refs = refs_from(Lang::Rust, src);
-        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
-        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}", import_refs.len());
+        let import_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            import_refs.len() >= 2,
+            "expected at least 2 import refs, got {}",
+            import_refs.len()
+        );
     }
 
     #[test]
@@ -2753,7 +2951,11 @@ mod tests {
         let refs = refs_from(Lang::Rust, src);
         let r = find_ref(&refs, "foo");
         assert_eq!(r.kind, ReferenceKind::Call);
-        assert!(r.context.contains("foo(42)"), "context was: {:?}", r.context);
+        assert!(
+            r.context.contains("foo(42)"),
+            "context was: {:?}",
+            r.context
+        );
         assert_eq!(r.file, "test_file");
         assert!(r.line > 0);
     }
@@ -2772,8 +2974,16 @@ mod tests {
     fn python_import_reference() {
         let src = "import os\nfrom pathlib import Path\n";
         let refs = refs_from(Lang::Python, src);
-        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
-        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}: {:?}", import_refs.len(), import_refs);
+        let import_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            import_refs.len() >= 2,
+            "expected at least 2 import refs, got {}: {:?}",
+            import_refs.len(),
+            import_refs
+        );
     }
 
     // ---------- JavaScript reference extraction ----------
@@ -2790,8 +3000,16 @@ mod tests {
     fn js_import_reference() {
         let src = "import { foo } from './foo';\nimport bar from 'bar';";
         let refs = refs_from(Lang::JavaScript, src);
-        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
-        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}: {:?}", import_refs.len(), import_refs);
+        let import_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            import_refs.len() >= 2,
+            "expected at least 2 import refs, got {}: {:?}",
+            import_refs.len(),
+            import_refs
+        );
     }
 
     // ---------- TypeScript reference extraction ----------
@@ -2815,15 +3033,23 @@ mod tests {
     fn ts_import_reference() {
         let src = "import { Component } from 'react';\nimport axios from 'axios';";
         let refs = refs_from(Lang::TypeScript, src);
-        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
-        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}", import_refs.len());
+        let import_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            import_refs.len() >= 2,
+            "expected at least 2 import refs, got {}",
+            import_refs.len()
+        );
     }
 
     // ---------- TSX reference extraction ----------
 
     #[test]
     fn tsx_call_and_type_reference() {
-        let src = "import React from 'react';\nconst App: FC = () => { useState(0); return <div/>; };";
+        let src =
+            "import React from 'react';\nconst App: FC = () => { useState(0); return <div/>; };";
         let refs = refs_from(Lang::Tsx, src);
         assert!(has_ref(&refs, "useState", ReferenceKind::Call));
         assert!(has_ref(&refs, "FC", ReferenceKind::Type));
@@ -2873,8 +3099,15 @@ mod tests {
     fn java_import_reference() {
         let src = "import java.util.List;\nimport java.io.File;\nclass App {}";
         let refs = refs_from(Lang::Java, src);
-        let import_refs: Vec<_> = refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
-        assert!(import_refs.len() >= 2, "expected at least 2 import refs, got {}", import_refs.len());
+        let import_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .collect();
+        assert!(
+            import_refs.len() >= 2,
+            "expected at least 2 import refs, got {}",
+            import_refs.len()
+        );
     }
 
     // ---------- C reference extraction ----------
@@ -2963,47 +3196,90 @@ mod tests {
     fn rust_exports() {
         let src = "pub fn hello() {}\npub struct Foo {}\nfn private() {}";
         let fi = imports_from(Lang::Rust, src);
-        assert!(fi.exports.contains(&"hello".to_string()), "exports: {:?}", fi.exports);
-        assert!(fi.exports.contains(&"Foo".to_string()), "exports: {:?}", fi.exports);
-        assert!(!fi.exports.contains(&"private".to_string()), "should not export private fn");
+        assert!(
+            fi.exports.contains(&"hello".to_string()),
+            "exports: {:?}",
+            fi.exports
+        );
+        assert!(
+            fi.exports.contains(&"Foo".to_string()),
+            "exports: {:?}",
+            fi.exports
+        );
+        assert!(
+            !fi.exports.contains(&"private".to_string()),
+            "should not export private fn"
+        );
     }
 
     #[test]
     fn python_imports() {
         let src = "import os\nfrom pathlib import Path\ndef main(): pass\n";
         let fi = imports_from(Lang::Python, src);
-        assert!(fi.imports.iter().any(|i| i.contains("os")), "imports: {:?}", fi.imports);
-        assert!(fi.imports.iter().any(|i| i.contains("pathlib")), "imports: {:?}", fi.imports);
+        assert!(
+            fi.imports.iter().any(|i| i.contains("os")),
+            "imports: {:?}",
+            fi.imports
+        );
+        assert!(
+            fi.imports.iter().any(|i| i.contains("pathlib")),
+            "imports: {:?}",
+            fi.imports
+        );
     }
 
     #[test]
     fn js_imports_and_exports() {
         let src = "import { foo } from './foo';\nexport function bar() {}\nexport default function baz() {}";
         let fi = imports_from(Lang::JavaScript, src);
-        assert!(fi.imports.iter().any(|i| i.contains("./foo")), "imports: {:?}", fi.imports);
-        assert!(fi.exports.contains(&"bar".to_string()), "exports: {:?}", fi.exports);
+        assert!(
+            fi.imports.iter().any(|i| i.contains("./foo")),
+            "imports: {:?}",
+            fi.imports
+        );
+        assert!(
+            fi.exports.contains(&"bar".to_string()),
+            "exports: {:?}",
+            fi.exports
+        );
     }
 
     #[test]
     fn ts_imports_and_exports() {
         let src = "import { Component } from 'react';\nexport interface Greeter { greet(): void; }";
         let fi = imports_from(Lang::TypeScript, src);
-        assert!(fi.imports.iter().any(|i| i.contains("react")), "imports: {:?}", fi.imports);
+        assert!(
+            fi.imports.iter().any(|i| i.contains("react")),
+            "imports: {:?}",
+            fi.imports
+        );
     }
 
     #[test]
     fn go_imports() {
         let src = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {}\n";
         let fi = imports_from(Lang::Go, src);
-        assert!(fi.imports.contains(&"fmt".to_string()), "imports: {:?}", fi.imports);
-        assert!(fi.imports.contains(&"os".to_string()), "imports: {:?}", fi.imports);
+        assert!(
+            fi.imports.contains(&"fmt".to_string()),
+            "imports: {:?}",
+            fi.imports
+        );
+        assert!(
+            fi.imports.contains(&"os".to_string()),
+            "imports: {:?}",
+            fi.imports
+        );
     }
 
     #[test]
     fn go_exports() {
         let src = "package main\n\nfunc Exported() {}\nfunc private() {}\n";
         let fi = imports_from(Lang::Go, src);
-        assert!(fi.exports.contains(&"Exported".to_string()), "exports: {:?}", fi.exports);
+        assert!(
+            fi.exports.contains(&"Exported".to_string()),
+            "exports: {:?}",
+            fi.exports
+        );
         assert!(!fi.exports.contains(&"private".to_string()));
     }
 
@@ -3018,24 +3294,48 @@ mod tests {
     fn c_includes() {
         let src = "#include <stdio.h>\n#include \"myheader.h\"\nint main() { return 0; }";
         let fi = imports_from(Lang::C, src);
-        assert!(fi.imports.contains(&"stdio.h".to_string()), "imports: {:?}", fi.imports);
-        assert!(fi.imports.contains(&"myheader.h".to_string()), "imports: {:?}", fi.imports);
+        assert!(
+            fi.imports.contains(&"stdio.h".to_string()),
+            "imports: {:?}",
+            fi.imports
+        );
+        assert!(
+            fi.imports.contains(&"myheader.h".to_string()),
+            "imports: {:?}",
+            fi.imports
+        );
     }
 
     #[test]
     fn cpp_includes() {
         let src = "#include <iostream>\n#include <vector>\nint main() { return 0; }";
         let fi = imports_from(Lang::Cpp, src);
-        assert!(fi.imports.contains(&"iostream".to_string()), "imports: {:?}", fi.imports);
-        assert!(fi.imports.contains(&"vector".to_string()), "imports: {:?}", fi.imports);
+        assert!(
+            fi.imports.contains(&"iostream".to_string()),
+            "imports: {:?}",
+            fi.imports
+        );
+        assert!(
+            fi.imports.contains(&"vector".to_string()),
+            "imports: {:?}",
+            fi.imports
+        );
     }
 
     #[test]
     fn ruby_requires() {
         let src = "require 'json'\nrequire_relative 'helper'\ndef main; end\n";
         let fi = imports_from(Lang::Ruby, src);
-        assert!(fi.imports.contains(&"json".to_string()), "imports: {:?}", fi.imports);
-        assert!(fi.imports.contains(&"helper".to_string()), "imports: {:?}", fi.imports);
+        assert!(
+            fi.imports.contains(&"json".to_string()),
+            "imports: {:?}",
+            fi.imports
+        );
+        assert!(
+            fi.imports.contains(&"helper".to_string()),
+            "imports: {:?}",
+            fi.imports
+        );
     }
 
     // ---------- Reference context line ----------
@@ -3067,11 +3367,7 @@ mod tests {
     #[allow(dead_code)]
     fn dump_tree(node: Node, src: &str, indent: usize) {
         let text = node.utf8_text(src.as_bytes()).unwrap_or("");
-        let short_text = if text.len() > 60 {
-            &text[..60]
-        } else {
-            text
-        };
+        let short_text = if text.len() > 60 { &text[..60] } else { text };
         eprintln!(
             "{:indent$}{} [{}:{}] {:?}",
             "",

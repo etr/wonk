@@ -16,7 +16,10 @@ use crate::db;
 use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
-use crate::output::{self, BudgetStatus, Formatter, LsSymbolEntry, RefOutput, SearchOutput, SignatureOutput, SymbolOutput};
+use crate::output::{
+    self, BudgetStatus, Formatter, LsSymbolEntry, RefOutput, SearchOutput, SignatureOutput,
+    SymbolOutput,
+};
 use crate::pipeline;
 use crate::progress::{self, Progress};
 use crate::search;
@@ -63,8 +66,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         let repo_root_for_config = std::env::current_dir()
             .ok()
             .and_then(|cwd| db::find_repo_root(&cwd).ok());
-        let config = crate::config::Config::load(repo_root_for_config.as_deref())
-            .unwrap_or_default();
+        let config =
+            crate::config::Config::load(repo_root_for_config.as_deref()).unwrap_or_default();
         crate::color::resolve_color(&config.output.color)
     };
 
@@ -75,18 +78,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     }
 
     // Auto-init: if this is a query command and no index exists, build one.
-    if is_query_command(&cli.command) {
-        if let Ok(cwd) = std::env::current_dir() {
-            if let Ok(repo_root) = db::find_repo_root(&cwd) {
-                if db::find_existing_index(&repo_root).is_none() {
-                    let progress = Progress::new("Indexing", "Indexed", progress::detect_mode(suppress));
-                    let stats = pipeline::build_index_with_progress(&repo_root, false, &progress)?;
-                    progress.finish(&stats);
-                    // Spawn daemon after auto-init (best-effort).
-                    spawn_daemon_background(&repo_root);
-                }
-            }
-        }
+    if is_query_command(&cli.command)
+        && let Ok(cwd) = std::env::current_dir()
+        && let Ok(repo_root) = db::find_repo_root(&cwd)
+        && db::find_existing_index(&repo_root).is_none()
+    {
+        let progress = Progress::new("Indexing", "Indexed", progress::detect_mode(suppress));
+        let stats = pipeline::build_index_with_progress(&repo_root, false, &progress)?;
+        progress.finish(&stats);
+        // Spawn daemon after auto-init (best-effort).
+        spawn_daemon_background(&repo_root);
     }
 
     match cli.command {
@@ -94,15 +95,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // Set up match highlighting for search results.
             fmt.set_highlight(&args.pattern, args.regex, args.ignore_case);
 
-            let results = search::text_search(
-                &args.pattern,
-                args.regex,
-                args.ignore_case,
-                &args.paths,
-            )?;
+            let results =
+                search::text_search(&args.pattern, args.regex, args.ignore_case, &args.paths)?;
 
             if results.is_empty() {
-                output::print_hint("no results found; try a broader pattern or different paths", suppress);
+                output::print_hint(
+                    "no results found; try a broader pattern or different paths",
+                    suppress,
+                );
             }
 
             // Open DB connection once (shared between detection and ranking).
@@ -118,7 +118,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             };
 
             // Count symbol matches for mode detection and indicator display.
-            let symbol_count = conn.as_ref()
+            let symbol_count = conn
+                .as_ref()
                 .map(|c| db::count_matching_symbols(c, &args.pattern))
                 .unwrap_or(0);
 
@@ -135,11 +136,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     // Ranked mode: classify, sort, dedup, and group with headers.
                     use crate::ranker;
 
-                    let groups = ranker::rank_and_dedup(
-                        &results,
-                        conn.as_ref(),
-                        &args.pattern,
-                    );
+                    let groups = ranker::rank_and_dedup(&results, conn.as_ref(), &args.pattern);
 
                     for (category, items) in &groups {
                         if !suppress {
@@ -162,9 +159,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 SearchMode::Plain => {
                     // Plain text mode: output directly without ranking/dedup.
                     for r in &results {
-                        let out = SearchOutput::from_search_result(
-                            &r.file, r.line, r.col, &r.content,
-                        );
+                        let out =
+                            SearchOutput::from_search_result(&r.file, r.line, r.col, &r.content);
                         if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
                             truncated += 1;
                         }
@@ -174,10 +170,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Sym(args) => {
-            let repo_root = db::find_repo_root(
-                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            )
-            .ok();
+            let repo_root =
+                db::find_repo_root(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                    .ok();
             let router = QueryRouter::new(repo_root, false);
 
             if !router.has_index() {
@@ -191,7 +186,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let results = router.query_symbols(&args.name, kind_str, args.exact)?;
 
             if results.is_empty() {
-                output::print_hint("no symbols found; try a broader query or omit --exact", suppress);
+                output::print_hint(
+                    "no symbols found; try a broader query or omit --exact",
+                    suppress,
+                );
             }
 
             let mut truncated = 0usize;
@@ -281,10 +279,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Deps(args) => {
-            let repo_root = db::find_repo_root(
-                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            )
-            .ok();
+            let repo_root =
+                db::find_repo_root(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                    .ok();
             let router = QueryRouter::new(repo_root, false);
 
             if !router.has_index() {
@@ -313,10 +310,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Rdeps(args) => {
-            let repo_root = db::find_repo_root(
-                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            )
-            .ok();
+            let repo_root =
+                db::find_repo_root(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                    .ok();
             let router = QueryRouter::new(repo_root, false);
 
             if !router.has_index() {
@@ -354,7 +350,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Update => {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
-            let progress = Progress::new("Re-indexing", "Re-indexed", progress::detect_mode(suppress));
+            let progress =
+                Progress::new("Re-indexing", "Re-indexed", progress::detect_mode(suppress));
             let stats = pipeline::rebuild_index_with_progress(&repo_root, false, &progress)?;
             progress.finish(&stats);
         }
@@ -448,12 +445,14 @@ fn spawn_daemon_background(repo_root: &Path) {
 /// When `--tree` is set, groups symbols by scope hierarchy (e.g. methods
 /// under their parent class).
 /// Returns the number of results truncated by budget (0 if no budget active).
-fn dispatch_ls<W: io::Write>(args: LsArgs, suppress: bool, fmt: &mut Formatter<W>) -> Result<usize> {
+fn dispatch_ls<W: io::Write>(
+    args: LsArgs,
+    suppress: bool,
+    fmt: &mut Formatter<W>,
+) -> Result<usize> {
     let path = PathBuf::from(&args.path);
-    let repo_root = db::find_repo_root(
-        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    )
-    .ok();
+    let repo_root =
+        db::find_repo_root(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))).ok();
     let router = QueryRouter::new(repo_root, false);
 
     if !router.has_index() {
@@ -599,8 +598,7 @@ fn regex_escape(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
-            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']'
-            | '{' | '}' | '|' | '\\' => {
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
                 escaped.push('\\');
                 escaped.push(ch);
             }
@@ -861,11 +859,7 @@ impl QueryRouter {
     ///
     /// Tries the SQLite index first; falls back to grep for function/class
     /// definitions.
-    pub fn query_symbols_in_file(
-        &self,
-        path: &str,
-        _tree: bool,
-    ) -> Result<Vec<Symbol>, DbError> {
+    pub fn query_symbols_in_file(&self, path: &str, _tree: bool) -> Result<Vec<Symbol>, DbError> {
         // Try SQLite first.
         if let Some(conn) = &self.conn {
             let results = query_symbols_in_file_db(conn, path)?;
@@ -1096,9 +1090,7 @@ fn query_deps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> 
     let sql = "SELECT DISTINCT import_path FROM file_imports WHERE source_file = ?1";
     let mut stmt = conn.prepare(sql)?;
 
-    let rows = stmt.query_map(rusqlite::params![file], |row| {
-        row.get::<_, String>(0)
-    })?;
+    let rows = stmt.query_map(rusqlite::params![file], |row| row.get::<_, String>(0))?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -1165,23 +1157,34 @@ fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
 fn extract_symbol_name(content: &str) -> String {
     // Split on whitespace, find the token after a keyword.
     let keywords = [
-        "fn", "def", "function", "func", "class", "struct", "enum", "trait",
-        "interface", "module",
+        "fn",
+        "def",
+        "function",
+        "func",
+        "class",
+        "struct",
+        "enum",
+        "trait",
+        "interface",
+        "module",
     ];
 
     let tokens: Vec<&str> = content.split_whitespace().collect();
     for (i, tok) in tokens.iter().enumerate() {
-        let clean = tok.trim_start_matches("pub(crate)").trim_start_matches("pub").trim();
-        if keywords.contains(&clean) {
-            if let Some(next) = tokens.get(i + 1) {
-                // Take only the identifier part: alphanumeric and underscores.
-                let name: String = next
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                if !name.is_empty() {
-                    return name;
-                }
+        let clean = tok
+            .trim_start_matches("pub(crate)")
+            .trim_start_matches("pub")
+            .trim();
+        if keywords.contains(&clean)
+            && let Some(next) = tokens.get(i + 1)
+        {
+            // Take only the identifier part: alphanumeric and underscores.
+            let name: String = next
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                return name;
             }
         }
     }
@@ -1328,7 +1331,10 @@ mod tests {
 
     #[test]
     fn test_extract_symbol_name_pub_fn() {
-        assert_eq!(extract_symbol_name("pub fn handler(req: Request)"), "handler");
+        assert_eq!(
+            extract_symbol_name("pub fn handler(req: Request)"),
+            "handler"
+        );
     }
 
     #[test]
@@ -1363,10 +1369,7 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
         let results = router.query_symbols("main", None, false).unwrap();
-        assert!(
-            !results.is_empty(),
-            "grep fallback should find 'fn main'"
-        );
+        assert!(!results.is_empty(), "grep fallback should find 'fn main'");
         assert!(results.iter().any(|s| s.name == "main"));
     }
 
@@ -1382,7 +1385,9 @@ mod tests {
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
         // Should find only the class when filtering by kind.
-        let results = router.query_symbols("Helper", Some("class"), false).unwrap();
+        let results = router
+            .query_symbols("Helper", Some("class"), false)
+            .unwrap();
         assert!(
             !results.is_empty(),
             "grep fallback should find 'class Helper'"
@@ -1428,7 +1433,11 @@ mod tests {
     fn test_router_query_deps_grep_fallback() {
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("main.py");
-        fs::write(&file_path, "import os\nfrom sys import argv\nprint('hello')\n").unwrap();
+        fs::write(
+            &file_path,
+            "import os\nfrom sys import argv\nprint('hello')\n",
+        )
+        .unwrap();
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
         let file_str = file_path.to_string_lossy().into_owned();
@@ -1447,11 +1456,7 @@ mod tests {
             "from utils import helper\nhelper()\n",
         )
         .unwrap();
-        fs::write(
-            dir.path().join("utils.py"),
-            "def helper():\n    pass\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("utils.py"), "def helper():\n    pass\n").unwrap();
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
         let results = router.query_rdeps("utils.py").unwrap();
@@ -1472,7 +1477,15 @@ mod tests {
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["my_func", "function", "src/main.rs", 10, 0, "rust", "fn my_func()"],
+            rusqlite::params![
+                "my_func",
+                "function",
+                "src/main.rs",
+                10,
+                0,
+                "rust",
+                "fn my_func()"
+            ],
         )
         .unwrap();
 
@@ -1496,13 +1509,29 @@ mod tests {
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["calculate_sum", "function", "lib.rs", 5, 0, "rust", "fn calculate_sum()"],
+            rusqlite::params![
+                "calculate_sum",
+                "function",
+                "lib.rs",
+                5,
+                0,
+                "rust",
+                "fn calculate_sum()"
+            ],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["calculate_avg", "function", "lib.rs", 15, 0, "rust", "fn calculate_avg()"],
+            rusqlite::params![
+                "calculate_avg",
+                "function",
+                "lib.rs",
+                15,
+                0,
+                "rust",
+                "fn calculate_avg()"
+            ],
         )
         .unwrap();
 
@@ -1535,9 +1564,7 @@ mod tests {
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
 
         // Filter by kind should only return the struct.
-        let results = router
-            .query_symbols("Item", Some("struct"), true)
-            .unwrap();
+        let results = router.query_symbols("Item", Some("struct"), true).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].kind, SymbolKind::Struct);
     }
@@ -1586,7 +1613,15 @@ mod tests {
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["process", "struct", "types.rs", 1, 0, "rust", "struct process"],
+            rusqlite::params![
+                "process",
+                "struct",
+                "types.rs",
+                1,
+                0,
+                "rust",
+                "struct process"
+            ],
         )
         .unwrap();
 
@@ -1656,11 +1691,7 @@ mod tests {
         // DB is empty -- no symbols inserted.
 
         // Create a file that grep can find.
-        fs::write(
-            dir.path().join("code.rs"),
-            "fn target_func() {}\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("code.rs"), "fn target_func() {}\n").unwrap();
 
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
         assert!(router.has_index());
@@ -1700,9 +1731,19 @@ mod tests {
 
         // Query deps for src/main.ts.
         let results = router.query_deps("src/main.ts").unwrap();
-        assert!(results.len() >= 2, "should find at least 2 imports, got {}", results.len());
-        assert!(results.iter().any(|r| r.contains("utils")), "should include utils import");
-        assert!(results.iter().any(|r| r.contains("config")), "should include config import");
+        assert!(
+            results.len() >= 2,
+            "should find at least 2 imports, got {}",
+            results.len()
+        );
+        assert!(
+            results.iter().any(|r| r.contains("utils")),
+            "should include utils import"
+        );
+        assert!(
+            results.iter().any(|r| r.contains("config")),
+            "should include config import"
+        );
     }
 
     #[test]
@@ -1722,7 +1763,11 @@ mod tests {
             "import { helper } from './utils';\nhelper();\n",
         )
         .unwrap();
-        fs::write(root.join("src/utils.ts"), "export function foo() {}\nexport function helper() {}\n").unwrap();
+        fs::write(
+            root.join("src/utils.ts"),
+            "export function foo() {}\nexport function helper() {}\n",
+        )
+        .unwrap();
 
         // Build index.
         pipeline::build_index(root, true).unwrap();
@@ -1733,7 +1778,11 @@ mod tests {
 
         // Query rdeps for src/utils.ts.
         let results = router.query_rdeps("src/utils.ts").unwrap();
-        assert!(results.len() >= 2, "should find at least 2 reverse deps, got {}", results.len());
+        assert!(
+            results.len() >= 2,
+            "should find at least 2 reverse deps, got {}",
+            results.len()
+        );
     }
 
     #[test]
@@ -1763,7 +1812,10 @@ mod tests {
             }
         }
         let output_str = String::from_utf8(buf).unwrap();
-        assert!(output_str.contains("src/main.ts -> ./utils"), "grep format: {output_str}");
+        assert!(
+            output_str.contains("src/main.ts -> ./utils"),
+            "grep format: {output_str}"
+        );
     }
 
     #[test]
@@ -1947,11 +1999,36 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
-        assert!(!router.query_symbols("handler", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("internal", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Config", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("State", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Runnable", None, false).unwrap().is_empty());
+        assert!(
+            !router
+                .query_symbols("handler", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("internal", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Config", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("State", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Runnable", None, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1965,8 +2042,18 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
-        assert!(!router.query_symbols("process", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Worker", None, false).unwrap().is_empty());
+        assert!(
+            !router
+                .query_symbols("process", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Worker", None, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1980,8 +2067,18 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
-        assert!(!router.query_symbols("render", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Component", None, false).unwrap().is_empty());
+        assert!(
+            !router
+                .query_symbols("render", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Component", None, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1995,7 +2092,12 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
-        assert!(!router.query_symbols("Handle", None, false).unwrap().is_empty());
+        assert!(
+            !router
+                .query_symbols("Handle", None, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2009,10 +2111,30 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
-        assert!(!router.query_symbols("execute", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Config", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Direction", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Service", None, false).unwrap().is_empty());
+        assert!(
+            !router
+                .query_symbols("execute", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Config", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Direction", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Service", None, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2026,9 +2148,24 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
-        assert!(!router.query_symbols("process", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Worker", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Utils", None, false).unwrap().is_empty());
+        assert!(
+            !router
+                .query_symbols("process", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Worker", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Utils", None, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2042,10 +2179,30 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
-        assert!(!router.query_symbols("handle", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Controller", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Cacheable", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Renderable", None, false).unwrap().is_empty());
+        assert!(
+            !router
+                .query_symbols("handle", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Controller", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Cacheable", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Renderable", None, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2059,9 +2216,24 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
 
-        assert!(!router.query_symbols("Application", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Service", None, false).unwrap().is_empty());
-        assert!(!router.query_symbols("Priority", None, false).unwrap().is_empty());
+        assert!(
+            !router
+                .query_symbols("Application", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Service", None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !router
+                .query_symbols("Priority", None, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2093,7 +2265,10 @@ mod tests {
 
         let results = router.query_rdeps("utils.py").unwrap();
         // Should find at least the JS and Rust files that reference "utils"
-        assert!(!results.is_empty(), "import patterns should find files referencing 'utils'");
+        assert!(
+            !results.is_empty(),
+            "import patterns should find files referencing 'utils'"
+        );
     }
 
     // -- Sig dispatch integration tests -------------------------------------
@@ -2129,8 +2304,14 @@ mod tests {
         }
         let text = String::from_utf8(buf).unwrap();
         // Should be in file:line:  signature format
-        assert!(text.contains("process"), "output should contain the function name");
-        assert!(text.contains(":"), "output should be in file:line:  sig format");
+        assert!(
+            text.contains("process"),
+            "output should contain the function name"
+        );
+        assert!(
+            text.contains(":"),
+            "output should be in file:line:  sig format"
+        );
     }
 
     #[test]
@@ -2194,7 +2375,10 @@ mod tests {
         let results = router.query_signatures("dispatch").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "dispatch");
-        assert_eq!(results[0].signature, "pub fn dispatch(cli: Cli) -> Result<()>");
+        assert_eq!(
+            results[0].signature,
+            "pub fn dispatch(cli: Cli) -> Result<()>"
+        );
 
         // Format as grep text
         let mut buf = Vec::new();
@@ -2229,7 +2413,10 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
         let results = router.query_signatures("nonexistent_func").unwrap();
-        assert!(results.is_empty(), "should return no results for non-existent function");
+        assert!(
+            results.is_empty(),
+            "should return no results for non-existent function"
+        );
     }
 
     // -- Sym dispatch integration tests -------------------------------------
@@ -2367,7 +2554,11 @@ mod tests {
         // Substring match should find both.
         let output = run_sym_query(&router, "process", None, false, false);
         let lines: Vec<&str> = output.trim().lines().collect();
-        assert_eq!(lines.len(), 2, "substring 'process' should match both symbols");
+        assert_eq!(
+            lines.len(),
+            2,
+            "substring 'process' should match both symbols"
+        );
         assert!(output.contains("processPayment"));
         assert!(output.contains("processRefund"));
     }
@@ -2455,7 +2646,11 @@ mod tests {
         // --kind function should only return the function.
         let output = run_sym_query(&router, "Payment", Some("function"), true, false);
         let lines: Vec<&str> = output.trim().lines().collect();
-        assert_eq!(lines.len(), 1, "--kind function should filter to functions only");
+        assert_eq!(
+            lines.len(),
+            1,
+            "--kind function should filter to functions only"
+        );
         assert!(output.contains("fn Payment()"));
         assert!(!output.contains("struct Payment"));
     }
@@ -2561,11 +2756,10 @@ mod tests {
 
         // Restrict to src/ only
         let src_path = src_dir.to_string_lossy().into_owned();
-        let results = router.query_references("processPayment", &[src_path]).unwrap();
-        assert!(
-            !results.is_empty(),
-            "should find references in src/"
-        );
+        let results = router
+            .query_references("processPayment", &[src_path])
+            .unwrap();
+        assert!(!results.is_empty(), "should find references in src/");
         // All results should be from src/ directory
         for r in &results {
             assert!(
@@ -2848,12 +3042,7 @@ mod tests {
     // -- Ls dispatch integration tests ----------------------------------------
 
     /// Helper: run ls query through QueryRouter and format results.
-    fn run_ls_query(
-        router: &QueryRouter,
-        path: &str,
-        tree: bool,
-        json: bool,
-    ) -> String {
+    fn run_ls_query(router: &QueryRouter, path: &str, tree: bool, json: bool) -> String {
         let results = router.query_symbols_in_file(path, tree).unwrap();
         let mut buf = Vec::new();
         {
@@ -2898,7 +3087,15 @@ mod tests {
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["helper", "function", "src/main.rs", 10, 0, "rust", "fn helper()"],
+            rusqlite::params![
+                "helper",
+                "function",
+                "src/main.rs",
+                10,
+                0,
+                "rust",
+                "fn helper()"
+            ],
         )
         .unwrap();
 
@@ -2919,19 +3116,44 @@ mod tests {
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["Worker", "class", "src/lib.py", 1, 0, "python", "class Worker:"],
+            rusqlite::params![
+                "Worker",
+                "class",
+                "src/lib.py",
+                1,
+                0,
+                "python",
+                "class Worker:"
+            ],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, scope, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params!["process", "method", "src/lib.py", 5, 4, "Worker", "python", "def process(self):"],
+            rusqlite::params![
+                "process",
+                "method",
+                "src/lib.py",
+                5,
+                4,
+                "Worker",
+                "python",
+                "def process(self):"
+            ],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["standalone", "function", "src/lib.py", 20, 0, "python", "def standalone():"],
+            rusqlite::params![
+                "standalone",
+                "function",
+                "src/lib.py",
+                20,
+                0,
+                "python",
+                "def standalone():"
+            ],
         )
         .unwrap();
 
@@ -2957,13 +3179,30 @@ mod tests {
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["Worker", "class", "src/lib.py", 1, 0, "python", "class Worker:"],
+            rusqlite::params![
+                "Worker",
+                "class",
+                "src/lib.py",
+                1,
+                0,
+                "python",
+                "class Worker:"
+            ],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, scope, language, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params!["process", "method", "src/lib.py", 5, 4, "Worker", "python", "def process(self):"],
+            rusqlite::params![
+                "process",
+                "method",
+                "src/lib.py",
+                5,
+                4,
+                "Worker",
+                "python",
+                "def process(self):"
+            ],
         )
         .unwrap();
 
@@ -2995,10 +3234,7 @@ mod tests {
 
         let router = QueryRouter::grep_only(dir.path().to_path_buf());
         let results = router.query_references("calc", &[]).unwrap();
-        assert!(
-            !results.is_empty(),
-            "should find references to 'calc'"
-        );
+        assert!(!results.is_empty(), "should find references to 'calc'");
         // Every reference should have a non-empty context line
         for r in &results {
             assert!(

@@ -135,7 +135,7 @@ pub fn build_index_with_progress(
     Ok(IndexStats {
         file_count: results.len(),
         symbol_count: sym_count,
-        ref_count: ref_count,
+        ref_count,
         elapsed: start.elapsed(),
     })
 }
@@ -233,15 +233,18 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
     let line_count = content.lines().count();
 
     // Single transaction: delete old data, insert new data.
-    upsert_file_data(conn, &FileResult {
-        rel_path,
-        language: lang.name().to_string(),
-        content_hash: new_hash,
-        line_count,
-        symbols,
-        refs,
-        imports: file_imports.imports,
-    })?;
+    upsert_file_data(
+        conn,
+        &FileResult {
+            rel_path,
+            language: lang.name().to_string(),
+            content_hash: new_hash,
+            line_count,
+            symbols,
+            refs,
+            imports: file_imports.imports,
+        },
+    )?;
 
     Ok(true)
 }
@@ -280,24 +283,14 @@ pub fn index_new_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> 
 /// Events are processed sequentially.  Errors on individual files are
 /// logged (via the returned Result) but do not abort the entire batch;
 /// processing continues with the remaining events.
-pub fn process_events(
-    conn: &Connection,
-    events: &[FileEvent],
-    repo_root: &Path,
-) -> Result<usize> {
+pub fn process_events(conn: &Connection, events: &[FileEvent], repo_root: &Path) -> Result<usize> {
     let mut updated = 0usize;
 
     for event in events {
         let result = match event {
-            FileEvent::Created(path) => {
-                index_new_file(conn, path, repo_root).map(|()| true)
-            }
-            FileEvent::Modified(path) => {
-                reindex_file(conn, path, repo_root)
-            }
-            FileEvent::Deleted(path) => {
-                remove_file(conn, path, repo_root).map(|()| true)
-            }
+            FileEvent::Created(path) => index_new_file(conn, path, repo_root).map(|()| true),
+            FileEvent::Modified(path) => reindex_file(conn, path, repo_root),
+            FileEvent::Deleted(path) => remove_file(conn, path, repo_root).map(|()| true),
         };
 
         match result {
@@ -429,9 +422,8 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
 
     // Insert new imports.
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
-        )?;
+        let mut stmt =
+            tx.prepare("INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)")?;
         for import in &result.imports {
             stmt.execute(rusqlite::params![result.rel_path, import])?;
         }
@@ -497,7 +489,8 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let tx = conn.unchecked_transaction()
+    let tx = conn
+        .unchecked_transaction()
         .context("starting transaction")?;
 
     let mut total_syms = 0usize;
@@ -567,9 +560,8 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
 
     // Insert file imports.
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
-        )?;
+        let mut stmt =
+            tx.prepare("INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)")?;
         for r in results {
             for import in &r.imports {
                 stmt.execute(rusqlite::params![r.rel_path, import])?;
@@ -670,7 +662,11 @@ class Component {
         let dir = make_test_repo();
         let stats = build_index(dir.path(), true).unwrap();
 
-        assert!(stats.file_count >= 3, "should index at least 3 files, got {}", stats.file_count);
+        assert!(
+            stats.file_count >= 3,
+            "should index at least 3 files, got {}",
+            stats.file_count
+        );
         assert!(stats.symbol_count > 0, "should extract symbols");
         // ref_count is usize so it's always >= 0; just ensure indexing ran.
         let _ = stats.ref_count;
@@ -695,15 +691,14 @@ class Component {
         let file_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .unwrap();
-        assert!(file_count >= 3, "files table should have at least 3 entries");
+        assert!(
+            file_count >= 3,
+            "files table should have at least 3 entries"
+        );
 
         // Check that files have hashes.
         let hash: String = conn
-            .query_row(
-                "SELECT hash FROM files LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT hash FROM files LIMIT 1", [], |row| row.get(0))
             .unwrap();
         assert_eq!(hash.len(), 16, "hash should be 16 hex chars");
     }
@@ -785,7 +780,9 @@ class Component {
         let index_path = db::local_index_path(dir.path());
         let conn1 = db::open_existing(&index_path).unwrap();
         let hash1: String = conn1
-            .query_row("SELECT hash FROM files WHERE path = 'test.rs'", [], |row| row.get(0))
+            .query_row("SELECT hash FROM files WHERE path = 'test.rs'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         // Modify the file and rebuild.
@@ -793,7 +790,9 @@ class Component {
         let _stats2 = rebuild_index(dir.path(), true).unwrap();
         let conn2 = db::open_existing(&index_path).unwrap();
         let hash2: String = conn2
-            .query_row("SELECT hash FROM files WHERE path = 'test.rs'", [], |row| row.get(0))
+            .query_row("SELECT hash FROM files WHERE path = 'test.rs'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         assert_ne!(hash1, hash2, "hash should change when content changes");
@@ -993,10 +992,16 @@ class Component {
 
         // Record the original hash and symbol count.
         let orig_hash: String = conn
-            .query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |row| row.get(0))
+            .query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let orig_sym_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert!(orig_sym_count > 0, "should have symbols initially");
 
@@ -1012,13 +1017,19 @@ class Component {
 
         // Hash should have changed.
         let new_hash: String = conn
-            .query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |row| row.get(0))
+            .query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_ne!(orig_hash, new_hash, "hash should change after modification");
 
         // Symbol count should have increased (we added a function).
         let new_sym_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert!(
             new_sym_count > orig_sym_count,
@@ -1032,7 +1043,11 @@ class Component {
         let root = dir.path();
 
         let orig_indexed: i64 = conn
-            .query_row("SELECT last_indexed FROM files WHERE path = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT last_indexed FROM files WHERE path = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
 
         // Change the file.
@@ -1042,18 +1057,36 @@ class Component {
 
         // last_indexed should be updated.
         let new_indexed: i64 = conn
-            .query_row("SELECT last_indexed FROM files WHERE path = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT last_indexed FROM files WHERE path = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert!(new_indexed >= orig_indexed, "last_indexed should be updated");
+        assert!(
+            new_indexed >= orig_indexed,
+            "last_indexed should be updated"
+        );
 
         // symbols_count should reflect the new file content.
         let sym_count_meta: i64 = conn
-            .query_row("SELECT symbols_count FROM files WHERE path = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT symbols_count FROM files WHERE path = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let sym_count_actual: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(sym_count_meta, sym_count_actual, "symbols_count metadata should match actual count");
+        assert_eq!(
+            sym_count_meta, sym_count_actual,
+            "symbols_count metadata should match actual count"
+        );
     }
 
     #[test]
@@ -1084,7 +1117,10 @@ class Component {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(has_hello_after, 0, "'hello' symbol should be removed after re-index");
+        assert_eq!(
+            has_hello_after, 0,
+            "'hello' symbol should be removed after re-index"
+        );
 
         // New symbols should be present.
         let has_alpha: i64 = conn
@@ -1094,7 +1130,10 @@ class Component {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(has_alpha > 0, "'alpha' symbol should be present after re-index");
+        assert!(
+            has_alpha > 0,
+            "'alpha' symbol should be present after re-index"
+        );
     }
 
     #[test]
@@ -1124,7 +1163,10 @@ class Component {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(fts_hello_after, 0, "FTS should not contain 'hello' after re-index");
+        assert_eq!(
+            fts_hello_after, 0,
+            "FTS should not contain 'hello' after re-index"
+        );
 
         // 'replacement' should be in FTS.
         let fts_replacement: i64 = conn
@@ -1134,7 +1176,10 @@ class Component {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(fts_replacement > 0, "FTS should contain 'replacement' after re-index");
+        assert!(
+            fts_replacement > 0,
+            "FTS should contain 'replacement' after re-index"
+        );
     }
 
     #[test]
@@ -1144,12 +1189,20 @@ class Component {
 
         // Verify data exists before removal.
         let file_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM files WHERE path = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(file_count, 1);
 
         let sym_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert!(sym_count > 0);
 
@@ -1158,17 +1211,29 @@ class Component {
 
         // All data should be gone.
         let file_count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM files WHERE path = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(file_count_after, 0, "files row should be removed");
 
         let sym_count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(sym_count_after, 0, "symbols should be removed");
 
         let ref_count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM \"references\" WHERE file = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM \"references\" WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(ref_count_after, 0, "references should be removed");
     }
@@ -1216,12 +1281,20 @@ class Component {
         remove_file(&conn, &root.join("lib.rs"), root).unwrap();
 
         let py_file: i64 = conn
-            .query_row("SELECT COUNT(*) FROM files WHERE path = 'app.py'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'app.py'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(py_file, 1, "app.py should still be in the index");
 
         let py_syms: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols WHERE file = 'app.py'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'app.py'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert!(py_syms > 0, "app.py symbols should still be in the index");
     }
@@ -1232,7 +1305,11 @@ class Component {
         let root = dir.path();
 
         // Create a new file not yet in the index.
-        fs::write(root.join("new_file.rs"), "fn brand_new() {}\nstruct Fresh {}").unwrap();
+        fs::write(
+            root.join("new_file.rs"),
+            "fn brand_new() {}\nstruct Fresh {}",
+        )
+        .unwrap();
 
         index_new_file(&conn, &root.join("new_file.rs"), root).unwrap();
 
@@ -1384,7 +1461,10 @@ class Component {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(has_changed > 0, "lib.rs should be re-indexed despite earlier error");
+        assert!(
+            has_changed > 0,
+            "lib.rs should be re-indexed despite earlier error"
+        );
     }
 
     #[test]
@@ -1401,7 +1481,11 @@ class Component {
         // some paths may be unsupported languages).
         assert!(progress.total() > 0, "progress total should be set");
         // Done should equal total (all files processed).
-        assert_eq!(progress.done(), progress.total(), "all files should be processed");
+        assert_eq!(
+            progress.done(),
+            progress.total(),
+            "all files should be processed"
+        );
         // Stats should still be correct.
         assert!(stats.file_count >= 3);
         assert!(stats.symbol_count > 0);
@@ -1416,11 +1500,22 @@ class Component {
         // Build first.
         let _stats1 = build_index(dir.path(), true).unwrap();
 
-        let progress = Arc::new(Progress::new("Re-indexing", "Re-indexed", ProgressMode::Silent));
+        let progress = Arc::new(Progress::new(
+            "Re-indexing",
+            "Re-indexed",
+            ProgressMode::Silent,
+        ));
         let stats2 = rebuild_index_with_progress(dir.path(), true, &progress).unwrap();
 
-        assert!(progress.total() > 0, "progress total should be set for rebuild");
-        assert_eq!(progress.done(), progress.total(), "all files processed in rebuild");
+        assert!(
+            progress.total() > 0,
+            "progress total should be set for rebuild"
+        );
+        assert_eq!(
+            progress.done(),
+            progress.total(),
+            "all files processed in rebuild"
+        );
         assert!(stats2.symbol_count > 0);
     }
 
@@ -1439,15 +1534,27 @@ class Component {
         let root = dir.path();
 
         let orig_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
 
         // Modify the file slightly (same symbols, different content to change hash).
-        fs::write(root.join("lib.rs"), "fn hello() { 1 }\nfn world() { 2 }\n// comment").unwrap();
+        fs::write(
+            root.join("lib.rs"),
+            "fn hello() { 1 }\nfn world() { 2 }\n// comment",
+        )
+        .unwrap();
         reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
 
         let new_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         // Should be the same number (old symbols deleted, new ones inserted).
         assert_eq!(

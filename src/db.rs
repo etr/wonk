@@ -111,8 +111,8 @@ pub fn open(path: &Path) -> Result<Connection> {
             .with_context(|| format!("creating index directory {}", parent.display()))?;
     }
 
-    let conn = Connection::open(path)
-        .with_context(|| format!("opening database {}", path.display()))?;
+    let conn =
+        Connection::open(path).with_context(|| format!("opening database {}", path.display()))?;
 
     apply_pragmas(&conn)?;
     apply_schema(&conn)?;
@@ -126,8 +126,8 @@ pub fn open_existing(path: &Path) -> Result<Connection> {
     if !path.exists() {
         bail!("index not found at {}", path.display());
     }
-    let conn = Connection::open(path)
-        .with_context(|| format!("opening database {}", path.display()))?;
+    let conn =
+        Connection::open(path).with_context(|| format!("opening database {}", path.display()))?;
 
     apply_pragmas(&conn)?;
     Ok(conn)
@@ -196,11 +196,7 @@ pub fn repo_hash(repo_path: &Path) -> String {
 /// First 16 hex characters of a byte slice.
 fn hex_encode_short(bytes: &[u8]) -> String {
     // 16 hex chars = 8 bytes
-    bytes
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Where the index lives when using the **central** (default) location:
@@ -235,10 +231,10 @@ pub fn find_existing_index(repo_root: &Path) -> Option<PathBuf> {
     if local.exists() {
         return Some(local);
     }
-    if let Ok(central) = central_index_path(repo_root) {
-        if central.exists() {
-            return Some(central);
-        }
+    if let Ok(central) = central_index_path(repo_root)
+        && central.exists()
+    {
+        return Some(central);
     }
     None
 }
@@ -285,8 +281,8 @@ pub fn read_meta(index_db_path: &Path) -> Result<Meta> {
         .expect("index.db must have a parent directory")
         .join("meta.json");
 
-    let data =
-        fs::read_to_string(&meta_path).with_context(|| format!("reading {}", meta_path.display()))?;
+    let data = fs::read_to_string(&meta_path)
+        .with_context(|| format!("reading {}", meta_path.display()))?;
     let meta: Meta = serde_json::from_str(&data).context("parsing meta.json")?;
     Ok(meta)
 }

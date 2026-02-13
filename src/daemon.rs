@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -187,9 +187,8 @@ pub fn check_stale_pid(index_dir: &Path) -> Result<()> {
                 .parse::<u32>()
                 .context("parsing PID from daemon.pid")?;
             if !process_alive(pid) {
-                fs::remove_file(&pid_path).with_context(|| {
-                    format!("removing stale PID file {}", pid_path.display())
-                })?;
+                fs::remove_file(&pid_path)
+                    .with_context(|| format!("removing stale PID file {}", pid_path.display()))?;
             }
             Ok(())
         }
@@ -214,9 +213,7 @@ pub fn remove_pid(index_dir: &Path) -> Result<()> {
     match fs::remove_file(&pid_path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => {
-            Err(e).with_context(|| format!("removing PID file {}", pid_path.display()))
-        }
+        Err(e) => Err(e).with_context(|| format!("removing PID file {}", pid_path.display())),
     }
 }
 
@@ -340,8 +337,7 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
 
     // --- File watcher event loop ---
     // Set up debounced file watching (500ms window) and run the event loop.
-    let (_watcher, rx) = FileWatcher::new(repo_root, 500)
-        .context("starting file watcher")?;
+    let (_watcher, rx) = FileWatcher::new(repo_root, 500).context("starting file watcher")?;
 
     let repo_root_buf = repo_root.to_path_buf();
     watcher::run_event_loop(&rx, &shutdown, |events| {
@@ -376,8 +372,12 @@ pub fn stop_daemon(repo_root: &Path, local: bool) -> Result<()> {
         .to_path_buf();
 
     let pid_path = pid_file_path(&index_dir);
-    let contents = fs::read_to_string(&pid_path)
-        .with_context(|| format!("reading PID file {} (is the daemon running?)", pid_path.display()))?;
+    let contents = fs::read_to_string(&pid_path).with_context(|| {
+        format!(
+            "reading PID file {} (is the daemon running?)",
+            pid_path.display()
+        )
+    })?;
 
     let pid: u32 = contents
         .trim()
@@ -445,6 +445,7 @@ pub fn daemon_status(repo_root: &Path, local: bool) -> Result<Option<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
     #[test]
@@ -645,8 +646,14 @@ mod tests {
         let pid = 12345_u32;
         write_startup_status(&conn, pid).unwrap();
 
-        assert_eq!(read_status(&conn, "pid").unwrap(), Some("12345".to_string()));
-        assert_eq!(read_status(&conn, "state").unwrap(), Some("running".to_string()));
+        assert_eq!(
+            read_status(&conn, "pid").unwrap(),
+            Some("12345".to_string())
+        );
+        assert_eq!(
+            read_status(&conn, "state").unwrap(),
+            Some("running".to_string())
+        );
 
         let uptime = read_status(&conn, "uptime_start").unwrap().unwrap();
         let ts: i64 = uptime.parse().unwrap();

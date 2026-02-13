@@ -109,9 +109,7 @@ impl Walker {
                 .expect("config ignore pattern should be valid");
         }
 
-        builder.overrides(
-            overrides.build().expect("override builder should succeed"),
-        );
+        builder.overrides(overrides.build().expect("override builder should succeed"));
 
         // Custom filter: skip hidden entries and worktree/nested-repo boundaries.
         builder.filter_entry(|entry| {
@@ -129,12 +127,12 @@ impl Walker {
             // Worktree boundary: skip non-root directories that contain a
             // `.git` entry (either a directory for nested repos, or a file
             // for linked worktrees).
-            if entry.depth() > 0 {
-                if let Some(ft) = entry.file_type() {
-                    if ft.is_dir() && entry.path().join(".git").exists() {
-                        return false;
-                    }
-                }
+            if entry.depth() > 0
+                && let Some(ft) = entry.file_type()
+                && ft.is_dir()
+                && entry.path().join(".git").exists()
+            {
+                return false;
             }
 
             true
@@ -157,10 +155,7 @@ impl Walker {
                 Err(_) => continue,
             };
             // Only collect files, not directories.
-            if entry
-                .file_type()
-                .map_or(false, |ft| ft.is_file())
-            {
+            if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 paths.push(entry.into_path());
             }
         }
@@ -183,10 +178,7 @@ impl Walker {
                     Ok(e) => e,
                     Err(_) => return WalkState::Continue,
                 };
-                if entry
-                    .file_type()
-                    .map_or(false, |ft| ft.is_file())
-                {
+                if entry.file_type().is_some_and(|ft| ft.is_file()) {
                     paths.lock().unwrap().push(entry.into_path());
                 }
                 WalkState::Continue
@@ -280,14 +272,38 @@ mod tests {
         let paths = walker.collect_paths();
         let rel = sorted_relative(td.path(), &paths);
 
-        assert!(rel.contains(&"src/main.rs".to_string()), "src/main.rs should be present, got: {rel:?}");
-        assert!(!rel.iter().any(|p| p.starts_with("node_modules")), "node_modules should be excluded");
-        assert!(!rel.iter().any(|p| p.starts_with("vendor")), "vendor should be excluded");
-        assert!(!rel.iter().any(|p| p.starts_with("target")), "target should be excluded");
-        assert!(!rel.iter().any(|p| p.starts_with("build")), "build should be excluded");
-        assert!(!rel.iter().any(|p| p.starts_with("dist")), "dist should be excluded");
-        assert!(!rel.iter().any(|p| p.starts_with("__pycache__")), "__pycache__ should be excluded");
-        assert!(!rel.iter().any(|p| p.starts_with(".venv")), ".venv should be excluded");
+        assert!(
+            rel.contains(&"src/main.rs".to_string()),
+            "src/main.rs should be present, got: {rel:?}"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("node_modules")),
+            "node_modules should be excluded"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("vendor")),
+            "vendor should be excluded"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("target")),
+            "target should be excluded"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("build")),
+            "build should be excluded"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("dist")),
+            "dist should be excluded"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("__pycache__")),
+            "__pycache__ should be excluded"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with(".venv")),
+            ".venv should be excluded"
+        );
     }
 
     #[test]
@@ -356,7 +372,10 @@ mod tests {
         seq.sort();
         par.sort();
 
-        assert_eq!(seq, par, "sequential and parallel walks should find the same files");
+        assert_eq!(
+            seq, par,
+            "sequential and parallel walks should find the same files"
+        );
     }
 
     // ----- .wonkignore tests -----
@@ -376,8 +395,14 @@ mod tests {
         let paths = walker.collect_paths();
         let rel = sorted_relative(td.path(), &paths);
 
-        assert!(rel.contains(&"keep.rs".to_string()), "keep.rs should be present, got: {rel:?}");
-        assert!(rel.contains(&"notes.md".to_string()), "notes.md should be present, got: {rel:?}");
+        assert!(
+            rel.contains(&"keep.rs".to_string()),
+            "keep.rs should be present, got: {rel:?}"
+        );
+        assert!(
+            rel.contains(&"notes.md".to_string()),
+            "notes.md should be present, got: {rel:?}"
+        );
         assert!(
             !rel.iter().any(|p| p.ends_with(".log")),
             ".log files should be excluded by .wonkignore, got: {rel:?}"
@@ -398,7 +423,10 @@ mod tests {
         let paths = walker.collect_paths();
         let rel = sorted_relative(td.path(), &paths);
 
-        assert!(rel.contains(&"src/main.rs".to_string()), "src/main.rs should be present");
+        assert!(
+            rel.contains(&"src/main.rs".to_string()),
+            "src/main.rs should be present"
+        );
         assert!(
             !rel.iter().any(|p| p.starts_with("generated")),
             "generated/ should be excluded by .wonkignore, got: {rel:?}"
@@ -443,7 +471,10 @@ mod tests {
         seq.sort();
         par.sort();
 
-        assert_eq!(seq, par, "sequential and parallel walks should match with .wonkignore");
+        assert_eq!(
+            seq, par,
+            "sequential and parallel walks should match with .wonkignore"
+        );
         assert!(!seq.iter().any(|p| p.ends_with(".log")));
     }
 
@@ -506,7 +537,11 @@ mod tests {
         let paths = walker.collect_paths();
         let rel = sorted_relative(td.path(), &paths);
 
-        assert_eq!(rel, vec!["keep.rs".to_string()], "only keep.rs should remain, got: {rel:?}");
+        assert_eq!(
+            rel,
+            vec!["keep.rs".to_string()],
+            "only keep.rs should remain, got: {rel:?}"
+        );
     }
 
     #[test]
@@ -524,7 +559,10 @@ mod tests {
         seq.sort();
         par.sort();
 
-        assert_eq!(seq, par, "sequential and parallel should match with config patterns");
+        assert_eq!(
+            seq, par,
+            "sequential and parallel should match with config patterns"
+        );
         assert!(!seq.iter().any(|p| p.ends_with(".csv")));
     }
 

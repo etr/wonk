@@ -136,15 +136,21 @@ impl IndexLookup {
             &format!("SELECT file, line FROM \"references\" WHERE file IN ({in_clause})"),
             &file_params,
         );
-        IndexLookup { definitions, references }
+        IndexLookup {
+            definitions,
+            references,
+        }
     }
 
     fn query_map(conn: &Connection, sql: &str, params: &[&str]) -> HashMap<String, HashSet<i64>> {
         let mut map: HashMap<String, HashSet<i64>> = HashMap::new();
         if let Ok(mut stmt) = conn.prepare(sql) {
-            let boxed_params: Vec<Box<dyn rusqlite::types::ToSql>> =
-                params.iter().map(|s| Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>).collect();
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> = boxed_params.iter().map(|b| b.as_ref()).collect();
+            let boxed_params: Vec<Box<dyn rusqlite::types::ToSql>> = params
+                .iter()
+                .map(|s| Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                boxed_params.iter().map(|b| b.as_ref()).collect();
             if let Ok(rows) = stmt.query_map(param_refs.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             }) {
@@ -157,11 +163,15 @@ impl IndexLookup {
     }
 
     fn is_definition(&self, file: &str, line: i64) -> bool {
-        self.definitions.get(file).is_some_and(|lines| lines.contains(&line))
+        self.definitions
+            .get(file)
+            .is_some_and(|lines| lines.contains(&line))
     }
 
     fn is_reference(&self, file: &str, line: i64) -> bool {
-        self.references.get(file).is_some_and(|lines| lines.contains(&line))
+        self.references
+            .get(file)
+            .is_some_and(|lines| lines.contains(&line))
     }
 }
 
@@ -186,8 +196,9 @@ static IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
             from\s             |
             \#include\s*[<"]   |
             require\s*[('"]
-        )"#
-    ).expect("import regex should compile")
+        )"#,
+    )
+    .expect("import regex should compile")
 });
 
 /// Check if a line is an import/require/use/include statement.
@@ -285,13 +296,7 @@ pub fn classify_results(
             let file_str = r.file.to_string_lossy();
             let line_i64 = r.line as i64;
 
-            let category = classify_one(
-                &file_str,
-                line_i64,
-                &r.content,
-                &r.file,
-                index.as_ref(),
-            );
+            let category = classify_one(&file_str, line_i64, &r.content, &r.file, index.as_ref());
 
             ClassifiedResult {
                 result: r.clone(),
@@ -316,10 +321,10 @@ fn classify_one(
     }
 
     // 2. Definition (from index)
-    if let Some(idx) = index {
-        if idx.is_definition(file_str, line) {
-            return ResultCategory::Definition;
-        }
+    if let Some(idx) = index
+        && idx.is_definition(file_str, line)
+    {
+        return ResultCategory::Definition;
     }
 
     // 3. Import (content heuristic, checked before Comment)
@@ -333,10 +338,10 @@ fn classify_one(
     }
 
     // 5. CallSite (from index)
-    if let Some(idx) = index {
-        if idx.is_reference(file_str, line) {
-            return ResultCategory::CallSite;
-        }
+    if let Some(idx) = index
+        && idx.is_reference(file_str, line)
+    {
+        return ResultCategory::CallSite;
     }
 
     // 6. Other (default)
@@ -365,8 +370,13 @@ pub fn rank_results(mut results: Vec<ClassifiedResult>) -> Vec<ClassifiedResult>
 ///
 /// Non-import, non-definition results are never deduplicated.
 pub fn dedup_reexports(results: Vec<ClassifiedResult>, _pattern: &str) -> Vec<ClassifiedResult> {
-    let has_definition = results.iter().any(|r| r.category == ResultCategory::Definition);
-    let import_count = results.iter().filter(|r| r.category == ResultCategory::Import).count();
+    let has_definition = results
+        .iter()
+        .any(|r| r.category == ResultCategory::Definition);
+    let import_count = results
+        .iter()
+        .filter(|r| r.category == ResultCategory::Import)
+        .count();
 
     // Only collapse when there is at least one definition and at least one import
     if !has_definition || import_count == 0 {
@@ -406,11 +416,11 @@ pub fn group_by_category(
     let mut groups: Vec<(ResultCategory, Vec<ClassifiedResult>)> = Vec::new();
 
     for r in results {
-        if let Some(last) = groups.last_mut() {
-            if last.0 == r.category {
-                last.1.push(r);
-                continue;
-            }
+        if let Some(last) = groups.last_mut()
+            && last.0 == r.category
+        {
+            last.1.push(r);
+            continue;
         }
         let cat = r.category;
         groups.push((cat, vec![r]));
@@ -460,7 +470,12 @@ mod tests {
         }
     }
 
-    fn make_classified(file: &str, line: u64, content: &str, cat: ResultCategory) -> ClassifiedResult {
+    fn make_classified(
+        file: &str,
+        line: u64,
+        content: &str,
+        cat: ResultCategory,
+    ) -> ClassifiedResult {
         ClassifiedResult {
             result: make_result(file, line, content),
             category: cat,
@@ -490,9 +505,7 @@ mod tests {
             rusqlite::params!["my_func", "function", "src/main.rs", 10, 0, "rust"],
         ).unwrap();
 
-        let results = vec![
-            make_result("src/main.rs", 10, "fn my_func() {}"),
-        ];
+        let results = vec![make_result("src/main.rs", 10, "fn my_func() {}")];
 
         let classified = classify_results(&results, Some(&conn));
         assert_eq!(classified.len(), 1);
@@ -511,9 +524,7 @@ mod tests {
             rusqlite::params!["my_func", "src/main.rs", 20, 4, "let x = my_func();"],
         ).unwrap();
 
-        let results = vec![
-            make_result("src/main.rs", 20, "let x = my_func();"),
-        ];
+        let results = vec![make_result("src/main.rs", 20, "let x = my_func();")];
 
         let classified = classify_results(&results, Some(&conn));
         assert_eq!(classified.len(), 1);
@@ -591,9 +602,7 @@ mod tests {
 
     #[test]
     fn classify_other_default() {
-        let results = vec![
-            make_result("src/main.rs", 5, "let x = 42;"),
-        ];
+        let results = vec![make_result("src/main.rs", 5, "let x = 42;")];
 
         let classified = classify_results(&results, None);
         assert_eq!(classified.len(), 1);
@@ -612,9 +621,7 @@ mod tests {
             rusqlite::params!["test_func", "function", "tests/test_foo.rs", 10, 0, "rust"],
         ).unwrap();
 
-        let results = vec![
-            make_result("tests/test_foo.rs", 10, "fn test_func() {}"),
-        ];
+        let results = vec![make_result("tests/test_foo.rs", 10, "fn test_func() {}")];
 
         let classified = classify_results(&results, Some(&conn));
         assert_eq!(classified[0].category, ResultCategory::Test);
@@ -623,9 +630,7 @@ mod tests {
     #[test]
     fn classification_priority_import_over_comment() {
         // #include looks like a comment (starts with #) but should be Import
-        let results = vec![
-            make_result("src/main.c", 1, "#include <stdio.h>"),
-        ];
+        let results = vec![make_result("src/main.c", 1, "#include <stdio.h>")];
 
         let classified = classify_results(&results, None);
         assert_eq!(classified[0].category, ResultCategory::Import);
@@ -647,9 +652,7 @@ mod tests {
 
     #[test]
     fn classify_preserves_original_result() {
-        let results = vec![
-            make_result("src/main.rs", 5, "let x = 42;"),
-        ];
+        let results = vec![make_result("src/main.rs", 5, "let x = 42;")];
 
         let classified = classify_results(&results, None);
         assert_eq!(classified[0].result, results[0]);
@@ -796,9 +799,24 @@ mod tests {
     #[test]
     fn dedup_collapses_import_reexports_when_definition_exists() {
         let input = vec![
-            make_classified("src/lib.rs", 10, "pub fn foo() {}", ResultCategory::Definition),
-            make_classified("src/reexport1.rs", 1, "pub use crate::foo;", ResultCategory::Import),
-            make_classified("src/reexport2.rs", 1, "pub use crate::foo;", ResultCategory::Import),
+            make_classified(
+                "src/lib.rs",
+                10,
+                "pub fn foo() {}",
+                ResultCategory::Definition,
+            ),
+            make_classified(
+                "src/reexport1.rs",
+                1,
+                "pub use crate::foo;",
+                ResultCategory::Import,
+            ),
+            make_classified(
+                "src/reexport2.rs",
+                1,
+                "pub use crate::foo;",
+                ResultCategory::Import,
+            ),
             make_classified("src/main.rs", 5, "foo();", ResultCategory::CallSite),
         ];
 
@@ -828,7 +846,12 @@ mod tests {
     #[test]
     fn dedup_keeps_all_when_no_imports() {
         let input = vec![
-            make_classified("src/lib.rs", 10, "pub fn foo() {}", ResultCategory::Definition),
+            make_classified(
+                "src/lib.rs",
+                10,
+                "pub fn foo() {}",
+                ResultCategory::Definition,
+            ),
             make_classified("src/main.rs", 5, "foo();", ResultCategory::CallSite),
         ];
 
@@ -842,8 +865,18 @@ mod tests {
     fn dedup_single_import_not_collapsed() {
         // Only one import + definition: no need for "(+1 other locations)"
         let input = vec![
-            make_classified("src/lib.rs", 10, "pub fn foo() {}", ResultCategory::Definition),
-            make_classified("src/index.rs", 1, "pub use crate::foo;", ResultCategory::Import),
+            make_classified(
+                "src/lib.rs",
+                10,
+                "pub fn foo() {}",
+                ResultCategory::Definition,
+            ),
+            make_classified(
+                "src/index.rs",
+                1,
+                "pub use crate::foo;",
+                ResultCategory::Import,
+            ),
         ];
 
         let deduped = dedup_reexports(input, "foo");
@@ -902,7 +935,10 @@ mod tests {
 
     #[test]
     fn category_header_mappings() {
-        assert_eq!(category_header(ResultCategory::Definition), "-- definitions --");
+        assert_eq!(
+            category_header(ResultCategory::Definition),
+            "-- definitions --"
+        );
         assert_eq!(category_header(ResultCategory::CallSite), "-- usages --");
         assert_eq!(category_header(ResultCategory::Import), "-- imports --");
         assert_eq!(category_header(ResultCategory::Other), "-- usages --");

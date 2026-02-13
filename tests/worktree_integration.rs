@@ -74,11 +74,7 @@ impl SiblingFixture {
         );
 
         // Add a file unique to the worktree (not committed).
-        std::fs::write(
-            worktree_root.join("src/extra.rs"),
-            "fn worktree_only() {}",
-        )
-        .unwrap();
+        std::fs::write(worktree_root.join("src/extra.rs"), "fn worktree_only() {}").unwrap();
 
         SiblingFixture {
             _dir: dir,
@@ -129,11 +125,7 @@ impl NestedFixture {
         );
 
         // Add a file unique to the nested worktree.
-        std::fs::write(
-            nested_wt.join("src/feature.rs"),
-            "fn feature_func() {}",
-        )
-        .unwrap();
+        std::fs::write(nested_wt.join("src/feature.rs"), "fn feature_func() {}").unwrap();
 
         NestedFixture {
             _dir: dir,
@@ -183,10 +175,7 @@ fn req_002_nested_worktree_nearest_root_wins() {
         found, expected,
         "should find nested worktree root, not parent"
     );
-    assert_ne!(
-        found, parent_canon,
-        "must NOT return the parent repo root"
-    );
+    assert_ne!(found, parent_canon, "must NOT return the parent repo root");
 }
 
 // ---------------------------------------------------------------------------
@@ -283,8 +272,14 @@ fn req_005_separate_indexes_per_worktree() {
     let parent_stats = wonk::pipeline::build_index(&fix.parent_root, true).unwrap();
     let wt_stats = wonk::pipeline::build_index(&fix.worktree_root, true).unwrap();
 
-    assert!(parent_stats.file_count > 0, "parent should have indexed files");
-    assert!(wt_stats.file_count > 0, "worktree should have indexed files");
+    assert!(
+        parent_stats.file_count > 0,
+        "parent should have indexed files"
+    );
+    assert!(
+        wt_stats.file_count > 0,
+        "worktree should have indexed files"
+    );
 
     // Index paths must be different.
     let parent_idx = wonk::db::local_index_path(&fix.parent_root);
@@ -295,12 +290,8 @@ fn req_005_separate_indexes_per_worktree() {
     );
 
     // Central repo hashes would also differ.
-    let parent_hash = wonk::db::repo_hash(
-        &std::fs::canonicalize(&fix.parent_root).unwrap(),
-    );
-    let wt_hash = wonk::db::repo_hash(
-        &std::fs::canonicalize(&fix.worktree_root).unwrap(),
-    );
+    let parent_hash = wonk::db::repo_hash(&std::fs::canonicalize(&fix.parent_root).unwrap());
+    let wt_hash = wonk::db::repo_hash(&std::fs::canonicalize(&fix.worktree_root).unwrap());
     assert_ne!(
         parent_hash, wt_hash,
         "repo hashes must differ for different worktree roots"

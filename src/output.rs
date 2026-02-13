@@ -6,7 +6,7 @@
 
 use std::fmt::Display;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::Path;
 
 use regex::Regex;
 use serde::Serialize;
@@ -120,7 +120,7 @@ pub enum BudgetStatus {
 
 impl SearchOutput {
     /// Build a `SearchOutput` from the internal `search::SearchResult`.
-    pub fn from_search_result(file: &PathBuf, line: u64, col: u64, content: &str) -> Self {
+    pub fn from_search_result(file: &Path, line: u64, col: u64, content: &str) -> Self {
         Self {
             file: file.to_string_lossy().into_owned(),
             line,
@@ -157,7 +157,13 @@ impl<W: Write> Formatter<W> {
     /// * `json`   - When `true`, emit JSON Lines; otherwise, emit grep-style text.
     /// * `color`  - When `true`, emit ANSI color codes in grep-style output.
     pub fn new(writer: W, json: bool, color: bool) -> Self {
-        Self { writer, json, color, highlight: None, budget: None }
+        Self {
+            writer,
+            json,
+            color,
+            highlight: None,
+            budget: None,
+        }
     }
 
     /// Set a highlight pattern for match highlighting in search results.
@@ -280,10 +286,10 @@ impl<W: Write> Formatter<W> {
 
     /// Write content with match highlighting if a highlight pattern is set.
     fn write_content(&mut self, content: &str) -> std::io::Result<()> {
-        if self.color {
-            if let Some(ref hl) = self.highlight {
-                return write_highlighted(&mut self.writer, content, &hl.re);
-            }
+        if self.color
+            && let Some(ref hl) = self.highlight
+        {
+            return write_highlighted(&mut self.writer, content, &hl.re);
         }
         write!(self.writer, "{}", content)
     }
@@ -300,10 +306,12 @@ impl<W: Write> Formatter<W> {
     }
 
     /// Shared render logic for a search result.
-    fn render_search_result<W2: Write>(fmt: &mut Formatter<W2>, result: &SearchOutput) -> std::io::Result<()> {
+    fn render_search_result<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        result: &SearchOutput,
+    ) -> std::io::Result<()> {
         if fmt.json {
-            let line = serde_json::to_string(result)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let line = serde_json::to_string(result).map_err(std::io::Error::other)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&result.file)?;
@@ -329,10 +337,12 @@ impl<W: Write> Formatter<W> {
     }
 
     /// Shared render logic for a symbol result.
-    fn render_symbol<W2: Write>(fmt: &mut Formatter<W2>, sym: &SymbolOutput) -> std::io::Result<()> {
+    fn render_symbol<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        sym: &SymbolOutput,
+    ) -> std::io::Result<()> {
         if fmt.json {
-            let line = serde_json::to_string(sym)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let line = serde_json::to_string(sym).map_err(std::io::Error::other)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&sym.file)?;
@@ -354,10 +364,12 @@ impl<W: Write> Formatter<W> {
     }
 
     /// Shared render logic for a reference result.
-    fn render_reference<W2: Write>(fmt: &mut Formatter<W2>, reference: &RefOutput) -> std::io::Result<()> {
+    fn render_reference<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        reference: &RefOutput,
+    ) -> std::io::Result<()> {
         if fmt.json {
-            let line = serde_json::to_string(reference)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let line = serde_json::to_string(reference).map_err(std::io::Error::other)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&reference.file)?;
@@ -379,10 +391,12 @@ impl<W: Write> Formatter<W> {
     }
 
     /// Shared render logic for a signature result.
-    fn render_signature<W2: Write>(fmt: &mut Formatter<W2>, sig: &SignatureOutput) -> std::io::Result<()> {
+    fn render_signature<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        sig: &SignatureOutput,
+    ) -> std::io::Result<()> {
         if fmt.json {
-            let line = serde_json::to_string(sig)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let line = serde_json::to_string(sig).map_err(std::io::Error::other)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&sig.file)?;
@@ -407,10 +421,12 @@ impl<W: Write> Formatter<W> {
     }
 
     /// Shared render logic for an ls-symbol entry.
-    fn render_ls_symbol<W2: Write>(fmt: &mut Formatter<W2>, entry: &LsSymbolEntry) -> std::io::Result<()> {
+    fn render_ls_symbol<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        entry: &LsSymbolEntry,
+    ) -> std::io::Result<()> {
         if fmt.json {
-            let line = serde_json::to_string(entry)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
             writeln!(fmt.writer, "{line}")
         } else {
             let padding = "  ".repeat(entry.indent + 1);
@@ -433,10 +449,12 @@ impl<W: Write> Formatter<W> {
     }
 
     /// Shared render logic for a file-list entry.
-    fn render_file_list<W2: Write>(fmt: &mut Formatter<W2>, entry: &FileEntry) -> std::io::Result<()> {
+    fn render_file_list<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        entry: &FileEntry,
+    ) -> std::io::Result<()> {
         if fmt.json {
-            let line = serde_json::to_string(entry)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&entry.path)?;
@@ -457,8 +475,7 @@ impl<W: Write> Formatter<W> {
     /// Shared render logic for a dependency edge.
     fn render_dep<W2: Write>(fmt: &mut Formatter<W2>, dep: &DepOutput) -> std::io::Result<()> {
         if fmt.json {
-            let line = serde_json::to_string(dep)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let line = serde_json::to_string(dep).map_err(std::io::Error::other)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&dep.file)?;
@@ -473,8 +490,7 @@ impl<W: Write> Formatter<W> {
     /// Emits a final JSON line with truncation info when `--budget` truncates
     /// output. In grep mode, callers should use [`print_budget_summary`] instead.
     pub fn format_truncation_meta(&mut self, meta: &TruncationMeta) -> std::io::Result<()> {
-        let line = serde_json::to_string(meta)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(meta).map_err(std::io::Error::other)?;
         writeln!(self.writer, "{line}")
     }
 }
@@ -610,7 +626,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let out = render(false, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -623,7 +639,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let out = render(true, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -815,14 +831,14 @@ mod tests {
                 line: 1,
                 col: 1,
                 content: "first".into(),
-            annotation: None,
+                annotation: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
                 line: 2,
                 col: 1,
                 content: "second".into(),
-            annotation: None,
+                annotation: None,
             },
         ];
         let out = render(true, |fmt| {
@@ -847,14 +863,14 @@ mod tests {
                 line: 1,
                 col: 1,
                 content: "first".into(),
-            annotation: None,
+                annotation: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
                 line: 2,
                 col: 1,
                 content: "second".into(),
-            annotation: None,
+                annotation: None,
             },
         ];
         let out = render(false, |fmt| {
@@ -873,7 +889,7 @@ mod tests {
 
     #[test]
     fn from_search_result_helper() {
-        let path = PathBuf::from("src/foo.rs");
+        let path = std::path::PathBuf::from("src/foo.rs");
         let out = SearchOutput::from_search_result(&path, 10, 3, "let x = 1;");
         assert_eq!(out.file, "src/foo.rs");
         assert_eq!(out.line, 10);
@@ -945,7 +961,7 @@ mod tests {
             line: 5,
             col: 1,
             content: "key: value".into(),
-        annotation: None,
+            annotation: None,
         };
         // Grep format: file:line:content (colons in content are fine)
         let out = render(false, |fmt| fmt.format_search_result(&result));
@@ -959,7 +975,7 @@ mod tests {
             line: 1,
             col: 1,
             content: "he said \"hello\"".into(),
-        annotation: None,
+            annotation: None,
         };
         let out = render(true, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -970,7 +986,7 @@ mod tests {
 
     #[test]
     fn format_error_returns_exit_code_1_for_general_error() {
-        use crate::errors::{DbError, WonkError, EXIT_ERROR};
+        use crate::errors::{DbError, EXIT_ERROR, WonkError};
         let err = WonkError::Db(DbError::NoIndex);
         let code = super::format_error(&err, false);
         assert_eq!(code, EXIT_ERROR);
@@ -978,7 +994,7 @@ mod tests {
 
     #[test]
     fn format_error_returns_exit_code_2_for_usage_error() {
-        use crate::errors::{WonkError, EXIT_USAGE};
+        use crate::errors::{EXIT_USAGE, WonkError};
         let err = WonkError::Usage("bad arg".into());
         let code = super::format_error(&err, false);
         assert_eq!(code, EXIT_USAGE);
@@ -1084,7 +1100,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let out = render(false, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -1097,12 +1113,16 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // File path should be wrapped in magenta+bold
         assert!(
-            out.contains(&format!("{}src/main.rs{}", crate::color::FILE, crate::color::RESET)),
+            out.contains(&format!(
+                "{}src/main.rs{}",
+                crate::color::FILE,
+                crate::color::RESET
+            )),
             "expected magenta+bold file path, got: {out:?}"
         );
     }
@@ -1114,12 +1134,16 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Line number should be wrapped in green
         assert!(
-            out.contains(&format!("{}42{}", crate::color::LINE_NO, crate::color::RESET)),
+            out.contains(&format!(
+                "{}42{}",
+                crate::color::LINE_NO,
+                crate::color::RESET
+            )),
             "expected green line number, got: {out:?}"
         );
     }
@@ -1131,7 +1155,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Separator should be wrapped in cyan
@@ -1148,7 +1172,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let mut buf = Vec::new();
         {
@@ -1169,7 +1193,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let mut buf = Vec::new();
         {
@@ -1192,7 +1216,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let mut buf = Vec::new();
         {
@@ -1215,7 +1239,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
-        annotation: None,
+            annotation: None,
         };
         let mut buf = Vec::new();
         {
@@ -1245,8 +1269,16 @@ mod tests {
             language: "Rust".into(),
         };
         let out = render_color(|fmt| fmt.format_symbol(&sym));
-        assert!(out.contains(&format!("{}src/main.rs{}", crate::color::FILE, crate::color::RESET)));
-        assert!(out.contains(&format!("{}10{}", crate::color::LINE_NO, crate::color::RESET)));
+        assert!(out.contains(&format!(
+            "{}src/main.rs{}",
+            crate::color::FILE,
+            crate::color::RESET
+        )));
+        assert!(out.contains(&format!(
+            "{}10{}",
+            crate::color::LINE_NO,
+            crate::color::RESET
+        )));
     }
 
     #[test]
@@ -1255,7 +1287,11 @@ mod tests {
             path: "src/output.rs".into(),
         };
         let out = render_color(|fmt| fmt.format_file_list(&entry));
-        assert!(out.contains(&format!("{}src/output.rs{}", crate::color::FILE, crate::color::RESET)));
+        assert!(out.contains(&format!(
+            "{}src/output.rs{}",
+            crate::color::FILE,
+            crate::color::RESET
+        )));
     }
 
     #[test]
@@ -1265,8 +1301,16 @@ mod tests {
             depends_on: "src/lib.rs".into(),
         };
         let out = render_color(|fmt| fmt.format_dep(&dep));
-        assert!(out.contains(&format!("{}src/main.rs{}", crate::color::FILE, crate::color::RESET)));
-        assert!(out.contains(&format!("{}src/lib.rs{}", crate::color::FILE, crate::color::RESET)));
+        assert!(out.contains(&format!(
+            "{}src/main.rs{}",
+            crate::color::FILE,
+            crate::color::RESET
+        )));
+        assert!(out.contains(&format!(
+            "{}src/lib.rs{}",
+            crate::color::FILE,
+            crate::color::RESET
+        )));
     }
 
     // -- Budget output helpers -----------------------------------------------
@@ -1439,7 +1483,9 @@ mod tests {
                 col: 0,
                 end_line: None,
                 scope: None,
-                signature: "fn some_really_long_function_name(arg1: Type1, arg2: Type2) -> ReturnType".into(),
+                signature:
+                    "fn some_really_long_function_name(arg1: Type1, arg2: Type2) -> ReturnType"
+                        .into(),
                 language: "Rust".into(),
             })
             .collect();
@@ -1468,7 +1514,7 @@ mod tests {
             line: 1,
             col: 1,
             content: "Hello WORLD hello".into(),
-        annotation: None,
+            annotation: None,
         };
         let mut buf = Vec::new();
         {
