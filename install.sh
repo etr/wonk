@@ -35,8 +35,7 @@ detect_os() {
   case "$(uname -s)" in
     Linux*)  echo "linux" ;;
     Darwin*) echo "macos" ;;
-    CYGWIN*|MINGW*|MSYS*) echo "windows" ;;
-    *) err "Unsupported operating system: $(uname -s)" ;;
+    *) err "Unsupported operating system: $(uname -s). wonk requires a Unix-like OS (Linux or macOS)." ;;
   esac
 }
 
@@ -58,7 +57,6 @@ get_target() {
     linux-aarch64)  echo "aarch64-unknown-linux-musl" ;;
     macos-x86_64)   echo "x86_64-apple-darwin" ;;
     macos-aarch64)  echo "aarch64-apple-darwin" ;;
-    windows-x86_64) echo "x86_64-pc-windows-msvc" ;;
     *) err "No prebuilt binary for ${os} ${arch}" ;;
   esac
 }
@@ -118,10 +116,6 @@ main() {
   fi
 
   info "Installing ${BINARY_NAME} v${version}"
-
-  if [ "$os" = "windows" ]; then
-    ext=".exe"
-  fi
 
   local artifact="${BINARY_NAME}-${version}-${target}${ext}"
   download_url="https://github.com/${GITHUB_REPO}/releases/download/v${version}/${artifact}"

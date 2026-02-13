@@ -40,11 +40,6 @@ jobs:
             use_cross: true
             strip: true
             ext: ""
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            use_cross: false
-            strip: false
-            ext: ".exe"
 
     steps:
       - uses: actions/checkout@v4
