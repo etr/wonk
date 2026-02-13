@@ -24,6 +24,9 @@ pub struct SearchOutput {
     pub line: u64,
     pub col: u64,
     pub content: String,
+    /// Optional annotation from ranking/dedup (e.g. "(+3 other locations)").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
 }
 
 /// A symbol definition result.
@@ -103,6 +106,7 @@ impl SearchOutput {
             line,
             col,
             content: content.to_string(),
+            annotation: None,
         }
     }
 }
@@ -206,6 +210,9 @@ impl<W: Write> Formatter<W> {
             self.write_line_no(result.line)?;
             self.write_sep()?;
             self.write_content(&result.content)?;
+            if let Some(ref ann) = result.annotation {
+                write!(self.writer, "  {ann}")?;
+            }
             writeln!(self.writer)
         }
     }
@@ -337,6 +344,13 @@ pub fn print_hint(msg: &str, json: bool) {
     }
 }
 
+/// Print a category header to stderr.
+///
+/// Headers go to stderr so they don't break grep-compatible stdout parsing.
+pub fn print_category_header(header: &str) {
+    eprintln!("{header}");
+}
+
 /// Print an error message to stderr.
 pub fn print_error(msg: &str) {
     eprintln!("error: {msg}");
@@ -399,6 +413,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let out = render(false, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -411,6 +426,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let out = render(true, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -602,12 +618,14 @@ mod tests {
                 line: 1,
                 col: 1,
                 content: "first".into(),
+            annotation: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
                 line: 2,
                 col: 1,
                 content: "second".into(),
+            annotation: None,
             },
         ];
         let out = render(true, |fmt| {
@@ -632,12 +650,14 @@ mod tests {
                 line: 1,
                 col: 1,
                 content: "first".into(),
+            annotation: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
                 line: 2,
                 col: 1,
                 content: "second".into(),
+            annotation: None,
             },
         ];
         let out = render(false, |fmt| {
@@ -664,6 +684,61 @@ mod tests {
         assert_eq!(out.content, "let x = 1;");
     }
 
+    // -- Annotation display -------------------------------------------------
+
+    #[test]
+    fn search_result_with_annotation_grep_format() {
+        let result = SearchOutput {
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 1,
+            content: "pub fn foo() {}".into(),
+            annotation: Some("(+3 other locations)".into()),
+        };
+        let out = render(false, |fmt| fmt.format_search_result(&result));
+        assert_eq!(out, "src/lib.rs:10:pub fn foo() {}  (+3 other locations)\n");
+    }
+
+    #[test]
+    fn search_result_without_annotation_no_trailing_space() {
+        let result = SearchOutput {
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 1,
+            content: "pub fn foo() {}".into(),
+            annotation: None,
+        };
+        let out = render(false, |fmt| fmt.format_search_result(&result));
+        assert_eq!(out, "src/lib.rs:10:pub fn foo() {}\n");
+    }
+
+    #[test]
+    fn search_result_annotation_in_json() {
+        let result = SearchOutput {
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 1,
+            content: "pub fn foo() {}".into(),
+            annotation: Some("(+2 other locations)".into()),
+        };
+        let out = render(true, |fmt| fmt.format_search_result(&result));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["annotation"], "(+2 other locations)");
+    }
+
+    #[test]
+    fn search_result_json_skips_annotation_when_none() {
+        let result = SearchOutput {
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 1,
+            content: "pub fn foo() {}".into(),
+            annotation: None,
+        };
+        let out = render(true, |fmt| fmt.format_search_result(&result));
+        assert!(!out.contains("annotation"));
+    }
+
     // -- Content with special characters ------------------------------------
 
     #[test]
@@ -673,6 +748,7 @@ mod tests {
             line: 5,
             col: 1,
             content: "key: value".into(),
+        annotation: None,
         };
         // Grep format: file:line:content (colons in content are fine)
         let out = render(false, |fmt| fmt.format_search_result(&result));
@@ -686,6 +762,7 @@ mod tests {
             line: 1,
             col: 1,
             content: "he said \"hello\"".into(),
+        annotation: None,
         };
         let out = render(true, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -810,6 +887,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let out = render(false, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -822,6 +900,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // File path should be wrapped in magenta+bold
@@ -838,6 +917,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Line number should be wrapped in green
@@ -854,6 +934,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Separator should be wrapped in cyan
@@ -870,6 +951,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let mut buf = Vec::new();
         {
@@ -890,6 +972,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let mut buf = Vec::new();
         {
@@ -912,6 +995,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let mut buf = Vec::new();
         {
@@ -934,6 +1018,7 @@ mod tests {
             line: 42,
             col: 1,
             content: "fn main() {}".into(),
+        annotation: None,
         };
         let mut buf = Vec::new();
         {
@@ -994,6 +1079,7 @@ mod tests {
             line: 1,
             col: 1,
             content: "Hello WORLD hello".into(),
+        annotation: None,
         };
         let mut buf = Vec::new();
         {

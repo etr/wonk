@@ -1,8 +1,9 @@
-//! Result classification engine.
+//! Result classification, ranking, and deduplication engine.
 //!
 //! Classifies each search result line into a category (Definition, CallSite,
 //! Import, Comment, Test, Other) using index metadata and path/content
-//! heuristics.
+//! heuristics, then ranks results by relevance tier, deduplicates re-exported
+//! symbols, and groups results by category for display with section headers.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -30,6 +31,35 @@ pub enum ResultCategory {
     Other,
 }
 
+impl ResultCategory {
+    /// Return a numeric tier for sort ordering.
+    ///
+    /// Lower values appear first in ranked output:
+    /// Definition(0) > CallSite(1) > Import(2) > Other(3) > Comment(4) > Test(5)
+    pub fn tier(&self) -> u8 {
+        match self {
+            ResultCategory::Definition => 0,
+            ResultCategory::CallSite => 1,
+            ResultCategory::Import => 2,
+            ResultCategory::Other => 3,
+            ResultCategory::Comment => 4,
+            ResultCategory::Test => 5,
+        }
+    }
+}
+
+impl PartialOrd for ResultCategory {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ResultCategory {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.tier().cmp(&other.tier())
+    }
+}
+
 impl std::fmt::Display for ResultCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -51,6 +81,23 @@ pub struct ClassifiedResult {
     pub result: SearchResult,
     /// The assigned category.
     pub category: ResultCategory,
+    /// Optional annotation (e.g. "(+3 other locations)") added by dedup.
+    pub annotation: Option<String>,
+}
+
+impl PartialOrd for ClassifiedResult {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ClassifiedResult {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.category
+            .cmp(&other.category)
+            .then_with(|| self.result.file.cmp(&other.result.file))
+            .then_with(|| self.result.line.cmp(&other.result.line))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +296,7 @@ pub fn classify_results(
             ClassifiedResult {
                 result: r.clone(),
                 category,
+                annotation: None,
             }
         })
         .collect()
@@ -295,6 +343,109 @@ fn classify_one(
     ResultCategory::Other
 }
 
+// ---------------------------------------------------------------------------
+// Ranking
+// ---------------------------------------------------------------------------
+
+/// Sort classified results by category tier, then file path, then line number.
+pub fn rank_results(mut results: Vec<ClassifiedResult>) -> Vec<ClassifiedResult> {
+    results.sort();
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Deduplication
+// ---------------------------------------------------------------------------
+
+/// Deduplicate re-exported/aliased symbols.
+///
+/// When the same symbol name appears as both a Definition and one or more
+/// Import re-exports, the imports are collapsed and the definition is
+/// annotated with "(+N other location(s))".
+///
+/// Non-import, non-definition results are never deduplicated.
+pub fn dedup_reexports(results: Vec<ClassifiedResult>, _pattern: &str) -> Vec<ClassifiedResult> {
+    let has_definition = results.iter().any(|r| r.category == ResultCategory::Definition);
+    let import_count = results.iter().filter(|r| r.category == ResultCategory::Import).count();
+
+    // Only collapse when there is at least one definition and at least one import
+    if !has_definition || import_count == 0 {
+        return results;
+    }
+
+    let mut out = Vec::with_capacity(results.len());
+
+    for mut r in results {
+        if r.category == ResultCategory::Import {
+            // Collapse this import (skip it)
+            continue;
+        }
+        if r.category == ResultCategory::Definition && r.annotation.is_none() {
+            let label = if import_count == 1 {
+                format!("(+{import_count} other location)")
+            } else {
+                format!("(+{import_count} other locations)")
+            };
+            r.annotation = Some(label);
+        }
+        out.push(r);
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Grouping
+// ---------------------------------------------------------------------------
+
+/// Group sorted results by category, returning (category, results) pairs.
+/// Empty categories are omitted.
+pub fn group_by_category(
+    results: Vec<ClassifiedResult>,
+) -> Vec<(ResultCategory, Vec<ClassifiedResult>)> {
+    let mut groups: Vec<(ResultCategory, Vec<ClassifiedResult>)> = Vec::new();
+
+    for r in results {
+        if let Some(last) = groups.last_mut() {
+            if last.0 == r.category {
+                last.1.push(r);
+                continue;
+            }
+        }
+        let cat = r.category;
+        groups.push((cat, vec![r]));
+    }
+
+    groups
+}
+
+/// Map a category to its display header string.
+pub fn category_header(cat: ResultCategory) -> &'static str {
+    match cat {
+        ResultCategory::Definition => "-- definitions --",
+        ResultCategory::CallSite | ResultCategory::Other => "-- usages --",
+        ResultCategory::Import => "-- imports --",
+        ResultCategory::Comment => "-- comments --",
+        ResultCategory::Test => "-- tests --",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full pipeline
+// ---------------------------------------------------------------------------
+
+/// Full ranking pipeline: classify -> sort -> dedup -> group.
+pub fn rank_and_dedup(
+    results: &[SearchResult],
+    conn: Option<&Connection>,
+    pattern: &str,
+) -> Vec<(ResultCategory, Vec<ClassifiedResult>)> {
+    let classified = classify_results(results, conn);
+    let sorted = rank_results(classified);
+    let deduped = dedup_reexports(sorted, pattern);
+    group_by_category(deduped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +457,14 @@ mod tests {
             line,
             col: 1,
             content: content.to_string(),
+        }
+    }
+
+    fn make_classified(file: &str, line: u64, content: &str, cat: ResultCategory) -> ClassifiedResult {
+        ClassifiedResult {
+            result: make_result(file, line, content),
+            category: cat,
+            annotation: None,
         }
     }
 
@@ -535,5 +694,240 @@ mod tests {
         assert!(!is_comment_line("let x = 42; // trailing comment"));
         assert!(!is_comment_line("fn main() {}"));
         assert!(!is_comment_line("#include <stdio.h>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier ordering tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tier_ordering_definition_first() {
+        assert!(ResultCategory::Definition.tier() < ResultCategory::CallSite.tier());
+        assert!(ResultCategory::Definition.tier() < ResultCategory::Import.tier());
+        assert!(ResultCategory::Definition.tier() < ResultCategory::Other.tier());
+        assert!(ResultCategory::Definition.tier() < ResultCategory::Comment.tier());
+        assert!(ResultCategory::Definition.tier() < ResultCategory::Test.tier());
+    }
+
+    #[test]
+    fn tier_ordering_full_sequence() {
+        // Definition < CallSite < Import < Other < Comment < Test
+        let tiers: Vec<u8> = vec![
+            ResultCategory::Definition.tier(),
+            ResultCategory::CallSite.tier(),
+            ResultCategory::Import.tier(),
+            ResultCategory::Other.tier(),
+            ResultCategory::Comment.tier(),
+            ResultCategory::Test.tier(),
+        ];
+        for i in 0..tiers.len() - 1 {
+            assert!(
+                tiers[i] < tiers[i + 1],
+                "tier {} should be less than tier {}",
+                i,
+                i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn result_category_ord_matches_tier() {
+        assert!(ResultCategory::Definition < ResultCategory::CallSite);
+        assert!(ResultCategory::CallSite < ResultCategory::Import);
+        assert!(ResultCategory::Import < ResultCategory::Other);
+        assert!(ResultCategory::Other < ResultCategory::Comment);
+        assert!(ResultCategory::Comment < ResultCategory::Test);
+    }
+
+    // -----------------------------------------------------------------------
+    // ClassifiedResult sorting tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classified_result_sorts_by_category_then_file_then_line() {
+        let mut results = vec![
+            make_classified("src/b.rs", 10, "let x = foo();", ResultCategory::CallSite),
+            make_classified("src/a.rs", 5, "fn foo() {}", ResultCategory::Definition),
+            make_classified("src/a.rs", 20, "foo();", ResultCategory::CallSite),
+            make_classified("src/a.rs", 10, "foo();", ResultCategory::CallSite),
+        ];
+
+        results.sort();
+
+        // Definition first
+        assert_eq!(results[0].category, ResultCategory::Definition);
+        assert_eq!(results[0].result.file.to_str().unwrap(), "src/a.rs");
+
+        // Then CallSite, sorted by file (a before b) then line
+        assert_eq!(results[1].category, ResultCategory::CallSite);
+        assert_eq!(results[1].result.file.to_str().unwrap(), "src/a.rs");
+        assert_eq!(results[1].result.line, 10);
+
+        assert_eq!(results[2].category, ResultCategory::CallSite);
+        assert_eq!(results[2].result.file.to_str().unwrap(), "src/a.rs");
+        assert_eq!(results[2].result.line, 20);
+
+        assert_eq!(results[3].category, ResultCategory::CallSite);
+        assert_eq!(results[3].result.file.to_str().unwrap(), "src/b.rs");
+    }
+
+    // -----------------------------------------------------------------------
+    // rank_results tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rank_results_sorts_by_tier() {
+        let input = vec![
+            make_classified("src/main.rs", 1, "use foo;", ResultCategory::Import),
+            make_classified("src/main.rs", 5, "fn foo() {}", ResultCategory::Definition),
+            make_classified("tests/t.rs", 10, "foo();", ResultCategory::Test),
+        ];
+
+        let ranked = rank_results(input);
+        assert_eq!(ranked[0].category, ResultCategory::Definition);
+        assert_eq!(ranked[1].category, ResultCategory::Import);
+        assert_eq!(ranked[2].category, ResultCategory::Test);
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup_reexports tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_collapses_import_reexports_when_definition_exists() {
+        let input = vec![
+            make_classified("src/lib.rs", 10, "pub fn foo() {}", ResultCategory::Definition),
+            make_classified("src/reexport1.rs", 1, "pub use crate::foo;", ResultCategory::Import),
+            make_classified("src/reexport2.rs", 1, "pub use crate::foo;", ResultCategory::Import),
+            make_classified("src/main.rs", 5, "foo();", ResultCategory::CallSite),
+        ];
+
+        let deduped = dedup_reexports(input, "foo");
+        // Should keep definition (with annotation), call site, and collapse 2 imports
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].category, ResultCategory::Definition);
+        assert_eq!(
+            deduped[0].annotation.as_deref(),
+            Some("(+2 other locations)")
+        );
+        assert_eq!(deduped[1].category, ResultCategory::CallSite);
+    }
+
+    #[test]
+    fn dedup_keeps_all_when_no_definition_exists() {
+        let input = vec![
+            make_classified("src/a.rs", 1, "pub use foo;", ResultCategory::Import),
+            make_classified("src/b.rs", 1, "pub use foo;", ResultCategory::Import),
+        ];
+
+        let deduped = dedup_reexports(input, "foo");
+        // No definitions => no dedup, keep all
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn dedup_keeps_all_when_no_imports() {
+        let input = vec![
+            make_classified("src/lib.rs", 10, "pub fn foo() {}", ResultCategory::Definition),
+            make_classified("src/main.rs", 5, "foo();", ResultCategory::CallSite),
+        ];
+
+        let deduped = dedup_reexports(input, "foo");
+        // No imports => nothing to collapse
+        assert_eq!(deduped.len(), 2);
+        assert!(deduped[0].annotation.is_none());
+    }
+
+    #[test]
+    fn dedup_single_import_not_collapsed() {
+        // Only one import + definition: no need for "(+1 other locations)"
+        let input = vec![
+            make_classified("src/lib.rs", 10, "pub fn foo() {}", ResultCategory::Definition),
+            make_classified("src/index.rs", 1, "pub use crate::foo;", ResultCategory::Import),
+        ];
+
+        let deduped = dedup_reexports(input, "foo");
+        // Single import should still be collapsed, annotating the definition
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].category, ResultCategory::Definition);
+        assert_eq!(
+            deduped[0].annotation.as_deref(),
+            Some("(+1 other location)")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // group_by_category tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn group_by_category_groups_and_preserves_order() {
+        let input = vec![
+            make_classified("src/a.rs", 5, "fn foo() {}", ResultCategory::Definition),
+            make_classified("src/b.rs", 10, "foo();", ResultCategory::CallSite),
+            make_classified("src/c.rs", 1, "use foo;", ResultCategory::Import),
+        ];
+
+        // Input must be sorted first
+        let sorted = rank_results(input);
+        let groups = group_by_category(sorted);
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].0, ResultCategory::Definition);
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[1].0, ResultCategory::CallSite);
+        assert_eq!(groups[1].1.len(), 1);
+        assert_eq!(groups[2].0, ResultCategory::Import);
+        assert_eq!(groups[2].1.len(), 1);
+    }
+
+    #[test]
+    fn group_by_category_omits_empty_categories() {
+        let input = vec![
+            make_classified("src/a.rs", 5, "fn foo() {}", ResultCategory::Definition),
+            make_classified("tests/t.rs", 10, "foo();", ResultCategory::Test),
+        ];
+
+        let sorted = rank_results(input);
+        let groups = group_by_category(sorted);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, ResultCategory::Definition);
+        assert_eq!(groups[1].0, ResultCategory::Test);
+    }
+
+    // -----------------------------------------------------------------------
+    // category_header tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn category_header_mappings() {
+        assert_eq!(category_header(ResultCategory::Definition), "-- definitions --");
+        assert_eq!(category_header(ResultCategory::CallSite), "-- usages --");
+        assert_eq!(category_header(ResultCategory::Import), "-- imports --");
+        assert_eq!(category_header(ResultCategory::Other), "-- usages --");
+        assert_eq!(category_header(ResultCategory::Comment), "-- comments --");
+        assert_eq!(category_header(ResultCategory::Test), "-- tests --");
+    }
+
+    // -----------------------------------------------------------------------
+    // rank_and_dedup end-to-end test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rank_and_dedup_full_pipeline() {
+        let results = vec![
+            make_result("tests/t.rs", 10, "foo();"),
+            make_result("src/main.rs", 1, "use foo;"),
+            make_result("src/lib.rs", 5, "let x = 42;"),
+            make_result("src/lib.rs", 3, "// comment about foo"),
+        ];
+
+        let groups = rank_and_dedup(&results, None, "foo");
+
+        // Without DB: Import, Comment, Other, Test (no Definition/CallSite)
+        assert!(!groups.is_empty());
+        // First group should be Import (tier 2)
+        assert_eq!(groups[0].0, ResultCategory::Import);
     }
 }

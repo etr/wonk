@@ -68,6 +68,10 @@ pub struct SearchArgs {
     #[arg(short = 'i', long)]
     pub ignore_case: bool,
 
+    /// Output raw results without ranking, deduplication, or category headers
+    #[arg(long)]
+    pub raw: bool,
+
     /// Restrict search to these paths (use -- before paths)
     #[arg(last = true)]
     pub paths: Vec<String>,

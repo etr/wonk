@@ -77,11 +77,46 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("no results found; try a broader pattern or different paths", suppress);
             }
 
-            for r in &results {
-                let out = SearchOutput::from_search_result(
-                    &r.file, r.line, r.col, &r.content,
+            if args.raw {
+                // Raw mode: output results directly without ranking/dedup.
+                for r in &results {
+                    let out = SearchOutput::from_search_result(
+                        &r.file, r.line, r.col, &r.content,
+                    );
+                    fmt.format_search_result(&out)?;
+                }
+            } else {
+                // Ranked mode: classify, sort, dedup, and group with headers.
+                use crate::ranker;
+
+                // Open DB connection best-effort for classification.
+                let conn = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| db::find_repo_root(&cwd).ok())
+                    .and_then(|root| db::find_existing_index(&root))
+                    .and_then(|path| db::open(&path).ok());
+
+                let groups = ranker::rank_and_dedup(
+                    &results,
+                    conn.as_ref(),
+                    &args.pattern,
                 );
-                fmt.format_search_result(&out)?;
+
+                for (category, items) in &groups {
+                    if !suppress {
+                        output::print_category_header(ranker::category_header(*category));
+                    }
+                    for item in items {
+                        let mut out = SearchOutput::from_search_result(
+                            &item.result.file,
+                            item.result.line,
+                            item.result.col,
+                            &item.result.content,
+                        );
+                        out.annotation = item.annotation.clone();
+                        fmt.format_search_result(&out)?;
+                    }
+                }
             }
         }
         Command::Sym(args) => {
@@ -2879,6 +2914,7 @@ mod tests {
             pattern: "test".into(),
             regex: false,
             ignore_case: false,
+            raw: false,
             paths: vec![],
         });
         assert!(is_query_command(&cmd));
