@@ -81,10 +81,18 @@ const HIDDEN_ALLOWLIST: &[&str] = &[".github"];
 /// Determine whether a filesystem event for `path` should be processed.
 ///
 /// Returns `false` for paths that fall inside default-excluded directories,
-/// hidden directories (unless allowlisted), or the `.git` directory itself.
+/// hidden directories (unless allowlisted), the `.git` directory itself,
+/// or nested worktree boundaries (directories containing a `.git` entry
+/// that are not the repo root).
+///
+/// `path` must be relative to `repo_root`.  `repo_root` is the absolute
+/// path to the repository root; it is used to probe the filesystem for
+/// nested `.git` entries without treating the root's own `.git` as a
+/// boundary.
+///
 /// This mirrors the filtering logic in `walker.rs` so the watcher and the
 /// initial walker agree on which files belong to the index.
-pub fn should_process(path: &Path) -> bool {
+pub fn should_process(path: &Path, repo_root: &Path) -> bool {
     for component in path.components() {
         let name = component.as_os_str().to_string_lossy();
 
@@ -101,22 +109,26 @@ pub fn should_process(path: &Path) -> bool {
         // Check hidden directories/files (starting with `.`), excluding
         // allowlisted names.
         if name.starts_with('.') && !HIDDEN_ALLOWLIST.iter().any(|a| *a == &*name) {
-            // Allow the root component (e.g. `/home/user/.config/repo/...`
-            // has `.config` in an absolute path component, but that is a
-            // parent above the repo root).  We rely on paths being relative
-            // to the repo root when this function is called with a
-            // repo-relative path.  For absolute paths the caller should
-            // strip the repo root prefix first.
-            //
-            // However, `std::path::Component::Normal` won't match `/` or
-            // prefix components, so we only hit this branch for actual
-            // directory/file names.  Hidden top-level files like `.gitignore`
-            // are also filtered out, which is correct for indexing.
             if let std::path::Component::Normal(_) = component {
                 return false;
             }
         }
     }
+
+    // Worktree boundary check: walk ancestor directories between
+    // repo_root and the event path.  If any directory along the way
+    // contains a `.git` entry (file or directory), the path is inside a
+    // nested worktree or sub-repository and should be discarded.
+    let mut ancestor = repo_root.to_path_buf();
+    for component in path.components() {
+        if let std::path::Component::Normal(seg) = component {
+            ancestor.push(seg);
+            if ancestor.join(".git").exists() {
+                return false;
+            }
+        }
+    }
+
     true
 }
 
@@ -157,7 +169,7 @@ impl FileWatcher {
                             // Make the path relative to repo root for filtering,
                             // but keep the absolute path in the event.
                             let rel = ev.path.strip_prefix(&repo_root_buf).unwrap_or(&ev.path);
-                            if should_process(rel) {
+                            if should_process(rel, &repo_root_buf) {
                                 Some(classify_event(ev))
                             } else {
                                 None
@@ -243,94 +255,204 @@ mod tests {
 
     // ---- should_process filtering tests ----
 
+    // For pure path-component tests (no filesystem boundary checks), we pass
+    // an empty path as repo_root so the worktree boundary probe is a no-op.
+    const NO_ROOT: &str = "";
+
     #[test]
     fn test_should_process_normal_source_file() {
-        assert!(should_process(Path::new("src/main.rs")));
+        assert!(should_process(Path::new("src/main.rs"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_nested_source_file() {
-        assert!(should_process(Path::new("src/utils/helpers.rs")));
+        assert!(should_process(Path::new("src/utils/helpers.rs"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_node_modules() {
-        assert!(!should_process(Path::new("node_modules/pkg/index.js")));
+        assert!(!should_process(Path::new("node_modules/pkg/index.js"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_vendor() {
-        assert!(!should_process(Path::new("vendor/lib.go")));
+        assert!(!should_process(Path::new("vendor/lib.go"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_target() {
-        assert!(!should_process(Path::new("target/debug/binary")));
+        assert!(!should_process(Path::new("target/debug/binary"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_build() {
-        assert!(!should_process(Path::new("build/output.js")));
+        assert!(!should_process(Path::new("build/output.js"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_dist() {
-        assert!(!should_process(Path::new("dist/bundle.js")));
+        assert!(!should_process(Path::new("dist/bundle.js"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_pycache() {
-        assert!(!should_process(Path::new("__pycache__/module.pyc")));
+        assert!(!should_process(Path::new("__pycache__/module.pyc"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_venv() {
-        assert!(!should_process(Path::new(".venv/bin/python")));
+        assert!(!should_process(Path::new(".venv/bin/python"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_git_dir() {
-        assert!(!should_process(Path::new(".git/objects/pack/abc")));
+        assert!(!should_process(Path::new(".git/objects/pack/abc"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_hidden_directory() {
-        assert!(!should_process(Path::new(".hidden/secret.txt")));
+        assert!(!should_process(Path::new(".hidden/secret.txt"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_hidden_config_dir() {
-        assert!(!should_process(Path::new(".config/settings.toml")));
+        assert!(!should_process(Path::new(".config/settings.toml"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_allows_github_directory() {
-        assert!(should_process(Path::new(".github/workflows/ci.yml")));
+        assert!(should_process(Path::new(".github/workflows/ci.yml"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_rejects_deep_exclusion() {
         // Even if node_modules is nested under a normal dir, it should
         // still be caught.
-        assert!(!should_process(Path::new(
-            "packages/foo/node_modules/bar/index.js"
-        )));
+        assert!(!should_process(
+            Path::new("packages/foo/node_modules/bar/index.js"),
+            Path::new(NO_ROOT),
+        ));
     }
 
     #[test]
     fn test_should_process_rejects_deep_hidden() {
-        assert!(!should_process(Path::new("src/.cache/data")));
+        assert!(!should_process(Path::new("src/.cache/data"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_top_level_file() {
-        assert!(should_process(Path::new("README.md")));
+        assert!(should_process(Path::new("README.md"), Path::new(NO_ROOT)));
     }
 
     #[test]
     fn test_should_process_empty_path() {
         // An empty path has no components to reject.
-        assert!(should_process(Path::new("")));
+        assert!(should_process(Path::new(""), Path::new(NO_ROOT)));
+    }
+
+    // ---- should_process worktree boundary tests ----
+
+    #[test]
+    fn test_should_process_rejects_nested_worktree_git_dir() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        // Set up a nested repo with a .git directory
+        fs::create_dir_all(dir.path().join("libs/nested-repo/.git")).unwrap();
+        fs::create_dir_all(dir.path().join("libs/nested-repo/src")).unwrap();
+        fs::write(dir.path().join("libs/nested-repo/src/lib.rs"), "").unwrap();
+
+        // Path inside nested repo should be rejected
+        assert!(
+            !should_process(
+                Path::new("libs/nested-repo/src/lib.rs"),
+                dir.path()
+            ),
+            "events inside nested worktree boundary (.git dir) should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_should_process_rejects_nested_worktree_git_file() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        // Set up a linked worktree with a .git *file*
+        fs::create_dir_all(dir.path().join("libs/linked-wt/src")).unwrap();
+        fs::write(
+            dir.path().join("libs/linked-wt/.git"),
+            "gitdir: /some/path/.git/worktrees/linked-wt",
+        )
+        .unwrap();
+        fs::write(dir.path().join("libs/linked-wt/src/lib.rs"), "").unwrap();
+
+        assert!(
+            !should_process(
+                Path::new("libs/linked-wt/src/lib.rs"),
+                dir.path()
+            ),
+            "events inside nested worktree boundary (.git file) should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_should_process_allows_own_repo_files() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        // Repo root has .git dir -- this is the root's own .git, not a boundary
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "").unwrap();
+
+        assert!(
+            should_process(Path::new("src/main.rs"), dir.path()),
+            "events from the repo's own files should be processed"
+        );
+    }
+
+    #[test]
+    fn test_should_process_allows_top_level_file_with_nested_worktree() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("README.md"), "").unwrap();
+        // Also has a nested worktree
+        fs::create_dir_all(dir.path().join("libs/nested/.git")).unwrap();
+
+        assert!(
+            should_process(Path::new("README.md"), dir.path()),
+            "top-level files should pass even when nested worktree exists"
+        );
+    }
+
+    #[test]
+    fn test_should_process_rejects_deeply_nested_worktree() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        // Deeply nested worktree boundary
+        fs::create_dir_all(dir.path().join("a/b/c/nested/.git")).unwrap();
+        fs::create_dir_all(dir.path().join("a/b/c/nested/deep/src")).unwrap();
+        fs::write(dir.path().join("a/b/c/nested/deep/src/lib.rs"), "").unwrap();
+
+        assert!(
+            !should_process(
+                Path::new("a/b/c/nested/deep/src/lib.rs"),
+                dir.path()
+            ),
+            "events from deeply nested worktree boundary should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_should_process_preserves_git_dir_rejection() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        // Existing behavior: .git dir in path components should still be rejected
+        assert!(
+            !should_process(
+                Path::new(".git/objects/pack/abc"),
+                dir.path()
+            ),
+            ".git directory events should still be rejected (existing behavior)"
+        );
     }
 
     // ---- classify_event tests ----
@@ -543,6 +665,65 @@ mod tests {
         assert!(
             !has_node_modules,
             "should NOT receive events for node_modules, got: {all_events:?}"
+        );
+
+        drop(watcher);
+    }
+
+    #[test]
+    fn test_file_watcher_filters_nested_worktree_events() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Set up directory structure before starting watcher.
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        // Nested worktree with a .git directory boundary.
+        fs::create_dir_all(dir.path().join("libs/nested/.git")).unwrap();
+        fs::create_dir_all(dir.path().join("libs/nested/src")).unwrap();
+
+        let (watcher, rx) = FileWatcher::new(dir.path(), 300).unwrap();
+
+        // Write to a file inside the nested worktree boundary.
+        fs::write(
+            dir.path().join("libs/nested/src/lib.rs"),
+            "pub fn nested() {}",
+        )
+        .unwrap();
+
+        // Also write to a normal directory to ensure we get at least that event.
+        std::thread::sleep(Duration::from_millis(50));
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Collect events for a reasonable window.
+        let mut all_events = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(batch) => all_events.extend(batch),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !all_events.is_empty() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // We should see the src/main.rs event but NOT libs/nested/src/lib.rs.
+        let has_main = all_events
+            .iter()
+            .any(|e| e.path().to_string_lossy().contains("main.rs"));
+        let has_nested = all_events
+            .iter()
+            .any(|e| e.path().to_string_lossy().contains("libs/nested"));
+
+        assert!(
+            has_main,
+            "should receive event for src/main.rs, got: {all_events:?}"
+        );
+        assert!(
+            !has_nested,
+            "should NOT receive events for files inside nested worktree boundary, got: {all_events:?}"
         );
 
         drop(watcher);
