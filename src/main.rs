@@ -8,6 +8,7 @@ mod indexer;
 mod output;
 mod pipeline;
 mod progress;
+mod ranker;
 mod router;
 mod search;
 mod types;
