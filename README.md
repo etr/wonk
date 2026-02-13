@@ -217,6 +217,18 @@ wonk repos list
 wonk repos clean    # Remove stale repositories from the index
 ```
 
+### `wonk mcp serve`
+
+Start an MCP (Model Context Protocol) server over stdio. This lets AI coding
+assistants like Claude Code use wonk as a tool provider.
+
+```
+wonk mcp serve
+```
+
+The server communicates via JSON-RPC 2.0 over NDJSON on stdin/stdout. It
+auto-indexes the repository on first startup if no index exists.
+
 ## Global flags
 
 These flags work with any command:
@@ -395,6 +407,40 @@ use:
 - `--budget <N>` caps output to roughly N tokens, keeping the highest-ranked
   results and dropping noise
 - `-q` suppresses stderr hints for clean machine parsing
+
+### MCP server
+
+Wonk includes a built-in [MCP](https://modelcontextprotocol.io/) server so AI
+coding assistants can use it as a tool provider. To configure it in your
+`.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "wonk": {
+      "command": "wonk",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
+
+The server exposes 9 tools over stdio (JSON-RPC 2.0):
+
+| Tool | Description |
+|------|-------------|
+| `wonk_search` | Full-text search with structural ranking and optional token budget |
+| `wonk_sym` | Look up symbol definitions by name, kind, or exact match |
+| `wonk_ref` | Find references to a symbol |
+| `wonk_sig` | Show function/method signatures |
+| `wonk_ls` | List files and symbols in a path |
+| `wonk_deps` | Show file dependencies (imports) |
+| `wonk_rdeps` | Show reverse dependencies |
+| `wonk_status` | Check index status (file/symbol/reference counts) |
+| `wonk_init` | Initialize or rebuild the index |
+
+All file paths are validated against the repository boundary. The index is
+built automatically on first use if it does not already exist.
 
 ## License
 

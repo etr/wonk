@@ -57,6 +57,9 @@ pub enum Command {
 
     /// Manage tracked repositories
     Repos(ReposArgs),
+
+    /// Run MCP (Model Context Protocol) server
+    Mcp(McpArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -173,6 +176,18 @@ pub enum ReposCommand {
     List,
     /// Remove stale repositories from the index
     Clean,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: McpCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Start the MCP server (stdio transport)
+    Serve,
 }
 
 pub fn parse() -> Cli {

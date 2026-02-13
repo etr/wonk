@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod db;
 pub mod errors;
 pub mod indexer;
+pub mod mcp;
 pub mod output;
 pub mod pipeline;
 pub mod progress;

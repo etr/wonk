@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::cli::{Cli, Command, DaemonCommand, LsArgs, ReposCommand};
+use crate::cli::{Cli, Command, DaemonCommand, LsArgs, McpCommand, ReposCommand};
 use crate::db;
 use crate::errors::DbError;
 #[cfg(test)]
@@ -377,6 +377,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("repos clean: not yet implemented", suppress);
             }
         },
+        Command::Mcp(args) => match args.command {
+            McpCommand::Serve => crate::mcp::serve()?,
+        },
     }
     Ok(())
 }
@@ -695,6 +698,16 @@ impl QueryRouter {
     /// Returns `true` if the router has an open index database.
     pub fn has_index(&self) -> bool {
         self.conn.is_some()
+    }
+
+    /// Returns a reference to the underlying database connection, if available.
+    pub fn conn(&self) -> Option<&Connection> {
+        self.conn.as_ref()
+    }
+
+    /// Returns a reference to the repository root path.
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
     }
 
     // -- Symbol queries -----------------------------------------------------
