@@ -191,16 +191,16 @@ impl<W: Write> Formatter<W> {
         self.budget.as_ref().map_or(0, |b| b.used())
     }
 
-    /// Check the budget for a given formatted text. Returns `Written` if the
-    /// text fits (or no budget is set), `Skipped` if the budget is exhausted.
+    /// Check the budget for a given byte buffer. Returns `Written` if the
+    /// data fits (or no budget is set), `Skipped` if the budget is exhausted.
     ///
-    /// When the result is `Written`, the caller should proceed to actually
-    /// write the output. When `Skipped`, the caller should skip the write.
-    fn check_budget(&mut self, text: &str) -> BudgetStatus {
+    /// Uses byte length directly for token estimation, avoiding the overhead
+    /// of converting bytes to a string via `String::from_utf8_lossy`.
+    fn check_budget_bytes(&mut self, data: &[u8]) -> BudgetStatus {
         match self.budget.as_mut() {
             None => BudgetStatus::Written,
             Some(budget) => {
-                if budget.try_consume(text) {
+                if budget.try_consume_bytes(data.len()) {
                     BudgetStatus::Written
                 } else {
                     BudgetStatus::Skipped
@@ -209,11 +209,19 @@ impl<W: Write> Formatter<W> {
         }
     }
 
+    /// Returns `true` if a token budget is currently active.
+    fn has_budget(&self) -> bool {
+        self.budget.is_some()
+    }
+
     /// Render a formatting closure to a temporary buffer, check the budget,
     /// and write to the real writer only if the budget allows.
     ///
     /// The closure receives a `Formatter` backed by a temporary `Vec<u8>` with
     /// the same `json`/`color`/`highlight` settings as `self`.
+    ///
+    /// **Note:** This is only called when a budget is active. When no budget is
+    /// set, callers should use the fast path that writes directly to `self`.
     fn budgeted_write<F>(&mut self, render: F) -> std::io::Result<BudgetStatus>
     where
         F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<()>,
@@ -234,7 +242,7 @@ impl<W: Write> Formatter<W> {
             result?;
         }
 
-        let status = self.check_budget(&String::from_utf8_lossy(&buf));
+        let status = self.check_budget_bytes(&buf);
         if status == BudgetStatus::Written {
             self.writer.write_all(&buf)?;
         }
@@ -282,78 +290,107 @@ impl<W: Write> Formatter<W> {
 
     /// Format a single text-search result.
     pub fn format_search_result(&mut self, result: &SearchOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            // Fast path: write directly, no temp buffer or clone needed.
+            Self::render_search_result(self, result)?;
+            return Ok(BudgetStatus::Written);
+        }
         let result = result.clone();
-        self.budgeted_write(move |fmt| {
-            if fmt.json {
-                let line = serde_json::to_string(&result)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                writeln!(fmt.writer, "{line}")
-            } else {
-                fmt.write_file(&result.file)?;
-                fmt.write_sep()?;
-                fmt.write_line_no(result.line)?;
-                fmt.write_sep()?;
-                fmt.write_content(&result.content)?;
-                if let Some(ref ann) = result.annotation {
-                    write!(fmt.writer, "  {ann}")?;
-                }
-                writeln!(fmt.writer)
+        self.budgeted_write(move |fmt| Self::render_search_result(fmt, &result))
+    }
+
+    /// Shared render logic for a search result.
+    fn render_search_result<W2: Write>(fmt: &mut Formatter<W2>, result: &SearchOutput) -> std::io::Result<()> {
+        if fmt.json {
+            let line = serde_json::to_string(result)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&result.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(result.line)?;
+            fmt.write_sep()?;
+            fmt.write_content(&result.content)?;
+            if let Some(ref ann) = result.annotation {
+                write!(fmt.writer, "  {ann}")?;
             }
-        })
+            writeln!(fmt.writer)
+        }
     }
 
     /// Format a single symbol definition result.
     pub fn format_symbol(&mut self, sym: &SymbolOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_symbol(self, sym)?;
+            return Ok(BudgetStatus::Written);
+        }
         let sym = sym.clone();
-        self.budgeted_write(move |fmt| {
-            if fmt.json {
-                let line = serde_json::to_string(&sym)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                writeln!(fmt.writer, "{line}")
-            } else {
-                fmt.write_file(&sym.file)?;
-                fmt.write_sep()?;
-                fmt.write_line_no(sym.line)?;
-                fmt.write_sep()?;
-                writeln!(fmt.writer, "  {}", sym.signature)
-            }
-        })
+        self.budgeted_write(move |fmt| Self::render_symbol(fmt, &sym))
+    }
+
+    /// Shared render logic for a symbol result.
+    fn render_symbol<W2: Write>(fmt: &mut Formatter<W2>, sym: &SymbolOutput) -> std::io::Result<()> {
+        if fmt.json {
+            let line = serde_json::to_string(sym)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&sym.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(sym.line)?;
+            fmt.write_sep()?;
+            writeln!(fmt.writer, "  {}", sym.signature)
+        }
     }
 
     /// Format a single reference result.
     pub fn format_reference(&mut self, reference: &RefOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_reference(self, reference)?;
+            return Ok(BudgetStatus::Written);
+        }
         let reference = reference.clone();
-        self.budgeted_write(move |fmt| {
-            if fmt.json {
-                let line = serde_json::to_string(&reference)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                writeln!(fmt.writer, "{line}")
-            } else {
-                fmt.write_file(&reference.file)?;
-                fmt.write_sep()?;
-                fmt.write_line_no(reference.line)?;
-                fmt.write_sep()?;
-                writeln!(fmt.writer, "{}", reference.context)
-            }
-        })
+        self.budgeted_write(move |fmt| Self::render_reference(fmt, &reference))
+    }
+
+    /// Shared render logic for a reference result.
+    fn render_reference<W2: Write>(fmt: &mut Formatter<W2>, reference: &RefOutput) -> std::io::Result<()> {
+        if fmt.json {
+            let line = serde_json::to_string(reference)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&reference.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(reference.line)?;
+            fmt.write_sep()?;
+            writeln!(fmt.writer, "{}", reference.context)
+        }
     }
 
     /// Format a single signature result.
     pub fn format_signature(&mut self, sig: &SignatureOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_signature(self, sig)?;
+            return Ok(BudgetStatus::Written);
+        }
         let sig = sig.clone();
-        self.budgeted_write(move |fmt| {
-            if fmt.json {
-                let line = serde_json::to_string(&sig)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                writeln!(fmt.writer, "{line}")
-            } else {
-                fmt.write_file(&sig.file)?;
-                fmt.write_sep()?;
-                fmt.write_line_no(sig.line)?;
-                fmt.write_sep()?;
-                writeln!(fmt.writer, "  {}", sig.signature)
-            }
-        })
+        self.budgeted_write(move |fmt| Self::render_signature(fmt, &sig))
+    }
+
+    /// Shared render logic for a signature result.
+    fn render_signature<W2: Write>(fmt: &mut Formatter<W2>, sig: &SignatureOutput) -> std::io::Result<()> {
+        if fmt.json {
+            let line = serde_json::to_string(sig)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&sig.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(sig.line)?;
+            fmt.write_sep()?;
+            writeln!(fmt.writer, "  {}", sig.signature)
+        }
     }
 
     /// Format a single ls-symbol entry (used by `wonk ls --tree`).
@@ -361,53 +398,74 @@ impl<W: Write> Formatter<W> {
     /// Grep format: `file:line:  [indent]kind name`
     /// JSON: all fields except `indent`.
     pub fn format_ls_symbol(&mut self, entry: &LsSymbolEntry) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_ls_symbol(self, entry)?;
+            return Ok(BudgetStatus::Written);
+        }
         let entry = entry.clone();
-        self.budgeted_write(move |fmt| {
-            if fmt.json {
-                let line = serde_json::to_string(&entry)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                writeln!(fmt.writer, "{line}")
-            } else {
-                let padding = "  ".repeat(entry.indent + 1);
-                fmt.write_file(&entry.file)?;
-                fmt.write_sep()?;
-                fmt.write_line_no(entry.line)?;
-                fmt.write_sep()?;
-                writeln!(fmt.writer, "{}{} {}", padding, entry.kind, entry.name)
-            }
-        })
+        self.budgeted_write(move |fmt| Self::render_ls_symbol(fmt, &entry))
+    }
+
+    /// Shared render logic for an ls-symbol entry.
+    fn render_ls_symbol<W2: Write>(fmt: &mut Formatter<W2>, entry: &LsSymbolEntry) -> std::io::Result<()> {
+        if fmt.json {
+            let line = serde_json::to_string(entry)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            let padding = "  ".repeat(entry.indent + 1);
+            fmt.write_file(&entry.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(entry.line)?;
+            fmt.write_sep()?;
+            writeln!(fmt.writer, "{}{} {}", padding, entry.kind, entry.name)
+        }
     }
 
     /// Format a single file-list entry.
     pub fn format_file_list(&mut self, entry: &FileEntry) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_file_list(self, entry)?;
+            return Ok(BudgetStatus::Written);
+        }
         let entry = entry.clone();
-        self.budgeted_write(move |fmt| {
-            if fmt.json {
-                let line = serde_json::to_string(&entry)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                writeln!(fmt.writer, "{line}")
-            } else {
-                fmt.write_file(&entry.path)?;
-                writeln!(fmt.writer)
-            }
-        })
+        self.budgeted_write(move |fmt| Self::render_file_list(fmt, &entry))
+    }
+
+    /// Shared render logic for a file-list entry.
+    fn render_file_list<W2: Write>(fmt: &mut Formatter<W2>, entry: &FileEntry) -> std::io::Result<()> {
+        if fmt.json {
+            let line = serde_json::to_string(entry)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&entry.path)?;
+            writeln!(fmt.writer)
+        }
     }
 
     /// Format a single dependency edge.
     pub fn format_dep(&mut self, dep: &DepOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_dep(self, dep)?;
+            return Ok(BudgetStatus::Written);
+        }
         let dep = dep.clone();
-        self.budgeted_write(move |fmt| {
-            if fmt.json {
-                let line = serde_json::to_string(&dep)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                writeln!(fmt.writer, "{line}")
-            } else {
-                fmt.write_file(&dep.file)?;
-                write!(fmt.writer, " -> ")?;
-                fmt.write_file(&dep.depends_on)?;
-                writeln!(fmt.writer)
-            }
-        })
+        self.budgeted_write(move |fmt| Self::render_dep(fmt, &dep))
+    }
+
+    /// Shared render logic for a dependency edge.
+    fn render_dep<W2: Write>(fmt: &mut Formatter<W2>, dep: &DepOutput) -> std::io::Result<()> {
+        if fmt.json {
+            let line = serde_json::to_string(dep)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&dep.file)?;
+            write!(fmt.writer, " -> ")?;
+            fmt.write_file(&dep.depends_on)?;
+            writeln!(fmt.writer)
+        }
     }
 
     /// Format a truncation metadata object (JSON mode only).

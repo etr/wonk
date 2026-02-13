@@ -11,6 +11,12 @@ pub fn estimate_tokens(text: &str) -> usize {
     (text.len() + 3) / 4
 }
 
+/// Estimate the number of tokens from a byte length using the ~4 bytes/token
+/// heuristic. Equivalent to `estimate_tokens` but avoids requiring a `&str`.
+pub fn estimate_tokens_from_len(byte_len: usize) -> usize {
+    (byte_len + 3) / 4
+}
+
 /// Tracks cumulative token consumption against a fixed limit.
 pub struct TokenBudget {
     limit: usize,
@@ -43,6 +49,20 @@ impl TokenBudget {
     /// if it would exceed the budget (leaving the budget unchanged).
     pub fn try_consume(&mut self, text: &str) -> bool {
         let tokens = estimate_tokens(text);
+        if tokens + self.used <= self.limit {
+            self.used += tokens;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to consume tokens estimated from a byte length. Same semantics as
+    /// [`try_consume`](Self::try_consume) but avoids requiring a `&str`,
+    /// eliminating the need for `String::from_utf8_lossy` when working with
+    /// raw byte buffers.
+    pub fn try_consume_bytes(&mut self, byte_len: usize) -> bool {
+        let tokens = estimate_tokens_from_len(byte_len);
         if tokens + self.used <= self.limit {
             self.used += tokens;
             true
