@@ -99,8 +99,12 @@ download() {
 
 # --- Main ---
 
+TMP_DIR=""
+cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
+
 main() {
-  local os arch target version ext="" download_url tmp_dir
+  local os arch target version download_url
 
   os=$(detect_os)
   arch=$(detect_arch)
@@ -117,14 +121,13 @@ main() {
 
   info "Installing ${BINARY_NAME} v${version}"
 
-  local artifact="${BINARY_NAME}-${version}-${target}${ext}"
+  local artifact="${BINARY_NAME}-${version}-${target}"
   download_url="https://github.com/${GITHUB_REPO}/releases/download/v${version}/${artifact}"
 
-  tmp_dir=$(mktemp -d)
-  trap 'rm -rf "$tmp_dir"' EXIT
+  TMP_DIR=$(mktemp -d)
 
   info "Downloading ${download_url}"
-  download "$download_url" "${tmp_dir}/${BINARY_NAME}${ext}"
+  download "$download_url" "${TMP_DIR}/${BINARY_NAME}"
 
   # Install
   if [ ! -d "$INSTALL_DIR" ]; then
@@ -132,13 +135,13 @@ main() {
     mkdir -p "$INSTALL_DIR"
   fi
 
-  local dest="${INSTALL_DIR}/${BINARY_NAME}${ext}"
+  local dest="${INSTALL_DIR}/${BINARY_NAME}"
 
   if [ -w "$INSTALL_DIR" ]; then
-    mv "${tmp_dir}/${BINARY_NAME}${ext}" "$dest"
+    mv "${TMP_DIR}/${BINARY_NAME}" "$dest"
   else
     info "Elevated permissions required to install to ${INSTALL_DIR}"
-    sudo mv "${tmp_dir}/${BINARY_NAME}${ext}" "$dest"
+    sudo mv "${TMP_DIR}/${BINARY_NAME}" "$dest"
   fi
 
   chmod +x "$dest"
