@@ -16,7 +16,7 @@ use crate::db;
 use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
-use crate::output::{self, Formatter, LsSymbolEntry, RefOutput, SearchOutput, SignatureOutput, SymbolOutput};
+use crate::output::{self, BudgetStatus, Formatter, LsSymbolEntry, RefOutput, SearchOutput, SignatureOutput, SymbolOutput};
 use crate::pipeline;
 use crate::progress::{self, Progress};
 use crate::search;
@@ -45,6 +45,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     };
 
     let mut fmt = Formatter::new(stdout, json, color);
+    let budget_limit = cli.budget;
+    if let Some(limit) = budget_limit {
+        fmt.set_budget(limit);
+    }
 
     // Auto-init: if this is a query command and no index exists, build one.
     if is_query_command(&cli.command) {
@@ -77,13 +81,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("no results found; try a broader pattern or different paths", suppress);
             }
 
+            let mut truncated = 0usize;
             if args.raw {
                 // Raw mode: output results directly without ranking/dedup.
                 for r in &results {
                     let out = SearchOutput::from_search_result(
                         &r.file, r.line, r.col, &r.content,
                     );
-                    fmt.format_search_result(&out)?;
+                    if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
+                        truncated += 1;
+                    }
                 }
             } else {
                 // Ranked mode: classify, sort, dedup, and group with headers.
@@ -114,10 +121,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             &item.result.content,
                         );
                         out.annotation = item.annotation.clone();
-                        fmt.format_search_result(&out)?;
+                        if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
+                            // Count remaining items in this group.
+                            truncated += 1;
+                        }
                     }
                 }
             }
+            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Sym(args) => {
             let repo_root = db::find_repo_root(
@@ -140,6 +151,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("no symbols found; try a broader query or omit --exact", suppress);
             }
 
+            let mut truncated = 0usize;
             for sym in &results {
                 let out = SymbolOutput {
                     name: sym.name.clone(),
@@ -152,8 +164,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     signature: sym.signature.clone(),
                     language: sym.language.clone(),
                 };
-                fmt.format_symbol(&out)?;
+                if fmt.format_symbol(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
             }
+            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Ref(args) => {
             let router = QueryRouter::new(None, false);
@@ -171,6 +186,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("no references found", suppress);
             }
 
+            let mut truncated = 0usize;
             for r in &results {
                 let out = RefOutput {
                     name: r.name.clone(),
@@ -180,8 +196,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     col: r.col,
                     context: r.context.clone(),
                 };
-                fmt.format_reference(&out)?;
+                if fmt.format_reference(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
             }
+            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Sig(args) => {
             let router = QueryRouter::new(None, false);
@@ -199,6 +218,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("no signatures found", suppress);
             }
 
+            let mut truncated = 0usize;
             for sym in &results {
                 let out = SignatureOutput {
                     name: sym.name.clone(),
@@ -207,11 +227,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     signature: sym.signature.clone(),
                     language: sym.language.clone(),
                 };
-                fmt.format_signature(&out)?;
+                if fmt.format_signature(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
             }
+            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Ls(args) => {
-            dispatch_ls(args, suppress, &mut fmt)?;
+            let truncated = dispatch_ls(args, suppress, &mut fmt)?;
+            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Deps(args) => {
             let repo_root = db::find_repo_root(
@@ -233,13 +257,17 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("no dependencies found", suppress);
             }
 
+            let mut truncated = 0usize;
             for dep in &results {
                 let out = output::DepOutput {
                     file: args.file.clone(),
                     depends_on: dep.clone(),
                 };
-                fmt.format_dep(&out)?;
+                if fmt.format_dep(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
             }
+            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Rdeps(args) => {
             let repo_root = db::find_repo_root(
@@ -261,13 +289,17 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("no reverse dependencies found", suppress);
             }
 
+            let mut truncated = 0usize;
             for source in &results {
                 let out = output::DepOutput {
                     file: source.clone(),
                     depends_on: args.file.clone(),
                 };
-                fmt.format_dep(&out)?;
+                if fmt.format_dep(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
             }
+            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
         }
         Command::Init(args) => {
             let repo_root = std::env::current_dir()?;
@@ -324,6 +356,34 @@ fn is_query_command(cmd: &Command) -> bool {
     )
 }
 
+/// Emit a budget summary if any results were truncated.
+///
+/// In grep mode, prints the summary to stderr. In JSON mode, emits a
+/// `TruncationMeta` JSON line to the formatter.
+fn emit_budget_summary<W: io::Write>(
+    fmt: &mut Formatter<W>,
+    truncated: usize,
+    budget_limit: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    if truncated == 0 {
+        return Ok(());
+    }
+    if let Some(limit) = budget_limit {
+        if json {
+            let meta = output::TruncationMeta {
+                truncated_count: truncated,
+                budget_tokens: limit,
+                used_tokens: fmt.budget_used(),
+            };
+            fmt.format_truncation_meta(&meta)?;
+        } else {
+            output::print_budget_summary(truncated, limit);
+        }
+    }
+    Ok(())
+}
+
 /// Spawn the daemon as a background subprocess (best-effort).
 ///
 /// Uses `std::process::Command` to launch `wonk daemon start` as a detached
@@ -344,7 +404,8 @@ fn spawn_daemon_background(repo_root: &Path) {
 /// Lists symbols in a single file or recursively for a directory.
 /// When `--tree` is set, groups symbols by scope hierarchy (e.g. methods
 /// under their parent class).
-fn dispatch_ls<W: io::Write>(args: LsArgs, suppress: bool, fmt: &mut Formatter<W>) -> Result<()> {
+/// Returns the number of results truncated by budget (0 if no budget active).
+fn dispatch_ls<W: io::Write>(args: LsArgs, suppress: bool, fmt: &mut Formatter<W>) -> Result<usize> {
     let path = PathBuf::from(&args.path);
     let repo_root = db::find_repo_root(
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -382,10 +443,13 @@ fn dispatch_ls<W: io::Write>(args: LsArgs, suppress: bool, fmt: &mut Formatter<W
         output::print_hint("no symbols found", suppress);
     }
 
+    let mut truncated = 0usize;
     if args.tree {
         let entries = build_tree_entries(&all_symbols);
         for entry in &entries {
-            fmt.format_ls_symbol(entry)?;
+            if fmt.format_ls_symbol(entry)? == BudgetStatus::Skipped {
+                truncated += 1;
+            }
         }
     } else {
         for sym in &all_symbols {
@@ -400,11 +464,13 @@ fn dispatch_ls<W: io::Write>(args: LsArgs, suppress: bool, fmt: &mut Formatter<W
                 signature: sym.signature.clone(),
                 language: sym.language.clone(),
             };
-            fmt.format_symbol(&out)?;
+            if fmt.format_symbol(&out)? == BudgetStatus::Skipped {
+                truncated += 1;
+            }
         }
     }
 
-    Ok(())
+    Ok(truncated)
 }
 
 // ---------------------------------------------------------------------------

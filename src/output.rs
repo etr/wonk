@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use regex::Regex;
 use serde::Serialize;
 
+use crate::budget::TokenBudget;
 use crate::color;
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,25 @@ pub struct DepOutput {
     pub depends_on: String,
 }
 
+/// Truncation metadata emitted as a final JSON line when `--budget` truncates
+/// output. In grep mode the summary goes to stderr instead.
+#[derive(Debug, Clone, Serialize)]
+pub struct TruncationMeta {
+    pub truncated_count: usize,
+    pub budget_tokens: usize,
+    pub used_tokens: usize,
+}
+
+/// Indicates whether a format call actually wrote data or was skipped due to
+/// budget exhaustion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetStatus {
+    /// The result was formatted and written to the output.
+    Written,
+    /// The result was skipped because the token budget was exhausted.
+    Skipped,
+}
+
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------
@@ -127,6 +147,7 @@ pub struct Formatter<W: Write> {
     json: bool,
     color: bool,
     highlight: Option<HighlightPattern>,
+    budget: Option<TokenBudget>,
 }
 
 impl<W: Write> Formatter<W> {
@@ -136,7 +157,7 @@ impl<W: Write> Formatter<W> {
     /// * `json`   - When `true`, emit JSON Lines; otherwise, emit grep-style text.
     /// * `color`  - When `true`, emit ANSI color codes in grep-style output.
     pub fn new(writer: W, json: bool, color: bool) -> Self {
-        Self { writer, json, color, highlight: None }
+        Self { writer, json, color, highlight: None, budget: None }
     }
 
     /// Set a highlight pattern for match highlighting in search results.
@@ -157,6 +178,67 @@ impl<W: Write> Formatter<W> {
         if let Ok(re) = Regex::new(&pattern_str) {
             self.highlight = Some(HighlightPattern { re });
         }
+    }
+
+    /// Set a token budget. When set, format methods will check whether each
+    /// result fits within the remaining budget before writing it.
+    pub fn set_budget(&mut self, limit: usize) {
+        self.budget = Some(TokenBudget::new(limit));
+    }
+
+    /// Return the number of tokens consumed so far (0 if no budget is set).
+    pub fn budget_used(&self) -> usize {
+        self.budget.as_ref().map_or(0, |b| b.used())
+    }
+
+    /// Check the budget for a given formatted text. Returns `Written` if the
+    /// text fits (or no budget is set), `Skipped` if the budget is exhausted.
+    ///
+    /// When the result is `Written`, the caller should proceed to actually
+    /// write the output. When `Skipped`, the caller should skip the write.
+    fn check_budget(&mut self, text: &str) -> BudgetStatus {
+        match self.budget.as_mut() {
+            None => BudgetStatus::Written,
+            Some(budget) => {
+                if budget.try_consume(text) {
+                    BudgetStatus::Written
+                } else {
+                    BudgetStatus::Skipped
+                }
+            }
+        }
+    }
+
+    /// Render a formatting closure to a temporary buffer, check the budget,
+    /// and write to the real writer only if the budget allows.
+    ///
+    /// The closure receives a `Formatter` backed by a temporary `Vec<u8>` with
+    /// the same `json`/`color`/`highlight` settings as `self`.
+    fn budgeted_write<F>(&mut self, render: F) -> std::io::Result<BudgetStatus>
+    where
+        F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<()>,
+    {
+        let mut buf = Vec::new();
+        {
+            let mut tmp = Formatter {
+                writer: &mut buf,
+                json: self.json,
+                color: self.color,
+                highlight: None,
+                budget: None,
+            };
+            // Transfer highlight pattern temporarily.
+            std::mem::swap(&mut tmp.highlight, &mut self.highlight);
+            let result = render(&mut tmp);
+            std::mem::swap(&mut tmp.highlight, &mut self.highlight);
+            result?;
+        }
+
+        let status = self.check_budget(&String::from_utf8_lossy(&buf));
+        if status == BudgetStatus::Written {
+            self.writer.write_all(&buf)?;
+        }
+        Ok(status)
     }
 
     // -- Color helper methods -----------------------------------------------
@@ -199,115 +281,143 @@ impl<W: Write> Formatter<W> {
     }
 
     /// Format a single text-search result.
-    pub fn format_search_result(&mut self, result: &SearchOutput) -> std::io::Result<()> {
-        if self.json {
-            let line = serde_json::to_string(result)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            writeln!(self.writer, "{line}")
-        } else {
-            self.write_file(&result.file)?;
-            self.write_sep()?;
-            self.write_line_no(result.line)?;
-            self.write_sep()?;
-            self.write_content(&result.content)?;
-            if let Some(ref ann) = result.annotation {
-                write!(self.writer, "  {ann}")?;
+    pub fn format_search_result(&mut self, result: &SearchOutput) -> std::io::Result<BudgetStatus> {
+        let result = result.clone();
+        self.budgeted_write(move |fmt| {
+            if fmt.json {
+                let line = serde_json::to_string(&result)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                writeln!(fmt.writer, "{line}")
+            } else {
+                fmt.write_file(&result.file)?;
+                fmt.write_sep()?;
+                fmt.write_line_no(result.line)?;
+                fmt.write_sep()?;
+                fmt.write_content(&result.content)?;
+                if let Some(ref ann) = result.annotation {
+                    write!(fmt.writer, "  {ann}")?;
+                }
+                writeln!(fmt.writer)
             }
-            writeln!(self.writer)
-        }
+        })
     }
 
     /// Format a single symbol definition result.
-    pub fn format_symbol(&mut self, sym: &SymbolOutput) -> std::io::Result<()> {
-        if self.json {
-            let line = serde_json::to_string(sym)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            writeln!(self.writer, "{line}")
-        } else {
-            // file:line:  signature
-            self.write_file(&sym.file)?;
-            self.write_sep()?;
-            self.write_line_no(sym.line)?;
-            self.write_sep()?;
-            writeln!(self.writer, "  {}", sym.signature)
-        }
+    pub fn format_symbol(&mut self, sym: &SymbolOutput) -> std::io::Result<BudgetStatus> {
+        let sym = sym.clone();
+        self.budgeted_write(move |fmt| {
+            if fmt.json {
+                let line = serde_json::to_string(&sym)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                writeln!(fmt.writer, "{line}")
+            } else {
+                fmt.write_file(&sym.file)?;
+                fmt.write_sep()?;
+                fmt.write_line_no(sym.line)?;
+                fmt.write_sep()?;
+                writeln!(fmt.writer, "  {}", sym.signature)
+            }
+        })
     }
 
     /// Format a single reference result.
-    pub fn format_reference(&mut self, reference: &RefOutput) -> std::io::Result<()> {
-        if self.json {
-            let line = serde_json::to_string(reference)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            writeln!(self.writer, "{line}")
-        } else {
-            // file:line:content  (grep style)
-            self.write_file(&reference.file)?;
-            self.write_sep()?;
-            self.write_line_no(reference.line)?;
-            self.write_sep()?;
-            writeln!(self.writer, "{}", reference.context)
-        }
+    pub fn format_reference(&mut self, reference: &RefOutput) -> std::io::Result<BudgetStatus> {
+        let reference = reference.clone();
+        self.budgeted_write(move |fmt| {
+            if fmt.json {
+                let line = serde_json::to_string(&reference)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                writeln!(fmt.writer, "{line}")
+            } else {
+                fmt.write_file(&reference.file)?;
+                fmt.write_sep()?;
+                fmt.write_line_no(reference.line)?;
+                fmt.write_sep()?;
+                writeln!(fmt.writer, "{}", reference.context)
+            }
+        })
     }
 
     /// Format a single signature result.
-    pub fn format_signature(&mut self, sig: &SignatureOutput) -> std::io::Result<()> {
-        if self.json {
-            let line = serde_json::to_string(sig)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            writeln!(self.writer, "{line}")
-        } else {
-            self.write_file(&sig.file)?;
-            self.write_sep()?;
-            self.write_line_no(sig.line)?;
-            self.write_sep()?;
-            writeln!(self.writer, "  {}", sig.signature)
-        }
+    pub fn format_signature(&mut self, sig: &SignatureOutput) -> std::io::Result<BudgetStatus> {
+        let sig = sig.clone();
+        self.budgeted_write(move |fmt| {
+            if fmt.json {
+                let line = serde_json::to_string(&sig)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                writeln!(fmt.writer, "{line}")
+            } else {
+                fmt.write_file(&sig.file)?;
+                fmt.write_sep()?;
+                fmt.write_line_no(sig.line)?;
+                fmt.write_sep()?;
+                writeln!(fmt.writer, "  {}", sig.signature)
+            }
+        })
     }
 
     /// Format a single ls-symbol entry (used by `wonk ls --tree`).
     ///
     /// Grep format: `file:line:  [indent]kind name`
     /// JSON: all fields except `indent`.
-    pub fn format_ls_symbol(&mut self, entry: &LsSymbolEntry) -> std::io::Result<()> {
-        if self.json {
-            let line = serde_json::to_string(entry)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            writeln!(self.writer, "{line}")
-        } else {
-            // Two spaces base indent, then two more per nesting level.
-            let padding = "  ".repeat(entry.indent + 1);
-            self.write_file(&entry.file)?;
-            self.write_sep()?;
-            self.write_line_no(entry.line)?;
-            self.write_sep()?;
-            writeln!(self.writer, "{}{} {}", padding, entry.kind, entry.name)
-        }
+    pub fn format_ls_symbol(&mut self, entry: &LsSymbolEntry) -> std::io::Result<BudgetStatus> {
+        let entry = entry.clone();
+        self.budgeted_write(move |fmt| {
+            if fmt.json {
+                let line = serde_json::to_string(&entry)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                writeln!(fmt.writer, "{line}")
+            } else {
+                let padding = "  ".repeat(entry.indent + 1);
+                fmt.write_file(&entry.file)?;
+                fmt.write_sep()?;
+                fmt.write_line_no(entry.line)?;
+                fmt.write_sep()?;
+                writeln!(fmt.writer, "{}{} {}", padding, entry.kind, entry.name)
+            }
+        })
     }
 
     /// Format a single file-list entry.
-    pub fn format_file_list(&mut self, entry: &FileEntry) -> std::io::Result<()> {
-        if self.json {
-            let line = serde_json::to_string(entry)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            writeln!(self.writer, "{line}")
-        } else {
-            self.write_file(&entry.path)?;
-            writeln!(self.writer)
-        }
+    pub fn format_file_list(&mut self, entry: &FileEntry) -> std::io::Result<BudgetStatus> {
+        let entry = entry.clone();
+        self.budgeted_write(move |fmt| {
+            if fmt.json {
+                let line = serde_json::to_string(&entry)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                writeln!(fmt.writer, "{line}")
+            } else {
+                fmt.write_file(&entry.path)?;
+                writeln!(fmt.writer)
+            }
+        })
     }
 
     /// Format a single dependency edge.
-    pub fn format_dep(&mut self, dep: &DepOutput) -> std::io::Result<()> {
-        if self.json {
-            let line = serde_json::to_string(dep)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            writeln!(self.writer, "{line}")
-        } else {
-            self.write_file(&dep.file)?;
-            write!(self.writer, " -> ")?;
-            self.write_file(&dep.depends_on)?;
-            writeln!(self.writer)
-        }
+    pub fn format_dep(&mut self, dep: &DepOutput) -> std::io::Result<BudgetStatus> {
+        let dep = dep.clone();
+        self.budgeted_write(move |fmt| {
+            if fmt.json {
+                let line = serde_json::to_string(&dep)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                writeln!(fmt.writer, "{line}")
+            } else {
+                fmt.write_file(&dep.file)?;
+                write!(fmt.writer, " -> ")?;
+                fmt.write_file(&dep.depends_on)?;
+                writeln!(fmt.writer)
+            }
+        })
+    }
+
+    /// Format a truncation metadata object (JSON mode only).
+    ///
+    /// Emits a final JSON line with truncation info when `--budget` truncates
+    /// output. In grep mode, callers should use [`print_budget_summary`] instead.
+    pub fn format_truncation_meta(&mut self, meta: &TruncationMeta) -> std::io::Result<()> {
+        let line = serde_json::to_string(meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        writeln!(self.writer, "{line}")
     }
 }
 
@@ -342,6 +452,13 @@ pub fn print_hint(msg: &str, json: bool) {
     if !json {
         eprintln!("hint: {msg}");
     }
+}
+
+/// Print a budget truncation summary to stderr (grep mode).
+///
+/// Format: `-- {truncated} more results truncated (budget: {budget} tokens) --`
+pub fn print_budget_summary(truncated: usize, budget: usize) {
+    eprintln!("-- {truncated} more results truncated (budget: {budget} tokens) --");
 }
 
 /// Print a category header to stderr.
@@ -379,9 +496,9 @@ mod tests {
     use super::*;
 
     /// Helper: renders output into a String (no color).
-    fn render<F>(json: bool, f: F) -> String
+    fn render<F, T: std::fmt::Debug>(json: bool, f: F) -> String
     where
-        F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<()>,
+        F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<T>,
     {
         let mut buf = Vec::new();
         {
@@ -392,9 +509,9 @@ mod tests {
     }
 
     /// Helper: renders output into a String with color enabled.
-    fn render_color<F>(f: F) -> String
+    fn render_color<F, T: std::fmt::Debug>(f: F) -> String
     where
-        F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<()>,
+        F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<T>,
     {
         let mut buf = Vec::new();
         {
@@ -1070,6 +1187,198 @@ mod tests {
         let out = render_color(|fmt| fmt.format_dep(&dep));
         assert!(out.contains(&format!("{}src/main.rs{}", crate::color::FILE, crate::color::RESET)));
         assert!(out.contains(&format!("{}src/lib.rs{}", crate::color::FILE, crate::color::RESET)));
+    }
+
+    // -- Budget output helpers -----------------------------------------------
+
+    #[test]
+    fn truncation_meta_json_format() {
+        let meta = TruncationMeta {
+            truncated_count: 42,
+            budget_tokens: 500,
+            used_tokens: 498,
+        };
+        let out = render(true, |fmt| fmt.format_truncation_meta(&meta));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["truncated_count"], 42);
+        assert_eq!(v["budget_tokens"], 500);
+        assert_eq!(v["used_tokens"], 498);
+    }
+
+    #[test]
+    fn truncation_meta_serializes_all_fields() {
+        let meta = TruncationMeta {
+            truncated_count: 10,
+            budget_tokens: 100,
+            used_tokens: 95,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"truncated_count\":10"));
+        assert!(json.contains("\"budget_tokens\":100"));
+        assert!(json.contains("\"used_tokens\":95"));
+    }
+
+    #[test]
+    fn budget_truncates_search_results_grep_mode() {
+        // Create results that together exceed the budget.
+        let results: Vec<SearchOutput> = (0..10)
+            .map(|i| SearchOutput {
+                file: "src/main.rs".into(),
+                line: i + 1,
+                col: 1,
+                content: "fn some_function_here() {}".into(),
+                annotation: None,
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        let mut emitted = 0usize;
+        let mut truncated = 0usize;
+        {
+            let mut fmt = Formatter::new(&mut buf, false, false);
+            // Set a small budget: each line is ~40 chars -> ~10 tokens.
+            // Budget of 25 tokens should allow ~2-3 results.
+            fmt.set_budget(25);
+            for r in &results {
+                match fmt.format_search_result(r) {
+                    Ok(BudgetStatus::Written) => emitted += 1,
+                    Ok(BudgetStatus::Skipped) => truncated += 1,
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+        }
+        let out = String::from_utf8(buf).unwrap();
+        // Should have emitted some but not all.
+        assert!(emitted > 0, "should emit at least one result");
+        assert!(emitted < 10, "should not emit all results");
+        assert_eq!(emitted + truncated, 10);
+        // Output should contain only the emitted lines.
+        let lines: Vec<&str> = out.trim().split('\n').collect();
+        assert_eq!(lines.len(), emitted);
+    }
+
+    #[test]
+    fn budget_truncates_search_results_json_mode() {
+        let results: Vec<SearchOutput> = (0..10)
+            .map(|i| SearchOutput {
+                file: "src/main.rs".into(),
+                line: i + 1,
+                col: 1,
+                content: "fn some_function_here() {}".into(),
+                annotation: None,
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        let mut emitted = 0usize;
+        let mut truncated = 0usize;
+        {
+            let mut fmt = Formatter::new(&mut buf, true, false);
+            fmt.set_budget(25);
+            for r in &results {
+                match fmt.format_search_result(r) {
+                    Ok(BudgetStatus::Written) => emitted += 1,
+                    Ok(BudgetStatus::Skipped) => truncated += 1,
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+            // Emit truncation meta.
+            if truncated > 0 {
+                let meta = TruncationMeta {
+                    truncated_count: truncated,
+                    budget_tokens: 25,
+                    used_tokens: fmt.budget_used(),
+                };
+                fmt.format_truncation_meta(&meta).unwrap();
+            }
+        }
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.trim().split('\n').collect();
+        // Last line should be the truncation meta.
+        assert!(emitted > 0);
+        assert!(truncated > 0);
+        let last_line = lines.last().unwrap();
+        let meta: serde_json::Value = serde_json::from_str(last_line).unwrap();
+        assert_eq!(meta["truncated_count"], truncated);
+    }
+
+    #[test]
+    fn no_budget_means_all_results_written() {
+        let results: Vec<SearchOutput> = (0..5)
+            .map(|i| SearchOutput {
+                file: "src/main.rs".into(),
+                line: i + 1,
+                col: 1,
+                content: "fn main() {}".into(),
+                annotation: None,
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        let mut emitted = 0usize;
+        {
+            let mut fmt = Formatter::new(&mut buf, false, false);
+            // No set_budget call - no budget.
+            for r in &results {
+                match fmt.format_search_result(r) {
+                    Ok(BudgetStatus::Written) => emitted += 1,
+                    Ok(BudgetStatus::Skipped) => panic!("should not skip without budget"),
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+        }
+        assert_eq!(emitted, 5);
+    }
+
+    #[test]
+    fn budget_tracks_used_tokens() {
+        let mut buf = Vec::new();
+        let mut fmt = Formatter::new(&mut buf, false, false);
+        fmt.set_budget(1000);
+        assert_eq!(fmt.budget_used(), 0);
+
+        let r = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 1,
+            col: 1,
+            content: "fn main() {}".into(),
+            annotation: None,
+        };
+        fmt.format_search_result(&r).unwrap();
+        assert!(fmt.budget_used() > 0);
+    }
+
+    #[test]
+    fn budget_applies_to_symbol_output() {
+        let syms: Vec<SymbolOutput> = (0..10)
+            .map(|i| SymbolOutput {
+                name: "some_really_long_function_name".into(),
+                kind: "function".into(),
+                file: "src/very/deep/nested/module.rs".into(),
+                line: i + 1,
+                col: 0,
+                end_line: None,
+                scope: None,
+                signature: "fn some_really_long_function_name(arg1: Type1, arg2: Type2) -> ReturnType".into(),
+                language: "Rust".into(),
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        let mut emitted = 0usize;
+        {
+            let mut fmt = Formatter::new(&mut buf, false, false);
+            fmt.set_budget(30);
+            for s in &syms {
+                match fmt.format_symbol(s) {
+                    Ok(BudgetStatus::Written) => emitted += 1,
+                    Ok(BudgetStatus::Skipped) => {}
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+        }
+        assert!(emitted > 0);
+        assert!(emitted < 10);
     }
 
     #[test]

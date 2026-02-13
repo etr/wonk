@@ -12,6 +12,10 @@ pub struct Cli {
     #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
 
+    /// Limit output to approximately N tokens (higher-ranked results preserved)
+    #[arg(long, global = true)]
+    pub budget: Option<usize>,
+
     #[command(subcommand)]
     pub command: Command,
 }

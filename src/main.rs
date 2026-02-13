@@ -1,3 +1,4 @@
+mod budget;
 mod cli;
 mod color;
 mod config;
