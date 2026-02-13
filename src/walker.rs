@@ -1,4 +1,5 @@
-//! File walker with gitignore support and default exclusions.
+//! File walker with gitignore support, default exclusions, and worktree
+//! boundary detection.
 //!
 //! Wraps the `ignore` crate's `WalkBuilder` to provide a file walker that:
 //! - Respects `.gitignore` rules
@@ -6,6 +7,9 @@
 //! - Applies additional ignore patterns from config (`[ignore].patterns`)
 //! - Skips common build/dependency directories by default
 //! - Skips hidden files/directories except `.github`
+//! - Skips nested repositories and linked worktrees (directories containing
+//!   a `.git` entry that are not the walk root) to prevent cross-worktree
+//!   contamination during indexing
 //! - Supports path restriction (walking from a subdirectory)
 //! - Supports parallel file enumeration via `WalkParallel`
 
@@ -109,10 +113,11 @@ impl Walker {
             overrides.build().expect("override builder should succeed"),
         );
 
-        // Custom filter: skip hidden entries (name starts with `.`) unless
-        // they appear in the allowlist.
+        // Custom filter: skip hidden entries and worktree/nested-repo boundaries.
         builder.filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
+
+            // Skip hidden entries (name starts with `.`) unless allowlisted.
             if name.starts_with('.') {
                 // The root entry itself (depth 0) always passes through.
                 if entry.depth() == 0 {
@@ -120,6 +125,18 @@ impl Walker {
                 }
                 return HIDDEN_ALLOWLIST.iter().any(|a| *a == &*name);
             }
+
+            // Worktree boundary: skip non-root directories that contain a
+            // `.git` entry (either a directory for nested repos, or a file
+            // for linked worktrees).
+            if entry.depth() > 0 {
+                if let Some(ft) = entry.file_type() {
+                    if ft.is_dir() && entry.path().join(".git").exists() {
+                        return false;
+                    }
+                }
+            }
+
             true
         });
 
@@ -553,5 +570,138 @@ mod tests {
         let empty = sorted_relative(td.path(), &walker_empty.collect_paths());
 
         assert_eq!(plain, empty, "empty patterns should not change behavior");
+    }
+
+    // ----- Worktree boundary exclusion tests -----
+
+    #[test]
+    fn skips_nested_git_directory() {
+        let td = TestDir::new();
+        // Root has a .git directory (making it a repo)
+        fs::create_dir(td.path().join(".git")).unwrap();
+        td.create_file("src/main.rs");
+        // Nested repo with its own .git directory
+        td.create_file("libs/nested-repo/lib.rs");
+        fs::create_dir(td.path().join("libs/nested-repo/.git")).unwrap();
+        td.create_file("libs/nested-repo/src/inner.rs");
+
+        let walker = Walker::new(td.path());
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(
+            rel.contains(&"src/main.rs".to_string()),
+            "root src/main.rs should be present, got: {rel:?}"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("libs/nested-repo")),
+            "nested repo should be skipped due to .git directory boundary, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn skips_nested_git_file_worktree() {
+        let td = TestDir::new();
+        // Root has a .git directory
+        fs::create_dir(td.path().join(".git")).unwrap();
+        td.create_file("src/main.rs");
+        // Linked worktree has a .git *file* (not directory)
+        td.create_file("libs/linked-wt/lib.rs");
+        fs::write(
+            td.path().join("libs/linked-wt/.git"),
+            "gitdir: /some/path/.git/worktrees/linked-wt",
+        )
+        .unwrap();
+        td.create_file("libs/linked-wt/src/inner.rs");
+
+        let walker = Walker::new(td.path());
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(
+            rel.contains(&"src/main.rs".to_string()),
+            "root src/main.rs should be present, got: {rel:?}"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("libs/linked-wt")),
+            "linked worktree should be skipped due to .git file boundary, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn root_git_dir_is_not_skipped() {
+        let td = TestDir::new();
+        // Root has a .git directory -- this must NOT cause the root to be skipped
+        fs::create_dir(td.path().join(".git")).unwrap();
+        td.create_file("src/main.rs");
+        td.create_file("lib.rs");
+
+        let walker = Walker::new(td.path());
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(
+            rel.contains(&"src/main.rs".to_string()),
+            "src/main.rs should be present, got: {rel:?}"
+        );
+        assert!(
+            rel.contains(&"lib.rs".to_string()),
+            "lib.rs should be present, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn worktree_exclusion_coexists_with_default_exclusions() {
+        let td = TestDir::new();
+        fs::create_dir(td.path().join(".git")).unwrap();
+        td.create_file("src/main.rs");
+        // Default exclusion: node_modules
+        td.create_file("node_modules/pkg/index.js");
+        // Worktree boundary: nested .git
+        td.create_file("sub/nested-repo/lib.rs");
+        fs::create_dir(td.path().join("sub/nested-repo/.git")).unwrap();
+
+        let walker = Walker::new(td.path());
+        let paths = walker.collect_paths();
+        let rel = sorted_relative(td.path(), &paths);
+
+        assert!(
+            rel.contains(&"src/main.rs".to_string()),
+            "src/main.rs should be present, got: {rel:?}"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("node_modules")),
+            "node_modules should still be excluded, got: {rel:?}"
+        );
+        assert!(
+            !rel.iter().any(|p| p.starts_with("sub/nested-repo")),
+            "nested repo should be excluded by worktree boundary, got: {rel:?}"
+        );
+    }
+
+    #[test]
+    fn worktree_boundary_parallel_matches_sequential() {
+        let td = TestDir::new();
+        fs::create_dir(td.path().join(".git")).unwrap();
+        td.create_file("a.rs");
+        td.create_file("sub/b.rs");
+        // Nested repo should be skipped in both modes
+        td.create_file("nested/repo/lib.rs");
+        fs::create_dir(td.path().join("nested/repo/.git")).unwrap();
+
+        let walker = Walker::new(td.path());
+        let mut seq = sorted_relative(td.path(), &walker.collect_paths());
+        let mut par = sorted_relative(td.path(), &walker.collect_paths_parallel());
+        seq.sort();
+        par.sort();
+
+        assert_eq!(
+            seq, par,
+            "sequential and parallel walks should match with worktree boundary exclusion"
+        );
+        assert!(
+            !seq.iter().any(|p| p.starts_with("nested/repo")),
+            "nested repo should be excluded in both modes, got: {seq:?}"
+        );
     }
 }
