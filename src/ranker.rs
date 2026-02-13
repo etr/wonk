@@ -4,7 +4,7 @@
 //! Import, Comment, Test, Other) using index metadata and path/content
 //! heuristics.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -57,48 +57,64 @@ pub struct ClassifiedResult {
 // Index lookup helper
 // ---------------------------------------------------------------------------
 
-/// Preloaded sets of (file, line) pairs from the DB for O(1) lookups.
+/// Preloaded maps of file -> {line numbers} from the DB for O(1) lookups.
+/// Only loads data for files present in the result set.
 struct IndexLookup {
-    definitions: HashSet<(String, i64)>,
-    references: HashSet<(String, i64)>,
+    definitions: HashMap<String, HashSet<i64>>,
+    references: HashMap<String, HashSet<i64>>,
 }
 
 impl IndexLookup {
-    /// Bulk-query the symbols and references tables, building hash sets keyed
-    /// by (file, line). Only two SQL queries are executed regardless of the
-    /// number of results to classify.
-    fn load(conn: &Connection) -> Self {
-        let definitions = Self::query_set(
+    /// Bulk-query the symbols and references tables, filtered to only the
+    /// files present in the result set. Two SQL queries are executed.
+    fn load(conn: &Connection, files: &HashSet<&str>) -> Self {
+        if files.is_empty() {
+            return IndexLookup {
+                definitions: HashMap::new(),
+                references: HashMap::new(),
+            };
+        }
+
+        let placeholders: Vec<&str> = files.iter().map(|_| "?").collect();
+        let in_clause = placeholders.join(", ");
+        let file_params: Vec<&str> = files.iter().copied().collect();
+
+        let definitions = Self::query_map(
             conn,
-            "SELECT file, line FROM symbols",
+            &format!("SELECT file, line FROM symbols WHERE file IN ({in_clause})"),
+            &file_params,
         );
-        let references = Self::query_set(
+        let references = Self::query_map(
             conn,
-            "SELECT file, line FROM \"references\"",
+            &format!("SELECT file, line FROM \"references\" WHERE file IN ({in_clause})"),
+            &file_params,
         );
         IndexLookup { definitions, references }
     }
 
-    fn query_set(conn: &Connection, sql: &str) -> HashSet<(String, i64)> {
-        let mut set = HashSet::new();
+    fn query_map(conn: &Connection, sql: &str, params: &[&str]) -> HashMap<String, HashSet<i64>> {
+        let mut map: HashMap<String, HashSet<i64>> = HashMap::new();
         if let Ok(mut stmt) = conn.prepare(sql) {
-            if let Ok(rows) = stmt.query_map([], |row| {
+            let boxed_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                params.iter().map(|s| Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>).collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = boxed_params.iter().map(|b| b.as_ref()).collect();
+            if let Ok(rows) = stmt.query_map(param_refs.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             }) {
                 for row in rows.flatten() {
-                    set.insert(row);
+                    map.entry(row.0).or_default().insert(row.1);
                 }
             }
         }
-        set
+        map
     }
 
     fn is_definition(&self, file: &str, line: i64) -> bool {
-        self.definitions.contains(&(file.to_string(), line))
+        self.definitions.get(file).is_some_and(|lines| lines.contains(&line))
     }
 
     fn is_reference(&self, file: &str, line: i64) -> bool {
-        self.references.contains(&(file.to_string(), line))
+        self.references.get(file).is_some_and(|lines| lines.contains(&line))
     }
 }
 
@@ -208,7 +224,13 @@ pub fn classify_results(
     results: &[SearchResult],
     conn: Option<&Connection>,
 ) -> Vec<ClassifiedResult> {
-    let index = conn.map(IndexLookup::load);
+    let index = conn.map(|c| {
+        let files: HashSet<&str> = results
+            .iter()
+            .map(|r| r.file.to_str().unwrap_or(""))
+            .collect();
+        IndexLookup::load(c, &files)
+    });
 
     results
         .iter()
