@@ -5,7 +5,7 @@
 - Architecture: `specs/architecture.md`
 
 **Last updated:** 2026-02-11
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
@@ -22,10 +22,10 @@
 | M2 | Indexing Engine | 6 | Complete |
 | M3 | Structural Queries | 5 | Complete |
 | M4 | Background Daemon | 5 | Complete |
-| M5 | Auto-Init, Dependencies & Configuration | 4 | In Progress |
-| M6 | Smart Search | 4 | Not Started |
-| M7 | Polish & Distribution | 5 | In Progress |
-| M8 | Git Worktree Support | 3 | Not Started |
+| M5 | Auto-Init, Dependencies & Configuration | 4 | Complete |
+| M6 | Smart Search | 4 | Complete |
+| M7 | Polish & Distribution | 5 | Complete |
+| M8 | Git Worktree Support | 3 | Complete |
 
 ### Dependency Graph
 
@@ -1408,11 +1408,11 @@ Add a `filter_entry` callback to the `WalkBuilder` that skips subdirectories con
 Extend the `should_process` event filter to discard filesystem events originating from within a nested worktree boundary.
 
 **Action Items:**
-- [ ] Add ancestor-path boundary check to `should_process` in `watcher.rs`
-- [ ] For each event path, walk ancestor directories between the event path and repo root
-- [ ] If any ancestor directory contains a `.git` entry (file or directory), discard the event
-- [ ] Accept repo root as parameter so the root's own `.git` is not treated as a boundary
-- [ ] Add unit tests simulating nested worktree events
+- [x] Add ancestor-path boundary check to `should_process` in `watcher.rs`
+- [x] For each event path, walk ancestor directories between the event path and repo root
+- [x] If any ancestor directory contains a `.git` entry (file or directory), discard the event
+- [x] Accept repo root as parameter so the root's own `.git` is not treated as a boundary
+- [x] Add unit tests simulating nested worktree events
 
 **Dependencies:**
 - Blocked by: None
@@ -1428,7 +1428,7 @@ Extend the `should_process` event filter to discard filesystem events originatin
 **Related Requirements:** PRD-WKT-REQ-004
 **Related Decisions:** DR-008
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -1442,12 +1442,12 @@ Extend the `should_process` event filter to discard filesystem events originatin
 Verify end-to-end worktree support: repo root detection accepts `.git` files, nearest root wins when nested, indexes are independent per worktree, and cross-worktree contamination is prevented.
 
 **Action Items:**
-- [ ] Create test fixture: initialize a git repo, add a linked worktree via `git worktree add`
-- [ ] Test REQ-001: `find_repo_root` correctly identifies the worktree root when `.git` is a file
-- [ ] Test REQ-002: When CWD is inside a nested worktree, `find_repo_root` returns the worktree root (not the parent)
-- [ ] Test REQ-003: Running `wonk init` from the parent repo does not index files from the nested worktree
-- [ ] Test REQ-004: The parent repo's daemon ignores file changes inside the nested worktree
-- [ ] Test REQ-005: Two worktrees of the same repo produce separate index directories with different content
+- [x] Create test fixture: initialize a git repo, add a linked worktree via `git worktree add`
+- [x] Test REQ-001: `find_repo_root` correctly identifies the worktree root when `.git` is a file
+- [x] Test REQ-002: When CWD is inside a nested worktree, `find_repo_root` returns the worktree root (not the parent)
+- [x] Test REQ-003: Running `wonk init` from the parent repo does not index files from the nested worktree
+- [x] Test REQ-004: The parent repo's daemon ignores file changes inside the nested worktree
+- [x] Test REQ-005: Two worktrees of the same repo produce separate index directories with different content
 
 **Dependencies:**
 - Blocked by: TASK-035, TASK-036
@@ -1465,7 +1465,7 @@ Verify end-to-end worktree support: repo root detection accepts `.git` files, ne
 **Related Requirements:** PRD-WKT-REQ-001 through PRD-WKT-REQ-005
 **Related Decisions:** DR-008
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
