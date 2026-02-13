@@ -1,2 +1,4 @@
 /target
 .worktrees
+bench/repos/
+bench/results/

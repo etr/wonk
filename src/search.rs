@@ -103,12 +103,18 @@ pub fn text_search_with_ignores(
             .collect_paths();
 
         for file_path in files {
+            // Strip leading "./" so paths match index format (e.g. "src/main.rs" not "./src/main.rs").
+            let normalized = file_path
+                .strip_prefix(".")
+                .map(|p| p.to_path_buf())
+                .unwrap_or(file_path);
+
             let mut sink = CollectSink {
-                file: file_path.clone(),
+                file: normalized.clone(),
                 results: &mut results,
             };
             // Silently skip files that cannot be read (e.g. permission errors).
-            let _ = searcher.search_path(&matcher, &file_path, &mut sink);
+            let _ = searcher.search_path(&matcher, &normalized, &mut sink);
         }
     }
 
@@ -430,5 +436,28 @@ mod tests {
             results[0].content, "hello world",
             "trailing newline should be stripped"
         );
+    }
+
+    #[test]
+    fn dot_prefix_is_stripped_from_paths() {
+        // Verify the normalization that strips "./" from walker output.
+        // When search roots default to ".", the walker returns paths like
+        // "./src/main.rs". strip_prefix(".") normalizes these to "src/main.rs"
+        // so they match index-stored paths.
+        let with_dot = PathBuf::from("./src/main.rs");
+        let normalized = with_dot
+            .strip_prefix(".")
+            .map(|p| p.to_path_buf())
+            .unwrap_or(with_dot);
+        assert_eq!(normalized, PathBuf::from("src/main.rs"));
+
+        // Absolute paths pass through unchanged.
+        let absolute = PathBuf::from("/home/user/project/src/main.rs");
+        let normalized = absolute
+            .clone()
+            .strip_prefix(".")
+            .map(|p| p.to_path_buf())
+            .unwrap_or(absolute.clone());
+        assert_eq!(normalized, absolute);
     }
 }
