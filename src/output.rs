@@ -519,6 +519,28 @@ pub fn print_budget_summary(truncated: usize, budget: usize) {
     eprintln!("-- {truncated} more results truncated (budget: {budget} tokens) --");
 }
 
+/// Format the search mode indicator message.
+///
+/// Returns `Some("(smart: N symbols matched)")` when ranking is active, or
+/// `Some("(text search)")` for plain grep mode. Returns `None` when suppressed.
+pub fn format_mode_indicator(symbol_count: u64, suppress: bool) -> Option<String> {
+    if suppress {
+        return None;
+    }
+    if symbol_count > 0 {
+        Some(format!("(smart: {} symbols matched)", symbol_count))
+    } else {
+        Some("(text search)".to_string())
+    }
+}
+
+/// Print the search mode indicator to stderr.
+pub fn print_mode_indicator(symbol_count: u64, suppress: bool) {
+    if let Some(msg) = format_mode_indicator(symbol_count, suppress) {
+        eprintln!("{msg}");
+    }
+}
+
 /// Print a category header to stderr.
 ///
 /// Headers go to stderr so they don't break grep-compatible stdout parsing.
@@ -1462,5 +1484,29 @@ mod tests {
             out.contains(&hl_hello) && out.contains(&hl_hello2),
             "expected both case variants highlighted, got: {out:?}"
         );
+    }
+
+    // -- Mode indicator -------------------------------------------------------
+
+    #[test]
+    fn mode_indicator_smart_with_symbols() {
+        assert_eq!(
+            format_mode_indicator(5, false),
+            Some("(smart: 5 symbols matched)".to_string()),
+        );
+    }
+
+    #[test]
+    fn mode_indicator_text_search() {
+        assert_eq!(
+            format_mode_indicator(0, false),
+            Some("(text search)".to_string()),
+        );
+    }
+
+    #[test]
+    fn mode_indicator_suppressed() {
+        assert_eq!(format_mode_indicator(5, true), None);
+        assert_eq!(format_mode_indicator(0, true), None);
     }
 }
