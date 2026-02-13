@@ -2,12 +2,12 @@
 # install.sh - Download and install the wonk binary for your platform.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/wonk/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/etr/wonk/main/install.sh | sh
 #
 # Options (via environment variables):
 #   WONK_VERSION   - Version to install (default: latest)
 #   WONK_INSTALL   - Installation directory (default: /usr/local/bin)
-#   GITHUB_REPO    - GitHub repository (default: OWNER/wonk)
+#   GITHUB_REPO    - GitHub repository (default: etr/wonk)
 #
 # Example:
 #   WONK_VERSION=0.2.0 WONK_INSTALL=$HOME/.local/bin curl -fsSL ... | sh
@@ -15,7 +15,7 @@
 set -eu
 
 BINARY_NAME="wonk"
-GITHUB_REPO="${GITHUB_REPO:-OWNER/wonk}"
+GITHUB_REPO="${GITHUB_REPO:-etr/wonk}"
 INSTALL_DIR="${WONK_INSTALL:-/usr/local/bin}"
 
 # --- Logging helpers ---
