@@ -5,56 +5,61 @@
 - Architecture: `specs/architecture.md`
 
 **Last updated:** 2026-02-11
-**Status:** Draft
+**Status:** In Progress
 
 ---
 
 ## Overview
 
-**Total Tasks:** 30
-**Milestones:** 6
+**Total Tasks:** 34
+**Milestones:** 7
 
 ### Milestone Summary
 
 | Milestone | Description | Tasks | Status |
 |-----------|-------------|-------|--------|
-| M1 | Project Scaffold & Text Search | 5 | Not Started |
-| M2 | Indexing Engine | 6 | Not Started |
-| M3 | Structural Queries | 5 | Not Started |
-| M4 | Background Daemon | 5 | Not Started |
-| M5 | Auto-Init, Dependencies & Configuration | 4 | Not Started |
-| M6 | Polish & Distribution | 5 | Not Started |
+| M1 | Project Scaffold & Text Search | 5 | Complete |
+| M2 | Indexing Engine | 6 | Complete |
+| M3 | Structural Queries | 5 | Complete |
+| M4 | Background Daemon | 5 | Complete |
+| M5 | Auto-Init, Dependencies & Configuration | 4 | In Progress |
+| M6 | Smart Search | 4 | Not Started |
+| M7 | Polish & Distribution | 5 | In Progress |
 
 ### Dependency Graph
 
 ```
-M1: Project Scaffold & Text Search
+M1: Project Scaffold & Text Search [Complete]
 ├── TASK-001 ──┬── TASK-002 ──┬── TASK-004 ── TASK-005
 │              │              │
 │              └── TASK-003 ──┘
 │
-M2: Indexing Engine (depends: M1)
+M2: Indexing Engine [Complete] (depends: M1)
 ├── TASK-006 ──────────────────────────────┐
 ├── TASK-007 ──┬── TASK-008 ──┐            │
 │              └── TASK-009 ──┼── TASK-010 ── TASK-011
 │                             │
-M3: Structural Queries (depends: M2)
+M3: Structural Queries [Complete] (depends: M2)
 ├── TASK-012 ──┬── TASK-013
 │              ├── TASK-014
 │              ├── TASK-015
 │              └── TASK-016
 │
-M4: Background Daemon (depends: M2)
+M4: Background Daemon [Complete] (depends: M2)
 ├── TASK-017 ──┬── TASK-018 ── TASK-019
 │              └── TASK-020 ──┐
 │                             └── TASK-021
 │
-M5: Auto-Init, Dependencies & Configuration (depends: M3, M4)
+M5: Auto-Init, Dependencies & Configuration [In Progress] (depends: M3, M4)
 ├── TASK-022
 ├── TASK-023
 ├── TASK-024 ── TASK-025
 │
-M6: Polish & Distribution (depends: M5)
+M6: Smart Search (depends: M3, M5)
+├── TASK-031 ── TASK-032 ── TASK-033
+├── TASK-034
+│
+M7: Polish & Distribution (depends: M6)
 ├── TASK-026
 ├── TASK-027
 ├── TASK-028
@@ -63,12 +68,13 @@ M6: Polish & Distribution (depends: M5)
 
 ### Critical Path
 
-TASK-001 → TASK-002 → TASK-004 → TASK-005 (M1)
-→ TASK-007 → TASK-008 → TASK-010 → TASK-011 (M2)
-→ TASK-012 → TASK-013 (M3)
-→ TASK-017 → TASK-018 → TASK-019 (M4)
+TASK-001 → TASK-002 → TASK-004 → TASK-005 (M1) ✅
+→ TASK-007 → TASK-008 → TASK-010 → TASK-011 (M2) ✅
+→ TASK-012 → TASK-013 (M3) ✅
+→ TASK-017 → TASK-018 → TASK-019 (M4) ✅
 → TASK-022 (M5)
-→ TASK-029 → TASK-030 (M6)
+→ TASK-031 → TASK-032 → TASK-033 (M6)
+→ TASK-029 → TASK-030 (M7)
 
 ---
 
@@ -87,11 +93,11 @@ TASK-001 → TASK-002 → TASK-004 → TASK-005 (M1)
 Set up Cargo project with all crate dependencies from DR-005.
 
 **Action Items:**
-- [ ] `cargo init` with binary target
-- [ ] Add all dependencies to Cargo.toml (clap, rusqlite with bundled, tree-sitter, grep, ignore, rayon, notify, notify-debouncer-mini, crossbeam-channel, xxhash-rust, sha2, toml, serde, serde_json, anyhow, thiserror, fork, signal-hook)
-- [ ] Add tree-sitter language grammar crates (10 languages)
-- [ ] Create initial module files (cli.rs, router.rs, db.rs, indexer.rs, search.rs, daemon.rs, config.rs, types.rs, errors.rs)
-- [ ] Verify `cargo build` succeeds
+- [x] `cargo init` with binary target
+- [x] Add all dependencies to Cargo.toml (clap, rusqlite with bundled, tree-sitter, grep, ignore, rayon, notify, notify-debouncer-mini, crossbeam-channel, xxhash-rust, sha2, toml, serde, serde_json, anyhow, thiserror, fork, signal-hook)
+- [x] Add tree-sitter language grammar crates (10 languages)
+- [x] Create initial module files (cli.rs, router.rs, db.rs, indexer.rs, search.rs, daemon.rs, config.rs, types.rs, errors.rs)
+- [x] Verify `cargo build` succeeds
 
 **Dependencies:**
 - Blocked by: None
@@ -105,7 +111,7 @@ Set up Cargo project with all crate dependencies from DR-005.
 **Related Requirements:** PRD-DST-REQ-001, PRD-DST-REQ-002
 **Related Decisions:** DR-001, DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -119,11 +125,11 @@ Set up Cargo project with all crate dependencies from DR-005.
 Define all subcommands and global flags with clap derive, dispatching to stub handlers.
 
 **Action Items:**
-- [ ] Define top-level `Cli` struct with `#[arg(global = true)]` `--json` flag
-- [ ] Define subcommand enum: search, sym, ref, sig, ls, deps, rdeps, init, update, status, daemon (start/stop/status), repos (list/clean)
-- [ ] Define argument structs for each subcommand (pattern, flags, path args)
-- [ ] Wire up dispatch from main.rs to stub functions that print "not yet implemented"
-- [ ] Implement `--` separator for path restriction on search/ref
+- [x] Define top-level `Cli` struct with `#[arg(global = true)]` `--json` flag
+- [x] Define subcommand enum: search, sym, ref, sig, ls, deps, rdeps, init, update, status, daemon (start/stop/status), repos (list/clean)
+- [x] Define argument structs for each subcommand (pattern, flags, path args)
+- [x] Wire up dispatch from main.rs to stub functions that print "not yet implemented"
+- [x] Implement `--` separator for path restriction on search/ref
 
 **Dependencies:**
 - Blocked by: TASK-001
@@ -139,7 +145,7 @@ Define all subcommands and global flags with clap derive, dispatching to stub ha
 **Related Requirements:** PRD-SRCH-REQ-001 through PRD-SRCH-REQ-004, PRD-SYM-REQ-001 through PRD-SYM-REQ-003, PRD-REF-REQ-001 through PRD-REF-REQ-002, PRD-SIG-REQ-001, PRD-LST-REQ-001, PRD-LST-REQ-002, PRD-DEP-REQ-001, PRD-DEP-REQ-002
 **Related Decisions:** DR-001, DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -153,11 +159,11 @@ Define all subcommands and global flags with clap derive, dispatching to stub ha
 Build a file walker using the `ignore` crate that respects .gitignore and default exclusions.
 
 **Action Items:**
-- [ ] Create `walker` module wrapping the `ignore` crate's `WalkBuilder`
-- [ ] Configure default exclusions (node_modules, vendor, target, build, dist, __pycache__, .venv)
-- [ ] Skip hidden files/directories except .github
-- [ ] Support path restriction (walk from a subdirectory)
-- [ ] Use ignore crate's internal parallelism (`WalkParallel`) for file enumeration
+- [x] Create `walker` module wrapping the `ignore` crate's `WalkBuilder`
+- [x] Configure default exclusions (node_modules, vendor, target, build, dist, __pycache__, .venv)
+- [x] Skip hidden files/directories except .github
+- [x] Support path restriction (walk from a subdirectory)
+- [x] Use ignore crate's internal parallelism (`WalkParallel`) for file enumeration
 
 **Dependencies:**
 - Blocked by: TASK-001
@@ -174,7 +180,7 @@ Build a file walker using the `ignore` crate that respects .gitignore and defaul
 **Related Requirements:** PRD-IDX-REQ-009, PRD-IDX-REQ-011
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -188,11 +194,11 @@ Build a file walker using the `ignore` crate that respects .gitignore and defaul
 Implement `wonk search <pattern>` using the `grep` crate with regex, case-insensitive, and path restriction support.
 
 **Action Items:**
-- [ ] Create `search` module wrapping the `grep` crate (grep-searcher, grep-regex, grep-matcher)
-- [ ] Implement literal and regex pattern matching
-- [ ] Implement case-insensitive flag (`-i`)
-- [ ] Integrate file walker (TASK-003) for file enumeration
-- [ ] Wire up to CLI dispatch from TASK-002
+- [x] Create `search` module wrapping the `grep` crate (grep-searcher, grep-regex, grep-matcher)
+- [x] Implement literal and regex pattern matching
+- [x] Implement case-insensitive flag (`-i`)
+- [x] Integrate file walker (TASK-003) for file enumeration
+- [x] Wire up to CLI dispatch from TASK-002
 
 **Dependencies:**
 - Blocked by: TASK-002, TASK-003
@@ -210,7 +216,7 @@ Implement `wonk search <pattern>` using the `grep` crate with regex, case-insens
 **Related Requirements:** PRD-SRCH-REQ-001 through PRD-SRCH-REQ-004
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -224,11 +230,11 @@ Implement `wonk search <pattern>` using the `grep` crate with regex, case-insens
 Implement dual output formatting: grep-compatible default and structured JSON via `--json`.
 
 **Action Items:**
-- [ ] Define output types (SearchResult, SymbolResult, RefResult, etc.) with serde derives
-- [ ] Implement grep-style formatter: `file:line:content`
-- [ ] Implement JSON formatter: one JSON object per line
-- [ ] Wire `--json` global flag to formatter selection
-- [ ] Ensure output goes to stdout, hints/errors to stderr
+- [x] Define output types (SearchResult, SymbolResult, RefResult, etc.) with serde derives
+- [x] Implement grep-style formatter: `file:line:content`
+- [x] Implement JSON formatter: one JSON object per line
+- [x] Wire `--json` global flag to formatter selection
+- [x] Ensure output goes to stdout, hints/errors to stderr
 
 **Dependencies:**
 - Blocked by: TASK-004
@@ -247,7 +253,7 @@ Implement dual output formatting: grep-compatible default and structured JSON vi
 **Related Requirements:** PRD-OUT-REQ-001, PRD-OUT-REQ-002, PRD-OUT-REQ-003, PRD-SRCH-REQ-005
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -266,14 +272,14 @@ Implement dual output formatting: grep-compatible default and structured JSON vi
 Create the SQLite database with full schema including FTS5 content-sync table and provide a connection manager.
 
 **Action Items:**
-- [ ] Create `db` module with connection open/create logic
-- [ ] Implement schema creation: `symbols`, `references`, `files`, `daemon_status` tables with all indexes
-- [ ] Create FTS5 content-sync virtual table (`symbols_fts`) with proper triggers (INSERT with 'delete' command for deletions — never raw DELETE)
-- [ ] Set `PRAGMA busy_timeout=5000` on all connections
-- [ ] Implement repo path hashing (SHA256-short, first 16 hex chars) for central index directory
-- [ ] Support both central (`~/.wonk/repos/<hash>/`) and local (`.wonk/`) index locations
-- [ ] Write `meta.json` alongside index (repo_path, created timestamp, detected languages)
-- [ ] Implement repo root discovery (walk up from CWD looking for `.git` or `.wonk`)
+- [x] Create `db` module with connection open/create logic
+- [x] Implement schema creation: `symbols`, `references`, `files`, `daemon_status` tables with all indexes
+- [x] Create FTS5 content-sync virtual table (`symbols_fts`) with proper triggers (INSERT with 'delete' command for deletions — never raw DELETE)
+- [x] Set `PRAGMA busy_timeout=5000` on all connections
+- [x] Implement repo path hashing (SHA256-short, first 16 hex chars) for central index directory
+- [x] Support both central (`~/.wonk/repos/<hash>/`) and local (`.wonk/`) index locations
+- [x] Write `meta.json` alongside index (repo_path, created timestamp, detected languages)
+- [x] Implement repo root discovery (walk up from CWD looking for `.git` or `.wonk`)
 
 **Dependencies:**
 - Blocked by: TASK-001
@@ -292,7 +298,7 @@ Create the SQLite database with full schema including FTS5 content-sync table an
 **Related Requirements:** PRD-IDX-REQ-002, PRD-IDX-REQ-003
 **Related Decisions:** DR-004, DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -306,12 +312,12 @@ Create the SQLite database with full schema including FTS5 content-sync table an
 Build a multi-language Tree-sitter dispatcher that detects file language and parses with the correct grammar.
 
 **Action Items:**
-- [ ] Create `indexer` module with language detection by file extension
-- [ ] Register all 10 bundled grammars using compile-time loading (`tree_sitter_rust::LANGUAGE.into()`, etc.)
-- [ ] Implement `parse_file(path) -> Option<tree_sitter::Tree>` that selects the correct parser
-- [ ] Handle unsupported languages gracefully (return None, don't error)
-- [ ] Write Tree-sitter S-expression queries for symbol extraction per language (function/method definitions, class/struct/interface/enum/trait definitions, type aliases, constants, exports)
-- [ ] Avoid deprecated APIs (set_timeout_micros, set_cancellation_flag) — use progress callbacks if needed
+- [x] Create `indexer` module with language detection by file extension
+- [x] Register all 10 bundled grammars using compile-time loading (`tree_sitter_rust::LANGUAGE.into()`, etc.)
+- [x] Implement `parse_file(path) -> Option<tree_sitter::Tree>` that selects the correct parser
+- [x] Handle unsupported languages gracefully (return None, don't error)
+- [x] Write Tree-sitter S-expression queries for symbol extraction per language (function/method definitions, class/struct/interface/enum/trait definitions, type aliases, constants, exports)
+- [x] Avoid deprecated APIs (set_timeout_micros, set_cancellation_flag) — use progress callbacks if needed
 
 **Dependencies:**
 - Blocked by: TASK-001
@@ -328,7 +334,7 @@ Build a multi-language Tree-sitter dispatcher that detects file language and par
 **Related Requirements:** PRD-IDX-REQ-004
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -342,11 +348,11 @@ Build a multi-language Tree-sitter dispatcher that detects file language and par
 Extract symbol definitions (functions, classes, methods, types, constants) from parsed Tree-sitter trees for all 10 languages.
 
 **Action Items:**
-- [ ] Define `Symbol` struct (name, kind, file, line, col, end_line, scope, signature, language)
-- [ ] Write extraction queries per language for: functions/methods, classes/structs/interfaces/enums/traits, type aliases, module-level constants/variables, exported symbols
-- [ ] Extract `scope` (parent symbol name, e.g., class name for a method)
-- [ ] Extract `signature` (full signature text for display)
-- [ ] Test against real-world code samples for each language
+- [x] Define `Symbol` struct (name, kind, file, line, col, end_line, scope, signature, language)
+- [x] Write extraction queries per language for: functions/methods, classes/structs/interfaces/enums/traits, type aliases, module-level constants/variables, exported symbols
+- [x] Extract `scope` (parent symbol name, e.g., class name for a method)
+- [x] Extract `signature` (full signature text for display)
+- [x] Test against real-world code samples for each language
 
 **Dependencies:**
 - Blocked by: TASK-007
@@ -363,7 +369,7 @@ Extract symbol definitions (functions, classes, methods, types, constants) from 
 **Related Requirements:** PRD-IDX-REQ-005, PRD-SYM-REQ-004
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -377,10 +383,10 @@ Extract symbol definitions (functions, classes, methods, types, constants) from 
 Extract references (function calls, type annotations, imports) from parsed trees and record them with context lines.
 
 **Action Items:**
-- [ ] Define `Reference` struct (name, file, line, col, context)
-- [ ] Write extraction queries per language for: function/method calls, type annotations, import statements
-- [ ] Capture the full source line as `context` for display
-- [ ] Extract import/export data for the `files` table (for dependency graph in M5)
+- [x] Define `Reference` struct (name, file, line, col, context)
+- [x] Write extraction queries per language for: function/method calls, type annotations, import statements
+- [x] Capture the full source line as `context` for display
+- [x] Extract import/export data for the `files` table (for dependency graph in M5)
 
 **Dependencies:**
 - Blocked by: TASK-007
@@ -396,7 +402,7 @@ Extract references (function calls, type annotations, imports) from parsed trees
 **Related Requirements:** PRD-IDX-REQ-006, PRD-IDX-REQ-007, PRD-REF-REQ-003
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -410,14 +416,14 @@ Extract references (function calls, type annotations, imports) from parsed trees
 Wire everything together into `wonk init` and `wonk update` commands that build a complete index.
 
 **Action Items:**
-- [ ] Implement `wonk init`: walk files (TASK-003), parse with Tree-sitter (TASK-007/008/009), batch-insert symbols/references/files into SQLite (TASK-006)
-- [ ] Parallelize file parsing with rayon across available CPU cores
-- [ ] Use transactions for atomicity (one transaction per batch)
-- [ ] Compute content hash (xxhash) per file for change detection
-- [ ] Populate FTS5 index via content-sync triggers
-- [ ] Implement `wonk init --local` for local index mode
-- [ ] Implement `wonk update` as force re-index (drop and rebuild)
-- [ ] Wire to CLI dispatch from TASK-002
+- [x] Implement `wonk init`: walk files (TASK-003), parse with Tree-sitter (TASK-007/008/009), batch-insert symbols/references/files into SQLite (TASK-006)
+- [x] Parallelize file parsing with rayon across available CPU cores
+- [x] Use transactions for atomicity (one transaction per batch)
+- [x] Compute content hash (xxhash) per file for change detection
+- [x] Populate FTS5 index via content-sync triggers
+- [x] Implement `wonk init --local` for local index mode
+- [x] Implement `wonk update` as force re-index (drop and rebuild)
+- [x] Wire to CLI dispatch from TASK-002
 
 **Dependencies:**
 - Blocked by: TASK-003, TASK-006, TASK-008, TASK-009
@@ -439,7 +445,7 @@ Wire everything together into `wonk init` and `wonk update` commands that build 
 **Related Requirements:** PRD-IDX-REQ-001, PRD-IDX-REQ-002, PRD-IDX-REQ-003, PRD-IDX-REQ-008, PRD-IDX-REQ-012
 **Related Decisions:** DR-001, DR-002, DR-004
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -453,10 +459,10 @@ Wire everything together into `wonk init` and `wonk update` commands that build 
 Implement `wonk status`, `wonk repos list`, and `wonk repos clean` commands.
 
 **Action Items:**
-- [ ] `wonk status`: query SQLite for file count, symbol count, reference count, index size (file size of index.db), last indexed time
-- [ ] `wonk repos list`: scan `~/.wonk/repos/`, read each `meta.json`, display repo paths with stats
-- [ ] `wonk repos clean`: check each repo path still exists, remove index directories for missing repos
-- [ ] Support `--json` output for all three commands
+- [x] `wonk status`: query SQLite for file count, symbol count, reference count, index size (file size of index.db), last indexed time
+- [x] `wonk repos list`: scan `~/.wonk/repos/`, read each `meta.json`, display repo paths with stats
+- [x] `wonk repos clean`: check each repo path still exists, remove index directories for missing repos
+- [x] Support `--json` output for all three commands
 
 **Dependencies:**
 - Blocked by: TASK-010
@@ -473,7 +479,7 @@ Implement `wonk status`, `wonk repos list`, and `wonk repos clean` commands.
 **Related Requirements:** PRD-IDX-REQ-013, PRD-IDX-REQ-014, PRD-IDX-REQ-015
 **Related Decisions:** DR-003
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -492,11 +498,11 @@ Implement `wonk status`, `wonk repos list`, and `wonk repos clean` commands.
 Build the routing layer that dispatches queries to SQLite index or grep-based fallback depending on availability and results.
 
 **Action Items:**
-- [ ] Create `router` module with a `QueryRouter` that holds both a db connection and search engine
-- [ ] Define `thiserror` error types: `DbError::NoIndex`, `DbError::QueryFailed`, `SearchError`
-- [ ] Implement routing logic: try primary (SQLite), if no results fall back to grep with heuristic patterns
-- [ ] Define heuristic grep patterns for symbol fallback (e.g., `fn <name>`, `def <name>`, `function <name>`, `class <name>`)
-- [ ] Define heuristic grep patterns for import fallback (e.g., `import.*<name>`, `require.*<name>`, `use <name>`)
+- [x] Create `router` module with a `QueryRouter` that holds both a db connection and search engine
+- [x] Define `thiserror` error types: `DbError::NoIndex`, `DbError::QueryFailed`, `SearchError`
+- [x] Implement routing logic: try primary (SQLite), if no results fall back to grep with heuristic patterns
+- [x] Define heuristic grep patterns for symbol fallback (e.g., `fn <name>`, `def <name>`, `function <name>`, `class <name>`)
+- [x] Define heuristic grep patterns for import fallback (e.g., `import.*<name>`, `require.*<name>`, `use <name>`)
 
 **Dependencies:**
 - Blocked by: TASK-006, TASK-004
@@ -513,7 +519,7 @@ Build the routing layer that dispatches queries to SQLite index or grep-based fa
 **Related Requirements:** PRD-FBK-REQ-001 through PRD-FBK-REQ-005
 **Related Decisions:** DR-006
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -527,12 +533,12 @@ Build the routing layer that dispatches queries to SQLite index or grep-based fa
 Implement `wonk sym <name>` with substring/exact matching, kind filtering, and fallback.
 
 **Action Items:**
-- [ ] Implement SQLite query: substring match via FTS5 or `LIKE '%name%'`
-- [ ] Implement `--exact` flag: exact name match via `WHERE name = ?`
-- [ ] Implement `--kind <kind>` flag: filter by symbol kind
-- [ ] Format output: `file:line:  signature` (grep-compatible) and JSON with all fields
-- [ ] Wire through query router for fallback to grep heuristics
-- [ ] Wire to CLI dispatch
+- [x] Implement SQLite query: substring match via FTS5 or `LIKE '%name%'`
+- [x] Implement `--exact` flag: exact name match via `WHERE name = ?`
+- [x] Implement `--kind <kind>` flag: filter by symbol kind
+- [x] Format output: `file:line:  signature` (grep-compatible) and JSON with all fields
+- [x] Wire through query router for fallback to grep heuristics
+- [x] Wire to CLI dispatch
 
 **Dependencies:**
 - Blocked by: TASK-012
@@ -551,7 +557,7 @@ Implement `wonk sym <name>` with substring/exact matching, kind filtering, and f
 **Related Requirements:** PRD-SYM-REQ-001 through PRD-SYM-REQ-004
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -565,11 +571,11 @@ Implement `wonk sym <name>` with substring/exact matching, kind filtering, and f
 Implement `wonk ref <name>` with path restriction and fallback.
 
 **Action Items:**
-- [ ] Implement SQLite query: match references by name
-- [ ] Implement path restriction via `-- <path>` (filter by file prefix)
-- [ ] Format output: `file:line:  context_line` (grep-compatible) and JSON with all fields
-- [ ] Wire through query router for fallback to grep (plain name search)
-- [ ] Wire to CLI dispatch
+- [x] Implement SQLite query: match references by name
+- [x] Implement path restriction via `-- <path>` (filter by file prefix)
+- [x] Format output: `file:line:  context_line` (grep-compatible) and JSON with all fields
+- [x] Wire through query router for fallback to grep (plain name search)
+- [x] Wire to CLI dispatch
 
 **Dependencies:**
 - Blocked by: TASK-012
@@ -587,7 +593,7 @@ Implement `wonk ref <name>` with path restriction and fallback.
 **Related Requirements:** PRD-REF-REQ-001 through PRD-REF-REQ-003
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -601,10 +607,10 @@ Implement `wonk ref <name>` with path restriction and fallback.
 Implement `wonk sig <name>` that displays just the signature lines for matching symbols.
 
 **Action Items:**
-- [ ] Implement SQLite query: select signature from symbols matching name
-- [ ] Format output: `file:line:  signature` (grep-compatible) and JSON
-- [ ] Wire through query router for fallback to grep heuristics
-- [ ] Wire to CLI dispatch
+- [x] Implement SQLite query: select signature from symbols matching name
+- [x] Format output: `file:line:  signature` (grep-compatible) and JSON
+- [x] Wire through query router for fallback to grep heuristics
+- [x] Wire to CLI dispatch
 
 **Dependencies:**
 - Blocked by: TASK-012
@@ -620,7 +626,7 @@ Implement `wonk sig <name>` that displays just the signature lines for matching 
 **Related Requirements:** PRD-SIG-REQ-001
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -634,12 +640,12 @@ Implement `wonk sig <name>` that displays just the signature lines for matching 
 Implement `wonk ls <path>` with flat and tree views, including on-demand Tree-sitter fallback.
 
 **Action Items:**
-- [ ] Implement SQLite query: select symbols filtered by file path (exact file or directory prefix)
-- [ ] Implement flat view: list symbols sorted by file and line
-- [ ] Implement `--tree` flag: group symbols by scope hierarchy (e.g., class → methods)
-- [ ] Format output: flat list (grep-compatible) and JSON
-- [ ] Wire fallback: if no symbols in index for a file, perform on-demand Tree-sitter parse
-- [ ] Wire to CLI dispatch
+- [x] Implement SQLite query: select symbols filtered by file path (exact file or directory prefix)
+- [x] Implement flat view: list symbols sorted by file and line
+- [x] Implement `--tree` flag: group symbols by scope hierarchy (e.g., class → methods)
+- [x] Format output: flat list (grep-compatible) and JSON
+- [x] Wire fallback: if no symbols in index for a file, perform on-demand Tree-sitter parse
+- [x] Wire to CLI dispatch
 
 **Dependencies:**
 - Blocked by: TASK-012, TASK-007
@@ -657,7 +663,7 @@ Implement `wonk ls <path>` with flat and tree views, including on-demand Tree-si
 **Related Requirements:** PRD-LST-REQ-001, PRD-LST-REQ-002, PRD-FBK-REQ-004
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -676,12 +682,12 @@ Implement `wonk ls <path>` with flat and tree views, including on-demand Tree-si
 Implement daemon spawning via double-fork, PID file management, and graceful shutdown via SIGTERM.
 
 **Action Items:**
-- [ ] Implement double-fork daemonization using `fork` crate (detach from parent, new session)
-- [ ] Write PID to `daemon.pid` alongside index.db
-- [ ] Check for stale PID files on startup (process no longer running → remove and proceed)
-- [ ] Enforce single instance per repo (check PID file before spawning)
-- [ ] Register SIGTERM handler via `signal-hook` for graceful shutdown
-- [ ] On shutdown: clean up PID file, close SQLite connection
+- [x] Implement double-fork daemonization using `fork` crate (detach from parent, new session)
+- [x] Write PID to `daemon.pid` alongside index.db
+- [x] Check for stale PID files on startup (process no longer running → remove and proceed)
+- [x] Enforce single instance per repo (check PID file before spawning)
+- [x] Register SIGTERM handler via `signal-hook` for graceful shutdown
+- [x] On shutdown: clean up PID file, close SQLite connection
 
 **Dependencies:**
 - Blocked by: TASK-006
@@ -699,7 +705,7 @@ Implement daemon spawning via double-fork, PID file management, and graceful shu
 **Related Requirements:** PRD-DMN-REQ-011
 **Related Decisions:** DR-003, DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -713,12 +719,12 @@ Implement daemon spawning via double-fork, PID file management, and graceful shu
 Set up filesystem watching with notify and notify-debouncer-mini, feeding debounced events into a crossbeam channel.
 
 **Action Items:**
-- [ ] Initialize `notify` recommended watcher for the repo root
-- [ ] Wrap with `notify-debouncer-mini` configured for 500ms debounce window
-- [ ] Feed debounced events into a `crossbeam-channel` sender
-- [ ] Implement the daemon event loop: receive from channel, dispatch to re-indexer
-- [ ] Respect file filtering rules (gitignore, default exclusions) when processing events
-- [ ] Handle event types: create, modify, delete, rename
+- [x] Initialize `notify` recommended watcher for the repo root
+- [x] Wrap with `notify-debouncer-mini` configured for 500ms debounce window
+- [x] Feed debounced events into a `crossbeam-channel` sender
+- [x] Implement the daemon event loop: receive from channel, dispatch to re-indexer
+- [x] Respect file filtering rules (gitignore, default exclusions) when processing events
+- [x] Handle event types: create, modify, delete, rename
 
 **Dependencies:**
 - Blocked by: TASK-017, TASK-003
@@ -736,7 +742,7 @@ Set up filesystem watching with notify and notify-debouncer-mini, feeding deboun
 **Related Requirements:** PRD-DMN-REQ-004, PRD-DMN-REQ-009
 **Related Decisions:** DR-002, DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -750,12 +756,12 @@ Set up filesystem watching with notify and notify-debouncer-mini, feeding deboun
 Process file change events by re-hashing, re-parsing, and updating the index incrementally.
 
 **Action Items:**
-- [ ] On file modify: compute xxhash, compare to stored hash in `files` table, skip if unchanged
-- [ ] On changed hash: re-parse with Tree-sitter, delete old symbols/references for that file, insert new ones (single transaction)
-- [ ] On file delete: remove all symbols, references, and file metadata for that file
-- [ ] On new file: detect language, parse if supported, insert into index
-- [ ] Update `files` table metadata (hash, last_indexed, line_count, symbols_count)
-- [ ] Update FTS5 via content-sync triggers (ensure INSERT-with-delete pattern, not raw DELETE)
+- [x] On file modify: compute xxhash, compare to stored hash in `files` table, skip if unchanged
+- [x] On changed hash: re-parse with Tree-sitter, delete old symbols/references for that file, insert new ones (single transaction)
+- [x] On file delete: remove all symbols, references, and file metadata for that file
+- [x] On new file: detect language, parse if supported, insert into index
+- [x] Update `files` table metadata (hash, last_indexed, line_count, symbols_count)
+- [x] Update FTS5 via content-sync triggers (ensure INSERT-with-delete pattern, not raw DELETE)
 
 **Dependencies:**
 - Blocked by: TASK-018, TASK-008, TASK-009
@@ -774,7 +780,7 @@ Process file change events by re-hashing, re-parsing, and updating the index inc
 **Related Requirements:** PRD-DMN-REQ-005, PRD-DMN-REQ-006, PRD-DMN-REQ-007, PRD-DMN-REQ-008, PRD-DMN-REQ-010
 **Related Decisions:** DR-004
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -788,12 +794,12 @@ Process file change events by re-hashing, re-parsing, and updating the index inc
 Write daemon status (heartbeat, queue depth, errors) to the `daemon_status` SQLite table for CLI to read.
 
 **Action Items:**
-- [ ] Write status on daemon start: pid, state='running', uptime_start
-- [ ] Update last_activity timestamp on each index update
-- [ ] Write files_queued count when processing batches
-- [ ] Write last_error on indexing failures
-- [ ] Periodic heartbeat write (every 30 seconds) so CLI can detect stale daemons
-- [ ] Clear status on clean shutdown
+- [x] Write status on daemon start: pid, state='running', uptime_start
+- [x] Update last_activity timestamp on each index update
+- [x] Write files_queued count when processing batches
+- [x] Write last_error on indexing failures
+- [x] Periodic heartbeat write (every 30 seconds) so CLI can detect stale daemons
+- [x] Clear status on clean shutdown
 
 **Dependencies:**
 - Blocked by: TASK-017, TASK-006
@@ -811,7 +817,7 @@ Write daemon status (heartbeat, queue depth, errors) to the `daemon_status` SQLi
 **Related Requirements:** PRD-DMN-REQ-014
 **Related Decisions:** DR-003
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -825,13 +831,13 @@ Write daemon status (heartbeat, queue depth, errors) to the `daemon_status` SQLi
 Implement `wonk daemon start/stop/status` and auto-spawn the daemon on any CLI command when an index exists.
 
 **Action Items:**
-- [ ] `wonk daemon start`: spawn daemon if not running, report if already running
-- [ ] `wonk daemon stop`: send SIGTERM to PID from PID file, wait for exit, clean up
-- [ ] `wonk daemon status`: read `daemon_status` table + check PID file, display state/PID/uptime/last activity
-- [ ] Implement idle timeout: daemon exits after 30 minutes of no filesystem activity (uses config value from TASK-024 when available)
-- [ ] Auto-spawn logic: on any CLI query command, check PID file → if daemon not running and index exists → spawn daemon
-- [ ] Wire `wonk init` to spawn daemon after index build
-- [ ] Support `--json` output for daemon status
+- [x] `wonk daemon start`: spawn daemon if not running, report if already running
+- [x] `wonk daemon stop`: send SIGTERM to PID from PID file, wait for exit, clean up
+- [x] `wonk daemon status`: read `daemon_status` table + check PID file, display state/PID/uptime/last activity
+- [x] Implement idle timeout: daemon exits after 30 minutes of no filesystem activity (uses config value from TASK-024 when available)
+- [x] Auto-spawn logic: on any CLI query command, check PID file → if daemon not running and index exists → spawn daemon
+- [x] Wire `wonk init` to spawn daemon after index build
+- [x] Support `--json` output for daemon status
 
 **Dependencies:**
 - Blocked by: TASK-017, TASK-020
@@ -851,7 +857,7 @@ Implement `wonk daemon start/stop/status` and auto-spawn the daemon on any CLI c
 **Related Requirements:** PRD-DMN-REQ-001, PRD-DMN-REQ-002, PRD-DMN-REQ-003, PRD-DMN-REQ-012, PRD-DMN-REQ-013, PRD-DMN-REQ-014
 **Related Decisions:** DR-003
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -862,6 +868,8 @@ Implement `wonk daemon start/stop/status` and auto-spawn the daemon on any CLI c
 
 ### TASK-022: Auto-initialization on first query
 
+**Status:** Complete
+
 **Milestone:** M5 - Auto-Init, Dependencies & Configuration
 **Component:** CLI, Structural Index
 **Estimate:** M
@@ -870,12 +878,12 @@ Implement `wonk daemon start/stop/status` and auto-spawn the daemon on any CLI c
 When any query command is run and no index exists, automatically build the index with a progress indicator before returning results.
 
 **Action Items:**
-- [ ] Detect missing index at query dispatch time (no index.db for current repo)
-- [ ] Run full index build inline (same as `wonk init` pipeline from TASK-010)
-- [ ] Display progress indicator to stderr during indexing (file count, percentage)
-- [ ] Spawn daemon after auto-init completes
-- [ ] Return query results after index is ready
-- [ ] Print hint to stderr: "Indexed N files in Xs. Daemon started."
+- [x] Detect missing index at query dispatch time (no index.db for current repo)
+- [x] Run full index build inline (same as `wonk init` pipeline from TASK-010)
+- [x] Display progress indicator to stderr during indexing (file count, percentage)
+- [x] Spawn daemon after auto-init completes
+- [x] Return query results after index is ready
+- [x] Print hint to stderr: "Indexed N files in Xs. Daemon started."
 
 **Dependencies:**
 - Blocked by: TASK-010, TASK-021
@@ -894,7 +902,7 @@ When any query command is run and no index exists, automatically build the index
 **Related Requirements:** PRD-AUT-REQ-001, PRD-AUT-REQ-002, PRD-AUT-REQ-003
 **Related Decisions:** DR-002
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -908,12 +916,12 @@ When any query command is run and no index exists, automatically build the index
 Implement `wonk deps <file>` and `wonk rdeps <file>` using import/export data from the index with grep fallback.
 
 **Action Items:**
-- [ ] Query `files` table import/export data for forward dependencies (`wonk deps`)
-- [ ] Query reverse: find all files whose imports include the target file (`wonk rdeps`)
-- [ ] Resolve import paths to actual file paths (language-specific: JS/TS relative imports, Python module paths, etc.)
-- [ ] Format output: one file path per line (grep-compatible) and JSON
-- [ ] Wire through query router: fall back to grep for import/require patterns when index has no data
-- [ ] Wire to CLI dispatch
+- [x] Query `files` table import/export data for forward dependencies (`wonk deps`)
+- [x] Query reverse: find all files whose imports include the target file (`wonk rdeps`)
+- [x] Resolve import paths to actual file paths (language-specific: JS/TS relative imports, Python module paths, etc.)
+- [x] Format output: one file path per line (grep-compatible) and JSON
+- [x] Wire through query router: fall back to grep for import/require patterns when index has no data
+- [x] Wire to CLI dispatch
 
 **Dependencies:**
 - Blocked by: TASK-009, TASK-012
@@ -931,7 +939,7 @@ Implement `wonk deps <file>` and `wonk rdeps <file>` using import/export data fr
 **Related Requirements:** PRD-DEP-REQ-001, PRD-DEP-REQ-002, PRD-FBK-REQ-003
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -945,13 +953,13 @@ Implement `wonk deps <file>` and `wonk rdeps <file>` using import/export data fr
 Load and merge global (`~/.wonk/config.toml`) and per-repo (`.wonk/config.toml`) configuration with sensible defaults.
 
 **Action Items:**
-- [ ] Define `Config` struct with all sections: `[daemon]` (idle_timeout_minutes, debounce_ms), `[index]` (max_file_size_kb, additional_extensions), `[output]` (default_format, color), `[ignore]` (patterns)
-- [ ] Implement defaults for all fields (30 min timeout, 500ms debounce, 1024kb max file size, grep format, color=true)
-- [ ] Load global config from `~/.wonk/config.toml` if it exists
-- [ ] Load per-repo config from `.wonk/config.toml` if it exists
-- [ ] Merge: defaults → global → per-repo (last wins)
-- [ ] Wire config into all components: daemon uses timeout/debounce, indexer uses max_file_size/additional_extensions, CLI uses output format/color, walker uses ignore patterns
-- [ ] Ensure tool works identically when no config files exist
+- [x] Define `Config` struct with all sections: `[daemon]` (idle_timeout_minutes, debounce_ms), `[index]` (max_file_size_kb, additional_extensions), `[output]` (default_format, color), `[ignore]` (patterns)
+- [x] Implement defaults for all fields (30 min timeout, 500ms debounce, 1024kb max file size, grep format, color=true)
+- [x] Load global config from `~/.wonk/config.toml` if it exists
+- [x] Load per-repo config from `.wonk/config.toml` if it exists
+- [x] Merge: defaults → global → per-repo (last wins)
+- [x] Wire config into all components: daemon uses timeout/debounce, indexer uses max_file_size/additional_extensions, CLI uses output format/color, walker uses ignore patterns
+- [x] Ensure tool works identically when no config files exist
 
 **Dependencies:**
 - Blocked by: TASK-001
@@ -971,7 +979,7 @@ Load and merge global (`~/.wonk/config.toml`) and per-repo (`.wonk/config.toml`)
 **Related Requirements:** PRD-CFG-REQ-001 through PRD-CFG-REQ-010
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -985,10 +993,10 @@ Load and merge global (`~/.wonk/config.toml`) and per-repo (`.wonk/config.toml`)
 Support `.wonkignore` files and `[ignore].patterns` from config for excluding files from indexing and search.
 
 **Action Items:**
-- [ ] Add `.wonkignore` support to the file walker (TASK-003) via ignore crate's custom ignore file feature
-- [ ] Add `[ignore].patterns` from config (TASK-024) as additional ignore rules
-- [ ] Ensure both apply to indexing (`wonk init`) and text search (`wonk search`)
-- [ ] `.wonkignore` uses same syntax as `.gitignore`
+- [x] Add `.wonkignore` support to the file walker (TASK-003) via ignore crate's custom ignore file feature
+- [x] Add `[ignore].patterns` from config (TASK-024) as additional ignore rules
+- [x] Ensure both apply to indexing (`wonk init`) and text search (`wonk search`)
+- [x] `.wonkignore` uses same syntax as `.gitignore`
 
 **Dependencies:**
 - Blocked by: TASK-003, TASK-024
@@ -1005,18 +1013,171 @@ Support `.wonkignore` files and `[ignore].patterns` from config for excluding fi
 **Related Requirements:** PRD-IDX-REQ-010, PRD-CFG-REQ-010
 **Related Decisions:** DR-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
-## Milestone 6: Polish & Distribution
+## Milestone 6: Smart Search
+
+**Goal:** `wonk search` returns ranked, deduplicated, token-efficient results when the query matches known symbols. `--budget` and `--raw` flags work.
+**Exit Criteria:** For queries matching known symbols, output contains ≥ 50% fewer lines than equivalent `rg` while preserving ≥ 95% of relevant results. `--budget` caps output. `--raw` bypasses ranking.
+
+### TASK-031: Result classification engine
+
+**Milestone:** M6 - Smart Search
+**Component:** Smart Search Ranker
+**Estimate:** M
+
+**Goal:**
+Classify each search result line into a category (definition, call site, import, comment, test) using index metadata and path heuristics.
+
+**Action Items:**
+- [x] Create `ranker` module with `ResultCategory` enum: Definition, CallSite, Import, Comment, Test, Other
+- [x] For each grep result line, check if the file+line matches a symbol definition in the index → Definition
+- [x] Check if the file+line matches a reference in the index → CallSite
+- [x] Check if the line contains import/require/use patterns → Import
+- [x] Check if the line is inside a comment (using Tree-sitter node types from the index, or heuristic patterns like `//`, `#`, `/* */`)
+- [x] Check if the file path matches test heuristics (`test/`, `tests/`, `__tests__/`, `*_test.*`, `*.test.*`, `*.spec.*`) → Test
+- [x] Default unclassified results to Other
+
+**Dependencies:**
+- Blocked by: TASK-012, TASK-013
+- Blocks: TASK-032
+
+**Acceptance Criteria:**
+- Symbol definitions are correctly classified as Definition
+- Function calls and usages are classified as CallSite
+- Import statements are classified as Import
+- Test files are detected by path heuristics
+- Unclassified lines default to Other
+- Classification adds < 10ms overhead per 100 results
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SSRCH-REQ-001
+**Related Decisions:** DR-001
+
+**Status:** Complete
+
+---
+
+### TASK-032: Result ranking and deduplication
+
+**Milestone:** M6 - Smart Search
+**Component:** Smart Search Ranker
+**Estimate:** M
+
+**Goal:**
+Sort classified results by relevance tier, deduplicate re-exported/aliased symbols, and insert category headers.
+
+**Action Items:**
+- [x] Sort results by category tier: Definition > CallSite > Import > Other > Comment > Test
+- [x] Within each tier, sort by file path then line number
+- [x] Deduplicate: when the same symbol name appears in multiple files as re-exports or barrel file entries, keep the canonical definition and collapse others into `(+N other locations)`
+- [x] Insert category headers between tiers: `-- definitions --`, `-- usages --`, `-- imports --`, `-- tests --`
+- [x] Support `--raw` flag to bypass all ranking/deduplication
+- [x] Ensure grep-compatible output format is preserved (headers go to stderr or are prefixed with `--` to not break parsers)
+
+**Dependencies:**
+- Blocked by: TASK-031
+- Blocks: TASK-033
+
+**Acceptance Criteria:**
+- Definitions always appear first in output
+- Re-exported symbols are deduplicated with count annotation
+- Category headers are visible and don't break grep-compatible parsing
+- `--raw` returns unranked, undeduped results
+- For queries matching known symbols, output ≥ 50% fewer lines than `rg`
+- Relevant results preserved at ≥ 95% recall
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SSRCH-REQ-001, PRD-SSRCH-REQ-002, PRD-SSRCH-REQ-003, PRD-SSRCH-REQ-006
+**Related Decisions:** DR-001
+
+**Status:** Complete
+
+---
+
+### TASK-033: Token budget mode
+
+**Milestone:** M6 - Smart Search
+**Component:** Smart Search Ranker, CLI
+**Estimate:** S
+
+**Goal:**
+Implement `--budget <n>` flag that limits output to approximately `n` tokens, prioritizing higher-ranked results.
+
+**Action Items:**
+- [x] Add `--budget <n>` flag to CLI (global, applies to all search/query commands)
+- [x] Implement token estimation: ~4 characters per token heuristic (simple, fast)
+- [x] Emit results in rank order, tracking cumulative token count
+- [x] When budget is exhausted, stop and append summary line: `-- N more results truncated (budget: <n> tokens) --`
+- [x] Budget summary goes to stderr so it doesn't break piped output parsing
+- [x] Ensure `--json` mode respects budget (truncate JSON array, add metadata object with truncation info)
+
+**Dependencies:**
+- Blocked by: TASK-032
+- Blocks: None
+
+**Acceptance Criteria:**
+- `--budget 500` limits output to approximately 500 tokens
+- Higher-ranked results are preserved, lower-ranked are truncated
+- Truncation summary is visible
+- Works with both grep-style and JSON output
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SSRCH-REQ-004
+**Related Decisions:** DR-001
+
+**Status:** Complete
+
+---
+
+### TASK-034: Symbol detection for automatic smart mode
+
+**Milestone:** M6 - Smart Search
+**Component:** Smart Search Ranker, Query Router
+**Estimate:** S
+
+**Goal:**
+Automatically detect whether a `wonk search` pattern matches known symbol names and engage smart ranking when it does.
+
+**Action Items:**
+- [x] On `wonk search <pattern>`, check if pattern matches any symbol name in the FTS5 index
+- [x] If match found: run grep search AND enrich results with structural metadata, then rank
+- [x] If no match: run plain grep search, skip ranking (pattern is likely a string literal, error message, or config value)
+- [x] Display mode indicator to stderr: `(smart: N symbols matched)` or `(text search)`
+- [x] Allow explicit override: `--smart` forces ranked mode, `--raw` forces unranked
+
+**Dependencies:**
+- Blocked by: TASK-012
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk search processPayment` detects symbol match and ranks results
+- `wonk search "connection refused"` detects no symbol match and returns plain grep results
+- Mode indicator is visible on stderr
+- `--smart` and `--raw` overrides work
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SSRCH-REQ-005, PRD-SSRCH-REQ-006
+**Related Decisions:** DR-001
+
+**Status:** Complete
+
+---
+
+## Milestone 7: Polish & Distribution
 
 **Goal:** Production-ready CLI with progress indicators, colorized output, helpful error messages, and cross-compiled binaries.
 **Exit Criteria:** Prebuilt binaries for all P0 platforms. `wonk` provides clear feedback on every operation.
 
 ### TASK-026: Progress indicators for indexing operations
 
-**Milestone:** M6 - Polish & Distribution
+**Milestone:** M7 - Polish & Distribution
 **Component:** CLI
 **Estimate:** S
 
@@ -1024,11 +1185,11 @@ Support `.wonkignore` files and `[ignore].patterns` from config for excluding fi
 Show progress feedback during `wonk init`, `wonk update`, and auto-initialization.
 
 **Action Items:**
-- [ ] Count total files before indexing starts (fast pre-scan via walker)
-- [ ] Display progress to stderr: `Indexing... [1234/5678 files]` updated in-place
-- [ ] Show completion summary: `Indexed 5678 files (4521 symbols, 12340 references) in 3.2s`
-- [ ] Suppress progress when stdout is not a TTY (piped output)
-- [ ] Ensure progress output doesn't interfere with `--json` mode
+- [x] Count total files before indexing starts (fast pre-scan via walker)
+- [x] Display progress to stderr: `Indexing... [1234/5678 files]` updated in-place
+- [x] Show completion summary: `Indexed 5678 files (4521 symbols, 12340 references) in 3.2s`
+- [x] Suppress progress when stdout is not a TTY (piped output)
+- [x] Ensure progress output doesn't interfere with `--json` mode
 
 **Dependencies:**
 - Blocked by: TASK-010, TASK-022
@@ -1045,13 +1206,13 @@ Show progress feedback during `wonk init`, `wonk update`, and auto-initializatio
 **Related Requirements:** PRD-AUT-REQ-002
 **Related Decisions:** DR-001
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
 ### TASK-027: Colorized output and terminal detection
 
-**Milestone:** M6 - Polish & Distribution
+**Milestone:** M7 - Polish & Distribution
 **Component:** CLI
 **Estimate:** S
 
@@ -1059,13 +1220,13 @@ Show progress feedback during `wonk init`, `wonk update`, and auto-initializatio
 Colorize grep-style output (file paths, line numbers, matches) with terminal detection and config override.
 
 **Action Items:**
-- [ ] Detect TTY on stdout (disable color when piped)
-- [ ] Colorize file paths, line numbers, match highlights — matching ripgrep conventions
-- [ ] Ensure color scheme does not rely solely on red/green distinction (accessible for deuteranopia/protanopia)
-- [ ] Use additional visual indicators beyond color (bold, underline, positioning) so information is never conveyed by color alone
-- [ ] Respect `output.color` config setting (true/false/auto)
-- [ ] Respect `NO_COLOR`, `CLICOLOR=0`, and `CLICOLOR_FORCE=1` environment variables (NO_COLOR takes precedence)
-- [ ] Apply color to all commands (search, sym, ref, sig, ls, deps, rdeps, status)
+- [x] Detect TTY on stdout (disable color when piped)
+- [x] Colorize file paths, line numbers, match highlights — matching ripgrep conventions
+- [x] Ensure color scheme does not rely solely on red/green distinction (accessible for deuteranopia/protanopia)
+- [x] Use additional visual indicators beyond color (bold, underline, positioning) so information is never conveyed by color alone
+- [x] Respect `output.color` config setting (true/false/auto)
+- [x] Respect `NO_COLOR`, `CLICOLOR=0`, and `CLICOLOR_FORCE=1` environment variables (NO_COLOR takes precedence)
+- [x] Apply color to all commands (search, sym, ref, sig, ls, deps, rdeps, status)
 
 **Dependencies:**
 - Blocked by: TASK-005, TASK-024
@@ -1083,13 +1244,13 @@ Colorize grep-style output (file paths, line numbers, matches) with terminal det
 
 **Related Requirements:** PRD-OUT-REQ-001, PRD-OUT-REQ-003, PRD-CFG-REQ-009
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
 ### TASK-028: Error messages and hint system
 
-**Milestone:** M6 - Polish & Distribution
+**Milestone:** M7 - Polish & Distribution
 **Component:** CLI
 **Estimate:** S
 
@@ -1097,10 +1258,10 @@ Colorize grep-style output (file paths, line numbers, matches) with terminal det
 Provide clear, actionable error messages and contextual hints on stderr.
 
 **Action Items:**
-- [ ] Implement user-facing error formatter (no raw panic output, no debug formatting)
-- [ ] Add hints for common situations: no index, stale daemon, unsupported language, no results
-- [ ] Print hints to stderr so they don't pollute piped output
-- [ ] Suppress hints in `--json` mode
+- [x] Implement user-facing error formatter (no raw panic output, no debug formatting)
+- [x] Add hints for common situations: no index, stale daemon, unsupported language, no results
+- [x] Print hints to stderr so they don't pollute piped output
+- [x] Suppress hints in `--json` mode
 
 **Dependencies:**
 - Blocked by: TASK-012
@@ -1118,13 +1279,13 @@ Provide clear, actionable error messages and contextual hints on stderr.
 **Related Requirements:** PRD-FBK-REQ-005
 **Related Decisions:** DR-006
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
 ### TASK-029: CI/CD pipeline with GitHub Actions + cross
 
-**Milestone:** M6 - Polish & Distribution
+**Milestone:** M7 - Polish & Distribution
 **Component:** Infrastructure
 **Estimate:** M
 
@@ -1132,12 +1293,12 @@ Provide clear, actionable error messages and contextual hints on stderr.
 Set up GitHub Actions workflow for testing, building, and cross-compiling for all 5 platform targets.
 
 **Action Items:**
-- [ ] Create `.github/workflows/ci.yml`: cargo test, cargo clippy, cargo fmt --check on push/PR
-- [ ] Create `.github/workflows/release.yml`: triggered on version tags
-- [ ] Set up build matrix with `cross` for 5 targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc
-- [ ] Strip binaries post-build
-- [ ] Assert binary size < 30 MB in CI
-- [ ] Upload build artifacts per platform
+- [x] Create `.github/workflows/ci.yml`: cargo test, cargo clippy, cargo fmt --check on push/PR
+- [x] Create `.github/workflows/release.yml`: triggered on version tags
+- [x] Set up build matrix with `cross` for 5 targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc
+- [x] Strip binaries post-build
+- [x] Assert binary size < 30 MB in CI
+- [x] Upload build artifacts per platform
 
 **Dependencies:**
 - Blocked by: TASK-001
@@ -1154,13 +1315,13 @@ Set up GitHub Actions workflow for testing, building, and cross-compiling for al
 **Related Requirements:** PRD-DST-REQ-001 through PRD-DST-REQ-007
 **Related Decisions:** DR-007
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
 ### TASK-030: Release workflow and install methods
 
-**Milestone:** M6 - Polish & Distribution
+**Milestone:** M7 - Polish & Distribution
 **Component:** Infrastructure
 **Estimate:** M
 
@@ -1168,12 +1329,12 @@ Set up GitHub Actions workflow for testing, building, and cross-compiling for al
 Automate GitHub Releases with platform binaries and set up Homebrew tap and install script.
 
 **Action Items:**
-- [ ] Create GitHub Release on tag push with all platform binaries attached
-- [ ] Name binaries consistently: `wonk-<version>-<target>`
-- [ ] Create Homebrew tap repo with formula pointing to GitHub Release assets
-- [ ] Create `install.sh` script: detect platform, download correct binary, install to `/usr/local/bin`
-- [ ] Create npm wrapper package (`@wonk/cli`) that downloads the correct binary on install
-- [ ] Add install instructions to README
+- [x] Create GitHub Release on tag push with all platform binaries attached
+- [x] Name binaries consistently: `wonk-<version>-<target>`
+- [x] Create Homebrew tap repo with formula pointing to GitHub Release assets
+- [x] Create `install.sh` script: detect platform, download correct binary, install to `/usr/local/bin`
+- [x] Create npm wrapper package (`@wonk/cli`) that downloads the correct binary on install
+- [x] Add install instructions to README
 
 **Dependencies:**
 - Blocked by: TASK-029
@@ -1189,7 +1350,7 @@ Automate GitHub Releases with platform binaries and set up Homebrew tap and inst
 
 **Related Requirements:** PRD-DST-REQ-001, PRD-DST-REQ-003, PRD-DST-REQ-004, PRD-DST-REQ-005
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -1214,3 +1375,4 @@ Tasks identified but not yet scheduled:
 | Date | Change | Author |
 |------|--------|--------|
 | 2026-02-11 | Initial task breakdown — 30 tasks across 6 milestones | TBD |
+| 2026-02-11 | Added Smart Search milestone (M6, TASK-031 to TASK-034). Renumbered Polish to M7. Updated milestone statuses. Total tasks: 34 across 7 milestones. Reframed around token-efficiency value proposition. | TBD |

@@ -73,8 +73,12 @@ pub struct SearchArgs {
     pub ignore_case: bool,
 
     /// Output raw results without ranking, deduplication, or category headers
-    #[arg(long)]
+    #[arg(long, conflicts_with = "smart")]
     pub raw: bool,
+
+    /// Force smart ranking mode even if pattern does not match known symbols
+    #[arg(long, conflicts_with = "raw")]
+    pub smart: bool,
 
     /// Restrict search to these paths (use -- before paths)
     #[arg(last = true)]

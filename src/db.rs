@@ -292,6 +292,33 @@ pub fn read_meta(index_db_path: &Path) -> Result<Meta> {
 }
 
 // ---------------------------------------------------------------------------
+// Symbol detection
+// ---------------------------------------------------------------------------
+
+/// Count symbol names in the FTS5 index matching the given pattern.
+///
+/// Returns 0 if the query fails (e.g. pattern contains characters that are
+/// invalid in FTS5 syntax) or if no symbols match.  Used for symbol detection:
+/// a non-zero result means the pattern likely refers to a code symbol and
+/// ranked mode should be used.
+pub fn count_matching_symbols(conn: &Connection, pattern: &str) -> u64 {
+    if pattern.is_empty() {
+        return 0;
+    }
+    // Wrap in double quotes to treat as a literal phrase in FTS5.
+    // Escape any embedded double quotes by doubling them.
+    let escaped = pattern.replace('"', "\"\"");
+    let fts_query = format!("\"{}\"", escaped);
+
+    conn.query_row(
+        "SELECT COUNT(*) FROM symbols_fts WHERE name MATCH ?1",
+        [&fts_query],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0) as u64
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -688,5 +715,68 @@ mod tests {
         fs::write(&central, b"central").unwrap();
         // Local should win.
         assert_eq!(find_existing_index(dir.path()), Some(local));
+    }
+
+    // -- count_matching_symbols tests ----------------------------------------
+
+    #[test]
+    fn test_count_matching_symbols_found() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES ('processPayment', 'function', 'pay.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+        assert_eq!(count_matching_symbols(&conn, "processPayment"), 1);
+    }
+
+    #[test]
+    fn test_count_matching_symbols_none() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+        assert_eq!(count_matching_symbols(&conn, "processPayment"), 0);
+    }
+
+    #[test]
+    fn test_count_matching_symbols_multiple() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES ('process', 'function', 'a.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES ('process', 'function', 'b.rs', 5, 0, 'rust')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES ('process', 'method', 'c.rs', 10, 0, 'rust')",
+            [],
+        ).unwrap();
+        assert_eq!(count_matching_symbols(&conn, "process"), 3);
+    }
+
+    #[test]
+    fn test_count_matching_symbols_special_chars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+        // "connection refused" is not a valid symbol name; should return 0.
+        assert_eq!(count_matching_symbols(&conn, "connection refused"), 0);
+    }
+
+    #[test]
+    fn test_count_matching_symbols_fts_syntax_safe() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+        // Patterns with FTS5-special chars should not panic or error.
+        assert_eq!(count_matching_symbols(&conn, ""), 0);
+        assert_eq!(count_matching_symbols(&conn, "foo OR bar"), 0);
+        assert_eq!(count_matching_symbols(&conn, "foo*"), 0);
+        assert_eq!(count_matching_symbols(&conn, "\"quoted\""), 0);
     }
 }

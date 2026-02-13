@@ -23,6 +23,30 @@ use crate::search;
 use crate::types::{Reference, ReferenceKind, Symbol, SymbolKind};
 
 // ---------------------------------------------------------------------------
+// Search mode detection
+// ---------------------------------------------------------------------------
+
+/// Search mode for `wonk search`, determined by flags and symbol detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Unranked grep output (`--raw` or no symbol match).
+    Plain,
+    /// Ranked output with structural metadata (symbol_count).
+    Smart(u64),
+}
+
+/// Determine search mode based on flags and symbol count.
+pub fn detect_search_mode(raw: bool, smart: bool, symbol_count: u64) -> SearchMode {
+    if raw {
+        SearchMode::Plain
+    } else if smart || symbol_count > 0 {
+        SearchMode::Smart(symbol_count)
+    } else {
+        SearchMode::Plain
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CLI dispatch (kept from original router)
 // ---------------------------------------------------------------------------
 
@@ -81,48 +105,67 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 output::print_hint("no results found; try a broader pattern or different paths", suppress);
             }
 
-            let mut truncated = 0usize;
-            if args.raw {
-                // Raw mode: output results directly without ranking/dedup.
-                for r in &results {
-                    let out = SearchOutput::from_search_result(
-                        &r.file, r.line, r.col, &r.content,
-                    );
-                    if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
-                        truncated += 1;
-                    }
-                }
+            // Open DB connection once (shared between detection and ranking).
+            // Skip DB work entirely in raw mode — user explicitly chose unranked.
+            let conn = if args.raw {
+                None
             } else {
-                // Ranked mode: classify, sort, dedup, and group with headers.
-                use crate::ranker;
-
-                // Open DB connection best-effort for classification.
-                let conn = std::env::current_dir()
+                std::env::current_dir()
                     .ok()
                     .and_then(|cwd| db::find_repo_root(&cwd).ok())
                     .and_then(|root| db::find_existing_index(&root))
-                    .and_then(|path| db::open(&path).ok());
+                    .and_then(|path| db::open(&path).ok())
+            };
 
-                let groups = ranker::rank_and_dedup(
-                    &results,
-                    conn.as_ref(),
-                    &args.pattern,
-                );
+            // Count symbol matches for mode detection and indicator display.
+            let symbol_count = conn.as_ref()
+                .map(|c| db::count_matching_symbols(c, &args.pattern))
+                .unwrap_or(0);
 
-                for (category, items) in &groups {
-                    if !suppress {
-                        output::print_category_header(ranker::category_header(*category));
+            let mode = detect_search_mode(args.raw, args.smart, symbol_count);
+
+            // Print mode indicator (skip for raw — user explicitly chose it).
+            if !args.raw {
+                output::print_mode_indicator(symbol_count, suppress);
+            }
+
+            let mut truncated = 0usize;
+            match mode {
+                SearchMode::Smart(_) => {
+                    // Ranked mode: classify, sort, dedup, and group with headers.
+                    use crate::ranker;
+
+                    let groups = ranker::rank_and_dedup(
+                        &results,
+                        conn.as_ref(),
+                        &args.pattern,
+                    );
+
+                    for (category, items) in &groups {
+                        if !suppress {
+                            output::print_category_header(ranker::category_header(*category));
+                        }
+                        for item in items {
+                            let mut out = SearchOutput::from_search_result(
+                                &item.result.file,
+                                item.result.line,
+                                item.result.col,
+                                &item.result.content,
+                            );
+                            out.annotation = item.annotation.clone();
+                            if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
+                                truncated += 1;
+                            }
+                        }
                     }
-                    for item in items {
-                        let mut out = SearchOutput::from_search_result(
-                            &item.result.file,
-                            item.result.line,
-                            item.result.col,
-                            &item.result.content,
+                }
+                SearchMode::Plain => {
+                    // Plain text mode: output directly without ranking/dedup.
+                    for r in &results {
+                        let out = SearchOutput::from_search_result(
+                            &r.file, r.line, r.col, &r.content,
                         );
-                        out.annotation = item.annotation.clone();
                         if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
-                            // Count remaining items in this group.
                             truncated += 1;
                         }
                     }
@@ -2981,6 +3024,7 @@ mod tests {
             regex: false,
             ignore_case: false,
             raw: false,
+            smart: false,
             paths: vec![],
         });
         assert!(is_query_command(&cmd));
@@ -3027,5 +3071,29 @@ mod tests {
     #[test]
     fn test_is_query_command_not_status() {
         assert!(!is_query_command(&Command::Status));
+    }
+
+    // -- SearchMode detection tests ------------------------------------------
+
+    #[test]
+    fn test_detect_search_mode_raw_always_plain() {
+        assert_eq!(detect_search_mode(true, false, 5), SearchMode::Plain);
+        assert_eq!(detect_search_mode(true, false, 0), SearchMode::Plain);
+    }
+
+    #[test]
+    fn test_detect_search_mode_smart_always_ranked() {
+        assert_eq!(detect_search_mode(false, true, 0), SearchMode::Smart(0));
+        assert_eq!(detect_search_mode(false, true, 3), SearchMode::Smart(3));
+    }
+
+    #[test]
+    fn test_detect_search_mode_auto_with_symbols() {
+        assert_eq!(detect_search_mode(false, false, 5), SearchMode::Smart(5));
+    }
+
+    #[test]
+    fn test_detect_search_mode_auto_no_symbols() {
+        assert_eq!(detect_search_mode(false, false, 0), SearchMode::Plain);
     }
 }
