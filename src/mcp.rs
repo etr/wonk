@@ -236,17 +236,15 @@ fn validate_path(path: &Path, repo_root: &Path) -> Result<PathBuf, CallToolResul
                 p.join(
                     resolved
                         .file_name()
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "invalid path")
-                        })
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))
                         .unwrap_or_default(),
                 )
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "path not found"))
     });
-    let root_canonical = repo_root.canonicalize().map_err(|_| {
-        CallToolResult::error("repository path cannot be validated".into())
-    })?;
+    let root_canonical = repo_root
+        .canonicalize()
+        .map_err(|_| CallToolResult::error("repository path cannot be validated".into()))?;
     match canonical {
         Ok(p) => {
             if p.starts_with(&root_canonical) {
