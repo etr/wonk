@@ -1,5 +1,9 @@
 # Wonk
 
+> **Disclaimer:** This tool was vibe-coded with love and little to no human supervision
+> using [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and
+> [Groundwork](https://github.com/etr/groundwork).
+
 Structure-aware code search that cuts LLM token burn.
 
 ## The problem
@@ -235,7 +239,7 @@ These flags work with any command:
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Output results as JSON (one object per line) |
+| `--format <format>` | Output format: `grep` (default), `json`, or `toon` |
 | `-q`, `--quiet` | Suppress hint messages on stderr |
 | `--budget <N>` | Limit output to approximately N tokens (higher-ranked results preserved) |
 
@@ -314,7 +318,7 @@ max_file_size_kb = 1024       # Skip files larger than this (KiB)
 additional_extensions = []    # Extra file extensions to index
 
 [output]
-default_format = "grep"       # "grep" or "json"
+default_format = "grep"       # "grep", "json", or "toon"
 color = "auto"                # "auto", "always", or "never"
 
 [ignore]
@@ -341,7 +345,7 @@ patterns = []                 # Glob patterns to exclude from indexing
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `default_format` | `"grep"` | Default output format: `"grep"` or `"json"` |
+| `default_format` | `"grep"` | Default output format: `"grep"`, `"json"`, or `"toon"` |
 | `color` | `"auto"` | Color mode: `"auto"`, `"always"`, or `"never"` |
 
 **`[ignore]`**
@@ -381,7 +385,7 @@ src/main.rs:42:fn main() {}
 src/lib.rs:10:pub fn foo() {}
 ```
 
-### JSON (`--json`)
+### JSON (`--format json`)
 
 One JSON object per line (NDJSON) on stdout. Hints and headers are suppressed.
 
@@ -397,13 +401,32 @@ emitted:
 {"truncated_count":15,"budget_tokens":500,"used_tokens":498}
 ```
 
+### Toon (`--format toon`)
+
+[TOON](https://docs.rs/serde_toon2/) (Token-Oriented Object Notation) -- a
+line-oriented, indentation-based format with minimal punctuation. Encodes the
+same data as JSON but is more compact and easier to scan.
+
+```
+file: src/main.rs
+line: 42
+col: 1
+content: fn main() {}
+
+file: src/lib.rs
+line: 10
+col: 1
+content: pub fn foo() {}
+```
+
 ## Integrating with LLM agents
 
 Wonk's grep-compatible output means any tool that can call `grep` or `rg` can
 call `wonk search` instead -- no integration work required. For programmatic
 use:
 
-- `--json` gives structured NDJSON output
+- `--format json` gives structured NDJSON output (or `--format toon` for a
+  compact human-readable view)
 - `--budget <N>` caps output to roughly N tokens, keeping the highest-ranked
   results and dropping noise
 - `-q` suppresses stderr hints for clean machine parsing
@@ -441,6 +464,27 @@ The server exposes 9 tools over stdio (JSON-RPC 2.0):
 
 All file paths are validated against the repository boundary. The index is
 built automatically on first use if it does not already exist.
+
+### Claude Code plugin
+
+The [wonk plugin](https://github.com/etr/wonk-plugin) integrates wonk into
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) as a native
+tool provider. It bundles the MCP server, an agent skill that teaches Claude
+when to prefer wonk over grep/glob, and a session hook that keeps the index
+fresh.
+
+Install via the [Groundwork Marketplace](https://github.com/etr/groundwork-marketplace):
+
+```sh
+claude plugin marketplace add https://github.com/etr/groundwork-marketplace
+claude plugin add wonk
+```
+
+Or directly from GitHub:
+
+```sh
+claude plugin add https://github.com/etr/wonk-plugin
+```
 
 ## License
 
