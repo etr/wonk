@@ -380,15 +380,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     for (repo_path, result) in &results {
                         match result {
                             Ok(()) => {
-                                eprintln!("Stopped daemon for {repo_path}");
+                                output::print_hint(
+                                    &format!("stopped daemon for {repo_path}"),
+                                    suppress,
+                                );
                             }
                             Err(e) => {
-                                eprintln!("Failed to stop daemon for {repo_path}: {e}");
+                                output::print_error(
+                                    &format!("failed to stop daemon for {repo_path}: {e}"),
+                                );
                             }
                         }
                     }
                     if results.is_empty() {
-                        output::print_hint("No running daemons found", suppress);
+                        output::print_hint("no running daemons found", suppress);
                     }
                 } else {
                     output::print_hint("daemon stop: not yet implemented", suppress);
@@ -403,7 +408,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     .and_then(|cwd| db::find_repo_root(&cwd).ok());
                 let daemons = crate::daemon::discover_all_daemons(repo_root.as_deref());
                 if daemons.is_empty() {
-                    output::print_hint("No running daemons found", suppress);
+                    output::print_hint("no running daemons found", suppress);
                 } else {
                     dispatch_daemon_list(&mut fmt, &daemons, format)?;
                 }
