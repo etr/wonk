@@ -31,7 +31,7 @@
   - Time to first result (warm index) < 100ms
   - Precision of `wonk sym` (correct definitions returned) > 90%
   - Recall of `wonk ref` (usages found vs grep baseline) > 80%
-- **Release strategy:** V1 is CLI-only. Editor integrations, semantic search, LSP backends, and cross-language call graphs are deferred to V2.
+- **Release strategy:** V1 is CLI-only. Editor integrations, LSP backends, and cross-language call graphs are deferred to V2. V2 semantic search features (embedding-based search, clustering, impact analysis) are now specified below.
 
 ---
 
@@ -278,18 +278,19 @@ The index must stay current as files change without requiring manual re-indexing
 **EARS Requirements**
 - `PRD-DMN-REQ-001` When `wonk init` completes then the system shall automatically start the background daemon.
 - `PRD-DMN-REQ-002` When any CLI command is run and no daemon is running but an index exists then the system shall auto-spawn the daemon.
-- `PRD-DMN-REQ-003` When the daemon detects no filesystem activity for 30 minutes then the system shall auto-exit the daemon.
-- `PRD-DMN-REQ-004` When the daemon receives filesystem change events then the system shall batch them over a 500ms debounce window before processing.
-- `PRD-DMN-REQ-005` When processing a changed file then the system shall re-hash the file, compare to the stored hash, and skip re-indexing if unchanged.
-- `PRD-DMN-REQ-006` When a changed file has a new content hash then the system shall re-parse it and update its symbols, references, and metadata in the index.
-- `PRD-DMN-REQ-007` When a file is deleted then the system shall remove all its symbols, references, and metadata from the index.
-- `PRD-DMN-REQ-008` When a new file is created then the system shall detect its language, parse it, and add it to the index if supported.
-- `PRD-DMN-REQ-009` While the daemon is idle the system shall use less than 15 MB memory and near-zero CPU.
-- `PRD-DMN-REQ-010` When re-indexing a single file then the system shall complete in less than 50ms.
-- `PRD-DMN-REQ-011` The system shall enforce only one daemon per repository via a PID file.
-- `PRD-DMN-REQ-012` When the user runs `wonk daemon start` then the system shall start the daemon if not already running.
-- `PRD-DMN-REQ-013` When the user runs `wonk daemon stop` then the system shall stop the running daemon.
-- `PRD-DMN-REQ-014` When the user runs `wonk daemon status` then the system shall display the daemon's running state and process ID.
+- `PRD-DMN-REQ-003` When the daemon receives filesystem change events then the system shall batch them over a 500ms debounce window before processing.
+- `PRD-DMN-REQ-004` When processing a changed file then the system shall re-hash the file, compare to the stored hash, and skip re-indexing if unchanged.
+- `PRD-DMN-REQ-005` When a changed file has a new content hash then the system shall re-parse it and update its symbols, references, and metadata in the index.
+- `PRD-DMN-REQ-006` When a file is deleted then the system shall remove all its symbols, references, and metadata from the index.
+- `PRD-DMN-REQ-007` When a new file is created then the system shall detect its language, parse it, and add it to the index if supported.
+- `PRD-DMN-REQ-008` While the daemon is idle the system shall use less than 15 MB memory and near-zero CPU.
+- `PRD-DMN-REQ-009` When re-indexing a single file then the system shall complete in less than 50ms.
+- `PRD-DMN-REQ-010` The system shall enforce only one daemon per repository via a PID file.
+- `PRD-DMN-REQ-011` When the user runs `wonk daemon start` then the system shall start the daemon if not already running.
+- `PRD-DMN-REQ-012` When the user runs `wonk daemon stop` then the system shall stop the running daemon.
+- `PRD-DMN-REQ-013` When the user runs `wonk daemon status` then the system shall display the daemon's running state and process ID.
+- `PRD-DMN-REQ-014` When the user runs `wonk daemon list` then the system shall display all running daemons across all repositories with their repo paths and process IDs.
+- `PRD-DMN-REQ-015` When the user runs `wonk daemon stop --all` then the system shall stop all running daemons across all repositories.
 
 **Acceptance criteria**
 - Index freshness after file save < 1 second
@@ -367,7 +368,7 @@ Users need to customize behavior without requiring config for default usage.
 - `PRD-CFG-REQ-001` When no configuration file exists then the system shall operate with sensible defaults requiring zero configuration.
 - `PRD-CFG-REQ-002` Where a global config file exists at `~/.wonk/config.toml` then the system shall apply its settings to all repositories.
 - `PRD-CFG-REQ-003` Where a per-repo config file exists at `.wonk/config.toml` then the system shall apply its settings, overriding global config for that repository.
-- `PRD-CFG-REQ-004` Where `daemon.idle_timeout_minutes` is configured then the system shall use that value instead of the default 30 minutes.
+- `PRD-CFG-REQ-004` ~~Where `daemon.idle_timeout_minutes` is configured then the system shall use that value instead of the default 30 minutes.~~ Removed — daemon no longer auto-exits on idle (see PRD-DMN-REQ-003 removal).
 - `PRD-CFG-REQ-005` Where `daemon.debounce_ms` is configured then the system shall use that value instead of the default 500ms.
 - `PRD-CFG-REQ-006` Where `index.max_file_size_kb` is configured then the system shall skip files larger than that size.
 - `PRD-CFG-REQ-007` Where `index.additional_extensions` is configured then the system shall treat files with those extensions as indexable.
@@ -418,19 +419,22 @@ All commands must support consistent output formats for both human and machine c
 
 **In scope**
 - Grep-compatible default output
-- JSON structured output via global `--json` flag
+- JSON structured output via `--format json`
+- TOON structured output via `--format toon`
 
 **Out of scope**
 - Custom output templates
 
 **EARS Requirements**
 - `PRD-OUT-REQ-001` When returning results then the system shall default to `file:line:content` format, identical to ripgrep output.
-- `PRD-OUT-REQ-002` When the user provides `--json` on any command then the system shall output results as structured JSON objects.
+- `PRD-OUT-REQ-002` When the user provides `--format json` on any command then the system shall output results as structured JSON objects.
 - `PRD-OUT-REQ-003` When color output is enabled then the system shall colorize grep-style output for terminal readability.
+- `PRD-OUT-REQ-004` When the user provides `--format toon` on any command then the system shall output results in TOON (Tree Object Oriented Notation) format.
 
 **Acceptance criteria**
 - Default output is parseable by any tool that parses ripgrep output
 - JSON output is valid and includes all relevant fields per command
+- TOON output is valid and includes all relevant fields per command
 - Color output respects terminal capability and config
 
 ---
@@ -465,6 +469,132 @@ Developers who use git worktrees to work on multiple branches simultaneously can
 
 ---
 
+### 3.16 Semantic Search (PRD-SEM)
+
+**Problem / outcome**
+Structural and text search can only find code that matches syntactically — searching for "authentication" won't find `verifyToken`, `checkCredentials`, or `validateSession`. Developers and LLM agents need to search by intent rather than exact names. Semantic search uses embeddings to bridge this vocabulary gap, finding functionally related code even when terminology doesn't overlap.
+
+**In scope**
+- `wonk ask <query>` — dedicated semantic search command
+- `wonk search --semantic` — blend structural + semantic results in smart search
+- Tree-sitter-based chunking (one chunk per symbol definition, with file/scope/import context)
+- Embedding via Ollama `nomic-embed-text` (external, optional dependency)
+- Vector storage in the existing SQLite index DB
+- Cosine similarity scoring displayed in all output formats
+- Embedding build during explicit `wonk init`; background daemon build for auto-init scenarios
+- Incremental re-embedding via daemon when files change
+- Block-and-wait with progress when embeddings are incomplete
+
+**Out of scope**
+- Bundled/offline embedding model (would require ONNX runtime in binary)
+- Custom/configurable embedding models (single model for V2)
+- Semantic search for non-code files (markdown, config) beyond full-file fallback
+
+**EARS Requirements**
+- `PRD-SEM-REQ-001` When the user runs `wonk ask <query>` then the system shall embed the query via Ollama, perform cosine similarity search against all stored symbol embeddings, and return results ranked by descending similarity score.
+- `PRD-SEM-REQ-002` When the user provides `--semantic` on `wonk search` then the system shall blend structural results with semantic results, presenting structural matches first followed by additional semantic matches not already present.
+- `PRD-SEM-REQ-003` When returning semantic search results then each result shall include file path, line number, symbol name, symbol kind, and cosine similarity score.
+- `PRD-SEM-REQ-004` When the user provides `--budget <n>` on `wonk ask` then the system shall limit output to approximately `n` tokens, prioritizing results with highest similarity.
+- `PRD-SEM-REQ-005` When the user provides `--json` on `wonk ask` then the system shall output results as JSON objects including all fields plus the similarity score.
+- `PRD-SEM-REQ-006` When building embeddings then the system shall create one chunk per tree-sitter symbol definition, including the file path, parent scope, import context, and the symbol's source code.
+- `PRD-SEM-REQ-007` When a file has no extractable tree-sitter symbols then the system shall treat the full file content as a single chunk for embedding.
+- `PRD-SEM-REQ-008` When the user runs `wonk init` explicitly and Ollama is reachable then the system shall build embeddings alongside the structural index, displaying progress.
+- `PRD-SEM-REQ-009` When auto-initialization is triggered by a query then the system shall build the structural index only, then delegate embedding generation to the background daemon.
+- `PRD-SEM-REQ-010` When the daemon detects file changes and Ollama is reachable then the system shall re-embed all chunks belonging to the changed files.
+- `PRD-SEM-REQ-011` If Ollama is unreachable during daemon re-embedding then the system shall skip embedding updates silently and mark affected files as stale in the index.
+- `PRD-SEM-REQ-012` If Ollama is not reachable when `wonk ask` is run then the system shall return a clear error message stating that Ollama is required for semantic search.
+- `PRD-SEM-REQ-013` When `wonk ask` is run and embeddings are incomplete then the system shall block and display embedding build progress until ready, then return results.
+- `PRD-SEM-REQ-014` If Ollama is not reachable when `wonk init` is run then the system shall skip embedding generation with a warning and build only the structural index.
+- `PRD-SEM-REQ-015` When storing embeddings then the system shall write vectors to a dedicated table in the existing SQLite index database.
+- `PRD-SEM-REQ-016` When computing similarity then the system shall use brute-force cosine similarity over all stored vectors.
+
+**Acceptance criteria**
+- `wonk ask "authentication"` finds `verifyToken`, `checkCredentials`, and similar symbols even though the word "authentication" doesn't appear in them
+- Similarity scores are displayed for every result
+- `wonk search --semantic <pattern>` returns structural matches first, then semantic matches
+- `--budget` correctly limits output token count
+- Embeddings survive daemon restart and are incrementally updated
+- Clear error message when Ollama is unavailable
+- `wonk init` completes structural index even if Ollama is down
+
+---
+
+### 3.17 Semantic Dependency Analysis (PRD-SDEP)
+
+**Problem / outcome**
+Semantic search alone returns results from across the entire codebase. Developers often need results scoped to a specific execution path — "find authentication-related code reachable from this endpoint." Combining semantic search with the dependency graph enables intent-aware, scope-limited queries.
+
+**In scope**
+- Semantic search filtered by dependency reachability
+- Forward scope (code reachable from a file) and reverse scope (code that reaches a file)
+
+**Out of scope**
+- Cross-language dependency resolution
+- Function-level call graph (file-level deps only)
+
+**EARS Requirements**
+- `PRD-SDEP-REQ-001` When the user provides `--from <file>` on `wonk ask` then the system shall restrict semantic results to symbols in files reachable via forward dependencies from the specified file.
+- `PRD-SDEP-REQ-002` When the user provides `--to <file>` on `wonk ask` then the system shall restrict semantic results to symbols in files that transitively import the specified file.
+- `PRD-SDEP-REQ-003` When computing reachability then the system shall traverse the file-level dependency graph transitively (not just direct imports).
+
+**Acceptance criteria**
+- `wonk ask "auth" --from src/routes/api.ts` returns only semantically related symbols reachable from that route
+- Transitive dependencies are followed (A imports B imports C → C is reachable from A)
+- Results still include similarity scores
+
+---
+
+### 3.18 Semantic Clustering (PRD-SCLST)
+
+**Problem / outcome**
+Developers joining a codebase or navigating an unfamiliar directory need a high-level map of what concerns exist. Current tools list files or symbols, but don't reveal the conceptual groupings within a directory. Clustering embeddings surfaces these groupings automatically.
+
+**In scope**
+- Cluster symbols in a directory by semantic similarity
+- Labeled cluster output (representative symbols per cluster)
+
+**Out of scope**
+- LLM-generated cluster labels/summaries
+- Interactive/visual cluster exploration
+
+**EARS Requirements**
+- `PRD-SCLST-REQ-001` When the user runs `wonk cluster <path>` then the system shall cluster all symbol embeddings within the specified path by semantic similarity and display labeled groups.
+- `PRD-SCLST-REQ-002` When displaying clusters then each cluster shall list its most representative symbols (closest to cluster centroid) and the files they belong to.
+- `PRD-SCLST-REQ-003` When the user provides `--json` on `wonk cluster` then the system shall output cluster data as structured JSON.
+
+**Acceptance criteria**
+- `wonk cluster src/auth/` groups related auth symbols together
+- Output clearly separates distinct concerns (e.g., token validation vs. session management vs. user lookup)
+- Each cluster shows its top representative symbols
+
+---
+
+### 3.19 Semantic Change Impact Analysis (PRD-SIMP)
+
+**Problem / outcome**
+When a developer modifies code, they need to know what other code might be affected beyond what the dependency graph shows. A renamed concept, changed algorithm, or modified interface might impact semantically related code in files with no direct import relationship.
+
+**In scope**
+- Find code semantically similar to recently changed symbols
+- Git-aware: detect changes since a commit or on unstaged files
+
+**Out of scope**
+- Automatic modification suggestions
+- Cross-repo impact analysis
+
+**EARS Requirements**
+- `PRD-SIMP-REQ-001` When the user runs `wonk impact <file>` then the system shall identify symbols that changed in the file (vs. indexed version), find semantically similar symbols in other files, and display them ranked by similarity.
+- `PRD-SIMP-REQ-002` When the user provides `--since <commit>` on `wonk impact` then the system shall analyze all files changed since that commit.
+- `PRD-SIMP-REQ-003` When displaying impact results then each result shall include the changed symbol, the potentially impacted symbol, the similarity score, and the file path.
+- `PRD-SIMP-REQ-004` When the user provides `--json` on `wonk impact` then the system shall output impact data as structured JSON.
+
+**Acceptance criteria**
+- Changing `verifyToken` surfaces `validateSession` and `checkCredentials` as potentially impacted
+- `--since HEAD~3` analyzes all files changed in the last 3 commits
+- Results are ranked by similarity to the changed code
+
+---
+
 ## 4) Traceability
 
 | Feature | Requirement IDs | Count |
@@ -477,35 +607,40 @@ Developers who use git worktrees to work on multiple branches simultaneously can
 | Symbol Listing | PRD-LST-REQ-001 to 002 | 2 |
 | Dependency Graph | PRD-DEP-REQ-001 to 002 | 2 |
 | Index Build | PRD-IDX-REQ-001 to 015 | 15 |
-| Background Daemon | PRD-DMN-REQ-001 to 014 | 14 |
+| Background Daemon | PRD-DMN-REQ-001 to 015 | 15 |
 | Auto-Initialization | PRD-AUT-REQ-001 to 003 | 3 |
 | Query Fallback | PRD-FBK-REQ-001 to 005 | 5 |
 | Configuration | PRD-CFG-REQ-001 to 010 | 10 |
 | Distribution | PRD-DST-REQ-001 to 007 | 7 |
-| Output Formats | PRD-OUT-REQ-001 to 003 | 3 |
+| Output Formats | PRD-OUT-REQ-001 to 004 | 4 |
 | Git Worktree Support | PRD-WKT-REQ-001 to 005 | 5 |
-| **Total** | | **85** |
+| Semantic Search | PRD-SEM-REQ-001 to 016 | 16 |
+| Semantic Dependency Analysis | PRD-SDEP-REQ-001 to 003 | 3 |
+| Semantic Clustering | PRD-SCLST-REQ-001 to 003 | 3 |
+| Semantic Change Impact | PRD-SIMP-REQ-001 to 004 | 4 |
+| **Total** | | **111** |
 
 ---
 
 ## 5) Open questions log
 
-All original open questions have been resolved:
-
-| ID | Question | Resolution |
-|---|---|---|
-| OQ-001 | Grammar bundling strategy | Bundle all 10 grammars in the binary |
-| OQ-002 | Reference accuracy | Name-based only, no heuristic disambiguation for V1 |
-| OQ-003 | Auto-init threshold | No cap; always auto-init with progress indicator |
-| OQ-004 | Tool name | Renamed from `csi` to `wonk` |
+| ID | Question | Resolution | Status |
+|---|---|---|---|
+| OQ-001 | Grammar bundling strategy | Bundle all 10 grammars in the binary | Resolved |
+| OQ-002 | Reference accuracy | Name-based only, no heuristic disambiguation for V1 | Resolved |
+| OQ-003 | Auto-init threshold | No cap; always auto-init with progress indicator | Resolved |
+| OQ-004 | Tool name | Renamed from `csi` to `wonk` | Resolved |
 | OQ-005 | Smart search ranking weights | How should results be weighted between definitions, call sites, imports, comments, and test files? Needs validation with real Claude Code sessions to calibrate. | Open |
+| OQ-006 | Similarity threshold | Should there be a minimum cosine similarity score below which results are not shown? Needs calibration with real queries. | Open |
+| OQ-007 | Clustering algorithm | k-means vs. DBSCAN vs. hierarchical? Depends on typical symbol counts per directory. | Open |
+| OQ-008 | Multi-daemon resource management | With daemons running indefinitely across many repos, should there be a global limit or resource budget? | Open |
 
 ---
 
 ## 6) Out of scope for V1
 
 - **LSP server integration.** V1 uses Tree-sitter only. LSP backends (for type-aware resolution) are a V2 feature.
-- **Semantic / embedding search.** Natural language queries require an embedding model. Deferred to V2.
+- ~~**Semantic / embedding search.** Natural language queries require an embedding model. Deferred to V2.~~ **Moved to V2 scope: PRD-SEM, PRD-SDEP, PRD-SCLST, PRD-SIMP.**
 - **Directory summaries.** LLM-generated descriptions of what each directory does. Deferred to V2.
 - **Cross-language call graphs.** Connecting a Python HTTP call to a Go handler. Deferred to V2.
 - **Editor integrations.** VS Code extension, Neovim plugin, etc. V1 is CLI-only.

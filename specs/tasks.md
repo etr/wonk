@@ -4,15 +4,15 @@
 - PRD: `specs/product_specs.md`
 - Architecture: `specs/architecture.md`
 
-**Last updated:** 2026-02-11
-**Status:** Complete
+**Last updated:** 2026-02-13
+**Status:** In Progress
 
 ---
 
 ## Overview
 
-**Total Tasks:** 37
-**Milestones:** 8
+**Total Tasks:** 56
+**Milestones:** 14
 
 ### Milestone Summary
 
@@ -26,60 +26,59 @@
 | M6 | Smart Search | 4 | Complete |
 | M7 | Polish & Distribution | 5 | Complete |
 | M8 | Git Worktree Support | 3 | Complete |
+| M9 | Embedding Infrastructure | 5 | Not Started |
+| M10 | Semantic Search (`wonk ask`) | 3 | Not Started |
+| M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
+| M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
+| M13 | Semantic Clustering (`wonk cluster`) | 2 | Not Started |
+| M14 | Change Impact Analysis (`wonk impact`) | 2 | Not Started |
 
 ### Dependency Graph
 
 ```
-M1: Project Scaffold & Text Search [Complete]
-├── TASK-001 ──┬── TASK-002 ──┬── TASK-004 ── TASK-005
-│              │              │
-│              └── TASK-003 ──┘
-│
-M2: Indexing Engine [Complete] (depends: M1)
-├── TASK-006 ──────────────────────────────┐
-├── TASK-007 ──┬── TASK-008 ──┐            │
-│              └── TASK-009 ──┼── TASK-010 ── TASK-011
+M1–M8: V1 [Complete] ✅
+
+M9: Embedding Infrastructure (depends: M1–M8)
+├── TASK-038 ──┬── TASK-039 ──┐
+│              └── TASK-040 ──┼── TASK-042
 │                             │
-M3: Structural Queries [Complete] (depends: M2)
-├── TASK-012 ──┬── TASK-013
-│              ├── TASK-014
-│              ├── TASK-015
-│              └── TASK-016
+│              TASK-041 ──────┘
 │
-M4: Background Daemon [Complete] (depends: M2)
-├── TASK-017 ──┬── TASK-018 ── TASK-019
-│              └── TASK-020 ──┐
-│                             └── TASK-021
+M10: Semantic Search (depends: M9)
+├── TASK-043 ── TASK-044 ── TASK-045
 │
-M5: Auto-Init, Dependencies & Configuration [In Progress] (depends: M3, M4)
-├── TASK-022
-├── TASK-023
-├── TASK-024 ── TASK-025
+M11: Daemon Embedding & Lifecycle (depends: M9)
+├── TASK-046
+├── TASK-047
+├── TASK-048
+├── TASK-049
 │
-M6: Smart Search (depends: M3, M5)
-├── TASK-031 ── TASK-032 ── TASK-033
-├── TASK-034
+M12: Semantic Blending & Dependency Scoping (depends: M10)
+├── TASK-050
+├── TASK-051 ── TASK-052
 │
-M7: Polish & Distribution (depends: M6)
-├── TASK-026
-├── TASK-027
-├── TASK-028
-├── TASK-029 ── TASK-030
+M13: Semantic Clustering (depends: M9)
+├── TASK-053 ── TASK-054
 │
-M8: Git Worktree Support (depends: M1)
-├── TASK-035 ──┐
-├── TASK-036 ──┼── TASK-037
+M14: Change Impact Analysis (depends: M10)
+├── TASK-055 ── TASK-056
 ```
 
 ### Critical Path
 
+**V1 (Complete):**
 TASK-001 → TASK-002 → TASK-004 → TASK-005 (M1) ✅
 → TASK-007 → TASK-008 → TASK-010 → TASK-011 (M2) ✅
 → TASK-012 → TASK-013 (M3) ✅
 → TASK-017 → TASK-018 → TASK-019 (M4) ✅
-→ TASK-022 (M5)
-→ TASK-031 → TASK-032 → TASK-033 (M6)
-→ TASK-029 → TASK-030 (M7)
+→ TASK-022 (M5) ✅
+→ TASK-031 → TASK-032 → TASK-033 (M6) ✅
+→ TASK-029 → TASK-030 (M7) ✅
+
+**V2 Critical Path:**
+TASK-038 → TASK-039 → TASK-042 (M9)
+→ TASK-043 → TASK-044 → TASK-045 (M10)
+→ TASK-051 → TASK-052 (M12)
 
 ---
 
@@ -1469,19 +1468,778 @@ Verify end-to-end worktree support: repo root detection accepts `.git` files, ne
 
 ---
 
+## Milestone 9: Embedding Infrastructure
+
+**Goal:** `wonk init` builds embedding vectors alongside the structural index when Ollama is reachable. Vectors stored in SQLite, retrievable via zero-copy deserialization.
+**Exit Criteria:** After `wonk init`, the `embeddings` table contains one row per symbol with a 768-dim f32 BLOB vector. Vectors are L2-normalized. Ollama-unavailable case handled gracefully.
+
+### TASK-038: V2 dependencies, schema migration, and error types
+
+**Milestone:** M9 - Embedding Infrastructure
+**Component:** SQLite Database, All
+**Estimate:** S
+
+**Goal:**
+Add V2 crate dependencies, extend the SQLite schema with the `embeddings` table, and add `EmbeddingError` type.
+
+**Action Items:**
+- [ ] Add to Cargo.toml: `ureq = { version = "3.1", features = ["json"] }`, `bytemuck = { version = "1", features = ["derive"] }`
+- [ ] Add `embeddings` table to schema creation in `db.rs`: `id`, `symbol_id` (FK → symbols, ON DELETE CASCADE), `file` (TEXT), `chunk_text` (TEXT), `vector` (BLOB), `stale` (INTEGER DEFAULT 0), `created_at` (INTEGER), `UNIQUE(symbol_id)`
+- [ ] Add `idx_embeddings_file` index on `embeddings(file)`
+- [ ] Add `EmbeddingError` enum to `errors.rs` with variants: `OllamaUnreachable`, `OllamaError(String)`, `InvalidResponse`, `NoEmbeddings`, `ChunkingFailed`
+- [ ] Add `QueryRouter` error matching for `EmbeddingError::NoEmbeddings` in `router.rs`
+- [ ] Handle schema migration: detect if `embeddings` table exists, create if missing (for upgrading V1 indexes)
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-039, TASK-040, TASK-041
+
+**Acceptance Criteria:**
+- `cargo build` succeeds with new dependencies
+- Schema creates `embeddings` table with all columns and constraints
+- `ON DELETE CASCADE` works: deleting a symbol row also deletes its embedding
+- `EmbeddingError` variants enable pattern matching in router
+- Existing V1 indexes upgrade gracefully (table created on first V2 use)
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-015
+**Related Decisions:** DR-005, DR-006, DR-010
+
+**Status:** Not Started
+
+---
+
+### TASK-039: Ollama API client
+
+**Milestone:** M9 - Embedding Infrastructure
+**Component:** Embedding Engine
+**Estimate:** M
+
+**Goal:**
+Implement a sync HTTP client for Ollama's embedding API with health checking, batch embedding, and error handling.
+
+**Action Items:**
+- [ ] Create `embedding.rs` module
+- [ ] Implement `OllamaClient` struct with configurable base URL (default: `http://localhost:11434`)
+- [ ] Implement health check: `GET /` → returns true if 200 OK
+- [ ] Implement `embed_batch(texts: &[String]) -> Result<Vec<Vec<f32>>>`: POST to `/api/embed` with `{"model": "nomic-embed-text", "input": [...]}`
+- [ ] Implement `embed_single(text: &str) -> Result<Vec<f32>>`: convenience wrapper
+- [ ] Parse response: extract `embeddings` array from JSON response
+- [ ] Configure connection timeout (2s) and read timeout (60s) via ureq agent builder
+- [ ] Return `EmbeddingError::OllamaUnreachable` on connection failure
+- [ ] Return `EmbeddingError::OllamaError` on non-200 responses with error detail
+
+**Dependencies:**
+- Blocked by: TASK-038
+- Blocks: TASK-042
+
+**Acceptance Criteria:**
+- Health check correctly detects Ollama running/not running
+- Batch embedding returns 768-dim f32 vectors for each input
+- Single embedding convenience method works
+- Connection errors return `OllamaUnreachable`
+- API errors return `OllamaError` with message
+- Timeouts are enforced (no hanging on unresponsive Ollama)
+- Typecheck passes
+- Tests pass (with mock or integration tests against real Ollama)
+
+**Related Requirements:** PRD-SEM-REQ-008, PRD-SEM-REQ-012, PRD-SEM-REQ-014
+**Related Decisions:** DR-009, DR-012
+
+**Status:** Not Started
+
+---
+
+### TASK-040: Symbol chunking engine
+
+**Milestone:** M9 - Embedding Infrastructure
+**Component:** Embedding Engine
+**Estimate:** M
+
+**Goal:**
+Generate context-rich text chunks from indexed symbols, suitable for embedding by `nomic-embed-text`.
+
+**Action Items:**
+- [ ] Implement `chunk_symbol(symbol: &Symbol, file_imports: &[String], source_code: &str) -> String` in `embedding.rs`
+- [ ] Chunk format: `File: <path>\nScope: <scope>\nImports: <imports>\n---\n<source_code>` where source_code is extracted from line to end_line
+- [ ] For symbols with no scope, omit the Scope line
+- [ ] For files with no imports, omit the Imports line
+- [ ] Implement `chunk_file_fallback(path: &str, content: &str) -> String` for files with no extractable symbols (PRD-SEM-REQ-007)
+- [ ] Read source code from disk for each symbol's line range (line to end_line)
+- [ ] Implement `chunk_all_symbols(db, repo_root) -> Vec<(i64, String)>` returning (symbol_id, chunk_text) pairs
+- [ ] Truncate chunks that exceed model context limit (8192 tokens ≈ 32KB for nomic-embed-text)
+
+**Dependencies:**
+- Blocked by: TASK-038
+- Blocks: TASK-042
+
+**Acceptance Criteria:**
+- Chunks include file path, scope, imports, and source code
+- Full-file fallback generates a single chunk for symbol-less files
+- Chunks are well-formed for the embedding model (not truncated mid-token)
+- Long files/symbols truncated to model context limit
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-006, PRD-SEM-REQ-007
+**Related Decisions:** DR-010
+
+**Status:** Not Started
+
+---
+
+### TASK-041: Vector storage and retrieval
+
+**Milestone:** M9 - Embedding Infrastructure
+**Component:** Embedding Engine, SQLite Database
+**Estimate:** M
+
+**Goal:**
+Store embedding vectors as BLOBs in SQLite and retrieve them with zero-copy deserialization via bytemuck.
+
+**Action Items:**
+- [ ] Implement `store_embedding(db, symbol_id, file, chunk_text, vector: &[f32]) -> Result<()>`: L2-normalize vector, write as little-endian f32 BLOB
+- [ ] Implement `store_embeddings_batch(db, embeddings: &[(i64, &str, &str, &[f32])]) -> Result<()>`: batch insert within a transaction
+- [ ] Implement `load_all_embeddings(db) -> Result<Vec<(i64, Vec<f32>)>>`: load all (symbol_id, vector) pairs
+- [ ] Use `bytemuck::cast_slice::<u8, f32>()` for zero-copy BLOB → f32 slice conversion
+- [ ] Implement `delete_embeddings_for_file(db, file: &str) -> Result<()>`: delete all embeddings for a file
+- [ ] Implement `mark_embeddings_stale(db, file: &str) -> Result<()>`: set `stale = 1` for a file's embeddings
+- [ ] Implement `embedding_stats(db) -> Result<(usize, usize)>`: return (total_count, stale_count)
+- [ ] Implement L2 normalization: `normalize(vec: &mut [f32])` — divide each element by the L2 norm
+
+**Dependencies:**
+- Blocked by: TASK-038
+- Blocks: TASK-042
+
+**Acceptance Criteria:**
+- Vectors round-trip correctly: store as BLOB, retrieve as identical f32 slice
+- All stored vectors are L2-normalized (norm ≈ 1.0)
+- Batch insert uses a single transaction for atomicity
+- Zero-copy deserialization via bytemuck works (no data corruption)
+- Stale marking and deletion work for per-file operations
+- Embedding stats return correct counts
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-015
+**Related Decisions:** DR-010, DR-012
+
+**Status:** Not Started
+
+---
+
+### TASK-042: Embedding build pipeline in `wonk init`
+
+**Milestone:** M9 - Embedding Infrastructure
+**Component:** Embedding Engine, CLI
+**Estimate:** L
+
+**Goal:**
+Wire chunking, Ollama embedding, and vector storage into the `wonk init` flow, with progress display and graceful handling of Ollama unavailability.
+
+**Action Items:**
+- [ ] After structural index build in `wonk init`, check Ollama reachability via health check
+- [ ] If reachable: generate chunks for all symbols (TASK-040), batch-embed via Ollama (TASK-039), store vectors (TASK-041)
+- [ ] Display embedding progress to stderr: `Embedding... [1234/5678 symbols]`
+- [ ] Batch size: embed ~50 chunks per Ollama API call for throughput
+- [ ] If Ollama unreachable during `wonk init`: print warning to stderr "Ollama not available — skipping embedding generation. Semantic search will not be available until embeddings are built.", continue with structural index only
+- [ ] Handle partial failures: if Ollama goes down mid-batch, store what was completed, report count
+- [ ] Wire embedding stats into `wonk status` output: show embedding count, stale count, Ollama reachability
+
+**Dependencies:**
+- Blocked by: TASK-039, TASK-040, TASK-041
+- Blocks: TASK-043, TASK-044, TASK-045, TASK-047, TASK-049, TASK-053, TASK-055
+
+**Acceptance Criteria:**
+- `wonk init` with Ollama running: builds structural index AND embeddings
+- `wonk init` without Ollama: builds structural index only, prints warning
+- Progress indicator shows during embedding
+- `wonk status` shows embedding count and Ollama reachability
+- Partial failures save completed embeddings
+- Re-running `wonk init` rebuilds all embeddings
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-008, PRD-SEM-REQ-014
+**Related Decisions:** DR-009, DR-010, DR-012
+
+**Status:** Not Started
+
+---
+
+## Milestone 10: Semantic Search (`wonk ask`)
+
+**Goal:** `wonk ask "authentication"` finds `verifyToken`, `checkCredentials`, and similar symbols via cosine similarity, even though "authentication" doesn't appear in any symbol name.
+**Exit Criteria:** Semantic search returns relevant results ranked by similarity. `--budget` and `--json` work. Clear error when Ollama unavailable.
+
+### TASK-043: Brute-force cosine similarity engine
+
+**Milestone:** M10 - Semantic Search
+**Component:** Semantic Search
+**Estimate:** M
+
+**Goal:**
+Implement parallel brute-force cosine similarity search over all stored embedding vectors.
+
+**Action Items:**
+- [ ] Create `semantic.rs` module
+- [ ] Implement `semantic_search(query_vec: &[f32], all_embeddings: &[(i64, Vec<f32>)], limit: usize) -> Vec<(i64, f32)>`: compute dot product (vectors are pre-normalized) for each stored vector, return top-N by descending score
+- [ ] Parallelize dot product computation with rayon (`par_iter()`)
+- [ ] Sort results by descending similarity score
+- [ ] Define `SemanticResult` struct in `types.rs`: `symbol_id`, `file`, `line`, `symbol_name`, `symbol_kind`, `similarity_score`
+- [ ] Implement `resolve_results(db, scored: &[(i64, f32)]) -> Vec<SemanticResult>`: join symbol_id with symbols table to get file, line, name, kind
+
+**Dependencies:**
+- Blocked by: TASK-042
+- Blocks: TASK-044
+
+**Acceptance Criteria:**
+- Cosine similarity (dot product on normalized vectors) is computed correctly
+- Results are sorted by descending similarity
+- rayon parallelism is used (measurable speedup on multi-core)
+- Search over 50K vectors completes in < 200ms
+- SemanticResult includes all required fields (file, line, name, kind, score)
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-016
+**Related Decisions:** DR-010, DR-012
+
+**Status:** Not Started
+
+---
+
+### TASK-044: `wonk ask` CLI subcommand
+
+**Milestone:** M10 - Semantic Search
+**Component:** CLI, Query Router, Semantic Search
+**Estimate:** M
+
+**Goal:**
+Implement the `wonk ask <query>` CLI command that performs semantic search and displays results with similarity scores.
+
+**Action Items:**
+- [ ] Add `ask` subcommand to CLI with args: `<query>` (required), `--budget <n>` (optional), `--json` (global), `--from <file>` (optional, wired in M12), `--to <file>` (optional, wired in M12)
+- [ ] Wire through Query Router: `wonk ask` → Semantic Search engine
+- [ ] Flow: embed query via Ollama → normalize → brute-force search (TASK-043) → format results
+- [ ] Default output format: `file:line  symbol_name (kind) [score]`
+- [ ] JSON output: include all SemanticResult fields plus similarity_score
+- [ ] `--budget`: apply token budget to semantic results (reuse budget logic from TASK-033)
+- [ ] Print result count and top score summary to stderr
+
+**Dependencies:**
+- Blocked by: TASK-043
+- Blocks: TASK-045, TASK-050, TASK-052, TASK-055
+
+**Acceptance Criteria:**
+- `wonk ask "authentication"` returns semantically related symbols with scores
+- Results sorted by descending similarity
+- Each result shows file, line, symbol name, kind, and similarity score
+- `--json` outputs valid JSON with all fields
+- `--budget` limits output token count
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-001, PRD-SEM-REQ-003, PRD-SEM-REQ-004, PRD-SEM-REQ-005
+**Related Decisions:** DR-009, DR-010
+
+**Status:** Not Started
+
+---
+
+### TASK-045: Block-and-wait and Ollama error handling
+
+**Milestone:** M10 - Semantic Search
+**Component:** CLI, Embedding Engine
+**Estimate:** M
+
+**Goal:**
+When `wonk ask` is run with incomplete embeddings, block and build them with progress. When Ollama is unavailable, return a clear error.
+
+**Action Items:**
+- [ ] On `wonk ask`, check embedding completeness: compare symbol count in `symbols` table vs `embeddings` table
+- [ ] If embeddings are incomplete: call `Embedding Engine::embed_repo()` directly from CLI with a progress callback that prints to stderr, blocking until complete
+- [ ] After embedding completes, proceed with the semantic query
+- [ ] If Ollama is not reachable when `wonk ask` is run: return `error: Ollama is required for semantic search. Start Ollama with 'ollama serve' and ensure nomic-embed-text is available.`
+- [ ] If Ollama becomes unreachable mid-embedding (block-and-wait): report partial progress and error
+
+**Dependencies:**
+- Blocked by: TASK-044
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk ask` with no embeddings: blocks, shows progress, builds embeddings, then returns results
+- `wonk ask` with partial embeddings: builds remaining, then returns results
+- `wonk ask` with complete embeddings: returns results immediately (no delay)
+- Ollama unavailable: clear, actionable error message
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-012, PRD-SEM-REQ-013
+**Related Decisions:** DR-009
+
+**Status:** Not Started
+
+---
+
+## Milestone 11: Daemon Embedding & Lifecycle Updates
+
+**Goal:** Daemon keeps embeddings fresh on file changes. Multi-daemon management works. Idle timeout removed.
+**Exit Criteria:** Edit a file with Ollama running → embeddings update within 1s. `wonk daemon list` shows all running daemons. `wonk daemon stop --all` stops them all.
+
+### TASK-046: Remove daemon idle timeout
+
+**Milestone:** M11 - Daemon Embedding & Lifecycle Updates
+**Component:** Background Daemon, Configuration
+**Estimate:** S
+
+**Goal:**
+Remove the 30-minute idle timeout so daemons run indefinitely until explicitly stopped.
+
+**Action Items:**
+- [ ] Remove idle timeout logic from daemon event loop in `daemon.rs`
+- [ ] Remove `idle_timeout_minutes` from `Config` struct and config parsing in `config.rs`
+- [ ] Update `wonk daemon status` output to no longer show timeout remaining
+- [ ] Ensure daemon still exits cleanly on SIGTERM
+- [ ] Update any tests that depend on idle timeout behavior
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: None
+
+**Acceptance Criteria:**
+- Daemon runs indefinitely without auto-exiting
+- `wonk daemon stop` still works (SIGTERM)
+- `idle_timeout_minutes` config key is ignored if present (no error)
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CFG-REQ-004 (removed)
+**Related Decisions:** DR-013
+
+**Status:** Not Started
+
+---
+
+### TASK-047: Daemon incremental embedding re-indexing
+
+**Milestone:** M11 - Daemon Embedding & Lifecycle Updates
+**Component:** Background Daemon, Embedding Engine
+**Estimate:** L
+
+**Goal:**
+After structural re-indexing of changed files, re-generate and store embeddings for those files when Ollama is reachable.
+
+**Action Items:**
+- [ ] After incremental structural re-index (existing pipeline), check Ollama reachability
+- [ ] If Ollama reachable: delete old embeddings for the changed file, generate new chunks from updated symbols, embed via Ollama, store new vectors
+- [ ] If Ollama unreachable: call `mark_embeddings_stale(db, file)` to set `stale = 1` for the file's embeddings (PRD-SEM-REQ-011)
+- [ ] Run embedding work on a separate thread from the watcher thread to avoid blocking file event processing
+- [ ] On file delete: CASCADE handles embedding cleanup (from FK constraint)
+- [ ] Log embedding re-index activity to daemon status table
+
+**Dependencies:**
+- Blocked by: TASK-042
+- Blocks: None
+
+**Acceptance Criteria:**
+- File change with Ollama running: embeddings updated within 1s of structural re-index
+- File change with Ollama down: embeddings marked stale, no error visible to user
+- File deletion: embeddings removed via CASCADE
+- Embedding work doesn't block file event processing (runs on separate thread)
+- Daemon status shows embedding activity
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-010, PRD-SEM-REQ-011
+**Related Decisions:** DR-009, DR-010, DR-013
+
+**Status:** Not Started
+
+---
+
+### TASK-048: Multi-daemon management (`daemon list`, `stop --all`)
+
+**Milestone:** M11 - Daemon Embedding & Lifecycle Updates
+**Component:** CLI, Background Daemon
+**Estimate:** M
+
+**Goal:**
+Implement `wonk daemon list` to show all running daemons and `wonk daemon stop --all` to stop them all.
+
+**Action Items:**
+- [ ] Implement `wonk daemon list`: glob `~/.wonk/repos/*/daemon.pid`, read each PID, check if process is alive (`kill(pid, 0)`), read `meta.json` for repo path
+- [ ] Display format: `PID    REPO PATH    UPTIME    STATUS`
+- [ ] Clean up stale PID files (process not running) during listing
+- [ ] Implement `wonk daemon stop --all`: iterate daemon list, send SIGTERM to each, wait for exit, report results
+- [ ] Support `--json` output for daemon list
+- [ ] Handle local-mode indexes: also check `.wonk/daemon.pid` in current repo
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk daemon list` shows all running daemons with repo paths and PIDs
+- Stale PID files are detected and cleaned up
+- `wonk daemon stop --all` stops all running daemons
+- `--json` outputs structured daemon list
+- Works for both central and local index modes
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-DMN-REQ-014, PRD-DMN-REQ-015
+**Related Decisions:** DR-013
+
+**Status:** Not Started
+
+---
+
+### TASK-049: Auto-init embedding delegation to daemon
+
+**Milestone:** M11 - Daemon Embedding & Lifecycle Updates
+**Component:** CLI, Background Daemon
+**Estimate:** S
+
+**Goal:**
+When auto-init is triggered by a query, build structural index only, then delegate embedding generation to the daemon.
+
+**Action Items:**
+- [ ] In auto-init path (triggered by `wonk ask` or `wonk search --semantic` with no index): build structural index synchronously
+- [ ] After structural index build, write `embedding_build_requested = 1` to `daemon_status` table
+- [ ] In daemon startup, check for `embedding_build_requested` flag, begin embedding generation in background if Ollama is reachable
+- [ ] Clear the flag after embedding build completes
+- [ ] If `wonk ask` is run before daemon finishes embeddings, block-and-wait logic (TASK-045) takes over
+
+**Dependencies:**
+- Blocked by: TASK-042
+- Blocks: None
+
+**Acceptance Criteria:**
+- Auto-init builds structural index immediately, not embeddings
+- Daemon picks up embedding_build_requested flag and starts embedding
+- Flag is cleared after completion
+- If user runs `wonk ask` before daemon finishes, block-and-wait works
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-009
+**Related Decisions:** DR-013
+
+**Status:** Not Started
+
+---
+
+## Milestone 12: Semantic Blending & Dependency Scoping
+
+**Goal:** `wonk search --semantic` blends structural and semantic results. `--from`/`--to` filters semantic results by dependency graph reachability.
+**Exit Criteria:** `wonk search --semantic <pattern>` returns structural matches first, then semantic matches. `wonk ask "auth" --from src/routes/api.ts` returns only reachable symbols.
+
+### TASK-050: `wonk search --semantic` blending
+
+**Milestone:** M12 - Semantic Blending & Dependency Scoping
+**Component:** Smart Search Ranker, CLI
+**Estimate:** M
+
+**Goal:**
+Add `--semantic` flag to `wonk search` that blends structural results with semantic results.
+
+**Action Items:**
+- [ ] Add `--semantic` flag to `wonk search` CLI
+- [ ] When `--semantic` is provided: run structural search as normal, then run semantic search for the same pattern
+- [ ] Deduplicate: remove semantic results that match structural results (same file+line)
+- [ ] Blend: present structural matches first (with existing ranking), then additional semantic matches with similarity scores
+- [ ] Semantic matches formatted with `[semantic: 0.87]` annotation
+- [ ] `--budget` applies to blended result set
+
+**Dependencies:**
+- Blocked by: TASK-044
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk search --semantic verifyToken` returns structural matches first, then semantic matches
+- Semantic matches include similarity score annotation
+- No duplicate results (same file+line appears only once)
+- `--budget` limits total blended output
+- `--json` includes both result types with a `source` field ("structural" or "semantic")
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SEM-REQ-002
+**Related Decisions:** DR-010
+
+**Status:** Not Started
+
+---
+
+### TASK-051: Dependency graph transitive traversal
+
+**Milestone:** M12 - Semantic Blending & Dependency Scoping
+**Component:** Semantic Search
+**Estimate:** M
+
+**Goal:**
+Implement BFS/DFS traversal over the file-level dependency graph to compute reachable file sets for `--from` and `--to` scoping.
+
+**Action Items:**
+- [ ] Implement `reachable_from(db, file: &str) -> HashSet<String>`: BFS forward traversal following import edges from the given file
+- [ ] Implement `reachable_to(db, file: &str) -> HashSet<String>`: BFS reverse traversal finding all files that transitively import the given file
+- [ ] Load file-level dependency graph from SQLite (files table import data) into an adjacency list
+- [ ] Use `VecDeque` for BFS, `HashSet` for visited tracking
+- [ ] Handle cycles (files that import each other) — visited set prevents infinite loops
+- [ ] Return the file as part of its own reachable set
+
+**Dependencies:**
+- Blocked by: TASK-042
+- Blocks: TASK-052
+
+**Acceptance Criteria:**
+- Forward traversal: A imports B imports C → reachable_from(A) = {A, B, C}
+- Reverse traversal: A imports B, C imports B → reachable_to(B) = {A, B, C}
+- Cycles handled correctly (no infinite loop)
+- Traversal completes in < 50ms for typical dependency graphs (< 10K files)
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SDEP-REQ-003
+**Related Decisions:** DR-010
+
+**Status:** Not Started
+
+---
+
+### TASK-052: `--from` / `--to` dependency scoping on `wonk ask`
+
+**Milestone:** M12 - Semantic Blending & Dependency Scoping
+**Component:** Semantic Search, CLI
+**Estimate:** S
+
+**Goal:**
+Wire `--from` and `--to` flags on `wonk ask` to filter semantic results by dependency reachability.
+
+**Action Items:**
+- [ ] Wire `--from <file>` flag: compute `reachable_from(file)` (TASK-051), filter semantic results to symbols in reachable files only
+- [ ] Wire `--to <file>` flag: compute `reachable_to(file)` (TASK-051), filter semantic results to symbols in reachable files only
+- [ ] Apply filtering BEFORE ranking/budget (so budget counts only relevant results)
+- [ ] If `--from` and `--to` are both specified, intersect reachable sets
+- [ ] If specified file doesn't exist in index, return clear error
+
+**Dependencies:**
+- Blocked by: TASK-044, TASK-051
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk ask "auth" --from src/routes/api.ts` returns only symbols reachable from that file
+- `wonk ask "auth" --to src/utils/db.ts` returns only symbols that can reach that file
+- Results still include similarity scores
+- Non-existent file produces clear error
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SDEP-REQ-001, PRD-SDEP-REQ-002
+**Related Decisions:** DR-010
+
+**Status:** Not Started
+
+---
+
+## Milestone 13: Semantic Clustering (`wonk cluster`)
+
+**Goal:** `wonk cluster src/auth/` groups related symbols by semantic similarity using K-Means, revealing conceptual groupings within a directory.
+**Exit Criteria:** Clustering produces meaningful groups. Auto-k selection via silhouette scoring works. Output shows representative symbols per cluster.
+
+### TASK-053: K-Means clustering with silhouette auto-k
+
+**Milestone:** M13 - Semantic Clustering
+**Component:** Clustering Engine
+**Estimate:** L
+
+**Goal:**
+Implement K-Means clustering of symbol embeddings with automatic k selection via silhouette scoring.
+
+**Action Items:**
+- [ ] Add to Cargo.toml: `linfa-clustering = "0.8"`, `linfa = "0.8"`, `ndarray = "0.16"`
+- [ ] Create `cluster.rs` module
+- [ ] Implement `cluster_embeddings(embeddings: &[(i64, Vec<f32>)], max_k: usize) -> Vec<Cluster>`: load embeddings into ndarray matrix, run K-Means for k = 2..min(√n, max_k), compute silhouette score for each k, select best k
+- [ ] Use K-Means++ initialization via `linfa-clustering::KMeans::params_with_rng(k).init_method(KMeansPlusPlus)`
+- [ ] Define `Cluster` struct in `types.rs`: `cluster_id`, `centroid: Vec<f32>`, `members: Vec<ClusterMember>`, `representative_symbols: Vec<ClusterMember>` (top 5 closest to centroid)
+- [ ] Define `ClusterMember` struct: `symbol_id`, `symbol_name`, `symbol_kind`, `file`, `line`, `distance_to_centroid`
+- [ ] Implement silhouette scoring: for each point, compute (b - a) / max(a, b) where a = avg distance to same-cluster points, b = avg distance to nearest other cluster points
+- [ ] Cap max_k at 20
+
+**Dependencies:**
+- Blocked by: TASK-042
+- Blocks: TASK-054
+
+**Acceptance Criteria:**
+- K-Means correctly partitions embeddings into k clusters
+- Silhouette scoring selects a reasonable k (verified on sample data)
+- Cluster representatives are the 5 symbols closest to centroid
+- Clustering completes in < 5s for 5000 symbols
+- Handles edge cases: < 3 symbols (return single cluster), all identical embeddings
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SCLST-REQ-001, PRD-SCLST-REQ-002
+**Related Decisions:** DR-011, DR-012
+
+**Status:** Not Started
+
+---
+
+### TASK-054: `wonk cluster` CLI subcommand
+
+**Milestone:** M13 - Semantic Clustering
+**Component:** CLI, Query Router, Clustering Engine
+**Estimate:** M
+
+**Goal:**
+Implement the `wonk cluster <path>` CLI command that displays semantic clusters of symbols within a directory.
+
+**Action Items:**
+- [ ] Add `cluster` subcommand to CLI with args: `<path>` (required), `--json` (global), `--top <n>` (optional, default 5, number of representative symbols per cluster)
+- [ ] Wire through Query Router: load embeddings filtered by path prefix, pass to Clustering Engine (TASK-053)
+- [ ] Default output format: numbered cluster groups with representative symbols
+  ```
+  Cluster 1 (15 symbols):
+    src/auth/middleware.ts:15  verifyToken (function) [0.12]
+    src/auth/session.ts:8     validateSession (function) [0.15]
+    ...
+  Cluster 2 (8 symbols):
+    ...
+  ```
+- [ ] JSON output: structured cluster data with members, centroids, distances
+- [ ] If no embeddings exist for path, return error with hint to run `wonk init`
+- [ ] If fewer than 3 symbols in path, return all symbols in a single group
+
+**Dependencies:**
+- Blocked by: TASK-053
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk cluster src/auth/` groups related auth symbols together
+- Output clearly separates distinct concerns
+- Each cluster shows top representative symbols with distance to centroid
+- `--json` outputs structured cluster data
+- `--top 10` shows 10 representatives per cluster
+- Clear error when no embeddings exist
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SCLST-REQ-001, PRD-SCLST-REQ-002, PRD-SCLST-REQ-003
+**Related Decisions:** DR-011
+
+**Status:** Not Started
+
+---
+
+## Milestone 14: Change Impact Analysis (`wonk impact`)
+
+**Goal:** `wonk impact <file>` finds semantically similar code that might be affected by changes. `--since <commit>` analyzes all files changed since a commit.
+**Exit Criteria:** Changing `verifyToken` surfaces `validateSession` and `checkCredentials` as potentially impacted. `--since HEAD~3` works.
+
+### TASK-055: Symbol change detection
+
+**Milestone:** M14 - Change Impact Analysis
+**Component:** Impact Analyzer
+**Estimate:** M
+
+**Goal:**
+Detect which symbols changed in a file by comparing a fresh Tree-sitter parse against the indexed version.
+
+**Action Items:**
+- [ ] Create `impact.rs` module
+- [ ] Implement `detect_changed_symbols(db, file: &str) -> Result<Vec<ChangedSymbol>>`: re-parse the file with Tree-sitter, extract current symbols, compare against stored symbols by (name, kind, content_hash)
+- [ ] Define `ChangedSymbol` struct in `types.rs`: `name`, `kind`, `file`, `line`, `change_type` (Added, Modified, Removed)
+- [ ] A symbol is "Modified" if name+kind match but content hash differs
+- [ ] A symbol is "Added" if it exists in current parse but not in index
+- [ ] A symbol is "Removed" if it exists in index but not in current parse
+- [ ] Implement `detect_changed_files_since(commit: &str) -> Result<Vec<String>>`: shell out to `git diff --name-only <commit>` and parse output
+- [ ] Handle git not installed: return clear error for `--since` only (file-level impact works without git)
+
+**Dependencies:**
+- Blocked by: TASK-042
+- Blocks: TASK-056
+
+**Acceptance Criteria:**
+- Modified symbols detected correctly (same name+kind, different content)
+- Added symbols detected (new symbol not in index)
+- Removed symbols detected (in index but not in current file)
+- `git diff --name-only` integration works for `--since`
+- Git not installed: error only for `--since`, not for file-level analysis
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SIMP-REQ-001, PRD-SIMP-REQ-002
+**Related Decisions:** DR-014
+
+**Status:** Not Started
+
+---
+
+### TASK-056: `wonk impact` CLI subcommand
+
+**Milestone:** M14 - Change Impact Analysis
+**Component:** CLI, Query Router, Impact Analyzer, Semantic Search
+**Estimate:** L
+
+**Goal:**
+Implement `wonk impact <file>` that finds semantically similar code that might be affected by changes in the specified file.
+
+**Action Items:**
+- [ ] Add `impact` subcommand to CLI with args: `<file>` (required), `--since <commit>` (optional), `--json` (global)
+- [ ] Wire through Query Router: detect changed symbols (TASK-055), embed each changed symbol's current source via Ollama, compare against all stored embeddings (TASK-043)
+- [ ] For `--since <commit>`: get changed files list (TASK-055), analyze each file, aggregate results
+- [ ] Define `ImpactResult` struct in `types.rs`: `changed_symbol` (name, kind, file, line), `impacted_symbol` (name, kind, file, line), `similarity_score`, `file_path`
+- [ ] Exclude the changed symbol itself from impact results (don't report a symbol as impacted by itself)
+- [ ] Sort results by descending similarity score
+- [ ] Default output format:
+  ```
+  Changed: verifyToken (function) in src/auth/middleware.ts:15
+    → src/auth/session.ts:8      validateSession (function) [0.89]
+    → src/auth/credentials.ts:22 checkCredentials (function) [0.84]
+  ```
+- [ ] JSON output: structured ImpactResult array
+- [ ] If no embeddings exist, return error with hint
+
+**Dependencies:**
+- Blocked by: TASK-044, TASK-055
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk impact src/auth/middleware.ts` finds semantically related code
+- Results ranked by similarity to the changed symbols
+- `--since HEAD~3` analyzes all files changed in last 3 commits
+- Each result shows changed symbol, impacted symbol, similarity, file
+- Changed symbol is not reported as impacted by itself
+- `--json` outputs valid structured data
+- Clear error when no embeddings exist
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SIMP-REQ-001, PRD-SIMP-REQ-002, PRD-SIMP-REQ-003, PRD-SIMP-REQ-004
+**Related Decisions:** DR-014, DR-010
+
+**Status:** Not Started
+
+---
+
 ## Parking Lot
 
 Tasks identified but not yet scheduled:
 
 | ID | Description | Reason Deferred |
 |----|-------------|-----------------|
-| - | LSP server integration | V2 feature |
-| - | Semantic/embedding search | V2 feature |
-| - | Directory summaries | V2 feature |
-| - | Cross-language call graphs | V2 feature |
-| - | Editor integrations | V2 feature |
-| - | Remote/monorepo support | V2 feature |
-| - | Web UI | V2 feature |
+| - | LSP server integration | V3 feature |
+| - | Directory summaries | V3 feature |
+| - | Cross-language call graphs | V3 feature |
+| - | Editor integrations | V3 feature |
+| - | Remote/monorepo support | V3 feature |
+| - | Web UI | V3 feature |
+| - | Bundled/offline embedding model (ONNX) | V3 feature — would remove Ollama dependency |
+| - | Configurable embedding models | V3 feature — single model for V2 |
+| - | ANN indexing for >100K vectors | V3 feature — brute-force sufficient for V2 scale |
 
 ---
 
@@ -1492,3 +2250,4 @@ Tasks identified but not yet scheduled:
 | 2026-02-11 | Initial task breakdown — 30 tasks across 6 milestones | TBD |
 | 2026-02-11 | Added Smart Search milestone (M6, TASK-031 to TASK-034). Renumbered Polish to M7. Updated milestone statuses. Total tasks: 34 across 7 milestones. Reframed around token-efficiency value proposition. | TBD |
 | 2026-02-12 | Added Git Worktree Support milestone (M8, TASK-035 to TASK-037). 3 tasks: walker boundary exclusion, watcher boundary filtering, integration tests. Total tasks: 37 across 8 milestones. | TBD |
+| 2026-02-13 | Added V2 semantic search milestones (M9-M14, TASK-038 to TASK-056). 19 tasks across 6 milestones: Embedding Infrastructure, Semantic Search, Daemon Embedding & Lifecycle, Semantic Blending & Dependency Scoping, Semantic Clustering, Change Impact Analysis. Total tasks: 56 across 14 milestones. | TBD |
