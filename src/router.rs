@@ -386,9 +386,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                 );
                             }
                             Err(e) => {
-                                output::print_error(
-                                    &format!("failed to stop daemon for {repo_path}: {e}"),
-                                );
+                                output::print_error(&format!(
+                                    "failed to stop daemon for {repo_path}: {e}"
+                                ));
                             }
                         }
                     }

@@ -4,6 +4,7 @@ pub mod color;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod embedding;
 pub mod errors;
 pub mod indexer;
 pub mod mcp;
