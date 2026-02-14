@@ -16,7 +16,9 @@ use serde_json::Value;
 
 use crate::budget::TokenBudget;
 use crate::db;
-use crate::output::{DepOutput, RefOutput, SearchOutput, SignatureOutput, SymbolOutput};
+use crate::output::{
+    DepOutput, OutputFormat, RefOutput, SearchOutput, SignatureOutput, SymbolOutput,
+};
 use crate::pipeline;
 use crate::progress::Progress;
 use crate::ranker;
@@ -178,12 +180,26 @@ fn require_str(args: &Value, key: &str) -> Result<String, CallToolResult> {
         .ok_or_else(|| CallToolResult::error(format!("missing required parameter: {key}")))
 }
 
-/// Serialize any `Serialize` value into a `CallToolResult`.
-fn json_result<T: Serialize>(data: &T) -> CallToolResult {
-    match serde_json::to_string_pretty(data) {
-        Ok(json) => CallToolResult::success(json),
-        Err(e) => CallToolResult::error(format!("serialization failed: {e}")),
+/// Serialize any `Serialize` value into a `CallToolResult` using the given format.
+fn format_result<T: Serialize>(data: &T, format: OutputFormat) -> CallToolResult {
+    let text: Result<String, String> = match format {
+        OutputFormat::Json | OutputFormat::Grep => {
+            serde_json::to_string_pretty(data).map_err(|e| e.to_string())
+        }
+        OutputFormat::Toon => serde_toon2::to_string(data).map_err(|e| e.to_string()),
+    };
+    match text {
+        Ok(s) => CallToolResult::success(s),
+        Err(_) => CallToolResult::error("output formatting failed".into()),
     }
+}
+
+/// Extract the output format from MCP tool args (defaults to JSON).
+fn extract_format(args: &Value) -> OutputFormat {
+    args.get("format")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(OutputFormat::Json)
 }
 
 /// Convert a `Symbol` to the serializable `SymbolOutput`.
@@ -204,25 +220,35 @@ fn symbol_to_output(sym: &Symbol) -> SymbolOutput {
 /// Validate that a path is within the repo root, returning a `CallToolResult::error`
 /// if the path escapes the repository boundary.
 fn validate_path(path: &Path, repo_root: &Path) -> Result<PathBuf, CallToolResult> {
-    // Resolve relative to repo_root, then canonicalize.
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        repo_root.join(path)
-    };
+    // Reject absolute paths — all paths must be relative to repo_root.
+    if path.is_absolute() {
+        return Err(CallToolResult::error(
+            "absolute paths are not allowed".into(),
+        ));
+    }
+    let resolved = repo_root.join(path);
     // Use canonicalize on the parent for non-existent files.
     let canonical = resolved.canonicalize().or_else(|_| {
         resolved
             .parent()
             .and_then(|p| p.canonicalize().ok())
-            .map(|p| p.join(resolved.file_name().unwrap_or_default()))
+            .map(|p| {
+                p.join(
+                    resolved
+                        .file_name()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "invalid path")
+                        })
+                        .unwrap_or_default(),
+                )
+            })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "path not found"))
     });
+    let root_canonical = repo_root.canonicalize().map_err(|_| {
+        CallToolResult::error("repository path cannot be validated".into())
+    })?;
     match canonical {
         Ok(p) => {
-            let root_canonical = repo_root
-                .canonicalize()
-                .unwrap_or_else(|_| repo_root.to_path_buf());
             if p.starts_with(&root_canonical) {
                 Ok(p)
             } else {
@@ -273,6 +299,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
                         }
                     },
                     "required": ["query"]
@@ -296,6 +328,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "boolean",
                             "description": "Require exact name match",
                             "default": false
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
                         }
                     },
                     "required": ["name"]
@@ -315,6 +353,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Restrict search to these file paths"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
                         }
                     },
                     "required": ["name"]
@@ -329,6 +373,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "name": {
                             "type": "string",
                             "description": "Function or method name"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
                         }
                     },
                     "required": ["name"]
@@ -349,6 +399,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "boolean",
                             "description": "Show symbols in a tree structure grouped by scope",
                             "default": false
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
                         }
                     }
                 }),
@@ -362,6 +418,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "file": {
                             "type": "string",
                             "description": "File to show dependencies for"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
                         }
                     },
                     "required": ["file"]
@@ -376,6 +438,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "file": {
                             "type": "string",
                             "description": "File to show reverse dependencies for"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
                         }
                     },
                     "required": ["file"]
@@ -386,7 +454,14 @@ fn tool_definitions() -> &'static Vec<Tool> {
                 description: "Show index status: whether an index exists, file count, symbol count, and reference count.",
                 input_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    }
                 }),
             },
             Tool {
@@ -399,6 +474,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "boolean",
                             "description": "Use a local (project-specific) index instead of the shared index",
                             "default": false
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
                         }
                     }
                 }),
@@ -458,7 +539,7 @@ impl McpServer {
             "wonk_ls" => self.tool_ls(call.arguments),
             "wonk_deps" => self.tool_deps(call.arguments),
             "wonk_rdeps" => self.tool_rdeps(call.arguments),
-            "wonk_status" => self.tool_status(),
+            "wonk_status" => self.tool_status(call.arguments),
             "wonk_init" => self.tool_init(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
@@ -486,6 +567,7 @@ impl McpServer {
             .get("budget")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        let format = extract_format(&args);
 
         let results = match search::text_search(&query, regex, case_insensitive, &paths) {
             Ok(r) => r,
@@ -521,7 +603,7 @@ impl McpServer {
             }
         }
 
-        json_result(&outputs)
+        format_result(&outputs, format)
     }
 
     fn tool_sym(&self, args: Value) -> CallToolResult {
@@ -531,6 +613,7 @@ impl McpServer {
         };
         let kind = args.get("kind").and_then(|v| v.as_str());
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+        let format = extract_format(&args);
 
         let results = match self.router.query_symbols(&name, kind, exact) {
             Ok(r) => r,
@@ -538,7 +621,7 @@ impl McpServer {
         };
 
         let outputs: Vec<SymbolOutput> = results.iter().map(symbol_to_output).collect();
-        json_result(&outputs)
+        format_result(&outputs, format)
     }
 
     fn tool_ref(&self, args: Value) -> CallToolResult {
@@ -550,6 +633,7 @@ impl McpServer {
             .get("paths")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        let format = extract_format(&args);
 
         let results = match self.router.query_references(&name, &paths) {
             Ok(r) => r,
@@ -568,7 +652,7 @@ impl McpServer {
             })
             .collect();
 
-        json_result(&outputs)
+        format_result(&outputs, format)
     }
 
     fn tool_sig(&self, args: Value) -> CallToolResult {
@@ -576,6 +660,7 @@ impl McpServer {
             Ok(n) => n,
             Err(e) => return e,
         };
+        let format = extract_format(&args);
 
         let results = match self.router.query_signatures(&name) {
             Ok(r) => r,
@@ -593,12 +678,13 @@ impl McpServer {
             })
             .collect();
 
-        json_result(&outputs)
+        format_result(&outputs, format)
     }
 
     fn tool_ls(&self, args: Value) -> CallToolResult {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let tree = args.get("tree").and_then(|v| v.as_bool()).unwrap_or(false);
+        let format = extract_format(&args);
 
         let path_buf = match validate_path(Path::new(path), self.router.repo_root()) {
             Ok(p) => p,
@@ -626,7 +712,7 @@ impl McpServer {
         }
 
         let outputs: Vec<SymbolOutput> = all_symbols.iter().map(symbol_to_output).collect();
-        json_result(&outputs)
+        format_result(&outputs, format)
     }
 
     fn tool_deps(&self, args: Value) -> CallToolResult {
@@ -634,6 +720,7 @@ impl McpServer {
             Ok(f) => f,
             Err(e) => return e,
         };
+        let format = extract_format(&args);
         if validate_path(Path::new(&file), self.router.repo_root()).is_err() {
             return CallToolResult::error("path is outside the repository".into());
         }
@@ -651,7 +738,7 @@ impl McpServer {
             })
             .collect();
 
-        json_result(&outputs)
+        format_result(&outputs, format)
     }
 
     fn tool_rdeps(&self, args: Value) -> CallToolResult {
@@ -659,6 +746,7 @@ impl McpServer {
             Ok(f) => f,
             Err(e) => return e,
         };
+        let format = extract_format(&args);
         if validate_path(Path::new(&file), self.router.repo_root()).is_err() {
             return CallToolResult::error("path is outside the repository".into());
         }
@@ -676,10 +764,11 @@ impl McpServer {
             })
             .collect();
 
-        json_result(&outputs)
+        format_result(&outputs, format)
     }
 
-    fn tool_status(&self) -> CallToolResult {
+    fn tool_status(&self, args: Value) -> CallToolResult {
+        let format = extract_format(&args);
         let status = if let Some(conn) = self.router.conn() {
             let file_count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
@@ -703,11 +792,12 @@ impl McpServer {
             })
         };
 
-        json_result(&status)
+        format_result(&status, format)
     }
 
     fn tool_init(&self, args: Value) -> CallToolResult {
         let local = args.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
+        let format = extract_format(&args);
 
         match pipeline::build_index_with_progress(
             self.router.repo_root(),
@@ -721,7 +811,7 @@ impl McpServer {
                     "reference_count": stats.ref_count,
                     "elapsed_ms": stats.elapsed.as_millis()
                 });
-                json_result(&result)
+                format_result(&result, format)
             }
             Err(_) => CallToolResult::error("index build failed".into()),
         }
@@ -947,10 +1037,18 @@ mod tests {
     }
 
     #[test]
-    fn json_result_produces_success() {
+    fn format_result_json_produces_success() {
         let data = vec![1, 2, 3];
-        let result = json_result(&data);
+        let result = format_result(&data, OutputFormat::Json);
         assert!(!result.is_error);
         assert!(result.content[0].text.contains("["));
+    }
+
+    #[test]
+    fn format_result_toon_produces_success() {
+        let data = vec![1, 2, 3];
+        let result = format_result(&data, OutputFormat::Toon);
+        assert!(!result.is_error);
+        assert!(!result.content[0].text.is_empty());
     }
 }

@@ -1,4 +1,4 @@
-//! Output formatting: grep-compatible (default) and JSON Lines (`--json`).
+//! Output formatting: grep-compatible (default), JSON Lines, or TOON.
 //!
 //! All result data flows through a [`Formatter`] which writes to an
 //! arbitrary [`std::io::Write`] destination (typically stdout).
@@ -9,17 +9,50 @@ use std::io::Write;
 use std::path::Path;
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::budget::TokenBudget;
 use crate::color;
+
+// ---------------------------------------------------------------------------
+// Output format
+// ---------------------------------------------------------------------------
+
+/// Output format selection for CLI and MCP results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Grep,
+    Json,
+    Toon,
+}
+
+impl OutputFormat {
+    /// Returns `true` for structured (non-grep) formats that should suppress
+    /// stderr hints and disable color.
+    pub fn is_structured(&self) -> bool {
+        matches!(self, OutputFormat::Json | OutputFormat::Toon)
+    }
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "grep" => Ok(Self::Grep),
+            "json" => Ok(Self::Json),
+            "toon" => Ok(Self::Toon),
+            _ => Err(format!("unknown format '{s}' (expected: grep, json, toon)")),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Serializable output types
 // ---------------------------------------------------------------------------
 
 /// A single text search match (corresponds to `SearchResult` in `search.rs`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchOutput {
     pub file: String,
     pub line: u64,
@@ -31,7 +64,7 @@ pub struct SearchOutput {
 }
 
 /// A symbol definition result.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolOutput {
     pub name: String,
     pub kind: String,
@@ -47,7 +80,7 @@ pub struct SymbolOutput {
 }
 
 /// A reference (usage site) result.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefOutput {
     pub name: String,
     pub kind: String,
@@ -58,7 +91,7 @@ pub struct RefOutput {
 }
 
 /// A function/method signature result.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureOutput {
     pub name: String,
     pub file: String,
@@ -68,7 +101,7 @@ pub struct SignatureOutput {
 }
 
 /// A single file entry for `ls` results.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: String,
 }
@@ -89,7 +122,7 @@ pub struct LsSymbolEntry {
 }
 
 /// A dependency edge for `deps` / `rdeps` results.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepOutput {
     pub file: String,
     pub depends_on: String,
@@ -140,11 +173,11 @@ pub struct HighlightPattern {
     re: Regex,
 }
 
-/// Output formatter that can render results in either grep-compatible text
-/// or JSON Lines (one JSON object per line).
+/// Output formatter that can render results in grep-compatible text,
+/// JSON Lines, or TOON format.
 pub struct Formatter<W: Write> {
     writer: W,
-    json: bool,
+    format: OutputFormat,
     color: bool,
     highlight: Option<HighlightPattern>,
     budget: Option<TokenBudget>,
@@ -154,12 +187,12 @@ impl<W: Write> Formatter<W> {
     /// Create a new formatter.
     ///
     /// * `writer` - The destination for output (e.g. `std::io::stdout()`).
-    /// * `json`   - When `true`, emit JSON Lines; otherwise, emit grep-style text.
+    /// * `format` - Output format (grep, json, or toon).
     /// * `color`  - When `true`, emit ANSI color codes in grep-style output.
-    pub fn new(writer: W, json: bool, color: bool) -> Self {
+    pub fn new(writer: W, format: OutputFormat, color: bool) -> Self {
         Self {
             writer,
-            json,
+            format,
             color,
             highlight: None,
             budget: None,
@@ -236,7 +269,7 @@ impl<W: Write> Formatter<W> {
         {
             let mut tmp = Formatter {
                 writer: &mut buf,
-                json: self.json,
+                format: self.format,
                 color: self.color,
                 highlight: None,
                 budget: None,
@@ -253,6 +286,22 @@ impl<W: Write> Formatter<W> {
             self.writer.write_all(&buf)?;
         }
         Ok(status)
+    }
+
+    /// Serialize a value to the active structured format (JSON or TOON).
+    ///
+    /// Only called when `self.format` is `Json` or `Toon`.
+    fn serialize_structured<T: Serialize>(
+        format: OutputFormat,
+        value: &T,
+    ) -> std::io::Result<String> {
+        match format {
+            OutputFormat::Json => serde_json::to_string(value).map_err(std::io::Error::other),
+            OutputFormat::Toon => {
+                serde_toon2::to_string(value).map_err(|e| std::io::Error::other(e.to_string()))
+            }
+            OutputFormat::Grep => unreachable!("serialize_structured called in grep mode"),
+        }
     }
 
     // -- Color helper methods -----------------------------------------------
@@ -310,8 +359,8 @@ impl<W: Write> Formatter<W> {
         fmt: &mut Formatter<W2>,
         result: &SearchOutput,
     ) -> std::io::Result<()> {
-        if fmt.json {
-            let line = serde_json::to_string(result).map_err(std::io::Error::other)?;
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, result)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&result.file)?;
@@ -341,8 +390,8 @@ impl<W: Write> Formatter<W> {
         fmt: &mut Formatter<W2>,
         sym: &SymbolOutput,
     ) -> std::io::Result<()> {
-        if fmt.json {
-            let line = serde_json::to_string(sym).map_err(std::io::Error::other)?;
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, sym)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&sym.file)?;
@@ -368,8 +417,8 @@ impl<W: Write> Formatter<W> {
         fmt: &mut Formatter<W2>,
         reference: &RefOutput,
     ) -> std::io::Result<()> {
-        if fmt.json {
-            let line = serde_json::to_string(reference).map_err(std::io::Error::other)?;
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, reference)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&reference.file)?;
@@ -395,8 +444,8 @@ impl<W: Write> Formatter<W> {
         fmt: &mut Formatter<W2>,
         sig: &SignatureOutput,
     ) -> std::io::Result<()> {
-        if fmt.json {
-            let line = serde_json::to_string(sig).map_err(std::io::Error::other)?;
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, sig)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&sig.file)?;
@@ -425,8 +474,8 @@ impl<W: Write> Formatter<W> {
         fmt: &mut Formatter<W2>,
         entry: &LsSymbolEntry,
     ) -> std::io::Result<()> {
-        if fmt.json {
-            let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, entry)?;
             writeln!(fmt.writer, "{line}")
         } else {
             let padding = "  ".repeat(entry.indent + 1);
@@ -453,8 +502,8 @@ impl<W: Write> Formatter<W> {
         fmt: &mut Formatter<W2>,
         entry: &FileEntry,
     ) -> std::io::Result<()> {
-        if fmt.json {
-            let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, entry)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&entry.path)?;
@@ -474,8 +523,8 @@ impl<W: Write> Formatter<W> {
 
     /// Shared render logic for a dependency edge.
     fn render_dep<W2: Write>(fmt: &mut Formatter<W2>, dep: &DepOutput) -> std::io::Result<()> {
-        if fmt.json {
-            let line = serde_json::to_string(dep).map_err(std::io::Error::other)?;
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, dep)?;
             writeln!(fmt.writer, "{line}")
         } else {
             fmt.write_file(&dep.file)?;
@@ -485,12 +534,12 @@ impl<W: Write> Formatter<W> {
         }
     }
 
-    /// Format a truncation metadata object (JSON mode only).
+    /// Format a truncation metadata object (structured mode only).
     ///
-    /// Emits a final JSON line with truncation info when `--budget` truncates
+    /// Emits a final line with truncation info when `--budget` truncates
     /// output. In grep mode, callers should use [`print_budget_summary`] instead.
     pub fn format_truncation_meta(&mut self, meta: &TruncationMeta) -> std::io::Result<()> {
-        let line = serde_json::to_string(meta).map_err(std::io::Error::other)?;
+        let line = Self::serialize_structured(self.format, meta)?;
         writeln!(self.writer, "{line}")
     }
 }
@@ -521,9 +570,9 @@ fn write_highlighted<W: Write>(writer: &mut W, content: &str, re: &Regex) -> std
 // Stderr helpers
 // ---------------------------------------------------------------------------
 
-/// Print a hint message to stderr (suppressed when `json` is true).
-pub fn print_hint(msg: &str, json: bool) {
-    if !json {
+/// Print a hint message to stderr (suppressed when `suppress` is true).
+pub fn print_hint(msg: &str, suppress: bool) {
+    if !suppress {
         eprintln!("hint: {msg}");
     }
 }
@@ -572,13 +621,13 @@ pub fn print_error(msg: &str) {
 /// Format a [`WonkError`] to stderr with structured `error:` / `hint:` lines.
 ///
 /// * Always prints `error: <message>` to stderr.
-/// * When `json` is `false` and the error carries a contextual hint, also
+/// * When `suppress` is `false` and the error carries a contextual hint, also
 ///   prints `hint: <suggestion>` to stderr.
 /// * Returns the appropriate process exit code.
-pub fn format_error(err: &crate::errors::WonkError, json: bool) -> i32 {
+pub fn format_error(err: &crate::errors::WonkError, suppress: bool) -> i32 {
     print_error(&format!("{err}"));
     if let Some(hint) = err.hint() {
-        print_hint(hint, json);
+        print_hint(hint, suppress);
     }
     err.exit_code()
 }
@@ -592,13 +641,13 @@ mod tests {
     use super::*;
 
     /// Helper: renders output into a String (no color).
-    fn render<F, T: std::fmt::Debug>(json: bool, f: F) -> String
+    fn render<F, T: std::fmt::Debug>(format: OutputFormat, f: F) -> String
     where
         F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<T>,
     {
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, json, false);
+            let mut fmt = Formatter::new(&mut buf, format, false);
             f(&mut fmt).unwrap();
         }
         String::from_utf8(buf).unwrap()
@@ -611,7 +660,7 @@ mod tests {
     {
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, false, true);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, true);
             f(&mut fmt).unwrap();
         }
         String::from_utf8(buf).unwrap()
@@ -628,7 +677,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
         };
-        let out = render(false, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
     }
 
@@ -641,7 +690,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
         };
-        let out = render(true, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["file"], "src/main.rs");
         assert_eq!(v["line"], 42);
@@ -664,7 +713,7 @@ mod tests {
             signature: "fn main()".into(),
             language: "Rust".into(),
         };
-        let out = render(false, |fmt| fmt.format_symbol(&sym));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_symbol(&sym));
         assert_eq!(out, "src/main.rs:10:  fn main()\n");
     }
 
@@ -681,7 +730,7 @@ mod tests {
             signature: "fn main()".into(),
             language: "Rust".into(),
         };
-        let out = render(true, |fmt| fmt.format_symbol(&sym));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_symbol(&sym));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["name"], "main");
         assert_eq!(v["kind"], "function");
@@ -704,7 +753,7 @@ mod tests {
             signature: "struct Foo".into(),
             language: "Rust".into(),
         };
-        let out = render(true, |fmt| fmt.format_symbol(&sym));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_symbol(&sym));
         // With skip_serializing_if = None, the JSON should not contain these keys.
         assert!(!out.contains("end_line"));
         assert!(!out.contains("scope"));
@@ -722,7 +771,7 @@ mod tests {
             col: 4,
             context: "    foo(42);".into(),
         };
-        let out = render(false, |fmt| fmt.format_reference(&reference));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_reference(&reference));
         assert_eq!(out, "src/lib.rs:99:    foo(42);\n");
     }
 
@@ -736,7 +785,7 @@ mod tests {
             col: 4,
             context: "    foo(42);".into(),
         };
-        let out = render(true, |fmt| fmt.format_reference(&reference));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_reference(&reference));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["name"], "foo");
         assert_eq!(v["kind"], "call");
@@ -754,7 +803,7 @@ mod tests {
             signature: "fn process(input: &str) -> Result<()>".into(),
             language: "Rust".into(),
         };
-        let out = render(false, |fmt| fmt.format_signature(&sig));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_signature(&sig));
         assert_eq!(
             out,
             "src/engine.rs:15:  fn process(input: &str) -> Result<()>\n"
@@ -770,7 +819,7 @@ mod tests {
             signature: "fn process(input: &str) -> Result<()>".into(),
             language: "Rust".into(),
         };
-        let out = render(true, |fmt| fmt.format_signature(&sig));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_signature(&sig));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["name"], "process");
         assert_eq!(v["signature"], "fn process(input: &str) -> Result<()>");
@@ -783,7 +832,7 @@ mod tests {
         let entry = FileEntry {
             path: "src/output.rs".into(),
         };
-        let out = render(false, |fmt| fmt.format_file_list(&entry));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_file_list(&entry));
         assert_eq!(out, "src/output.rs\n");
     }
 
@@ -792,7 +841,7 @@ mod tests {
         let entry = FileEntry {
             path: "src/output.rs".into(),
         };
-        let out = render(true, |fmt| fmt.format_file_list(&entry));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_file_list(&entry));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["path"], "src/output.rs");
     }
@@ -805,7 +854,7 @@ mod tests {
             file: "src/main.rs".into(),
             depends_on: "src/lib.rs".into(),
         };
-        let out = render(false, |fmt| fmt.format_dep(&dep));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_dep(&dep));
         assert_eq!(out, "src/main.rs -> src/lib.rs\n");
     }
 
@@ -815,7 +864,7 @@ mod tests {
             file: "src/main.rs".into(),
             depends_on: "src/lib.rs".into(),
         };
-        let out = render(true, |fmt| fmt.format_dep(&dep));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_dep(&dep));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["file"], "src/main.rs");
         assert_eq!(v["depends_on"], "src/lib.rs");
@@ -841,7 +890,7 @@ mod tests {
                 annotation: None,
             },
         ];
-        let out = render(true, |fmt| {
+        let out = render(OutputFormat::Json, |fmt| {
             for r in &results {
                 fmt.format_search_result(r)?;
             }
@@ -873,7 +922,7 @@ mod tests {
                 annotation: None,
             },
         ];
-        let out = render(false, |fmt| {
+        let out = render(OutputFormat::Grep, |fmt| {
             for r in &results {
                 fmt.format_search_result(r)?;
             }
@@ -908,7 +957,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: Some("(+3 other locations)".into()),
         };
-        let out = render(false, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}  (+3 other locations)\n");
     }
 
@@ -921,7 +970,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: None,
         };
-        let out = render(false, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}\n");
     }
 
@@ -934,7 +983,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: Some("(+2 other locations)".into()),
         };
-        let out = render(true, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["annotation"], "(+2 other locations)");
     }
@@ -948,7 +997,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: None,
         };
-        let out = render(true, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         assert!(!out.contains("annotation"));
     }
 
@@ -964,7 +1013,7 @@ mod tests {
             annotation: None,
         };
         // Grep format: file:line:content (colons in content are fine)
-        let out = render(false, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "cfg.toml:5:key: value\n");
     }
 
@@ -977,7 +1026,7 @@ mod tests {
             content: "he said \"hello\"".into(),
             annotation: None,
         };
-        let out = render(true, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["content"], "he said \"hello\"");
     }
@@ -1022,7 +1071,7 @@ mod tests {
             indent: 0,
             scope: None,
         };
-        let out = render(false, |fmt| fmt.format_ls_symbol(&entry));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_ls_symbol(&entry));
         assert_eq!(out, "src/main.rs:1:  function main\n");
     }
 
@@ -1036,7 +1085,7 @@ mod tests {
             indent: 1,
             scope: Some("Worker".into()),
         };
-        let out = render(false, |fmt| fmt.format_ls_symbol(&entry));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_ls_symbol(&entry));
         assert_eq!(out, "src/lib.rs:15:    method process\n");
     }
 
@@ -1050,7 +1099,7 @@ mod tests {
             indent: 2,
             scope: Some("Outer".into()),
         };
-        let out = render(false, |fmt| fmt.format_ls_symbol(&entry));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_ls_symbol(&entry));
         assert_eq!(out, "src/lib.rs:30:      function inner\n");
     }
 
@@ -1064,7 +1113,7 @@ mod tests {
             indent: 1,
             scope: Some("Worker".into()),
         };
-        let out = render(true, |fmt| fmt.format_ls_symbol(&entry));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_ls_symbol(&entry));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["name"], "process");
         assert_eq!(v["kind"], "method");
@@ -1083,7 +1132,7 @@ mod tests {
             indent: 2,
             scope: None,
         };
-        let out = render(true, |fmt| fmt.format_ls_symbol(&entry));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_ls_symbol(&entry));
         // indent should NOT appear in JSON
         assert!(!out.contains("indent"));
         // scope should be omitted when None
@@ -1102,7 +1151,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
         };
-        let out = render(false, |fmt| fmt.format_search_result(&result));
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
     }
 
@@ -1176,7 +1225,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, true, true);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Json, true);
             fmt.format_search_result(&result).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
@@ -1197,7 +1246,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, false, true);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, true);
             fmt.set_highlight("main", false, false);
             fmt.format_search_result(&result).unwrap();
         }
@@ -1220,7 +1269,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, false, true);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, true);
             fmt.set_highlight("ma.n", true, false);
             fmt.format_search_result(&result).unwrap();
         }
@@ -1243,7 +1292,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, false, true);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, true);
             fmt.set_highlight("zzzzz", false, false);
             fmt.format_search_result(&result).unwrap();
         }
@@ -1322,7 +1371,7 @@ mod tests {
             budget_tokens: 500,
             used_tokens: 498,
         };
-        let out = render(true, |fmt| fmt.format_truncation_meta(&meta));
+        let out = render(OutputFormat::Json, |fmt| fmt.format_truncation_meta(&meta));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["truncated_count"], 42);
         assert_eq!(v["budget_tokens"], 500);
@@ -1359,7 +1408,7 @@ mod tests {
         let mut emitted = 0usize;
         let mut truncated = 0usize;
         {
-            let mut fmt = Formatter::new(&mut buf, false, false);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
             // Set a small budget: each line is ~40 chars -> ~10 tokens.
             // Budget of 25 tokens should allow ~2-3 results.
             fmt.set_budget(25);
@@ -1397,7 +1446,7 @@ mod tests {
         let mut emitted = 0usize;
         let mut truncated = 0usize;
         {
-            let mut fmt = Formatter::new(&mut buf, true, false);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Json, false);
             fmt.set_budget(25);
             for r in &results {
                 match fmt.format_search_result(r) {
@@ -1441,7 +1490,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut emitted = 0usize;
         {
-            let mut fmt = Formatter::new(&mut buf, false, false);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
             // No set_budget call - no budget.
             for r in &results {
                 match fmt.format_search_result(r) {
@@ -1457,7 +1506,7 @@ mod tests {
     #[test]
     fn budget_tracks_used_tokens() {
         let mut buf = Vec::new();
-        let mut fmt = Formatter::new(&mut buf, false, false);
+        let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
         fmt.set_budget(1000);
         assert_eq!(fmt.budget_used(), 0);
 
@@ -1493,7 +1542,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut emitted = 0usize;
         {
-            let mut fmt = Formatter::new(&mut buf, false, false);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
             fmt.set_budget(30);
             for s in &syms {
                 match fmt.format_symbol(s) {
@@ -1518,7 +1567,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, false, true);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, true);
             fmt.set_highlight("hello", false, true);
             fmt.format_search_result(&result).unwrap();
         }
@@ -1554,5 +1603,115 @@ mod tests {
     fn mode_indicator_suppressed() {
         assert_eq!(format_mode_indicator(5, true), None);
         assert_eq!(format_mode_indicator(0, true), None);
+    }
+
+    // -- TOON output tests ---------------------------------------------------
+
+    #[test]
+    fn search_result_toon_format() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+            annotation: None,
+        };
+        let out = render(OutputFormat::Toon, |fmt| fmt.format_search_result(&result));
+        assert!(!out.is_empty());
+        // Should be parseable by serde_toon2.
+        let parsed: SearchOutput = serde_toon2::from_str(out.trim()).unwrap();
+        assert_eq!(parsed.file, "src/main.rs");
+        assert_eq!(parsed.line, 42);
+    }
+
+    #[test]
+    fn symbol_toon_format() {
+        let sym = SymbolOutput {
+            name: "main".into(),
+            kind: "function".into(),
+            file: "src/main.rs".into(),
+            line: 10,
+            col: 0,
+            end_line: None,
+            scope: None,
+            signature: "fn main()".into(),
+            language: "Rust".into(),
+        };
+        let out = render(OutputFormat::Toon, |fmt| fmt.format_symbol(&sym));
+        let parsed: SymbolOutput = serde_toon2::from_str(out.trim()).unwrap();
+        assert_eq!(parsed.name, "main");
+        assert_eq!(parsed.kind, "function");
+    }
+
+    #[test]
+    fn reference_toon_format() {
+        let reference = RefOutput {
+            name: "foo".into(),
+            kind: "call".into(),
+            file: "src/lib.rs".into(),
+            line: 99,
+            col: 4,
+            context: "    foo(42);".into(),
+        };
+        let out = render(OutputFormat::Toon, |fmt| fmt.format_reference(&reference));
+        let parsed: RefOutput = serde_toon2::from_str(out.trim()).unwrap();
+        assert_eq!(parsed.name, "foo");
+    }
+
+    #[test]
+    fn signature_toon_format() {
+        let sig = SignatureOutput {
+            name: "process".into(),
+            file: "src/engine.rs".into(),
+            line: 15,
+            signature: "fn process(input: &str) -> Result<()>".into(),
+            language: "Rust".into(),
+        };
+        let out = render(OutputFormat::Toon, |fmt| fmt.format_signature(&sig));
+        let parsed: SignatureOutput = serde_toon2::from_str(out.trim()).unwrap();
+        assert_eq!(parsed.name, "process");
+    }
+
+    #[test]
+    fn file_list_toon_format() {
+        let entry = FileEntry {
+            path: "src/output.rs".into(),
+        };
+        let out = render(OutputFormat::Toon, |fmt| fmt.format_file_list(&entry));
+        let parsed: FileEntry = serde_toon2::from_str(out.trim()).unwrap();
+        assert_eq!(parsed.path, "src/output.rs");
+    }
+
+    #[test]
+    fn dep_toon_format() {
+        let dep = DepOutput {
+            file: "src/main.rs".into(),
+            depends_on: "src/lib.rs".into(),
+        };
+        let out = render(OutputFormat::Toon, |fmt| fmt.format_dep(&dep));
+        let parsed: DepOutput = serde_toon2::from_str(out.trim()).unwrap();
+        assert_eq!(parsed.file, "src/main.rs");
+        assert_eq!(parsed.depends_on, "src/lib.rs");
+    }
+
+    #[test]
+    fn toon_output_has_no_ansi_codes() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+            annotation: None,
+        };
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Toon, true);
+            fmt.format_search_result(&result).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains('\x1b'),
+            "TOON output should never contain ANSI escape codes, got: {out:?}"
+        );
     }
 }

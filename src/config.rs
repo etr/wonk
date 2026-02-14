@@ -47,7 +47,7 @@ pub struct IndexConfig {
 /// Output / display settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputConfig {
-    /// Default output format: `"grep"` or `"json"`.
+    /// Default output format: `"grep"`, `"json"`, or `"toon"`.
     pub default_format: String,
     /// Color mode: `"auto"`, `"always"`, or `"never"`.
     pub color: String,

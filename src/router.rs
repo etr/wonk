@@ -17,8 +17,8 @@ use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
 use crate::output::{
-    self, BudgetStatus, Formatter, LsSymbolEntry, RefOutput, SearchOutput, SignatureOutput,
-    SymbolOutput,
+    self, BudgetStatus, Formatter, LsSymbolEntry, OutputFormat, RefOutput, SearchOutput,
+    SignatureOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -54,24 +54,33 @@ pub fn detect_search_mode(raw: bool, smart: bool, symbol_count: u64) -> SearchMo
 // ---------------------------------------------------------------------------
 
 pub fn dispatch(cli: Cli) -> Result<()> {
-    let json = cli.json;
     let quiet = cli.quiet;
-    let suppress = json || quiet;
     let stdout = io::stdout().lock();
 
-    // Resolve color: load config and check env/TTY.
-    let color = if json {
+    // Load config early so we can resolve format and color.
+    let repo_root_for_config = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok());
+    let config = crate::config::Config::load(repo_root_for_config.as_deref()).unwrap_or_default();
+
+    // Resolve format: CLI flag > config default_format > grep.
+    let format = cli.format.unwrap_or_else(|| {
+        config
+            .output
+            .default_format
+            .parse()
+            .unwrap_or(OutputFormat::Grep)
+    });
+    let suppress = format.is_structured() || quiet;
+
+    // Resolve color: disabled for structured formats.
+    let color = if format.is_structured() {
         false
     } else {
-        let repo_root_for_config = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| db::find_repo_root(&cwd).ok());
-        let config =
-            crate::config::Config::load(repo_root_for_config.as_deref()).unwrap_or_default();
         crate::color::resolve_color(&config.output.color)
     };
 
-    let mut fmt = Formatter::new(stdout, json, color);
+    let mut fmt = Formatter::new(stdout, format, color);
     let budget_limit = cli.budget;
     if let Some(limit) = budget_limit {
         fmt.set_budget(limit);
@@ -167,7 +176,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Sym(args) => {
             let repo_root =
@@ -209,7 +218,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Ref(args) => {
             let router = QueryRouter::new(None, false);
@@ -241,7 +250,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Sig(args) => {
             let router = QueryRouter::new(None, false);
@@ -272,11 +281,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Ls(args) => {
             let truncated = dispatch_ls(args, suppress, &mut fmt)?;
-            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Deps(args) => {
             let repo_root =
@@ -307,7 +316,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Rdeps(args) => {
             let repo_root =
@@ -338,7 +347,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, json)?;
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Init(args) => {
             let repo_root = std::env::current_dir()?;
@@ -401,19 +410,19 @@ fn is_query_command(cmd: &Command) -> bool {
 
 /// Emit a budget summary if any results were truncated.
 ///
-/// In grep mode, prints the summary to stderr. In JSON mode, emits a
-/// `TruncationMeta` JSON line to the formatter.
+/// In grep mode, prints the summary to stderr. In structured mode (JSON/TOON),
+/// emits a truncation metadata line to the formatter.
 fn emit_budget_summary<W: io::Write>(
     fmt: &mut Formatter<W>,
     truncated: usize,
     budget_limit: Option<usize>,
-    json: bool,
+    format: OutputFormat,
 ) -> Result<()> {
     if truncated == 0 {
         return Ok(());
     }
     if let Some(limit) = budget_limit {
-        if json {
+        if format.is_structured() {
             let meta = output::TruncationMeta {
                 truncated_count: truncated,
                 budget_tokens: limit,
@@ -1815,7 +1824,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, false, false);
+            let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
             for dep in &deps {
                 let out = output::DepOutput {
                     file: "src/main.ts".to_string(),
@@ -1848,7 +1857,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, true, false);
+            let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Json, false);
             for dep in &deps {
                 let out = output::DepOutput {
                     file: "src/main.ts".to_string(),
@@ -2303,7 +2312,7 @@ mod tests {
         // Format as grep-style text
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, false, false);
+            let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
             for sym in &results {
                 let out = SignatureOutput {
                     name: sym.name.clone(),
@@ -2344,7 +2353,7 @@ mod tests {
         // Format as JSON
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, true, false);
+            let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Json, false);
             for sym in &results {
                 let out = SignatureOutput {
                     name: sym.name.clone(),
@@ -2396,7 +2405,7 @@ mod tests {
         // Format as grep text
         let mut buf = Vec::new();
         {
-            let mut fmt = output::Formatter::new(&mut buf, false, false);
+            let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
             let sym = &results[0];
             let out = SignatureOutput {
                 name: sym.name.clone(),
@@ -2440,12 +2449,12 @@ mod tests {
         name: &str,
         kind: Option<&str>,
         exact: bool,
-        json: bool,
+        format: OutputFormat,
     ) -> String {
         let results = router.query_symbols(name, kind, exact).unwrap();
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, json, false);
+            let mut fmt = Formatter::new(&mut buf, format, false);
             for sym in &results {
                 let out = SymbolOutput {
                     name: sym.name.clone(),
@@ -2485,7 +2494,7 @@ mod tests {
         .unwrap();
 
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_sym_query(&router, "processPayment", None, false, false);
+        let output = run_sym_query(&router, "processPayment", None, false, OutputFormat::Grep);
         assert_eq!(
             output.trim(),
             "src/billing.rs:42:  fn processPayment(amount: f64)"
@@ -2515,7 +2524,7 @@ mod tests {
         .unwrap();
 
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_sym_query(&router, "processPayment", None, false, true);
+        let output = run_sym_query(&router, "processPayment", None, false, OutputFormat::Json);
         let v: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
         assert_eq!(v["name"], "processPayment");
         assert_eq!(v["kind"], "method");
@@ -2565,7 +2574,7 @@ mod tests {
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
 
         // Substring match should find both.
-        let output = run_sym_query(&router, "process", None, false, false);
+        let output = run_sym_query(&router, "process", None, false, OutputFormat::Grep);
         let lines: Vec<&str> = output.trim().lines().collect();
         assert_eq!(
             lines.len(),
@@ -2613,7 +2622,7 @@ mod tests {
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
 
         // Exact match should find only processPayment.
-        let output = run_sym_query(&router, "processPayment", None, true, false);
+        let output = run_sym_query(&router, "processPayment", None, true, OutputFormat::Grep);
         let lines: Vec<&str> = output.trim().lines().collect();
         assert_eq!(lines.len(), 1, "--exact should return only exact matches");
         assert!(output.contains("processPayment"));
@@ -2657,7 +2666,13 @@ mod tests {
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
 
         // --kind function should only return the function.
-        let output = run_sym_query(&router, "Payment", Some("function"), true, false);
+        let output = run_sym_query(
+            &router,
+            "Payment",
+            Some("function"),
+            true,
+            OutputFormat::Grep,
+        );
         let lines: Vec<&str> = output.trim().lines().collect();
         assert_eq!(
             lines.len(),
@@ -2685,7 +2700,7 @@ mod tests {
         .unwrap();
 
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_sym_query(&router, "processPayment", None, false, false);
+        let output = run_sym_query(&router, "processPayment", None, false, OutputFormat::Grep);
         assert!(
             !output.is_empty(),
             "should fall back to grep when DB returns empty"
@@ -2714,7 +2729,7 @@ mod tests {
         .unwrap();
 
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_sym_query(&router, "processPayment", None, true, true);
+        let output = run_sym_query(&router, "processPayment", None, true, OutputFormat::Json);
         // end_line and scope should be omitted when None.
         assert!(!output.contains("end_line"));
         assert!(!output.contains("scope"));
@@ -2798,7 +2813,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, false, false);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
             fmt.format_reference(&reference).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
@@ -2820,7 +2835,7 @@ mod tests {
 
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, true, false);
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Json, false);
             fmt.format_reference(&reference).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
@@ -3055,11 +3070,11 @@ mod tests {
     // -- Ls dispatch integration tests ----------------------------------------
 
     /// Helper: run ls query through QueryRouter and format results.
-    fn run_ls_query(router: &QueryRouter, path: &str, tree: bool, json: bool) -> String {
+    fn run_ls_query(router: &QueryRouter, path: &str, tree: bool, format: OutputFormat) -> String {
         let results = router.query_symbols_in_file(path, tree).unwrap();
         let mut buf = Vec::new();
         {
-            let mut fmt = Formatter::new(&mut buf, json, false);
+            let mut fmt = Formatter::new(&mut buf, format, false);
             if tree {
                 let entries = build_tree_entries(&results);
                 for entry in &entries {
@@ -3113,7 +3128,7 @@ mod tests {
         .unwrap();
 
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_ls_query(&router, "src/main.rs", false, false);
+        let output = run_ls_query(&router, "src/main.rs", false, OutputFormat::Grep);
         let lines: Vec<&str> = output.trim().lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(output.contains("fn main()"));
@@ -3171,7 +3186,7 @@ mod tests {
         .unwrap();
 
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_ls_query(&router, "src/lib.py", true, false);
+        let output = run_ls_query(&router, "src/lib.py", true, OutputFormat::Grep);
         let lines: Vec<&str> = output.trim().lines().collect();
         assert_eq!(lines.len(), 3);
 
@@ -3220,7 +3235,7 @@ mod tests {
         .unwrap();
 
         let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_ls_query(&router, "src/lib.py", true, true);
+        let output = run_ls_query(&router, "src/lib.py", true, OutputFormat::Json);
         let lines: Vec<&str> = output.trim().lines().collect();
         assert_eq!(lines.len(), 2);
 

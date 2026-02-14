@@ -1,12 +1,14 @@
 use clap::{Parser, Subcommand};
 
+use crate::output::OutputFormat;
+
 /// wonk - code search and indexing tool
 #[derive(Parser, Debug)]
 #[command(name = "wonk", version, about)]
 pub struct Cli {
-    /// Output results as JSON
-    #[arg(long, global = true)]
-    pub json: bool,
+    /// Output format: grep (default), json, or toon
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<OutputFormat>,
 
     /// Suppress hint messages on stderr
     #[arg(short = 'q', long, global = true)]
