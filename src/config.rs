@@ -29,8 +29,6 @@ pub struct Config {
 /// Daemon-related settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DaemonConfig {
-    /// How many minutes of inactivity before the daemon shuts down.
-    pub idle_timeout_minutes: u64,
     /// Debounce interval in milliseconds for file-change events.
     pub debounce_ms: u64,
 }
@@ -66,10 +64,7 @@ pub struct IgnoreConfig {
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        Self {
-            idle_timeout_minutes: 30,
-            debounce_ms: 500,
-        }
+        Self { debounce_ms: 500 }
     }
 }
 
@@ -110,7 +105,6 @@ struct ConfigOverlay {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct DaemonOverlay {
-    idle_timeout_minutes: Option<u64>,
     debounce_ms: Option<u64>,
 }
 
@@ -142,13 +136,10 @@ impl Config {
     /// Apply an overlay on top of this config, replacing only the fields
     /// that are `Some` in the overlay.
     fn apply_overlay(&mut self, overlay: ConfigOverlay) {
-        if let Some(d) = overlay.daemon {
-            if let Some(v) = d.idle_timeout_minutes {
-                self.daemon.idle_timeout_minutes = v;
-            }
-            if let Some(v) = d.debounce_ms {
-                self.daemon.debounce_ms = v;
-            }
+        if let Some(d) = overlay.daemon
+            && let Some(v) = d.debounce_ms
+        {
+            self.daemon.debounce_ms = v;
         }
         if let Some(idx) = overlay.index {
             if let Some(v) = idx.max_file_size_kb {
@@ -311,7 +302,6 @@ mod tests {
         // No config files written.
         let config = env.load().unwrap();
         assert_eq!(config, Config::default());
-        assert_eq!(config.daemon.idle_timeout_minutes, 30);
         assert_eq!(config.daemon.debounce_ms, 500);
         assert_eq!(config.index.max_file_size_kb, 1024);
         assert!(config.index.additional_extensions.is_empty());
@@ -326,7 +316,6 @@ mod tests {
         env.write_global_config(
             r#"
 [daemon]
-idle_timeout_minutes = 60
 debounce_ms = 200
 
 [output]
@@ -336,7 +325,6 @@ default_format = "json"
 
         let config = env.load().unwrap();
         // Overridden values:
-        assert_eq!(config.daemon.idle_timeout_minutes, 60);
         assert_eq!(config.daemon.debounce_ms, 200);
         assert_eq!(config.output.default_format, "json");
         // Default values should remain:
@@ -350,7 +338,7 @@ default_format = "json"
         env.write_global_config(
             r#"
 [daemon]
-idle_timeout_minutes = 60
+debounce_ms = 200
 
 [output]
 color = "always"
@@ -361,7 +349,7 @@ color = "always"
         env.write_repo_config(
             r#"
 [daemon]
-idle_timeout_minutes = 10
+debounce_ms = 100
 
 [index]
 max_file_size_kb = 512
@@ -371,7 +359,7 @@ additional_extensions = ["toml", "yaml"]
 
         let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
         // Per-repo overrides global:
-        assert_eq!(config.daemon.idle_timeout_minutes, 10);
+        assert_eq!(config.daemon.debounce_ms, 100);
         // Per-repo sets index fields:
         assert_eq!(config.index.max_file_size_kb, 512);
         assert_eq!(
@@ -382,7 +370,6 @@ additional_extensions = ["toml", "yaml"]
         assert_eq!(config.output.color, "always");
         // Default not touched by either layer:
         assert_eq!(config.output.default_format, "grep");
-        assert_eq!(config.daemon.debounce_ms, 500);
     }
 
     #[test]
@@ -396,9 +383,9 @@ debounce_ms = 100
         );
 
         let config = env.load().unwrap();
-        // Only debounce_ms was set; idle_timeout_minutes should be the default.
+        // Only debounce_ms was set; other defaults should remain.
         assert_eq!(config.daemon.debounce_ms, 100);
-        assert_eq!(config.daemon.idle_timeout_minutes, 30);
+        assert_eq!(config.index.max_file_size_kb, 1024);
     }
 
     #[test]
@@ -446,7 +433,7 @@ patterns = ["*.bak"]
         env.write_global_config(
             r#"
 [daemon]
-idle_timeout_minutes = 45
+debounce_ms = 250
 some_future_key = true
 
 [some_future_section]
@@ -455,7 +442,7 @@ value = 42
         );
 
         let config = env.load().unwrap();
-        assert_eq!(config.daemon.idle_timeout_minutes, 45);
+        assert_eq!(config.daemon.debounce_ms, 250);
     }
 
     #[test]
@@ -464,7 +451,7 @@ value = 42
         env.write_global_config(
             r#"
 [daemon]
-idle_timeout_minutes = "not a number"
+debounce_ms = "not a number"
 "#,
         );
 
@@ -505,7 +492,7 @@ color = "never"
         assert_eq!(config.output.default_format, "json");
         assert_eq!(config.output.color, "never");
         // Everything else should be defaults.
-        assert_eq!(config.daemon.idle_timeout_minutes, 30);
+        assert_eq!(config.daemon.debounce_ms, 500);
     }
 
     #[test]
@@ -514,7 +501,6 @@ color = "never"
         env.write_global_config(
             r#"
 [daemon]
-idle_timeout_minutes = 15
 debounce_ms = 250
 
 [index]
@@ -531,7 +517,6 @@ patterns = ["*.tmp", "cache/"]
         );
 
         let config = env.load().unwrap();
-        assert_eq!(config.daemon.idle_timeout_minutes, 15);
         assert_eq!(config.daemon.debounce_ms, 250);
         assert_eq!(config.index.max_file_size_kb, 2048);
         assert_eq!(
@@ -544,6 +529,25 @@ patterns = ["*.tmp", "cache/"]
             config.ignore.patterns,
             vec!["*.tmp".to_string(), "cache/".to_string()]
         );
+    }
+
+    #[test]
+    fn legacy_idle_timeout_minutes_silently_ignored() {
+        // Old config files may still contain idle_timeout_minutes.
+        // Since DaemonOverlay uses #[serde(default)] without deny_unknown_fields,
+        // the key should be silently ignored with no error.
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[daemon]
+idle_timeout_minutes = 60
+debounce_ms = 200
+"#,
+        );
+
+        let config = env.load().unwrap();
+        // idle_timeout_minutes is ignored; debounce_ms is applied.
+        assert_eq!(config.daemon.debounce_ms, 200);
     }
 
     #[test]
@@ -560,7 +564,6 @@ patterns = ["*.tmp", "cache/"]
         env.write_global_config(
             r#"
 [daemon]
-idle_timeout_minutes = 60
 debounce_ms = 200
 
 [index]
@@ -589,7 +592,6 @@ color = "never"
         let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
 
         // From global:
-        assert_eq!(config.daemon.idle_timeout_minutes, 60);
         assert_eq!(config.index.max_file_size_kb, 2048);
         assert_eq!(config.output.default_format, "json");
         assert_eq!(config.ignore.patterns, vec!["*.log".to_string()]);

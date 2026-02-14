@@ -310,7 +310,6 @@ value.
 
 ```toml
 [daemon]
-idle_timeout_minutes = 30     # Minutes of inactivity before daemon shuts down
 debounce_ms = 500             # Debounce interval for file-change events (ms)
 
 [index]
@@ -331,7 +330,6 @@ patterns = []                 # Glob patterns to exclude from indexing
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `idle_timeout_minutes` | `30` | Minutes of inactivity before the daemon shuts down |
 | `debounce_ms` | `500` | Debounce interval in milliseconds for file-change events |
 
 **`[index]`**
@@ -361,7 +359,7 @@ up to date. The daemon:
 
 - Auto-spawns on first query (including after auto-indexing) if not already running
 - Debounces file-system events (default: 500ms)
-- Shuts down after idle timeout (default: 30 minutes)
+- Runs indefinitely until explicitly stopped
 - Manages its PID file automatically
 
 Use `wonk daemon start`, `wonk daemon stop`, and `wonk daemon status` to
