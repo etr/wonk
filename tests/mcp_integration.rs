@@ -75,7 +75,7 @@ fn mcp_server_initialize_and_list_tools() {
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-11-05",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": {"name": "test", "version": "0.1"}
         }
@@ -87,7 +87,7 @@ fn mcp_server_initialize_and_list_tools() {
     assert!(init_resp["error"].is_null());
     assert_eq!(
         init_resp["result"]["protocolVersion"].as_str().unwrap(),
-        "2025-11-05"
+        "2025-11-25"
     );
     assert_eq!(
         init_resp["result"]["serverInfo"]["name"].as_str().unwrap(),

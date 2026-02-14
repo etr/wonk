@@ -88,7 +88,7 @@ impl Response {
 // MCP protocol types
 // ---------------------------------------------------------------------------
 
-const PROTOCOL_VERSION: &str = "2025-11-05";
+const PROTOCOL_VERSION: &str = "2025-11-25";
 
 #[derive(Debug, Serialize)]
 struct InitializeResult {
