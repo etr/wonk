@@ -3,6 +3,7 @@
 //! Provides structured error types for the query routing layer:
 //! - [`DbError`] for database/index errors (enables fallback decisions)
 //! - [`SearchError`] for grep-based search failures
+//! - [`EmbeddingError`] for embedding / semantic-search failures
 //! - [`WonkError`] as the unified top-level error type
 //!
 //! The [`WonkError`] type carries contextual hints and exit codes so that
@@ -52,6 +53,30 @@ pub enum SearchError {
     SearchFailed(String),
 }
 
+/// Errors arising from the embedding / semantic-search layer.
+#[derive(Error, Debug)]
+pub enum EmbeddingError {
+    /// Cannot connect to the Ollama server.
+    #[error("cannot connect to Ollama embedding server")]
+    OllamaUnreachable,
+
+    /// Ollama returned an error response.
+    #[error("Ollama error: {0}")]
+    OllamaError(String),
+
+    /// The response from Ollama could not be parsed.
+    #[error("invalid embedding response")]
+    InvalidResponse,
+
+    /// No embeddings exist in the index.
+    #[error("no embeddings found; run `wonk init --embed` to generate them")]
+    NoEmbeddings,
+
+    /// Failed to chunk a symbol body for embedding.
+    #[error("failed to chunk symbol for embedding")]
+    ChunkingFailed,
+}
+
 // ---------------------------------------------------------------------------
 // Unified application error
 // ---------------------------------------------------------------------------
@@ -67,6 +92,9 @@ pub enum WonkError {
 
     #[error(transparent)]
     Search(#[from] SearchError),
+
+    #[error(transparent)]
+    Embedding(#[from] EmbeddingError),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -100,6 +128,12 @@ impl WonkError {
             }
             WonkError::Search(SearchError::SearchFailed(_)) => {
                 Some("check your search pattern for syntax errors")
+            }
+            WonkError::Embedding(EmbeddingError::OllamaUnreachable) => {
+                Some("ensure Ollama is running: `ollama serve`")
+            }
+            WonkError::Embedding(EmbeddingError::NoEmbeddings) => {
+                Some("run `wonk init --embed` to generate embeddings")
             }
             WonkError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Some("verify the file or directory exists")
@@ -232,5 +266,73 @@ mod tests {
             rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(1), Some("test".into()));
         let err = WonkError::Db(DbError::QueryFailed(inner));
         assert!(err.hint().unwrap().contains("rebuild"));
+    }
+
+    // -- EmbeddingError tests -----------------------------------------------
+
+    #[test]
+    fn embedding_error_ollama_unreachable_display() {
+        let err = EmbeddingError::OllamaUnreachable;
+        assert_eq!(
+            format!("{err}"),
+            "cannot connect to Ollama embedding server"
+        );
+    }
+
+    #[test]
+    fn embedding_error_ollama_error_display() {
+        let err = EmbeddingError::OllamaError("model not found".to_string());
+        assert_eq!(format!("{err}"), "Ollama error: model not found");
+    }
+
+    #[test]
+    fn embedding_error_invalid_response_display() {
+        let err = EmbeddingError::InvalidResponse;
+        assert_eq!(format!("{err}"), "invalid embedding response");
+    }
+
+    #[test]
+    fn embedding_error_no_embeddings_display() {
+        let err = EmbeddingError::NoEmbeddings;
+        assert_eq!(
+            format!("{err}"),
+            "no embeddings found; run `wonk init --embed` to generate them"
+        );
+    }
+
+    #[test]
+    fn embedding_error_chunking_failed_display() {
+        let err = EmbeddingError::ChunkingFailed;
+        assert_eq!(format!("{err}"), "failed to chunk symbol for embedding");
+    }
+
+    #[test]
+    fn wonk_error_from_embedding_error() {
+        let emb_err = EmbeddingError::NoEmbeddings;
+        let wonk_err: WonkError = emb_err.into();
+        assert!(matches!(
+            wonk_err,
+            WonkError::Embedding(EmbeddingError::NoEmbeddings)
+        ));
+    }
+
+    #[test]
+    fn hint_ollama_unreachable() {
+        let err = WonkError::Embedding(EmbeddingError::OllamaUnreachable);
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("Ollama"));
+    }
+
+    #[test]
+    fn hint_no_embeddings() {
+        let err = WonkError::Embedding(EmbeddingError::NoEmbeddings);
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("wonk init --embed"));
+    }
+
+    #[test]
+    fn exit_code_embedding_error() {
+        let err = WonkError::Embedding(EmbeddingError::NoEmbeddings);
+        assert_eq!(err.exit_code(), EXIT_ERROR);
     }
 }
