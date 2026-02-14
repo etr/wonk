@@ -225,6 +225,11 @@ impl<W: Write> Formatter<W> {
         self.budget = Some(TokenBudget::new(limit));
     }
 
+    /// Borrow the underlying writer for direct output (e.g. table headers).
+    pub fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
     /// Return the number of tokens consumed so far (0 if no budget is set).
     pub fn budget_used(&self) -> usize {
         self.budget.as_ref().map_or(0, |b| b.used())

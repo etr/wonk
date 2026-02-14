@@ -371,11 +371,47 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             DaemonCommand::Start => {
                 output::print_hint("daemon start: not yet implemented", suppress);
             }
-            DaemonCommand::Stop => {
-                output::print_hint("daemon stop: not yet implemented", suppress);
+            DaemonCommand::Stop(stop_args) => {
+                if stop_args.all {
+                    let repo_root = std::env::current_dir()
+                        .ok()
+                        .and_then(|cwd| db::find_repo_root(&cwd).ok());
+                    let results = crate::daemon::stop_all_daemons(repo_root.as_deref());
+                    for (repo_path, result) in &results {
+                        match result {
+                            Ok(()) => {
+                                output::print_hint(
+                                    &format!("stopped daemon for {repo_path}"),
+                                    suppress,
+                                );
+                            }
+                            Err(e) => {
+                                output::print_error(
+                                    &format!("failed to stop daemon for {repo_path}: {e}"),
+                                );
+                            }
+                        }
+                    }
+                    if results.is_empty() {
+                        output::print_hint("no running daemons found", suppress);
+                    }
+                } else {
+                    output::print_hint("daemon stop: not yet implemented", suppress);
+                }
             }
             DaemonCommand::Status => {
                 output::print_hint("daemon status: not yet implemented", suppress);
+            }
+            DaemonCommand::List => {
+                let repo_root = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| db::find_repo_root(&cwd).ok());
+                let daemons = crate::daemon::discover_all_daemons(repo_root.as_deref());
+                if daemons.is_empty() {
+                    output::print_hint("no running daemons found", suppress);
+                } else {
+                    dispatch_daemon_list(&mut fmt, &daemons, format)?;
+                }
             }
         },
         Command::Repos(args) => match args.command {
@@ -449,6 +485,37 @@ fn spawn_daemon_background(repo_root: &Path) {
             .stderr(std::process::Stdio::null())
             .spawn();
     }
+}
+
+/// Handle `wonk daemon list` dispatch.
+///
+/// Prints a table of running daemons (grep mode) or JSON array (structured).
+fn dispatch_daemon_list<W: io::Write>(
+    fmt: &mut Formatter<W>,
+    daemons: &[crate::daemon::DaemonEntry],
+    format: OutputFormat,
+) -> Result<()> {
+    if format.is_structured() {
+        // JSON / TOON: emit as a JSON array.
+        let json = serde_json::to_string(&daemons)?;
+        writeln!(fmt.writer_mut(), "{json}")?;
+    } else {
+        // Grep mode: table format.
+        let header = format!(
+            "{:<10} {:<40} {:<12} {}",
+            "PID", "REPO PATH", "UPTIME", "STATUS"
+        );
+        writeln!(fmt.writer_mut(), "{header}")?;
+        for entry in daemons {
+            let status = if entry.alive { "running" } else { "dead" };
+            let line = format!(
+                "{:<10} {:<40} {:<12} {}",
+                entry.pid, entry.repo_path, entry.uptime, status
+            );
+            writeln!(fmt.writer_mut(), "{line}")?;
+        }
+    }
+    Ok(())
 }
 
 /// Handle `wonk ls <path>` dispatch.

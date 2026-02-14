@@ -439,6 +439,184 @@ pub fn daemon_status(repo_root: &Path, local: bool) -> Result<Option<u32>> {
 }
 
 // ---------------------------------------------------------------------------
+// Daemon discovery
+// ---------------------------------------------------------------------------
+
+/// A discovered daemon entry with its metadata.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DaemonEntry {
+    pub pid: u32,
+    pub repo_path: String,
+    pub uptime: String,
+    pub alive: bool,
+    #[serde(skip)]
+    pub index_dir: PathBuf,
+}
+
+/// Format a duration since `start_epoch` (Unix seconds) as a human-readable
+/// uptime string.  Returns `"unknown"` if `start_epoch` is `None`.
+///
+/// Examples: `"3m 12s"`, `"2h 45m"`, `"1d 3h"`, `"unknown"`.
+pub fn format_uptime(start_epoch: Option<i64>) -> String {
+    let Some(start) = start_epoch else {
+        return "unknown".to_string();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    format_duration(now.saturating_sub(start))
+}
+
+/// Pure function: format a number of seconds as a human-readable duration.
+fn format_duration(secs: i64) -> String {
+    if secs < 0 {
+        return "unknown".to_string();
+    }
+    let secs = secs as u64;
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Discover daemons under a given `repos_dir` (e.g. `~/.wonk/repos/`)
+/// and optionally a local repo root (for `.wonk/daemon.pid`).
+///
+/// Entries with dead processes have their PID files removed (stale cleanup).
+/// Only alive entries are returned.
+pub fn discover_daemons_in(repos_dir: &Path, local_repo_root: Option<&Path>) -> Vec<DaemonEntry> {
+    let mut entries = Vec::new();
+    let mut seen_pids = std::collections::HashSet::new();
+
+    // Scan central repos directory: ~/.wonk/repos/*/daemon.pid
+    if repos_dir.is_dir()
+        && let Ok(read_dir) = fs::read_dir(repos_dir)
+    {
+        for entry in read_dir.flatten() {
+            let index_dir = entry.path();
+            if !index_dir.is_dir() {
+                continue;
+            }
+            if let Some(daemon_entry) = probe_index_dir(&index_dir)
+                && seen_pids.insert(daemon_entry.pid)
+            {
+                entries.push(daemon_entry);
+            }
+        }
+    }
+
+    // Check local index: <repo>/.wonk/daemon.pid
+    if let Some(repo_root) = local_repo_root {
+        let local_index_dir = repo_root.join(".wonk");
+        if local_index_dir.is_dir()
+            && let Some(daemon_entry) = probe_index_dir(&local_index_dir)
+            && seen_pids.insert(daemon_entry.pid)
+        {
+            entries.push(daemon_entry);
+        }
+    }
+
+    entries
+}
+
+/// Probe a single index directory for a daemon.pid file.
+///
+/// Returns `Some(DaemonEntry)` if the PID file exists and the process is alive.
+/// Removes stale PID files and returns `None` if the process is dead.
+fn probe_index_dir(index_dir: &Path) -> Option<DaemonEntry> {
+    let pid_path = pid_file_path(index_dir);
+    let contents = fs::read_to_string(&pid_path).ok()?;
+    let pid: u32 = contents.trim().parse().ok()?;
+
+    if !process_alive(pid) {
+        // Stale: remove the PID file.
+        let _ = fs::remove_file(&pid_path);
+        return None;
+    }
+
+    // Read meta.json for repo path.
+    let db_path = index_dir.join("index.db");
+    let repo_path = crate::db::read_meta(&db_path)
+        .map(|m| m.repo_path)
+        .unwrap_or_else(|_| "<unknown>".to_string());
+
+    // Read uptime_start from daemon_status table if possible.
+    let uptime = crate::db::open(&db_path)
+        .ok()
+        .and_then(|conn| read_status(&conn, "uptime_start").ok().flatten())
+        .and_then(|s| s.parse::<i64>().ok());
+
+    Some(DaemonEntry {
+        pid,
+        repo_path,
+        uptime: format_uptime(uptime),
+        alive: true,
+        index_dir: index_dir.to_path_buf(),
+    })
+}
+
+/// Discover all running daemons (central + local).
+///
+/// `local_repo_root` is the current repo root (if known), used to also check
+/// for a local-mode daemon at `<repo>/.wonk/daemon.pid`.
+pub fn discover_all_daemons(local_repo_root: Option<&Path>) -> Vec<DaemonEntry> {
+    let repos_dir = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".wonk").join("repos"))
+        .unwrap_or_default();
+    discover_daemons_in(&repos_dir, local_repo_root)
+}
+
+/// Stop all running daemons.  Returns a list of `(repo_path, result)` pairs.
+pub fn stop_all_daemons(
+    local_repo_root: Option<&Path>,
+) -> Vec<(String, std::result::Result<(), String>)> {
+    let daemons = discover_all_daemons(local_repo_root);
+    let mut results = Vec::new();
+
+    for entry in daemons {
+        let result = stop_daemon_by_pid(entry.pid, &entry.index_dir);
+        results.push((entry.repo_path, result.map_err(|e| format!("{e:#}"))));
+    }
+
+    results
+}
+
+/// Send SIGTERM to a daemon by PID and wait for it to exit.
+fn stop_daemon_by_pid(pid: u32, index_dir: &Path) -> Result<()> {
+    if !process_alive(pid) {
+        let _ = remove_pid(index_dir);
+        bail!("daemon was not running (stale PID file removed)");
+    }
+
+    // Send SIGTERM.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if ret != 0 {
+        bail!("failed to send SIGTERM to PID {pid}");
+    }
+
+    // Wait briefly for exit.
+    for _ in 0..25 {
+        thread::sleep(Duration::from_millis(200));
+        if !process_alive(pid) {
+            let _ = remove_pid(index_dir);
+            return Ok(());
+        }
+    }
+
+    bail!("daemon (PID {pid}) did not exit within 5 seconds after SIGTERM");
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -825,5 +1003,212 @@ mod tests {
         assert!(info.files_queued.is_none());
         assert!(info.last_error.is_none());
         assert!(info.heartbeat.is_none());
+    }
+
+    // -- format_uptime / format_duration tests --------------------------------
+
+    #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(59), "59s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(60), "1m 0s");
+        assert_eq!(format_duration(192), "3m 12s");
+        assert_eq!(format_duration(3599), "59m 59s");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(3600), "1h 0m");
+        assert_eq!(format_duration(9900), "2h 45m");
+        assert_eq!(format_duration(86399), "23h 59m");
+    }
+
+    #[test]
+    fn test_format_duration_days() {
+        assert_eq!(format_duration(86400), "1d 0h");
+        assert_eq!(format_duration(97200), "1d 3h");
+    }
+
+    #[test]
+    fn test_format_duration_negative() {
+        assert_eq!(format_duration(-1), "unknown");
+    }
+
+    #[test]
+    fn test_format_uptime_none() {
+        assert_eq!(format_uptime(None), "unknown");
+    }
+
+    #[test]
+    fn test_format_uptime_recent() {
+        // Start time is "now" -> uptime should be 0s.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let result = format_uptime(Some(now));
+        assert_eq!(result, "0s");
+    }
+
+    // -- discover_daemons_in tests -------------------------------------------
+
+    #[test]
+    fn test_discover_daemons_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        fs::create_dir(&repos_dir).unwrap();
+
+        let entries = discover_daemons_in(&repos_dir, None);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_discover_daemons_nonexistent_dir() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("nonexistent");
+
+        let entries = discover_daemons_in(&repos_dir, None);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_discover_daemons_stale_cleaned() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abcdef1234567890");
+        fs::create_dir_all(&hash_dir).unwrap();
+
+        // Write a PID file with a dead PID.
+        let pid_path = hash_dir.join("daemon.pid");
+        fs::write(&pid_path, "4294967\n").unwrap();
+        assert!(pid_path.exists());
+
+        let entries = discover_daemons_in(&repos_dir, None);
+        assert!(entries.is_empty());
+        // Stale PID file should have been cleaned up.
+        assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn test_discover_daemons_alive_process() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abcdef1234567890");
+        fs::create_dir_all(&hash_dir).unwrap();
+
+        // Write our own PID (alive).
+        let pid_path = hash_dir.join("daemon.pid");
+        fs::write(&pid_path, format!("{}\n", process::id())).unwrap();
+
+        let entries = discover_daemons_in(&repos_dir, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pid, process::id());
+        assert!(entries[0].alive);
+        // No meta.json -> repo_path should be "<unknown>".
+        assert_eq!(entries[0].repo_path, "<unknown>");
+    }
+
+    #[test]
+    fn test_discover_daemons_with_meta_json() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abcdef1234567890");
+        fs::create_dir_all(&hash_dir).unwrap();
+
+        // Write a daemon.pid with our PID.
+        fs::write(hash_dir.join("daemon.pid"), format!("{}\n", process::id())).unwrap();
+
+        // Write a meta.json.
+        let meta = serde_json::json!({
+            "repo_path": "/home/user/my-project",
+            "created": 1700000000_u64,
+            "languages": ["rust"]
+        });
+        fs::write(
+            hash_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let entries = discover_daemons_in(&repos_dir, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].repo_path, "/home/user/my-project");
+    }
+
+    #[test]
+    fn test_discover_daemons_invalid_pid_content() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abcdef1234567890");
+        fs::create_dir_all(&hash_dir).unwrap();
+
+        // Write non-numeric PID.
+        fs::write(hash_dir.join("daemon.pid"), "not_a_number\n").unwrap();
+
+        let entries = discover_daemons_in(&repos_dir, None);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_discover_daemons_local_mode() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        fs::create_dir(&repos_dir).unwrap();
+
+        // Create a local .wonk dir with a daemon.pid.
+        let repo_root = dir.path().join("my-repo");
+        let local_wonk = repo_root.join(".wonk");
+        fs::create_dir_all(&local_wonk).unwrap();
+        fs::write(
+            local_wonk.join("daemon.pid"),
+            format!("{}\n", process::id()),
+        )
+        .unwrap();
+
+        let entries = discover_daemons_in(&repos_dir, Some(&repo_root));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pid, process::id());
+    }
+
+    #[test]
+    fn test_discover_daemons_dedup_by_pid() {
+        let dir = TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abcdef1234567890");
+        fs::create_dir_all(&hash_dir).unwrap();
+
+        let my_pid = process::id();
+
+        // Write our PID in central.
+        fs::write(hash_dir.join("daemon.pid"), format!("{my_pid}\n")).unwrap();
+
+        // Also write our PID in local.
+        let repo_root = dir.path().join("my-repo");
+        let local_wonk = repo_root.join(".wonk");
+        fs::create_dir_all(&local_wonk).unwrap();
+        fs::write(local_wonk.join("daemon.pid"), format!("{my_pid}\n")).unwrap();
+
+        let entries = discover_daemons_in(&repos_dir, Some(&repo_root));
+        // Should deduplicate by PID.
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_daemon_entry_serializable() {
+        let entry = DaemonEntry {
+            pid: 1234,
+            repo_path: "/some/path".to_string(),
+            uptime: "3m 12s".to_string(),
+            alive: true,
+            index_dir: PathBuf::from("/tmp/wonk/index"),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("1234"));
+        assert!(json.contains("/some/path"));
     }
 }
