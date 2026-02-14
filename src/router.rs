@@ -2008,6 +2008,17 @@ mod tests {
         assert!(matches!(wonk_err, WonkError::Io(_)));
     }
 
+    #[test]
+    fn test_wonk_error_from_embedding_error() {
+        use crate::errors::{EmbeddingError, WonkError};
+        let emb_err = EmbeddingError::NoEmbeddings;
+        let wonk_err: WonkError = emb_err.into();
+        assert!(matches!(
+            wonk_err,
+            WonkError::Embedding(EmbeddingError::NoEmbeddings)
+        ));
+    }
+
     // -- Multi-language heuristic pattern coverage tests ---------------------
 
     #[test]

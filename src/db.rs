@@ -70,6 +70,20 @@ CREATE INDEX IF NOT EXISTS idx_file_imports_source ON file_imports(source_file);
 CREATE INDEX IF NOT EXISTS idx_file_imports_target ON file_imports(import_path);
 "#;
 
+const EMBEDDINGS_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS embeddings (
+    id INTEGER PRIMARY KEY,
+    symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    file TEXT NOT NULL,
+    chunk_text TEXT NOT NULL,
+    vector BLOB NOT NULL,
+    stale INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    UNIQUE(symbol_id)
+);
+CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file);
+"#;
+
 const FTS_SQL: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     name, kind, file, content=symbols, content_rowid=id
@@ -147,10 +161,23 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
 fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)
         .context("creating base tables and indexes")?;
+    conn.execute_batch(EMBEDDINGS_SQL)
+        .context("creating embeddings table")?;
     conn.execute_batch(FTS_SQL)
         .context("creating FTS5 virtual table")?;
     conn.execute_batch(TRIGGERS_SQL)
         .context("creating FTS5 sync triggers")?;
+    Ok(())
+}
+
+/// Ensure the `embeddings` table exists, creating it if missing.
+///
+/// This handles schema migration for V1 indexes that were created before
+/// embedding support was added.  Safe to call on databases that already
+/// have the table (uses `CREATE TABLE IF NOT EXISTS`).
+pub fn ensure_embeddings_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(EMBEDDINGS_SQL)
+        .context("creating embeddings table (migration)")?;
     Ok(())
 }
 
@@ -356,6 +383,7 @@ mod tests {
         assert!(tables.contains(&"daemon_status".to_string()));
         assert!(tables.contains(&"symbols_fts".to_string()));
         assert!(tables.contains(&"file_imports".to_string()));
+        assert!(tables.contains(&"embeddings".to_string()));
     }
 
     #[test]
@@ -774,5 +802,195 @@ mod tests {
         assert_eq!(count_matching_symbols(&conn, "foo OR bar"), 0);
         assert_eq!(count_matching_symbols(&conn, "foo*"), 0);
         assert_eq!(count_matching_symbols(&conn, "\"quoted\""), 0);
+    }
+
+    // -- Embeddings table tests ---------------------------------------------
+
+    #[test]
+    fn test_open_creates_embeddings_table() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(tables.contains(&"embeddings".to_string()));
+    }
+
+    #[test]
+    fn test_embeddings_table_columns() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        // Insert a symbol first (FK target).
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'foo', 'function', 'a.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+
+        // Insert an embedding with all columns.
+        conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, stale, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![1, "a.rs", "fn foo() {}", vec![0u8; 16], 0, 1700000000i64],
+        ).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_embeddings_unique_symbol_id() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'foo', 'function', 'a.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, created_at) VALUES (1, 'a.rs', 'text1', X'00', 1000)",
+            [],
+        ).unwrap();
+
+        // Second insert with same symbol_id should fail (UNIQUE constraint).
+        let result = conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, created_at) VALUES (1, 'a.rs', 'text2', X'00', 2000)",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_embeddings_cascade_delete() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'bar', 'function', 'b.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, created_at) VALUES (1, 'b.rs', 'fn bar()', X'AABB', 1000)",
+            [],
+        ).unwrap();
+
+        // Verify embedding exists.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Delete the symbol -- cascade should remove embedding.
+        conn.execute("DELETE FROM symbols WHERE id = 1", [])
+            .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_embeddings_stale_default() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'baz', 'function', 'c.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+
+        // Insert without specifying stale -- should default to 0.
+        conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, created_at) VALUES (1, 'c.rs', 'text', X'00', 1000)",
+            [],
+        ).unwrap();
+
+        let stale: i64 = conn
+            .query_row(
+                "SELECT stale FROM embeddings WHERE symbol_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0);
+    }
+
+    #[test]
+    fn test_embeddings_file_index_exists() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        // Check that the index exists.
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name = 'idx_embeddings_file'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(indexes.len(), 1);
+    }
+
+    #[test]
+    fn test_ensure_embeddings_table_on_v1_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // Simulate a V1 database: apply only base schema without embeddings.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute_batch(FTS_SQL).unwrap();
+        conn.execute_batch(TRIGGERS_SQL).unwrap();
+
+        // Embeddings table should NOT exist yet (V1 schema).
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.is_empty());
+
+        // Migrate: ensure_embeddings_table should create it.
+        ensure_embeddings_table(&conn).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(tables.len(), 1);
+    }
+
+    #[test]
+    fn test_ensure_embeddings_table_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        // Table already exists via open(). Calling ensure_embeddings_table
+        // again should not fail.
+        ensure_embeddings_table(&conn).unwrap();
+        ensure_embeddings_table(&conn).unwrap();
     }
 }

@@ -58,6 +58,10 @@ serde_toon2 = "0.1"
 anyhow = "1"
 thiserror = "2"
 
+# Embedding support
+ureq = { version = "3.1", features = ["json"] }
+bytemuck = { version = "1", features = ["derive"] }
+
 # Daemon
 fork = "0.2"
 signal-hook = "0.3"
