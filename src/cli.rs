@@ -161,9 +161,18 @@ pub enum DaemonCommand {
     /// Start the background daemon
     Start,
     /// Stop the background daemon
-    Stop,
+    Stop(DaemonStopArgs),
     /// Show the daemon status
     Status,
+    /// List all running daemons
+    List,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct DaemonStopArgs {
+    /// Stop all running daemons across all repositories
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(clap::Args, Debug)]
