@@ -42,6 +42,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `search.rs` | Text search wrapping the `grep` crate (ripgrep internals) |
 | `ranker.rs` | Classifies results (Definition > CallSite > Import > Other > Comment > Test), deduplicates re-exports |
 | `output.rs` | Dual format: grep-compatible (stdout+stderr) or NDJSON (stdout) |
+| `embedding.rs` | Ollama API client and symbol chunking engine — sync HTTP client for embedding generation, context-rich text chunk formatting for `nomic-embed-text` |
 | `daemon.rs` | Background file watcher — double-fork daemonization, PID file, idle timeout, SIGTERM handler |
 | `watcher.rs` | Filesystem event classification and debouncing via `notify` |
 | `config.rs` | Layered TOML config: built-in defaults → `~/.wonk/config.toml` → `<repo>/.wonk/config.toml` |

@@ -7,7 +7,7 @@
 //! Also provides the chunking pipeline that transforms indexed symbols into
 //! context-rich text chunks suitable for embedding by `nomic-embed-text`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -308,77 +308,155 @@ struct SymbolRow {
 }
 
 /// Query all symbols from the database, returning (id, Symbol) pairs.
-fn query_all_symbols(conn: &Connection) -> Vec<SymbolRow> {
+fn query_all_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError> {
     let mut stmt = conn
         .prepare(
             "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
              FROM symbols ORDER BY file, line",
         )
-        .expect("preparing symbol query");
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
 
-    stmt.query_map([], |row| {
-        let id: i64 = row.get(0)?;
-        let name: String = row.get(1)?;
-        let kind_str: String = row.get(2)?;
-        let file: String = row.get(3)?;
-        let line: usize = row.get::<_, i64>(4)? as usize;
-        let col: usize = row.get::<_, i64>(5)? as usize;
-        let end_line: Option<usize> = row.get::<_, Option<i64>>(6)?.map(|v| v as usize);
-        let scope: Option<String> = row.get(7)?;
-        let signature: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
-        let language: String = row.get(9)?;
-        let kind = kind_str
-            .parse::<SymbolKind>()
-            .unwrap_or(SymbolKind::Function);
+    let rows = stmt
+        .query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let kind_str: String = row.get(2)?;
+            let file: String = row.get(3)?;
+            let line: usize = row.get::<_, i64>(4)? as usize;
+            let col: usize = row.get::<_, i64>(5)? as usize;
+            let end_line: Option<usize> = row.get::<_, Option<i64>>(6)?.map(|v| v as usize);
+            let scope: Option<String> = row.get(7)?;
+            let signature: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+            let language: String = row.get(9)?;
+            let kind = kind_str
+                .parse::<SymbolKind>()
+                .unwrap_or(SymbolKind::Function);
 
-        Ok(SymbolRow {
-            id,
-            symbol: Symbol {
-                name,
-                kind,
-                file,
-                line,
-                col,
-                end_line,
-                scope,
-                signature,
-                language,
-            },
+            Ok(SymbolRow {
+                id,
+                symbol: Symbol {
+                    name,
+                    kind,
+                    file,
+                    line,
+                    col,
+                    end_line,
+                    scope,
+                    signature,
+                    language,
+                },
+            })
         })
-    })
-    .expect("executing symbol query")
-    .filter_map(|r| r.ok())
-    .collect()
+        .map_err(|_| EmbeddingError::ChunkingFailed)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(rows)
 }
 
 /// Query file-level import paths for a given source file.
-fn query_file_imports(conn: &Connection, source_file: &str) -> Vec<String> {
+#[cfg(test)]
+fn query_file_imports(conn: &Connection, source_file: &str) -> Result<Vec<String>, EmbeddingError> {
     let mut stmt = conn
         .prepare("SELECT import_path FROM file_imports WHERE source_file = ?1")
-        .expect("preparing file_imports query");
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
 
-    stmt.query_map([source_file], |row| row.get(0))
-        .expect("executing file_imports query")
+    let imports = stmt
+        .query_map([source_file], |row| row.get(0))
+        .map_err(|_| EmbeddingError::ChunkingFailed)?
         .filter_map(|r| r.ok())
-        .collect()
+        .collect();
+
+    Ok(imports)
+}
+
+/// Batch-fetch all file-level imports, grouped by source file.
+fn query_all_file_imports(
+    conn: &Connection,
+) -> Result<BTreeMap<String, Vec<String>>, EmbeddingError> {
+    let mut stmt = conn
+        .prepare("SELECT source_file, import_path FROM file_imports ORDER BY source_file")
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    let mut imports: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    for r in rows.flatten() {
+        imports.entry(r.0).or_default().push(r.1);
+    }
+
+    Ok(imports)
 }
 
 // ---------------------------------------------------------------------------
 // Public bulk chunking API
 // ---------------------------------------------------------------------------
 
+/// Compute byte offsets for each line start in `source`.
+///
+/// Returns a vec where `offsets[i]` is the byte offset of 1-based line `i+1`.
+fn compute_line_offsets(source: &str) -> Vec<usize> {
+    let mut offsets = vec![0]; // line 1 starts at byte 0
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            offsets.push(i + 1);
+        }
+    }
+    offsets
+}
+
+/// Extract lines using precomputed line offsets for O(1) lookup.
+fn extract_line_range_indexed<'a>(
+    source: &'a str,
+    offsets: &[usize],
+    start_line: usize,
+    end_line: Option<usize>,
+) -> &'a str {
+    let start_idx = if start_line <= 1 {
+        0
+    } else if start_line - 1 < offsets.len() {
+        offsets[start_line - 1]
+    } else {
+        return "";
+    };
+
+    let end_idx = match end_line {
+        Some(el) => {
+            if el < offsets.len() {
+                offsets[el].min(source.len())
+            } else {
+                source.len()
+            }
+        }
+        None => source.len(),
+    };
+
+    &source[start_idx..end_idx]
+}
+
 /// Generate text chunks for all indexed symbols.
 ///
 /// Returns `(symbol_id, chunk_text)` pairs.  Reads source files from disk
-/// under `repo_root`, and silently skips files that cannot be read.
-pub fn chunk_all_symbols(conn: &Connection, repo_root: &Path) -> Vec<(i64, String)> {
-    let rows = query_all_symbols(conn);
+/// under `repo_root`, and silently skips files that cannot be read or whose
+/// paths contain `..` components.
+pub fn chunk_all_symbols(
+    conn: &Connection,
+    repo_root: &Path,
+) -> Result<Vec<(i64, String)>, EmbeddingError> {
+    let rows = query_all_symbols(conn)?;
     if rows.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    // Group symbols by file to avoid reading the same file multiple times.
-    let mut by_file: HashMap<String, Vec<&SymbolRow>> = HashMap::new();
+    // Batch-fetch all file imports in one query.
+    let all_imports = query_all_file_imports(conn)?;
+
+    // Group symbols by file (BTreeMap for deterministic iteration order).
+    let mut by_file: BTreeMap<String, Vec<&SymbolRow>> = BTreeMap::new();
     for row in &rows {
         by_file
             .entry(row.symbol.file.clone())
@@ -386,24 +464,56 @@ pub fn chunk_all_symbols(conn: &Connection, repo_root: &Path) -> Vec<(i64, Strin
             .push(row);
     }
 
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(rows.len());
 
     for (file, symbols) in &by_file {
+        // Reject paths with ".." to prevent path traversal.
+        let rel = Path::new(file);
+        if rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+
         let path = repo_root.join(file);
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => continue, // silently skip unreadable files
+            Err(_) => continue,
         };
 
-        let imports = query_file_imports(conn, file);
+        let imports: &[String] = all_imports.get(file.as_str()).map_or(&[], |v| v.as_slice());
+
+        // Pre-compute line offsets once per file for O(1) extraction.
+        let offsets = compute_line_offsets(&source);
 
         for sym_row in symbols {
-            let chunk = chunk_symbol(&sym_row.symbol, &imports, &source);
+            let code = extract_line_range_indexed(
+                &source,
+                &offsets,
+                sym_row.symbol.line,
+                sym_row.symbol.end_line,
+            );
+
+            let mut header = format!("File: {}\n", sym_row.symbol.file);
+            if let Some(ref scope) = sym_row.symbol.scope {
+                header.push_str(&format!("Scope: {scope}\n"));
+            }
+            if !imports.is_empty() {
+                header.push_str(&format!("Imports: {}\n", imports.join(", ")));
+            }
+            header.push_str("---\n");
+
+            let remaining = MAX_CHUNK_BYTES.saturating_sub(header.len());
+            let code = truncate_at_line_boundary(code, remaining);
+
+            let mut chunk = header;
+            chunk.push_str(code);
             results.push((sym_row.id, chunk));
         }
     }
 
-    results
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -791,7 +901,7 @@ mod tests {
             "Rust",
         );
 
-        let rows = query_all_symbols(&conn);
+        let rows = query_all_symbols(&conn).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].symbol.name, "foo");
         assert_eq!(rows[1].symbol.name, "bar");
@@ -805,7 +915,7 @@ mod tests {
         insert_import(&conn, "a.rs", "serde");
         insert_import(&conn, "b.rs", "tokio");
 
-        let imports = query_file_imports(&conn, "a.rs");
+        let imports = query_file_imports(&conn, "a.rs").unwrap();
         assert_eq!(imports.len(), 2);
         assert!(imports.contains(&"std::io".to_string()));
         assert!(imports.contains(&"serde".to_string()));
@@ -814,7 +924,7 @@ mod tests {
     #[test]
     fn query_file_imports_empty_for_unknown_file() {
         let conn = setup_test_db();
-        let imports = query_file_imports(&conn, "unknown.rs");
+        let imports = query_file_imports(&conn, "unknown.rs").unwrap();
         assert!(imports.is_empty());
     }
 
@@ -846,7 +956,7 @@ mod tests {
         );
         insert_import(&conn, "main.rs", "std::io");
 
-        let chunks = chunk_all_symbols(&conn, root);
+        let chunks = chunk_all_symbols(&conn, root).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].0, sym_id);
         assert!(chunks[0].1.contains("File: main.rs"));
@@ -873,7 +983,7 @@ mod tests {
             "Rust",
         );
 
-        let chunks = chunk_all_symbols(&conn, root);
+        let chunks = chunk_all_symbols(&conn, root).unwrap();
         assert!(chunks.is_empty());
     }
 
@@ -908,10 +1018,61 @@ mod tests {
             "Rust",
         );
 
-        let chunks = chunk_all_symbols(&conn, root);
+        let chunks = chunk_all_symbols(&conn, root).unwrap();
         assert_eq!(chunks.len(), 2);
         let ids: Vec<i64> = chunks.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&id_a));
         assert!(ids.contains(&id_b));
+    }
+
+    #[test]
+    fn chunk_all_symbols_rejects_path_traversal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        let conn = setup_test_db();
+        insert_symbol(
+            &conn,
+            "evil",
+            "function",
+            "../../../etc/passwd",
+            1,
+            Some(1),
+            None,
+            "fn evil()",
+            "Rust",
+        );
+
+        let chunks = chunk_all_symbols(&conn, root).unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    // -- line offset tests ----------------------------------------------------
+
+    #[test]
+    fn compute_line_offsets_basic() {
+        let source = "line1\nline2\nline3\n";
+        let offsets = compute_line_offsets(source);
+        assert_eq!(offsets, vec![0, 6, 12, 18]);
+    }
+
+    #[test]
+    fn extract_line_range_indexed_single_line() {
+        let source = "line1\nline2\nline3\n";
+        let offsets = compute_line_offsets(source);
+        assert_eq!(
+            extract_line_range_indexed(source, &offsets, 2, Some(2)),
+            "line2\n"
+        );
+    }
+
+    #[test]
+    fn extract_line_range_indexed_to_end() {
+        let source = "line1\nline2\nline3";
+        let offsets = compute_line_offsets(source);
+        assert_eq!(
+            extract_line_range_indexed(source, &offsets, 2, None),
+            "line2\nline3"
+        );
     }
 }
