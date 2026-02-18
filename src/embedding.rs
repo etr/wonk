@@ -245,6 +245,31 @@ fn truncate_at_line_boundary(text: &str, max_bytes: usize) -> &str {
 // Public chunking API
 // ---------------------------------------------------------------------------
 
+/// Build the metadata header for a chunk.
+///
+/// Format: `File: <path>\nScope: <scope>\nImports: <imports>\n---\n`
+/// (Scope and Imports lines are omitted when absent/empty.)
+fn build_chunk_header(file: &str, scope: Option<&str>, imports_line: Option<&str>) -> String {
+    let mut header = format!("File: {file}\n");
+    if let Some(s) = scope {
+        header.push_str(&format!("Scope: {s}\n"));
+    }
+    if let Some(imp) = imports_line {
+        header.push_str(imp);
+    }
+    header.push_str("---\n");
+    header
+}
+
+/// Append code to a header, truncating so the total fits within [`MAX_CHUNK_BYTES`].
+fn assemble_chunk(header: String, code: &str) -> String {
+    let remaining = MAX_CHUNK_BYTES.saturating_sub(header.len());
+    let code = truncate_at_line_boundary(code, remaining);
+    let mut chunk = header;
+    chunk.push_str(code);
+    chunk
+}
+
 /// Generate a context-rich text chunk for a single symbol.
 ///
 /// Format:
@@ -259,24 +284,18 @@ fn truncate_at_line_boundary(text: &str, max_bytes: usize) -> &str {
 /// `source_code` is the full file content; the relevant line range is
 /// extracted from `symbol.line` to `symbol.end_line`.
 pub fn chunk_symbol(symbol: &Symbol, file_imports: &[String], source_code: &str) -> String {
-    let mut header = format!("File: {}\n", symbol.file);
-    if let Some(ref scope) = symbol.scope {
-        header.push_str(&format!("Scope: {scope}\n"));
-    }
-    if !file_imports.is_empty() {
-        header.push_str(&format!("Imports: {}\n", file_imports.join(", ")));
-    }
-    header.push_str("---\n");
-
+    let imports_line = if file_imports.is_empty() {
+        None
+    } else {
+        Some(format!("Imports: {}\n", file_imports.join(", ")))
+    };
+    let header = build_chunk_header(
+        &symbol.file,
+        symbol.scope.as_deref(),
+        imports_line.as_deref(),
+    );
     let code = extract_line_range(source_code, symbol.line, symbol.end_line);
-
-    // Truncate code so the total chunk fits within MAX_CHUNK_BYTES.
-    let remaining = MAX_CHUNK_BYTES.saturating_sub(header.len());
-    let code = truncate_at_line_boundary(code, remaining);
-
-    let mut chunk = header;
-    chunk.push_str(code);
-    chunk
+    assemble_chunk(header, code)
 }
 
 /// Generate a fallback chunk for a file with no extractable symbols.
@@ -288,13 +307,8 @@ pub fn chunk_symbol(symbol: &Symbol, file_imports: &[String], source_code: &str)
 /// <content>
 /// ```
 pub fn chunk_file_fallback(path: &str, content: &str) -> String {
-    let header = format!("File: {path}\n---\n");
-    let remaining = MAX_CHUNK_BYTES.saturating_sub(header.len());
-    let content = truncate_at_line_boundary(content, remaining);
-
-    let mut chunk = header;
-    chunk.push_str(content);
-    chunk
+    let header = build_chunk_header(path, None, None);
+    assemble_chunk(header, content)
 }
 
 // ---------------------------------------------------------------------------
@@ -502,20 +516,12 @@ pub fn chunk_all_symbols(
                 sym_row.symbol.end_line,
             );
 
-            let mut header = format!("File: {}\n", sym_row.symbol.file);
-            if let Some(ref scope) = sym_row.symbol.scope {
-                header.push_str(&format!("Scope: {scope}\n"));
-            }
-            if let Some(ref imp) = imports_line {
-                header.push_str(imp);
-            }
-            header.push_str("---\n");
-
-            let remaining = MAX_CHUNK_BYTES.saturating_sub(header.len());
-            let code = truncate_at_line_boundary(code, remaining);
-
-            let mut chunk = header;
-            chunk.push_str(code);
+            let header = build_chunk_header(
+                &sym_row.symbol.file,
+                sym_row.symbol.scope.as_deref(),
+                imports_line.as_deref(),
+            );
+            let chunk = assemble_chunk(header, code);
             results.push((sym_row.id, chunk));
         }
     }
