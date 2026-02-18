@@ -37,7 +37,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `router.rs` | Query dispatch — routes commands to index or grep fallback, auto-initializes index on first use |
 | `indexer.rs` | Tree-sitter parsing — extracts symbols, references, and imports for 11 languages |
 | `db.rs` | SQLite layer — schema (WAL mode), repo root detection, index path computation |
-| `pipeline.rs` | Index build orchestration — parallel file walk + parse + batch insert; incremental re-indexing for daemon |
+| `pipeline.rs` | Index build orchestration — parallel file walk + parse + batch insert; incremental re-indexing for daemon; embedding build pipeline (chunking → Ollama batch embed → vector storage) |
 | `walker.rs` | File enumeration with gitignore/wonkignore support; worktree-aware boundary detection |
 | `search.rs` | Text search wrapping the `grep` crate (ripgrep internals) |
 | `ranker.rs` | Classifies results (Definition > CallSite > Import > Other > Comment > Test), deduplicates re-exports |

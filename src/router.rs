@@ -361,8 +361,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let index_path = db::index_path_for(&repo_root, args.local)?;
             let conn = db::open(&index_path)?;
             let client = crate::embedding::OllamaClient::new();
-            let emb_stats =
-                pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode, suppress)?;
+            let emb_stats = pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
             if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
                 eprintln!(
                     "Embedded {} symbols in {:.1}s",
@@ -374,10 +373,23 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Update => {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
-            let progress =
-                Progress::new("Re-indexing", "Re-indexed", progress::detect_mode(suppress));
+            let progress_mode = progress::detect_mode(suppress);
+            let progress = Progress::new("Re-indexing", "Re-indexed", progress_mode);
             let stats = pipeline::rebuild_index_with_progress(&repo_root, false, &progress)?;
             progress.finish(&stats);
+
+            // Rebuild embeddings after structural re-index.
+            let index_path = db::index_path_for(&repo_root, false)?;
+            let conn = db::open(&index_path)?;
+            let client = crate::embedding::OllamaClient::new();
+            let emb_stats = pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
+            if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
+                eprintln!(
+                    "Embedded {} symbols in {:.1}s",
+                    emb_stats.embedded_count,
+                    emb_stats.elapsed.as_secs_f64(),
+                );
+            }
         }
         Command::Status => {
             let conn = std::env::current_dir()
@@ -551,8 +563,12 @@ pub fn format_status_info(info: &StatusInfo) -> String {
 }
 
 /// Query status from the database and Ollama health check.
-fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
+///
+/// Uses a quick 500ms timeout for the Ollama health check so that
+/// `wonk status` doesn't block for 2 seconds when Ollama is unreachable.
+pub fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
     let client = crate::embedding::OllamaClient::new();
+    let ollama_reachable = client.is_healthy_quick();
 
     let Some(conn) = conn else {
         return StatusInfo {
@@ -562,7 +578,7 @@ fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
             reference_count: 0,
             embedding_count: 0,
             stale_embedding_count: 0,
-            ollama_reachable: client.is_healthy(),
+            ollama_reachable,
         };
     };
 
@@ -585,7 +601,7 @@ fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
         reference_count,
         embedding_count,
         stale_embedding_count,
-        ollama_reachable: client.is_healthy(),
+        ollama_reachable,
     }
 }
 

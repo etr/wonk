@@ -98,6 +98,23 @@ impl OllamaClient {
         }
     }
 
+    /// Quick health check with a shorter timeout (500ms) for status queries.
+    ///
+    /// Avoids blocking `wonk status` for the full 2-second connect timeout
+    /// when Ollama is unreachable.
+    pub fn is_healthy_quick(&self) -> bool {
+        let quick: Agent = Agent::config_builder()
+            .timeout_connect(Some(Duration::from_millis(500)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let url = format!("{}/", self.base_url);
+        match quick.get(&url).call() {
+            Ok(resp) => resp.status() == 200,
+            Err(_) => false,
+        }
+    }
+
     /// Generate embeddings for a batch of texts.
     ///
     /// Returns one `Vec<f32>` per input string.  An empty input slice
@@ -1017,6 +1034,7 @@ mod tests {
         conn
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_symbol(
         conn: &Connection,
         name: &str,

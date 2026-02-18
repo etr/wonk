@@ -606,13 +606,13 @@ pub fn build_embeddings(
     repo_root: &Path,
     client: &OllamaClient,
     progress_mode: ProgressMode,
-    suppress: bool,
 ) -> Result<EmbeddingBuildStats> {
     let start = Instant::now();
+    let silent = progress_mode == ProgressMode::Silent;
 
     // Health check.
     if !client.is_healthy() {
-        if !suppress {
+        if !silent {
             eprintln!(
                 "Ollama not available — skipping embedding generation. \
                  Semantic search will not be available until embeddings are built."
@@ -657,8 +657,7 @@ pub fn build_embeddings(
         let vectors = match client.embed_batch(&texts) {
             Ok(v) => v,
             Err(EmbeddingError::OllamaUnreachable) => {
-                // Ollama went down mid-build.  Report partial count.
-                if !suppress {
+                if !silent {
                     eprintln!(
                         "Ollama became unreachable after embedding {embedded}/{total} symbols."
                     );
@@ -666,12 +665,24 @@ pub fn build_embeddings(
                 break;
             }
             Err(e) => {
-                if !suppress {
+                if !silent {
                     eprintln!("Embedding error: {e}. Stopping after {embedded}/{total} symbols.");
                 }
                 break;
             }
         };
+
+        // Validate response count matches request count.
+        if vectors.len() != texts.len() {
+            if !silent {
+                eprintln!(
+                    "Ollama returned {} vectors for {} texts. Stopping after {embedded}/{total} symbols.",
+                    vectors.len(),
+                    texts.len(),
+                );
+            }
+            break;
+        }
 
         // Build storage tuples.
         let store_batch: Vec<(i64, &str, &str, &[f32])> = batch
@@ -685,14 +696,14 @@ pub fn build_embeddings(
         embedding::store_embeddings_batch(conn, &store_batch)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        embedded += batch.len();
+        embedded += store_batch.len();
 
         render_embedding_progress(progress_mode, embedded, total);
     }
 
     // Clear the progress line if in-place mode.
     if progress_mode == ProgressMode::InPlace && embedded > 0 {
-        eprintln!("\rEmbedded {embedded}/{total} symbols{:>40}", "");
+        eprintln!("\rEmbedded {embedded}/{total} symbols{:<40}", "");
     }
 
     Ok(EmbeddingBuildStats {
@@ -1737,7 +1748,7 @@ class Component {
         let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
         let progress_mode = crate::progress::ProgressMode::Silent;
 
-        let emb_stats = build_embeddings(&conn, root, &client, progress_mode, true).unwrap();
+        let emb_stats = build_embeddings(&conn, root, &client, progress_mode).unwrap();
         assert!(emb_stats.skipped, "should skip when Ollama is unreachable");
         assert_eq!(emb_stats.embedded_count, 0);
     }
