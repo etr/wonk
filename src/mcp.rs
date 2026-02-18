@@ -777,16 +777,30 @@ impl McpServer {
             let ref_count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM \"references\"", [], |row| row.get(0))
                 .unwrap_or(0);
+            let (embedding_count, stale_embedding_count) =
+                crate::embedding::embedding_stats(conn).unwrap_or((0, 0));
+
+            let client = crate::embedding::OllamaClient::new();
+            let ollama_reachable = client.is_healthy();
 
             serde_json::json!({
                 "indexed": true,
                 "file_count": file_count,
                 "symbol_count": symbol_count,
-                "reference_count": ref_count
+                "reference_count": ref_count,
+                "embedding_count": embedding_count,
+                "stale_embedding_count": stale_embedding_count,
+                "ollama_reachable": ollama_reachable
             })
         } else {
+            let client = crate::embedding::OllamaClient::new();
+            let ollama_reachable = client.is_healthy();
+
             serde_json::json!({
-                "indexed": false
+                "indexed": false,
+                "embedding_count": 0,
+                "stale_embedding_count": 0,
+                "ollama_reachable": ollama_reachable
             })
         };
 
@@ -1048,5 +1062,29 @@ mod tests {
         let result = format_result(&data, OutputFormat::Toon);
         assert!(!result.is_error);
         assert!(!result.content[0].text.is_empty());
+    }
+
+    #[test]
+    fn tool_status_includes_embedding_fields() {
+        // The test_server has no index, so status will show indexed=false.
+        // But the JSON should still contain the embedding fields.
+        let server = test_server();
+        let result = server.tool_status(serde_json::json!({}));
+        assert!(!result.is_error);
+        let text = &result.content[0].text;
+        let json: Value = serde_json::from_str(text).unwrap();
+        // Should contain the new embedding-related fields.
+        assert!(
+            json.get("embedding_count").is_some(),
+            "missing embedding_count"
+        );
+        assert!(
+            json.get("stale_embedding_count").is_some(),
+            "missing stale_embedding_count"
+        );
+        assert!(
+            json.get("ollama_reachable").is_some(),
+            "missing ollama_reachable"
+        );
     }
 }

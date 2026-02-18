@@ -5,7 +5,7 @@
 //! is unavailable or returns no results, falls back to grep-based heuristic
 //! search patterns that cover all 10 supported languages.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -352,9 +352,24 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Init(args) => {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
-            let progress = Progress::new("Indexing", "Indexed", progress::detect_mode(suppress));
+            let progress_mode = progress::detect_mode(suppress);
+            let progress = Progress::new("Indexing", "Indexed", progress_mode);
             let stats = pipeline::build_index_with_progress(&repo_root, args.local, &progress)?;
             progress.finish(&stats);
+
+            // Build embeddings after structural index.
+            let index_path = db::index_path_for(&repo_root, args.local)?;
+            let conn = db::open(&index_path)?;
+            let client = crate::embedding::OllamaClient::new();
+            let emb_stats =
+                pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode, suppress)?;
+            if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
+                eprintln!(
+                    "Embedded {} symbols in {:.1}s",
+                    emb_stats.embedded_count,
+                    emb_stats.elapsed.as_secs_f64(),
+                );
+            }
         }
         Command::Update => {
             let repo_root = std::env::current_dir()?;
@@ -365,7 +380,22 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             progress.finish(&stats);
         }
         Command::Status => {
-            output::print_hint("status: not yet implemented", suppress);
+            let conn = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| db::find_repo_root(&cwd).ok())
+                .and_then(|root| db::find_existing_index(&root))
+                .and_then(|path| db::open(&path).ok());
+
+            let info = query_status_info(conn.as_ref());
+
+            if format.is_structured() {
+                let json =
+                    serde_json::to_string_pretty(&serde_json::to_value(&info).unwrap_or_default())
+                        .unwrap_or_default();
+                writeln!(fmt.writer_mut(), "{json}")?;
+            } else {
+                eprintln!("{}", format_status_info(&info));
+            }
         }
         Command::Daemon(args) => match args.command {
             DaemonCommand::Start => {
@@ -470,6 +500,93 @@ fn emit_budget_summary<W: io::Write>(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+/// Structured status information for `wonk status`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatusInfo {
+    pub indexed: bool,
+    pub file_count: i64,
+    pub symbol_count: i64,
+    pub reference_count: i64,
+    pub embedding_count: usize,
+    pub stale_embedding_count: usize,
+    pub ollama_reachable: bool,
+}
+
+/// Format status info as a human-readable string for stderr output.
+pub fn format_status_info(info: &StatusInfo) -> String {
+    if !info.indexed {
+        return "No index found. Run `wonk init` to build one.".to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Index: {} files, {} symbols, {} references",
+        info.file_count, info.symbol_count, info.reference_count
+    ));
+
+    if info.embedding_count > 0 {
+        let mut emb_line = format!("Embeddings: {} embeddings", info.embedding_count);
+        if info.stale_embedding_count > 0 {
+            emb_line.push_str(&format!(" ({} stale)", info.stale_embedding_count));
+        }
+        lines.push(emb_line);
+    } else {
+        lines.push("Embeddings: none".to_string());
+    }
+
+    let ollama_status = if info.ollama_reachable {
+        "reachable"
+    } else {
+        "unreachable"
+    };
+    lines.push(format!("Ollama: {ollama_status}"));
+
+    lines.join("\n")
+}
+
+/// Query status from the database and Ollama health check.
+fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
+    let client = crate::embedding::OllamaClient::new();
+
+    let Some(conn) = conn else {
+        return StatusInfo {
+            indexed: false,
+            file_count: 0,
+            symbol_count: 0,
+            reference_count: 0,
+            embedding_count: 0,
+            stale_embedding_count: 0,
+            ollama_reachable: client.is_healthy(),
+        };
+    };
+
+    let file_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap_or(0);
+    let symbol_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+        .unwrap_or(0);
+    let reference_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM \"references\"", [], |row| row.get(0))
+        .unwrap_or(0);
+    let (embedding_count, stale_embedding_count) =
+        crate::embedding::embedding_stats(conn).unwrap_or((0, 0));
+
+    StatusInfo {
+        indexed: true,
+        file_count,
+        symbol_count,
+        reference_count,
+        embedding_count,
+        stale_embedding_count,
+        ollama_reachable: client.is_healthy(),
+    }
 }
 
 /// Spawn the daemon as a background subprocess (best-effort).
@@ -3437,5 +3554,57 @@ mod tests {
     #[test]
     fn test_detect_search_mode_auto_no_symbols() {
         assert_eq!(detect_search_mode(false, false, 0), SearchMode::Plain);
+    }
+
+    // -- StatusInfo tests ---------------------------------------------------
+
+    #[test]
+    fn test_status_info_format_with_embeddings() {
+        let info = StatusInfo {
+            indexed: true,
+            file_count: 100,
+            symbol_count: 500,
+            reference_count: 2000,
+            embedding_count: 300,
+            stale_embedding_count: 10,
+            ollama_reachable: true,
+        };
+        let output = format_status_info(&info);
+        assert!(output.contains("100 files"));
+        assert!(output.contains("500 symbols"));
+        assert!(output.contains("2000 references"));
+        assert!(output.contains("300 embeddings"));
+        assert!(output.contains("10 stale"));
+        assert!(output.contains("reachable"));
+    }
+
+    #[test]
+    fn test_status_info_format_no_index() {
+        let info = StatusInfo {
+            indexed: false,
+            file_count: 0,
+            symbol_count: 0,
+            reference_count: 0,
+            embedding_count: 0,
+            stale_embedding_count: 0,
+            ollama_reachable: false,
+        };
+        let output = format_status_info(&info);
+        assert!(output.contains("No index"));
+    }
+
+    #[test]
+    fn test_status_info_format_ollama_unreachable() {
+        let info = StatusInfo {
+            indexed: true,
+            file_count: 50,
+            symbol_count: 200,
+            reference_count: 800,
+            embedding_count: 0,
+            stale_embedding_count: 0,
+            ollama_reachable: false,
+        };
+        let output = format_status_info(&info);
+        assert!(output.contains("unreachable"));
     }
 }

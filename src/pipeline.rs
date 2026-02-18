@@ -20,8 +20,10 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 
 use crate::db;
+use crate::embedding::{self, OllamaClient};
+use crate::errors::EmbeddingError;
 use crate::indexer;
-use crate::progress::Progress;
+use crate::progress::{Progress, ProgressMode};
 use crate::types::{Reference, Symbol};
 use crate::walker::Walker;
 use crate::watcher::FileEvent;
@@ -573,10 +575,152 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
     Ok((total_syms, total_refs))
 }
 
+// ---------------------------------------------------------------------------
+// Embedding build pipeline
+// ---------------------------------------------------------------------------
+
+/// Statistics returned after an embedding build run.
+#[derive(Debug, Clone)]
+pub struct EmbeddingBuildStats {
+    /// Number of symbols successfully embedded.
+    pub embedded_count: usize,
+    /// Total number of symbol chunks generated.
+    pub total_symbols: usize,
+    /// Whether the entire embedding pass was skipped (Ollama unreachable).
+    pub skipped: bool,
+    /// Wall-clock elapsed time.
+    pub elapsed: std::time::Duration,
+}
+
+/// Batch size for Ollama API calls.
+const EMBEDDING_BATCH_SIZE: usize = 50;
+
+/// Build embeddings for all indexed symbols.
+///
+/// Checks Ollama health first; if unreachable, returns with `skipped = true`.
+/// Otherwise generates chunks, deletes existing embeddings, and batch-embeds
+/// in groups of [`EMBEDDING_BATCH_SIZE`].  Partial failures (Ollama going down
+/// mid-batch) are handled gracefully: previously committed batches are persisted.
+pub fn build_embeddings(
+    conn: &Connection,
+    repo_root: &Path,
+    client: &OllamaClient,
+    progress_mode: ProgressMode,
+    suppress: bool,
+) -> Result<EmbeddingBuildStats> {
+    let start = Instant::now();
+
+    // Health check.
+    if !client.is_healthy() {
+        if !suppress {
+            eprintln!(
+                "Ollama not available — skipping embedding generation. \
+                 Semantic search will not be available until embeddings are built."
+            );
+        }
+        return Ok(EmbeddingBuildStats {
+            embedded_count: 0,
+            total_symbols: 0,
+            skipped: true,
+            elapsed: start.elapsed(),
+        });
+    }
+
+    // Generate chunks.
+    let chunks =
+        embedding::chunk_all_symbols(conn, repo_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if chunks.is_empty() {
+        return Ok(EmbeddingBuildStats {
+            embedded_count: 0,
+            total_symbols: 0,
+            skipped: false,
+            elapsed: start.elapsed(),
+        });
+    }
+
+    let total = chunks.len();
+
+    // Delete existing embeddings for a clean rebuild.
+    conn.execute("DELETE FROM embeddings", [])
+        .context("clearing old embeddings")?;
+
+    let mut embedded = 0usize;
+
+    // Batch-embed in groups.
+    for batch_start in (0..total).step_by(EMBEDDING_BATCH_SIZE) {
+        let batch_end = (batch_start + EMBEDDING_BATCH_SIZE).min(total);
+        let batch = &chunks[batch_start..batch_end];
+
+        let texts: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
+
+        let vectors = match client.embed_batch(&texts) {
+            Ok(v) => v,
+            Err(EmbeddingError::OllamaUnreachable) => {
+                // Ollama went down mid-build.  Report partial count.
+                if !suppress {
+                    eprintln!(
+                        "Ollama became unreachable after embedding {embedded}/{total} symbols."
+                    );
+                }
+                break;
+            }
+            Err(e) => {
+                if !suppress {
+                    eprintln!("Embedding error: {e}. Stopping after {embedded}/{total} symbols.");
+                }
+                break;
+            }
+        };
+
+        // Build storage tuples.
+        let store_batch: Vec<(i64, &str, &str, &[f32])> = batch
+            .iter()
+            .zip(vectors.iter())
+            .map(|((sym_id, file, text), vec)| {
+                (*sym_id, file.as_str(), text.as_str(), vec.as_slice())
+            })
+            .collect();
+
+        embedding::store_embeddings_batch(conn, &store_batch)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        embedded += batch.len();
+
+        render_embedding_progress(progress_mode, embedded, total);
+    }
+
+    // Clear the progress line if in-place mode.
+    if progress_mode == ProgressMode::InPlace && embedded > 0 {
+        eprintln!("\rEmbedded {embedded}/{total} symbols{:>40}", "");
+    }
+
+    Ok(EmbeddingBuildStats {
+        embedded_count: embedded,
+        total_symbols: total,
+        skipped: false,
+        elapsed: start.elapsed(),
+    })
+}
+
+/// Render embedding progress to stderr.
+fn render_embedding_progress(mode: ProgressMode, done: usize, total: usize) {
+    match mode {
+        ProgressMode::Silent => {}
+        ProgressMode::InPlace => {
+            eprint!("\rEmbedding... [{done}/{total} symbols]");
+        }
+        ProgressMode::LineBased => {
+            eprintln!("Embedding... [{done}/{total} symbols]");
+        }
+    }
+}
+
 /// Drop all data from the main tables (used before rebuild).
 fn drop_all_data(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM symbols;
+        "DELETE FROM embeddings;
+         DELETE FROM symbols;
          DELETE FROM \"references\";
          DELETE FROM file_imports;
          DELETE FROM files;",
@@ -1560,6 +1704,68 @@ class Component {
         assert_eq!(
             orig_count, new_count,
             "symbol count should not double after re-index: orig={orig_count}, new={new_count}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Embedding pipeline tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_embedding_build_stats_struct() {
+        let stats = EmbeddingBuildStats {
+            embedded_count: 10,
+            total_symbols: 20,
+            skipped: false,
+            elapsed: std::time::Duration::from_secs(1),
+        };
+        assert_eq!(stats.embedded_count, 10);
+        assert_eq!(stats.total_symbols, 20);
+        assert!(!stats.skipped);
+    }
+
+    #[test]
+    fn test_build_embeddings_ollama_unreachable_skips() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        let _stats = build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Use a dead port to simulate Ollama unreachable.
+        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let progress_mode = crate::progress::ProgressMode::Silent;
+
+        let emb_stats = build_embeddings(&conn, root, &client, progress_mode, true).unwrap();
+        assert!(emb_stats.skipped, "should skip when Ollama is unreachable");
+        assert_eq!(emb_stats.embedded_count, 0);
+    }
+
+    #[test]
+    fn test_drop_all_data_clears_embeddings() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        let _stats = build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Insert a fake embedding.
+        let sym_id: i64 = conn
+            .query_row("SELECT id FROM symbols LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        crate::embedding::store_embedding(&conn, sym_id, "test.rs", "chunk", &[1.0, 0.0]).unwrap();
+
+        let (total, _) = crate::embedding::embedding_stats(&conn).unwrap();
+        assert_eq!(total, 1, "should have 1 embedding before drop");
+
+        drop_all_data(&conn).unwrap();
+
+        let (total_after, _) = crate::embedding::embedding_stats(&conn).unwrap();
+        assert_eq!(
+            total_after, 0,
+            "embeddings should be cleared after drop_all_data"
         );
     }
 }
