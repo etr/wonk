@@ -1561,14 +1561,14 @@ Implement a sync HTTP client for Ollama's embedding API with health checking, ba
 Generate context-rich text chunks from indexed symbols, suitable for embedding by `nomic-embed-text`.
 
 **Action Items:**
-- [ ] Implement `chunk_symbol(symbol: &Symbol, file_imports: &[String], source_code: &str) -> String` in `embedding.rs`
-- [ ] Chunk format: `File: <path>\nScope: <scope>\nImports: <imports>\n---\n<source_code>` where source_code is extracted from line to end_line
-- [ ] For symbols with no scope, omit the Scope line
-- [ ] For files with no imports, omit the Imports line
-- [ ] Implement `chunk_file_fallback(path: &str, content: &str) -> String` for files with no extractable symbols (PRD-SEM-REQ-007)
-- [ ] Read source code from disk for each symbol's line range (line to end_line)
-- [ ] Implement `chunk_all_symbols(db, repo_root) -> Vec<(i64, String)>` returning (symbol_id, chunk_text) pairs
-- [ ] Truncate chunks that exceed model context limit (8192 tokens ≈ 32KB for nomic-embed-text)
+- [x] Implement `chunk_symbol(symbol: &Symbol, file_imports: &[String], source_code: &str) -> String` in `embedding.rs`
+- [x] Chunk format: `File: <path>\nScope: <scope>\nImports: <imports>\n---\n<source_code>` where source_code is extracted from line to end_line
+- [x] For symbols with no scope, omit the Scope line
+- [x] For files with no imports, omit the Imports line
+- [x] Implement `chunk_file_fallback(path: &str, content: &str) -> String` for files with no extractable symbols (PRD-SEM-REQ-007)
+- [x] Read source code from disk for each symbol's line range (line to end_line)
+- [x] Implement `chunk_all_symbols(db, repo_root) -> Vec<(i64, String)>` returning (symbol_id, chunk_text) pairs
+- [x] Truncate chunks that exceed model context limit (8192 tokens ≈ 32KB for nomic-embed-text)
 
 **Dependencies:**
 - Blocked by: TASK-038
@@ -1585,7 +1585,7 @@ Generate context-rich text chunks from indexed symbols, suitable for embedding b
 **Related Requirements:** PRD-SEM-REQ-006, PRD-SEM-REQ-007
 **Related Decisions:** DR-010
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
