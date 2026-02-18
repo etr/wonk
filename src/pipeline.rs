@@ -628,7 +628,7 @@ pub fn build_embeddings(
 
     // Generate chunks.
     let chunks =
-        embedding::chunk_all_symbols(conn, repo_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        embedding::chunk_all_symbols(conn, repo_root).context("chunking symbols for embedding")?;
 
     if chunks.is_empty() {
         return Ok(EmbeddingBuildStats {
@@ -693,8 +693,7 @@ pub fn build_embeddings(
             })
             .collect();
 
-        embedding::store_embeddings_batch(conn, &store_batch)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        embedding::store_embeddings_batch(conn, &store_batch).context("storing embedding batch")?;
 
         embedded += store_batch.len();
 

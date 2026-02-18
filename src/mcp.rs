@@ -464,7 +464,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_init",
-                description: "Initialize or rebuild the index for the current repository.",
+                description: "Initialize or rebuild the structural index and embeddings for the current repository. Embedding generation requires Ollama; if unavailable, only the structural index is built.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
