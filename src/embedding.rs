@@ -442,7 +442,7 @@ fn extract_line_range_indexed<'a>(
 ///
 /// Returns `(symbol_id, chunk_text)` pairs.  Reads source files from disk
 /// under `repo_root`, and silently skips files that cannot be read or whose
-/// paths contain `..` components.
+/// paths are absolute or contain `..` components.
 pub fn chunk_all_symbols(
     conn: &Connection,
     repo_root: &Path,
@@ -467,11 +467,12 @@ pub fn chunk_all_symbols(
     let mut results = Vec::with_capacity(rows.len());
 
     for (file, symbols) in &by_file {
-        // Reject paths with ".." to prevent path traversal.
+        // Reject absolute paths and ".." to prevent path traversal.
         let rel = Path::new(file);
-        if rel
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             continue;
         }
@@ -1036,6 +1037,28 @@ mod tests {
             "evil",
             "function",
             "../../../etc/passwd",
+            1,
+            Some(1),
+            None,
+            "fn evil()",
+            "Rust",
+        );
+
+        let chunks = chunk_all_symbols(&conn, root).unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_all_symbols_rejects_absolute_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        let conn = setup_test_db();
+        insert_symbol(
+            &conn,
+            "evil",
+            "function",
+            "/etc/passwd",
             1,
             Some(1),
             None,
