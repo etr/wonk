@@ -1,6 +1,7 @@
 //! Shared types and data structures.
 
 use std::fmt;
+use std::str::FromStr;
 
 /// The kind of a symbol definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,6 +35,27 @@ impl fmt::Display for SymbolKind {
             SymbolKind::Module => "module",
         };
         write!(f, "{s}")
+    }
+}
+
+impl FromStr for SymbolKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "function" => Ok(SymbolKind::Function),
+            "method" => Ok(SymbolKind::Method),
+            "class" => Ok(SymbolKind::Class),
+            "struct" => Ok(SymbolKind::Struct),
+            "interface" => Ok(SymbolKind::Interface),
+            "enum" => Ok(SymbolKind::Enum),
+            "trait" => Ok(SymbolKind::Trait),
+            "type_alias" => Ok(SymbolKind::TypeAlias),
+            "constant" => Ok(SymbolKind::Constant),
+            "variable" => Ok(SymbolKind::Variable),
+            "module" => Ok(SymbolKind::Module),
+            other => Err(format!("unknown symbol kind: {other}")),
+        }
     }
 }
 
