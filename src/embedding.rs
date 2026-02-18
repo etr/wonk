@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -404,6 +404,162 @@ fn query_all_file_imports(
     }
 
     Ok(imports)
+}
+
+// ---------------------------------------------------------------------------
+// Vector normalization
+// ---------------------------------------------------------------------------
+
+/// L2-normalize a vector in place.
+///
+/// Divides each element by the L2 (Euclidean) norm so the result has
+/// unit length.  Zero-norm vectors (all zeros) are left unchanged.
+pub fn normalize(vec: &mut [f32]) {
+    let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        let inv_norm = 1.0 / norm;
+        for x in vec.iter_mut() {
+            *x *= inv_norm;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vector storage and retrieval
+// ---------------------------------------------------------------------------
+
+/// Store an embedding vector for a symbol.
+///
+/// L2-normalizes the vector before storing.  Uses `INSERT OR REPLACE`
+/// so re-embedding the same symbol overwrites the previous vector.
+pub fn store_embedding(
+    conn: &Connection,
+    symbol_id: i64,
+    file: &str,
+    chunk_text: &str,
+    vector: &[f32],
+) -> Result<(), EmbeddingError> {
+    let mut normalized = vector.to_vec();
+    normalize(&mut normalized);
+
+    let bytes: &[u8] = bytemuck::cast_slice(&normalized);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO embeddings (symbol_id, file, chunk_text, vector, stale, created_at)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+        rusqlite::params![symbol_id, file, chunk_text, bytes, now],
+    )
+    .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    Ok(())
+}
+
+/// Batch-insert embedding vectors within a single transaction.
+///
+/// Each tuple is `(symbol_id, file, chunk_text, vector)`.  Vectors are
+/// L2-normalized before storage.  The entire batch is atomic: if any
+/// insert fails, all are rolled back.
+pub fn store_embeddings_batch(
+    conn: &Connection,
+    embeddings: &[(i64, &str, &str, &[f32])],
+) -> Result<(), EmbeddingError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT OR REPLACE INTO embeddings (symbol_id, file, chunk_text, vector, stale, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            )
+            .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+        for &(symbol_id, file, chunk_text, vector) in embeddings {
+            let mut normalized = vector.to_vec();
+            normalize(&mut normalized);
+            let bytes: &[u8] = bytemuck::cast_slice(&normalized);
+            stmt.execute(rusqlite::params![symbol_id, file, chunk_text, bytes, now])
+                .map_err(|_| EmbeddingError::ChunkingFailed)?;
+        }
+    }
+
+    tx.commit().map_err(|_| EmbeddingError::ChunkingFailed)?;
+    Ok(())
+}
+
+/// Load all embedding vectors from the database.
+///
+/// Returns `(symbol_id, vector)` pairs.  Uses `bytemuck::cast_slice`
+/// for zero-copy BLOB-to-f32 conversion.
+pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
+    let mut stmt = conn
+        .prepare("SELECT symbol_id, vector FROM embeddings")
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let symbol_id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((symbol_id, blob))
+        })
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    let mut results = Vec::new();
+    for r in rows {
+        let (symbol_id, blob) = r.map_err(|_| EmbeddingError::ChunkingFailed)?;
+        let floats: &[f32] =
+            bytemuck::try_cast_slice(&blob).map_err(|_| EmbeddingError::ChunkingFailed)?;
+        results.push((symbol_id, floats.to_vec()));
+    }
+
+    Ok(results)
+}
+
+/// Delete all embeddings for a given file.
+pub fn delete_embeddings_for_file(conn: &Connection, file: &str) -> Result<(), EmbeddingError> {
+    conn.execute(
+        "DELETE FROM embeddings WHERE file = ?1",
+        rusqlite::params![file],
+    )
+    .map_err(|_| EmbeddingError::ChunkingFailed)?;
+    Ok(())
+}
+
+/// Mark all embeddings for a file as stale (`stale = 1`).
+pub fn mark_embeddings_stale(conn: &Connection, file: &str) -> Result<(), EmbeddingError> {
+    conn.execute(
+        "UPDATE embeddings SET stale = 1 WHERE file = ?1",
+        rusqlite::params![file],
+    )
+    .map_err(|_| EmbeddingError::ChunkingFailed)?;
+    Ok(())
+}
+
+/// Return `(total_count, stale_count)` for embeddings in the database.
+pub fn embedding_stats(conn: &Connection) -> Result<(usize, usize), EmbeddingError> {
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM embeddings WHERE stale = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    Ok((total as usize, stale as usize))
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,5 +1265,333 @@ mod tests {
             extract_line_range_indexed(source, &offsets, 2, None),
             "line2\nline3"
         );
+    }
+
+    // -- normalize tests ------------------------------------------------------
+
+    #[test]
+    fn normalize_produces_unit_norm() {
+        let mut v = vec![3.0_f32, 4.0];
+        normalize(&mut v);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert!((v[0] - 0.6).abs() < 1e-6);
+        assert!((v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_zero_vector_stays_zero() {
+        let mut v = vec![0.0_f32, 0.0, 0.0];
+        normalize(&mut v);
+        assert!(v.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn normalize_already_unit_vector() {
+        let mut v = vec![1.0_f32, 0.0, 0.0];
+        normalize(&mut v);
+        assert!((v[0] - 1.0).abs() < 1e-6);
+        assert!(v[1].abs() < 1e-6);
+        assert!(v[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_empty_vector() {
+        let mut v: Vec<f32> = vec![];
+        normalize(&mut v); // Should not panic
+        assert!(v.is_empty());
+    }
+
+    // -- DB embedding storage tests -------------------------------------------
+
+    fn setup_test_db_with_embeddings() -> Connection {
+        let conn = setup_test_db();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS embeddings (
+                id INTEGER PRIMARY KEY,
+                symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                file TEXT NOT NULL,
+                chunk_text TEXT NOT NULL,
+                vector BLOB NOT NULL,
+                stale INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                UNIQUE(symbol_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn store_embedding_round_trip() {
+        let conn = setup_test_db_with_embeddings();
+        let sym_id = insert_symbol(
+            &conn,
+            "foo",
+            "function",
+            "a.rs",
+            1,
+            Some(3),
+            None,
+            "fn foo()",
+            "Rust",
+        );
+
+        let vector = vec![3.0_f32, 4.0]; // will be normalized to [0.6, 0.8]
+        store_embedding(&conn, sym_id, "a.rs", "fn foo() {}", &vector).unwrap();
+
+        let loaded = load_all_embeddings(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, sym_id);
+        // Check it was L2-normalized
+        let norm: f32 = loaded[0].1.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert!((loaded[0].1[0] - 0.6).abs() < 1e-6);
+        assert!((loaded[0].1[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn store_embedding_replaces_on_same_symbol() {
+        let conn = setup_test_db_with_embeddings();
+        let sym_id = insert_symbol(
+            &conn,
+            "foo",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn foo()",
+            "Rust",
+        );
+
+        let v1 = vec![1.0_f32, 0.0];
+        store_embedding(&conn, sym_id, "a.rs", "v1", &v1).unwrap();
+
+        let v2 = vec![0.0_f32, 1.0];
+        store_embedding(&conn, sym_id, "a.rs", "v2", &v2).unwrap();
+
+        let loaded = load_all_embeddings(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        // Should have the second vector
+        assert!((loaded[0].1[0] - 0.0).abs() < 1e-6);
+        assert!((loaded[0].1[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn store_embeddings_batch_inserts_all() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+
+        let v1 = vec![1.0_f32, 0.0];
+        let v2 = vec![0.0_f32, 1.0];
+        let batch: Vec<(i64, &str, &str, &[f32])> =
+            vec![(id1, "a.rs", "fn a()", &v1), (id2, "b.rs", "fn b()", &v2)];
+        store_embeddings_batch(&conn, &batch).unwrap();
+
+        let loaded = load_all_embeddings(&conn).unwrap();
+        assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn store_embeddings_batch_is_atomic() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+
+        let v1 = vec![1.0_f32, 0.0];
+        // Second entry references non-existent symbol_id=999 -- should cause FK failure.
+        let v2 = vec![0.0_f32, 1.0];
+        let batch: Vec<(i64, &str, &str, &[f32])> =
+            vec![(id1, "a.rs", "fn a()", &v1), (999, "z.rs", "bogus", &v2)];
+        let result = store_embeddings_batch(&conn, &batch);
+        assert!(result.is_err());
+
+        // Atomic: nothing should have been inserted.
+        let loaded = load_all_embeddings(&conn).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_all_embeddings_empty_db() {
+        let conn = setup_test_db_with_embeddings();
+        let loaded = load_all_embeddings(&conn).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn delete_embeddings_for_file_removes_correct_rows() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+
+        delete_embeddings_for_file(&conn, "a.rs").unwrap();
+
+        let loaded = load_all_embeddings(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, id2);
+    }
+
+    #[test]
+    fn delete_embeddings_for_nonexistent_file_succeeds() {
+        let conn = setup_test_db_with_embeddings();
+        // Should not error even if no rows match.
+        delete_embeddings_for_file(&conn, "nonexistent.rs").unwrap();
+    }
+
+    #[test]
+    fn mark_embeddings_stale_sets_flag() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+
+        mark_embeddings_stale(&conn, "a.rs").unwrap();
+
+        let (total, stale) = embedding_stats(&conn).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(stale, 1);
+    }
+
+    #[test]
+    fn embedding_stats_all_zero() {
+        let conn = setup_test_db_with_embeddings();
+        let (total, stale) = embedding_stats(&conn).unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(stale, 0);
+    }
+
+    #[test]
+    fn embedding_stats_counts_correctly() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "a.rs",
+            2,
+            Some(2),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        let id3 = insert_symbol(
+            &conn,
+            "c",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn c()",
+            "Rust",
+        );
+
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, id2, "a.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        store_embedding(&conn, id3, "b.rs", "fn c()", &[0.7, 0.7]).unwrap();
+
+        mark_embeddings_stale(&conn, "a.rs").unwrap();
+
+        let (total, stale) = embedding_stats(&conn).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(stale, 2);
+    }
+
+    #[test]
+    fn bytemuck_round_trip_preserves_values() {
+        // Verify that cast_slice/try_cast_slice round-trips correctly.
+        let original: Vec<f32> = vec![1.0, 2.5, -3.0, 0.0];
+        let bytes: &[u8] = bytemuck::cast_slice(&original);
+        let recovered: &[f32] = bytemuck::cast_slice(bytes);
+        assert_eq!(original.as_slice(), recovered);
     }
 }
