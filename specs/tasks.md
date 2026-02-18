@@ -1483,12 +1483,12 @@ Verify end-to-end worktree support: repo root detection accepts `.git` files, ne
 Add V2 crate dependencies, extend the SQLite schema with the `embeddings` table, and add `EmbeddingError` type.
 
 **Action Items:**
-- [ ] Add to Cargo.toml: `ureq = { version = "3.1", features = ["json"] }`, `bytemuck = { version = "1", features = ["derive"] }`
-- [ ] Add `embeddings` table to schema creation in `db.rs`: `id`, `symbol_id` (FK → symbols, ON DELETE CASCADE), `file` (TEXT), `chunk_text` (TEXT), `vector` (BLOB), `stale` (INTEGER DEFAULT 0), `created_at` (INTEGER), `UNIQUE(symbol_id)`
-- [ ] Add `idx_embeddings_file` index on `embeddings(file)`
-- [ ] Add `EmbeddingError` enum to `errors.rs` with variants: `OllamaUnreachable`, `OllamaError(String)`, `InvalidResponse`, `NoEmbeddings`, `ChunkingFailed`
-- [ ] Add `QueryRouter` error matching for `EmbeddingError::NoEmbeddings` in `router.rs`
-- [ ] Handle schema migration: detect if `embeddings` table exists, create if missing (for upgrading V1 indexes)
+- [x] Add to Cargo.toml: `ureq = { version = "3.1", features = ["json"] }`, `bytemuck = { version = "1", features = ["derive"] }`
+- [x] Add `embeddings` table to schema creation in `db.rs`: `id`, `symbol_id` (FK → symbols, ON DELETE CASCADE), `file` (TEXT), `chunk_text` (TEXT), `vector` (BLOB), `stale` (INTEGER DEFAULT 0), `created_at` (INTEGER), `UNIQUE(symbol_id)`
+- [x] Add `idx_embeddings_file` index on `embeddings(file)`
+- [x] Add `EmbeddingError` enum to `errors.rs` with variants: `OllamaUnreachable`, `OllamaError(String)`, `InvalidResponse`, `NoEmbeddings`, `ChunkingFailed`
+- [x] Add `QueryRouter` error matching for `EmbeddingError::NoEmbeddings` in `router.rs`
+- [x] Handle schema migration: detect if `embeddings` table exists, create if missing (for upgrading V1 indexes)
 
 **Dependencies:**
 - Blocked by: None
@@ -1506,7 +1506,7 @@ Add V2 crate dependencies, extend the SQLite schema with the `embeddings` table,
 **Related Requirements:** PRD-SEM-REQ-015
 **Related Decisions:** DR-005, DR-006, DR-010
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -1520,15 +1520,15 @@ Add V2 crate dependencies, extend the SQLite schema with the `embeddings` table,
 Implement a sync HTTP client for Ollama's embedding API with health checking, batch embedding, and error handling.
 
 **Action Items:**
-- [ ] Create `embedding.rs` module
-- [ ] Implement `OllamaClient` struct with configurable base URL (default: `http://localhost:11434`)
-- [ ] Implement health check: `GET /` → returns true if 200 OK
-- [ ] Implement `embed_batch(texts: &[String]) -> Result<Vec<Vec<f32>>>`: POST to `/api/embed` with `{"model": "nomic-embed-text", "input": [...]}`
-- [ ] Implement `embed_single(text: &str) -> Result<Vec<f32>>`: convenience wrapper
-- [ ] Parse response: extract `embeddings` array from JSON response
-- [ ] Configure connection timeout (2s) and read timeout (60s) via ureq agent builder
-- [ ] Return `EmbeddingError::OllamaUnreachable` on connection failure
-- [ ] Return `EmbeddingError::OllamaError` on non-200 responses with error detail
+- [x] Create `embedding.rs` module
+- [x] Implement `OllamaClient` struct with configurable base URL (default: `http://localhost:11434`)
+- [x] Implement health check: `GET /` → returns true if 200 OK
+- [x] Implement `embed_batch(texts: &[String]) -> Result<Vec<Vec<f32>>>`: POST to `/api/embed` with `{"model": "nomic-embed-text", "input": [...]}`
+- [x] Implement `embed_single(text: &str) -> Result<Vec<f32>>`: convenience wrapper
+- [x] Parse response: extract `embeddings` array from JSON response
+- [x] Configure connection timeout (2s) and read timeout (60s) via ureq agent builder
+- [x] Return `EmbeddingError::OllamaUnreachable` on connection failure
+- [x] Return `EmbeddingError::OllamaError` on non-200 responses with error detail
 
 **Dependencies:**
 - Blocked by: TASK-038
@@ -1547,7 +1547,7 @@ Implement a sync HTTP client for Ollama's embedding API with health checking, ba
 **Related Requirements:** PRD-SEM-REQ-008, PRD-SEM-REQ-012, PRD-SEM-REQ-014
 **Related Decisions:** DR-009, DR-012
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -1625,7 +1625,7 @@ Store embedding vectors as BLOBs in SQLite and retrieve them with zero-copy dese
 **Related Requirements:** PRD-SEM-REQ-015
 **Related Decisions:** DR-010, DR-012
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
