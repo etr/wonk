@@ -484,6 +484,12 @@ pub fn chunk_all_symbols(
         };
 
         let imports: &[String] = all_imports.get(file.as_str()).map_or(&[], |v| v.as_slice());
+        // Pre-compute the joined imports string once per file.
+        let imports_line = if imports.is_empty() {
+            None
+        } else {
+            Some(format!("Imports: {}\n", imports.join(", ")))
+        };
 
         // Pre-compute line offsets once per file for O(1) extraction.
         let offsets = compute_line_offsets(&source);
@@ -500,8 +506,8 @@ pub fn chunk_all_symbols(
             if let Some(ref scope) = sym_row.symbol.scope {
                 header.push_str(&format!("Scope: {scope}\n"));
             }
-            if !imports.is_empty() {
-                header.push_str(&format!("Imports: {}\n", imports.join(", ")));
+            if let Some(ref imp) = imports_line {
+                header.push_str(imp);
             }
             header.push_str("---\n");
 
