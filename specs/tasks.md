@@ -1599,14 +1599,14 @@ Generate context-rich text chunks from indexed symbols, suitable for embedding b
 Store embedding vectors as BLOBs in SQLite and retrieve them with zero-copy deserialization via bytemuck.
 
 **Action Items:**
-- [ ] Implement `store_embedding(db, symbol_id, file, chunk_text, vector: &[f32]) -> Result<()>`: L2-normalize vector, write as little-endian f32 BLOB
-- [ ] Implement `store_embeddings_batch(db, embeddings: &[(i64, &str, &str, &[f32])]) -> Result<()>`: batch insert within a transaction
-- [ ] Implement `load_all_embeddings(db) -> Result<Vec<(i64, Vec<f32>)>>`: load all (symbol_id, vector) pairs
-- [ ] Use `bytemuck::cast_slice::<u8, f32>()` for zero-copy BLOB → f32 slice conversion
-- [ ] Implement `delete_embeddings_for_file(db, file: &str) -> Result<()>`: delete all embeddings for a file
-- [ ] Implement `mark_embeddings_stale(db, file: &str) -> Result<()>`: set `stale = 1` for a file's embeddings
-- [ ] Implement `embedding_stats(db) -> Result<(usize, usize)>`: return (total_count, stale_count)
-- [ ] Implement L2 normalization: `normalize(vec: &mut [f32])` — divide each element by the L2 norm
+- [x] Implement `store_embedding(db, symbol_id, file, chunk_text, vector: &[f32]) -> Result<()>`: L2-normalize vector, write as little-endian f32 BLOB
+- [x] Implement `store_embeddings_batch(db, embeddings: &[(i64, &str, &str, &[f32])]) -> Result<()>`: batch insert within a transaction
+- [x] Implement `load_all_embeddings(db) -> Result<Vec<(i64, Vec<f32>)>>`: load all (symbol_id, vector) pairs
+- [x] Use `bytemuck::cast_slice::<u8, f32>()` for zero-copy BLOB → f32 slice conversion
+- [x] Implement `delete_embeddings_for_file(db, file: &str) -> Result<()>`: delete all embeddings for a file
+- [x] Implement `mark_embeddings_stale(db, file: &str) -> Result<()>`: set `stale = 1` for a file's embeddings
+- [x] Implement `embedding_stats(db) -> Result<(usize, usize)>`: return (total_count, stale_count)
+- [x] Implement L2 normalization: `normalize(vec: &mut [f32])` — divide each element by the L2 norm
 
 **Dependencies:**
 - Blocked by: TASK-038
@@ -1625,7 +1625,7 @@ Store embedding vectors as BLOBs in SQLite and retrieve them with zero-copy dese
 **Related Requirements:** PRD-SEM-REQ-015
 **Related Decisions:** DR-010, DR-012
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

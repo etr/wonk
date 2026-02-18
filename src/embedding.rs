@@ -453,7 +453,7 @@ pub fn store_embedding(
          VALUES (?1, ?2, ?3, ?4, 0, ?5)",
         rusqlite::params![symbol_id, file, chunk_text, bytes, now],
     )
-    .map_err(|_| EmbeddingError::ChunkingFailed)?;
+    .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     Ok(())
 }
@@ -474,7 +474,7 @@ pub fn store_embeddings_batch(
 
     let tx = conn
         .unchecked_transaction()
-        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     {
         let mut stmt = tx
@@ -482,29 +482,34 @@ pub fn store_embeddings_batch(
                 "INSERT OR REPLACE INTO embeddings (symbol_id, file, chunk_text, vector, stale, created_at)
                  VALUES (?1, ?2, ?3, ?4, 0, ?5)",
             )
-            .map_err(|_| EmbeddingError::ChunkingFailed)?;
+            .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
+        let mut scratch = Vec::new();
         for &(symbol_id, file, chunk_text, vector) in embeddings {
-            let mut normalized = vector.to_vec();
-            normalize(&mut normalized);
-            let bytes: &[u8] = bytemuck::cast_slice(&normalized);
+            scratch.clear();
+            scratch.extend_from_slice(vector);
+            normalize(&mut scratch);
+            let bytes: &[u8] = bytemuck::cast_slice(&scratch);
             stmt.execute(rusqlite::params![symbol_id, file, chunk_text, bytes, now])
-                .map_err(|_| EmbeddingError::ChunkingFailed)?;
+                .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
         }
     }
 
-    tx.commit().map_err(|_| EmbeddingError::ChunkingFailed)?;
+    tx.commit()
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
     Ok(())
 }
 
 /// Load all embedding vectors from the database.
 ///
-/// Returns `(symbol_id, vector)` pairs.  Uses `bytemuck::cast_slice`
-/// for zero-copy BLOB-to-f32 conversion.
+/// Returns `(symbol_id, vector)` pairs.  Uses `bytemuck::try_cast_slice`
+/// to validate BLOB alignment, then copies the floats into an owned `Vec<f32>`.
+/// (The intermediate `Vec<u8>` is a rusqlite API constraint — SQLite BLOBs
+/// must be copied out of the page cache regardless.)
 pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
     let mut stmt = conn
         .prepare("SELECT symbol_id, vector FROM embeddings")
-        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let rows = stmt
         .query_map([], |row| {
@@ -512,13 +517,13 @@ pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, Em
             let blob: Vec<u8> = row.get(1)?;
             Ok((symbol_id, blob))
         })
-        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let mut results = Vec::new();
     for r in rows {
-        let (symbol_id, blob) = r.map_err(|_| EmbeddingError::ChunkingFailed)?;
-        let floats: &[f32] =
-            bytemuck::try_cast_slice(&blob).map_err(|_| EmbeddingError::ChunkingFailed)?;
+        let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+        let floats: &[f32] = bytemuck::try_cast_slice(&blob)
+            .map_err(|e| EmbeddingError::StorageFailed(format!("BLOB cast failed: {e}")))?;
         results.push((symbol_id, floats.to_vec()));
     }
 
@@ -531,7 +536,7 @@ pub fn delete_embeddings_for_file(conn: &Connection, file: &str) -> Result<(), E
         "DELETE FROM embeddings WHERE file = ?1",
         rusqlite::params![file],
     )
-    .map_err(|_| EmbeddingError::ChunkingFailed)?;
+    .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
     Ok(())
 }
 
@@ -541,23 +546,19 @@ pub fn mark_embeddings_stale(conn: &Connection, file: &str) -> Result<(), Embedd
         "UPDATE embeddings SET stale = 1 WHERE file = ?1",
         rusqlite::params![file],
     )
-    .map_err(|_| EmbeddingError::ChunkingFailed)?;
+    .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
     Ok(())
 }
 
 /// Return `(total_count, stale_count)` for embeddings in the database.
 pub fn embedding_stats(conn: &Connection) -> Result<(usize, usize), EmbeddingError> {
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
-        .map_err(|_| EmbeddingError::ChunkingFailed)?;
-
-    let stale: i64 = conn
+    let (total, stale): (i64, i64) = conn
         .query_row(
-            "SELECT COUNT(*) FROM embeddings WHERE stale = 1",
+            "SELECT COUNT(*), COALESCE(SUM(stale), 0) FROM embeddings",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     Ok((total as usize, stale as usize))
 }

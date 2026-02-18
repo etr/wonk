@@ -75,6 +75,10 @@ pub enum EmbeddingError {
     /// Failed to chunk a symbol body for embedding.
     #[error("failed to chunk symbol for embedding")]
     ChunkingFailed,
+
+    /// A database operation in the embedding storage layer failed.
+    #[error("embedding storage failed: {0}")]
+    StorageFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +138,9 @@ impl WonkError {
             }
             WonkError::Embedding(EmbeddingError::NoEmbeddings) => {
                 Some("run `wonk init --embed` to generate embeddings")
+            }
+            WonkError::Embedding(EmbeddingError::StorageFailed(_)) => {
+                Some("the index may be corrupt; try `wonk init` to rebuild it")
             }
             WonkError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Some("verify the file or directory exists")
@@ -334,5 +341,18 @@ mod tests {
     fn exit_code_embedding_error() {
         let err = WonkError::Embedding(EmbeddingError::NoEmbeddings);
         assert_eq!(err.exit_code(), EXIT_ERROR);
+    }
+
+    #[test]
+    fn embedding_error_storage_failed_display() {
+        let err = EmbeddingError::StorageFailed("disk full".to_string());
+        assert_eq!(format!("{err}"), "embedding storage failed: disk full");
+    }
+
+    #[test]
+    fn hint_storage_failed() {
+        let err = WonkError::Embedding(EmbeddingError::StorageFailed("test".to_string()));
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("rebuild"));
     }
 }
