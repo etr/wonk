@@ -351,6 +351,41 @@ struct SymbolRow {
     symbol: Symbol,
 }
 
+/// Map a single database row to a [`SymbolRow`].
+///
+/// Expects columns in this order:
+/// `id, name, kind, file, line, col, end_line, scope, signature, language`.
+fn map_symbol_row(row: &rusqlite::Row) -> rusqlite::Result<SymbolRow> {
+    let id: i64 = row.get(0)?;
+    let name: String = row.get(1)?;
+    let kind_str: String = row.get(2)?;
+    let file: String = row.get(3)?;
+    let line: usize = row.get::<_, i64>(4)? as usize;
+    let col: usize = row.get::<_, i64>(5)? as usize;
+    let end_line: Option<usize> = row.get::<_, Option<i64>>(6)?.map(|v| v as usize);
+    let scope: Option<String> = row.get(7)?;
+    let signature: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+    let language: String = row.get(9)?;
+    let kind = kind_str
+        .parse::<SymbolKind>()
+        .unwrap_or(SymbolKind::Function);
+
+    Ok(SymbolRow {
+        id,
+        symbol: Symbol {
+            name,
+            kind,
+            file,
+            line,
+            col,
+            end_line,
+            scope,
+            signature,
+            language,
+        },
+    })
+}
+
 /// Execute a symbol query and map rows into `SymbolRow` structs.
 ///
 /// The `sql` must select columns in this order:
@@ -361,36 +396,7 @@ fn query_symbol_rows(conn: &Connection, sql: &str) -> Result<Vec<SymbolRow>, Emb
         .map_err(|_| EmbeddingError::ChunkingFailed)?;
 
     let rows = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let kind_str: String = row.get(2)?;
-            let file: String = row.get(3)?;
-            let line: usize = row.get::<_, i64>(4)? as usize;
-            let col: usize = row.get::<_, i64>(5)? as usize;
-            let end_line: Option<usize> = row.get::<_, Option<i64>>(6)?.map(|v| v as usize);
-            let scope: Option<String> = row.get(7)?;
-            let signature: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
-            let language: String = row.get(9)?;
-            let kind = kind_str
-                .parse::<SymbolKind>()
-                .unwrap_or(SymbolKind::Function);
-
-            Ok(SymbolRow {
-                id,
-                symbol: Symbol {
-                    name,
-                    kind,
-                    file,
-                    line,
-                    col,
-                    end_line,
-                    scope,
-                    signature,
-                    language,
-                },
-            })
-        })
+        .query_map([], map_symbol_row)
         .map_err(|_| EmbeddingError::ChunkingFailed)?
         .filter_map(|r| r.ok())
         .collect();
@@ -410,6 +416,39 @@ fn query_unembedded_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, Embeddi
          WHERE id NOT IN (SELECT symbol_id FROM embeddings WHERE NOT stale)
          ORDER BY file, line",
     )
+}
+
+/// Query symbols for specific files, returning (id, Symbol) pairs.
+fn query_symbols_for_files(
+    conn: &Connection,
+    files: &[String],
+) -> Result<Vec<SymbolRow>, EmbeddingError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: Vec<String> = (1..=files.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
+         FROM symbols WHERE file IN ({}) ORDER BY file, line",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = files
+        .iter()
+        .map(|f| f as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows = stmt
+        .query_map(params.as_slice(), map_symbol_row)
+        .map_err(|_| EmbeddingError::ChunkingFailed)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(rows)
 }
 
 /// Query all symbols from the database, returning (id, Symbol) pairs.
@@ -433,6 +472,43 @@ fn query_file_imports(conn: &Connection, source_file: &str) -> Result<Vec<String
         .map_err(|_| EmbeddingError::ChunkingFailed)?
         .filter_map(|r| r.ok())
         .collect();
+
+    Ok(imports)
+}
+
+/// Batch-fetch file-level imports for specific files, grouped by source file.
+fn query_file_imports_for_files(
+    conn: &Connection,
+    files: &[String],
+) -> Result<BTreeMap<String, Vec<String>>, EmbeddingError> {
+    if files.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders: Vec<String> = (1..=files.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        "SELECT source_file, import_path FROM file_imports WHERE source_file IN ({}) ORDER BY source_file",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = files
+        .iter()
+        .map(|f| f as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let mut imports: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    for r in rows.flatten() {
+        imports.entry(r.0).or_default().push(r.1);
+    }
 
     Ok(imports)
 }
@@ -781,6 +857,24 @@ pub fn chunk_missing_symbols(
 ) -> Result<Vec<(i64, String, String)>, EmbeddingError> {
     let rows = query_unembedded_symbols(conn)?;
     let all_imports = query_all_file_imports(conn)?;
+    Ok(chunk_symbol_rows(&rows, &all_imports, repo_root))
+}
+
+/// Generate text chunks for symbols belonging to specific files.
+///
+/// Like [`chunk_all_symbols`] but only processes symbols whose `file` column
+/// matches one of the provided paths.  Returns an empty `Vec` when `files`
+/// is empty.
+pub fn chunk_symbols_for_files(
+    conn: &Connection,
+    repo_root: &Path,
+    files: &[String],
+) -> Result<Vec<(i64, String, String)>, EmbeddingError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = query_symbols_for_files(conn, files)?;
+    let all_imports = query_file_imports_for_files(conn, files)?;
     Ok(chunk_symbol_rows(&rows, &all_imports, repo_root))
 }
 
@@ -2096,6 +2190,123 @@ mod tests {
         mark_embeddings_stale(&conn, "a.rs").unwrap();
 
         let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].1, "a.rs");
+    }
+
+    // -- chunk_symbols_for_files tests ----------------------------------------
+
+    #[test]
+    fn chunk_symbols_for_files_targets_specific_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        std::fs::write(root.join("b.rs"), "fn b() { 2 }\n").unwrap();
+        std::fs::write(root.join("c.rs"), "fn c() { 3 }\n").unwrap();
+
+        let conn = setup_test_db();
+        insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "c",
+            "function",
+            "c.rs",
+            1,
+            Some(1),
+            None,
+            "fn c()",
+            "Rust",
+        );
+
+        // Only chunk symbols for a.rs and c.rs.
+        let files = vec!["a.rs".to_string(), "c.rs".to_string()];
+        let chunks = chunk_symbols_for_files(&conn, root, &files).unwrap();
+        assert_eq!(chunks.len(), 2);
+        let file_paths: Vec<&str> = chunks.iter().map(|(_, f, _)| f.as_str()).collect();
+        assert!(file_paths.contains(&"a.rs"));
+        assert!(file_paths.contains(&"c.rs"));
+        assert!(!file_paths.contains(&"b.rs"));
+    }
+
+    #[test]
+    fn chunk_symbols_for_files_empty_list_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() { 1 }\n").unwrap();
+
+        let conn = setup_test_db();
+        insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+
+        let files: Vec<String> = vec![];
+        let chunks = chunk_symbols_for_files(&conn, root, &files).unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_symbols_for_files_nonexistent_file_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        // a.rs exists on disk and in DB, ghost.rs exists in DB but not on disk.
+        std::fs::write(root.join("a.rs"), "fn a() { 1 }\n").unwrap();
+
+        let conn = setup_test_db();
+        insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "ghost",
+            "function",
+            "ghost.rs",
+            1,
+            Some(1),
+            None,
+            "fn ghost()",
+            "Rust",
+        );
+
+        let files = vec!["a.rs".to_string(), "ghost.rs".to_string()];
+        let chunks = chunk_symbols_for_files(&conn, root, &files).unwrap();
+        // Only a.rs should produce chunks (ghost.rs can't be read from disk).
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].1, "a.rs");
     }

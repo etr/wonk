@@ -1832,12 +1832,12 @@ Remove the 30-minute idle timeout so daemons run indefinitely until explicitly s
 After structural re-indexing of changed files, re-generate and store embeddings for those files when Ollama is reachable.
 
 **Action Items:**
-- [ ] After incremental structural re-index (existing pipeline), check Ollama reachability
-- [ ] If Ollama reachable: delete old embeddings for the changed file, generate new chunks from updated symbols, embed via Ollama, store new vectors
-- [ ] If Ollama unreachable: call `mark_embeddings_stale(db, file)` to set `stale = 1` for the file's embeddings (PRD-SEM-REQ-011)
-- [ ] Run embedding work on a separate thread from the watcher thread to avoid blocking file event processing
-- [ ] On file delete: CASCADE handles embedding cleanup (from FK constraint)
-- [ ] Log embedding re-index activity to daemon status table
+- [x] After incremental structural re-index (existing pipeline), check Ollama reachability
+- [x] If Ollama reachable: delete old embeddings for the changed file, generate new chunks from updated symbols, embed via Ollama, store new vectors
+- [x] If Ollama unreachable: call `mark_embeddings_stale(db, file)` to set `stale = 1` for the file's embeddings (PRD-SEM-REQ-011)
+- [x] Run embedding work on a separate thread from the watcher thread to avoid blocking file event processing
+- [x] On file delete: CASCADE handles embedding cleanup (from FK constraint)
+- [x] Log embedding re-index activity to daemon status table
 
 **Dependencies:**
 - Blocked by: TASK-042
@@ -1855,7 +1855,7 @@ After structural re-indexing of changed files, re-generate and store embeddings 
 **Related Requirements:** PRD-SEM-REQ-010, PRD-SEM-REQ-011
 **Related Decisions:** DR-009, DR-010, DR-013
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

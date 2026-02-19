@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,7 @@ use rusqlite::Connection;
 use signal_hook::flag;
 
 use crate::db;
+use crate::embedding::OllamaClient;
 use crate::pipeline;
 use crate::watcher::{self, FileWatcher};
 
@@ -48,6 +49,8 @@ pub struct DaemonInfo {
     pub files_queued: Option<String>,
     pub last_error: Option<String>,
     pub heartbeat: Option<String>,
+    pub embedding_last_activity: Option<String>,
+    pub embedding_files_count: Option<String>,
 }
 
 /// Write a single key/value pair into the `daemon_status` table.
@@ -107,6 +110,13 @@ pub fn write_heartbeat(conn: &Connection) -> Result<()> {
     write_status(conn, "heartbeat", &now_epoch().to_string())
 }
 
+/// Update embedding activity status (call after each embedding re-index).
+pub fn update_embedding_activity(conn: &Connection, files_count: usize) -> Result<()> {
+    write_status(conn, "embedding_last_activity", &now_epoch().to_string())?;
+    write_status(conn, "embedding_files_count", &files_count.to_string())?;
+    Ok(())
+}
+
 /// Clear all rows from the `daemon_status` table (call on clean shutdown).
 pub fn clear_status(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM daemon_status", [])
@@ -139,6 +149,8 @@ pub fn read_all_status(conn: &Connection) -> Result<DaemonInfo> {
         files_queued: map.remove("files_queued"),
         last_error: map.remove("last_error"),
         heartbeat: map.remove("heartbeat"),
+        embedding_last_activity: map.remove("embedding_last_activity"),
+        embedding_files_count: map.remove("embedding_files_count"),
     })
 }
 
@@ -287,6 +299,26 @@ pub fn register_signal_handler() -> Result<Arc<AtomicBool>> {
 }
 
 // ---------------------------------------------------------------------------
+// Embedding worker helpers
+// ---------------------------------------------------------------------------
+
+/// Drain any pending batches from `rx` and merge them with `first`,
+/// deduplicating file paths.  This coalesces rapid successive file change
+/// notifications so the embedding worker processes each file at most once.
+pub(crate) fn coalesce_file_batches(
+    first: Vec<String>,
+    rx: &crossbeam_channel::Receiver<Vec<String>>,
+) -> Vec<String> {
+    let mut all: Vec<String> = first;
+    while let Ok(batch) = rx.try_recv() {
+        all.extend(batch);
+    }
+    all.sort();
+    all.dedup();
+    all
+}
+
+// ---------------------------------------------------------------------------
 // Spawn daemon (main entry point)
 // ---------------------------------------------------------------------------
 
@@ -335,6 +367,60 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     // Register signal handler for graceful shutdown.
     let shutdown = register_signal_handler()?;
 
+    // --- Embedding worker thread ---
+    // Create a channel for sending changed file lists to the embedding worker.
+    let (embed_tx, embed_rx) = crossbeam_channel::unbounded::<Vec<String>>();
+    let embed_shutdown = Arc::clone(&shutdown);
+    let embed_index_path = index_path.clone();
+    let embed_repo_root = repo_root.to_path_buf();
+
+    let embed_handle = thread::Builder::new()
+        .name("wonk-embed".to_string())
+        .spawn(move || {
+            // Open a dedicated DB connection for the embedding worker.
+            let embed_conn = match db::open(&embed_index_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("embedding worker: failed to open database: {e:#}");
+                    return;
+                }
+            };
+            let client = OllamaClient::new();
+
+            loop {
+                // Wait for a batch of changed files, checking shutdown periodically.
+                let files = match embed_rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(batch) => coalesce_file_batches(batch, &embed_rx),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if embed_shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+
+                if files.is_empty() {
+                    continue;
+                }
+
+                match pipeline::reembed_changed_files(
+                    &embed_conn,
+                    &embed_repo_root,
+                    &files,
+                    &client,
+                ) {
+                    Ok(_embedded) => {
+                        update_embedding_activity(&embed_conn, files.len()).ok();
+                    }
+                    Err(e) => {
+                        write_error(&embed_conn, &format!("embedding: {e:#}")).ok();
+                    }
+                }
+            }
+        })
+        .context("spawning embedding worker thread")?;
+
     // --- File watcher event loop ---
     // Set up debounced file watching (500ms window) and run the event loop.
     let (_watcher, rx) = FileWatcher::new(repo_root, 500).context("starting file watcher")?;
@@ -344,9 +430,13 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
         update_queue_depth(&conn, events.len()).ok();
 
         match pipeline::process_events(&conn, events, &repo_root_buf) {
-            Ok(count) => {
-                if count > 0 {
+            Ok(result) => {
+                if result.updated_count > 0 {
                     update_activity(&conn).ok();
+                }
+                // Send changed files to embedding worker (non-blocking).
+                if !result.changed_files.is_empty() {
+                    let _ = embed_tx.send(result.changed_files);
                 }
                 update_queue_depth(&conn, 0).ok();
             }
@@ -357,6 +447,11 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     });
 
     // --- Graceful shutdown ---
+    // Drop the sender to signal the embedding worker to exit.
+    drop(embed_tx);
+    // Wait for the embedding worker thread to finish.
+    let _ = embed_handle.join();
+
     clear_status(&conn)?;
     remove_pid(&index_dir)?;
 
@@ -922,6 +1017,8 @@ mod tests {
         assert!(info.files_queued.is_none());
         assert!(info.last_error.is_none());
         assert!(info.heartbeat.is_none());
+        assert!(info.embedding_last_activity.is_none());
+        assert!(info.embedding_files_count.is_none());
     }
 
     #[test]
@@ -1003,6 +1100,8 @@ mod tests {
         assert!(info.files_queued.is_none());
         assert!(info.last_error.is_none());
         assert!(info.heartbeat.is_none());
+        assert!(info.embedding_last_activity.is_none());
+        assert!(info.embedding_files_count.is_none());
     }
 
     // -- format_uptime / format_duration tests --------------------------------
@@ -1210,5 +1309,67 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("1234"));
         assert!(json.contains("/some/path"));
+    }
+
+    // -- Embedding status fields in DaemonInfo --------------------------------
+
+    #[test]
+    fn test_daemon_info_embedding_fields_default() {
+        let info = DaemonInfo::default();
+        assert!(info.embedding_last_activity.is_none());
+        assert!(info.embedding_files_count.is_none());
+    }
+
+    #[test]
+    fn test_read_all_status_includes_embedding_fields() {
+        let conn = open_test_db();
+        write_status(&conn, "embedding_last_activity", "1700000000").unwrap();
+        write_status(&conn, "embedding_files_count", "5").unwrap();
+
+        let info = read_all_status(&conn).unwrap();
+        assert_eq!(info.embedding_last_activity, Some("1700000000".to_string()));
+        assert_eq!(info.embedding_files_count, Some("5".to_string()));
+    }
+
+    #[test]
+    fn test_update_embedding_activity_writes_status() {
+        let conn = open_test_db();
+        update_embedding_activity(&conn, 7).unwrap();
+
+        let info = read_all_status(&conn).unwrap();
+        assert!(
+            info.embedding_last_activity.is_some(),
+            "should write timestamp"
+        );
+        let ts: i64 = info.embedding_last_activity.unwrap().parse().unwrap();
+        assert!(ts > 0, "timestamp should be positive");
+        assert_eq!(info.embedding_files_count, Some("7".to_string()));
+    }
+
+    #[test]
+    fn test_coalesce_file_lists_deduplicates() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<String>>();
+        tx.send(vec!["a.rs".to_string(), "b.rs".to_string()])
+            .unwrap();
+        tx.send(vec!["b.rs".to_string(), "c.rs".to_string()])
+            .unwrap();
+
+        // Drain the first message.
+        let first = rx.recv().unwrap();
+        // Coalesce any pending messages with it.
+        let combined = coalesce_file_batches(first, &rx);
+        assert_eq!(combined.len(), 3);
+        assert!(combined.contains(&"a.rs".to_string()));
+        assert!(combined.contains(&"b.rs".to_string()));
+        assert!(combined.contains(&"c.rs".to_string()));
+    }
+
+    #[test]
+    fn test_coalesce_file_lists_single_batch() {
+        let (_tx, rx) = crossbeam_channel::unbounded::<Vec<String>>();
+        // No pending messages.
+        let first = vec!["a.rs".to_string()];
+        let combined = coalesce_file_batches(first, &rx);
+        assert_eq!(combined, vec!["a.rs".to_string()]);
     }
 }
