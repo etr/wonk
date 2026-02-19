@@ -636,6 +636,23 @@ enum EmbedErrorPolicy {
     FailFast,
 }
 
+/// Handle an embedding interruption according to the error policy.
+///
+/// With [`EmbedErrorPolicy::FailFast`], returns `Err` so the `?` operator
+/// propagates the failure.  With [`EmbedErrorPolicy::SkipPartial`], logs the
+/// message (unless silent) and returns `Ok(())` — the caller should `break`.
+fn handle_embed_interruption(msg: &str, policy: EmbedErrorPolicy, silent: bool) -> Result<()> {
+    match policy {
+        EmbedErrorPolicy::FailFast => anyhow::bail!("{msg}"),
+        EmbedErrorPolicy::SkipPartial => {
+            if !silent {
+                eprintln!("{msg}");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Shared batch-embed loop.
 ///
 /// Iterates over `chunks` in groups of [`EMBEDDING_BATCH_SIZE`], embeds each
@@ -664,28 +681,14 @@ fn embed_chunks(
                 let msg = format!(
                     "Ollama became unreachable after embedding {embedded}/{total} symbols."
                 );
-                match policy {
-                    EmbedErrorPolicy::FailFast => anyhow::bail!("{msg}"),
-                    EmbedErrorPolicy::SkipPartial => {
-                        if !silent {
-                            eprintln!("{msg}");
-                        }
-                        break;
-                    }
-                }
+                handle_embed_interruption(&msg, policy, silent)?;
+                break;
             }
             Err(e) => {
                 let msg =
                     format!("Embedding error: {e}. Stopped after {embedded}/{total} symbols.");
-                match policy {
-                    EmbedErrorPolicy::FailFast => anyhow::bail!("{msg}"),
-                    EmbedErrorPolicy::SkipPartial => {
-                        if !silent {
-                            eprintln!("{msg}");
-                        }
-                        break;
-                    }
-                }
+                handle_embed_interruption(&msg, policy, silent)?;
+                break;
             }
         };
 
@@ -696,15 +699,8 @@ fn embed_chunks(
                 vectors.len(),
                 texts.len(),
             );
-            match policy {
-                EmbedErrorPolicy::FailFast => anyhow::bail!("{msg}"),
-                EmbedErrorPolicy::SkipPartial => {
-                    if !silent {
-                        eprintln!("{msg}");
-                    }
-                    break;
-                }
-            }
+            handle_embed_interruption(&msg, policy, silent)?;
+            break;
         }
 
         // Build storage tuples.
@@ -884,17 +880,27 @@ pub fn reembed_changed_files(
     }
 
     if !client.is_healthy() {
-        // Ollama unreachable: mark embeddings stale for each file.
+        // Ollama unreachable: mark embeddings stale for each file in a single transaction.
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting stale-mark transaction")?;
         for file in changed_files {
-            embedding::mark_embeddings_stale(conn, file).ok();
+            embedding::mark_embeddings_stale(&tx, file).context("marking embeddings stale")?;
         }
+        tx.commit().context("committing stale-mark transaction")?;
         return Ok(0);
     }
 
-    // Delete old embeddings for changed files.
+    // Delete old embeddings for changed files in a single transaction.
+    let tx = conn
+        .unchecked_transaction()
+        .context("starting delete-embeddings transaction")?;
     for file in changed_files {
-        embedding::delete_embeddings_for_file(conn, file).ok();
+        embedding::delete_embeddings_for_file(&tx, file)
+            .context("deleting embeddings for changed file")?;
     }
+    tx.commit()
+        .context("committing delete-embeddings transaction")?;
 
     // Generate chunks for the changed files.
     let chunks = embedding::chunk_symbols_for_files(conn, repo_root, changed_files)

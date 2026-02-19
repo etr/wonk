@@ -305,7 +305,7 @@ pub fn register_signal_handler() -> Result<Arc<AtomicBool>> {
 /// Drain any pending batches from `rx` and merge them with `first`,
 /// deduplicating file paths.  This coalesces rapid successive file change
 /// notifications so the embedding worker processes each file at most once.
-pub fn coalesce_file_batches(
+pub(crate) fn coalesce_file_batches(
     first: Vec<String>,
     rx: &crossbeam_channel::Receiver<Vec<String>>,
 ) -> Vec<String> {
@@ -380,7 +380,10 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
             // Open a dedicated DB connection for the embedding worker.
             let embed_conn = match db::open(&embed_index_path) {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(e) => {
+                    eprintln!("embedding worker: failed to open database: {e:#}");
+                    return;
+                }
             };
             let client = OllamaClient::new();
 

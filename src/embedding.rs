@@ -351,6 +351,41 @@ struct SymbolRow {
     symbol: Symbol,
 }
 
+/// Map a single database row to a [`SymbolRow`].
+///
+/// Expects columns in this order:
+/// `id, name, kind, file, line, col, end_line, scope, signature, language`.
+fn map_symbol_row(row: &rusqlite::Row) -> rusqlite::Result<SymbolRow> {
+    let id: i64 = row.get(0)?;
+    let name: String = row.get(1)?;
+    let kind_str: String = row.get(2)?;
+    let file: String = row.get(3)?;
+    let line: usize = row.get::<_, i64>(4)? as usize;
+    let col: usize = row.get::<_, i64>(5)? as usize;
+    let end_line: Option<usize> = row.get::<_, Option<i64>>(6)?.map(|v| v as usize);
+    let scope: Option<String> = row.get(7)?;
+    let signature: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+    let language: String = row.get(9)?;
+    let kind = kind_str
+        .parse::<SymbolKind>()
+        .unwrap_or(SymbolKind::Function);
+
+    Ok(SymbolRow {
+        id,
+        symbol: Symbol {
+            name,
+            kind,
+            file,
+            line,
+            col,
+            end_line,
+            scope,
+            signature,
+            language,
+        },
+    })
+}
+
 /// Execute a symbol query and map rows into `SymbolRow` structs.
 ///
 /// The `sql` must select columns in this order:
@@ -361,36 +396,7 @@ fn query_symbol_rows(conn: &Connection, sql: &str) -> Result<Vec<SymbolRow>, Emb
         .map_err(|_| EmbeddingError::ChunkingFailed)?;
 
     let rows = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let kind_str: String = row.get(2)?;
-            let file: String = row.get(3)?;
-            let line: usize = row.get::<_, i64>(4)? as usize;
-            let col: usize = row.get::<_, i64>(5)? as usize;
-            let end_line: Option<usize> = row.get::<_, Option<i64>>(6)?.map(|v| v as usize);
-            let scope: Option<String> = row.get(7)?;
-            let signature: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
-            let language: String = row.get(9)?;
-            let kind = kind_str
-                .parse::<SymbolKind>()
-                .unwrap_or(SymbolKind::Function);
-
-            Ok(SymbolRow {
-                id,
-                symbol: Symbol {
-                    name,
-                    kind,
-                    file,
-                    line,
-                    col,
-                    end_line,
-                    scope,
-                    signature,
-                    language,
-                },
-            })
-        })
+        .query_map([], map_symbol_row)
         .map_err(|_| EmbeddingError::ChunkingFailed)?
         .filter_map(|r| r.ok())
         .collect();
@@ -437,36 +443,7 @@ fn query_symbols_for_files(
         .collect();
 
     let rows = stmt
-        .query_map(params.as_slice(), |row| {
-            let id: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let kind_str: String = row.get(2)?;
-            let file: String = row.get(3)?;
-            let line: usize = row.get::<_, i64>(4)? as usize;
-            let col: usize = row.get::<_, i64>(5)? as usize;
-            let end_line: Option<usize> = row.get::<_, Option<i64>>(6)?.map(|v| v as usize);
-            let scope: Option<String> = row.get(7)?;
-            let signature: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
-            let language: String = row.get(9)?;
-            let kind = kind_str
-                .parse::<SymbolKind>()
-                .unwrap_or(SymbolKind::Function);
-
-            Ok(SymbolRow {
-                id,
-                symbol: Symbol {
-                    name,
-                    kind,
-                    file,
-                    line,
-                    col,
-                    end_line,
-                    scope,
-                    signature,
-                    language,
-                },
-            })
-        })
+        .query_map(params.as_slice(), map_symbol_row)
         .map_err(|_| EmbeddingError::ChunkingFailed)?
         .filter_map(|r| r.ok())
         .collect();
@@ -495,6 +472,43 @@ fn query_file_imports(conn: &Connection, source_file: &str) -> Result<Vec<String
         .map_err(|_| EmbeddingError::ChunkingFailed)?
         .filter_map(|r| r.ok())
         .collect();
+
+    Ok(imports)
+}
+
+/// Batch-fetch file-level imports for specific files, grouped by source file.
+fn query_file_imports_for_files(
+    conn: &Connection,
+    files: &[String],
+) -> Result<BTreeMap<String, Vec<String>>, EmbeddingError> {
+    if files.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders: Vec<String> = (1..=files.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        "SELECT source_file, import_path FROM file_imports WHERE source_file IN ({}) ORDER BY source_file",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = files
+        .iter()
+        .map(|f| f as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let mut imports: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    for r in rows.flatten() {
+        imports.entry(r.0).or_default().push(r.1);
+    }
 
     Ok(imports)
 }
@@ -860,7 +874,7 @@ pub fn chunk_symbols_for_files(
         return Ok(Vec::new());
     }
     let rows = query_symbols_for_files(conn, files)?;
-    let all_imports = query_all_file_imports(conn)?;
+    let all_imports = query_file_imports_for_files(conn, files)?;
     Ok(chunk_symbol_rows(&rows, &all_imports, repo_root))
 }
 
