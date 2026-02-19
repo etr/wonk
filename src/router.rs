@@ -429,13 +429,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let client = crate::embedding::OllamaClient::new();
 
             if symbol_count > 0 && embedding_count < symbol_count {
-                if !client.is_healthy() {
-                    output::print_error(ollama_error_msg);
-                    return Ok(());
-                }
-
                 let progress_mode = progress::detect_mode(suppress);
-                let repo = repo_root.as_deref().unwrap();
+                let repo = match repo_root.as_deref() {
+                    Some(r) => r,
+                    None => {
+                        output::print_error("no repository root found");
+                        return Ok(());
+                    }
+                };
                 match pipeline::build_missing_embeddings(&conn, repo, &client, progress_mode) {
                     Ok(stats) => {
                         if !suppress && stats.embedded_count > 0 {
@@ -455,7 +456,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             let all_embeddings = crate::embedding::load_all_embeddings(&conn)?;
             if all_embeddings.is_empty() {
-                output::print_error(ollama_error_msg);
+                output::print_hint(
+                    "no embeddings available; run `wonk init` with Ollama running to build embeddings",
+                    suppress,
+                );
                 return Ok(());
             }
 

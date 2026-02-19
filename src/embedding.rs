@@ -338,18 +338,13 @@ struct SymbolRow {
     symbol: Symbol,
 }
 
-/// Query symbols that do not have fresh (non-stale) embeddings.
+/// Execute a symbol query and map rows into `SymbolRow` structs.
 ///
-/// Returns symbols whose `id` is not in the `embeddings` table with `stale = 0`.
-/// This includes symbols with no embedding and symbols whose embedding is stale.
-fn query_unembedded_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError> {
+/// The `sql` must select columns in this order:
+/// `id, name, kind, file, line, col, end_line, scope, signature, language`.
+fn query_symbol_rows(conn: &Connection, sql: &str) -> Result<Vec<SymbolRow>, EmbeddingError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
-             FROM symbols
-             WHERE id NOT IN (SELECT symbol_id FROM embeddings WHERE NOT stale)
-             ORDER BY file, line",
-        )
+        .prepare(sql)
         .map_err(|_| EmbeddingError::ChunkingFailed)?;
 
     let rows = stmt
@@ -390,51 +385,27 @@ fn query_unembedded_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, Embeddi
     Ok(rows)
 }
 
+/// Query symbols that do not have fresh (non-stale) embeddings.
+///
+/// Returns symbols whose `id` is not in the `embeddings` table with `stale = 0`.
+/// This includes symbols with no embedding and symbols whose embedding is stale.
+fn query_unembedded_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError> {
+    query_symbol_rows(
+        conn,
+        "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
+         FROM symbols
+         WHERE id NOT IN (SELECT symbol_id FROM embeddings WHERE NOT stale)
+         ORDER BY file, line",
+    )
+}
+
 /// Query all symbols from the database, returning (id, Symbol) pairs.
 fn query_all_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
-             FROM symbols ORDER BY file, line",
-        )
-        .map_err(|_| EmbeddingError::ChunkingFailed)?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let kind_str: String = row.get(2)?;
-            let file: String = row.get(3)?;
-            let line: usize = row.get::<_, i64>(4)? as usize;
-            let col: usize = row.get::<_, i64>(5)? as usize;
-            let end_line: Option<usize> = row.get::<_, Option<i64>>(6)?.map(|v| v as usize);
-            let scope: Option<String> = row.get(7)?;
-            let signature: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
-            let language: String = row.get(9)?;
-            let kind = kind_str
-                .parse::<SymbolKind>()
-                .unwrap_or(SymbolKind::Function);
-
-            Ok(SymbolRow {
-                id,
-                symbol: Symbol {
-                    name,
-                    kind,
-                    file,
-                    line,
-                    col,
-                    end_line,
-                    scope,
-                    signature,
-                    language,
-                },
-            })
-        })
-        .map_err(|_| EmbeddingError::ChunkingFailed)?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    Ok(rows)
+    query_symbol_rows(
+        conn,
+        "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
+         FROM symbols ORDER BY file, line",
+    )
 }
 
 /// Query file-level import paths for a given source file.

@@ -741,8 +741,9 @@ pub fn build_missing_embeddings(
 
     let total = chunks.len();
 
-    // Health check -- unlike build_embeddings, we return Err because the
-    // caller (wonk ask) requires Ollama.
+    // Health check — bail before starting the expensive batch-embed loop.
+    // Unlike build_embeddings we return Err because the caller (wonk ask)
+    // requires Ollama.
     if !client.is_healthy() {
         anyhow::bail!(
             "Ollama is required for semantic search. \
@@ -762,12 +763,6 @@ pub fn build_missing_embeddings(
         let vectors = match client.embed_batch(&texts) {
             Ok(v) => v,
             Err(EmbeddingError::OllamaUnreachable) => {
-                let silent = progress_mode == ProgressMode::Silent;
-                if !silent {
-                    eprintln!(
-                        "Ollama became unreachable after embedding {embedded}/{total} symbols."
-                    );
-                }
                 anyhow::bail!(
                     "Ollama became unreachable after embedding {embedded}/{total} symbols."
                 );
