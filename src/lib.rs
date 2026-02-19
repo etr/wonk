@@ -14,6 +14,7 @@ pub mod progress;
 pub mod ranker;
 pub mod router;
 pub mod search;
+pub mod semantic;
 pub mod types;
 pub mod walker;
 pub mod watcher;
