@@ -1744,7 +1744,7 @@ Implement the `wonk ask <query>` CLI command that performs semantic search and d
 **Related Requirements:** PRD-SEM-REQ-001, PRD-SEM-REQ-003, PRD-SEM-REQ-004, PRD-SEM-REQ-005
 **Related Decisions:** DR-009, DR-010
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
