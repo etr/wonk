@@ -29,6 +29,10 @@ pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 /// Default embedding model.
 pub const DEFAULT_MODEL: &str = "nomic-embed-text";
 
+/// User-facing error message when Ollama is required but unreachable.
+pub const OLLAMA_REQUIRED_MSG: &str = "Ollama is required for semantic search. \
+    Start Ollama with 'ollama serve' and ensure nomic-embed-text is available.";
+
 // ---------------------------------------------------------------------------
 // Serde types for the Ollama /api/embed endpoint
 // ---------------------------------------------------------------------------

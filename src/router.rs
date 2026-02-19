@@ -399,8 +399,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
 
-            let ollama_error_msg = "Ollama is required for semantic search. \
-                Start Ollama with 'ollama serve' and ensure nomic-embed-text is available.";
+            let ollama_error_msg = crate::embedding::OLLAMA_REQUIRED_MSG;
 
             // Discover repo root (needed for embedding build).
             let repo_root = std::env::current_dir()
