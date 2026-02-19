@@ -8,6 +8,7 @@
 //! context-rich text chunks suitable for embedding by `nomic-embed-text`.
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -138,7 +139,15 @@ impl OllamaClient {
 
         let status = response.status().as_u16();
         if status != 200 {
-            let body = response.into_body().read_to_string().unwrap_or_default();
+            let body = {
+                let mut buf = String::new();
+                let _ = response
+                    .into_body()
+                    .as_reader()
+                    .take(4096)
+                    .read_to_string(&mut buf);
+                buf
+            };
             return Err(EmbeddingError::OllamaError(extract_error_detail(
                 status, &body,
             )));
