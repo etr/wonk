@@ -128,6 +128,17 @@ pub struct DepOutput {
     pub depends_on: String,
 }
 
+/// A semantic search result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticOutput {
+    pub file: String,
+    pub line: usize,
+    pub symbol_name: String,
+    pub symbol_kind: String,
+    pub similarity_score: f32,
+    pub symbol_id: i64,
+}
+
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
 /// output. In grep mode the summary goes to stderr instead.
 #[derive(Debug, Clone, Serialize)]
@@ -536,6 +547,39 @@ impl<W: Write> Formatter<W> {
             write!(fmt.writer, " -> ")?;
             fmt.write_file(&dep.depends_on)?;
             writeln!(fmt.writer)
+        }
+    }
+
+    /// Format a single semantic search result.
+    pub fn format_semantic_result(
+        &mut self,
+        result: &SemanticOutput,
+    ) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_semantic_result(self, result)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let result = result.clone();
+        self.budgeted_write(move |fmt| Self::render_semantic_result(fmt, &result))
+    }
+
+    /// Shared render logic for a semantic search result.
+    fn render_semantic_result<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        result: &SemanticOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, result)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&result.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(result.line)?;
+            writeln!(
+                fmt.writer,
+                "  {} ({}) [{:.4}]",
+                result.symbol_name, result.symbol_kind, result.similarity_score
+            )
         }
     }
 
@@ -1718,5 +1762,77 @@ mod tests {
             !out.contains('\x1b'),
             "TOON output should never contain ANSI escape codes, got: {out:?}"
         );
+    }
+
+    // -- SemanticOutput -------------------------------------------------------
+
+    #[test]
+    fn semantic_result_grep_format() {
+        let result = SemanticOutput {
+            file: "src/auth.rs".into(),
+            line: 42,
+            symbol_name: "authenticate".into(),
+            symbol_kind: "function".into(),
+            similarity_score: 0.8765,
+            symbol_id: 1,
+        };
+        let out = render(OutputFormat::Grep, |fmt| {
+            fmt.format_semantic_result(&result)
+        });
+        assert_eq!(out, "src/auth.rs:42  authenticate (function) [0.8765]\n");
+    }
+
+    #[test]
+    fn semantic_result_json_format() {
+        let result = SemanticOutput {
+            file: "src/auth.rs".into(),
+            line: 42,
+            symbol_name: "authenticate".into(),
+            symbol_kind: "function".into(),
+            similarity_score: 0.8765,
+            symbol_id: 1,
+        };
+        let out = render(OutputFormat::Json, |fmt| {
+            fmt.format_semantic_result(&result)
+        });
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["file"], "src/auth.rs");
+        assert_eq!(v["line"], 42);
+        assert_eq!(v["symbol_name"], "authenticate");
+        assert_eq!(v["symbol_kind"], "function");
+        assert!((v["similarity_score"].as_f64().unwrap() - 0.8765).abs() < 0.001);
+        assert_eq!(v["symbol_id"], 1);
+    }
+
+    #[test]
+    fn semantic_result_budget_truncation() {
+        let results: Vec<SemanticOutput> = (0..10)
+            .map(|i| SemanticOutput {
+                file: "src/some_module.rs".into(),
+                line: i + 1,
+                symbol_name: "some_long_function_name".into(),
+                symbol_kind: "function".into(),
+                similarity_score: 0.9 - (i as f32) * 0.05,
+                symbol_id: i as i64,
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        let mut emitted = 0usize;
+        let mut truncated = 0usize;
+        {
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
+            fmt.set_budget(25);
+            for r in &results {
+                match fmt.format_semantic_result(r) {
+                    Ok(BudgetStatus::Written) => emitted += 1,
+                    Ok(BudgetStatus::Skipped) => truncated += 1,
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+        }
+        assert!(emitted > 0, "should emit at least one result");
+        assert!(emitted < 10, "should not emit all results");
+        assert_eq!(emitted + truncated, 10);
     }
 }
