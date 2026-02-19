@@ -98,6 +98,23 @@ impl OllamaClient {
         }
     }
 
+    /// Quick health check with a shorter timeout (500ms) for status queries.
+    ///
+    /// Avoids blocking `wonk status` for the full 2-second connect timeout
+    /// when Ollama is unreachable.
+    pub fn is_healthy_quick(&self) -> bool {
+        let quick: Agent = Agent::config_builder()
+            .timeout_connect(Some(Duration::from_millis(500)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let url = format!("{}/", self.base_url);
+        match quick.get(&url).call() {
+            Ok(resp) => resp.status() == 200,
+            Err(_) => false,
+        }
+    }
+
     /// Generate embeddings for a batch of texts.
     ///
     /// Returns one `Vec<f32>` per input string.  An empty input slice
@@ -611,13 +628,13 @@ fn extract_line_range_indexed<'a>(
 
 /// Generate text chunks for all indexed symbols.
 ///
-/// Returns `(symbol_id, chunk_text)` pairs.  Reads source files from disk
-/// under `repo_root`, and silently skips files that cannot be read or whose
-/// paths are absolute or contain `..` components.
+/// Returns `(symbol_id, file_path, chunk_text)` triples.  Reads source files
+/// from disk under `repo_root`, and silently skips files that cannot be read
+/// or whose paths are absolute or contain `..` components.
 pub fn chunk_all_symbols(
     conn: &Connection,
     repo_root: &Path,
-) -> Result<Vec<(i64, String)>, EmbeddingError> {
+) -> Result<Vec<(i64, String, String)>, EmbeddingError> {
     let rows = query_all_symbols(conn)?;
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -679,7 +696,7 @@ pub fn chunk_all_symbols(
                 imports_line.as_deref(),
             );
             let chunk = assemble_chunk(header, code);
-            results.push((sym_row.id, chunk));
+            results.push((sym_row.id, file.clone(), chunk));
         }
     }
 
@@ -1017,6 +1034,7 @@ mod tests {
         conn
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_symbol(
         conn: &Connection,
         name: &str,
@@ -1128,10 +1146,12 @@ mod tests {
 
         let chunks = chunk_all_symbols(&conn, root).unwrap();
         assert_eq!(chunks.len(), 1);
+        // (symbol_id, file_path, chunk_text)
         assert_eq!(chunks[0].0, sym_id);
-        assert!(chunks[0].1.contains("File: main.rs"));
-        assert!(chunks[0].1.contains("Imports: std::io"));
-        assert!(chunks[0].1.contains("fn hello()"));
+        assert_eq!(chunks[0].1, "main.rs");
+        assert!(chunks[0].2.contains("File: main.rs"));
+        assert!(chunks[0].2.contains("Imports: std::io"));
+        assert!(chunks[0].2.contains("fn hello()"));
     }
 
     #[test]
@@ -1190,9 +1210,11 @@ mod tests {
 
         let chunks = chunk_all_symbols(&conn, root).unwrap();
         assert_eq!(chunks.len(), 2);
-        let ids: Vec<i64> = chunks.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<i64> = chunks.iter().map(|(id, _, _)| *id).collect();
         assert!(ids.contains(&id_a));
         assert!(ids.contains(&id_b));
+        // All chunks from same file should have same file_path
+        assert!(chunks.iter().all(|(_, file, _)| file == "lib.rs"));
     }
 
     #[test]

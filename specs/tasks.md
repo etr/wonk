@@ -26,7 +26,7 @@
 | M6 | Smart Search | 4 | Complete |
 | M7 | Polish & Distribution | 5 | Complete |
 | M8 | Git Worktree Support | 3 | Complete |
-| M9 | Embedding Infrastructure | 5 | Not Started |
+| M9 | Embedding Infrastructure | 5 | In Progress |
 | M10 | Semantic Search (`wonk ask`) | 3 | Not Started |
 | M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
 | M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
@@ -1639,13 +1639,13 @@ Store embedding vectors as BLOBs in SQLite and retrieve them with zero-copy dese
 Wire chunking, Ollama embedding, and vector storage into the `wonk init` flow, with progress display and graceful handling of Ollama unavailability.
 
 **Action Items:**
-- [ ] After structural index build in `wonk init`, check Ollama reachability via health check
-- [ ] If reachable: generate chunks for all symbols (TASK-040), batch-embed via Ollama (TASK-039), store vectors (TASK-041)
-- [ ] Display embedding progress to stderr: `Embedding... [1234/5678 symbols]`
-- [ ] Batch size: embed ~50 chunks per Ollama API call for throughput
-- [ ] If Ollama unreachable during `wonk init`: print warning to stderr "Ollama not available — skipping embedding generation. Semantic search will not be available until embeddings are built.", continue with structural index only
-- [ ] Handle partial failures: if Ollama goes down mid-batch, store what was completed, report count
-- [ ] Wire embedding stats into `wonk status` output: show embedding count, stale count, Ollama reachability
+- [x] After structural index build in `wonk init`, check Ollama reachability via health check
+- [x] If reachable: generate chunks for all symbols (TASK-040), batch-embed via Ollama (TASK-039), store vectors (TASK-041)
+- [x] Display embedding progress to stderr: `Embedding... [1234/5678 symbols]`
+- [x] Batch size: embed ~50 chunks per Ollama API call for throughput
+- [x] If Ollama unreachable during `wonk init`: print warning to stderr "Ollama not available — skipping embedding generation. Semantic search will not be available until embeddings are built.", continue with structural index only
+- [x] Handle partial failures: if Ollama goes down mid-batch, store what was completed, report count
+- [x] Wire embedding stats into `wonk status` output: show embedding count, stale count, Ollama reachability
 
 **Dependencies:**
 - Blocked by: TASK-039, TASK-040, TASK-041
@@ -1664,7 +1664,7 @@ Wire chunking, Ollama embedding, and vector storage into the `wonk init` flow, w
 **Related Requirements:** PRD-SEM-REQ-008, PRD-SEM-REQ-014
 **Related Decisions:** DR-009, DR-010, DR-012
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

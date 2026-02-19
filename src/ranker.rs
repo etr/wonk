@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn classified_result_sorts_by_category_then_file_then_line() {
-        let mut results = vec![
+        let mut results = [
             make_classified("src/b.rs", 10, "let x = foo();", ResultCategory::CallSite),
             make_classified("src/a.rs", 5, "fn foo() {}", ResultCategory::Definition),
             make_classified("src/a.rs", 20, "foo();", ResultCategory::CallSite),

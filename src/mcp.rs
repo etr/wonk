@@ -449,7 +449,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_status",
-                description: "Show index status: whether an index exists, file count, symbol count, and reference count.",
+                description: "Show index status: whether an index exists, file count, symbol count, reference count, embedding count, stale embedding count, and Ollama reachability.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -464,7 +464,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_init",
-                description: "Initialize or rebuild the index for the current repository.",
+                description: "Initialize or rebuild the structural index and embeddings for the current repository. Embedding generation requires Ollama; if unavailable, only the structural index is built.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -767,29 +767,8 @@ impl McpServer {
 
     fn tool_status(&self, args: Value) -> CallToolResult {
         let format = extract_format(&args);
-        let status = if let Some(conn) = self.router.conn() {
-            let file_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
-                .unwrap_or(0);
-            let symbol_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
-                .unwrap_or(0);
-            let ref_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM \"references\"", [], |row| row.get(0))
-                .unwrap_or(0);
-
-            serde_json::json!({
-                "indexed": true,
-                "file_count": file_count,
-                "symbol_count": symbol_count,
-                "reference_count": ref_count
-            })
-        } else {
-            serde_json::json!({
-                "indexed": false
-            })
-        };
-
+        let info = crate::router::query_status_info(self.router.conn());
+        let status = serde_json::to_value(&info).unwrap_or_default();
         format_result(&status, format)
     }
 
@@ -797,22 +776,59 @@ impl McpServer {
         let local = args.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
 
-        match pipeline::build_index_with_progress(
+        let stats = match pipeline::build_index_with_progress(
             self.router.repo_root(),
             local,
             &Progress::silent(),
         ) {
-            Ok(stats) => {
+            Ok(s) => s,
+            Err(_) => return CallToolResult::error("index build failed".into()),
+        };
+
+        // Build embeddings after structural index.
+        let index_path = match db::index_path_for(self.router.repo_root(), local) {
+            Ok(p) => p,
+            Err(_) => {
                 let result = serde_json::json!({
                     "file_count": stats.file_count,
                     "symbol_count": stats.symbol_count,
                     "reference_count": stats.ref_count,
-                    "elapsed_ms": stats.elapsed.as_millis()
+                    "elapsed_ms": stats.elapsed.as_millis(),
+                    "embedding_count": 0,
+                    "embedding_skipped": true
                 });
-                format_result(&result, format)
+                return format_result(&result, format);
             }
-            Err(_) => CallToolResult::error("index build failed".into()),
-        }
+        };
+
+        let emb_stats = db::open(&index_path)
+            .ok()
+            .and_then(|conn| {
+                let client = crate::embedding::OllamaClient::new();
+                pipeline::build_embeddings(
+                    &conn,
+                    self.router.repo_root(),
+                    &client,
+                    crate::progress::ProgressMode::Silent,
+                )
+                .ok()
+            })
+            .unwrap_or(pipeline::EmbeddingBuildStats {
+                embedded_count: 0,
+                total_symbols: 0,
+                skipped: true,
+                elapsed: std::time::Duration::ZERO,
+            });
+
+        let result = serde_json::json!({
+            "file_count": stats.file_count,
+            "symbol_count": stats.symbol_count,
+            "reference_count": stats.ref_count,
+            "elapsed_ms": stats.elapsed.as_millis(),
+            "embedding_count": emb_stats.embedded_count,
+            "embedding_skipped": emb_stats.skipped
+        });
+        format_result(&result, format)
     }
 }
 
@@ -1048,5 +1064,29 @@ mod tests {
         let result = format_result(&data, OutputFormat::Toon);
         assert!(!result.is_error);
         assert!(!result.content[0].text.is_empty());
+    }
+
+    #[test]
+    fn tool_status_includes_embedding_fields() {
+        // The test_server has no index, so status will show indexed=false.
+        // But the JSON should still contain the embedding fields.
+        let server = test_server();
+        let result = server.tool_status(serde_json::json!({}));
+        assert!(!result.is_error);
+        let text = &result.content[0].text;
+        let json: Value = serde_json::from_str(text).unwrap();
+        // Should contain the new embedding-related fields.
+        assert!(
+            json.get("embedding_count").is_some(),
+            "missing embedding_count"
+        );
+        assert!(
+            json.get("stale_embedding_count").is_some(),
+            "missing stale_embedding_count"
+        );
+        assert!(
+            json.get("ollama_reachable").is_some(),
+            "missing ollama_reachable"
+        );
     }
 }
