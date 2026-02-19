@@ -196,10 +196,10 @@ pub enum ReposCommand {
 pub struct AskArgs {
     /// The semantic search query
     pub query: String,
-    /// Restrict results to symbols reachable from this file (wired in M12)
+    /// Restrict results to symbols reachable from this file
     #[arg(long)]
     pub from: Option<String>,
-    /// Restrict results to symbols that can reach this file (wired in M12)
+    /// Restrict results to symbols that can reach this file
     #[arg(long)]
     pub to: Option<String>,
 }

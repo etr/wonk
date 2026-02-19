@@ -575,6 +575,7 @@ impl<W: Write> Formatter<W> {
             fmt.write_file(&result.file)?;
             fmt.write_sep()?;
             fmt.write_line_no(result.line)?;
+            fmt.write_sep()?;
             writeln!(
                 fmt.writer,
                 "  {} ({}) [{:.4}]",
@@ -1779,7 +1780,7 @@ mod tests {
         let out = render(OutputFormat::Grep, |fmt| {
             fmt.format_semantic_result(&result)
         });
-        assert_eq!(out, "src/auth.rs:42  authenticate (function) [0.8765]\n");
+        assert_eq!(out, "src/auth.rs:42:  authenticate (function) [0.8765]\n");
     }
 
     #[test]

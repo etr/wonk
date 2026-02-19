@@ -27,7 +27,7 @@
 | M7 | Polish & Distribution | 5 | Complete |
 | M8 | Git Worktree Support | 3 | Complete |
 | M9 | Embedding Infrastructure | 5 | Complete |
-| M10 | Semantic Search (`wonk ask`) | 3 | Not Started |
+| M10 | Semantic Search (`wonk ask`) | 3 | In Progress |
 | M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
 | M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
 | M13 | Semantic Clustering (`wonk cluster`) | 2 | Not Started |
@@ -1720,13 +1720,13 @@ Implement parallel brute-force cosine similarity search over all stored embeddin
 Implement the `wonk ask <query>` CLI command that performs semantic search and displays results with similarity scores.
 
 **Action Items:**
-- [ ] Add `ask` subcommand to CLI with args: `<query>` (required), `--budget <n>` (optional), `--json` (global), `--from <file>` (optional, wired in M12), `--to <file>` (optional, wired in M12)
-- [ ] Wire through Query Router: `wonk ask` → Semantic Search engine
-- [ ] Flow: embed query via Ollama → normalize → brute-force search (TASK-043) → format results
-- [ ] Default output format: `file:line  symbol_name (kind) [score]`
-- [ ] JSON output: include all SemanticResult fields plus similarity_score
-- [ ] `--budget`: apply token budget to semantic results (reuse budget logic from TASK-033)
-- [ ] Print result count and top score summary to stderr
+- [x] Add `ask` subcommand to CLI with args: `<query>` (required), `--budget <n>` (optional), `--json` (global), `--from <file>` (optional, wired in M12), `--to <file>` (optional, wired in M12)
+- [x] Wire through Query Router: `wonk ask` → Semantic Search engine
+- [x] Flow: embed query via Ollama → normalize → brute-force search (TASK-043) → format results
+- [x] Default output format: `file:line  symbol_name (kind) [score]`
+- [x] JSON output: include all SemanticResult fields plus similarity_score
+- [x] `--budget`: apply token budget to semantic results (reuse budget logic from TASK-033)
+- [x] Print result count and top score summary to stderr
 
 **Dependencies:**
 - Blocked by: TASK-043
@@ -1744,7 +1744,7 @@ Implement the `wonk ask <query>` CLI command that performs semantic search and d
 **Related Requirements:** PRD-SEM-REQ-001, PRD-SEM-REQ-003, PRD-SEM-REQ-004, PRD-SEM-REQ-005
 **Related Decisions:** DR-009, DR-010
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

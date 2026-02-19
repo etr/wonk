@@ -392,6 +392,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Ask(args) => {
+            if args.from.is_some() || args.to.is_some() {
+                output::print_hint(
+                    "--from/--to filtering is not yet implemented; ignoring",
+                    suppress,
+                );
+            }
+
             let conn = std::env::current_dir()
                 .ok()
                 .and_then(|cwd| db::find_repo_root(&cwd).ok())
@@ -440,11 +447,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
 
-            if !results.is_empty() && !suppress {
-                eprintln!(
-                    "{} results (top score: {:.4})",
-                    results.len(),
-                    results[0].similarity_score,
+            if !results.is_empty() {
+                output::print_hint(
+                    &format!(
+                        "{} results (top score: {:.4})",
+                        results.len(),
+                        results[0].similarity_score,
+                    ),
+                    suppress,
                 );
             }
 
