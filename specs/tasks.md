@@ -26,7 +26,7 @@
 | M6 | Smart Search | 4 | Complete |
 | M7 | Polish & Distribution | 5 | Complete |
 | M8 | Git Worktree Support | 3 | Complete |
-| M9 | Embedding Infrastructure | 5 | In Progress |
+| M9 | Embedding Infrastructure | 5 | Complete |
 | M10 | Semantic Search (`wonk ask`) | 3 | Not Started |
 | M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
 | M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
@@ -1664,7 +1664,7 @@ Wire chunking, Ollama embedding, and vector storage into the `wonk init` flow, w
 **Related Requirements:** PRD-SEM-REQ-008, PRD-SEM-REQ-014
 **Related Decisions:** DR-009, DR-010, DR-012
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
