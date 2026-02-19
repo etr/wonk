@@ -3,6 +3,8 @@
 //! Provides parallel vector similarity computation using rayon and
 //! result resolution against the symbols table.
 
+use std::collections::HashMap;
+
 use rayon::prelude::*;
 use rusqlite::Connection;
 
@@ -12,9 +14,10 @@ use crate::types::{SemanticResult, SymbolKind};
 /// Compute the dot product of two f32 slices.
 ///
 /// For L2-normalized vectors, the dot product equals the cosine similarity.
-/// Panics if the slices have different lengths (callers must ensure matching
-/// dimensionality).
+/// In debug builds, panics if the slices have different lengths.  In release
+/// builds, mismatched lengths silently compute over the shorter length.
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot_product: dimension mismatch");
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
@@ -83,28 +86,44 @@ pub fn resolve_results(
         })
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
+    // Small struct to avoid opaque positional tuples in the lookup map.
+    struct SymbolFields {
+        name: String,
+        kind_str: String,
+        file: String,
+        line: usize,
+    }
+
     // Collect into a map keyed by symbol_id for order-preserving lookup.
-    let mut by_id: std::collections::HashMap<i64, (String, String, String, usize)> =
-        std::collections::HashMap::new();
+    let mut by_id: HashMap<i64, SymbolFields> = HashMap::with_capacity(scored.len());
     for r in rows {
         let (id, name, kind_str, file, line) =
             r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-        by_id.insert(id, (name, kind_str, file, line));
+        by_id.insert(
+            id,
+            SymbolFields {
+                name,
+                kind_str,
+                file,
+                line,
+            },
+        );
     }
 
     // Reconstruct results in the original scored order, skipping missing IDs.
     let results = scored
         .iter()
         .filter_map(|(id, score)| {
-            by_id.get(id).map(|(name, kind_str, file, line)| {
-                let kind = kind_str
+            by_id.get(id).map(|sym| {
+                let kind = sym
+                    .kind_str
                     .parse::<SymbolKind>()
                     .unwrap_or(SymbolKind::Function);
                 SemanticResult {
                     symbol_id: *id,
-                    file: file.clone(),
-                    line: *line,
-                    symbol_name: name.clone(),
+                    file: sym.file.clone(),
+                    line: sym.line,
+                    symbol_name: sym.name.clone(),
                     symbol_kind: kind,
                     similarity_score: *score,
                 }
@@ -253,16 +272,48 @@ mod tests {
             })
             .collect();
 
-        let start = std::time::Instant::now();
         let result = semantic_search(&query, &embeddings, 10);
-        let elapsed = start.elapsed();
 
         assert_eq!(result.len(), 10);
         // Results should be sorted descending
         for w in result.windows(2) {
             assert!(w[0].1 >= w[1].1);
         }
-        // Should complete in under 200ms
+    }
+
+    /// The 200ms budget applies to optimized (release) builds only.
+    /// Debug builds are significantly slower due to lack of auto-vectorization.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn semantic_search_large_input_perf_budget() {
+        let dim = 768;
+        let n = 50_000;
+        let query: Vec<f32> = {
+            let mut v: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001).collect();
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+            }
+            v
+        };
+        let embeddings: Vec<(i64, Vec<f32>)> = (0..n as i64)
+            .map(|i| {
+                let mut v: Vec<f32> = (0..dim).map(|j| ((i + j as i64) as f32) * 0.0001).collect();
+                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    for x in v.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+                (i, v)
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let _result = semantic_search(&query, &embeddings, 10);
+        let elapsed = start.elapsed();
         assert!(
             elapsed.as_millis() < 200,
             "50K search took {}ms, expected < 200ms",

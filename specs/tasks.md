@@ -1683,12 +1683,12 @@ Wire chunking, Ollama embedding, and vector storage into the `wonk init` flow, w
 Implement parallel brute-force cosine similarity search over all stored embedding vectors.
 
 **Action Items:**
-- [ ] Create `semantic.rs` module
-- [ ] Implement `semantic_search(query_vec: &[f32], all_embeddings: &[(i64, Vec<f32>)], limit: usize) -> Vec<(i64, f32)>`: compute dot product (vectors are pre-normalized) for each stored vector, return top-N by descending score
-- [ ] Parallelize dot product computation with rayon (`par_iter()`)
-- [ ] Sort results by descending similarity score
-- [ ] Define `SemanticResult` struct in `types.rs`: `symbol_id`, `file`, `line`, `symbol_name`, `symbol_kind`, `similarity_score`
-- [ ] Implement `resolve_results(db, scored: &[(i64, f32)]) -> Vec<SemanticResult>`: join symbol_id with symbols table to get file, line, name, kind
+- [x] Create `semantic.rs` module
+- [x] Implement `semantic_search(query_vec: &[f32], all_embeddings: &[(i64, Vec<f32>)], limit: usize) -> Vec<(i64, f32)>`: compute dot product (vectors are pre-normalized) for each stored vector, return top-N by descending score
+- [x] Parallelize dot product computation with rayon (`par_iter()`)
+- [x] Sort results by descending similarity score
+- [x] Define `SemanticResult` struct in `types.rs`: `symbol_id`, `file`, `line`, `symbol_name`, `symbol_kind`, `similarity_score`
+- [x] Implement `resolve_results(db, scored: &[(i64, f32)]) -> Vec<SemanticResult>`: join symbol_id with symbols table to get file, line, name, kind
 
 **Dependencies:**
 - Blocked by: TASK-042

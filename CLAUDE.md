@@ -40,6 +40,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `pipeline.rs` | Index build orchestration — parallel file walk + parse + batch insert; incremental re-indexing for daemon; embedding build pipeline (chunking → Ollama batch embed → vector storage) |
 | `walker.rs` | File enumeration with gitignore/wonkignore support; worktree-aware boundary detection |
 | `search.rs` | Text search wrapping the `grep` crate (ripgrep internals) |
+| `semantic.rs` | Brute-force cosine similarity search — parallel dot product via rayon, top-N ranking, and resolution of symbol IDs to SemanticResult structs |
 | `ranker.rs` | Classifies results (Definition > CallSite > Import > Other > Comment > Test), deduplicates re-exports |
 | `output.rs` | Dual format: grep-compatible (stdout+stderr) or NDJSON (stdout) |
 | `embedding.rs` | Ollama API client, symbol chunking engine, and vector storage — sync HTTP client for embedding generation, context-rich text chunk formatting for `nomic-embed-text`, BLOB storage/retrieval with bytemuck zero-copy deserialization |
