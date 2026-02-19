@@ -136,3 +136,24 @@ pub struct FileImports {
     /// Symbols exported from this file (for JS/TS `export` statements).
     pub exports: Vec<String>,
 }
+
+/// A result from semantic (embedding-based) similarity search.
+///
+/// Contains the matched symbol's metadata and its cosine similarity score
+/// relative to the query vector.  Derives `PartialEq` but not `Eq` because
+/// `similarity_score` is `f32`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticResult {
+    /// Database row ID of the matched symbol.
+    pub symbol_id: i64,
+    /// Path of the source file containing the symbol.
+    pub file: String,
+    /// 1-based line number where the symbol starts.
+    pub line: usize,
+    /// The symbol name.
+    pub symbol_name: String,
+    /// What kind of symbol this is.
+    pub symbol_kind: SymbolKind,
+    /// Cosine similarity score (higher = more similar).
+    pub similarity_score: f32,
+}
