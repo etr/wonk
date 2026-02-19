@@ -1803,7 +1803,10 @@ mod tests {
         assert_eq!(v["symbol_name"], "authenticate");
         assert_eq!(v["symbol_kind"], "function");
         assert!((v["similarity_score"].as_f64().unwrap() - 0.8765).abs() < 0.001);
-        assert!(v.get("symbol_id").is_none(), "symbol_id should not appear in JSON output");
+        assert!(
+            v.get("symbol_id").is_none(),
+            "symbol_id should not appear in JSON output"
+        );
     }
 
     #[test]

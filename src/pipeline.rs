@@ -171,6 +171,19 @@ pub fn rebuild_index_with_progress(
 }
 
 // ---------------------------------------------------------------------------
+// ProcessResult
+// ---------------------------------------------------------------------------
+
+/// Result of processing a batch of file change events.
+#[derive(Debug, Clone)]
+pub struct ProcessResult {
+    /// Number of files that were actually updated (re-indexed or removed).
+    pub updated_count: usize,
+    /// Relative paths of the files that changed (created, modified, or deleted).
+    pub changed_files: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Incremental re-indexing API
 // ---------------------------------------------------------------------------
 
@@ -279,16 +292,28 @@ pub fn index_new_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> 
     Ok(())
 }
 
-/// Process a batch of file change events, returning the number of files
-/// that were actually updated (re-indexed or removed).
+/// Process a batch of file change events, returning a [`ProcessResult`]
+/// with the count of updated files and their relative paths.
 ///
 /// Events are processed sequentially.  Errors on individual files are
 /// logged (via the returned Result) but do not abort the entire batch;
 /// processing continues with the remaining events.
-pub fn process_events(conn: &Connection, events: &[FileEvent], repo_root: &Path) -> Result<usize> {
+pub fn process_events(
+    conn: &Connection,
+    events: &[FileEvent],
+    repo_root: &Path,
+) -> Result<ProcessResult> {
     let mut updated = 0usize;
+    let mut changed_files = Vec::new();
 
     for event in events {
+        let rel_path = event
+            .path()
+            .strip_prefix(repo_root)
+            .unwrap_or(event.path())
+            .to_string_lossy()
+            .into_owned();
+
         let result = match event {
             FileEvent::Created(path) => index_new_file(conn, path, repo_root).map(|()| true),
             FileEvent::Modified(path) => reindex_file(conn, path, repo_root),
@@ -296,7 +321,10 @@ pub fn process_events(conn: &Connection, events: &[FileEvent], repo_root: &Path)
         };
 
         match result {
-            Ok(true) => updated += 1,
+            Ok(true) => {
+                updated += 1;
+                changed_files.push(rel_path);
+            }
             Ok(false) => {} // unchanged
             Err(e) => {
                 // Log the error but continue processing the batch.
@@ -309,7 +337,10 @@ pub fn process_events(conn: &Connection, events: &[FileEvent], repo_root: &Path)
         }
     }
 
-    Ok(updated)
+    Ok(ProcessResult {
+        updated_count: updated,
+        changed_files,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -630,8 +661,9 @@ fn embed_chunks(
         let vectors = match client.embed_batch(&texts) {
             Ok(v) => v,
             Err(EmbeddingError::OllamaUnreachable) => {
-                let msg =
-                    format!("Ollama became unreachable after embedding {embedded}/{total} symbols.");
+                let msg = format!(
+                    "Ollama became unreachable after embedding {embedded}/{total} symbols."
+                );
                 match policy {
                     EmbedErrorPolicy::FailFast => anyhow::bail!("{msg}"),
                     EmbedErrorPolicy::SkipPartial => {
@@ -748,8 +780,13 @@ pub fn build_embeddings(
     conn.execute("DELETE FROM embeddings", [])
         .context("clearing old embeddings")?;
 
-    let embedded =
-        embed_chunks(conn, &chunks, client, progress_mode, EmbedErrorPolicy::SkipPartial)?;
+    let embedded = embed_chunks(
+        conn,
+        &chunks,
+        client,
+        progress_mode,
+        EmbedErrorPolicy::SkipPartial,
+    )?;
 
     Ok(EmbeddingBuildStats {
         embedded_count: embedded,
@@ -794,8 +831,13 @@ pub fn build_missing_embeddings(
         anyhow::bail!("{}", embedding::OLLAMA_REQUIRED_MSG);
     }
 
-    let embedded =
-        embed_chunks(conn, &chunks, client, progress_mode, EmbedErrorPolicy::FailFast)?;
+    let embedded = embed_chunks(
+        conn,
+        &chunks,
+        client,
+        progress_mode,
+        EmbedErrorPolicy::FailFast,
+    )?;
 
     Ok(EmbeddingBuildStats {
         embedded_count: embedded,
@@ -816,6 +858,62 @@ fn render_embedding_progress(mode: ProgressMode, done: usize, total: usize) {
             eprintln!("Embedding... [{done}/{total} symbols]");
         }
     }
+}
+
+/// Re-embed symbols for files that have changed during incremental re-indexing.
+///
+/// If Ollama is healthy:
+///   1. Delete old embeddings for each changed file.
+///   2. Generate chunks for symbols in those files.
+///   3. Embed via Ollama and store new vectors.
+///
+/// If Ollama is unhealthy:
+///   Mark embeddings stale for each changed file so they are picked up on
+///   the next full embedding pass.
+///
+/// Returns the number of symbols successfully embedded (0 if Ollama was
+/// unreachable or the file list was empty).
+pub fn reembed_changed_files(
+    conn: &Connection,
+    repo_root: &Path,
+    changed_files: &[String],
+    client: &OllamaClient,
+) -> Result<usize> {
+    if changed_files.is_empty() {
+        return Ok(0);
+    }
+
+    if !client.is_healthy() {
+        // Ollama unreachable: mark embeddings stale for each file.
+        for file in changed_files {
+            embedding::mark_embeddings_stale(conn, file).ok();
+        }
+        return Ok(0);
+    }
+
+    // Delete old embeddings for changed files.
+    for file in changed_files {
+        embedding::delete_embeddings_for_file(conn, file).ok();
+    }
+
+    // Generate chunks for the changed files.
+    let chunks = embedding::chunk_symbols_for_files(conn, repo_root, changed_files)
+        .context("chunking symbols for changed files")?;
+
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+
+    // Embed and store (SkipPartial: daemon should not crash on embedding failures).
+    let embedded = embed_chunks(
+        conn,
+        &chunks,
+        client,
+        ProgressMode::Silent,
+        EmbedErrorPolicy::SkipPartial,
+    )?;
+
+    Ok(embedded)
 }
 
 /// Drop all data from the main tables (used before rebuild).
@@ -1610,6 +1708,33 @@ class Component {
     }
 
     #[test]
+    fn test_process_events_returns_changed_files() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        // Modify an existing file.
+        fs::write(root.join("lib.rs"), "fn modified_func() {}").unwrap();
+
+        // Create a new file.
+        fs::write(root.join("extra.rs"), "fn extra() {}").unwrap();
+
+        let events = vec![
+            FileEvent::Modified(root.join("lib.rs")),
+            FileEvent::Created(root.join("extra.rs")),
+            FileEvent::Deleted(root.join("app.py")),
+        ];
+
+        let result = process_events(&conn, &events, root).unwrap();
+
+        // ProcessResult should report the count and the changed file paths.
+        assert_eq!(result.updated_count, 3);
+        assert_eq!(result.changed_files.len(), 3);
+        assert!(result.changed_files.contains(&"lib.rs".to_string()));
+        assert!(result.changed_files.contains(&"extra.rs".to_string()));
+        assert!(result.changed_files.contains(&"app.py".to_string()));
+    }
+
+    #[test]
     fn test_process_events_mixed_batch() {
         let (dir, conn) = setup_indexed_repo();
         let root = dir.path();
@@ -1628,9 +1753,12 @@ class Component {
             FileEvent::Deleted(root.join("app.py")),
         ];
 
-        let updated = process_events(&conn, &events, root).unwrap();
+        let result = process_events(&conn, &events, root).unwrap();
         // All three should count as updates (modify changed hash, new file, delete).
-        assert_eq!(updated, 3, "all three events should result in updates");
+        assert_eq!(
+            result.updated_count, 3,
+            "all three events should result in updates"
+        );
 
         // lib.rs should have the new symbol.
         let has_modified: i64 = conn
@@ -1667,8 +1795,12 @@ class Component {
     fn test_process_events_empty_batch() {
         let (dir, conn) = setup_indexed_repo();
         let events: Vec<FileEvent> = vec![];
-        let updated = process_events(&conn, &events, dir.path()).unwrap();
-        assert_eq!(updated, 0, "empty batch should produce 0 updates");
+        let result = process_events(&conn, &events, dir.path()).unwrap();
+        assert_eq!(
+            result.updated_count, 0,
+            "empty batch should produce 0 updates"
+        );
+        assert!(result.changed_files.is_empty());
     }
 
     #[test]
@@ -1678,8 +1810,12 @@ class Component {
 
         // Send a Modified event for a file that hasn't actually changed.
         let events = vec![FileEvent::Modified(root.join("lib.rs"))];
-        let updated = process_events(&conn, &events, root).unwrap();
-        assert_eq!(updated, 0, "unchanged file should not count as updated");
+        let result = process_events(&conn, &events, root).unwrap();
+        assert_eq!(
+            result.updated_count, 0,
+            "unchanged file should not count as updated"
+        );
+        assert!(result.changed_files.is_empty());
     }
 
     #[test]
@@ -1696,9 +1832,12 @@ class Component {
             FileEvent::Modified(root.join("lib.rs")),
         ];
 
-        let updated = process_events(&conn, &events, root).unwrap();
+        let result = process_events(&conn, &events, root).unwrap();
         // The ghost.rs error should not prevent lib.rs from being processed.
-        assert_eq!(updated, 1, "should process remaining events after error");
+        assert_eq!(
+            result.updated_count, 1,
+            "should process remaining events after error"
+        );
 
         let has_changed: i64 = conn
             .query_row(
@@ -1918,5 +2057,78 @@ class Component {
         assert_eq!(stats.embedded_count, 0);
         assert_eq!(stats.total_symbols, 0);
         assert!(!stats.skipped);
+    }
+
+    // -----------------------------------------------------------------------
+    // reembed_changed_files tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reembed_changed_files_ollama_unreachable_marks_stale() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        let _stats = build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Store a fake embedding for one of the symbols in src/main.rs.
+        let sym_id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE file = 'src/main.rs' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        embedding::store_embedding(&conn, sym_id, "src/main.rs", "chunk", &[1.0, 0.0]).unwrap();
+
+        // Verify embedding is fresh (not stale).
+        let (_, stale_before) = embedding::embedding_stats(&conn).unwrap();
+        assert_eq!(stale_before, 0, "embedding should be fresh initially");
+
+        // Use dead port to simulate Ollama unreachable.
+        let client = embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let files = vec!["src/main.rs".to_string()];
+
+        let count = reembed_changed_files(&conn, root, &files, &client).unwrap();
+        assert_eq!(count, 0, "should embed 0 when Ollama is unreachable");
+
+        // Embedding should now be stale.
+        let (_, stale_after) = embedding::embedding_stats(&conn).unwrap();
+        assert_eq!(stale_after, 1, "embedding should be marked stale");
+    }
+
+    #[test]
+    fn test_reembed_changed_files_empty_list_is_noop() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        let _stats = build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        let client = embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let files: Vec<String> = vec![];
+
+        let count = reembed_changed_files(&conn, root, &files, &client).unwrap();
+        assert_eq!(count, 0, "empty file list should be noop");
+    }
+
+    #[test]
+    fn test_reembed_changed_files_deleted_file_skipped() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        let _stats = build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Use dead port; the function should mark stale rather than error.
+        let client = embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        // File that was deleted from disk but still referenced.
+        let files = vec!["nonexistent.rs".to_string()];
+
+        let count = reembed_changed_files(&conn, root, &files, &client).unwrap();
+        assert_eq!(count, 0, "deleted file should not produce embeddings");
     }
 }
