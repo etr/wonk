@@ -595,6 +595,110 @@ pub struct EmbeddingBuildStats {
 /// Batch size for Ollama API calls.
 const EMBEDDING_BATCH_SIZE: usize = 50;
 
+/// How the batch-embed loop handles errors from Ollama.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmbedErrorPolicy {
+    /// Log and break — partial results are kept (used by `wonk init`).
+    SkipPartial,
+    /// Return `Err` immediately — caller cannot proceed without all
+    /// embeddings (used by `wonk ask`).
+    FailFast,
+}
+
+/// Shared batch-embed loop.
+///
+/// Iterates over `chunks` in groups of [`EMBEDDING_BATCH_SIZE`], embeds each
+/// batch via `client`, and stores the resulting vectors.  Returns the number
+/// of successfully embedded symbols.
+fn embed_chunks(
+    conn: &Connection,
+    chunks: &[(i64, String, String)],
+    client: &OllamaClient,
+    progress_mode: ProgressMode,
+    policy: EmbedErrorPolicy,
+) -> Result<usize> {
+    let total = chunks.len();
+    let silent = progress_mode == ProgressMode::Silent;
+    let mut embedded = 0usize;
+
+    for batch_start in (0..total).step_by(EMBEDDING_BATCH_SIZE) {
+        let batch_end = (batch_start + EMBEDDING_BATCH_SIZE).min(total);
+        let batch = &chunks[batch_start..batch_end];
+
+        let texts: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
+
+        let vectors = match client.embed_batch(&texts) {
+            Ok(v) => v,
+            Err(EmbeddingError::OllamaUnreachable) => {
+                let msg =
+                    format!("Ollama became unreachable after embedding {embedded}/{total} symbols.");
+                match policy {
+                    EmbedErrorPolicy::FailFast => anyhow::bail!("{msg}"),
+                    EmbedErrorPolicy::SkipPartial => {
+                        if !silent {
+                            eprintln!("{msg}");
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                let msg =
+                    format!("Embedding error: {e}. Stopped after {embedded}/{total} symbols.");
+                match policy {
+                    EmbedErrorPolicy::FailFast => anyhow::bail!("{msg}"),
+                    EmbedErrorPolicy::SkipPartial => {
+                        if !silent {
+                            eprintln!("{msg}");
+                        }
+                        break;
+                    }
+                }
+            }
+        };
+
+        // Validate response count matches request count.
+        if vectors.len() != texts.len() {
+            let msg = format!(
+                "Ollama returned {} vectors for {} texts. Stopped after {embedded}/{total} symbols.",
+                vectors.len(),
+                texts.len(),
+            );
+            match policy {
+                EmbedErrorPolicy::FailFast => anyhow::bail!("{msg}"),
+                EmbedErrorPolicy::SkipPartial => {
+                    if !silent {
+                        eprintln!("{msg}");
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Build storage tuples.
+        let store_batch: Vec<(i64, &str, &str, &[f32])> = batch
+            .iter()
+            .zip(vectors.iter())
+            .map(|((sym_id, file, text), vec)| {
+                (*sym_id, file.as_str(), text.as_str(), vec.as_slice())
+            })
+            .collect();
+
+        embedding::store_embeddings_batch(conn, &store_batch).context("storing embedding batch")?;
+
+        embedded += store_batch.len();
+
+        render_embedding_progress(progress_mode, embedded, total);
+    }
+
+    // Clear the progress line if in-place mode.
+    if progress_mode == ProgressMode::InPlace && embedded > 0 {
+        eprintln!("\rEmbedded {embedded}/{total} symbols{:<40}", "");
+    }
+
+    Ok(embedded)
+}
+
 /// Build embeddings for all indexed symbols.
 ///
 /// Checks Ollama health first; if unreachable, returns with `skipped = true`.
@@ -608,11 +712,10 @@ pub fn build_embeddings(
     progress_mode: ProgressMode,
 ) -> Result<EmbeddingBuildStats> {
     let start = Instant::now();
-    let silent = progress_mode == ProgressMode::Silent;
 
     // Health check.
     if !client.is_healthy() {
-        if !silent {
+        if progress_mode != ProgressMode::Silent {
             eprintln!(
                 "Ollama not available — skipping embedding generation. \
                  Semantic search will not be available until embeddings are built."
@@ -645,65 +748,54 @@ pub fn build_embeddings(
     conn.execute("DELETE FROM embeddings", [])
         .context("clearing old embeddings")?;
 
-    let mut embedded = 0usize;
+    let embedded =
+        embed_chunks(conn, &chunks, client, progress_mode, EmbedErrorPolicy::SkipPartial)?;
 
-    // Batch-embed in groups.
-    for batch_start in (0..total).step_by(EMBEDDING_BATCH_SIZE) {
-        let batch_end = (batch_start + EMBEDDING_BATCH_SIZE).min(total);
-        let batch = &chunks[batch_start..batch_end];
+    Ok(EmbeddingBuildStats {
+        embedded_count: embedded,
+        total_symbols: total,
+        skipped: false,
+        elapsed: start.elapsed(),
+    })
+}
 
-        let texts: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
+/// Build embeddings only for symbols that lack fresh (non-stale) embeddings.
+///
+/// Unlike [`build_embeddings`], this does **not** delete existing embeddings
+/// first -- it is incremental.  Returns `Err` when Ollama is unreachable
+/// (the caller needs Ollama for the subsequent query).
+pub fn build_missing_embeddings(
+    conn: &Connection,
+    repo_root: &Path,
+    client: &OllamaClient,
+    progress_mode: ProgressMode,
+) -> Result<EmbeddingBuildStats> {
+    let start = Instant::now();
 
-        let vectors = match client.embed_batch(&texts) {
-            Ok(v) => v,
-            Err(EmbeddingError::OllamaUnreachable) => {
-                if !silent {
-                    eprintln!(
-                        "Ollama became unreachable after embedding {embedded}/{total} symbols."
-                    );
-                }
-                break;
-            }
-            Err(e) => {
-                if !silent {
-                    eprintln!("Embedding error: {e}. Stopping after {embedded}/{total} symbols.");
-                }
-                break;
-            }
-        };
+    // Generate chunks only for un-embedded / stale symbols.
+    let chunks = embedding::chunk_missing_symbols(conn, repo_root)
+        .context("chunking missing symbols for embedding")?;
 
-        // Validate response count matches request count.
-        if vectors.len() != texts.len() {
-            if !silent {
-                eprintln!(
-                    "Ollama returned {} vectors for {} texts. Stopping after {embedded}/{total} symbols.",
-                    vectors.len(),
-                    texts.len(),
-                );
-            }
-            break;
-        }
-
-        // Build storage tuples.
-        let store_batch: Vec<(i64, &str, &str, &[f32])> = batch
-            .iter()
-            .zip(vectors.iter())
-            .map(|((sym_id, file, text), vec)| {
-                (*sym_id, file.as_str(), text.as_str(), vec.as_slice())
-            })
-            .collect();
-
-        embedding::store_embeddings_batch(conn, &store_batch).context("storing embedding batch")?;
-
-        embedded += store_batch.len();
-
-        render_embedding_progress(progress_mode, embedded, total);
+    if chunks.is_empty() {
+        return Ok(EmbeddingBuildStats {
+            embedded_count: 0,
+            total_symbols: 0,
+            skipped: false,
+            elapsed: start.elapsed(),
+        });
     }
 
-    // Clear the progress line if in-place mode.
-    if progress_mode == ProgressMode::InPlace && embedded > 0 {
-        eprintln!("\rEmbedded {embedded}/{total} symbols{:<40}", "");
+    let total = chunks.len();
+
+    // Health check — bail before starting the expensive batch-embed loop.
+    // Unlike build_embeddings we return Err because the caller (wonk ask)
+    // requires Ollama.
+    if !client.is_healthy() {
+        anyhow::bail!("{}", embedding::OLLAMA_REQUIRED_MSG);
     }
+
+    let embedded =
+        embed_chunks(conn, &chunks, client, progress_mode, EmbedErrorPolicy::FailFast)?;
 
     Ok(EmbeddingBuildStats {
         embedded_count: embedded,
@@ -1777,5 +1869,54 @@ class Component {
             total_after, 0,
             "embeddings should be cleared after drop_all_data"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_missing_embeddings tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_missing_embeddings_ollama_unreachable_returns_error() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        let _stats = build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Use a dead port to simulate Ollama unreachable.
+        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let progress_mode = crate::progress::ProgressMode::Silent;
+
+        let result = build_missing_embeddings(&conn, root, &client, progress_mode);
+        assert!(result.is_err(), "should return Err when Ollama unreachable");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Ollama"),
+            "error should mention Ollama: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_missing_embeddings_no_symbols_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        // Empty repo - no source files.
+        let _stats = build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let progress_mode = crate::progress::ProgressMode::Silent;
+
+        let result = build_missing_embeddings(&conn, root, &client, progress_mode);
+        assert!(result.is_ok(), "should succeed with no symbols");
+        let stats = result.unwrap();
+        assert_eq!(stats.embedded_count, 0);
+        assert_eq!(stats.total_symbols, 0);
+        assert!(!stats.skipped);
     }
 }

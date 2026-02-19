@@ -399,10 +399,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
 
-            let conn = std::env::current_dir()
+            let ollama_error_msg = crate::embedding::OLLAMA_REQUIRED_MSG;
+
+            // Discover repo root (needed for embedding build).
+            let repo_root = std::env::current_dir()
                 .ok()
-                .and_then(|cwd| db::find_repo_root(&cwd).ok())
-                .and_then(|root| db::find_existing_index(&root))
+                .and_then(|cwd| db::find_repo_root(&cwd).ok());
+
+            let conn = repo_root
+                .as_ref()
+                .and_then(|root| db::find_existing_index(root))
                 .and_then(|path| db::open(&path).ok());
 
             let conn = match conn {
@@ -416,17 +422,54 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             };
 
+            // Check embedding completeness and build if needed.
+            let (symbol_count, embedding_count) = crate::embedding::embedding_completeness(&conn)?;
+
+            let client = crate::embedding::OllamaClient::new();
+
+            if symbol_count > 0 && embedding_count < symbol_count {
+                let progress_mode = progress::detect_mode(suppress);
+                let repo = match repo_root.as_deref() {
+                    Some(r) => r,
+                    None => {
+                        output::print_error("no repository root found");
+                        return Ok(());
+                    }
+                };
+                match pipeline::build_missing_embeddings(&conn, repo, &client, progress_mode) {
+                    Ok(stats) => {
+                        if !suppress && stats.embedded_count > 0 {
+                            eprintln!(
+                                "Embedded {} symbols in {:.1}s",
+                                stats.embedded_count,
+                                stats.elapsed.as_secs_f64(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        output::print_error(&format!("embedding build failed: {e:#}"));
+                        return Ok(());
+                    }
+                }
+            }
+
             let all_embeddings = crate::embedding::load_all_embeddings(&conn)?;
             if all_embeddings.is_empty() {
                 output::print_hint(
-                    "no embeddings found; run `wonk init` with Ollama running to generate embeddings",
+                    "no embeddings available; run `wonk init` with Ollama running to build embeddings",
                     suppress,
                 );
                 return Ok(());
             }
 
-            let client = crate::embedding::OllamaClient::new();
-            let mut query_vec = client.embed_single(&args.query)?;
+            let mut query_vec = match client.embed_single(&args.query) {
+                Ok(v) => v,
+                Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
+                    output::print_error(ollama_error_msg);
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
             crate::embedding::normalize(&mut query_vec);
 
             let scored = crate::semantic::semantic_search(&query_vec, &all_embeddings, 50);

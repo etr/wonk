@@ -8,6 +8,7 @@
 //! context-rich text chunks suitable for embedding by `nomic-embed-text`.
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,10 @@ pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 
 /// Default embedding model.
 pub const DEFAULT_MODEL: &str = "nomic-embed-text";
+
+/// User-facing error message when Ollama is required but unreachable.
+pub const OLLAMA_REQUIRED_MSG: &str = "Ollama is required for semantic search. \
+    Start Ollama with 'ollama serve' and ensure nomic-embed-text is available.";
 
 // ---------------------------------------------------------------------------
 // Serde types for the Ollama /api/embed endpoint
@@ -138,7 +143,15 @@ impl OllamaClient {
 
         let status = response.status().as_u16();
         if status != 200 {
-            let body = response.into_body().read_to_string().unwrap_or_default();
+            let body = {
+                let mut buf = String::new();
+                let _ = response
+                    .into_body()
+                    .as_reader()
+                    .take(4096)
+                    .read_to_string(&mut buf);
+                buf
+            };
             return Err(EmbeddingError::OllamaError(extract_error_detail(
                 status, &body,
             )));
@@ -338,13 +351,13 @@ struct SymbolRow {
     symbol: Symbol,
 }
 
-/// Query all symbols from the database, returning (id, Symbol) pairs.
-fn query_all_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError> {
+/// Execute a symbol query and map rows into `SymbolRow` structs.
+///
+/// The `sql` must select columns in this order:
+/// `id, name, kind, file, line, col, end_line, scope, signature, language`.
+fn query_symbol_rows(conn: &Connection, sql: &str) -> Result<Vec<SymbolRow>, EmbeddingError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
-             FROM symbols ORDER BY file, line",
-        )
+        .prepare(sql)
         .map_err(|_| EmbeddingError::ChunkingFailed)?;
 
     let rows = stmt
@@ -383,6 +396,29 @@ fn query_all_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError
         .collect();
 
     Ok(rows)
+}
+
+/// Query symbols that do not have fresh (non-stale) embeddings.
+///
+/// Returns symbols whose `id` is not in the `embeddings` table with `stale = 0`.
+/// This includes symbols with no embedding and symbols whose embedding is stale.
+fn query_unembedded_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError> {
+    query_symbol_rows(
+        conn,
+        "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
+         FROM symbols
+         WHERE id NOT IN (SELECT symbol_id FROM embeddings WHERE NOT stale)
+         ORDER BY file, line",
+    )
+}
+
+/// Query all symbols from the database, returning (id, Symbol) pairs.
+fn query_all_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError> {
+    query_symbol_rows(
+        conn,
+        "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
+         FROM symbols ORDER BY file, line",
+    )
 }
 
 /// Query file-level import paths for a given source file.
@@ -567,6 +603,27 @@ pub fn mark_embeddings_stale(conn: &Connection, file: &str) -> Result<(), Embedd
     Ok(())
 }
 
+/// Return `(total_symbols, fresh_embedding_count)` for completeness checking.
+///
+/// `total_symbols` is the count of rows in the `symbols` table.
+/// `fresh_embedding_count` is the count of non-stale embeddings.
+/// When `total_symbols == fresh_embedding_count`, all symbols are embedded.
+pub fn embedding_completeness(conn: &Connection) -> Result<(usize, usize), EmbeddingError> {
+    let total_symbols: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let fresh_embeddings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM embeddings WHERE NOT stale",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    Ok((total_symbols as usize, fresh_embeddings as usize))
+}
+
 /// Return `(total_count, stale_count)` for embeddings in the database.
 pub fn embedding_stats(conn: &Connection) -> Result<(usize, usize), EmbeddingError> {
     let (total, stale): (i64, i64) = conn
@@ -626,26 +683,23 @@ fn extract_line_range_indexed<'a>(
     &source[start_idx..end_idx]
 }
 
-/// Generate text chunks for all indexed symbols.
+/// Shared chunking logic: turn a set of `SymbolRow`s into text chunks.
 ///
-/// Returns `(symbol_id, file_path, chunk_text)` triples.  Reads source files
-/// from disk under `repo_root`, and silently skips files that cannot be read
-/// or whose paths are absolute or contain `..` components.
-pub fn chunk_all_symbols(
-    conn: &Connection,
+/// Groups symbols by file, reads source from disk, and produces
+/// `(symbol_id, file_path, chunk_text)` triples.  Silently skips files
+/// that cannot be read or whose paths are absolute / contain `..`.
+fn chunk_symbol_rows(
+    rows: &[SymbolRow],
+    all_imports: &BTreeMap<String, Vec<String>>,
     repo_root: &Path,
-) -> Result<Vec<(i64, String, String)>, EmbeddingError> {
-    let rows = query_all_symbols(conn)?;
+) -> Vec<(i64, String, String)> {
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-
-    // Batch-fetch all file imports in one query.
-    let all_imports = query_all_file_imports(conn)?;
 
     // Group symbols by file (BTreeMap for deterministic iteration order).
     let mut by_file: BTreeMap<String, Vec<&SymbolRow>> = BTreeMap::new();
-    for row in &rows {
+    for row in rows {
         by_file
             .entry(row.symbol.file.clone())
             .or_default()
@@ -700,7 +754,34 @@ pub fn chunk_all_symbols(
         }
     }
 
-    Ok(results)
+    results
+}
+
+/// Generate text chunks for all indexed symbols.
+///
+/// Returns `(symbol_id, file_path, chunk_text)` triples.  Reads source files
+/// from disk under `repo_root`, and silently skips files that cannot be read
+/// or whose paths are absolute or contain `..` components.
+pub fn chunk_all_symbols(
+    conn: &Connection,
+    repo_root: &Path,
+) -> Result<Vec<(i64, String, String)>, EmbeddingError> {
+    let rows = query_all_symbols(conn)?;
+    let all_imports = query_all_file_imports(conn)?;
+    Ok(chunk_symbol_rows(&rows, &all_imports, repo_root))
+}
+
+/// Generate text chunks for symbols that lack fresh (non-stale) embeddings.
+///
+/// Like [`chunk_all_symbols`] but only processes symbols returned by
+/// [`query_unembedded_symbols`].
+pub fn chunk_missing_symbols(
+    conn: &Connection,
+    repo_root: &Path,
+) -> Result<Vec<(i64, String, String)>, EmbeddingError> {
+    let rows = query_unembedded_symbols(conn)?;
+    let all_imports = query_all_file_imports(conn)?;
+    Ok(chunk_symbol_rows(&rows, &all_imports, repo_root))
 }
 
 #[cfg(test)]
@@ -1616,5 +1697,406 @@ mod tests {
         let bytes: &[u8] = bytemuck::cast_slice(&original);
         let recovered: &[f32] = bytemuck::cast_slice(bytes);
         assert_eq!(original.as_slice(), recovered);
+    }
+
+    // -- embedding_completeness tests -----------------------------------------
+
+    #[test]
+    fn embedding_completeness_no_symbols_no_embeddings() {
+        let conn = setup_test_db_with_embeddings();
+        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        assert_eq!(sym_count, 0);
+        assert_eq!(emb_count, 0);
+    }
+
+    #[test]
+    fn embedding_completeness_symbols_no_embeddings() {
+        let conn = setup_test_db_with_embeddings();
+        insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        assert_eq!(sym_count, 2);
+        assert_eq!(emb_count, 0);
+    }
+
+    #[test]
+    fn embedding_completeness_partial() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        assert_eq!(sym_count, 2);
+        assert_eq!(emb_count, 1);
+    }
+
+    #[test]
+    fn embedding_completeness_all_embedded() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        assert_eq!(sym_count, 2);
+        assert_eq!(emb_count, 2);
+    }
+
+    #[test]
+    fn embedding_completeness_excludes_stale() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        // Mark one as stale -- should not count as fresh
+        mark_embeddings_stale(&conn, "a.rs").unwrap();
+        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        assert_eq!(sym_count, 2);
+        assert_eq!(emb_count, 1);
+    }
+
+    // -- query_unembedded_symbols tests ---------------------------------------
+
+    #[test]
+    fn query_unembedded_symbols_all_missing() {
+        let conn = setup_test_db_with_embeddings();
+        insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        let rows = query_unembedded_symbols(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn query_unembedded_symbols_some_embedded() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        let rows = query_unembedded_symbols(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol.name, "b");
+    }
+
+    #[test]
+    fn query_unembedded_symbols_all_embedded() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        let rows = query_unembedded_symbols(&conn).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn query_unembedded_symbols_stale_reembedded() {
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        // Mark id1's embedding as stale -- it needs re-embedding
+        mark_embeddings_stale(&conn, "a.rs").unwrap();
+        let rows = query_unembedded_symbols(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol.name, "a");
+    }
+
+    // -- chunk_missing_symbols tests ------------------------------------------
+
+    #[test]
+    fn chunk_missing_symbols_all_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        std::fs::write(root.join("b.rs"), "fn b() { 2 }\n").unwrap();
+
+        let conn = setup_test_db_with_embeddings();
+        insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+
+        let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn chunk_missing_symbols_some_embedded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        std::fs::write(root.join("b.rs"), "fn b() { 2 }\n").unwrap();
+
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+
+        let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].1, "b.rs");
+    }
+
+    #[test]
+    fn chunk_missing_symbols_all_embedded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() { 1 }\n").unwrap();
+
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+
+        let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_missing_symbols_stale_gets_rechunked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        std::fs::write(root.join("b.rs"), "fn b() { 2 }\n").unwrap();
+
+        let conn = setup_test_db_with_embeddings();
+        let id1 = insert_symbol(
+            &conn,
+            "a",
+            "function",
+            "a.rs",
+            1,
+            Some(1),
+            None,
+            "fn a()",
+            "Rust",
+        );
+        let id2 = insert_symbol(
+            &conn,
+            "b",
+            "function",
+            "b.rs",
+            1,
+            Some(1),
+            None,
+            "fn b()",
+            "Rust",
+        );
+        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        mark_embeddings_stale(&conn, "a.rs").unwrap();
+
+        let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].1, "a.rs");
     }
 }

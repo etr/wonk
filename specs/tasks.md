@@ -27,7 +27,7 @@
 | M7 | Polish & Distribution | 5 | Complete |
 | M8 | Git Worktree Support | 3 | Complete |
 | M9 | Embedding Infrastructure | 5 | Complete |
-| M10 | Semantic Search (`wonk ask`) | 3 | In Progress |
+| M10 | Semantic Search (`wonk ask`) | 3 | Complete |
 | M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
 | M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
 | M13 | Semantic Clustering (`wonk cluster`) | 2 | Not Started |
@@ -1758,11 +1758,11 @@ Implement the `wonk ask <query>` CLI command that performs semantic search and d
 When `wonk ask` is run with incomplete embeddings, block and build them with progress. When Ollama is unavailable, return a clear error.
 
 **Action Items:**
-- [ ] On `wonk ask`, check embedding completeness: compare symbol count in `symbols` table vs `embeddings` table
-- [ ] If embeddings are incomplete: call `Embedding Engine::embed_repo()` directly from CLI with a progress callback that prints to stderr, blocking until complete
-- [ ] After embedding completes, proceed with the semantic query
-- [ ] If Ollama is not reachable when `wonk ask` is run: return `error: Ollama is required for semantic search. Start Ollama with 'ollama serve' and ensure nomic-embed-text is available.`
-- [ ] If Ollama becomes unreachable mid-embedding (block-and-wait): report partial progress and error
+- [x] On `wonk ask`, check embedding completeness: compare symbol count in `symbols` table vs `embeddings` table
+- [x] If embeddings are incomplete: call `Embedding Engine::embed_repo()` directly from CLI with a progress callback that prints to stderr, blocking until complete
+- [x] After embedding completes, proceed with the semantic query
+- [x] If Ollama is not reachable when `wonk ask` is run: return `error: Ollama is required for semantic search. Start Ollama with 'ollama serve' and ensure nomic-embed-text is available.`
+- [x] If Ollama becomes unreachable mid-embedding (block-and-wait): report partial progress and error
 
 **Dependencies:**
 - Blocked by: TASK-044
@@ -1779,7 +1779,7 @@ When `wonk ask` is run with incomplete embeddings, block and build them with pro
 **Related Requirements:** PRD-SEM-REQ-012, PRD-SEM-REQ-013
 **Related Decisions:** DR-009
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
