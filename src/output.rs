@@ -136,6 +136,7 @@ pub struct SemanticOutput {
     pub symbol_name: String,
     pub symbol_kind: String,
     pub similarity_score: f32,
+    #[serde(skip)]
     pub symbol_id: i64,
 }
 
@@ -1802,7 +1803,7 @@ mod tests {
         assert_eq!(v["symbol_name"], "authenticate");
         assert_eq!(v["symbol_kind"], "function");
         assert!((v["similarity_score"].as_f64().unwrap() - 0.8765).abs() < 0.001);
-        assert_eq!(v["symbol_id"], 1);
+        assert!(v.get("symbol_id").is_none(), "symbol_id should not appear in JSON output");
     }
 
     #[test]

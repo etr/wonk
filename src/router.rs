@@ -432,6 +432,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let scored = crate::semantic::semantic_search(&query_vec, &all_embeddings, 50);
             let results = crate::semantic::resolve_results(&conn, &scored)?;
 
+            if results.is_empty() {
+                output::print_hint(
+                    "no results found; try a different query or run `wonk init` to rebuild embeddings",
+                    suppress,
+                );
+            }
+
             let mut truncated = 0usize;
             for sr in &results {
                 let out = SemanticOutput {

@@ -1779,7 +1779,7 @@ When `wonk ask` is run with incomplete embeddings, block and build them with pro
 **Related Requirements:** PRD-SEM-REQ-012, PRD-SEM-REQ-013
 **Related Decisions:** DR-009
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
