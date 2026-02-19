@@ -18,7 +18,7 @@ use crate::errors::DbError;
 use crate::errors::SearchError;
 use crate::output::{
     self, BudgetStatus, Formatter, LsSymbolEntry, OutputFormat, RefOutput, SearchOutput,
-    SignatureOutput, SymbolOutput,
+    SemanticOutput, SignatureOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -391,6 +391,75 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
         }
+        Command::Ask(args) => {
+            if args.from.is_some() || args.to.is_some() {
+                output::print_hint(
+                    "--from/--to filtering is not yet implemented; ignoring",
+                    suppress,
+                );
+            }
+
+            let conn = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| db::find_repo_root(&cwd).ok())
+                .and_then(|root| db::find_existing_index(&root))
+                .and_then(|path| db::open(&path).ok());
+
+            let conn = match conn {
+                Some(c) => c,
+                None => {
+                    output::print_hint(
+                        "no index found; run `wonk init` to build the index",
+                        suppress,
+                    );
+                    return Ok(());
+                }
+            };
+
+            let all_embeddings = crate::embedding::load_all_embeddings(&conn)?;
+            if all_embeddings.is_empty() {
+                output::print_hint(
+                    "no embeddings found; run `wonk init` with Ollama running to generate embeddings",
+                    suppress,
+                );
+                return Ok(());
+            }
+
+            let client = crate::embedding::OllamaClient::new();
+            let mut query_vec = client.embed_single(&args.query)?;
+            crate::embedding::normalize(&mut query_vec);
+
+            let scored = crate::semantic::semantic_search(&query_vec, &all_embeddings, 50);
+            let results = crate::semantic::resolve_results(&conn, &scored)?;
+
+            let mut truncated = 0usize;
+            for sr in &results {
+                let out = SemanticOutput {
+                    file: sr.file.clone(),
+                    line: sr.line,
+                    symbol_name: sr.symbol_name.clone(),
+                    symbol_kind: sr.symbol_kind.to_string(),
+                    similarity_score: sr.similarity_score,
+                    symbol_id: sr.symbol_id,
+                };
+                if fmt.format_semantic_result(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
+            }
+
+            if !results.is_empty() {
+                output::print_hint(
+                    &format!(
+                        "{} results (top score: {:.4})",
+                        results.len(),
+                        results[0].similarity_score,
+                    ),
+                    suppress,
+                );
+            }
+
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+        }
         Command::Status => {
             let conn = std::env::current_dir()
                 .ok()
@@ -483,6 +552,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Ls(_)
             | Command::Deps(_)
             | Command::Rdeps(_)
+            | Command::Ask(_)
     )
 }
 
@@ -3546,6 +3616,17 @@ mod tests {
     #[test]
     fn test_is_query_command_not_status() {
         assert!(!is_query_command(&Command::Status));
+    }
+
+    #[test]
+    fn test_is_query_command_ask() {
+        use crate::cli::AskArgs;
+        let cmd = Command::Ask(AskArgs {
+            query: "test query".into(),
+            from: None,
+            to: None,
+        });
+        assert!(is_query_command(&cmd));
     }
 
     // -- SearchMode detection tests ------------------------------------------

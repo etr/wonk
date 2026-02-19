@@ -62,6 +62,9 @@ pub enum Command {
 
     /// Run MCP (Model Context Protocol) server
     Mcp(McpArgs),
+
+    /// Semantic search: find symbols related to a natural language query
+    Ask(AskArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -190,6 +193,18 @@ pub enum ReposCommand {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct AskArgs {
+    /// The semantic search query
+    pub query: String,
+    /// Restrict results to symbols reachable from this file
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Restrict results to symbols that can reach this file
+    #[arg(long)]
+    pub to: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct McpArgs {
     #[command(subcommand)]
     pub command: McpCommand,
@@ -203,4 +218,55 @@ pub enum McpCommand {
 
 pub fn parse() -> Cli {
     Cli::parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parse_ask_basic_query() {
+        let cli = Cli::try_parse_from(["wonk", "ask", "authentication"]).unwrap();
+        match cli.command {
+            Command::Ask(args) => {
+                assert_eq!(args.query, "authentication");
+                assert!(args.from.is_none());
+                assert!(args.to.is_none());
+            }
+            _ => panic!("expected Command::Ask"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_with_from_and_to() {
+        let cli = Cli::try_parse_from(["wonk", "ask", "query", "--from", "a.rs", "--to", "b.rs"])
+            .unwrap();
+        match cli.command {
+            Command::Ask(args) => {
+                assert_eq!(args.query, "query");
+                assert_eq!(args.from.as_deref(), Some("a.rs"));
+                assert_eq!(args.to.as_deref(), Some("b.rs"));
+            }
+            _ => panic!("expected Command::Ask"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_with_global_budget() {
+        let cli = Cli::try_parse_from(["wonk", "--budget", "500", "ask", "query"]).unwrap();
+        assert_eq!(cli.budget, Some(500));
+        match cli.command {
+            Command::Ask(args) => {
+                assert_eq!(args.query, "query");
+            }
+            _ => panic!("expected Command::Ask"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_requires_query() {
+        let result = Cli::try_parse_from(["wonk", "ask"]);
+        assert!(result.is_err());
+    }
 }
