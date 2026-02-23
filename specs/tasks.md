@@ -1869,12 +1869,12 @@ After structural re-indexing of changed files, re-generate and store embeddings 
 Implement `wonk daemon list` to show all running daemons and `wonk daemon stop --all` to stop them all.
 
 **Action Items:**
-- [ ] Implement `wonk daemon list`: glob `~/.wonk/repos/*/daemon.pid`, read each PID, check if process is alive (`kill(pid, 0)`), read `meta.json` for repo path
-- [ ] Display format: `PID    REPO PATH    UPTIME    STATUS`
-- [ ] Clean up stale PID files (process not running) during listing
-- [ ] Implement `wonk daemon stop --all`: iterate daemon list, send SIGTERM to each, wait for exit, report results
-- [ ] Support `--json` output for daemon list
-- [ ] Handle local-mode indexes: also check `.wonk/daemon.pid` in current repo
+- [x] Implement `wonk daemon list`: glob `~/.wonk/repos/*/daemon.pid`, read each PID, check if process is alive (`kill(pid, 0)`), read `meta.json` for repo path
+- [x] Display format: `PID    REPO PATH    UPTIME    STATUS`
+- [x] Clean up stale PID files (process not running) during listing
+- [x] Implement `wonk daemon stop --all`: iterate daemon list, send SIGTERM to each, wait for exit, report results
+- [x] Support `--json` output for daemon list
+- [x] Handle local-mode indexes: also check `.wonk/daemon.pid` in current repo
 
 **Dependencies:**
 - Blocked by: None
@@ -1892,7 +1892,7 @@ Implement `wonk daemon list` to show all running daemons and `wonk daemon stop -
 **Related Requirements:** PRD-DMN-REQ-014, PRD-DMN-REQ-015
 **Related Decisions:** DR-013
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -1927,7 +1927,7 @@ When auto-init is triggered by a query, build structural index only, then delega
 **Related Requirements:** PRD-SEM-REQ-009
 **Related Decisions:** DR-013
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -1969,7 +1969,7 @@ Add `--semantic` flag to `wonk search` that blends structural results with seman
 **Related Requirements:** PRD-SEM-REQ-002
 **Related Decisions:** DR-010
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
