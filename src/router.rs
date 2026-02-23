@@ -95,6 +95,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         let progress = Progress::new("Indexing", "Indexed", progress::detect_mode(suppress));
         let stats = pipeline::build_index_with_progress(&repo_root, false, &progress)?;
         progress.finish(&stats);
+        // Signal daemon to build embeddings in background.
+        if let Ok(index_path) = db::index_path_for(&repo_root, false)
+            && let Ok(conn) = db::open(&index_path)
+        {
+            crate::daemon::request_embedding_build(&conn).ok();
+        }
         // Spawn daemon after auto-init (best-effort).
         spawn_daemon_background(&repo_root);
     }
@@ -530,7 +536,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Daemon(args) => match args.command {
             DaemonCommand::Start => {
-                output::print_hint("daemon start: not yet implemented", suppress);
+                let repo_root = db::find_repo_root(&std::env::current_dir()?)?;
+                crate::daemon::spawn_daemon(&repo_root, false)?;
             }
             DaemonCommand::Stop(stop_args) => {
                 if stop_args.all {
@@ -557,11 +564,95 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         output::print_hint("no running daemons found", suppress);
                     }
                 } else {
-                    output::print_hint("daemon stop: not yet implemented", suppress);
+                    let repo_root = db::find_repo_root(&std::env::current_dir()?)?;
+                    crate::daemon::stop_daemon(&repo_root, false)?;
+                    output::print_hint("daemon stopped", suppress);
                 }
             }
             DaemonCommand::Status => {
-                output::print_hint("daemon status: not yet implemented", suppress);
+                let repo_root = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| db::find_repo_root(&cwd).ok());
+
+                // Check if daemon process is alive.
+                let daemon_pid = repo_root
+                    .as_ref()
+                    .and_then(|r| crate::daemon::daemon_status(r, false).ok())
+                    .flatten();
+
+                // Read detailed status from DB.
+                let conn = repo_root
+                    .as_ref()
+                    .and_then(|root| db::find_existing_index(root))
+                    .and_then(|path| db::open(&path).ok());
+                let info = conn
+                    .as_ref()
+                    .and_then(|c| crate::daemon::read_all_status(c).ok())
+                    .unwrap_or_default();
+
+                if format.is_structured() {
+                    let mut status = serde_json::Map::new();
+                    status.insert(
+                        "running".to_string(),
+                        serde_json::Value::Bool(daemon_pid.is_some()),
+                    );
+                    if let Some(pid) = daemon_pid {
+                        status.insert("pid".to_string(), serde_json::Value::Number(pid.into()));
+                    }
+                    if let Some(ref state) = info.state {
+                        status.insert(
+                            "state".to_string(),
+                            serde_json::Value::String(state.clone()),
+                        );
+                    }
+                    if let Some(ref uptime_start) = info.uptime_start {
+                        let uptime = uptime_start.parse::<i64>().ok();
+                        status.insert(
+                            "uptime".to_string(),
+                            serde_json::Value::String(crate::daemon::format_uptime(uptime)),
+                        );
+                    }
+                    if let Some(ref last_activity) = info.last_activity {
+                        status.insert(
+                            "last_activity".to_string(),
+                            serde_json::Value::String(last_activity.clone()),
+                        );
+                    }
+                    if let Some(ref last_error) = info.last_error {
+                        status.insert(
+                            "last_error".to_string(),
+                            serde_json::Value::String(last_error.clone()),
+                        );
+                    }
+                    if let Some(ref ebr) = info.embedding_build_requested {
+                        status.insert(
+                            "embedding_build_requested".to_string(),
+                            serde_json::Value::Bool(ebr == "1"),
+                        );
+                    }
+                    let json = serde_json::to_string_pretty(&status)?;
+                    writeln!(fmt.writer_mut(), "{json}")?;
+                } else if let Some(pid) = daemon_pid {
+                    let uptime = info
+                        .uptime_start
+                        .as_ref()
+                        .and_then(|s| s.parse::<i64>().ok());
+                    eprintln!(
+                        "Daemon: running (PID {pid}, uptime {})",
+                        crate::daemon::format_uptime(uptime)
+                    );
+                    if let Some(ref last_activity) = info.last_activity {
+                        eprintln!("Last activity: epoch {last_activity}");
+                    }
+                    if let Some(ref last_error) = info.last_error {
+                        eprintln!("Last error: {last_error}");
+                    }
+                    if info.embedding_build_requested.as_deref() == Some("1") {
+                        eprintln!("Embedding build: requested (pending)");
+                    }
+                } else {
+                    eprintln!("Daemon: not running");
+                }
             }
             DaemonCommand::List => {
                 let repo_root = std::env::current_dir()
