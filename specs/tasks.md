@@ -1946,12 +1946,12 @@ When auto-init is triggered by a query, build structural index only, then delega
 Add `--semantic` flag to `wonk search` that blends structural results with semantic results.
 
 **Action Items:**
-- [ ] Add `--semantic` flag to `wonk search` CLI
-- [ ] When `--semantic` is provided: run structural search as normal, then run semantic search for the same pattern
-- [ ] Deduplicate: remove semantic results that match structural results (same file+line)
-- [ ] Blend: present structural matches first (with existing ranking), then additional semantic matches with similarity scores
-- [ ] Semantic matches formatted with `[semantic: 0.87]` annotation
-- [ ] `--budget` applies to blended result set
+- [x] Add `--semantic` flag to `wonk search` CLI
+- [x] When `--semantic` is provided: run structural search as normal, then run semantic search for the same pattern
+- [x] Deduplicate: remove semantic results that match structural results (same file+line)
+- [x] Blend: present structural matches first (with existing ranking), then additional semantic matches with similarity scores
+- [x] Semantic matches formatted with `[semantic: 0.87]` annotation
+- [x] `--budget` applies to blended result set
 
 **Dependencies:**
 - Blocked by: TASK-044
@@ -1969,7 +1969,7 @@ Add `--semantic` flag to `wonk search` that blends structural results with seman
 **Related Requirements:** PRD-SEM-REQ-002
 **Related Decisions:** DR-010
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

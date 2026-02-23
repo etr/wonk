@@ -88,6 +88,10 @@ pub struct SearchArgs {
     #[arg(long, conflicts_with = "raw")]
     pub smart: bool,
 
+    /// Blend structural results with semantic (embedding-based) results
+    #[arg(long, conflicts_with = "raw")]
+    pub semantic: bool,
+
     /// Restrict search to these paths (use -- before paths)
     #[arg(last = true)]
     pub paths: Vec<String>,
@@ -268,5 +272,35 @@ mod tests {
     fn parse_ask_requires_query() {
         let result = Cli::try_parse_from(["wonk", "ask"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_search_semantic_flag() {
+        let cli = Cli::try_parse_from(["wonk", "search", "--semantic", "verifyToken"]).unwrap();
+        match cli.command {
+            Command::Search(args) => {
+                assert_eq!(args.pattern, "verifyToken");
+                assert!(args.semantic);
+                assert!(!args.raw);
+            }
+            _ => panic!("expected Command::Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_semantic_default_false() {
+        let cli = Cli::try_parse_from(["wonk", "search", "verifyToken"]).unwrap();
+        match cli.command {
+            Command::Search(args) => {
+                assert!(!args.semantic);
+            }
+            _ => panic!("expected Command::Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_semantic_conflicts_with_raw() {
+        let result = Cli::try_parse_from(["wonk", "search", "--semantic", "--raw", "pattern"]);
+        assert!(result.is_err(), "--semantic and --raw should conflict");
     }
 }

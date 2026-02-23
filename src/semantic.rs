@@ -3,7 +3,7 @@
 //! Provides parallel vector similarity computation using rayon and
 //! result resolution against the symbols table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -132,6 +132,21 @@ pub fn resolve_results(
         .collect();
 
     Ok(results)
+}
+
+/// Filter out semantic results that overlap with structural search results.
+///
+/// Any semantic result whose `(file, line)` pair appears in `structural_keys`
+/// is excluded, preventing the same location from appearing twice in blended
+/// output.
+pub fn dedup_semantic<'a>(
+    semantic: &'a [SemanticResult],
+    structural_keys: &HashSet<(String, u64)>,
+) -> Vec<&'a SemanticResult> {
+    semantic
+        .iter()
+        .filter(|sr| !structural_keys.contains(&(sr.file.clone(), sr.line as u64)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -410,5 +425,73 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].symbol_name, "exists");
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup_semantic tests
+    // -----------------------------------------------------------------------
+
+    fn make_semantic_result(file: &str, line: usize, score: f32) -> SemanticResult {
+        SemanticResult {
+            symbol_id: 0,
+            file: file.to_string(),
+            line,
+            symbol_name: "test".to_string(),
+            symbol_kind: SymbolKind::Function,
+            similarity_score: score,
+        }
+    }
+
+    #[test]
+    fn dedup_semantic_removes_overlapping_results() {
+        use std::collections::HashSet;
+        let semantic = vec![
+            make_semantic_result("src/lib.rs", 10, 0.95),
+            make_semantic_result("src/lib.rs", 20, 0.85),
+        ];
+        let mut structural_keys = HashSet::new();
+        structural_keys.insert(("src/lib.rs".to_string(), 10u64));
+
+        let deduped = dedup_semantic(&semantic, &structural_keys);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].line, 20);
+    }
+
+    #[test]
+    fn dedup_semantic_preserves_non_overlapping() {
+        use std::collections::HashSet;
+        let semantic = vec![
+            make_semantic_result("src/a.rs", 5, 0.9),
+            make_semantic_result("src/b.rs", 10, 0.8),
+        ];
+        let structural_keys = HashSet::new();
+
+        let deduped = dedup_semantic(&semantic, &structural_keys);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn dedup_semantic_empty_input() {
+        use std::collections::HashSet;
+        let semantic: Vec<SemanticResult> = vec![];
+        let structural_keys = HashSet::new();
+
+        let deduped = dedup_semantic(&semantic, &structural_keys);
+        assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn dedup_semantic_all_overlap() {
+        use std::collections::HashSet;
+        let semantic = vec![
+            make_semantic_result("src/a.rs", 5, 0.9),
+            make_semantic_result("src/b.rs", 10, 0.8),
+        ];
+        let mut structural_keys = HashSet::new();
+        structural_keys.insert(("src/a.rs".to_string(), 5u64));
+        structural_keys.insert(("src/b.rs".to_string(), 10u64));
+
+        let deduped = dedup_semantic(&semantic, &structural_keys);
+        assert!(deduped.is_empty());
     }
 }
