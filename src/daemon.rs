@@ -51,6 +51,7 @@ pub struct DaemonInfo {
     pub heartbeat: Option<String>,
     pub embedding_last_activity: Option<String>,
     pub embedding_files_count: Option<String>,
+    pub embedding_build_requested: Option<String>,
 }
 
 /// Write a single key/value pair into the `daemon_status` table.
@@ -117,6 +118,37 @@ pub fn update_embedding_activity(conn: &Connection, files_count: usize) -> Resul
     Ok(())
 }
 
+/// Write `embedding_build_requested = 1` to the daemon status table.
+///
+/// Called by auto-init to signal the daemon to build embeddings in the
+/// background after the structural index is ready.
+pub fn request_embedding_build(conn: &Connection) -> Result<()> {
+    write_status(conn, "embedding_build_requested", "1")
+}
+
+/// Clear the `embedding_build_requested` flag from the daemon status table.
+///
+/// Called by the daemon after it finishes building embeddings.
+pub fn clear_embedding_build_request(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM daemon_status WHERE key = 'embedding_build_requested'",
+        [],
+    )
+    .context("clearing embedding_build_requested flag")?;
+    Ok(())
+}
+
+/// Check whether an embedding build has been requested.
+///
+/// Returns `true` if the `embedding_build_requested` key is set to `"1"`.
+pub fn is_embedding_build_requested(conn: &Connection) -> bool {
+    read_status(conn, "embedding_build_requested")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1")
+}
+
 /// Clear all rows from the `daemon_status` table (call on clean shutdown).
 pub fn clear_status(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM daemon_status", [])
@@ -151,6 +183,7 @@ pub fn read_all_status(conn: &Connection) -> Result<DaemonInfo> {
         heartbeat: map.remove("heartbeat"),
         embedding_last_activity: map.remove("embedding_last_activity"),
         embedding_files_count: map.remove("embedding_files_count"),
+        embedding_build_requested: map.remove("embedding_build_requested"),
     })
 }
 
@@ -386,6 +419,25 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
                 }
             };
             let client = OllamaClient::new();
+
+            // Check for a full embedding build request (set by auto-init).
+            if is_embedding_build_requested(&embed_conn) {
+                let progress_mode = crate::progress::ProgressMode::Silent;
+                match pipeline::build_embeddings(
+                    &embed_conn,
+                    &embed_repo_root,
+                    &client,
+                    progress_mode,
+                ) {
+                    Ok(stats) => {
+                        update_embedding_activity(&embed_conn, stats.embedded_count).ok();
+                    }
+                    Err(e) => {
+                        write_error(&embed_conn, &format!("initial embedding build: {e:#}")).ok();
+                    }
+                }
+                clear_embedding_build_request(&embed_conn).ok();
+            }
 
             loop {
                 // Wait for a batch of changed files, checking shutdown periodically.
@@ -1102,6 +1154,7 @@ mod tests {
         assert!(info.heartbeat.is_none());
         assert!(info.embedding_last_activity.is_none());
         assert!(info.embedding_files_count.is_none());
+        assert!(info.embedding_build_requested.is_none());
     }
 
     // -- format_uptime / format_duration tests --------------------------------
@@ -1362,6 +1415,83 @@ mod tests {
         assert!(combined.contains(&"a.rs".to_string()));
         assert!(combined.contains(&"b.rs".to_string()));
         assert!(combined.contains(&"c.rs".to_string()));
+    }
+
+    // -- Embedding build request flag tests ---------------------------------
+
+    #[test]
+    fn test_request_embedding_build() {
+        let conn = open_test_db();
+        request_embedding_build(&conn).unwrap();
+        let val = read_status(&conn, "embedding_build_requested").unwrap();
+        assert_eq!(val, Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_clear_embedding_build_request() {
+        let conn = open_test_db();
+        request_embedding_build(&conn).unwrap();
+        clear_embedding_build_request(&conn).unwrap();
+        let val = read_status(&conn, "embedding_build_requested").unwrap();
+        assert_eq!(val, None);
+    }
+
+    #[test]
+    fn test_is_embedding_build_requested_false_by_default() {
+        let conn = open_test_db();
+        assert!(!is_embedding_build_requested(&conn));
+    }
+
+    #[test]
+    fn test_is_embedding_build_requested_after_request() {
+        let conn = open_test_db();
+        request_embedding_build(&conn).unwrap();
+        assert!(is_embedding_build_requested(&conn));
+    }
+
+    #[test]
+    fn test_read_all_status_includes_embedding_build_requested() {
+        let conn = open_test_db();
+        request_embedding_build(&conn).unwrap();
+        let info = read_all_status(&conn).unwrap();
+        assert_eq!(info.embedding_build_requested, Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_read_all_status_embedding_build_requested_not_set() {
+        let conn = open_test_db();
+        let info = read_all_status(&conn).unwrap();
+        assert!(info.embedding_build_requested.is_none());
+    }
+
+    #[test]
+    fn test_is_embedding_build_requested_after_clear() {
+        let conn = open_test_db();
+        request_embedding_build(&conn).unwrap();
+        assert!(is_embedding_build_requested(&conn));
+        clear_embedding_build_request(&conn).unwrap();
+        assert!(!is_embedding_build_requested(&conn));
+    }
+
+    #[test]
+    fn test_embedding_build_request_lifecycle() {
+        // Simulates the lifecycle: auto-init sets flag, daemon reads it,
+        // daemon clears it after build.
+        let conn = open_test_db();
+
+        // Auto-init sets the flag.
+        request_embedding_build(&conn).unwrap();
+        assert!(is_embedding_build_requested(&conn));
+
+        // Daemon startup checks the flag and would build embeddings...
+        // (build_embeddings not called here - tested in pipeline tests)
+
+        // After build, daemon clears the flag.
+        clear_embedding_build_request(&conn).unwrap();
+        assert!(!is_embedding_build_requested(&conn));
+
+        // Subsequent checks still return false.
+        assert!(!is_embedding_build_requested(&conn));
     }
 
     #[test]
