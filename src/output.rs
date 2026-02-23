@@ -61,6 +61,9 @@ pub struct SearchOutput {
     /// Optional annotation from ranking/dedup (e.g. "(+3 other locations)").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotation: Option<String>,
+    /// Optional source indicator for blended search ("structural" or "semantic").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// A symbol definition result.
@@ -172,6 +175,7 @@ impl SearchOutput {
             col,
             content: content.to_string(),
             annotation: None,
+            source: None,
         }
     }
 }
@@ -727,6 +731,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -740,6 +745,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -932,6 +938,7 @@ mod tests {
                 col: 1,
                 content: "first".into(),
                 annotation: None,
+                source: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
@@ -939,6 +946,7 @@ mod tests {
                 col: 1,
                 content: "second".into(),
                 annotation: None,
+                source: None,
             },
         ];
         let out = render(OutputFormat::Json, |fmt| {
@@ -964,6 +972,7 @@ mod tests {
                 col: 1,
                 content: "first".into(),
                 annotation: None,
+                source: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
@@ -971,6 +980,7 @@ mod tests {
                 col: 1,
                 content: "second".into(),
                 annotation: None,
+                source: None,
             },
         ];
         let out = render(OutputFormat::Grep, |fmt| {
@@ -1007,6 +1017,7 @@ mod tests {
             col: 1,
             content: "pub fn foo() {}".into(),
             annotation: Some("(+3 other locations)".into()),
+            source: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}  (+3 other locations)\n");
@@ -1020,6 +1031,7 @@ mod tests {
             col: 1,
             content: "pub fn foo() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}\n");
@@ -1033,6 +1045,7 @@ mod tests {
             col: 1,
             content: "pub fn foo() {}".into(),
             annotation: Some("(+2 other locations)".into()),
+            source: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -1047,9 +1060,48 @@ mod tests {
             col: 1,
             content: "pub fn foo() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         assert!(!out.contains("annotation"));
+    }
+
+    // -- Source field ---------------------------------------------------------
+
+    #[test]
+    fn search_result_json_includes_source_when_set() {
+        let result = SearchOutput {
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 1,
+            content: "pub fn foo() {}".into(),
+            annotation: None,
+            source: Some("structural".into()),
+        };
+        let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["source"], "structural");
+    }
+
+    #[test]
+    fn search_result_json_skips_source_when_none() {
+        let result = SearchOutput {
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 1,
+            content: "pub fn foo() {}".into(),
+            annotation: None,
+            source: None,
+        };
+        let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
+        assert!(!out.contains("source"));
+    }
+
+    #[test]
+    fn from_search_result_sets_source_none() {
+        let path = std::path::PathBuf::from("src/foo.rs");
+        let out = SearchOutput::from_search_result(&path, 10, 3, "let x = 1;");
+        assert!(out.source.is_none());
     }
 
     // -- Content with special characters ------------------------------------
@@ -1062,6 +1114,7 @@ mod tests {
             col: 1,
             content: "key: value".into(),
             annotation: None,
+            source: None,
         };
         // Grep format: file:line:content (colons in content are fine)
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
@@ -1076,6 +1129,7 @@ mod tests {
             col: 1,
             content: "he said \"hello\"".into(),
             annotation: None,
+            source: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -1201,6 +1255,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -1214,6 +1269,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // File path should be wrapped in magenta+bold
@@ -1235,6 +1291,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Line number should be wrapped in green
@@ -1256,6 +1313,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Separator should be wrapped in cyan
@@ -1273,6 +1331,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let mut buf = Vec::new();
         {
@@ -1294,6 +1353,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let mut buf = Vec::new();
         {
@@ -1317,6 +1377,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let mut buf = Vec::new();
         {
@@ -1340,6 +1401,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let mut buf = Vec::new();
         {
@@ -1452,6 +1514,7 @@ mod tests {
                 col: 1,
                 content: "fn some_function_here() {}".into(),
                 annotation: None,
+                source: None,
             })
             .collect();
 
@@ -1490,6 +1553,7 @@ mod tests {
                 col: 1,
                 content: "fn some_function_here() {}".into(),
                 annotation: None,
+                source: None,
             })
             .collect();
 
@@ -1535,6 +1599,7 @@ mod tests {
                 col: 1,
                 content: "fn main() {}".into(),
                 annotation: None,
+                source: None,
             })
             .collect();
 
@@ -1567,6 +1632,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         fmt.format_search_result(&r).unwrap();
         assert!(fmt.budget_used() > 0);
@@ -1615,6 +1681,7 @@ mod tests {
             col: 1,
             content: "Hello WORLD hello".into(),
             annotation: None,
+            source: None,
         };
         let mut buf = Vec::new();
         {
@@ -1666,6 +1733,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let out = render(OutputFormat::Toon, |fmt| fmt.format_search_result(&result));
         assert!(!out.is_empty());
@@ -1753,6 +1821,7 @@ mod tests {
             col: 1,
             content: "fn main() {}".into(),
             annotation: None,
+            source: None,
         };
         let mut buf = Vec::new();
         {
