@@ -642,7 +642,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         crate::daemon::format_uptime(uptime)
                     );
                     if let Some(ref last_activity) = info.last_activity {
-                        eprintln!("Last activity: epoch {last_activity}");
+                        let display = last_activity
+                            .parse::<i64>()
+                            .ok()
+                            .map(|e| format!("{} ago", crate::daemon::format_uptime(Some(e))))
+                            .unwrap_or_else(|| format!("epoch {last_activity}"));
+                        eprintln!("Last activity: {display}");
                     }
                     if let Some(ref last_error) = info.last_error {
                         eprintln!("Last error: {last_error}");

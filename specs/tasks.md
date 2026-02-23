@@ -1906,11 +1906,11 @@ Implement `wonk daemon list` to show all running daemons and `wonk daemon stop -
 When auto-init is triggered by a query, build structural index only, then delegate embedding generation to the daemon.
 
 **Action Items:**
-- [ ] In auto-init path (triggered by `wonk ask` or `wonk search --semantic` with no index): build structural index synchronously
-- [ ] After structural index build, write `embedding_build_requested = 1` to `daemon_status` table
-- [ ] In daemon startup, check for `embedding_build_requested` flag, begin embedding generation in background if Ollama is reachable
-- [ ] Clear the flag after embedding build completes
-- [ ] If `wonk ask` is run before daemon finishes embeddings, block-and-wait logic (TASK-045) takes over
+- [x] In auto-init path (triggered by `wonk ask` or `wonk search --semantic` with no index): build structural index synchronously
+- [x] After structural index build, write `embedding_build_requested = 1` to `daemon_status` table
+- [x] In daemon startup, check for `embedding_build_requested` flag, begin embedding generation in background if Ollama is reachable
+- [x] Clear the flag after embedding build completes
+- [x] If `wonk ask` is run before daemon finishes embeddings, block-and-wait logic (TASK-045) takes over
 
 **Dependencies:**
 - Blocked by: TASK-042

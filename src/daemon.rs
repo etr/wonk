@@ -1154,6 +1154,7 @@ mod tests {
         assert!(info.heartbeat.is_none());
         assert!(info.embedding_last_activity.is_none());
         assert!(info.embedding_files_count.is_none());
+        assert!(info.embedding_build_requested.is_none());
     }
 
     // -- format_uptime / format_duration tests --------------------------------
