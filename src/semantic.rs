@@ -181,16 +181,27 @@ fn extract_import_stem(import_path: &str) -> Option<String> {
 }
 
 /// Adjacency list mapping file paths to their connected neighbors.
-type AdjacencyList = HashMap<String, HashSet<String>>;
+pub(crate) type AdjacencyList = HashMap<String, HashSet<String>>;
 
-/// Load the file-level dependency graph from SQLite into forward and reverse
-/// adjacency lists.
+/// Which direction(s) of the dependency graph to build.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DepDirection {
+    Forward,
+    Reverse,
+    Both,
+}
+
+/// Load the file-level dependency graph from SQLite into adjacency lists.
 ///
 /// Returns `(forward, reverse)` where:
-/// - `forward[file]` = set of files that `file` imports
-/// - `reverse[file]` = set of files that import `file`
-fn load_dep_graph(
+/// - `forward[file]` = set of files that `file` imports (empty if not requested)
+/// - `reverse[file]` = set of files that import `file` (empty if not requested)
+///
+/// Use [`DepDirection`] to build only the direction you need, avoiding
+/// unnecessary allocations.
+pub(crate) fn load_dep_graph(
     conn: &Connection,
+    direction: DepDirection,
 ) -> Result<(AdjacencyList, AdjacencyList), DbError> {
     // Build a stem -> set of file paths lookup from the files table.
     let mut stem_to_files: HashMap<String, Vec<String>> = HashMap::new();
@@ -211,8 +222,11 @@ fn load_dep_graph(
         }
     }
 
-    let mut forward: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut reverse: HashMap<String, HashSet<String>> = HashMap::new();
+    let build_forward = direction == DepDirection::Forward || direction == DepDirection::Both;
+    let build_reverse = direction == DepDirection::Reverse || direction == DepDirection::Both;
+
+    let mut forward: AdjacencyList = HashMap::new();
+    let mut reverse: AdjacencyList = HashMap::new();
 
     // Query all import edges.
     {
@@ -227,14 +241,18 @@ fn load_dep_graph(
             {
                 for target in targets {
                     if target != &source_file {
-                        forward
-                            .entry(source_file.clone())
-                            .or_default()
-                            .insert(target.clone());
-                        reverse
-                            .entry(target.clone())
-                            .or_default()
-                            .insert(source_file.clone());
+                        if build_forward {
+                            forward
+                                .entry(source_file.clone())
+                                .or_default()
+                                .insert(target.clone());
+                        }
+                        if build_reverse {
+                            reverse
+                                .entry(target.clone())
+                                .or_default()
+                                .insert(source_file.clone());
+                        }
                     }
                 }
             }
@@ -252,8 +270,9 @@ fn bfs(start: &str, adj: &AdjacencyList) -> HashSet<String> {
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
 
-    visited.insert(start.to_string());
-    queue.push_back(start.to_string());
+    let start_owned = start.to_string();
+    visited.insert(start_owned.clone());
+    queue.push_back(start_owned);
 
     while let Some(node) = queue.pop_front() {
         if let Some(neighbors) = adj.get(&node) {
@@ -274,7 +293,7 @@ fn bfs(start: &str, adj: &AdjacencyList) -> HashSet<String> {
 /// For example, if A imports B and B imports C, then `reachable_from(conn, "A")`
 /// returns `{A, B, C}`. The starting file is always included in the result.
 pub fn reachable_from(conn: &Connection, file: &str) -> Result<HashSet<String>, DbError> {
-    let (forward, _reverse) = load_dep_graph(conn)?;
+    let (forward, _) = load_dep_graph(conn, DepDirection::Forward)?;
     Ok(bfs(file, &forward))
 }
 
@@ -284,7 +303,7 @@ pub fn reachable_from(conn: &Connection, file: &str) -> Result<HashSet<String>, 
 /// For example, if A imports B and C imports B, then `reachable_to(conn, "B")`
 /// returns `{A, B, C}`. The target file is always included in the result.
 pub fn reachable_to(conn: &Connection, file: &str) -> Result<HashSet<String>, DbError> {
-    let (_forward, reverse) = load_dep_graph(conn)?;
+    let (_, reverse) = load_dep_graph(conn, DepDirection::Reverse)?;
     Ok(bfs(file, &reverse))
 }
 
