@@ -163,9 +163,7 @@ pub fn dedup_semantic<'a>(
 /// - `../helpers/format.ts` -> `format`
 fn extract_import_stem(import_path: &str) -> Option<String> {
     // Split on all known separators and take the last non-empty segment.
-    let last_segment = import_path
-        .rsplit(['/', ':'])
-        .find(|s| !s.is_empty())?;
+    let last_segment = import_path.rsplit(['/', ':']).find(|s| !s.is_empty())?;
 
     // Strip file extension if present.
     let stem = Path::new(last_segment)
@@ -173,11 +171,7 @@ fn extract_import_stem(import_path: &str) -> Option<String> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| last_segment.to_string());
 
-    if stem.is_empty() {
-        None
-    } else {
-        Some(stem)
-    }
+    if stem.is_empty() { None } else { Some(stem) }
 }
 
 /// Adjacency list mapping file paths to their connected neighbors.
@@ -214,10 +208,7 @@ pub(crate) fn load_dep_graph(
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
             {
-                stem_to_files
-                    .entry(stem)
-                    .or_default()
-                    .push(path.clone());
+                stem_to_files.entry(stem).or_default().push(path.clone());
             }
         }
     }
