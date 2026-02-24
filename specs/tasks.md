@@ -30,7 +30,7 @@
 | M10 | Semantic Search (`wonk ask`) | 3 | Complete |
 | M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
 | M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
-| M13 | Semantic Clustering (`wonk cluster`) | 2 | Not Started |
+| M13 | Semantic Clustering (`wonk cluster`) | 2 | In Progress |
 | M14 | Change Impact Analysis (`wonk impact`) | 2 | Not Started |
 
 ### Dependency Graph
@@ -2059,14 +2059,14 @@ Wire `--from` and `--to` flags on `wonk ask` to filter semantic results by depen
 Implement K-Means clustering of symbol embeddings with automatic k selection via silhouette scoring.
 
 **Action Items:**
-- [ ] Add to Cargo.toml: `linfa-clustering = "0.8"`, `linfa = "0.8"`, `ndarray = "0.16"`
-- [ ] Create `cluster.rs` module
-- [ ] Implement `cluster_embeddings(embeddings: &[(i64, Vec<f32>)], max_k: usize) -> Vec<Cluster>`: load embeddings into ndarray matrix, run K-Means for k = 2..min(√n, max_k), compute silhouette score for each k, select best k
-- [ ] Use K-Means++ initialization via `linfa-clustering::KMeans::params_with_rng(k).init_method(KMeansPlusPlus)`
-- [ ] Define `Cluster` struct in `types.rs`: `cluster_id`, `centroid: Vec<f32>`, `members: Vec<ClusterMember>`, `representative_symbols: Vec<ClusterMember>` (top 5 closest to centroid)
-- [ ] Define `ClusterMember` struct: `symbol_id`, `symbol_name`, `symbol_kind`, `file`, `line`, `distance_to_centroid`
-- [ ] Implement silhouette scoring: for each point, compute (b - a) / max(a, b) where a = avg distance to same-cluster points, b = avg distance to nearest other cluster points
-- [ ] Cap max_k at 20
+- [x] Add to Cargo.toml: `linfa-clustering = "0.8"`, `linfa = "0.8"`, `ndarray = "0.16"`
+- [x] Create `cluster.rs` module
+- [x] Implement `cluster_embeddings(embeddings: &[(i64, Vec<f32>)], max_k: usize) -> Vec<Cluster>`: load embeddings into ndarray matrix, run K-Means for k = 2..min(√n, max_k), compute silhouette score for each k, select best k
+- [x] Use K-Means++ initialization via `linfa-clustering::KMeans::params_with_rng(k).init_method(KMeansPlusPlus)`
+- [x] Define `Cluster` struct in `types.rs`: `cluster_id`, `centroid: Vec<f32>`, `members: Vec<ClusterMember>`, `representative_symbols: Vec<ClusterMember>` (top 5 closest to centroid)
+- [x] Define `ClusterMember` struct: `symbol_id`, `symbol_name`, `symbol_kind`, `file`, `line`, `distance_to_centroid`
+- [x] Implement silhouette scoring: for each point, compute (b - a) / max(a, b) where a = avg distance to same-cluster points, b = avg distance to nearest other cluster points
+- [x] Cap max_k at 20
 
 **Dependencies:**
 - Blocked by: TASK-042
@@ -2084,7 +2084,7 @@ Implement K-Means clustering of symbol embeddings with automatic k selection via
 **Related Requirements:** PRD-SCLST-REQ-001, PRD-SCLST-REQ-002
 **Related Decisions:** DR-011, DR-012
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 

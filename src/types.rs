@@ -137,6 +137,40 @@ pub struct FileImports {
     pub exports: Vec<String>,
 }
 
+/// A member of a K-Means cluster, representing a single symbol embedding.
+///
+/// Derives `PartialEq` but not `Eq` because `distance_to_centroid` is `f32`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterMember {
+    /// Database row ID of the symbol.
+    pub symbol_id: i64,
+    /// The symbol name (empty until resolved from DB).
+    pub symbol_name: String,
+    /// What kind of symbol this is (defaults to Function until resolved).
+    pub symbol_kind: SymbolKind,
+    /// Path of the source file (empty until resolved from DB).
+    pub file: String,
+    /// 1-based line number (0 until resolved from DB).
+    pub line: usize,
+    /// Euclidean distance from this point to the cluster centroid.
+    pub distance_to_centroid: f32,
+}
+
+/// A cluster of symbol embeddings produced by K-Means.
+///
+/// Derives `PartialEq` but not `Eq` because centroid and member distances are `f32`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cluster {
+    /// Cluster index (0-based).
+    pub cluster_id: usize,
+    /// The centroid vector of this cluster.
+    pub centroid: Vec<f32>,
+    /// All members of this cluster, sorted by ascending distance to centroid.
+    pub members: Vec<ClusterMember>,
+    /// The top N members closest to the centroid (subset of `members`).
+    pub representative_symbols: Vec<ClusterMember>,
+}
+
 /// A result from semantic (embedding-based) similarity search.
 ///
 /// Contains the matched symbol's metadata and its cosine similarity score

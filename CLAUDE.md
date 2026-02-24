@@ -41,6 +41,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `walker.rs` | File enumeration with gitignore/wonkignore support; worktree-aware boundary detection |
 | `search.rs` | Text search wrapping the `grep` crate (ripgrep internals) |
 | `semantic.rs` | Brute-force cosine similarity search — parallel dot product via rayon, top-N ranking, resolution of symbol IDs to SemanticResult structs, and structural/semantic deduplication for `--semantic` blending; BFS dependency graph traversal for `--from`/`--to` reachability scoping |
+| `cluster.rs` | K-Means clustering engine — auto-k selection via silhouette scoring, cluster member resolution from SQLite |
 | `ranker.rs` | Classifies results (Definition > CallSite > Import > Other > Comment > Test), deduplicates re-exports |
 | `output.rs` | Dual format: grep-compatible (stdout+stderr) or NDJSON (stdout) |
 | `embedding.rs` | Ollama API client, symbol chunking engine, and vector storage — sync HTTP client for embedding generation, context-rich text chunk formatting for `nomic-embed-text`, BLOB storage/retrieval with bytemuck zero-copy deserialization |
