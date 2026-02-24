@@ -131,6 +131,24 @@ pub struct DepOutput {
     pub depends_on: String,
 }
 
+/// A single member of a cluster, shown as a representative symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterMemberOutput {
+    pub file: String,
+    pub line: usize,
+    pub symbol_name: String,
+    pub symbol_kind: String,
+    pub distance_to_centroid: f32,
+}
+
+/// A cluster of semantically similar symbols.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterOutput {
+    pub cluster_id: usize,
+    pub total_members: usize,
+    pub representatives: Vec<ClusterMemberOutput>,
+}
+
 /// A semantic search result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticOutput {
@@ -597,6 +615,62 @@ impl<W: Write> Formatter<W> {
         let line = Self::serialize_structured(self.format, meta)?;
         writeln!(self.writer, "{line}")
     }
+
+    /// Format a single cluster member (representative symbol).
+    pub fn format_cluster_member(
+        &mut self,
+        member: &ClusterMemberOutput,
+    ) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_cluster_member(self, member)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let member = member.clone();
+        self.budgeted_write(move |fmt| Self::render_cluster_member(fmt, &member))
+    }
+
+    /// Shared render logic for a cluster member.
+    fn render_cluster_member<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        member: &ClusterMemberOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, member)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            writeln!(
+                fmt.writer,
+                "  {}:{}  {} ({}) [{:.2}]",
+                member.file,
+                member.line,
+                member.symbol_name,
+                member.symbol_kind,
+                member.distance_to_centroid
+            )
+        }
+    }
+
+    /// Format a full cluster (structured modes only: JSON/TOON).
+    ///
+    /// In grep mode, callers should use [`print_cluster_header`] for the
+    /// header and [`format_cluster_member`] for each representative.
+    pub fn format_cluster(&mut self, cluster: &ClusterOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            let line = Self::serialize_structured(self.format, cluster)?;
+            writeln!(self.writer, "{line}")?;
+            return Ok(BudgetStatus::Written);
+        }
+        let cluster = cluster.clone();
+        self.budgeted_write(move |fmt| {
+            let line = Self::serialize_structured(fmt.format, &cluster)?;
+            writeln!(fmt.writer, "{line}")
+        })
+    }
+}
+
+/// Print a cluster header to stderr (grep mode).
+pub fn print_cluster_header(cluster_id: usize, total_members: usize) {
+    eprintln!("Cluster {} ({} symbols):", cluster_id + 1, total_members);
 }
 
 // ---------------------------------------------------------------------------
@@ -1899,6 +1973,93 @@ mod tests {
             fmt.set_budget(25);
             for r in &results {
                 match fmt.format_semantic_result(r) {
+                    Ok(BudgetStatus::Written) => emitted += 1,
+                    Ok(BudgetStatus::Skipped) => truncated += 1,
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+        }
+        assert!(emitted > 0, "should emit at least one result");
+        assert!(emitted < 10, "should not emit all results");
+        assert_eq!(emitted + truncated, 10);
+    }
+
+    // -- ClusterOutput -------------------------------------------------------
+
+    #[test]
+    fn cluster_member_grep_format() {
+        let member = ClusterMemberOutput {
+            file: "src/auth/middleware.ts".into(),
+            line: 15,
+            symbol_name: "verifyToken".into(),
+            symbol_kind: "function".into(),
+            distance_to_centroid: 0.12,
+        };
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_cluster_member(&member));
+        assert_eq!(
+            out,
+            "  src/auth/middleware.ts:15  verifyToken (function) [0.12]\n"
+        );
+    }
+
+    #[test]
+    fn cluster_member_json_format() {
+        let member = ClusterMemberOutput {
+            file: "src/auth/middleware.ts".into(),
+            line: 15,
+            symbol_name: "verifyToken".into(),
+            symbol_kind: "function".into(),
+            distance_to_centroid: 0.12,
+        };
+        let out = render(OutputFormat::Json, |fmt| fmt.format_cluster_member(&member));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["file"], "src/auth/middleware.ts");
+        assert_eq!(v["line"], 15);
+        assert_eq!(v["symbol_name"], "verifyToken");
+        assert_eq!(v["symbol_kind"], "function");
+    }
+
+    #[test]
+    fn cluster_output_json_format() {
+        let cluster = ClusterOutput {
+            cluster_id: 0,
+            total_members: 15,
+            representatives: vec![ClusterMemberOutput {
+                file: "src/auth/middleware.ts".into(),
+                line: 15,
+                symbol_name: "verifyToken".into(),
+                symbol_kind: "function".into(),
+                distance_to_centroid: 0.12,
+            }],
+        };
+        let out = render(OutputFormat::Json, |fmt| fmt.format_cluster(&cluster));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["cluster_id"], 0);
+        assert_eq!(v["total_members"], 15);
+        assert!(v["representatives"].is_array());
+        assert_eq!(v["representatives"][0]["symbol_name"], "verifyToken");
+    }
+
+    #[test]
+    fn cluster_member_budget_truncation() {
+        let members: Vec<ClusterMemberOutput> = (0..10)
+            .map(|i| ClusterMemberOutput {
+                file: "src/some_module.rs".into(),
+                line: i + 1,
+                symbol_name: "some_long_function_name".into(),
+                symbol_kind: "function".into(),
+                distance_to_centroid: 0.1 + (i as f32) * 0.05,
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        let mut emitted = 0usize;
+        let mut truncated = 0usize;
+        {
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
+            fmt.set_budget(25);
+            for m in &members {
+                match fmt.format_cluster_member(m) {
                     Ok(BudgetStatus::Written) => emitted += 1,
                     Ok(BudgetStatus::Skipped) => truncated += 1,
                     Err(e) => panic!("unexpected error: {e}"),

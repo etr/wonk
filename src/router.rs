@@ -731,6 +731,80 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Mcp(args) => match args.command {
             McpCommand::Serve => crate::mcp::serve()?,
         },
+        Command::Cluster(args) => {
+            let conn = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| db::find_repo_root(&cwd).ok())
+                .and_then(|root| db::find_existing_index(&root))
+                .and_then(|path| db::open(&path).ok());
+
+            let conn = match conn {
+                Some(c) => c,
+                None => {
+                    output::print_error("no index found; run `wonk init` to build the index");
+                    return Ok(());
+                }
+            };
+
+            // Normalize path: strip leading "./", normalize "." to empty.
+            let prefix = args.path.strip_prefix("./").unwrap_or(&args.path);
+            let prefix = if prefix == "." { "" } else { prefix };
+
+            let embeddings = crate::embedding::load_embeddings_for_path_prefix(&conn, prefix)?;
+
+            if embeddings.is_empty() {
+                output::print_error(
+                    "no embeddings found for this path; run `wonk init` with Ollama running to build embeddings",
+                );
+                return Ok(());
+            }
+
+            let mut clusters = crate::cluster::cluster_embeddings(&embeddings, 20);
+            crate::cluster::resolve_cluster_members(&conn, &mut clusters)?;
+
+            let mut truncated = 0usize;
+            for cluster in &clusters {
+                if format.is_structured() {
+                    let out = output::ClusterOutput {
+                        cluster_id: cluster.cluster_id,
+                        total_members: cluster.members.len(),
+                        representatives: cluster
+                            .members
+                            .iter()
+                            .take(args.top)
+                            .map(|m| output::ClusterMemberOutput {
+                                file: m.file.clone(),
+                                line: m.line,
+                                symbol_name: m.symbol_name.clone(),
+                                symbol_kind: m.symbol_kind.to_string(),
+                                distance_to_centroid: m.distance_to_centroid,
+                            })
+                            .collect(),
+                    };
+                    if fmt.format_cluster(&out)? == BudgetStatus::Skipped {
+                        truncated += 1;
+                    }
+                } else {
+                    if !suppress {
+                        output::print_cluster_header(cluster.cluster_id, cluster.members.len());
+                    }
+                    for member in cluster.members.iter().take(args.top) {
+                        let out = output::ClusterMemberOutput {
+                            file: member.file.clone(),
+                            line: member.line,
+                            symbol_name: member.symbol_name.clone(),
+                            symbol_kind: member.symbol_kind.to_string(),
+                            distance_to_centroid: member.distance_to_centroid,
+                        };
+                        if fmt.format_cluster_member(&out)? == BudgetStatus::Skipped {
+                            truncated += 1;
+                        }
+                    }
+                }
+            }
+
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+        }
     }
     Ok(())
 }
@@ -748,6 +822,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Deps(_)
             | Command::Rdeps(_)
             | Command::Ask(_)
+            | Command::Cluster(_)
     )
 }
 
@@ -3925,6 +4000,16 @@ mod tests {
             query: "test query".into(),
             from: None,
             to: None,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_cluster() {
+        use crate::cli::ClusterArgs;
+        let cmd = Command::Cluster(ClusterArgs {
+            path: "src/auth/".into(),
+            top: 5,
         });
         assert!(is_query_command(&cmd));
     }
