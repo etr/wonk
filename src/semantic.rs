@@ -313,8 +313,10 @@ pub fn compute_reachable_files(
         (Some(f), None) => Ok(Some(reachable_from(conn, f)?)),
         (None, Some(t)) => Ok(Some(reachable_to(conn, t)?)),
         (Some(f), Some(t)) => {
-            let from_set = reachable_from(conn, f)?;
-            let to_set = reachable_to(conn, t)?;
+            // Load the graph once with Both to avoid two full SQL scans.
+            let (forward, reverse) = load_dep_graph(conn, DepDirection::Both)?;
+            let from_set = bfs(f, &forward);
+            let to_set = bfs(t, &reverse);
             Ok(Some(from_set.intersection(&to_set).cloned().collect()))
         }
     }
