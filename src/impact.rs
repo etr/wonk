@@ -84,15 +84,15 @@ pub fn detect_changed_symbols(
     file: &str,
     repo_root: &Path,
 ) -> Result<Vec<ChangedSymbol>> {
-    let abs_path = repo_root.join(file);
-
-    // Guard against path traversal: resolved path must stay within repo_root.
-    if let Ok(canonical) = abs_path.canonicalize()
-        && let Ok(canon_root) = repo_root.canonicalize()
-        && !canonical.starts_with(&canon_root)
+    // Guard against path traversal: reject `..` components before any filesystem access.
+    if Path::new(file)
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
     {
         bail!("path escapes repository root: {file}");
     }
+
+    let abs_path = repo_root.join(file);
 
     // If file doesn't exist on disk, all indexed symbols are Removed.
     if !abs_path.exists() {
@@ -180,9 +180,10 @@ pub fn detect_changed_symbols(
 pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<String>> {
     // Validate commit reference to prevent git argument injection (CWE-88).
     // Allow alphanumeric chars plus common git-ref characters: / _ . - @ ~ ^
-    if !commit
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "/_.-@~^".contains(c))
+    if commit.is_empty()
+        || !commit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/_.-@~^".contains(c))
     {
         bail!("invalid commit reference: {commit}");
     }
@@ -353,6 +354,24 @@ mod tests {
                 .iter()
                 .all(|c| c.change_type == crate::types::ChangeType::Added)
         );
+    }
+
+    #[test]
+    fn path_traversal_rejected() {
+        let source = "fn hello() { }\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let result = detect_changed_symbols(&conn, "../../etc/passwd", dir.path());
+        assert!(result.is_err(), "path with .. should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("path escapes repository root"));
+    }
+
+    #[test]
+    fn git_diff_rejects_empty_commit() {
+        let dir = TempDir::new().unwrap();
+        let result = detect_changed_files_since("", dir.path());
+        assert!(result.is_err(), "empty commit ref should be rejected");
     }
 
     #[test]
