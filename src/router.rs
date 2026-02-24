@@ -421,13 +421,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Ask(args) => {
-            if args.from.is_some() || args.to.is_some() {
-                output::print_hint(
-                    "--from/--to filtering is not yet implemented; ignoring",
-                    suppress,
-                );
-            }
-
             let ollama_error_msg = crate::embedding::OLLAMA_REQUIRED_MSG;
 
             // Discover repo root (needed for embedding build).
@@ -450,6 +443,34 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
             };
+
+            // Validate --from/--to files exist in the index before computing
+            // reachability (fail fast with a clear error).
+            if let Some(ref f) = args.from
+                && !db::file_exists_in_index(&conn, f)?
+            {
+                output::print_error(&format!(
+                    "file not found in index: {f}\nRun `wonk init` to rebuild the index, \
+                     or check the path is repo-relative."
+                ));
+                return Ok(());
+            }
+            if let Some(ref t) = args.to
+                && !db::file_exists_in_index(&conn, t)?
+            {
+                output::print_error(&format!(
+                    "file not found in index: {t}\nRun `wonk init` to rebuild the index, \
+                     or check the path is repo-relative."
+                ));
+                return Ok(());
+            }
+
+            // Compute dependency-scoped file set for --from/--to filtering.
+            let reachable_files = crate::semantic::compute_reachable_files(
+                &conn,
+                args.from.as_deref(),
+                args.to.as_deref(),
+            )?;
 
             // Check embedding completeness and build if needed.
             let (symbol_count, embedding_count) = crate::embedding::embedding_completeness(&conn)?;
@@ -482,8 +503,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
 
-            let all_embeddings = crate::embedding::load_all_embeddings(&conn)?;
-            if all_embeddings.is_empty() {
+            // Load embeddings — scoped to reachable files when --from/--to
+            // is specified, otherwise load all.
+            let embeddings = match &reachable_files {
+                Some(files) => crate::embedding::load_embeddings_for_files(&conn, files)?,
+                None => crate::embedding::load_all_embeddings(&conn)?,
+            };
+            if embeddings.is_empty() {
                 output::print_hint(
                     "no embeddings available; run `wonk init` with Ollama running to build embeddings",
                     suppress,
@@ -501,7 +527,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             };
             crate::embedding::normalize(&mut query_vec);
 
-            let scored = crate::semantic::semantic_search(&query_vec, &all_embeddings, 50);
+            let scored = crate::semantic::semantic_search(&query_vec, &embeddings, 50);
             let results = crate::semantic::resolve_results(&conn, &scored)?;
 
             if results.is_empty() {

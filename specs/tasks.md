@@ -2019,11 +2019,11 @@ Implement BFS/DFS traversal over the file-level dependency graph to compute reac
 Wire `--from` and `--to` flags on `wonk ask` to filter semantic results by dependency reachability.
 
 **Action Items:**
-- [ ] Wire `--from <file>` flag: compute `reachable_from(file)` (TASK-051), filter semantic results to symbols in reachable files only
-- [ ] Wire `--to <file>` flag: compute `reachable_to(file)` (TASK-051), filter semantic results to symbols in reachable files only
-- [ ] Apply filtering BEFORE ranking/budget (so budget counts only relevant results)
-- [ ] If `--from` and `--to` are both specified, intersect reachable sets
-- [ ] If specified file doesn't exist in index, return clear error
+- [x] Wire `--from <file>` flag: compute `reachable_from(file)` (TASK-051), filter semantic results to symbols in reachable files only
+- [x] Wire `--to <file>` flag: compute `reachable_to(file)` (TASK-051), filter semantic results to symbols in reachable files only
+- [x] Apply filtering BEFORE ranking/budget (so budget counts only relevant results)
+- [x] If `--from` and `--to` are both specified, intersect reachable sets
+- [x] If specified file doesn't exist in index, return clear error
 
 **Dependencies:**
 - Blocked by: TASK-044, TASK-051
@@ -2040,7 +2040,7 @@ Wire `--from` and `--to` flags on `wonk ask` to filter semantic results by depen
 **Related Requirements:** PRD-SDEP-REQ-001, PRD-SDEP-REQ-002
 **Related Decisions:** DR-010
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

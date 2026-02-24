@@ -7,7 +7,7 @@
 //! Also provides the chunking pipeline that transforms indexed symbols into
 //! context-rich text chunks suitable for embedding by `nomic-embed-text`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -642,6 +642,54 @@ pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, Em
 
     let rows = stmt
         .query_map([], |row| {
+            let symbol_id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((symbol_id, blob))
+        })
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let mut results = Vec::new();
+    for r in rows {
+        let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+        let floats: &[f32] = bytemuck::try_cast_slice(&blob)
+            .map_err(|e| EmbeddingError::StorageFailed(format!("BLOB cast failed: {e}")))?;
+        results.push((symbol_id, floats.to_vec()));
+    }
+
+    Ok(results)
+}
+
+/// Load embedding vectors only for symbols belonging to the specified files.
+///
+/// Returns `(symbol_id, vector)` pairs, filtered at the SQL level using
+/// `WHERE file IN (...)`.  Returns an empty `Vec` when `files` is empty.
+pub fn load_embeddings_for_files(
+    conn: &Connection,
+    files: &HashSet<String>,
+) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build a parameterized IN clause: (?1, ?2, ..., ?N)
+    let placeholders: Vec<String> = (1..=files.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        "SELECT symbol_id, vector FROM embeddings WHERE file IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let file_params: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = file_params
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
             let symbol_id: i64 = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
             Ok((symbol_id, blob))
@@ -2309,5 +2357,79 @@ mod tests {
         // Only a.rs should produce chunks (ghost.rs can't be read from disk).
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].1, "a.rs");
+    }
+
+    // -- load_embeddings_for_files tests --------------------------------------
+
+    fn setup_db_with_embeddings() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE symbols (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+                file TEXT NOT NULL, line INTEGER NOT NULL, col INTEGER NOT NULL,
+                end_line INTEGER, scope TEXT, signature TEXT, language TEXT NOT NULL
+            );
+            CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                symbol_id INTEGER NOT NULL REFERENCES symbols(id),
+                file TEXT NOT NULL, chunk_text TEXT NOT NULL, vector BLOB NOT NULL,
+                stale INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                UNIQUE(symbol_id)
+            );
+            CREATE INDEX idx_embeddings_file ON embeddings(file);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_symbol_and_embedding(conn: &Connection, sym_id: i64, file: &str, vec_bytes: &[u8]) {
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) \
+             VALUES (?1, ?2, 'function', ?3, 1, 0, 'rust')",
+            rusqlite::params![sym_id, format!("sym_{}", sym_id), file],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, created_at) \
+             VALUES (?1, ?2, 'chunk', ?3, 1000)",
+            rusqlite::params![sym_id, file, vec_bytes],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_load_embeddings_for_files_filters_correctly() {
+        let conn = setup_db_with_embeddings();
+        // 4 bytes = 1 f32
+        let vec_a: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        let vec_b: Vec<u8> = bytemuck::cast_slice(&[2.0_f32]).to_vec();
+        let vec_c: Vec<u8> = bytemuck::cast_slice(&[3.0_f32]).to_vec();
+
+        insert_symbol_and_embedding(&conn, 1, "src/a.ts", &vec_a);
+        insert_symbol_and_embedding(&conn, 2, "src/b.ts", &vec_b);
+        insert_symbol_and_embedding(&conn, 3, "src/c.ts", &vec_c);
+
+        let files: HashSet<String> = ["src/a.ts", "src/c.ts"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let results = load_embeddings_for_files(&conn, &files).unwrap();
+
+        assert_eq!(results.len(), 2);
+        let ids: HashSet<i64> = results.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3));
+        assert!(!ids.contains(&2));
+    }
+
+    #[test]
+    fn test_load_embeddings_for_files_empty_set() {
+        let conn = setup_db_with_embeddings();
+        let vec_a: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_and_embedding(&conn, 1, "src/a.ts", &vec_a);
+
+        let files: HashSet<String> = HashSet::new();
+        let results = load_embeddings_for_files(&conn, &files).unwrap();
+        assert!(results.is_empty());
     }
 }
