@@ -2149,14 +2149,14 @@ Implement the `wonk cluster <path>` CLI command that displays semantic clusters 
 Detect which symbols changed in a file by comparing a fresh Tree-sitter parse against the indexed version.
 
 **Action Items:**
-- [ ] Create `impact.rs` module
-- [ ] Implement `detect_changed_symbols(db, file: &str) -> Result<Vec<ChangedSymbol>>`: re-parse the file with Tree-sitter, extract current symbols, compare against stored symbols by (name, kind, content_hash)
-- [ ] Define `ChangedSymbol` struct in `types.rs`: `name`, `kind`, `file`, `line`, `change_type` (Added, Modified, Removed)
-- [ ] A symbol is "Modified" if name+kind match but content hash differs
-- [ ] A symbol is "Added" if it exists in current parse but not in index
-- [ ] A symbol is "Removed" if it exists in index but not in current parse
-- [ ] Implement `detect_changed_files_since(commit: &str) -> Result<Vec<String>>`: shell out to `git diff --name-only <commit>` and parse output
-- [ ] Handle git not installed: return clear error for `--since` only (file-level impact works without git)
+- [x] Create `impact.rs` module
+- [x] Implement `detect_changed_symbols(db, file: &str) -> Result<Vec<ChangedSymbol>>`: re-parse the file with Tree-sitter, extract current symbols, compare against stored symbols by (name, kind, content_hash)
+- [x] Define `ChangedSymbol` struct in `types.rs`: `name`, `kind`, `file`, `line`, `change_type` (Added, Modified, Removed)
+- [x] A symbol is "Modified" if name+kind match but content hash differs
+- [x] A symbol is "Added" if it exists in current parse but not in index
+- [x] A symbol is "Removed" if it exists in index but not in current parse
+- [x] Implement `detect_changed_files_since(commit: &str) -> Result<Vec<String>>`: shell out to `git diff --name-only <commit>` and parse output
+- [x] Handle git not installed: return clear error for `--since` only (file-level impact works without git)
 
 **Dependencies:**
 - Blocked by: TASK-042

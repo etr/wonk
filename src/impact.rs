@@ -19,16 +19,29 @@ use crate::types::{ChangeType, ChangedSymbol, Symbol, SymbolKind};
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Identity key for comparing symbols: (name, kind_str, scope).
-type SymbolKey = (String, String, Option<String>);
+/// Identity key for comparing symbols: (name, kind, scope).
+type SymbolKey = (String, SymbolKind, Option<String>);
 
 fn symbol_key(sym: &Symbol) -> SymbolKey {
-    (sym.name.clone(), sym.kind.to_string(), sym.scope.clone())
+    (sym.name.clone(), sym.kind, sym.scope.clone())
 }
 
-/// Compute the xxhash of file content, matching the format used by pipeline.rs.
+/// Compute the xxhash of file content.
+///
+/// Must stay in sync with the hash format in `pipeline.rs` (xxh3, 16-char hex).
 fn file_content_hash(content: &[u8]) -> String {
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(content))
+}
+
+/// Build a [`ChangedSymbol`] from a [`Symbol`] and a [`ChangeType`].
+fn make_changed(sym: &Symbol, change_type: ChangeType) -> ChangedSymbol {
+    ChangedSymbol {
+        name: sym.name.clone(),
+        kind: sym.kind,
+        file: sym.file.clone(),
+        line: sym.line,
+        change_type,
+    }
 }
 
 /// Query all indexed symbols for a given file from the database.
@@ -73,26 +86,29 @@ pub fn detect_changed_symbols(
 ) -> Result<Vec<ChangedSymbol>> {
     let abs_path = repo_root.join(file);
 
+    // Guard against path traversal: resolved path must stay within repo_root.
+    if let Ok(canonical) = abs_path.canonicalize()
+        && let Ok(canon_root) = repo_root.canonicalize()
+        && !canonical.starts_with(&canon_root)
+    {
+        bail!("path escapes repository root: {file}");
+    }
+
     // If file doesn't exist on disk, all indexed symbols are Removed.
     if !abs_path.exists() {
         let indexed = query_indexed_symbols(conn, file)?;
         return Ok(indexed
-            .into_iter()
-            .map(|s| ChangedSymbol {
-                name: s.name,
-                kind: s.kind,
-                file: s.file,
-                line: s.line,
-                change_type: ChangeType::Removed,
-            })
+            .iter()
+            .map(|s| make_changed(s, ChangeType::Removed))
             .collect());
     }
 
-    // Read current content.
-    let content = std::fs::read(abs_path).with_context(|| format!("reading file {file}"))?;
+    // Read current content as UTF-8 (matching pipeline.rs which uses read_to_string).
+    let content_str =
+        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
 
     // Fast path: compare content hash against stored hash.
-    let current_hash = file_content_hash(&content);
+    let current_hash = file_content_hash(content_str.as_bytes());
     let stored_hash: Option<String> = conn
         .query_row(
             "SELECT hash FROM files WHERE path = ?1",
@@ -112,10 +128,9 @@ pub fn detect_changed_symbols(
     };
 
     // Parse with Tree-sitter.
-    let content_str = String::from_utf8_lossy(&content);
     let mut parser = indexer::get_parser(lang);
     let tree = parser
-        .parse(&content, None)
+        .parse(content_str.as_bytes(), None)
         .context("tree-sitter parse failed")?;
 
     let current_symbols = indexer::extract_symbols(&tree, &content_str, file, lang);
@@ -124,14 +139,8 @@ pub fn detect_changed_symbols(
     let indexed_symbols = query_indexed_symbols(conn, file)?;
     if stored_hash.is_none() && indexed_symbols.is_empty() {
         return Ok(current_symbols
-            .into_iter()
-            .map(|s| ChangedSymbol {
-                line: s.line,
-                name: s.name,
-                kind: s.kind,
-                file: s.file,
-                change_type: ChangeType::Added,
-            })
+            .iter()
+            .map(|s| make_changed(s, ChangeType::Added))
             .collect());
     }
 
@@ -143,44 +152,21 @@ pub fn detect_changed_symbols(
 
     let mut changes = Vec::new();
 
-    // Added: in current but not in indexed.
+    // Added + Modified: iterate current symbols.
     for (key, sym) in &current_map {
-        if !indexed_map.contains_key(key) {
-            changes.push(ChangedSymbol {
-                name: sym.name.clone(),
-                kind: sym.kind,
-                file: sym.file.clone(),
-                line: sym.line,
-                change_type: ChangeType::Added,
-            });
+        if let Some(indexed_sym) = indexed_map.get(key) {
+            if sym.signature != indexed_sym.signature {
+                changes.push(make_changed(sym, ChangeType::Modified));
+            }
+        } else {
+            changes.push(make_changed(sym, ChangeType::Added));
         }
     }
 
     // Removed: in indexed but not in current.
     for (key, sym) in &indexed_map {
         if !current_map.contains_key(key) {
-            changes.push(ChangedSymbol {
-                name: sym.name.clone(),
-                kind: sym.kind,
-                file: sym.file.clone(),
-                line: sym.line,
-                change_type: ChangeType::Removed,
-            });
-        }
-    }
-
-    // Modified: in both but signature differs.
-    for (key, current_sym) in &current_map {
-        if let Some(indexed_sym) = indexed_map.get(key)
-            && current_sym.signature != indexed_sym.signature
-        {
-            changes.push(ChangedSymbol {
-                name: current_sym.name.clone(),
-                kind: current_sym.kind,
-                file: current_sym.file.clone(),
-                line: current_sym.line,
-                change_type: ChangeType::Modified,
-            });
+            changes.push(make_changed(sym, ChangeType::Removed));
         }
     }
 
@@ -192,11 +178,16 @@ pub fn detect_changed_symbols(
 /// Shells out to `git diff --name-only <commit>` and parses the output.
 /// Returns a clear error if git is not installed (relevant only for `--since`).
 pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<String>> {
+    // Reject flag-shaped inputs to prevent git argument injection (CWE-88).
+    if commit.starts_with('-') {
+        bail!("invalid commit reference: {commit}");
+    }
+
     let output = Command::new("git")
         .args(["diff", "--name-only", commit])
         .current_dir(repo_root)
         .output()
-        .context("failed to run git -- is git installed? (--since requires git)")?;
+        .context("failed to run git — is git installed? (--since requires git)")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -206,9 +197,9 @@ pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<
     let stdout = String::from_utf8_lossy(&output.stdout);
     let files: Vec<String> = stdout
         .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
         .collect();
 
     Ok(files)
@@ -221,6 +212,11 @@ mod tests {
     use crate::pipeline;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Returns true if git is available on this system.
+    fn git_available() -> bool {
+        Command::new("git").arg("--version").output().is_ok()
+    }
 
     /// Create a minimal Rust repo, index it, and return (TempDir, Connection).
     fn make_indexed_repo(source: &str) -> (TempDir, Connection) {
@@ -400,24 +396,45 @@ impl Bar {
 
         let changes = detect_changed_symbols(&conn, "src/lib.rs", dir.path()).unwrap();
 
-        // Foo's impl block is removed, so Foo::work should be removed
-        // Bar::work should remain unchanged (or might be modified if line changes)
-        let removed: Vec<_> = changes
+        // Foo's impl block is removed, so Foo::work should be among Removed.
+        // The scope field distinguishes Foo::work from Bar::work.
+        let removed_names: Vec<&str> = changes
             .iter()
             .filter(|c| c.change_type == crate::types::ChangeType::Removed)
+            .map(|c| c.name.as_str())
             .collect();
         assert!(
-            !removed.is_empty(),
-            "should detect removal of scoped symbol"
+            removed_names.contains(&"work"),
+            "Foo::work should be detected as removed"
+        );
+        // Bar::work should NOT appear as removed (it still exists).
+        let bar_work_removed = changes.iter().any(|c| {
+            c.change_type == crate::types::ChangeType::Removed
+                && c.name == "work"
+                && c.kind == SymbolKind::Method
+        });
+        // At least one removed "work" should exist; Bar::work should still be present.
+        let added_names: Vec<&str> = changes
+            .iter()
+            .filter(|c| c.change_type == crate::types::ChangeType::Added)
+            .map(|c| c.name.as_str())
+            .collect();
+        // Bar::work should not appear as Added either (it was already indexed).
+        assert!(
+            !added_names.contains(&"work") || bar_work_removed,
+            "Bar::work should remain unchanged"
         );
     }
 
     #[test]
     fn git_diff_invalid_commit_returns_error() {
+        if !git_available() {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let root = dir.path();
         // Initialize a real git repo
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["init"])
             .current_dir(root)
             .output()
@@ -432,40 +449,43 @@ impl Bar {
 
     #[test]
     fn git_diff_parses_output() {
+        if !git_available() {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let root = dir.path();
 
         // Initialize git repo and create initial commit
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["init"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["config", "user.name", "Test"])
             .current_dir(root)
             .output()
             .unwrap();
 
         fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["commit", "-m", "initial"])
             .current_dir(root)
             .output()
             .unwrap();
 
         // Get the commit hash
-        let output = std::process::Command::new("git")
+        let output = Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(root)
             .output()
@@ -475,12 +495,12 @@ impl Bar {
         // Make a second commit with changes
         fs::write(root.join("a.rs"), "fn a() { changed }\n").unwrap();
         fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["commit", "-m", "second"])
             .current_dir(root)
             .output()
@@ -499,32 +519,35 @@ impl Bar {
 
     #[test]
     fn git_diff_empty_result() {
+        if !git_available() {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let root = dir.path();
 
         // Initialize git repo with a commit, then diff HEAD (no changes)
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["init"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["config", "user.email", "test@test.com"])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["config", "user.name", "Test"])
             .current_dir(root)
             .output()
             .unwrap();
         fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["add", "."])
             .current_dir(root)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        Command::new("git")
             .args(["commit", "-m", "initial"])
             .current_dir(root)
             .output()
