@@ -655,10 +655,9 @@ impl<W: Write> Formatter<W> {
     /// In grep mode, callers should use [`print_cluster_header`] for the
     /// header and [`format_cluster_member`] for each representative.
     pub fn format_cluster(&mut self, cluster: &ClusterOutput) -> std::io::Result<BudgetStatus> {
-        debug_assert!(
-            self.format.is_structured(),
-            "format_cluster is for structured modes only; use format_cluster_member for grep"
-        );
+        if !self.format.is_structured() {
+            return Ok(BudgetStatus::Written);
+        }
         if !self.has_budget() {
             let line = Self::serialize_structured(self.format, cluster)?;
             writeln!(self.writer, "{line}")?;

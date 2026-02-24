@@ -30,7 +30,7 @@
 | M10 | Semantic Search (`wonk ask`) | 3 | Complete |
 | M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
 | M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
-| M13 | Semantic Clustering (`wonk cluster`) | 2 | In Progress |
+| M13 | Semantic Clustering (`wonk cluster`) | 2 | Complete |
 | M14 | Change Impact Analysis (`wonk impact`) | 2 | Not Started |
 
 ### Dependency Graph
@@ -2130,7 +2130,7 @@ Implement the `wonk cluster <path>` CLI command that displays semantic clusters 
 **Related Requirements:** PRD-SCLST-REQ-001, PRD-SCLST-REQ-002, PRD-SCLST-REQ-003
 **Related Decisions:** DR-011
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
