@@ -11,6 +11,7 @@ use linfa_clustering::KMeans;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rayon::prelude::*;
 use rusqlite::Connection;
 
 use crate::errors::EmbeddingError;
@@ -21,6 +22,11 @@ const ABSOLUTE_MAX_K: usize = 20;
 
 /// Number of representative symbols to select per cluster (closest to centroid).
 const NUM_REPRESENTATIVES: usize = 5;
+
+/// Maximum number of points to evaluate in silhouette scoring.
+/// When n exceeds this, a deterministic subsample is used to keep
+/// the O(n²) silhouette computation tractable.
+const SILHOUETTE_SAMPLE_CAP: usize = 1000;
 
 /// Compute the Euclidean distance between two f32 slices.
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
@@ -46,62 +52,69 @@ pub fn silhouette_score(data: &Array2<f32>, assignments: &[usize], k: usize) -> 
         return 0.0;
     }
 
-    let mut total = 0.0_f32;
-    for i in 0..n {
-        let my_cluster = assignments[i];
-        let point_i = data.row(i);
+    // For large n, subsample to keep the O(n²) silhouette tractable.
+    // Uses a deterministic stride-based sample to preserve cluster proportions.
+    let indices: Vec<usize> = if n > SILHOUETTE_SAMPLE_CAP {
+        let step = n / SILHOUETTE_SAMPLE_CAP;
+        (0..n).step_by(step).take(SILHOUETTE_SAMPLE_CAP).collect()
+    } else {
+        (0..n).collect()
+    };
 
-        // Compute average distance to same-cluster points (a)
-        // and average distance to each other cluster (to find b)
-        let mut same_sum = 0.0_f32;
-        let mut same_count = 0_usize;
-        let mut other_sums = vec![0.0_f32; k];
-        let mut other_counts = vec![0_usize; k];
+    let sample_n = indices.len();
+    let dim = data.ncols();
+    let raw = data.as_slice().expect("data matrix must be contiguous");
 
-        for j in 0..n {
-            if i == j {
-                continue;
+    // Parallelize the outer loop with rayon — each point's silhouette is independent.
+    let total: f32 = indices
+        .par_iter()
+        .map(|&i| {
+            let my_cluster = assignments[i];
+            let row_i = &raw[i * dim..(i + 1) * dim];
+
+            let mut same_sum = 0.0_f32;
+            let mut same_count = 0_usize;
+            let mut other_sums = vec![0.0_f32; k];
+            let mut other_counts = vec![0_usize; k];
+
+            // Compare against all sampled points.
+            for &j in &indices {
+                if i == j {
+                    continue;
+                }
+                let row_j = &raw[j * dim..(j + 1) * dim];
+                let dist = euclidean_distance(row_i, row_j);
+                if assignments[j] == my_cluster {
+                    same_sum += dist;
+                    same_count += 1;
+                } else {
+                    other_sums[assignments[j]] += dist;
+                    other_counts[assignments[j]] += 1;
+                }
             }
-            let dist =
-                euclidean_distance(point_i.as_slice().unwrap(), data.row(j).as_slice().unwrap());
-            if assignments[j] == my_cluster {
-                same_sum += dist;
-                same_count += 1;
-            } else {
-                other_sums[assignments[j]] += dist;
-                other_counts[assignments[j]] += 1;
+
+            // Singleton cluster: score is 0 by convention.
+            if same_count == 0 {
+                return 0.0;
             }
-        }
 
-        // Singleton cluster: score is 0 by convention
-        if same_count == 0 {
-            continue;
-        }
+            let a = same_sum / same_count as f32;
 
-        let a = same_sum / same_count as f32;
+            // Find nearest other cluster.
+            let b = (0..k)
+                .filter(|&c| c != my_cluster && other_counts[c] > 0)
+                .map(|c| other_sums[c] / other_counts[c] as f32)
+                .fold(f32::INFINITY, f32::min);
 
-        // Find nearest other cluster
-        let mut b = f32::INFINITY;
-        for c in 0..k {
-            if c == my_cluster || other_counts[c] == 0 {
-                continue;
+            if b.is_infinite() {
+                return 0.0;
             }
-            let avg = other_sums[c] / other_counts[c] as f32;
-            if avg < b {
-                b = avg;
-            }
-        }
 
-        if b.is_infinite() {
-            // Only one cluster has points -- shouldn't happen with k >= 2
-            continue;
-        }
+            (b - a) / a.max(b)
+        })
+        .sum();
 
-        let s = (b - a) / a.max(b);
-        total += s;
-    }
-
-    total / n as f32
+    total / sample_n as f32
 }
 
 /// Sort cluster members by ascending distance to centroid.
@@ -269,42 +282,35 @@ pub fn cluster_embeddings(embeddings: &[(i64, Vec<f32>)], max_k: usize) -> Vec<C
 
     let dataset = linfa::DatasetBase::from(data.clone());
 
-    let mut best_k = 2;
-    let mut best_score = f32::NEG_INFINITY;
-    let mut best_assignments: Option<Vec<usize>> = None;
-    let mut best_centroids: Option<Array2<f32>> = None;
-
+    // Clone so each k value starts from the same seed for reproducibility.
     let rng = StdRng::seed_from_u64(42);
 
-    for k in 2..=effective_max_k {
-        let model = match KMeans::params_with_rng(k, rng.clone())
-            .tolerance(1e-4)
-            .max_n_iterations(100)
-            .n_runs(3)
-            .fit(&dataset)
-        {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+    // Parallelize the k-sweep: each iteration independently fits K-Means
+    // and computes a silhouette score on the shared read-only dataset.
+    let best = (2..=effective_max_k)
+        .into_par_iter()
+        .filter_map(|k| {
+            let model = KMeans::params_with_rng(k, rng.clone())
+                .tolerance(1e-4)
+                .max_n_iterations(100)
+                .n_runs(3)
+                .fit(&dataset)
+                .ok()?;
 
-        let predictions = model.predict(&dataset);
-        let assignments: Vec<usize> = predictions.as_targets().to_vec();
+            let predictions = model.predict(&dataset);
+            let assignments: Vec<usize> = predictions.as_targets().to_vec();
 
-        let score = silhouette_score(&data, &assignments, k);
+            let score = silhouette_score(&data, &assignments, k);
 
-        if score > best_score {
-            best_score = score;
-            best_k = k;
-            best_assignments = Some(assignments);
-            best_centroids = Some(model.centroids().clone());
+            Some((score, k, assignments, model.centroids().clone()))
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    match best {
+        Some((_score, k, assignments, centroids)) => {
+            build_clusters(embeddings, &assignments, &centroids, k)
         }
-    }
-
-    match (best_assignments, best_centroids) {
-        (Some(assignments), Some(centroids)) => {
-            build_clusters(embeddings, &assignments, &centroids, best_k)
-        }
-        _ => make_single_cluster(embeddings),
+        None => make_single_cluster(embeddings),
     }
 }
 
@@ -737,8 +743,8 @@ mod tests {
     #[test]
     #[cfg(not(debug_assertions))]
     fn cluster_5000_symbols_performance() {
-        // 5000 embeddings of dimension 128, arranged in ~5 groups
-        let dim = 128;
+        // 5000 embeddings of dimension 768 (nomic-embed-text), arranged in ~5 groups
+        let dim = 768;
         let n = 5000;
         let mut embeddings = Vec::with_capacity(n);
         let group_size = n / 5;
