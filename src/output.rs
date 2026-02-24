@@ -709,6 +709,20 @@ impl<W: Write> Formatter<W> {
         self.budgeted_write(move |fmt| Self::render_impact_entry(fmt, &entry))
     }
 
+    /// Format a full impact group (changed symbol + impacted entries) for structured output.
+    pub fn format_impact(&mut self, out: &ImpactOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            let line = Self::serialize_structured(self.format, out)?;
+            writeln!(self.writer, "{line}")?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| {
+            let line = Self::serialize_structured(fmt.format, &out)?;
+            writeln!(fmt.writer, "{line}")
+        })
+    }
+
     /// Shared render logic for an impact entry.
     fn render_impact_entry<W2: Write>(
         fmt: &mut Formatter<W2>,
@@ -725,7 +739,7 @@ impl<W: Write> Formatter<W> {
             fmt.write_sep()?;
             writeln!(
                 fmt.writer,
-                "  {} ({}) [{:.2}]",
+                "  {} ({}) [{:.4}]",
                 entry.symbol_name, entry.symbol_kind, entry.similarity_score
             )
         }
@@ -2160,7 +2174,7 @@ mod tests {
         assert!(out.contains(":8:"));
         assert!(out.contains("validateSession"));
         assert!(out.contains("(function)"));
-        assert!(out.contains("[0.89]"));
+        assert!(out.contains("[0.8900]"));
     }
 
     #[test]

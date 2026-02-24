@@ -845,10 +845,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         .unwrap_or_else(|_| PathBuf::from("."))
                         .join(&args.file)
                 };
-                let rel = abs
-                    .strip_prefix(&repo_root)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| args.file.clone());
+                let rel = match abs.strip_prefix(&repo_root) {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    Err(_) => {
+                        output::print_error(&format!(
+                            "file is outside the repository root: {}",
+                            args.file
+                        ));
+                        return Ok(());
+                    }
+                };
                 vec![rel]
             };
 
@@ -857,23 +863,31 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
+            // Load all embeddings once (shared across files for --since).
+            let all_embeddings = crate::embedding::load_all_embeddings(&conn)?;
+            if all_embeddings.is_empty() {
+                output::print_error(
+                    "no embeddings found in the index; \
+                     run `wonk init` with Ollama running to build embeddings",
+                );
+                return Ok(());
+            }
+
             let client = crate::embedding::OllamaClient::new();
 
             // Aggregate results across all files.
             let mut all_results = Vec::new();
             for file in &files {
-                match crate::impact::analyze_impact(&conn, file, &repo_root, &client) {
+                match crate::impact::analyze_impact(
+                    &conn,
+                    file,
+                    &repo_root,
+                    &client,
+                    &all_embeddings,
+                ) {
                     Ok(results) => all_results.extend(results),
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        if msg.contains("no embeddings") {
-                            output::print_error(&msg);
-                            output::print_hint(
-                                "run `wonk init` with Ollama running to build embeddings",
-                                suppress,
-                            );
-                            return Ok(());
-                        }
                         if msg.contains("unsupported language") {
                             // Skip files we can't parse (e.g. .md, .json).
                             continue;
@@ -883,7 +897,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
 
-            // Sort by descending similarity.
+            // Re-sort after merging results across multiple files
+            // (--since may produce results from several analyze_impact calls).
             all_results.sort_by(|a, b| {
                 b.similarity_score
                     .partial_cmp(&a.similarity_score)
@@ -895,63 +910,72 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
-            // Output results.
+            // Helper: build grouping key for a changed symbol.
+            let changed_key = |r: &crate::types::ImpactResult| {
+                format!(
+                    "{}:{}:{}:{}",
+                    r.changed_symbol.file,
+                    r.changed_symbol.line,
+                    r.changed_symbol.name,
+                    r.changed_symbol.kind
+                )
+            };
+
+            // Helper: convert SymbolRef to output struct.
+            let to_symbol_output = |s: &crate::types::SymbolRef| output::ImpactSymbolOutput {
+                name: s.name.clone(),
+                kind: s.kind.to_string(),
+                file: s.file.clone(),
+                line: s.line,
+            };
+
+            let to_entry_output = |r: &crate::types::ImpactResult| output::ImpactEntryOutput {
+                file: r.impacted_symbol.file.clone(),
+                line: r.impacted_symbol.line,
+                symbol_name: r.impacted_symbol.name.clone(),
+                symbol_kind: r.impacted_symbol.kind.to_string(),
+                similarity_score: r.similarity_score,
+            };
+
+            // Output results — route through Formatter for budget + TOON support.
+            let mut truncated = 0usize;
+
             if format.is_structured() {
-                // JSON mode: group by changed symbol.
-                let mut groups: std::collections::BTreeMap<
+                // Structured mode: group by changed symbol, emit via Formatter.
+                let mut groups: Vec<(
                     String,
-                    (output::ImpactSymbolOutput, Vec<output::ImpactEntryOutput>),
-                > = std::collections::BTreeMap::new();
+                    output::ImpactSymbolOutput,
+                    Vec<output::ImpactEntryOutput>,
+                )> = Vec::new();
 
                 for r in &all_results {
-                    let key = format!(
-                        "{}:{}:{}:{}",
-                        r.changed_symbol.file,
-                        r.changed_symbol.line,
-                        r.changed_symbol.name,
-                        r.changed_symbol.kind
-                    );
-                    let entry = groups.entry(key).or_insert_with(|| {
-                        (
-                            output::ImpactSymbolOutput {
-                                name: r.changed_symbol.name.clone(),
-                                kind: r.changed_symbol.kind.to_string(),
-                                file: r.changed_symbol.file.clone(),
-                                line: r.changed_symbol.line,
-                            },
-                            Vec::new(),
-                        )
-                    });
-                    entry.1.push(output::ImpactEntryOutput {
-                        file: r.impacted_symbol.file.clone(),
-                        line: r.impacted_symbol.line,
-                        symbol_name: r.impacted_symbol.name.clone(),
-                        symbol_kind: r.impacted_symbol.kind.to_string(),
-                        similarity_score: r.similarity_score,
-                    });
+                    let key = changed_key(r);
+                    if groups.last().is_some_and(|(k, _, _)| k == &key) {
+                        groups.last_mut().unwrap().2.push(to_entry_output(r));
+                    } else {
+                        groups.push((
+                            key,
+                            to_symbol_output(&r.changed_symbol),
+                            vec![to_entry_output(r)],
+                        ));
+                    }
                 }
 
-                for (_, (changed, impacted)) in groups {
+                for (_, changed, impacted) in groups {
                     let out = output::ImpactOutput {
                         changed_symbol: changed,
                         impacted,
                     };
-                    let line = serde_json::to_string(&out).map_err(io::Error::other)?;
-                    writeln!(fmt.writer_mut(), "{line}")?;
+                    if fmt.format_impact(&out)? == BudgetStatus::Skipped {
+                        truncated += 1;
+                    }
                 }
             } else {
                 // Grep mode: group by changed symbol, print header + entries.
                 let mut current_key = String::new();
-                let mut truncated = 0usize;
 
                 for r in &all_results {
-                    let key = format!(
-                        "{}:{}:{}:{}",
-                        r.changed_symbol.file,
-                        r.changed_symbol.line,
-                        r.changed_symbol.name,
-                        r.changed_symbol.kind
-                    );
+                    let key = changed_key(r);
                     if key != current_key {
                         output::print_impact_header(
                             &r.changed_symbol.name,
@@ -962,20 +986,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         );
                         current_key = key;
                     }
-                    let entry = output::ImpactEntryOutput {
-                        file: r.impacted_symbol.file.clone(),
-                        line: r.impacted_symbol.line,
-                        symbol_name: r.impacted_symbol.name.clone(),
-                        symbol_kind: r.impacted_symbol.kind.to_string(),
-                        similarity_score: r.similarity_score,
-                    };
+                    let entry = to_entry_output(r);
                     if fmt.format_impact_entry(&entry)? == BudgetStatus::Skipped {
                         truncated += 1;
                     }
                 }
-
-                emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
             }
+
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
     }
     Ok(())

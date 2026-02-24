@@ -88,13 +88,7 @@ pub fn detect_changed_symbols(
     file: &str,
     repo_root: &Path,
 ) -> Result<Vec<ChangedSymbol>> {
-    // Guard against path traversal: reject `..` components before any filesystem access.
-    if Path::new(file)
-        .components()
-        .any(|c| c == std::path::Component::ParentDir)
-    {
-        bail!("path escapes repository root: {file}");
-    }
+    validate_file_path(file)?;
 
     let abs_path = repo_root.join(file);
 
@@ -125,19 +119,7 @@ pub fn detect_changed_symbols(
         return Ok(Vec::new());
     }
 
-    // Detect language.
-    let lang = match indexer::detect_language(Path::new(file)) {
-        Some(l) => l,
-        None => bail!("unsupported language for file: {file}"),
-    };
-
-    // Parse with Tree-sitter.
-    let mut parser = indexer::get_parser(lang);
-    let tree = parser
-        .parse(content_str.as_bytes(), None)
-        .context("tree-sitter parse failed")?;
-
-    let current_symbols = indexer::extract_symbols(&tree, &content_str, file, lang);
+    let current_symbols = parse_file_to_symbols(file, &content_str)?;
 
     // If file not in index at all, all current symbols are Added.
     let indexed_symbols = query_indexed_symbols(conn, file)?;
@@ -214,15 +196,10 @@ pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<
     Ok(files)
 }
 
-/// Re-parse a file from disk to get full [`Symbol`] structs (with `end_line`).
+/// Parse file content with Tree-sitter and return extracted symbols.
 ///
-/// This is needed because `detect_changed_symbols` only returns [`ChangedSymbol`]
-/// which lacks `end_line`, `signature`, and other fields needed for embedding.
-pub fn parse_current_symbols(file: &str, repo_root: &Path) -> Result<Vec<Symbol>> {
-    let abs_path = repo_root.join(file);
-    let content =
-        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
-
+/// Shared helper for both [`detect_changed_symbols`] and [`parse_current_symbols`].
+fn parse_file_to_symbols(file: &str, content: &str) -> Result<Vec<Symbol>> {
     let lang = match indexer::detect_language(Path::new(file)) {
         Some(l) => l,
         None => bail!("unsupported language for file: {file}"),
@@ -233,7 +210,36 @@ pub fn parse_current_symbols(file: &str, repo_root: &Path) -> Result<Vec<Symbol>
         .parse(content.as_bytes(), None)
         .context("tree-sitter parse failed")?;
 
-    Ok(indexer::extract_symbols(&tree, &content, file, lang))
+    Ok(indexer::extract_symbols(&tree, content, file, lang))
+}
+
+/// Validate that a file path is safe: no `..` components and no absolute paths.
+fn validate_file_path(file: &str) -> Result<()> {
+    let path = Path::new(file);
+    if path.is_absolute() {
+        bail!("absolute path not allowed: {file}");
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        bail!("path escapes repository root: {file}");
+    }
+    Ok(())
+}
+
+/// Re-parse a file from disk to get full [`Symbol`] structs (with `end_line`).
+///
+/// This is needed because `detect_changed_symbols` only returns [`ChangedSymbol`]
+/// which lacks `end_line`, `signature`, and other fields needed for embedding.
+pub fn parse_current_symbols(file: &str, repo_root: &Path) -> Result<Vec<Symbol>> {
+    validate_file_path(file)?;
+
+    let abs_path = repo_root.join(file);
+    let content =
+        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
+
+    parse_file_to_symbols(file, &content)
 }
 
 /// Build [`ImpactResult`] entries from semantic search results, excluding
@@ -291,14 +297,20 @@ fn query_self_symbol_ids(
 /// Detects changed symbols, embeds each one, and finds semantically similar
 /// symbols in the index. Returns results sorted by descending similarity.
 ///
+/// `all_embeddings` should be pre-loaded via [`embedding::load_all_embeddings`]
+/// and shared across multiple calls (e.g. `--since` mode) to avoid redundant
+/// SQLite I/O.
+///
 /// Returns an empty `Vec` if the file has no changes.
-/// Returns an error if no embeddings exist in the index.
 pub fn analyze_impact(
     conn: &Connection,
     file: &str,
     repo_root: &Path,
     client: &embedding::OllamaClient,
+    all_embeddings: &[(i64, Vec<f32>)],
 ) -> Result<Vec<ImpactResult>> {
+    validate_file_path(file)?;
+
     // Step 1: Detect changed symbols.
     let changes = detect_changed_symbols(conn, file, repo_root)?;
     if changes.is_empty() {
@@ -315,17 +327,18 @@ pub fn analyze_impact(
         return Ok(Vec::new());
     }
 
-    // Step 3: Load all stored embeddings.
-    let all_embeddings = embedding::load_all_embeddings(conn)?;
+    // Step 3: Nothing to compare against if no embeddings were provided.
     if all_embeddings.is_empty() {
-        bail!(
-            "no embeddings found in the index; \
-             run `wonk init` with Ollama running to build embeddings"
-        );
+        return Ok(Vec::new());
     }
 
-    // Step 4: Re-parse the file from disk to get full Symbol structs.
-    let current_symbols = parse_current_symbols(file, repo_root)?;
+    // Step 4: Read file content once (shared for parsing + chunking).
+    let abs_path = repo_root.join(file);
+    let source_code =
+        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
+
+    // Step 4: Parse to get full Symbol structs (with end_line for chunking).
+    let current_symbols = parse_file_to_symbols(file, &source_code)?;
 
     // Build a lookup map from (name, kind) to full Symbol for chunking.
     let sym_map: HashMap<(String, SymbolKind), &Symbol> = current_symbols
@@ -334,6 +347,7 @@ pub fn analyze_impact(
         .collect();
 
     // Step 5: Load file imports for chunk context.
+    // Imports are optional context for embedding; silently skip on DB error.
     let file_imports = conn
         .prepare("SELECT import_path FROM file_imports WHERE source_file = ?1")
         .and_then(|mut stmt| {
@@ -341,11 +355,6 @@ pub fn analyze_impact(
             rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
-
-    // Read file content for chunking.
-    let abs_path = repo_root.join(file);
-    let source_code =
-        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
 
     // Step 6: For each changed symbol, embed and search.
     let mut all_results = Vec::new();
@@ -367,7 +376,7 @@ pub fn analyze_impact(
         embedding::normalize(&mut query_vec);
 
         // Semantic search (limit to 20 results per changed symbol).
-        let scored = semantic::semantic_search(&query_vec, &all_embeddings, 20);
+        let scored = semantic::semantic_search(&query_vec, all_embeddings, 20);
         let resolved = semantic::resolve_results(conn, &scored)?;
 
         // Self-exclusion: find IDs of the changed symbol itself.
@@ -387,13 +396,12 @@ pub fn analyze_impact(
     // Deduplicate: keep only the highest-scoring entry per impacted symbol.
     let mut seen = HashSet::new();
     all_results.retain(|r| {
-        let key = (
+        seen.insert((
             r.impacted_symbol.name.clone(),
             r.impacted_symbol.kind,
             r.impacted_symbol.file.clone(),
             r.impacted_symbol.line,
-        );
-        seen.insert(key)
+        ))
     });
 
     Ok(all_results)
@@ -889,7 +897,7 @@ impl Bar {
     // -- analyze_impact with no embeddings returns error -----------------------
 
     #[test]
-    fn analyze_impact_no_embeddings_returns_error() {
+    fn analyze_impact_empty_embeddings_returns_empty() {
         let source = "fn hello() { }\n";
         let (dir, conn) = make_indexed_repo(source);
 
@@ -899,13 +907,11 @@ impl Bar {
         // Dead-port client
         let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
 
-        let result = analyze_impact(&conn, "src/lib.rs", dir.path(), &client);
-        assert!(result.is_err(), "should error when no embeddings exist");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("no embeddings") || err_msg.contains("embedding"),
-            "error should mention embeddings: {err_msg}"
-        );
+        // Pass empty embeddings — should return empty (no embeddings to compare against)
+        let all_embeddings = Vec::new();
+        let results =
+            analyze_impact(&conn, "src/lib.rs", dir.path(), &client, &all_embeddings).unwrap();
+        assert!(results.is_empty(), "empty embeddings should return empty");
     }
 
     // -- analyze_impact with unchanged file returns empty ----------------------
@@ -918,11 +924,27 @@ impl Bar {
         // File unchanged, no client needed
         let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
 
-        let results = analyze_impact(&conn, "src/lib.rs", dir.path(), &client).unwrap();
+        let all_embeddings = Vec::new();
+        let results =
+            analyze_impact(&conn, "src/lib.rs", dir.path(), &client, &all_embeddings).unwrap();
         assert!(
             results.is_empty(),
             "unchanged file should produce no impact results"
         );
+    }
+
+    #[test]
+    fn parse_current_symbols_rejects_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let result = parse_current_symbols("../../etc/passwd", dir.path());
+        assert!(result.is_err(), "path with .. should be rejected");
+    }
+
+    #[test]
+    fn parse_current_symbols_rejects_absolute_path() {
+        let dir = TempDir::new().unwrap();
+        let result = parse_current_symbols("/etc/passwd", dir.path());
+        assert!(result.is_err(), "absolute path should be rejected");
     }
 
     #[test]
