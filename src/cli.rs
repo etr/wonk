@@ -200,10 +200,10 @@ pub enum ReposCommand {
 pub struct AskArgs {
     /// The semantic search query
     pub query: String,
-    /// Restrict results to symbols reachable from this file (not yet implemented)
+    /// Restrict results to symbols reachable from this file (dependency scoping)
     #[arg(long)]
     pub from: Option<String>,
-    /// Restrict results to symbols that can reach this file (not yet implemented)
+    /// Restrict results to symbols that can reach this file (reverse dependency scoping)
     #[arg(long)]
     pub to: Option<String>,
 }

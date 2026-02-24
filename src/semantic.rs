@@ -298,6 +298,28 @@ pub fn reachable_to(conn: &Connection, file: &str) -> Result<HashSet<String>, Db
     Ok(bfs(file, &reverse))
 }
 
+/// Compute the set of files to restrict semantic results to, based on
+/// `--from` and `--to` flags.
+///
+/// Returns `None` when neither flag is specified (no filtering).
+/// When both are specified, returns the intersection of the two reachable sets.
+pub fn compute_reachable_files(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Option<HashSet<String>>, DbError> {
+    match (from, to) {
+        (None, None) => Ok(None),
+        (Some(f), None) => Ok(Some(reachable_from(conn, f)?)),
+        (None, Some(t)) => Ok(Some(reachable_to(conn, t)?)),
+        (Some(f), Some(t)) => {
+            let from_set = reachable_from(conn, f)?;
+            let to_set = reachable_to(conn, t)?;
+            Ok(Some(from_set.intersection(&to_set).cloned().collect()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,5 +842,180 @@ mod tests {
         assert!(result.contains("src/main.ts"));
         assert!(result.contains("src/utils.ts"));
         assert!(result.contains("src/helpers.ts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_reachable_files tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_reachable_files_none_when_no_flags() {
+        let conn = setup_dep_test_db();
+        let result = compute_reachable_files(&conn, None, None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_compute_reachable_files_from_only() {
+        // A imports B, B imports C => from A gives {A, B, C}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/b.ts", "./c");
+
+        let result = compute_reachable_files(&conn, Some("src/a.ts"), None).unwrap();
+        let files = result.unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files.contains("src/a.ts"));
+        assert!(files.contains("src/b.ts"));
+        assert!(files.contains("src/c.ts"));
+    }
+
+    #[test]
+    fn test_compute_reachable_files_to_only() {
+        // A imports B, C imports B => to B gives {A, B, C}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/c.ts", "./b");
+
+        let result = compute_reachable_files(&conn, None, Some("src/b.ts")).unwrap();
+        let files = result.unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files.contains("src/a.ts"));
+        assert!(files.contains("src/b.ts"));
+        assert!(files.contains("src/c.ts"));
+    }
+
+    #[test]
+    fn test_compute_reachable_files_both_intersect() {
+        // A -> B -> C -> D
+        // from A = {A, B, C, D}, to D = {A, B, C, D} => intersection = {A, B, C, D}
+        // from B = {B, C, D}, to C = {A, B, C} => intersection = {B, C}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_file(&conn, "src/d.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/b.ts", "./c");
+        insert_import(&conn, "src/c.ts", "./d");
+
+        let result = compute_reachable_files(&conn, Some("src/b.ts"), Some("src/c.ts")).unwrap();
+        let files = result.unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.contains("src/b.ts"));
+        assert!(files.contains("src/c.ts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: compute_reachable_files + load_embeddings_for_files
+    // -----------------------------------------------------------------------
+
+    fn setup_full_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (
+                path TEXT PRIMARY KEY, language TEXT, hash TEXT NOT NULL,
+                last_indexed INTEGER NOT NULL, line_count INTEGER, symbols_count INTEGER
+            );
+            CREATE TABLE file_imports (
+                id INTEGER PRIMARY KEY, source_file TEXT NOT NULL, import_path TEXT NOT NULL
+            );
+            CREATE TABLE symbols (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+                file TEXT NOT NULL, line INTEGER NOT NULL, col INTEGER NOT NULL,
+                end_line INTEGER, scope TEXT, signature TEXT, language TEXT NOT NULL
+            );
+            CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY, symbol_id INTEGER NOT NULL REFERENCES symbols(id),
+                file TEXT NOT NULL, chunk_text TEXT NOT NULL, vector BLOB NOT NULL,
+                stale INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                UNIQUE(symbol_id)
+            );
+            CREATE INDEX idx_embeddings_file ON embeddings(file);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_symbol_with_embedding(conn: &Connection, id: i64, file: &str) {
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) \
+             VALUES (?1, ?2, 'function', ?3, 1, 0, 'ts')",
+            rusqlite::params![id, format!("fn_{}", id), file],
+        )
+        .unwrap();
+        let vec_bytes: Vec<u8> = bytemuck::cast_slice(&[id as f32]).to_vec();
+        conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, created_at) \
+             VALUES (?1, ?2, 'chunk', ?3, 1000)",
+            rusqlite::params![id, file, vec_bytes],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_from_flag_filters_embeddings_to_reachable_files() {
+        let conn = setup_full_db();
+        // A -> B -> C, D is isolated
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_file(&conn, "src/d.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/b.ts", "./c");
+
+        insert_symbol_with_embedding(&conn, 1, "src/a.ts");
+        insert_symbol_with_embedding(&conn, 2, "src/b.ts");
+        insert_symbol_with_embedding(&conn, 3, "src/c.ts");
+        insert_symbol_with_embedding(&conn, 4, "src/d.ts");
+
+        // --from src/a.ts should only include a, b, c (not d)
+        let reachable = compute_reachable_files(&conn, Some("src/a.ts"), None)
+            .unwrap()
+            .unwrap();
+        let embeddings = crate::embedding::load_embeddings_for_files(&conn, &reachable).unwrap();
+
+        assert_eq!(embeddings.len(), 3);
+        let ids: HashSet<i64> = embeddings.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+        assert!(!ids.contains(&4));
+    }
+
+    #[test]
+    fn test_to_flag_filters_embeddings_to_reverse_reachable() {
+        let conn = setup_full_db();
+        // A -> B, C -> B, D is isolated
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_file(&conn, "src/d.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/c.ts", "./b");
+
+        insert_symbol_with_embedding(&conn, 1, "src/a.ts");
+        insert_symbol_with_embedding(&conn, 2, "src/b.ts");
+        insert_symbol_with_embedding(&conn, 3, "src/c.ts");
+        insert_symbol_with_embedding(&conn, 4, "src/d.ts");
+
+        // --to src/b.ts should include a, b, c (not d)
+        let reachable = compute_reachable_files(&conn, None, Some("src/b.ts"))
+            .unwrap()
+            .unwrap();
+        let embeddings = crate::embedding::load_embeddings_for_files(&conn, &reachable).unwrap();
+
+        assert_eq!(embeddings.len(), 3);
+        let ids: HashSet<i64> = embeddings.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+        assert!(!ids.contains(&4));
     }
 }

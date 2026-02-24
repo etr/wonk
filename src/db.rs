@@ -345,6 +345,16 @@ pub fn count_matching_symbols(conn: &Connection, pattern: &str) -> u64 {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Check whether a file path exists in the `files` table.
+pub fn file_exists_in_index(conn: &Connection, path: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE path = ?1",
+        [path],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 fn home_dir() -> Result<PathBuf> {
     // Try $HOME first.  We avoid the `dirs` crate to keep dependencies small.
     if let Ok(home) = std::env::var("HOME") {
@@ -992,5 +1002,30 @@ mod tests {
         // again should not fail.
         ensure_embeddings_table(&conn).unwrap();
         ensure_embeddings_table(&conn).unwrap();
+    }
+
+    // -- file_exists_in_index tests ------------------------------------------
+
+    #[test]
+    fn test_file_exists_in_index_found() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, language, hash, last_indexed) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["src/main.ts", "TypeScript", "abc123", 0],
+        )
+        .unwrap();
+
+        assert!(file_exists_in_index(&conn, "src/main.ts").unwrap());
+    }
+
+    #[test]
+    fn test_file_exists_in_index_not_found() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        assert!(!file_exists_in_index(&conn, "src/nonexistent.ts").unwrap());
     }
 }
