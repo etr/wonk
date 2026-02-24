@@ -171,6 +171,43 @@ pub struct Cluster {
     pub representative_symbols: Vec<ClusterMember>,
 }
 
+/// The kind of change detected for a symbol between the current file and the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChangeType {
+    /// Symbol exists in current file but not in the index.
+    Added,
+    /// Symbol exists in both but has a different signature.
+    Modified,
+    /// Symbol exists in the index but not in the current file.
+    Removed,
+}
+
+impl fmt::Display for ChangeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ChangeType::Added => "added",
+            ChangeType::Modified => "modified",
+            ChangeType::Removed => "removed",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// A symbol that changed between the current file on disk and the indexed version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedSymbol {
+    /// The symbol name.
+    pub name: String,
+    /// What kind of symbol this is.
+    pub kind: SymbolKind,
+    /// Path of the source file (relative to repo root).
+    pub file: String,
+    /// 1-based line number (current for Added/Modified, last indexed for Removed).
+    pub line: usize,
+    /// What kind of change was detected.
+    pub change_type: ChangeType,
+}
+
 /// A result from semantic (embedding-based) similarity search.
 ///
 /// Contains the matched symbol's metadata and its cosine similarity score
