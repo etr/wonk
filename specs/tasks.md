@@ -2040,7 +2040,7 @@ Wire `--from` and `--to` flags on `wonk ask` to filter semantic results by depen
 **Related Requirements:** PRD-SDEP-REQ-001, PRD-SDEP-REQ-002
 **Related Decisions:** DR-010
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
