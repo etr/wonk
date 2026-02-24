@@ -65,6 +65,9 @@ pub enum Command {
 
     /// Semantic search: find symbols related to a natural language query
     Ask(AskArgs),
+
+    /// Cluster symbols by semantic similarity within a directory
+    Cluster(ClusterArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -209,6 +212,15 @@ pub struct AskArgs {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct ClusterArgs {
+    /// Directory path to cluster symbols from
+    pub path: String,
+    /// Number of representative symbols to show per cluster (default: 5)
+    #[arg(long, default_value_t = 5)]
+    pub top: usize,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct McpArgs {
     #[command(subcommand)]
     pub command: McpCommand,
@@ -302,5 +314,47 @@ mod tests {
     fn parse_search_semantic_conflicts_with_raw() {
         let result = Cli::try_parse_from(["wonk", "search", "--semantic", "--raw", "pattern"]);
         assert!(result.is_err(), "--semantic and --raw should conflict");
+    }
+
+    #[test]
+    fn parse_cluster_basic() {
+        let cli = Cli::try_parse_from(["wonk", "cluster", "src/auth/"]).unwrap();
+        match cli.command {
+            Command::Cluster(args) => {
+                assert_eq!(args.path, "src/auth/");
+                assert_eq!(args.top, 5);
+            }
+            _ => panic!("expected Command::Cluster"),
+        }
+    }
+
+    #[test]
+    fn parse_cluster_with_top() {
+        let cli = Cli::try_parse_from(["wonk", "cluster", "--top", "10", "src/auth/"]).unwrap();
+        match cli.command {
+            Command::Cluster(args) => {
+                assert_eq!(args.path, "src/auth/");
+                assert_eq!(args.top, 10);
+            }
+            _ => panic!("expected Command::Cluster"),
+        }
+    }
+
+    #[test]
+    fn parse_cluster_requires_path() {
+        let result = Cli::try_parse_from(["wonk", "cluster"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_cluster_with_global_budget() {
+        let cli = Cli::try_parse_from(["wonk", "--budget", "500", "cluster", "src/auth/"]).unwrap();
+        assert_eq!(cli.budget, Some(500));
+        match cli.command {
+            Command::Cluster(args) => {
+                assert_eq!(args.path, "src/auth/");
+            }
+            _ => panic!("expected Command::Cluster"),
+        }
     }
 }

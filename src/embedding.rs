@@ -659,6 +659,50 @@ pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, Em
     Ok(results)
 }
 
+/// Load embedding vectors for symbols whose file path starts with a prefix.
+///
+/// Returns `(symbol_id, vector)` pairs, filtered at the SQL level using
+/// `WHERE file GLOB 'prefix*' AND NOT stale`.  GLOB is case-sensitive and
+/// allows SQLite to use the B-tree index on `embeddings(file)` for prefix
+/// patterns.  An empty prefix matches all non-stale embeddings.
+///
+/// Stale embeddings are excluded because clustering quality depends heavily
+/// on vector accuracy — unlike `wonk ask` which includes stale rows as a
+/// best-effort fallback.
+pub fn load_embeddings_for_path_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
+    // Escape GLOB metacharacters (*, ?, [) in user-supplied prefix so only the
+    // trailing `*` acts as a wildcard.
+    let escaped = prefix
+        .replace('[', "[[]")
+        .replace('*', "[*]")
+        .replace('?', "[?]");
+    let pattern = format!("{escaped}*");
+    let mut stmt = conn
+        .prepare("SELECT symbol_id, vector FROM embeddings WHERE file GLOB ?1 AND NOT stale")
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let rows = stmt
+        .query_map([&pattern], |row| {
+            let symbol_id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((symbol_id, blob))
+        })
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let mut results = Vec::new();
+    for r in rows {
+        let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+        let floats: &[f32] = bytemuck::try_cast_slice(&blob)
+            .map_err(|e| EmbeddingError::StorageFailed(format!("BLOB cast failed: {e}")))?;
+        results.push((symbol_id, floats.to_vec()));
+    }
+
+    Ok(results)
+}
+
 /// Load embedding vectors only for symbols belonging to the specified files.
 ///
 /// Returns `(symbol_id, vector)` pairs, filtered at the SQL level using
@@ -2431,5 +2475,96 @@ mod tests {
         let files: HashSet<String> = HashSet::new();
         let results = load_embeddings_for_files(&conn, &files).unwrap();
         assert!(results.is_empty());
+    }
+
+    // -- load_embeddings_for_path_prefix tests --------------------------------
+
+    fn insert_symbol_and_embedding_stale(
+        conn: &Connection,
+        sym_id: i64,
+        file: &str,
+        vec_bytes: &[u8],
+    ) {
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) \
+             VALUES (?1, ?2, 'function', ?3, 1, 0, 'rust')",
+            rusqlite::params![sym_id, format!("sym_{}", sym_id), file],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, stale, created_at) \
+             VALUES (?1, ?2, 'chunk', ?3, 1, 1000)",
+            rusqlite::params![sym_id, file, vec_bytes],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_load_embeddings_for_path_prefix_filters_correctly() {
+        let conn = setup_db_with_embeddings();
+        let vec_a: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        let vec_b: Vec<u8> = bytemuck::cast_slice(&[2.0_f32]).to_vec();
+        let vec_c: Vec<u8> = bytemuck::cast_slice(&[3.0_f32]).to_vec();
+
+        insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
+        insert_symbol_and_embedding(&conn, 2, "src/auth/session.ts", &vec_b);
+        insert_symbol_and_embedding(&conn, 3, "src/db/connection.ts", &vec_c);
+
+        let results = load_embeddings_for_path_prefix(&conn, "src/auth/").unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: HashSet<i64> = results.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert!(!ids.contains(&3));
+    }
+
+    #[test]
+    fn test_load_embeddings_for_path_prefix_empty_result() {
+        let conn = setup_db_with_embeddings();
+        let vec_a: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
+
+        let results = load_embeddings_for_path_prefix(&conn, "lib/").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_load_embeddings_for_path_prefix_all_match() {
+        let conn = setup_db_with_embeddings();
+        let vec_a: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        let vec_b: Vec<u8> = bytemuck::cast_slice(&[2.0_f32]).to_vec();
+
+        insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
+        insert_symbol_and_embedding(&conn, 2, "src/auth/session.ts", &vec_b);
+
+        let results = load_embeddings_for_path_prefix(&conn, "src/").unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_load_embeddings_for_path_prefix_excludes_stale() {
+        let conn = setup_db_with_embeddings();
+        let vec_a: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        let vec_b: Vec<u8> = bytemuck::cast_slice(&[2.0_f32]).to_vec();
+
+        insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
+        insert_symbol_and_embedding_stale(&conn, 2, "src/auth/session.ts", &vec_b);
+
+        let results = load_embeddings_for_path_prefix(&conn, "src/auth/").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
+    }
+
+    #[test]
+    fn test_load_embeddings_for_path_prefix_empty_prefix_matches_all() {
+        let conn = setup_db_with_embeddings();
+        let vec_a: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        let vec_b: Vec<u8> = bytemuck::cast_slice(&[2.0_f32]).to_vec();
+
+        insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
+        insert_symbol_and_embedding(&conn, 2, "lib/utils.ts", &vec_b);
+
+        let results = load_embeddings_for_path_prefix(&conn, "").unwrap();
+        assert_eq!(results.len(), 2);
     }
 }
