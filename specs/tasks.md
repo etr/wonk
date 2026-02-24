@@ -2174,7 +2174,7 @@ Detect which symbols changed in a file by comparing a fresh Tree-sitter parse ag
 **Related Requirements:** PRD-SIMP-REQ-001, PRD-SIMP-REQ-002
 **Related Decisions:** DR-014
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

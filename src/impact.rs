@@ -178,8 +178,12 @@ pub fn detect_changed_symbols(
 /// Shells out to `git diff --name-only <commit>` and parses the output.
 /// Returns a clear error if git is not installed (relevant only for `--since`).
 pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<String>> {
-    // Reject flag-shaped inputs to prevent git argument injection (CWE-88).
-    if commit.starts_with('-') {
+    // Validate commit reference to prevent git argument injection (CWE-88).
+    // Allow alphanumeric chars plus common git-ref characters: / _ . - @ ~ ^
+    if !commit
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/_.-@~^".contains(c))
+    {
         bail!("invalid commit reference: {commit}");
     }
 
@@ -423,6 +427,28 @@ impl Bar {
         assert!(
             !added_names.contains(&"work") || bar_work_removed,
             "Bar::work should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn git_diff_rejects_flag_injection() {
+        let dir = TempDir::new().unwrap();
+        let result = detect_changed_files_since("--upload-pack=evil", dir.path());
+        assert!(result.is_err(), "flag-shaped commit ref should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("invalid commit reference"),
+            "error should mention invalid commit reference"
+        );
+    }
+
+    #[test]
+    fn git_diff_rejects_special_characters() {
+        let dir = TempDir::new().unwrap();
+        let result = detect_changed_files_since("HEAD:../../etc/passwd", dir.path());
+        assert!(
+            result.is_err(),
+            "commit ref with colon should be rejected"
         );
     }
 
