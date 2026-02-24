@@ -62,6 +62,12 @@ thiserror = "2"
 ureq = { version = "3.1", features = ["json"] }
 bytemuck = { version = "1", features = ["derive"] }
 
+# Clustering
+linfa = "0.8"
+linfa-clustering = "0.8"
+ndarray = "0.16"
+rand = "0.8"
+
 # Daemon
 fork = "0.2"
 signal-hook = "0.3"

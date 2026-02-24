@@ -1,5 +1,6 @@
 pub mod budget;
 pub mod cli;
+pub mod cluster;
 pub mod color;
 pub mod config;
 pub mod daemon;
