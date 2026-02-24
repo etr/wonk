@@ -662,15 +662,26 @@ pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, Em
 /// Load embedding vectors for symbols whose file path starts with a prefix.
 ///
 /// Returns `(symbol_id, vector)` pairs, filtered at the SQL level using
-/// `WHERE file LIKE 'prefix%' AND NOT stale`.  An empty prefix matches all
-/// non-stale embeddings.
+/// `WHERE file GLOB 'prefix*' AND NOT stale`.  GLOB is case-sensitive and
+/// allows SQLite to use the B-tree index on `embeddings(file)` for prefix
+/// patterns.  An empty prefix matches all non-stale embeddings.
+///
+/// Stale embeddings are excluded because clustering quality depends heavily
+/// on vector accuracy — unlike `wonk ask` which includes stale rows as a
+/// best-effort fallback.
 pub fn load_embeddings_for_path_prefix(
     conn: &Connection,
     prefix: &str,
 ) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
-    let pattern = format!("{prefix}%");
+    // Escape GLOB metacharacters (*, ?, [) in user-supplied prefix so only the
+    // trailing `*` acts as a wildcard.
+    let escaped = prefix
+        .replace('[', "[[]")
+        .replace('*', "[*]")
+        .replace('?', "[?]");
+    let pattern = format!("{escaped}*");
     let mut stmt = conn
-        .prepare("SELECT symbol_id, vector FROM embeddings WHERE file LIKE ?1 AND NOT stale")
+        .prepare("SELECT symbol_id, vector FROM embeddings WHERE file GLOB ?1 AND NOT stale")
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let rows = stmt

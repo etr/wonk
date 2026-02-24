@@ -741,7 +741,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let conn = match conn {
                 Some(c) => c,
                 None => {
-                    output::print_error("no index found; run `wonk init` to build the index");
+                    output::print_hint(
+                        "no index found; run `wonk init` to build the index",
+                        suppress,
+                    );
                     return Ok(());
                 }
             };
@@ -753,14 +756,24 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let embeddings = crate::embedding::load_embeddings_for_path_prefix(&conn, prefix)?;
 
             if embeddings.is_empty() {
-                output::print_error(
+                output::print_hint(
                     "no embeddings found for this path; run `wonk init` with Ollama running to build embeddings",
+                    suppress,
                 );
                 return Ok(());
             }
 
-            let mut clusters = crate::cluster::cluster_embeddings(&embeddings, 20);
+            let mut clusters =
+                crate::cluster::cluster_embeddings(&embeddings, crate::cluster::ABSOLUTE_MAX_K);
             crate::cluster::resolve_cluster_members(&conn, &mut clusters)?;
+
+            let to_member_output = |m: &crate::types::ClusterMember| output::ClusterMemberOutput {
+                file: m.file.clone(),
+                line: m.line,
+                symbol_name: m.symbol_name.clone(),
+                symbol_kind: m.symbol_kind.to_string(),
+                distance_to_centroid: m.distance_to_centroid,
+            };
 
             let mut truncated = 0usize;
             for cluster in &clusters {
@@ -772,30 +785,21 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             .members
                             .iter()
                             .take(args.top)
-                            .map(|m| output::ClusterMemberOutput {
-                                file: m.file.clone(),
-                                line: m.line,
-                                symbol_name: m.symbol_name.clone(),
-                                symbol_kind: m.symbol_kind.to_string(),
-                                distance_to_centroid: m.distance_to_centroid,
-                            })
+                            .map(&to_member_output)
                             .collect(),
                     };
                     if fmt.format_cluster(&out)? == BudgetStatus::Skipped {
                         truncated += 1;
                     }
                 } else {
-                    if !suppress {
-                        output::print_cluster_header(cluster.cluster_id, cluster.members.len());
-                    }
+                    // Header goes to stderr; member lines go to stdout via Formatter.
+                    output::print_cluster_header(
+                        cluster.cluster_id,
+                        cluster.members.len(),
+                        suppress,
+                    );
                     for member in cluster.members.iter().take(args.top) {
-                        let out = output::ClusterMemberOutput {
-                            file: member.file.clone(),
-                            line: member.line,
-                            symbol_name: member.symbol_name.clone(),
-                            symbol_kind: member.symbol_kind.to_string(),
-                            distance_to_centroid: member.distance_to_centroid,
-                        };
+                        let out = to_member_output(member);
                         if fmt.format_cluster_member(&out)? == BudgetStatus::Skipped {
                             truncated += 1;
                         }

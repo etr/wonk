@@ -638,14 +638,14 @@ impl<W: Write> Formatter<W> {
             let line = Self::serialize_structured(fmt.format, member)?;
             writeln!(fmt.writer, "{line}")
         } else {
+            fmt.write_file(&member.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(member.line)?;
+            fmt.write_sep()?;
             writeln!(
                 fmt.writer,
-                "  {}:{}  {} ({}) [{:.2}]",
-                member.file,
-                member.line,
-                member.symbol_name,
-                member.symbol_kind,
-                member.distance_to_centroid
+                "  {} ({}) [{:.4}]",
+                member.symbol_name, member.symbol_kind, member.distance_to_centroid
             )
         }
     }
@@ -655,6 +655,10 @@ impl<W: Write> Formatter<W> {
     /// In grep mode, callers should use [`print_cluster_header`] for the
     /// header and [`format_cluster_member`] for each representative.
     pub fn format_cluster(&mut self, cluster: &ClusterOutput) -> std::io::Result<BudgetStatus> {
+        debug_assert!(
+            self.format.is_structured(),
+            "format_cluster is for structured modes only; use format_cluster_member for grep"
+        );
         if !self.has_budget() {
             let line = Self::serialize_structured(self.format, cluster)?;
             writeln!(self.writer, "{line}")?;
@@ -669,8 +673,10 @@ impl<W: Write> Formatter<W> {
 }
 
 /// Print a cluster header to stderr (grep mode).
-pub fn print_cluster_header(cluster_id: usize, total_members: usize) {
-    eprintln!("Cluster {} ({} symbols):", cluster_id + 1, total_members);
+pub fn print_cluster_header(cluster_id: usize, total_members: usize, suppress: bool) {
+    if !suppress {
+        eprintln!("Cluster {} ({} symbols):", cluster_id + 1, total_members);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1998,7 +2004,7 @@ mod tests {
         let out = render(OutputFormat::Grep, |fmt| fmt.format_cluster_member(&member));
         assert_eq!(
             out,
-            "  src/auth/middleware.ts:15  verifyToken (function) [0.12]\n"
+            "src/auth/middleware.ts:15:  verifyToken (function) [0.1200]\n"
         );
     }
 

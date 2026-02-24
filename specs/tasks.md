@@ -2098,9 +2098,9 @@ Implement K-Means clustering of symbol embeddings with automatic k selection via
 Implement the `wonk cluster <path>` CLI command that displays semantic clusters of symbols within a directory.
 
 **Action Items:**
-- [ ] Add `cluster` subcommand to CLI with args: `<path>` (required), `--json` (global), `--top <n>` (optional, default 5, number of representative symbols per cluster)
-- [ ] Wire through Query Router: load embeddings filtered by path prefix, pass to Clustering Engine (TASK-053)
-- [ ] Default output format: numbered cluster groups with representative symbols
+- [x] Add `cluster` subcommand to CLI with args: `<path>` (required), `--json` (global), `--top <n>` (optional, default 5, number of representative symbols per cluster)
+- [x] Wire through Query Router: load embeddings filtered by path prefix, pass to Clustering Engine (TASK-053)
+- [x] Default output format: numbered cluster groups with representative symbols
   ```
   Cluster 1 (15 symbols):
     src/auth/middleware.ts:15  verifyToken (function) [0.12]
@@ -2109,9 +2109,9 @@ Implement the `wonk cluster <path>` CLI command that displays semantic clusters 
   Cluster 2 (8 symbols):
     ...
   ```
-- [ ] JSON output: structured cluster data with members, centroids, distances
-- [ ] If no embeddings exist for path, return error with hint to run `wonk init`
-- [ ] If fewer than 3 symbols in path, return all symbols in a single group
+- [x] JSON output: structured cluster data with members, centroids, distances
+- [x] If no embeddings exist for path, return error with hint to run `wonk init`
+- [x] If fewer than 3 symbols in path, return all symbols in a single group
 
 **Dependencies:**
 - Blocked by: TASK-053
@@ -2130,7 +2130,7 @@ Implement the `wonk cluster <path>` CLI command that displays semantic clusters 
 **Related Requirements:** PRD-SCLST-REQ-001, PRD-SCLST-REQ-002, PRD-SCLST-REQ-003
 **Related Decisions:** DR-011
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

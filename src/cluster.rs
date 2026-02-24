@@ -18,7 +18,7 @@ use crate::errors::EmbeddingError;
 use crate::types::{Cluster, ClusterMember, SymbolKind};
 
 /// Maximum number of clusters to consider, regardless of max_k argument.
-const ABSOLUTE_MAX_K: usize = 20;
+pub const ABSOLUTE_MAX_K: usize = 20;
 
 /// Number of representative symbols to select per cluster (closest to centroid).
 const NUM_REPRESENTATIVES: usize = 5;
