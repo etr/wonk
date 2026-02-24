@@ -1983,12 +1983,12 @@ Add `--semantic` flag to `wonk search` that blends structural results with seman
 Implement BFS/DFS traversal over the file-level dependency graph to compute reachable file sets for `--from` and `--to` scoping.
 
 **Action Items:**
-- [ ] Implement `reachable_from(db, file: &str) -> HashSet<String>`: BFS forward traversal following import edges from the given file
-- [ ] Implement `reachable_to(db, file: &str) -> HashSet<String>`: BFS reverse traversal finding all files that transitively import the given file
-- [ ] Load file-level dependency graph from SQLite (files table import data) into an adjacency list
-- [ ] Use `VecDeque` for BFS, `HashSet` for visited tracking
-- [ ] Handle cycles (files that import each other) — visited set prevents infinite loops
-- [ ] Return the file as part of its own reachable set
+- [x] Implement `reachable_from(db, file: &str) -> HashSet<String>`: BFS forward traversal following import edges from the given file
+- [x] Implement `reachable_to(db, file: &str) -> HashSet<String>`: BFS reverse traversal finding all files that transitively import the given file
+- [x] Load file-level dependency graph from SQLite (files table import data) into an adjacency list
+- [x] Use `VecDeque` for BFS, `HashSet` for visited tracking
+- [x] Handle cycles (files that import each other) — visited set prevents infinite loops
+- [x] Return the file as part of its own reachable set
 
 **Dependencies:**
 - Blocked by: TASK-042
@@ -2005,7 +2005,7 @@ Implement BFS/DFS traversal over the file-level dependency graph to compute reac
 **Related Requirements:** PRD-SDEP-REQ-003
 **Related Decisions:** DR-010
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
