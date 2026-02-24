@@ -3,12 +3,13 @@
 //! Provides parallel vector similarity computation using rayon and
 //! result resolution against the symbols table.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 use rayon::prelude::*;
 use rusqlite::Connection;
 
-use crate::errors::EmbeddingError;
+use crate::errors::{DbError, EmbeddingError};
 use crate::types::{SemanticResult, SymbolKind};
 
 /// Compute the dot product of two f32 slices.
@@ -147,6 +148,144 @@ pub fn dedup_semantic<'a>(
         .iter()
         .filter(|sr| !structural_keys.contains(&(sr.file.clone(), sr.line as u64)))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Dependency graph traversal
+// ---------------------------------------------------------------------------
+
+/// Extract the stem from an import path for fuzzy matching against file paths.
+///
+/// Takes the last segment of an import path (splitting on `/`, `::`, or `:`)
+/// and strips any file extension. For example:
+/// - `./utils` -> `utils`
+/// - `crate::db` -> `db`
+/// - `../helpers/format.ts` -> `format`
+fn extract_import_stem(import_path: &str) -> Option<String> {
+    // Split on all known separators and take the last non-empty segment.
+    let last_segment = import_path
+        .rsplit(['/', ':'])
+        .find(|s| !s.is_empty())?;
+
+    // Strip file extension if present.
+    let stem = Path::new(last_segment)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| last_segment.to_string());
+
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem)
+    }
+}
+
+/// Adjacency list mapping file paths to their connected neighbors.
+type AdjacencyList = HashMap<String, HashSet<String>>;
+
+/// Load the file-level dependency graph from SQLite into forward and reverse
+/// adjacency lists.
+///
+/// Returns `(forward, reverse)` where:
+/// - `forward[file]` = set of files that `file` imports
+/// - `reverse[file]` = set of files that import `file`
+fn load_dep_graph(
+    conn: &Connection,
+) -> Result<(AdjacencyList, AdjacencyList), DbError> {
+    // Build a stem -> set of file paths lookup from the files table.
+    let mut stem_to_files: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT path FROM files")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let path = row?;
+            if let Some(stem) = Path::new(&path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+            {
+                stem_to_files
+                    .entry(stem)
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+    }
+
+    let mut forward: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut reverse: HashMap<String, HashSet<String>> = HashMap::new();
+
+    // Query all import edges.
+    {
+        let mut stmt = conn.prepare("SELECT source_file, import_path FROM file_imports")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (source_file, import_path) = row?;
+            if let Some(stem) = extract_import_stem(&import_path)
+                && let Some(targets) = stem_to_files.get(&stem)
+            {
+                for target in targets {
+                    if target != &source_file {
+                        forward
+                            .entry(source_file.clone())
+                            .or_default()
+                            .insert(target.clone());
+                        reverse
+                            .entry(target.clone())
+                            .or_default()
+                            .insert(source_file.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((forward, reverse))
+}
+
+/// Standard BFS traversal over an adjacency list.
+///
+/// Returns the set of all reachable nodes from `start`, including `start`
+/// itself. Handles cycles via a visited set.
+fn bfs(start: &str, adj: &AdjacencyList) -> HashSet<String> {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    visited.insert(start.to_string());
+    queue.push_back(start.to_string());
+
+    while let Some(node) = queue.pop_front() {
+        if let Some(neighbors) = adj.get(&node) {
+            for neighbor in neighbors {
+                if visited.insert(neighbor.clone()) {
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+    }
+
+    visited
+}
+
+/// Compute the set of files transitively reachable from `file` by following
+/// import edges forward.
+///
+/// For example, if A imports B and B imports C, then `reachable_from(conn, "A")`
+/// returns `{A, B, C}`. The starting file is always included in the result.
+pub fn reachable_from(conn: &Connection, file: &str) -> Result<HashSet<String>, DbError> {
+    let (forward, _reverse) = load_dep_graph(conn)?;
+    Ok(bfs(file, &forward))
+}
+
+/// Compute the set of files that transitively import `file` (reverse
+/// reachability).
+///
+/// For example, if A imports B and C imports B, then `reachable_to(conn, "B")`
+/// returns `{A, B, C}`. The target file is always included in the result.
+pub fn reachable_to(conn: &Connection, file: &str) -> Result<HashSet<String>, DbError> {
+    let (_forward, reverse) = load_dep_graph(conn)?;
+    Ok(bfs(file, &reverse))
 }
 
 #[cfg(test)]
@@ -493,5 +632,183 @@ mod tests {
 
         let deduped = dedup_semantic(&semantic, &structural_keys);
         assert!(deduped.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dependency graph traversal tests
+    // -----------------------------------------------------------------------
+
+    fn setup_dep_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY,
+                language TEXT,
+                hash TEXT NOT NULL,
+                last_indexed INTEGER NOT NULL,
+                line_count INTEGER,
+                symbols_count INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS file_imports (
+                id INTEGER PRIMARY KEY,
+                source_file TEXT NOT NULL,
+                import_path TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_file(conn: &Connection, path: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO files (path, language, hash, last_indexed) \
+             VALUES (?1, 'TypeScript', 'abc123', 0)",
+            rusqlite::params![path],
+        )
+        .unwrap();
+    }
+
+    fn insert_import(conn: &Connection, source: &str, import: &str) {
+        conn.execute(
+            "INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)",
+            rusqlite::params![source, import],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_reachable_from_linear_chain() {
+        // A imports B, B imports C => reachable_from(A) = {A, B, C}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/b.ts", "./c");
+
+        let result = reachable_from(&conn, "src/a.ts").unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(result.contains("src/a.ts"));
+        assert!(result.contains("src/b.ts"));
+        assert!(result.contains("src/c.ts"));
+    }
+
+    #[test]
+    fn test_reachable_to_diamond() {
+        // A imports B, C imports B => reachable_to(B) = {A, B, C}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/c.ts", "./b");
+
+        let result = reachable_to(&conn, "src/b.ts").unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(result.contains("src/a.ts"));
+        assert!(result.contains("src/b.ts"));
+        assert!(result.contains("src/c.ts"));
+    }
+
+    #[test]
+    fn test_reachable_from_includes_self() {
+        // No imports, reachable_from(A) = {A}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+
+        let result = reachable_from(&conn, "src/a.ts").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.contains("src/a.ts"));
+    }
+
+    #[test]
+    fn test_reachable_to_includes_self() {
+        // No reverse deps, reachable_to(A) = {A}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+
+        let result = reachable_to(&conn, "src/a.ts").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.contains("src/a.ts"));
+    }
+
+    #[test]
+    fn test_reachable_from_cycle() {
+        // A imports B, B imports A => reachable_from(A) = {A, B}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/b.ts", "./a");
+
+        let result = reachable_from(&conn, "src/a.ts").unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.contains("src/a.ts"));
+        assert!(result.contains("src/b.ts"));
+    }
+
+    #[test]
+    fn test_reachable_from_complex_graph() {
+        // Diamond: A->B->D, A->C->D => reachable_from(A) = {A,B,C,D}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_file(&conn, "src/d.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/a.ts", "./c");
+        insert_import(&conn, "src/b.ts", "./d");
+        insert_import(&conn, "src/c.ts", "./d");
+
+        let result = reachable_from(&conn, "src/a.ts").unwrap();
+        assert_eq!(result.len(), 4);
+        assert!(result.contains("src/a.ts"));
+        assert!(result.contains("src/b.ts"));
+        assert!(result.contains("src/c.ts"));
+        assert!(result.contains("src/d.ts"));
+    }
+
+    #[test]
+    fn test_reachable_to_transitive_chain() {
+        // A imports B, B imports C => reachable_to(C) = {A, B, C}
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/a.ts");
+        insert_file(&conn, "src/b.ts");
+        insert_file(&conn, "src/c.ts");
+        insert_import(&conn, "src/a.ts", "./b");
+        insert_import(&conn, "src/b.ts", "./c");
+
+        let result = reachable_to(&conn, "src/c.ts").unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(result.contains("src/a.ts"));
+        assert!(result.contains("src/b.ts"));
+        assert!(result.contains("src/c.ts"));
+    }
+
+    #[test]
+    fn test_reachable_from_unknown_file() {
+        // Start file not in DB => returns {start_file}
+        let conn = setup_dep_test_db();
+
+        let result = reachable_from(&conn, "src/unknown.ts").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.contains("src/unknown.ts"));
+    }
+
+    #[test]
+    fn test_reachable_from_stem_matching() {
+        // Realistic import_path like ./utils matching src/utils.ts
+        let conn = setup_dep_test_db();
+        insert_file(&conn, "src/main.ts");
+        insert_file(&conn, "src/utils.ts");
+        insert_file(&conn, "src/helpers.ts");
+        insert_import(&conn, "src/main.ts", "./utils");
+        insert_import(&conn, "src/utils.ts", "../helpers");
+
+        let result = reachable_from(&conn, "src/main.ts").unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(result.contains("src/main.ts"));
+        assert!(result.contains("src/utils.ts"));
+        assert!(result.contains("src/helpers.ts"));
     }
 }
