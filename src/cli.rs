@@ -68,6 +68,9 @@ pub enum Command {
 
     /// Cluster symbols by semantic similarity within a directory
     Cluster(ClusterArgs),
+
+    /// Analyze impact of changed symbols via semantic similarity
+    Impact(ImpactArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -221,6 +224,16 @@ pub struct ClusterArgs {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct ImpactArgs {
+    /// File to analyze for changed symbols
+    pub file: String,
+
+    /// Analyze all files changed since this commit (e.g. HEAD~3)
+    #[arg(long)]
+    pub since: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct McpArgs {
     #[command(subcommand)]
     pub command: McpCommand,
@@ -344,6 +357,56 @@ mod tests {
     fn parse_cluster_requires_path() {
         let result = Cli::try_parse_from(["wonk", "cluster"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_impact_basic() {
+        let cli = Cli::try_parse_from(["wonk", "impact", "src/auth/middleware.ts"]).unwrap();
+        match cli.command {
+            Command::Impact(args) => {
+                assert_eq!(args.file, "src/auth/middleware.ts");
+                assert!(args.since.is_none());
+            }
+            _ => panic!("expected Command::Impact"),
+        }
+    }
+
+    #[test]
+    fn parse_impact_with_since() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "impact",
+            "--since",
+            "HEAD~3",
+            "src/auth/middleware.ts",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Impact(args) => {
+                assert_eq!(args.file, "src/auth/middleware.ts");
+                assert_eq!(args.since.as_deref(), Some("HEAD~3"));
+            }
+            _ => panic!("expected Command::Impact"),
+        }
+    }
+
+    #[test]
+    fn parse_impact_requires_file() {
+        let result = Cli::try_parse_from(["wonk", "impact"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_impact_with_global_json() {
+        let cli =
+            Cli::try_parse_from(["wonk", "--format", "json", "impact", "src/main.rs"]).unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Impact(args) => {
+                assert_eq!(args.file, "src/main.rs");
+            }
+            _ => panic!("expected Command::Impact"),
+        }
     }
 
     #[test]

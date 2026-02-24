@@ -228,3 +228,124 @@ pub struct SemanticResult {
     /// Cosine similarity score (higher = more similar).
     pub similarity_score: f32,
 }
+
+/// A lightweight reference to a symbol's identity and location.
+///
+/// Used in impact analysis results to identify the changed and impacted symbols
+/// without carrying the full [`Symbol`] payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolRef {
+    /// The symbol name.
+    pub name: String,
+    /// What kind of symbol this is.
+    pub kind: SymbolKind,
+    /// Path of the source file (relative to repo root).
+    pub file: String,
+    /// 1-based line number.
+    pub line: usize,
+}
+
+impl From<&ChangedSymbol> for SymbolRef {
+    fn from(cs: &ChangedSymbol) -> Self {
+        Self {
+            name: cs.name.clone(),
+            kind: cs.kind,
+            file: cs.file.clone(),
+            line: cs.line,
+        }
+    }
+}
+
+/// A single impact analysis result linking a changed symbol to a semantically
+/// similar symbol that may be affected.
+///
+/// Derives `PartialEq` but not `Eq` because `similarity_score` is `f32`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImpactResult {
+    /// The symbol that changed.
+    pub changed_symbol: SymbolRef,
+    /// The symbol that may be impacted.
+    pub impacted_symbol: SymbolRef,
+    /// Cosine similarity score between the changed and impacted symbols.
+    pub similarity_score: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbol_ref_creation() {
+        let sr = SymbolRef {
+            name: "verify_token".into(),
+            kind: SymbolKind::Function,
+            file: "src/auth/middleware.ts".into(),
+            line: 15,
+        };
+        assert_eq!(sr.name, "verify_token");
+        assert_eq!(sr.kind, SymbolKind::Function);
+        assert_eq!(sr.file, "src/auth/middleware.ts");
+        assert_eq!(sr.line, 15);
+    }
+
+    #[test]
+    fn impact_result_creation() {
+        let changed = SymbolRef {
+            name: "verify_token".into(),
+            kind: SymbolKind::Function,
+            file: "src/auth/middleware.ts".into(),
+            line: 15,
+        };
+        let impacted = SymbolRef {
+            name: "validate_session".into(),
+            kind: SymbolKind::Function,
+            file: "src/auth/session.ts".into(),
+            line: 8,
+        };
+        let result = ImpactResult {
+            changed_symbol: changed.clone(),
+            impacted_symbol: impacted.clone(),
+            similarity_score: 0.89,
+        };
+        assert_eq!(result.changed_symbol, changed);
+        assert_eq!(result.impacted_symbol, impacted);
+        assert!((result.similarity_score - 0.89).abs() < 1e-6);
+    }
+
+    #[test]
+    fn impact_result_equality_by_value() {
+        let a = ImpactResult {
+            changed_symbol: SymbolRef {
+                name: "foo".into(),
+                kind: SymbolKind::Function,
+                file: "a.rs".into(),
+                line: 1,
+            },
+            impacted_symbol: SymbolRef {
+                name: "bar".into(),
+                kind: SymbolKind::Method,
+                file: "b.rs".into(),
+                line: 10,
+            },
+            similarity_score: 0.75,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn symbol_ref_from_changed_symbol() {
+        let cs = ChangedSymbol {
+            name: "hello".into(),
+            kind: SymbolKind::Function,
+            file: "src/lib.rs".into(),
+            line: 5,
+            change_type: ChangeType::Modified,
+        };
+        let sr = SymbolRef::from(&cs);
+        assert_eq!(sr.name, "hello");
+        assert_eq!(sr.kind, SymbolKind::Function);
+        assert_eq!(sr.file, "src/lib.rs");
+        assert_eq!(sr.line, 5);
+    }
+}

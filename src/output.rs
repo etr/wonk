@@ -161,6 +161,32 @@ pub struct SemanticOutput {
     pub symbol_id: i64,
 }
 
+/// A symbol reference in impact analysis output (the changed or impacted symbol).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactSymbolOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+}
+
+/// A single impacted symbol entry with similarity score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactEntryOutput {
+    pub file: String,
+    pub line: usize,
+    pub symbol_name: String,
+    pub symbol_kind: String,
+    pub similarity_score: f32,
+}
+
+/// Full impact output for JSON: groups impacted symbols under their changed symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactOutput {
+    pub changed_symbol: ImpactSymbolOutput,
+    pub impacted: Vec<ImpactEntryOutput>,
+}
+
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
 /// output. In grep mode the summary goes to stderr instead.
 #[derive(Debug, Clone, Serialize)]
@@ -668,6 +694,48 @@ impl<W: Write> Formatter<W> {
             let line = Self::serialize_structured(fmt.format, &cluster)?;
             writeln!(fmt.writer, "{line}")
         })
+    }
+
+    /// Format a single impact entry line (impacted symbol with similarity score).
+    pub fn format_impact_entry(
+        &mut self,
+        entry: &ImpactEntryOutput,
+    ) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_impact_entry(self, entry)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let entry = entry.clone();
+        self.budgeted_write(move |fmt| Self::render_impact_entry(fmt, &entry))
+    }
+
+    /// Shared render logic for an impact entry.
+    fn render_impact_entry<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        entry: &ImpactEntryOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, entry)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            write!(fmt.writer, "  -> ")?;
+            fmt.write_file(&entry.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(entry.line)?;
+            fmt.write_sep()?;
+            writeln!(
+                fmt.writer,
+                "  {} ({}) [{:.2}]",
+                entry.symbol_name, entry.symbol_kind, entry.similarity_score
+            )
+        }
+    }
+}
+
+/// Print an impact header to stderr (grep mode): "Changed: name (kind) in file:line".
+pub fn print_impact_header(name: &str, kind: &str, file: &str, line: usize, suppress: bool) {
+    if !suppress {
+        eprintln!("Changed: {name} ({kind}) in {file}:{line}");
     }
 }
 
@@ -2074,5 +2142,65 @@ mod tests {
         assert!(emitted > 0, "should emit at least one result");
         assert!(emitted < 10, "should not emit all results");
         assert_eq!(emitted + truncated, 10);
+    }
+
+    // -- ImpactOutput -------------------------------------------------------
+
+    #[test]
+    fn impact_entry_grep_format() {
+        let entry = ImpactEntryOutput {
+            file: "src/auth/session.ts".into(),
+            line: 8,
+            symbol_name: "validateSession".into(),
+            symbol_kind: "function".into(),
+            similarity_score: 0.89,
+        };
+        let out = render(OutputFormat::Grep, |fmt| fmt.format_impact_entry(&entry));
+        assert!(out.contains("src/auth/session.ts"));
+        assert!(out.contains(":8:"));
+        assert!(out.contains("validateSession"));
+        assert!(out.contains("(function)"));
+        assert!(out.contains("[0.89]"));
+    }
+
+    #[test]
+    fn impact_entry_json_format() {
+        let entry = ImpactEntryOutput {
+            file: "src/auth/session.ts".into(),
+            line: 8,
+            symbol_name: "validateSession".into(),
+            symbol_kind: "function".into(),
+            similarity_score: 0.89,
+        };
+        let out = render(OutputFormat::Json, |fmt| fmt.format_impact_entry(&entry));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["file"], "src/auth/session.ts");
+        assert_eq!(v["line"], 8);
+        assert_eq!(v["symbol_name"], "validateSession");
+        assert_eq!(v["symbol_kind"], "function");
+        assert!((v["similarity_score"].as_f64().unwrap() - 0.89).abs() < 0.01);
+    }
+
+    #[test]
+    fn impact_full_json_output() {
+        let output = ImpactOutput {
+            changed_symbol: ImpactSymbolOutput {
+                name: "verifyToken".into(),
+                kind: "function".into(),
+                file: "src/auth/middleware.ts".into(),
+                line: 15,
+            },
+            impacted: vec![ImpactEntryOutput {
+                file: "src/auth/session.ts".into(),
+                line: 8,
+                symbol_name: "validateSession".into(),
+                symbol_kind: "function".into(),
+                similarity_score: 0.89,
+            }],
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["changed_symbol"]["name"], "verifyToken");
+        assert_eq!(v["impacted"][0]["symbol_name"], "validateSession");
     }
 }

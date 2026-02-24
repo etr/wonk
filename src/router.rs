@@ -809,6 +809,174 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
+        Command::Impact(args) => {
+            let repo_root = match std::env::current_dir()
+                .ok()
+                .and_then(|cwd| db::find_repo_root(&cwd).ok())
+            {
+                Some(r) => r,
+                None => {
+                    output::print_error("no repository root found");
+                    return Ok(());
+                }
+            };
+
+            let conn =
+                match db::find_existing_index(&repo_root).and_then(|path| db::open(&path).ok()) {
+                    Some(c) => c,
+                    None => {
+                        output::print_hint(
+                            "no index found; run `wonk init` to build the index",
+                            suppress,
+                        );
+                        return Ok(());
+                    }
+                };
+
+            // Determine files to analyze.
+            let files: Vec<String> = if let Some(ref since) = args.since {
+                crate::impact::detect_changed_files_since(since, &repo_root)?
+            } else {
+                // Normalize the user-provided path to be repo-relative.
+                let abs = if Path::new(&args.file).is_absolute() {
+                    PathBuf::from(&args.file)
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(&args.file)
+                };
+                let rel = abs
+                    .strip_prefix(&repo_root)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| args.file.clone());
+                vec![rel]
+            };
+
+            if files.is_empty() {
+                output::print_hint("no changed files found", suppress);
+                return Ok(());
+            }
+
+            let client = crate::embedding::OllamaClient::new();
+
+            // Aggregate results across all files.
+            let mut all_results = Vec::new();
+            for file in &files {
+                match crate::impact::analyze_impact(&conn, file, &repo_root, &client) {
+                    Ok(results) => all_results.extend(results),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if msg.contains("no embeddings") {
+                            output::print_error(&msg);
+                            output::print_hint(
+                                "run `wonk init` with Ollama running to build embeddings",
+                                suppress,
+                            );
+                            return Ok(());
+                        }
+                        if msg.contains("unsupported language") {
+                            // Skip files we can't parse (e.g. .md, .json).
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Sort by descending similarity.
+            all_results.sort_by(|a, b| {
+                b.similarity_score
+                    .partial_cmp(&a.similarity_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if all_results.is_empty() {
+                output::print_hint("no impact detected", suppress);
+                return Ok(());
+            }
+
+            // Output results.
+            if format.is_structured() {
+                // JSON mode: group by changed symbol.
+                let mut groups: std::collections::BTreeMap<
+                    String,
+                    (output::ImpactSymbolOutput, Vec<output::ImpactEntryOutput>),
+                > = std::collections::BTreeMap::new();
+
+                for r in &all_results {
+                    let key = format!(
+                        "{}:{}:{}:{}",
+                        r.changed_symbol.file,
+                        r.changed_symbol.line,
+                        r.changed_symbol.name,
+                        r.changed_symbol.kind
+                    );
+                    let entry = groups.entry(key).or_insert_with(|| {
+                        (
+                            output::ImpactSymbolOutput {
+                                name: r.changed_symbol.name.clone(),
+                                kind: r.changed_symbol.kind.to_string(),
+                                file: r.changed_symbol.file.clone(),
+                                line: r.changed_symbol.line,
+                            },
+                            Vec::new(),
+                        )
+                    });
+                    entry.1.push(output::ImpactEntryOutput {
+                        file: r.impacted_symbol.file.clone(),
+                        line: r.impacted_symbol.line,
+                        symbol_name: r.impacted_symbol.name.clone(),
+                        symbol_kind: r.impacted_symbol.kind.to_string(),
+                        similarity_score: r.similarity_score,
+                    });
+                }
+
+                for (_, (changed, impacted)) in groups {
+                    let out = output::ImpactOutput {
+                        changed_symbol: changed,
+                        impacted,
+                    };
+                    let line = serde_json::to_string(&out).map_err(io::Error::other)?;
+                    writeln!(fmt.writer_mut(), "{line}")?;
+                }
+            } else {
+                // Grep mode: group by changed symbol, print header + entries.
+                let mut current_key = String::new();
+                let mut truncated = 0usize;
+
+                for r in &all_results {
+                    let key = format!(
+                        "{}:{}:{}:{}",
+                        r.changed_symbol.file,
+                        r.changed_symbol.line,
+                        r.changed_symbol.name,
+                        r.changed_symbol.kind
+                    );
+                    if key != current_key {
+                        output::print_impact_header(
+                            &r.changed_symbol.name,
+                            &r.changed_symbol.kind.to_string(),
+                            &r.changed_symbol.file,
+                            r.changed_symbol.line,
+                            suppress,
+                        );
+                        current_key = key;
+                    }
+                    let entry = output::ImpactEntryOutput {
+                        file: r.impacted_symbol.file.clone(),
+                        line: r.impacted_symbol.line,
+                        symbol_name: r.impacted_symbol.name.clone(),
+                        symbol_kind: r.impacted_symbol.kind.to_string(),
+                        similarity_score: r.similarity_score,
+                    };
+                    if fmt.format_impact_entry(&entry)? == BudgetStatus::Skipped {
+                        truncated += 1;
+                    }
+                }
+
+                emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            }
+        }
     }
     Ok(())
 }
@@ -827,6 +995,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Rdeps(_)
             | Command::Ask(_)
             | Command::Cluster(_)
+            | Command::Impact(_)
     )
 }
 
@@ -4203,5 +4372,27 @@ mod tests {
         let result =
             blend_semantic_results("test_query", Some(&conn), &structural_keys, true, &mut fmt);
         assert!(result.is_ok(), "blend_semantic_results should not error");
+    }
+
+    // -- Impact query command test -------------------------------------------
+
+    #[test]
+    fn test_is_query_command_impact() {
+        use crate::cli::ImpactArgs;
+        let cmd = Command::Impact(ImpactArgs {
+            file: "src/main.rs".into(),
+            since: None,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_impact_with_since() {
+        use crate::cli::ImpactArgs;
+        let cmd = Command::Impact(ImpactArgs {
+            file: "src/main.rs".into(),
+            since: Some("HEAD~3".into()),
+        });
+        assert!(is_query_command(&cmd));
     }
 }
