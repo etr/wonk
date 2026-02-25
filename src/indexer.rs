@@ -25,6 +25,7 @@ pub enum Lang {
     Cpp,
     Ruby,
     Php,
+    CSharp,
 }
 
 impl Lang {
@@ -42,6 +43,7 @@ impl Lang {
             Lang::Cpp => "C++",
             Lang::Ruby => "Ruby",
             Lang::Php => "PHP",
+            Lang::CSharp => "C#",
         }
     }
 }
@@ -63,6 +65,7 @@ pub fn detect_language(path: &Path) -> Option<Lang> {
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Lang::Cpp),
         "rb" => Some(Lang::Ruby),
         "php" => Some(Lang::Php),
+        "cs" => Some(Lang::CSharp),
         _ => None,
     }
 }
@@ -81,6 +84,7 @@ fn grammar_for(lang: Lang) -> Language {
         Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
         Lang::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
     }
 }
 
@@ -187,6 +191,15 @@ fn is_container(kind: &str, lang: Lang) -> bool {
             kind,
             "class_declaration" | "interface_declaration" | "trait_declaration"
         ),
+        Lang::CSharp => matches!(
+            kind,
+            "class_declaration"
+                | "struct_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "namespace_declaration"
+                | "record_declaration"
+        ),
     }
 }
 
@@ -210,6 +223,7 @@ fn match_node(
         Lang::Cpp => extract_cpp(node, kind, src, file, scope),
         Lang::Ruby => extract_ruby(node, kind, src, file, scope),
         Lang::Php => extract_php(node, kind, src, file, scope),
+        Lang::CSharp => extract_csharp(node, kind, src, file, scope),
     }
 }
 
@@ -1271,6 +1285,162 @@ fn extract_php(
     }
 }
 
+// ---------------------------------------------------------------------------
+// C#
+// ---------------------------------------------------------------------------
+
+fn extract_csharp(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    scope: Option<&str>,
+) -> Option<Symbol> {
+    match kind {
+        "class_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Class,
+                node,
+                src,
+                file,
+                Lang::CSharp,
+                scope,
+            ))
+        }
+        "record_declaration" => {
+            let name = field_text(node, "name", src)?;
+            // record class → Class, record struct → Struct
+            let text = node_text(node, src);
+            let sk = if text.contains("record struct") {
+                SymbolKind::Struct
+            } else {
+                SymbolKind::Class
+            };
+            Some(make_symbol(name, sk, node, src, file, Lang::CSharp, scope))
+        }
+        "struct_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Struct,
+                node,
+                src,
+                file,
+                Lang::CSharp,
+                scope,
+            ))
+        }
+        "interface_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Interface,
+                node,
+                src,
+                file,
+                Lang::CSharp,
+                scope,
+            ))
+        }
+        "enum_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Enum,
+                node,
+                src,
+                file,
+                Lang::CSharp,
+                scope,
+            ))
+        }
+        "namespace_declaration" | "file_scoped_namespace_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Module,
+                node,
+                src,
+                file,
+                Lang::CSharp,
+                scope,
+            ))
+        }
+        "delegate_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::TypeAlias,
+                node,
+                src,
+                file,
+                Lang::CSharp,
+                scope,
+            ))
+        }
+        "method_declaration" | "constructor_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Method,
+                node,
+                src,
+                file,
+                Lang::CSharp,
+                scope,
+            ))
+        }
+        "property_declaration" => {
+            let name = field_text(node, "name", src)?;
+            Some(make_symbol(
+                name,
+                SymbolKind::Method,
+                node,
+                src,
+                file,
+                Lang::CSharp,
+                scope,
+            ))
+        }
+        "field_declaration" => {
+            // `public const int MAX = 100;` or `private int _count;`
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i as u32)
+                    && child.kind() == "variable_declaration"
+                {
+                    for j in 0..child.named_child_count() {
+                        if let Some(decl) = child.named_child(j as u32)
+                            && decl.kind() == "variable_declarator"
+                            && let Some(name_node) = decl.child_by_field_name("name")
+                        {
+                            let name = node_text(name_node, src);
+                            let text = node_text(node, src);
+                            let sk = if text.contains("const") || text.contains("readonly") {
+                                SymbolKind::Constant
+                            } else {
+                                SymbolKind::Variable
+                            };
+                            return Some(make_symbol(
+                                name,
+                                sk,
+                                node,
+                                src,
+                                file,
+                                Lang::CSharp,
+                                scope,
+                            ));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 // ===========================================================================
 // Reference extraction
 // ===========================================================================
@@ -1369,6 +1539,7 @@ fn match_call_ref(
         Lang::C | Lang::Cpp => match_c_call(node, kind, src, file, source_lines),
         Lang::Ruby => match_ruby_call(node, kind, src, file, source_lines),
         Lang::Php => match_php_call(node, kind, src, file, source_lines),
+        Lang::CSharp => match_csharp_call(node, kind, src, file, source_lines),
     }
 }
 
@@ -1626,6 +1797,50 @@ fn match_php_call(
     }
 }
 
+fn match_csharp_call(
+    node: Node,
+    kind: &str,
+    src: &[u8],
+    file: &str,
+    source_lines: &[&str],
+) -> Option<Reference> {
+    if kind != "invocation_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    match func.kind() {
+        "member_access_expression" => {
+            let name_node = func.child_by_field_name("name")?;
+            let name = node_text(name_node, src);
+            if name.is_empty() {
+                return None;
+            }
+            Some(make_ref(
+                name,
+                ReferenceKind::Call,
+                node,
+                file,
+                source_lines,
+            ))
+        }
+        _ => {
+            let name = node_text(func, src);
+            if name.is_empty() {
+                return None;
+            }
+            // Take last segment for dotted names
+            let short = name.rsplit_once('.').map(|(_, last)| last).unwrap_or(name);
+            Some(make_ref(
+                short,
+                ReferenceKind::Call,
+                node,
+                file,
+                source_lines,
+            ))
+        }
+    }
+}
+
 /// Extract the function/method name from a call target node.
 ///
 /// Handles `identifier`, `member_expression` (a.b), `field_expression`,
@@ -1841,6 +2056,36 @@ fn match_type_ref(
             }
             _ => None,
         },
+        Lang::CSharp => match kind {
+            "identifier" => {
+                let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                // Type contexts: base types, type arguments, parameter types, return types, etc.
+                if !matches!(
+                    parent_kind,
+                    "base_list"
+                        | "type_argument_list"
+                        | "type_constraint"
+                        | "object_creation_expression"
+                        | "generic_name"
+                        | "nullable_type"
+                        | "array_type"
+                ) {
+                    return None;
+                }
+                let name = node_text(node, src);
+                if name.is_empty() {
+                    return None;
+                }
+                Some(make_ref(
+                    name,
+                    ReferenceKind::Type,
+                    node,
+                    file,
+                    source_lines,
+                ))
+            }
+            _ => None,
+        },
     }
 }
 
@@ -2020,6 +2265,19 @@ fn match_import_ref(
                     ))
                 }
             }
+        }
+        Lang::CSharp => {
+            if kind != "using_directive" {
+                return None;
+            }
+            let text = node_text(node, src).trim().to_string();
+            Some(make_ref(
+                &text,
+                ReferenceKind::Import,
+                node,
+                file,
+                source_lines,
+            ))
         }
     }
 }
@@ -2235,6 +2493,35 @@ fn walk_imports(
                 }
             }
         }
+        Lang::CSharp => {
+            if kind == "using_directive" {
+                // `using System.Collections.Generic;` → extract the namespace
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i as u32)
+                        && matches!(child.kind(), "qualified_name" | "identifier")
+                    {
+                        imports.push(node_text(child, src).to_string());
+                    }
+                }
+            }
+            // C# public types at namespace level are effectively exports
+            if matches!(
+                kind,
+                "class_declaration"
+                    | "struct_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "delegate_declaration"
+                    | "record_declaration"
+            ) {
+                let text = node_text(node, src);
+                if text.contains("public")
+                    && let Some(name) = field_text(node, "name", src)
+                {
+                    exports.push(name.to_string());
+                }
+            }
+        }
     }
 
     // Recurse into children
@@ -2348,6 +2635,7 @@ mod tests {
             Lang::Cpp,
             Lang::Ruby,
             Lang::Php,
+            Lang::CSharp,
         ];
         for lang in langs {
             let _parser = get_parser(lang); // should not panic
@@ -3361,6 +3649,130 @@ mod tests {
         let fi = imports_from(Lang::Rust, "");
         assert!(fi.imports.is_empty());
         assert!(fi.exports.is_empty());
+    }
+
+    // ---------- C# language detection ----------
+
+    #[test]
+    fn detect_csharp() {
+        assert_eq!(detect_language(Path::new("a.cs")), Some(Lang::CSharp));
+    }
+
+    // ---------- C# parsing ----------
+
+    #[test]
+    fn parse_csharp_file() {
+        let src = "class Hello { static void Main() {} }";
+        let (tree, lang) = parse_temp("cs", src).unwrap();
+        assert_eq!(lang, Lang::CSharp);
+        assert!(!tree.root_node().has_error());
+    }
+
+    // ---------- C# symbol extraction ----------
+
+    #[test]
+    fn csharp_class_and_methods() {
+        let src = "public class Calculator {\n    public int Add(int a, int b) { return a + b; }\n    public Calculator() {}\n}";
+        let syms = extract_from(Lang::CSharp, src);
+        let cls = find_sym(&syms, "Calculator");
+        assert_eq!(cls.kind, SymbolKind::Class);
+        assert_eq!(cls.language, "C#");
+        let m = find_sym(&syms, "Add");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.scope.as_deref(), Some("Calculator"));
+    }
+
+    #[test]
+    fn csharp_struct() {
+        let src = "public struct Point {\n    public int X;\n    public int Y;\n}";
+        let syms = extract_from(Lang::CSharp, src);
+        let s = find_sym(&syms, "Point");
+        assert_eq!(s.kind, SymbolKind::Struct);
+    }
+
+    #[test]
+    fn csharp_interface() {
+        let src = "public interface IComparable {\n    int CompareTo(object o);\n}";
+        let syms = extract_from(Lang::CSharp, src);
+        let i = find_sym(&syms, "IComparable");
+        assert_eq!(i.kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn csharp_enum() {
+        let src = "enum Direction { North, South, East, West }";
+        let syms = extract_from(Lang::CSharp, src);
+        let e = find_sym(&syms, "Direction");
+        assert_eq!(e.kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn csharp_namespace() {
+        let src = "namespace MyApp {\n    class Foo {}\n}";
+        let syms = extract_from(Lang::CSharp, src);
+        let ns = find_sym(&syms, "MyApp");
+        assert_eq!(ns.kind, SymbolKind::Module);
+        let cls = find_sym(&syms, "Foo");
+        assert_eq!(cls.kind, SymbolKind::Class);
+        assert_eq!(cls.scope.as_deref(), Some("MyApp"));
+    }
+
+    #[test]
+    fn csharp_delegate() {
+        let src = "public delegate void EventHandler(object sender);";
+        let syms = extract_from(Lang::CSharp, src);
+        let d = find_sym(&syms, "EventHandler");
+        assert_eq!(d.kind, SymbolKind::TypeAlias);
+    }
+
+    #[test]
+    fn csharp_const_and_field() {
+        let src = "class Config {\n    public const int MAX = 100;\n    private int _count;\n}";
+        let syms = extract_from(Lang::CSharp, src);
+        let c = find_sym(&syms, "MAX");
+        assert_eq!(c.kind, SymbolKind::Constant);
+        assert_eq!(c.scope.as_deref(), Some("Config"));
+        let v = find_sym(&syms, "_count");
+        assert_eq!(v.kind, SymbolKind::Variable);
+    }
+
+    #[test]
+    fn csharp_property() {
+        let src = "class User {\n    public string Name { get; set; }\n}";
+        let syms = extract_from(Lang::CSharp, src);
+        let p = find_sym(&syms, "Name");
+        assert_eq!(p.kind, SymbolKind::Method);
+        assert_eq!(p.scope.as_deref(), Some("User"));
+    }
+
+    // ---------- C# reference extraction ----------
+
+    #[test]
+    fn csharp_call_reference() {
+        let src = "class Foo {\n    void Bar() {\n        Console.WriteLine(\"hi\");\n        DoStuff();\n    }\n}";
+        let refs = refs_from(Lang::CSharp, src);
+        assert!(has_ref(&refs, "WriteLine", ReferenceKind::Call));
+        assert!(has_ref(&refs, "DoStuff", ReferenceKind::Call));
+    }
+
+    #[test]
+    fn csharp_import_reference() {
+        let src = "using System;\nusing System.Collections.Generic;\nclass Foo {}";
+        let refs = refs_from(Lang::CSharp, src);
+        assert!(
+            refs.iter()
+                .any(|r| r.kind == ReferenceKind::Import && r.name.contains("System"))
+        );
+    }
+
+    // ---------- C# import extraction ----------
+
+    #[test]
+    fn csharp_imports() {
+        let src = "using System;\nusing System.Linq;\nclass Foo {}";
+        let fi = imports_from(Lang::CSharp, src);
+        assert!(fi.imports.iter().any(|i| i == "System"));
+        assert!(fi.imports.iter().any(|i| i == "System.Linq"));
     }
 
     /// Debug helper: print the tree structure to understand node kinds.

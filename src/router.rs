@@ -3,7 +3,7 @@
 //! [`dispatch`] handles CLI command dispatch.  [`QueryRouter`] provides the
 //! core query interface: it tries the SQLite index first and, when the index
 //! is unavailable or returns no results, falls back to grep-based heuristic
-//! search patterns that cover all 10 supported languages.
+//! search patterns that cover all 11 supported languages.
 
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -1368,7 +1368,7 @@ fn dispatch_ls<W: io::Write>(
 
 /// Build a regex pattern to find symbol definitions via grep.
 ///
-/// Covers all 10 supported languages:
+/// Covers all 11 supported languages:
 ///   Rust:       `fn`, `pub fn`, `pub(crate) fn`, `struct`, `enum`, `trait`
 ///   Python:     `def`, `class`
 ///   Ruby:       `def`, `class`, `module`
@@ -1379,10 +1379,11 @@ fn dispatch_ls<W: io::Write>(
 ///   C:          function-like patterns (captured by generic regex)
 ///   C++:        `class`, `struct`, `enum`, function-like patterns
 ///   PHP:        `function`, `class`, `interface`, `trait`
+///   C#:         `class`, `struct`, `interface`, `enum`, `delegate`
 pub fn symbol_grep_pattern(name: &str) -> String {
     // Use word boundary around the name to reduce false positives.
     format!(
-        r"(fn|pub\s+fn|pub\(crate\)\s+fn|def|function|func|class|struct|enum|trait|interface|module|type|const|let|var|val)\s+{}\b",
+        r"(fn|pub\s+fn|pub\(crate\)\s+fn|def|function|func|class|struct|enum|trait|interface|module|type|const|let|var|val|delegate)\s+{}\b",
         regex_escape(name)
     )
 }
@@ -1396,7 +1397,7 @@ pub fn symbol_kind_grep_pattern(name: &str, kind: &str) -> String {
         "interface" => "interface",
         "enum" => "enum",
         "trait" => "trait",
-        "type_alias" => "type",
+        "type_alias" => "type|delegate",
         "constant" => "const",
         "variable" => "let|var|val",
         "module" => "module|mod",
@@ -1415,7 +1416,7 @@ pub fn reference_grep_pattern(name: &str) -> String {
 
 /// Build a regex pattern to find import/use statements mentioning a name.
 ///
-/// Covers all 10 supported languages:
+/// Covers all 11 supported languages:
 ///   Rust:       `use ... name`
 ///   Python:     `import name`, `from ... import name`
 ///   Ruby:       `require ... name`
@@ -1425,9 +1426,10 @@ pub fn reference_grep_pattern(name: &str) -> String {
 ///   Java:       `import ... name`
 ///   C/C++:      `#include ... name`
 ///   PHP:        `use ... name`, `require ... name`, `include ... name`
+///   C#:         `using ... name`
 pub fn import_grep_pattern(name: &str) -> String {
     format!(
-        r"(import|from|require|use|include)\s+.*{}",
+        r"(import|from|require|use|using|include)\s+.*{}",
         regex_escape(name)
     )
 }

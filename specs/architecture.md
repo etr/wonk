@@ -1,7 +1,7 @@
 # System Architecture
 
-**Version:** 0.2
-**Last updated:** 2026-02-13
+**Version:** 0.3
+**Last updated:** 2026-02-24
 **Status:** Draft
 **Owner:** TBD
 
@@ -17,6 +17,8 @@ It combines a Tree-sitter-based structural indexer with the `grep` crate (ripgre
 
 The architecture prioritizes simplicity and low resource usage. A single Rust crate organized into modules handles both CLI queries and background indexing. The daemon process shares the SQLite database with CLI invocations — no IPC protocol is needed. Concurrency uses sync Rust with `rayon` for parallel indexing; no async runtime is required since all workloads are CPU-bound or event-driven (filesystem watching). V2's Ollama HTTP calls use `ureq`, a sync blocking HTTP client that fits the no-async constraint.
 
+**V3 adds source display, code summaries, and call graph analysis.** `wonk show` collapses symbol lookup + file reading into a single call that returns exactly the source span tree-sitter already knows — halving round-trip latency for LLM agents. `wonk summary` provides structural metrics and optional LLM-generated descriptions of files and directories via Ollama's `/api/generate` endpoint. `wonk callers`, `wonk callees`, and `wonk callpath` enable symbol-level call graph navigation by recording the enclosing function for each call-site reference during indexing, enabling agents to trace execution paths and understand blast radius at the function level.
+
 Key technology choices: Rust for single static binary distribution and native Tree-sitter/SQLite FFI, SQLite with FTS5 for persistent symbol storage, the `grep` and `ignore` crates from ripgrep for text search and file filtering, `notify` for cross-platform filesystem watching, `ureq` for sync HTTP to Ollama, and `linfa-clustering` for K-Means clustering.
 
 ---
@@ -29,6 +31,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - Zero-config first use — auto-initializes on first query
 - Single binary, no external dependencies (V1) — trivial to install and distribute
 - **Vocabulary gap bridging (V2):** Semantic search finds functionally related code even when terminology doesn't overlap — essential for LLM agents searching by intent rather than exact names
+- **Round-trip reduction (V3):** `wonk show` eliminates the symbol-lookup-then-file-read round-trip; `wonk summary` provides high-level orientation without reading every file; call graph commands trace execution paths without manual grep chains
 
 ### 2.2 Quality Attributes (from PRD NFRs)
 
@@ -45,6 +48,10 @@ Key technology choices: Rust for single static binary distribution and native Tr
 | Binary size | < 30 MB | Static binary with bundled SQLite, Tree-sitter grammars, grep engine |
 | Storage | ~1 MB per 10k symbols | SQLite with appropriate indexes |
 | Storage (embeddings) | ~3 KB per symbol (768 × f32) | BLOBs in SQLite; ~146 MB for 50k vectors |
+| Storage (V3 additions) | ~4 bytes per reference (caller_id); ~0.5 KB per summary cache entry | Additive: ~4 MB per 1M references; summaries table negligible for typical repos |
+| Latency (show) | < 50ms for source display | Index lookup + file read; no re-parse needed |
+| Latency (summary) | < 100ms structural; 1-5s with `--semantic` | Index aggregation; LLM generation cached in SQLite |
+| Latency (callers/callees) | < 100ms depth-1; < 500ms depth-10 | SQL JOIN on `caller_id`; BFS traversal for callpath |
 
 ### 2.3 Constraints
 - **Language:** Rust (required for single static binary, native Tree-sitter FFI, grep crate access)
@@ -66,6 +73,8 @@ Key technology choices: Rust for single static binary distribution and native Tr
 │  Subcommands: search, sym, ref, sig, ls, deps, rdeps,       │
 │               init, update, status, daemon, repos,           │
 │               ask, cluster, impact                  [V2]     │
+│               show, summary, callers, callees,      [V3]     │
+│               callpath                              [V3]     │
 ├─────────────────────────────────────────────────────────────┤
 │                     Query Router                              │
 │  Routes queries to index, grep, or semantic backends          │
@@ -109,6 +118,9 @@ Key technology choices: Rust for single static binary distribution and native Tr
 | Semantic Search [V2] | Cosine similarity search, result blending, dependency-scoped queries | rayon, custom module |
 | Clustering Engine [V2] | K-Means clustering of symbol embeddings | linfa-clustering 0.8, ndarray |
 | Impact Analyzer [V2] | Detect changed symbols, find semantically similar code | Custom module (git CLI, embedding comparison) |
+| Source Display [V3] | Look up symbol in index, read source span from file | Custom module (index query + file read) |
+| Code Summary Engine [V3] | Structural metrics aggregation, LLM description generation + caching | Custom module, ureq (Ollama `/api/generate`) |
+| Call Graph [V3] | Record enclosing callers during indexing, traverse caller/callee relationships | Custom module (Tree-sitter parent traversal, BFS) |
 
 ---
 
@@ -136,10 +148,16 @@ Key technology choices: Rust for single static binary distribution and native Tr
   - `wonk cluster <path>` — semantic clustering with `--json` flag
   - `wonk impact <file>` — change impact analysis with `--since`, `--json` flags
   - `wonk search --semantic` — blended structural + semantic results
+- V3 subcommands:
+  - `wonk show <name>` — source display with `--file`, `--kind`, `--exact`, `--shallow`, `--budget` flags
+  - `wonk summary <path>` — structural summary with `--detail`, `--depth`, `--recursive`, `--semantic` flags
+  - `wonk callers <symbol>` — list caller functions with `--depth` flag
+  - `wonk callees <symbol>` — list callee functions with `--depth` flag
+  - `wonk callpath <from> <to>` — find call chain between two symbols
 - **Auto-init embedding delegation (PRD-SEM-REQ-009):** When auto-init is triggered by a query, the CLI builds the structural index synchronously, then writes a `embedding_build_requested = 1` flag to the `daemon_status` table. The daemon reads this flag on startup and begins embedding generation in the background.
 - **Block-and-wait for incomplete embeddings (PRD-SEM-REQ-013):** When `wonk ask` detects embeddings are incomplete, the CLI calls `Embedding Engine::embed_repo()` directly with a progress callback that prints to stderr, blocking until complete, then proceeds with the semantic query.
 
-**Related Requirements:** PRD-OUT-REQ-001, PRD-OUT-REQ-002, PRD-OUT-REQ-003, PRD-AUT-REQ-001, PRD-DMN-REQ-002, PRD-DMN-REQ-011 through PRD-DMN-REQ-015, PRD-SSRCH-REQ-006, PRD-SEM-REQ-001 through PRD-SEM-REQ-005, PRD-SEM-REQ-009, PRD-SEM-REQ-013, PRD-SCLST-REQ-001 through PRD-SCLST-REQ-003, PRD-SIMP-REQ-001 through PRD-SIMP-REQ-004
+**Related Requirements:** PRD-OUT-REQ-001, PRD-OUT-REQ-002, PRD-OUT-REQ-003, PRD-AUT-REQ-001, PRD-DMN-REQ-002, PRD-DMN-REQ-011 through PRD-DMN-REQ-015, PRD-SSRCH-REQ-006, PRD-SEM-REQ-001 through PRD-SEM-REQ-005, PRD-SEM-REQ-009, PRD-SEM-REQ-013, PRD-SCLST-REQ-001 through PRD-SCLST-REQ-003, PRD-SIMP-REQ-001 through PRD-SIMP-REQ-004, PRD-SHOW-REQ-001 through PRD-SHOW-REQ-013, PRD-SUM-REQ-001 through PRD-SUM-REQ-018, PRD-CGR-REQ-001 through PRD-CGR-REQ-014
 
 ### 4.2 Query Router
 
@@ -259,6 +277,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Multi-daemon management (DR-013):** `wonk daemon list` scans PID files via glob `~/.wonk/repos/*/daemon.pid` to discover all running daemons. `wonk daemon stop --all` iterates and sends SIGTERM to each (PRD-DMN-REQ-014, PRD-DMN-REQ-015).
 - **Worktree boundary filtering (DR-008):** The `should_process` event filter checks whether an event path falls within a nested worktree boundary by walking ancestor directories (between the event path and the repo root) for `.git` entries. Events inside a nested boundary are discarded. Cost is O(depth) `exists()` calls per event, negligible since events are debounced.
 - **V2 embedding re-indexing:** After structural re-indexing of changed files, if Ollama is reachable, re-generate chunks and re-embed all symbols belonging to the changed files (PRD-SEM-REQ-010). If Ollama is unreachable, skip embedding update silently and mark affected files as stale in the embeddings table (PRD-SEM-REQ-011).
+- **V3 caller_id population:** Incremental re-indexing of changed files must also populate `caller_id` on new reference rows using the same Tree-sitter parent traversal logic as the full index build (DR-021). This ensures call graph data stays current as files change.
 
 **Related Requirements:** PRD-DMN-REQ-001 through PRD-DMN-REQ-015, PRD-WKT-REQ-004, PRD-SEM-REQ-009, PRD-SEM-REQ-010, PRD-SEM-REQ-011
 
@@ -275,10 +294,11 @@ Key technology choices: Rust for single static binary distribution and native Tr
 **Key Design Notes:**
 - Load order: defaults → global config → per-repo config (last wins)
 - All config is optional — sensible defaults baked in
-- Config sections: `[daemon]`, `[index]`, `[output]`, `[ignore]`
+- Config sections: `[daemon]`, `[index]`, `[output]`, `[ignore]`, `[llm]` [V3]
 - **V2 change:** `daemon.idle_timeout_minutes` config key removed — daemons now run indefinitely (PRD-DMN-REQ-003 removed, PRD-CFG-REQ-004 struck through). See DR-013 for rationale.
+- **V3 change:** `[llm]` section added with `model` key (default: `"llama3.2:3b"`) for `wonk summary --semantic` text generation (DR-018, PRD-SUM-REQ-014).
 
-**Related Requirements:** PRD-CFG-REQ-001 through PRD-CFG-REQ-010
+**Related Requirements:** PRD-CFG-REQ-001 through PRD-CFG-REQ-010, PRD-SUM-REQ-014
 
 ### 4.8 Embedding Engine [V2]
 
@@ -376,6 +396,114 @@ Key technology choices: Rust for single static binary distribution and native Tr
 
 **Related Requirements:** PRD-SIMP-REQ-001 through PRD-SIMP-REQ-004
 
+### 4.12 Source Display [V3]
+
+**Responsibility:** Look up symbols by name in the index, read their source spans from the source file, and format output with line numbers.
+
+**Technology:** Custom Rust module, no additional dependencies
+
+**Interfaces:**
+- Exposes: `show_symbol(name, options) -> Vec<ShowResult>`
+- Consumes: SQLite Database (symbols table), Filesystem (source files)
+
+**Key Design Notes:**
+- **Source span reading (PRD-SHOW-REQ-001):** Query `symbols` table for matching name, read file lines `line..end_line` for each match. Prefix each line with its 1-based file line number (PRD-SHOW-REQ-008).
+- **Multiple matches (PRD-SHOW-REQ-002):** Display all matches, each preceded by a file header showing `file:start_line-end_line`.
+- **Filtering:** `--file <path>` restricts to symbols in that file (PRD-SHOW-REQ-003). `--kind <kind>` restricts to symbol kind (PRD-SHOW-REQ-004). `--exact` requires exact name match (PRD-SHOW-REQ-005).
+- **Shallow mode (DR-017, PRD-SHOW-REQ-006):** For container types (class, struct, enum, trait, interface), query child symbols via `scope` column match in the same file, then display the container's signature line followed by each child's `signature` field. No Tree-sitter re-parse needed — uses existing index data.
+- **Budget truncation (PRD-SHOW-REQ-007):** Uses the existing budget module (~4 chars/token heuristic) to truncate output and indicate omission.
+- **No index fallback (PRD-SHOW-REQ-009):** Unlike other commands, `wonk show` requires an index. Returns an error directing user to `wonk init` if no index exists.
+- **Missing end_line (PRD-SHOW-REQ-010):** If a symbol has no `end_line`, fall back to displaying the `signature` text from the index.
+- **Missing source file (PRD-SHOW-REQ-011):** If the source file no longer exists, skip the result and emit a warning to stderr.
+- **Structured output (PRD-SHOW-REQ-012):** JSON/TOON response includes fields: `name` (string), `kind` (string), `file` (string), `line` (integer), `end_line` (integer|null), `source` (string — full source body), `language` (string). Defined as `ShowResult` in `types.rs`.
+- **MCP exposure (PRD-SHOW-REQ-013):** `wonk_show` tool with parameters: name (required), kind (optional), file (optional), exact (boolean), shallow (boolean), budget (integer), format (json|toon).
+
+**Related Requirements:** PRD-SHOW-REQ-001 through PRD-SHOW-REQ-013
+
+### 4.13 Code Summary Engine [V3]
+
+**Responsibility:** Aggregate structural metrics for files and directories from the index, optionally generate natural-language descriptions via Ollama LLM, and cache descriptions in SQLite.
+
+**Technology:** Custom Rust module, ureq 3.1 (Ollama `/api/generate`), serde_json
+
+**Interfaces:**
+- Exposes: `summarize_path(db, path, options) -> SummaryResult`
+- Consumes: SQLite Database (symbols, files, summaries tables), Ollama API (`/api/generate`)
+
+**Key Design Notes:**
+- **Structural metrics (PRD-SUM-REQ-001, PRD-SUM-REQ-002):** Query `files` and `symbols` tables to aggregate: file count, line count, symbol count by kind, language breakdown, dependency count. Three detail levels control which metrics are included (PRD-SUM-REQ-003 through PRD-SUM-REQ-005).
+- **Recursion (PRD-SUM-REQ-006 through PRD-SUM-REQ-008):** `--depth N` recursively summarizes children up to N levels. `--recursive` is unlimited depth. Default is depth 0 (target only).
+- **LLM description (DR-018, PRD-SUM-REQ-009):** When `--semantic` is provided, construct a prompt containing structural metrics and symbol signatures, send to Ollama's `POST /api/generate` endpoint with the configured model. Default model is `llama3.2:3b`, overridable via `[llm].model` in config.toml.
+- **LLM prompt construction (PRD-SUM-REQ-010):** The prompt includes: path being summarized, language breakdown, symbol signatures grouped by kind, and import/export relationships. Asks for a 2-3 sentence description of the path's purpose and contents.
+- **Description caching (DR-019, DR-020, PRD-SUM-REQ-011, PRD-SUM-REQ-012):** Cache LLM descriptions in the `summaries` table keyed by path + content hash. Content hash is computed from sorted `(symbol.id, file.hash)` pairs under the path. Cache hit returns instantly without calling Ollama.
+- **Ollama unavailable (PRD-SUM-REQ-013):** Display warning and return structural summary without description.
+- **Model not found (PRD-SUM-REQ-015):** Distinct from Ollama-unreachable. If Ollama is reachable but responds with model-not-found for the configured (or default) model, return an error instructing the user to run `ollama pull <model>` or set `[llm].model` in config.toml. This is an error (not a warning with fallback) because the user explicitly requested `--semantic`.
+- **Structured output (PRD-SUM-REQ-017):** JSON/TOON response includes fields: `path` (string), `type` (`"file"` | `"directory"`), `detail_level` (`"rich"` | `"light"` | `"symbols"`), `metrics` (object: `file_count`, `line_count`, `symbol_count_by_kind`, `language_breakdown`, `dependency_count` — subset varies by detail level), `children` (array of `SummaryResult`, present if depth > 0 or `--recursive`), `description` (string, present only if `--semantic` and Ollama successful). Defined as `SummaryResult` in `types.rs`.
+- **Semantic + recursion interaction (PRD-SUM-REQ-009, PRD-SUM-REQ-006):** When both `--semantic` and `--depth N` (or `--recursive`) are specified, the LLM description is generated only for the top-level target path, not for each child. Generating per-child descriptions would be prohibitively slow (1-5s per Ollama call).
+- **Configuration (DR-018):** `[llm]` section in config.toml with `model` key (default: `"llama3.2:3b"`). Additional keys: `generate_url` (default: `"http://localhost:11434/api/generate"`).
+- **Auto-init (PRD-SUM-REQ-016):** Consistent with PRD-AUT behavior — builds index on first use.
+- **MCP exposure (PRD-SUM-REQ-018):** `wonk_summary` tool with parameters: path (required), detail (optional: rich|light|symbols), depth (optional integer), recursive (optional boolean), semantic (optional boolean), format (json|toon).
+
+**Related Requirements:** PRD-SUM-REQ-001 through PRD-SUM-REQ-018
+
+### 4.14 Call Graph [V3]
+
+**Responsibility:** Record enclosing caller symbols during indexing, query caller/callee relationships, and find call paths between symbols via BFS traversal.
+
+**Technology:** Custom Rust module, no additional dependencies beyond existing Tree-sitter and SQLite
+
+**Interfaces:**
+- Exposes: `callers(db, name, depth) -> Vec<CallerResult>`, `callees(db, name, depth) -> Vec<CalleeResult>`, `callpath(db, from, to) -> Option<Vec<CallPathHop>>`
+- Consumes: SQLite Database (references + symbols tables via `caller_id` JOIN)
+
+**Key Design Notes:**
+- **Enclosing symbol detection (DR-021, PRD-CGR-REQ-001):** During Tree-sitter parsing in the indexer, when a call-site node is encountered, walk up `node.parent()` to find the nearest enclosing function/method node. Record its `symbols.id` as `caller_id` on the reference row. File-scope calls (no enclosing function) get `caller_id = NULL`, treated as `<module>` scope at query time (PRD-CGR-REQ-002).
+- **Data model (DR-015):** `caller_id INTEGER REFERENCES symbols(id)` added to the `references` table. Nullable for file-scope calls. Indexed for efficient JOIN queries.
+- **Callers query (PRD-CGR-REQ-003):** `SELECT DISTINCT s.* FROM references r JOIN symbols s ON r.caller_id = s.id WHERE r.name = ?` — returns all functions whose bodies contain a call to the named symbol.
+- **Callees query (PRD-CGR-REQ-004):** `SELECT DISTINCT r.name, ... FROM references r WHERE r.caller_id IN (SELECT id FROM symbols WHERE name LIKE ?)` — returns all symbols called within the named function's body.
+- **Transitive expansion (PRD-CGR-REQ-005, PRD-CGR-REQ-006):** `--depth N` iteratively expands at each level: depth 1 = direct only, depth 2 = callers/callees of callers/callees, etc. Default depth 1 (PRD-CGR-REQ-007). Cap at depth 10 with warning (PRD-CGR-REQ-008).
+- **Call path (DR-016, PRD-CGR-REQ-009):** BFS from `<from>` symbol expanding callees at each level. Maintains a visited set and parent map to reconstruct the shortest path when `<to>` is reached. Returns the chain of intermediate hops. Reports "no path found" if BFS exhausts the graph (PRD-CGR-REQ-010). Depth capped at 10.
+- **Multiple definitions (PRD-CGR-REQ-011):** When the named symbol has multiple definitions (e.g., same name in different files), include callers/callees from all definitions and indicate which definition each result corresponds to.
+- **Auto-init (PRD-CGR-REQ-012):** Consistent with PRD-AUT behavior — auto-initializes the structural index on first use. Fresh indexes include `caller_id` data from the start. Existing indexes without `caller_id` return empty call graph results with a hint to re-index via `wonk update`.
+- **Index rebuild requirement:** Existing indexes lack `caller_id` data. Repos must re-index (`wonk update`) to populate caller relationships. Call graph queries on old indexes return empty results with a hint to re-index.
+- **MCP exposure (PRD-CGR-REQ-013, PRD-CGR-REQ-014):** `wonk_callers` and `wonk_callees` tools with parameters: name (required), depth (optional, default 1, max 10), format (json|toon). `wonk_callpath` tool with parameters: from (required), to (required), format (json|toon).
+
+**Related Requirements:** PRD-CGR-REQ-001 through PRD-CGR-REQ-014
+
+### 4.15 MCP Server
+
+**Responsibility:** Expose wonk query capabilities as MCP (Model Context Protocol) tools over JSON-RPC 2.0 stdio, enabling AI coding assistants to use wonk without CLI invocation.
+
+**Technology:** Custom Rust module, serde_json for JSON-RPC serialization
+
+**Interfaces:**
+- Exposes: 14 MCP tools over stdio (JSON-RPC 2.0)
+- Consumes: All query backends (Query Router, Semantic Search, Clustering Engine, Impact Analyzer, Source Display, Code Summary Engine, Call Graph)
+
+**Key Design Notes:**
+- **Tool manifest (14 tools):**
+  | Tool | Backend | Added |
+  |------|---------|-------|
+  | `wonk_search` | Text Search + Smart Search Ranker | V1 |
+  | `wonk_sym` | Structural Index | V1 |
+  | `wonk_ref` | Structural Index | V1 |
+  | `wonk_sig` | Structural Index | V1 |
+  | `wonk_ls` | Structural Index | V1 |
+  | `wonk_deps` | Structural Index | V1 |
+  | `wonk_rdeps` | Structural Index | V1 |
+  | `wonk_init` | Pipeline | V1 |
+  | `wonk_status` | SQLite Database | V1 |
+  | `wonk_show` | Source Display | V3 |
+  | `wonk_summary` | Code Summary Engine | V3 |
+  | `wonk_callers` | Call Graph | V3 |
+  | `wonk_callees` | Call Graph | V3 |
+  | `wonk_callpath` | Call Graph | V3 |
+- **Routing:** Each tool handler delegates to its backend component using the same code paths as the CLI subcommands. MCP tools and CLI commands produce identical results.
+- **Parameter mapping:** MCP tool parameters map 1:1 to CLI flags. See sections 4.12, 4.13, 4.14 for parameter specifications per tool.
+- **Error handling:** Backend errors are returned as JSON-RPC error responses with human-readable messages.
+
+**Related Requirements:** PRD-SHOW-REQ-013, PRD-SUM-REQ-018, PRD-CGR-REQ-013, PRD-CGR-REQ-014
+
 ---
 
 ## 5) Data Architecture
@@ -413,7 +541,8 @@ CREATE TABLE references (
     file TEXT NOT NULL,
     line INTEGER NOT NULL,
     col INTEGER NOT NULL,
-    context TEXT                 -- the full line of source for display
+    context TEXT,                -- the full line of source for display
+    caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL  -- [V3] enclosing function (DR-015); NULL for file-scope calls
 );
 
 -- File metadata
@@ -452,12 +581,21 @@ CREATE TABLE embeddings (
 -- [V2] Index for per-file embedding operations (daemon re-embedding, file deletion)
 CREATE INDEX idx_embeddings_file ON embeddings(file);
 
+-- [V3] Cached LLM descriptions for wonk summary --semantic (DR-020)
+CREATE TABLE summaries (
+    path TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,  -- hash of sorted (symbol.id, file.hash) pairs under path (DR-019)
+    description TEXT NOT NULL,   -- LLM-generated natural-language description
+    created_at INTEGER NOT NULL
+);
+
 -- Indexes
 CREATE INDEX idx_symbols_name ON symbols(name);
 CREATE INDEX idx_symbols_file ON symbols(file);
 CREATE INDEX idx_symbols_kind ON symbols(kind);
 CREATE INDEX idx_references_name ON references(name);
 CREATE INDEX idx_references_file ON references(file);
+CREATE INDEX idx_references_caller ON references(caller_id);  -- [V3] for callers/callees queries (DR-015)
 ```
 
 ### 5.3 Data Flow
@@ -485,6 +623,35 @@ CREATE INDEX idx_references_file ON references(file);
 2. Query Router checks index: `SELECT * FROM symbols WHERE name LIKE '%<name>%'` (or FTS5 for performance)
 3. If results found → format and print
 4. If no results → fall back to grep crate with heuristic patterns
+
+**Source display (`wonk show <name>`) [V3]:**
+1. CLI opens read-only SQLite connection
+2. Query `symbols` table for matching name (with optional `--kind`, `--file`, `--exact` filters)
+3. For each matching symbol: read source file lines `line..end_line`
+4. If `--shallow` and symbol is a container type: query child symbols via `scope` match, display container signature + child signatures (DR-017)
+5. If `--budget` specified: truncate output to token budget
+6. Format with line numbers and file headers
+
+**Code summary (`wonk summary <path>`) [V3]:**
+1. CLI opens SQLite connection
+2. Query `files` and `symbols` tables to aggregate metrics for the target path
+3. If `--depth N` or `--recursive`: recursively aggregate for child paths
+4. If `--semantic`: compute content hash from `(symbol.id, file.hash)` pairs (DR-019), check `summaries` table for cache hit
+5. On cache miss: construct prompt with structural metrics + symbol signatures, call Ollama `POST /api/generate` with configured model (DR-018), store result in `summaries` table (DR-020)
+6. If Ollama unreachable: return structural summary with warning
+
+**Callers/callees query (`wonk callers <symbol>`) [V3]:**
+1. CLI opens read-only SQLite connection
+2. Query `references` JOIN `symbols` on `caller_id` to find callers (or callees via reverse join)
+3. If `--depth > 1`: iteratively expand at each level using BFS, up to depth cap of 10
+4. Format results with file path, line, symbol name, kind
+
+**Call path query (`wonk callpath <from> <to>`) [V3]:**
+1. CLI opens read-only SQLite connection
+2. Resolve `<from>` and `<to>` to symbol IDs via `symbols` table
+3. BFS from `<from>` expanding callees at each level (DR-016), maintaining visited set + parent map
+4. If `<to>` reached: reconstruct shortest path via parent map, return chain of hops
+5. If BFS exhausts graph or depth cap reached: return "no path found"
 
 **Semantic query (`wonk ask <query>`) [V2]:**
 1. CLI opens SQLite connection
@@ -537,12 +704,17 @@ Repo path hash: SHA256 of the canonical repo root path, truncated to first 16 he
 | System | Protocol | Purpose | Failure Handling |
 |--------|----------|---------|------------------|
 | Ollama | HTTP (localhost:11434) | Embedding generation via `nomic-embed-text` | Graceful degradation: V1 features work without Ollama; `wonk ask` returns clear error; daemon skips re-embedding and marks files stale |
+| Ollama [V3] | HTTP (localhost:11434) | Text generation via `/api/generate` for `wonk summary --semantic` | Graceful degradation: structural summary returned without description; warning emitted |
 
 **Ollama API details:**
-- Endpoint: `POST http://localhost:11434/api/embed`
-- Request: `{"model": "nomic-embed-text", "input": ["chunk1", "chunk2", ...]}`
-- Response: `{"embeddings": [[f32; 768], ...]}`
-- Batch size: Multiple chunks per request for throughput
+- Embed endpoint: `POST http://localhost:11434/api/embed`
+  - Request: `{"model": "nomic-embed-text", "input": ["chunk1", "chunk2", ...]}`
+  - Response: `{"embeddings": [[f32; 768], ...]}`
+  - Batch size: Multiple chunks per request for throughput
+- Generate endpoint [V3]: `POST http://localhost:11434/api/generate`
+  - Request: `{"model": "<configured model>", "prompt": "<summary prompt>", "stream": false}`
+  - Response: `{"response": "<generated text>", ...}`
+  - Default model: `llama3.2:3b` (configurable via `[llm].model` in config.toml)
 - Reachability check: `GET http://localhost:11434/` (returns 200 if running)
 - No authentication required (localhost-only)
 
@@ -1092,18 +1264,238 @@ GitHub Actions workflow:
 
 ---
 
+### DR-015: Call Graph Data Model [V3]
+
+**Status:** Accepted
+**Date:** 2026-02-24
+**Context:** `wonk callers`, `wonk callees`, and `wonk callpath` require knowing which function contains each call-site reference. The current `references` table records name, file, line, col, and context — but no link to the enclosing symbol. (PRD-CGR-REQ-001 through PRD-CGR-REQ-014)
+
+**Options Considered:**
+1. **Add `caller_id` column to `references` table** — INTEGER column referencing `symbols(id)` for the enclosing function/method
+   - Pros: Single table, simple JOINs, minimal schema change (one new nullable column), backward compatible (existing refs get NULL)
+   - Cons: Nullable for file-scope refs; requires index rebuild to populate
+2. **Separate `call_edges` table** — New table `call_edges(caller_symbol_id, callee_name, file, line)`
+   - Pros: Clean separation, no nullable columns, call-graph-specific indexes
+   - Cons: Duplicates data already in references, two tables to maintain, more complex indexer
+3. **Add `caller_name` + `caller_file` columns to `references`** — Denormalized enclosing symbol info
+   - Pros: Fast callers queries without JOIN
+   - Cons: Denormalized duplication, harder to resolve to full symbol info
+
+**Decision:** Option 1 — Add `caller_id` column to `references` table
+
+**Rationale:** Simplest schema change that uses proper normalization with the existing `symbols` table. Enables rich queries via a single JOIN. The nullable `caller_id` for file-scope refs is a clean representation of PRD-CGR-REQ-002's `<module>` case. Existing indexes without `caller_id` simply return empty call graph results with a re-index hint.
+
+**Consequences:**
+- `references` table gains `caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL`
+- New index: `idx_references_caller ON references(caller_id)` for efficient callers queries
+- Existing repos must re-index (`wonk update`) to populate caller relationships
+- Call graph queries on old indexes return empty results with hint to re-index
+
+---
+
+### DR-016: Call Graph Traversal Algorithm [V3]
+
+**Status:** Accepted
+**Date:** 2026-02-24
+**Context:** `wonk callpath <from> <to>` needs to find a chain of calls connecting two symbols. `wonk callers --depth N` and `wonk callees --depth N` need transitive expansion at each depth level. The call graph is a directed graph where edges are caller→callee relationships. Typical codebase graphs are sparse with depth rarely exceeding 10-15 hops. PRD caps traversal at depth 10. (PRD-CGR-REQ-005 through PRD-CGR-REQ-010)
+
+**Options Considered:**
+1. **BFS (Breadth-First Search)** — BFS from `<from>` expanding callees, stopping when `<to>` found
+   - Pros: Guarantees shortest path, simple queue + visited set, natural depth limiting, matches existing BFS pattern in `semantic.rs`
+   - Cons: Explores all nodes at each depth level (memory proportional to branching factor)
+2. **Bidirectional BFS** — BFS from both ends simultaneously
+   - Pros: Much faster for deep graphs (√n exploration)
+   - Cons: More complex, marginal benefit given depth-10 cap
+3. **DFS with depth limit** — Depth-first with backtracking
+   - Pros: Lower memory usage
+   - Cons: Does NOT guarantee shortest path, may explore deep dead-ends first
+
+**Decision:** Option 1 — BFS
+
+**Rationale:** Guarantees shortest call path, matches the existing BFS pattern used for dependency traversal in `semantic.rs`, and the depth-10 cap keeps memory trivial. Bidirectional BFS is over-engineered for this scale. The same BFS approach applies to transitive callers/callees expansion: each BFS level corresponds to one depth increment, iteratively expanding from the starting symbol(s). Application-level BFS is preferred over SQL recursive CTEs to avoid SQLite recursion limits on deep call chains.
+
+**Consequences:**
+- `callpath` uses a simple BFS with queue + visited set + parent map
+- Returns the shortest call chain (fewest hops)
+- `callers --depth N` and `callees --depth N` use the same iterative BFS pattern, expanding one level per iteration
+- Depth capped at 10 — BFS level corresponds directly to hop count
+- Consistent pattern with `semantic.rs` dependency traversal
+
+---
+
+### DR-017: Source Display Shallow Mode [V3]
+
+**Status:** Accepted
+**Date:** 2026-02-24
+**Context:** `wonk show --shallow` for container types (class, struct, enum, trait, interface) should display the container signature and member signatures without member bodies. Need to decide how to extract member signatures. (PRD-SHOW-REQ-006)
+
+**Options Considered:**
+1. **File read + Tree-sitter re-parse** — Re-parse the source span and extract direct children's signatures
+   - Pros: Accurate even if index is slightly stale, works from live file
+   - Cons: Adds Tree-sitter parse (~1-5ms per symbol), more complex code path
+2. **Index-based child lookup** — Query symbols where `scope` matches the container name in the same file, display each child's `signature` field
+   - Pros: No re-parse needed, pure index query, fast, uses existing data (`scope` + `signature` columns)
+   - Cons: Depends on `scope` being correctly populated
+
+**Decision:** Option 2 — Index-based child lookup
+
+**Rationale:** Simpler implementation that leverages existing index data. The `scope` column is already populated by the indexer for methods under classes, and the `signature` column stores the text needed for display. Avoids an unnecessary Tree-sitter re-parse and aligns with the tool's philosophy of leveraging the index.
+
+**Consequences:**
+- Shallow mode queries: `SELECT signature FROM symbols WHERE scope = ? AND file = ?`
+- Falls back to reading just the symbol's start line if `signature` is empty
+- Depends on `scope` correctness — already validated by existing structural queries
+
+---
+
+### DR-018: LLM Generation Model Configuration [V3]
+
+**Status:** Accepted
+**Date:** 2026-02-24
+**Context:** `wonk summary --semantic` generates descriptions via Ollama's `/api/generate` endpoint. Need to decide whether to require explicit model configuration or provide a sensible default. (PRD-SUM-REQ-014, PRD-SUM-REQ-015)
+
+**Options Considered:**
+1. **No default model — require explicit config** — `--semantic` without `[llm].model` returns error with instructions
+   - Pros: User consciously chooses model, no surprise resource usage, matches original PRD
+   - Cons: Extra friction on first use
+2. **Default model with config override** — Ship with `llama3.2:3b` as default, overridable via `[llm].model`
+   - Pros: Works out of the box if Ollama has the model pulled, less friction
+   - Cons: Default model may not be pulled (clear error), opinionated choice
+
+**Decision:** Option 2 — Default model (`llama3.2:3b`) with config override
+
+**Rationale:** Reduces first-use friction. If the default model isn't pulled, Ollama returns a clear error that guides the user to pull it. A small model (3B) is a sensible default that runs on most developer machines. Power users override via config.
+
+**Consequences:**
+- `[llm].model` in config.toml defaults to `"llama3.2:3b"` if not specified
+- PRD-SUM-REQ-015 updated to reflect default model behavior instead of error-on-missing
+- If Ollama returns model-not-found error, display message instructing user to `ollama pull` or configure a different model
+
+---
+
+### DR-019: Summary Description Cache Invalidation [V3]
+
+**Status:** Accepted
+**Date:** 2026-02-24
+**Context:** LLM-generated descriptions are expensive (~1-5s per call). Need a cache invalidation strategy that correctly regenerates when content changes but avoids unnecessary regeneration. (PRD-SUM-REQ-011, PRD-SUM-REQ-012)
+
+**Options Considered:**
+1. **Hash of symbol IDs + file content hashes** — Compute hash over sorted `(symbol.id, file.hash)` pairs under the target path
+   - Pros: Precise invalidation, uses existing `files.hash` (xxhash), cheap to compute
+   - Cons: Adding/removing files invalidates (correct behavior)
+2. **Hash of structural metrics only** — Cache key is aggregate metrics (file count, symbol count, line count)
+   - Pros: Very cheap to compute
+   - Cons: Misses meaningful content changes that don't alter counts
+3. **Timestamp-based TTL** — Cache with expiry (e.g., 1 hour)
+   - Pros: Simplest implementation
+   - Cons: Stale descriptions within TTL, unnecessary regeneration when nothing changed
+
+**Decision:** Option 1 — Hash of symbol IDs + file content hashes
+
+**Rationale:** Content-based invalidation using data the indexer already maintains. Correct, cheap (query + hash), and avoids both false positives (unnecessary regeneration) and false negatives (stale descriptions after content changes).
+
+**Consequences:**
+- Cache key: `(path, SHA256(sorted [(symbol.id, file.hash), ...]))` for all files under path
+- Cache hit: instant return without Ollama call
+- Cache miss: generate description, store in `summaries` table
+- File content changes detected via existing xxhash values in `files` table
+
+---
+
+### DR-020: Summary Cache Storage [V3]
+
+**Status:** Accepted
+**Date:** 2026-02-24
+**Context:** Need to store cached LLM descriptions for `wonk summary --semantic` in SQLite. (PRD-SUM-REQ-011)
+
+**Options Considered:**
+1. **Dedicated `summaries` table** — `summaries(path TEXT PRIMARY KEY, content_hash TEXT, description TEXT, created_at INTEGER)`
+   - Pros: Clean separation, simple queries, easy to clear without touching other tables
+   - Cons: One more table in the schema
+2. **Reuse key-value pattern** — Store in a generic metadata table (like `daemon_status`)
+   - Pros: No new table
+   - Cons: Awkward compound keys, mixes concerns
+
+**Decision:** Option 1 — Dedicated `summaries` table
+
+**Rationale:** Clean, purpose-built, simple queries. A `SELECT WHERE path = ? AND content_hash = ?` is the entire cache lookup. Easy to `DELETE FROM summaries` to clear all cached descriptions without risk.
+
+**Consequences:**
+- New table: `summaries(path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, description TEXT NOT NULL, created_at INTEGER NOT NULL)`
+- Cache lookup: `SELECT description FROM summaries WHERE path = ? AND content_hash = ?`
+- Cache miss (hash mismatch): `INSERT OR REPLACE` with new description
+- `wonk update` can optionally clear cached summaries
+
+---
+
+### DR-021: Call Graph Enclosing Symbol Detection [V3]
+
+**Status:** Accepted
+**Date:** 2026-02-24
+**Context:** The indexer must record the enclosing function/method for each call-site reference to populate `caller_id` (DR-015). Need to decide how to identify the enclosing symbol during Tree-sitter parsing. (PRD-CGR-REQ-001, PRD-CGR-REQ-002)
+
+**Options Considered:**
+1. **Tree-sitter parent traversal at parse time** — Walk `node.parent()` from each call-site to find nearest enclosing function/method node
+   - Pros: Simple, uses Tree-sitter's concrete syntax tree natively, O(depth) per call site, happens during existing parse pass
+   - Cons: Must map Tree-sitter node kinds to symbol kinds per language (already done in indexer)
+2. **Post-processing pass using line ranges** — After extracting symbols and references, match each reference to the symbol whose `line..end_line` range contains it
+   - Pros: Decoupled from Tree-sitter traversal
+   - Cons: Requires second pass, line-range containment ambiguous for nested scopes, more complex
+
+**Decision:** Option 1 — Tree-sitter parent traversal at parse time
+
+**Rationale:** Uses the tree structure for exactly what it's designed for. The indexer already maps node kinds to symbol kinds per language, so identifying "is this parent a function?" is a reuse of existing logic. No second pass, no ambiguity, no additional data structures.
+
+**Consequences:**
+- Indexer's reference extraction code gains a `find_enclosing_function(node)` helper that walks `node.parent()` upward
+- Maps parent node kinds to symbol IDs using the already-extracted symbols for the current file
+- File-scope calls (no enclosing function found) get `caller_id = NULL`
+- All 11 supported languages need their function/method node kinds mapped (most already are)
+
+---
+
+### DR-022: MCP Server V3 Tool Expansion [V3]
+
+**Status:** Accepted
+**Date:** 2026-02-24
+**Context:** V3 adds 5 new CLI subcommands (show, summary, callers, callees, callpath) that should be accessible to AI coding assistants via MCP. Need to decide whether to extend the existing MCP server or create a versioned/separate interface. (PRD-SHOW-REQ-013, PRD-SUM-REQ-018, PRD-CGR-REQ-013, PRD-CGR-REQ-014)
+
+**Options Considered:**
+1. **Extend existing MCP server** — Add 5 new tool handlers to `mcp.rs`, increasing tool count from 9 to 14
+   - Pros: Single server, additive change (no breaking changes), MCP clients automatically discover new tools, each tool maps 1:1 to its CLI subcommand
+   - Cons: Growing handler count in one file (manageable at 14)
+2. **Versioned MCP server** — Separate V3 tool manifest, clients must opt in
+   - Pros: Backward compatibility guaranteed
+   - Cons: Over-engineered — MCP tool addition is inherently additive and non-breaking
+
+**Decision:** Option 1 — Extend existing MCP server
+
+**Rationale:** MCP tool addition is additive — existing tools remain unchanged, new tools are discovered automatically by clients. There's no breaking change to justify versioning. Each new tool reuses the same routing pattern as existing tools, delegating to its backend component. The 1:1 mapping between CLI subcommands and MCP tools keeps the interface predictable.
+
+**Consequences:**
+- `mcp.rs` gains 5 new tool handler functions routing to `show.rs`, `summary.rs`, and `callgraph.rs`
+- Tool count increases from 9 to 14
+- No changes to existing tool contracts
+- MCP clients (Claude Code, Aider, etc.) discover new tools automatically via `tools/list`
+
+---
+
 ## 12) Open Questions & Risks
 
 | ID | Question/Risk | Impact | Mitigation | Owner |
 |----|---------------|--------|------------|-------|
 | AR-001 | grep crate documentation is sparse — may be hard to use correctly | M | Reference ripgrep source code for usage patterns | Eng |
 | AR-002 | WAL file growth under sustained heavy writes (e.g., initial index of 50k files) | L | SQLite auto-checkpoints; busy_timeout handles writer contention | Eng |
-| AR-003 | Binary size budget (30 MB) with 10 bundled grammars + SQLite + grep engine + V2 crates | M | Monitor in CI; strip binaries; consider LTO | Eng |
+| AR-003 | Binary size budget (30 MB) with 10 bundled grammars + SQLite + grep engine + V2 crates + V3 modules (show, summary, callgraph) | M | V3 adds no new crates — three pure-Rust modules add ~0.1-0.3 MB; ureq already present for V2; monitor in CI; strip binaries; consider LTO | Eng |
 | AR-004 | Windows cross-compilation with C FFI deps (SQLite, Tree-sitter) | L | P2 priority; can switch to native Windows runner if cross fails | Eng |
 | AR-005 | tree-sitter 0.26 deprecated APIs (set_timeout_micros, set_allocator) | L | Use progress callbacks instead; monitor for 0.27 migration | Eng |
 | AR-006 | Similarity threshold calibration — should there be a minimum cosine similarity cutoff? | M | Test with real queries; may need empirical calibration before setting a default | Eng |
 | AR-007 | Memory usage for 50K+ vector brute-force search (~146 MB) may be high on constrained machines | M | Monitor; truncation (DR-012) can be added as opt-in if needed | Eng |
 | AR-008 | Ollama availability — users must install and run Ollama separately for V2 features | M | Clear error messages; all V1 features work without Ollama; installation docs | Eng |
+| AR-009 | Call graph accuracy for dynamic dispatch — virtual calls, trait objects, function pointers cannot be resolved statically | M | Document limitation; out of scope per PRD-CGR; name-based matching catches most cases | Eng |
+| AR-010 | Index migration for `caller_id` — existing repos need re-index for call graph features | L | Detect missing `caller_id` at query time; display re-index hint; non-breaking for existing features | Eng |
+| AR-011 | Default LLM model (`llama3.2:3b`) may not be pulled in Ollama | L | Clear error message guiding user to `ollama pull` or configure alternative model | Eng |
+| AR-012 | Summary cache invalidation precision — content hash based on symbol IDs + file hashes may trigger regeneration on unrelated file changes within the target path | L | Acceptable: regeneration is correct behavior; cost is 1-5s per call | Eng |
 
 ---
 
@@ -1126,6 +1518,9 @@ GitHub Actions workflow:
 | nomic-embed-text | Embedding model producing 768-dim vectors; optimized for text and code (V2) |
 | K-Means | Clustering algorithm that partitions data into k groups by minimizing within-cluster variance (V2) |
 | Silhouette score | Metric measuring how well each point fits its assigned cluster vs. neighboring clusters (V2) |
+| Call graph | Directed graph of caller→callee relationships between functions/methods (V3) |
+| `caller_id` | Foreign key in `references` table pointing to the enclosing function's `symbols.id` (V3) |
+| BFS | Breadth-First Search — graph traversal that explores all neighbors at each depth before going deeper (V3) |
 
 ### B. Module Layout
 
@@ -1146,6 +1541,9 @@ src/
   semantic.rs        # [V2] Cosine similarity search, result blending, dependency scoping
   cluster.rs         # [V2] K-Means clustering via linfa, silhouette auto-k
   impact.rs          # [V2] Change detection, semantic impact analysis
+  show.rs            # [V3] Source display — symbol lookup + file read + shallow mode
+  summary.rs         # [V3] Structural metrics aggregation, LLM description generation + caching
+  callgraph.rs       # [V3] Caller/callee queries, BFS call path traversal
 ```
 
 ### C. References

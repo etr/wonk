@@ -4,15 +4,15 @@
 - PRD: `specs/product_specs.md`
 - Architecture: `specs/architecture.md`
 
-**Last updated:** 2026-02-13
+**Last updated:** 2026-02-24
 **Status:** In Progress
 
 ---
 
 ## Overview
 
-**Total Tasks:** 56
-**Milestones:** 14
+**Total Tasks:** 64
+**Milestones:** 18
 
 ### Milestone Summary
 
@@ -28,10 +28,14 @@
 | M8 | Git Worktree Support | 3 | Complete |
 | M9 | Embedding Infrastructure | 5 | Complete |
 | M10 | Semantic Search (`wonk ask`) | 3 | Complete |
-| M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
-| M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
+| M11 | Daemon Embedding & Lifecycle Updates | 4 | Complete |
+| M12 | Semantic Blending & Dependency Scoping | 3 | Complete |
 | M13 | Semantic Clustering (`wonk cluster`) | 2 | Complete |
 | M14 | Change Impact Analysis (`wonk impact`) | 2 | Complete |
+| M15 | Call Graph Data Model & Indexing | 2 | Not Started |
+| M16 | Source Display (`wonk show`) | 2 | Not Started |
+| M17 | Call Graph Commands | 2 | Not Started |
+| M18 | Code Summary Engine (`wonk summary`) | 2 | Not Started |
 
 ### Dependency Graph
 
@@ -62,6 +66,18 @@ M13: Semantic Clustering (depends: M9)
 │
 M14: Change Impact Analysis (depends: M10)
 ├── TASK-055 ── TASK-056
+
+M15: Call Graph Data Model & Indexing (independent)
+├── TASK-057 ── TASK-058
+│
+M16: Source Display (independent, parallel with M15)
+├── TASK-059 ── TASK-060
+│
+M17: Call Graph Commands (depends: M15)
+├── TASK-061 ── TASK-062
+│
+M18: Code Summary Engine (independent, parallel with M15/M16)
+├── TASK-063 ── TASK-064
 ```
 
 ### Critical Path
@@ -75,10 +91,17 @@ TASK-001 → TASK-002 → TASK-004 → TASK-005 (M1) ✅
 → TASK-031 → TASK-032 → TASK-033 (M6) ✅
 → TASK-029 → TASK-030 (M7) ✅
 
-**V2 Critical Path:**
-TASK-038 → TASK-039 → TASK-042 (M9)
-→ TASK-043 → TASK-044 → TASK-045 (M10)
-→ TASK-051 → TASK-052 (M12)
+**V2 (Complete):**
+TASK-038 → TASK-039 → TASK-042 (M9) ✅
+→ TASK-043 → TASK-044 → TASK-045 (M10) ✅
+→ TASK-051 → TASK-052 (M12) ✅
+
+**V3 Critical Path (Call Graph):**
+TASK-057 → TASK-058 (M15) → TASK-061 → TASK-062 (M17)
+
+**V3 Parallel Tracks:**
+Track A: TASK-059 → TASK-060 (M16 — Source Display)
+Track B: TASK-063 → TASK-064 (M18 — Code Summary)
 
 ---
 
@@ -2225,21 +2248,376 @@ Implement `wonk impact <file>` that finds semantically similar code that might b
 
 ---
 
+## Milestone 15: Call Graph Data Model & Indexing
+
+**Goal:** The Tree-sitter indexer records which enclosing function each call-site reference lives inside, stored as `caller_id` in the references table. This is foundational data for callers/callees/callpath commands.
+**Exit Criteria:** After `wonk init` or `wonk update`, `SELECT COUNT(*) FROM references WHERE caller_id IS NOT NULL` returns a non-zero count for repos with function calls. Daemon incremental re-indexing also populates caller_id.
+
+### TASK-057: Call graph schema and enclosing function detection
+
+**Milestone:** M15 - Call Graph Data Model & Indexing
+**Component:** SQLite Database, Structural Index
+**Estimate:** M
+
+**Goal:**
+Add `caller_id` column to the references table and implement Tree-sitter parent traversal to detect the enclosing function for each call-site reference.
+
+**Action Items:**
+- [ ] Add `caller_id INTEGER REFERENCES symbols(id)` column to `references` table (nullable for file-scope calls)
+- [ ] Add index on `caller_id` for efficient JOIN queries (DR-015)
+- [ ] Handle schema migration: detect existing indexes without caller_id, add column via ALTER TABLE
+- [ ] Implement enclosing symbol detection (DR-021): when a call-site node is encountered during Tree-sitter parsing, walk `node.parent()` to find the nearest enclosing function/method node
+- [ ] Map enclosing node to its `symbols.id` (match by file, name, line range)
+- [ ] Set `caller_id = NULL` for file-scope calls (no enclosing function) — treated as `<module>` at query time (PRD-CGR-REQ-002)
+- [ ] Support all 11 languages for enclosing function detection
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-058, TASK-061, TASK-062
+
+**Acceptance Criteria:**
+- `caller_id` column exists in references table with FK to symbols.id
+- Index on caller_id is created for query performance
+- Existing indexes without caller_id upgrade gracefully (ALTER TABLE)
+- Enclosing function detection correctly identifies parent function/method for call sites
+- File-scope calls have caller_id = NULL
+- Works for all 11 supported languages
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CGR-REQ-001, PRD-CGR-REQ-002
+**Related Decisions:** DR-015, DR-021
+
+**Status:** Not Started
+
+---
+
+### TASK-058: Populate caller_id in build pipeline and daemon
+
+**Milestone:** M15 - Call Graph Data Model & Indexing
+**Component:** Pipeline, Background Daemon
+**Estimate:** M
+
+**Goal:**
+Wire enclosing function detection into the full index build (`wonk init`/`wonk update`) and daemon incremental re-indexing so caller_id is populated on all reference rows.
+
+**Action Items:**
+- [ ] During full index build (pipeline.rs), after extracting references for each file, resolve enclosing functions and set caller_id on each reference row
+- [ ] Use two-pass approach within each file: first extract symbols (to get their IDs), then extract references with caller_id resolution
+- [ ] During daemon incremental re-indexing, populate caller_id on new reference rows using the same logic
+- [ ] For `wonk update` on existing indexes: full rebuild includes caller_id population
+- [ ] When indexes lack caller_id data, call graph queries should return empty results with a hint to re-index
+- [ ] Log caller_id population stats during init (e.g., "Populated N caller relationships")
+
+**Dependencies:**
+- Blocked by: TASK-057
+- Blocks: TASK-061, TASK-062
+
+**Acceptance Criteria:**
+- After `wonk init`, references table has non-null caller_id for calls inside functions
+- After daemon re-indexes a file, new references have caller_id populated
+- `wonk update` rebuilds all caller_id relationships
+- Fresh indexes include caller_id from the start
+- Caller_id stats shown during init progress
+- Progress/stat messages emitted to stderr, not stdout
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CGR-REQ-001
+**Related Decisions:** DR-015, DR-021
+
+**Status:** Not Started
+
+---
+
+## Milestone 16: Source Display (`wonk show`)
+
+**Goal:** `wonk show <name>` looks up symbols in the index, reads their source code from the file, and returns it with line numbers — collapsing the symbol-lookup + file-read round-trip into a single call.
+**Exit Criteria:** `wonk show processPayment` returns the full function body. Filtering, shallow mode, budget, and MCP tool all work.
+
+### TASK-059: `wonk show` core implementation
+
+**Milestone:** M16 - Source Display
+**Component:** Source Display, CLI
+**Estimate:** L
+
+**Goal:**
+Implement the core `wonk show <name>` command that looks up symbols in the index, reads their source spans from source files, and formats output with line numbers.
+
+**Action Items:**
+- [ ] Create `show.rs` module with `show_symbol(db, name, options) -> Vec<ShowResult>` function
+- [ ] Add `show` subcommand to CLI with args: `<name>` (required), `--file <path>`, `--kind <kind>`, `--exact`, `--format` (grep|json|toon)
+- [ ] Query symbols table for matching name (substring by default, exact with --exact)
+- [ ] Filter by --file (file path prefix match) and --kind (symbol kind filter)
+- [ ] For each match: read source file lines from `line` to `end_line`, prefix each with 1-based line number (PRD-SHOW-REQ-008)
+- [ ] Multiple matches: display all, each preceded by file header `file:start_line-end_line` (PRD-SHOW-REQ-002)
+- [ ] No end_line fallback: display signature text from index (PRD-SHOW-REQ-010)
+- [ ] Missing source file: skip result, emit warning to stderr (PRD-SHOW-REQ-011)
+- [ ] No index fallback: return error directing user to `wonk init` (PRD-SHOW-REQ-009)
+- [ ] Define `ShowResult` in types.rs: name, kind, file, line, end_line, source, language (PRD-SHOW-REQ-012)
+- [ ] JSON/TOON output includes all ShowResult fields
+- [ ] Wire to CLI dispatch
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-060
+
+**Acceptance Criteria:**
+- `wonk show processPayment` returns full function body with line numbers
+- `wonk show --kind class StripeClient` filters to class only
+- `wonk show --file src/auth.ts login` restricts to symbols in that file
+- `wonk show --exact foo` requires exact name match
+- Multiple matches shown with file headers
+- Missing end_line falls back to signature display
+- Missing source file produces stderr warning
+- No index produces error with init guidance
+- JSON output includes all ShowResult fields
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SHOW-REQ-001 through PRD-SHOW-REQ-005, PRD-SHOW-REQ-008 through PRD-SHOW-REQ-012 (PRD-SHOW-REQ-006, REQ-007, REQ-013 covered by TASK-060)
+**Related Decisions:** DR-017, DR-022
+
+**Status:** Not Started
+
+---
+
+### TASK-060: `wonk show` shallow mode, budget, and MCP tool
+
+**Milestone:** M16 - Source Display
+**Component:** Source Display, CLI, MCP Server
+**Estimate:** M
+
+**Goal:**
+Add shallow mode for container types, budget truncation, and expose `wonk_show` as an MCP tool.
+
+**Action Items:**
+- [ ] Implement `--shallow` flag (PRD-SHOW-REQ-006, DR-017): for container types (class, struct, enum, trait, interface), query child symbols via `scope` column match in the same file
+- [ ] Shallow display: container's signature line followed by each child's `signature` field (no bodies)
+- [ ] No Tree-sitter re-parse needed — uses existing index data
+- [ ] Implement `--budget <n>` flag (PRD-SHOW-REQ-007): use existing budget module (~4 chars/token heuristic) to truncate output and indicate omission
+- [ ] Add `wonk_show` MCP tool with parameters: name (required), kind (optional), file (optional), exact (boolean), shallow (boolean), budget (integer), format (json|toon) (PRD-SHOW-REQ-013)
+- [ ] Wire MCP tool handler to existing show_symbol backend
+
+**Dependencies:**
+- Blocked by: TASK-059
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk show --shallow StripeClient` shows class signature + method signatures without bodies
+- Shallow mode works for all container types (class, struct, enum, trait, interface)
+- `wonk show --budget 100 LargeClass` truncates and notes omission
+- MCP tool `wonk_show` works with all parameters
+- MCP returns identical results to CLI
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SHOW-REQ-006, PRD-SHOW-REQ-007, PRD-SHOW-REQ-013
+**Related Decisions:** DR-017, DR-022
+
+**Status:** Not Started
+
+---
+
+## Milestone 17: Call Graph Commands
+
+**Goal:** `wonk callers`, `wonk callees`, and `wonk callpath` enable symbol-level call graph navigation, letting agents trace execution paths and understand blast radius at the function level.
+**Exit Criteria:** All three commands return correct results. Transitive expansion works. BFS call path finds shortest chains. MCP tools work.
+
+### TASK-061: `wonk callers` and `wonk callees` with transitive expansion
+
+**Milestone:** M17 - Call Graph Commands
+**Component:** Call Graph, CLI, MCP Server
+**Estimate:** L
+
+**Goal:**
+Implement `wonk callers <symbol>` and `wonk callees <symbol>` commands with transitive depth expansion and MCP tool exposure.
+
+**Action Items:**
+- [ ] Create `callgraph.rs` module
+- [ ] Implement `callers(db, name, depth) -> Vec<CallerResult>`: SQL query `SELECT DISTINCT s.* FROM references r JOIN symbols s ON r.caller_id = s.id WHERE r.name = ?` (PRD-CGR-REQ-003)
+- [ ] Implement `callees(db, name, depth) -> Vec<CalleeResult>`: SQL query `SELECT DISTINCT r.name, ... FROM references r WHERE r.caller_id IN (SELECT id FROM symbols WHERE name LIKE ?)` (PRD-CGR-REQ-004)
+- [ ] Implement transitive expansion (PRD-CGR-REQ-005, PRD-CGR-REQ-006): --depth N iteratively expands at each level
+- [ ] Default depth 1 (PRD-CGR-REQ-007), cap at 10 with warning (PRD-CGR-REQ-008)
+- [ ] Handle multiple definitions (PRD-CGR-REQ-011): include results from all definitions, indicate which definition
+- [ ] Handle file-scope callers: display as `<module>` scope
+- [ ] Auto-init: consistent with PRD-AUT behavior (PRD-CGR-REQ-012)
+- [ ] Old indexes without caller_id: return empty results with hint to re-index via `wonk update`
+- [ ] Add `callers` and `callees` subcommands to CLI with args: `<symbol>` (required), `--depth <n>` (optional, default 1)
+- [ ] Output formatting: grep-compatible + JSON/TOON
+- [ ] Add MCP tools `wonk_callers` and `wonk_callees` with parameters: name, depth, format (PRD-CGR-REQ-013)
+
+**Dependencies:**
+- Blocked by: TASK-057, TASK-058
+- Blocks: TASK-062
+
+**Acceptance Criteria:**
+- `wonk callers dispatch` lists all functions whose bodies call `dispatch`
+- `wonk callers dispatch --depth 2` lists direct callers and their callers
+- `wonk callees main` lists all functions called within `main`
+- `--depth 15` warns about depth cap and uses depth 10
+- Multiple definitions handled correctly
+- Auto-init works on unindexed repos
+- Old indexes without caller_id show hint to re-index
+- MCP tools work with all parameters
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CGR-REQ-002 through PRD-CGR-REQ-008, PRD-CGR-REQ-011, PRD-CGR-REQ-012, PRD-CGR-REQ-013
+**Related Decisions:** DR-015, DR-021, DR-022
+
+**Status:** Not Started
+
+---
+
+### TASK-062: `wonk callpath` BFS call chain finder
+
+**Milestone:** M17 - Call Graph Commands
+**Component:** Call Graph, CLI, MCP Server
+**Estimate:** M
+
+**Goal:**
+Implement `wonk callpath <from> <to>` that finds call chains between two symbols via BFS traversal.
+
+**Action Items:**
+- [ ] Implement `callpath(db, from, to) -> Option<Vec<CallPathHop>>` (DR-016): BFS from `<from>` expanding callees at each level
+- [ ] Maintain visited set (HashSet) and parent map (HashMap) for path reconstruction
+- [ ] When `<to>` is reached, reconstruct shortest path via parent map
+- [ ] If BFS exhausts the graph without reaching `<to>`, report "no path found" (PRD-CGR-REQ-010)
+- [ ] Cap BFS depth at 10 (consistent with callers/callees cap)
+- [ ] Define `CallPathHop` struct: symbol_name, symbol_kind, file, line
+- [ ] Add `callpath` subcommand to CLI with args: `<from>` (required), `<to>` (required)
+- [ ] Output formatting: chain display `from -> hop1 -> hop2 -> to` with file:line per hop (use ASCII `->`, not Unicode arrows, for terminal compatibility)
+- [ ] JSON/TOON output: array of CallPathHop structs
+- [ ] Add MCP tool `wonk_callpath` with parameters: from, to, format (PRD-CGR-REQ-014)
+
+**Dependencies:**
+- Blocked by: TASK-061
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk callpath main dispatch` shows the call chain from main to dispatch
+- `wonk callpath foo bar` where no path exists prints "no path found"
+- BFS finds shortest path
+- Depth capped at 10
+- JSON output includes all hop details
+- MCP tool `wonk_callpath` works with all parameters
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CGR-REQ-009, PRD-CGR-REQ-010, PRD-CGR-REQ-014
+**Related Decisions:** DR-016, DR-022
+
+**Status:** Not Started
+
+---
+
+## Milestone 18: Code Summary Engine (`wonk summary`)
+
+**Goal:** `wonk summary <path>` provides structural metrics and optional LLM-generated descriptions of files and directories, giving agents and developers a quick orientation without reading every file.
+**Exit Criteria:** Structural summaries at all detail levels. Recursive depth works. LLM descriptions generated and cached. MCP tool works.
+
+### TASK-063: Structural summary engine and `wonk summary` CLI
+
+**Milestone:** M18 - Code Summary Engine
+**Component:** Code Summary Engine, CLI, MCP Server
+**Estimate:** L
+
+**Goal:**
+Implement `wonk summary <path>` with structural metrics aggregation, three detail levels, recursive depth, and MCP tool exposure.
+
+**Action Items:**
+- [ ] Create `summary.rs` module
+- [ ] Implement `summarize_path(db, path, options) -> SummaryResult`: query files and symbols tables to aggregate metrics
+- [ ] Structural metrics: file count, line count, symbol count by kind, language breakdown, dependency count (PRD-SUM-REQ-001, PRD-SUM-REQ-002)
+- [ ] Detail levels: `--detail rich` (default, all metrics), `--detail light` (file count, symbol count, languages), `--detail symbols` (symbol counts by kind only) (PRD-SUM-REQ-003 through PRD-SUM-REQ-005)
+- [ ] Recursion: `--depth N` summarizes nested directories/files up to N levels (PRD-SUM-REQ-006), default depth 0 (PRD-SUM-REQ-007), `--recursive` for unlimited depth (PRD-SUM-REQ-008)
+- [ ] Define `SummaryResult` in types.rs: path, type (file|directory), detail_level, metrics, children (array), description (optional) (PRD-SUM-REQ-017)
+- [ ] Add `summary` subcommand to CLI with args: `<path>` (required), `--detail`, `--depth`, `--recursive`, `--semantic` (wired in TASK-064)
+- [ ] Output formatting: human-readable default, JSON/TOON structured output
+- [ ] Auto-init: consistent with PRD-AUT behavior (PRD-SUM-REQ-016)
+- [ ] Add MCP tool `wonk_summary` with parameters: path, detail, depth, recursive, semantic, format (PRD-SUM-REQ-018)
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-064
+
+**Acceptance Criteria:**
+- `wonk summary src/` displays file count, line count, symbol counts, language breakdown, dependency count
+- `wonk summary src/ --detail light` shows only file count, symbol count, languages
+- `wonk summary src/ --detail symbols` shows only symbol counts by kind
+- `wonk summary src/ --depth 2` shows target + children + grandchildren
+- `wonk summary src/ --recursive` shows full hierarchy
+- JSON output includes all SummaryResult fields
+- Auto-init works on unindexed repos
+- MCP tool works with all parameters
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SUM-REQ-001 through PRD-SUM-REQ-008, PRD-SUM-REQ-016, PRD-SUM-REQ-017, PRD-SUM-REQ-018
+**Related Decisions:** DR-018, DR-019, DR-020, DR-022
+
+**Status:** Not Started
+
+---
+
+### TASK-064: LLM description generation and caching
+
+**Milestone:** M18 - Code Summary Engine
+**Component:** Code Summary Engine, Configuration, SQLite Database
+**Estimate:** M
+
+**Goal:**
+Add `--semantic` flag to `wonk summary` that generates LLM descriptions via Ollama, with caching in SQLite and configurable model selection.
+
+**Action Items:**
+- [ ] Add `[llm]` section to Config with `model` key (default: `"llama3.2:3b"`) and `generate_url` (default: `"http://localhost:11434/api/generate"`) (DR-018, PRD-SUM-REQ-014)
+- [ ] Add `summaries` table to SQLite schema: path, content_hash, description, created_at (DR-020)
+- [ ] Implement content hash computation: sorted `(symbol.id, file.hash)` pairs under the path (DR-019)
+- [ ] Implement prompt construction (PRD-SUM-REQ-010): path, language breakdown, symbol signatures by kind, import/export relationships — ask for 2-3 sentence description
+- [ ] Implement Ollama `/api/generate` call via ureq: POST with model, prompt, stream=false
+- [ ] Cache hit: return cached description when path + content_hash match (PRD-SUM-REQ-012)
+- [ ] Ollama unreachable: display warning to stderr, return structural summary without description on stdout (PRD-SUM-REQ-013)
+- [ ] Model not found: return error with instructions to `ollama pull <model>` or configure `[llm].model` (PRD-SUM-REQ-015)
+- [ ] Semantic + recursion interaction: LLM description only for top-level path, not per-child
+- [ ] Default model llama3.2:3b when no config (PRD-SUM-REQ-015)
+
+**Dependencies:**
+- Blocked by: TASK-063
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk summary src/ --semantic` includes LLM-generated description
+- Repeated call on unchanged code returns cached description instantly
+- `wonk summary src/ --semantic` without config uses llama3.2:3b; error with instructions if model unavailable
+- `wonk summary src/ --semantic` with Ollama down shows warning on stderr + structural only on stdout
+- Cache invalidated when content changes (different hash)
+- `[llm].model` config override works
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-SUM-REQ-009 through PRD-SUM-REQ-015
+**Related Decisions:** DR-018, DR-019, DR-020
+
+**Status:** Not Started
+
+---
+
 ## Parking Lot
 
 Tasks identified but not yet scheduled:
 
 | ID | Description | Reason Deferred |
 |----|-------------|-----------------|
-| - | LSP server integration | V3 feature |
-| - | Directory summaries | V3 feature |
-| - | Cross-language call graphs | V3 feature |
-| - | Editor integrations | V3 feature |
-| - | Remote/monorepo support | V3 feature |
-| - | Web UI | V3 feature |
-| - | Bundled/offline embedding model (ONNX) | V3 feature — would remove Ollama dependency |
-| - | Configurable embedding models | V3 feature — single model for V2 |
-| - | ANN indexing for >100K vectors | V3 feature — brute-force sufficient for V2 scale |
+| - | LSP server integration | Future version |
+| - | Cross-language call graphs | Future version — V3 call graph is same-language only |
+| - | Editor integrations | Future version |
+| - | Remote/monorepo support | Future version |
+| - | Web UI | Future version |
+| - | Bundled/offline embedding model (ONNX) | Future version — would remove Ollama dependency |
+| - | Configurable embedding models | Future version — single model for V2 |
+| - | ANN indexing for >100K vectors | Future version — brute-force sufficient for V2 scale |
+| - | Dynamic dispatch resolution for call graph | Future version — V3 tracks static calls only |
 
 ---
 
@@ -2251,3 +2629,4 @@ Tasks identified but not yet scheduled:
 | 2026-02-11 | Added Smart Search milestone (M6, TASK-031 to TASK-034). Renumbered Polish to M7. Updated milestone statuses. Total tasks: 34 across 7 milestones. Reframed around token-efficiency value proposition. | TBD |
 | 2026-02-12 | Added Git Worktree Support milestone (M8, TASK-035 to TASK-037). 3 tasks: walker boundary exclusion, watcher boundary filtering, integration tests. Total tasks: 37 across 8 milestones. | TBD |
 | 2026-02-13 | Added V2 semantic search milestones (M9-M14, TASK-038 to TASK-056). 19 tasks across 6 milestones: Embedding Infrastructure, Semantic Search, Daemon Embedding & Lifecycle, Semantic Blending & Dependency Scoping, Semantic Clustering, Change Impact Analysis. Total tasks: 56 across 14 milestones. | TBD |
+| 2026-02-24 | Added V3 milestones (M15-M18, TASK-057 to TASK-064). 8 tasks across 4 milestones: Call Graph Data Model & Indexing, Source Display, Call Graph Commands, Code Summary Engine. Marked M11/M12 as Complete. Updated parking lot. Total tasks: 64 across 18 milestones. | TBD |

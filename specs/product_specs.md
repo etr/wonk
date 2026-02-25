@@ -229,7 +229,7 @@ The system needs to build and maintain a structural index of the codebase using 
 
 **In scope**
 - Full index build, central and local storage, parallel indexing
-- Tree-sitter parsing for 10 languages
+- Tree-sitter parsing for 11 languages
 - File filtering (gitignore, wonkignore, default exclusions)
 - Force re-index, status reporting, repo management
 
@@ -240,7 +240,7 @@ The system needs to build and maintain a structural index of the codebase using 
 - `PRD-IDX-REQ-001` When the user runs `wonk init` then the system shall build a full structural index of the current repository.
 - `PRD-IDX-REQ-002` When `wonk init` is run without `--local` then the system shall store the index centrally at `~/.wonk/repos/<hash>/`.
 - `PRD-IDX-REQ-003` When `wonk init --local` is run then the system shall store the index in `.wonk/` inside the repository root.
-- `PRD-IDX-REQ-004` When indexing then the system shall detect and parse files using bundled Tree-sitter grammars for TypeScript/TSX, JavaScript/JSX, Python, Rust, Go, Java, C, C++, Ruby, and PHP.
+- `PRD-IDX-REQ-004` When indexing then the system shall detect and parse files using bundled Tree-sitter grammars for TypeScript/TSX, JavaScript/JSX, Python, Rust, Go, Java, C, C++, Ruby, PHP, and C#.
 - `PRD-IDX-REQ-005` When indexing files then the system shall extract symbol definitions including functions, methods, classes, structs, interfaces, enums, traits, type aliases, constants, and exported symbols.
 - `PRD-IDX-REQ-006` When indexing files then the system shall extract references including function calls, type annotations, and import statements.
 - `PRD-IDX-REQ-007` When indexing files then the system shall record file metadata including language, line count, content hash, and import/export list.
@@ -257,7 +257,7 @@ The system needs to build and maintain a structural index of the codebase using 
 - Small repos (< 1k files) index in < 1 second
 - Medium repos (1k-10k files) index in 1-5 seconds
 - Large repos (10k-50k files) index in 5-15 seconds
-- All 10 language families are correctly parsed
+- All 11 language families are correctly parsed
 - Gitignore, wonkignore, and default exclusions are respected
 
 ---
@@ -398,7 +398,7 @@ The tool must be easily installable across platforms as a single binary with no 
 
 **EARS Requirements**
 - `PRD-DST-REQ-001` The system shall be distributed as a single static binary with no external runtime dependencies.
-- `PRD-DST-REQ-002` The system shall bundle all 10 Tree-sitter grammars within the binary.
+- `PRD-DST-REQ-002` The system shall bundle all 11 Tree-sitter grammars within the binary.
 - `PRD-DST-REQ-003` The binary size shall not exceed 30 MB including all bundled grammars.
 - `PRD-DST-REQ-004` The system shall support macOS ARM and x86_64 as P0 platforms.
 - `PRD-DST-REQ-005` The system shall support Linux x86_64 as a P0 platform.
@@ -530,7 +530,7 @@ Semantic search alone returns results from across the entire codebase. Developer
 
 **Out of scope**
 - Cross-language dependency resolution
-- Function-level call graph (file-level deps only)
+- Function-level call graph (see PRD-CGR for standalone call graph feature)
 
 **EARS Requirements**
 - `PRD-SDEP-REQ-001` When the user provides `--from <file>` on `wonk ask` then the system shall restrict semantic results to symbols in files reachable via forward dependencies from the specified file.
@@ -593,6 +593,152 @@ When a developer modifies code, they need to know what other code might be affec
 - `--since HEAD~3` analyzes all files changed in the last 3 commits
 - Results are ranked by similarity to the changed code
 
+### 3.20 Source Display (PRD-SHOW)
+
+**Problem / outcome**
+LLM coding agents need two tool calls to see a symbol's source code: one to look up the symbol (getting file path and line number), then another to read the file at those lines. This doubles round-trip latency and often results in over-reading — agents guess at line ranges and pull in irrelevant code. `wonk show` collapses this into a single call that returns exactly the source span tree-sitter already knows.
+
+**In scope**
+- Display full source body of any indexed symbol (functions, methods, classes, structs, enums, traits, interfaces, etc.)
+- Disambiguation by file path (`--file`) and symbol kind (`--kind`)
+- Shallow mode for container types (signature + member signatures, no bodies)
+- Budget-aware truncation
+- Line-numbered output
+- MCP tool exposure (`wonk_show`)
+
+**Out of scope**
+- Grep-based fallback when no index exists (index is required)
+- Syntax highlighting / colorization of source
+- Cross-file expansion (following imports to show dependencies)
+
+**EARS Requirements**
+- `PRD-SHOW-REQ-001` When user runs `wonk show <name>` then the system shall look up matching symbols in the index and display their source code by reading lines `line` through `end_line` from the source file.
+- `PRD-SHOW-REQ-002` When multiple symbols match the name then the system shall display all matches, each preceded by a file header showing `file:start_line-end_line`.
+- `PRD-SHOW-REQ-003` Where `--file <path>` is provided then the system shall restrict results to symbols defined in that file.
+- `PRD-SHOW-REQ-004` Where `--kind <kind>` is provided then the system shall restrict results to symbols of that kind.
+- `PRD-SHOW-REQ-005` Where `--exact` is provided then the system shall require an exact name match instead of substring matching.
+- `PRD-SHOW-REQ-006` Where `--shallow` is provided and the symbol is a container type (class, struct, enum, trait, interface) then the system shall display the container signature and member signatures without member bodies.
+- `PRD-SHOW-REQ-007` Where `--budget <n>` is provided then the system shall truncate output to approximately n tokens and indicate what was omitted.
+- `PRD-SHOW-REQ-008` When displaying source lines then the system shall prefix each line with its 1-based file line number.
+- `PRD-SHOW-REQ-009` When no index exists for the repository then the system shall return an error directing the user to run `wonk init`.
+- `PRD-SHOW-REQ-010` If a matched symbol has no `end_line` recorded then the system shall fall back to displaying only the symbol's signature text.
+- `PRD-SHOW-REQ-011` If the source file for a matched symbol no longer exists or is unreadable then the system shall skip that result and emit a warning.
+- `PRD-SHOW-REQ-012` When output format is JSON or TOON then the system shall include structured fields: name, kind, file, line, end_line, source, language.
+- `PRD-SHOW-REQ-013` The system shall expose `wonk_show` as an MCP tool with parameters: name (required), kind (optional), file (optional), exact (boolean), shallow (boolean), budget (integer), format (json|toon).
+
+**Acceptance criteria**
+- `wonk show processPayment` on a TypeScript repo returns the full function body with correct line numbers
+- `wonk show --kind class StripeClient` returns only the class, not variables with the same name
+- `wonk show --shallow StripeClient` returns class signature + method signatures without bodies
+- `wonk show --file src/auth.ts login` returns only the `login` symbol from that specific file
+- `wonk show nonexistent` returns empty result set
+- `wonk show` on an unindexed repo shows error with init guidance
+- Budget truncation: `wonk show --budget 100 LargeClass` truncates and notes omission
+- JSON output includes `source` field with the full code body
+- MCP tool `wonk_show` works through Claude Code
+
+---
+
+### 3.21 Code Summary (PRD-SUM)
+
+**Problem / outcome**
+LLM coding agents and developers need a quick structural and semantic overview of files and directories — what's in them, how complex they are, and what they do — without manually reading every file. The existing `wonk ls` shows individual symbols but provides no aggregate metrics or natural-language descriptions.
+
+**In scope**
+- New `wonk summary <path>` subcommand
+- Three detail levels for structural metrics: rich (default), light, symbols-only
+- Configurable recursion depth (`--depth N`) for hierarchical summaries
+- LLM-generated natural-language descriptions via `--semantic` flag (Ollama `/api/generate`)
+- LLM generation model configuration in `[llm]` section of existing layered config.toml
+- Caching of LLM descriptions in SQLite index (invalidated on content changes)
+- MCP tool exposure (`wonk_summary`)
+
+**Out of scope**
+- Bundled/offline LLM (must use external Ollama)
+- Automatic LLM description without explicit `--semantic` flag
+- Code quality metrics (complexity, test coverage)
+- Streaming LLM output
+
+**EARS Requirements**
+- `PRD-SUM-REQ-001` When user runs `wonk summary <path>` on a file then the system shall display a structural summary including the file's language, line count, and symbols grouped by kind.
+- `PRD-SUM-REQ-002` When user runs `wonk summary <path>` on a directory then the system shall display an aggregate structural summary including file count, total line count, language breakdown, and total symbols grouped by kind.
+- `PRD-SUM-REQ-003` Where `--detail rich` is specified or no `--detail` flag is provided then the system shall include file count, line count, symbol count by kind, language breakdown, and dependency count in the summary.
+- `PRD-SUM-REQ-004` Where `--detail light` is specified then the system shall include file count, symbol count, and language breakdown only.
+- `PRD-SUM-REQ-005` Where `--detail symbols` is specified then the system shall include symbol counts grouped by kind only.
+- `PRD-SUM-REQ-006` Where `--depth N` is provided then the system shall recursively summarize nested directories and files up to N levels deep, presenting each child's summary indented under its parent.
+- `PRD-SUM-REQ-007` While no `--depth` flag is specified then the system shall summarize only the target path (depth 0, no recursion).
+- `PRD-SUM-REQ-008` Where `--recursive` is provided then the system shall summarize all nested directories and files to unlimited depth.
+- `PRD-SUM-REQ-009` Where the `--semantic` flag is provided then the system shall generate a natural-language description of the path's purpose and contents using the configured LLM model via Ollama's `/api/generate` endpoint and include it in the summary output.
+- `PRD-SUM-REQ-010` When generating an LLM description then the system shall construct a prompt containing the structural metrics and symbol signatures for the target path as context.
+- `PRD-SUM-REQ-011` When an LLM description is successfully generated then the system shall store it in the SQLite index keyed by path and a content hash derived from the path's indexed symbols.
+- `PRD-SUM-REQ-012` When an LLM description is requested and a cached entry with a matching content hash exists then the system shall return the cached description without calling Ollama.
+- `PRD-SUM-REQ-013` If Ollama is unreachable when `--semantic` is requested then the system shall display a warning and return the structural summary without the LLM description.
+- `PRD-SUM-REQ-014` When the user configures an `[llm]` section with a `model` key in `config.toml` then the system shall use the specified model name for text generation requests to Ollama.
+- `PRD-SUM-REQ-015` If no `[llm].model` is configured when `--semantic` is requested then the system shall use `llama3.2:3b` as the default generation model. If the model is not available in Ollama then the system shall display an error instructing the user to pull the model or configure an alternative in `config.toml`.
+- `PRD-SUM-REQ-016` When `wonk summary` is invoked without an existing index then the system shall auto-initialize the index consistent with PRD-AUT behavior.
+- `PRD-SUM-REQ-017` When output format is JSON or TOON then the system shall include structured fields: path, type (file|directory), detail_level, metrics (object), children (array, if recursive), description (string, if `--semantic`).
+- `PRD-SUM-REQ-018` The system shall expose `wonk_summary` as an MCP tool with parameters: path (required), detail (optional: rich|light|symbols), depth (optional integer), recursive (optional boolean), semantic (optional boolean), format (json|toon).
+
+**Acceptance criteria**
+- `wonk summary src/` displays file count, line count, symbol counts by kind, language breakdown, dependency count
+- `wonk summary src/ --detail light` displays only file count, symbol count, language breakdown
+- `wonk summary src/ --detail symbols` displays only symbol counts grouped by kind
+- `wonk summary src/ --depth 2` shows target summary plus summaries of children and grandchildren
+- `wonk summary src/ --recursive` shows full hierarchy to leaves
+- `wonk summary src/ --semantic` includes an LLM-generated natural-language description (Ollama must be running with configured model)
+- Repeated `wonk summary src/ --semantic` on unchanged code returns cached description instantly
+- `wonk summary src/ --semantic` without `[llm]` config uses default model `llama3.2:3b`; shows error with pull/config instructions if model not available
+- `wonk summary src/ --semantic` with Ollama down shows warning + structural summary only
+- JSON output includes all structured fields
+- MCP tool `wonk_summary` works through Claude Code
+
+---
+
+### 3.22 Call Graph Analysis (PRD-CGR)
+
+**Problem / outcome**
+Wonk provides flat reference lookup (`wonk ref`) and file-level dependency graphs (`wonk deps`/`wonk rdeps`), but there is no way to navigate **symbol-level caller/callee relationships**. When an LLM agent or developer asks "who calls this function?" or "what does this function call?", they get name-occurrence matches without knowing which enclosing function contains the call. A proper call graph enables tracing execution paths, understanding blast radius of changes at the function level, and scoping refactoring work precisely.
+
+**In scope**
+- Indexer enhancement: store the enclosing caller symbol for each call-site reference
+- `wonk callers <symbol>` — list functions/methods that call the given symbol
+- `wonk callees <symbol>` — list functions/methods called by the given symbol
+- `wonk callpath <from> <to>` — find call chains connecting two symbols
+- Transitive traversal with `--depth N` for callers and callees
+- MCP tool exposure (`wonk_callers`, `wonk_callees`, `wonk_callpath`)
+
+**Out of scope**
+- Dynamic dispatch resolution (virtual calls, trait objects, function pointers)
+- Cross-language call graph edges
+- Call frequency or hot-path analysis
+
+**EARS Requirements**
+- `PRD-CGR-REQ-001` When indexing a source file then the system shall record, for each call-site reference, the enclosing function or method symbol that contains the call.
+- `PRD-CGR-REQ-002` When a call-site reference occurs at file scope (outside any function) then the system shall record the enclosing caller as `<module>` (the file's implicit top-level scope).
+- `PRD-CGR-REQ-003` When the user runs `wonk callers <symbol>` then the system shall display all functions and methods whose bodies contain a call-site reference to the named symbol.
+- `PRD-CGR-REQ-004` When the user runs `wonk callees <symbol>` then the system shall display all symbols that are called within the body of the named function or method.
+- `PRD-CGR-REQ-005` Where `--depth N` is provided on `wonk callers` then the system shall transitively expand callers up to N levels (depth 1 = direct callers only, depth 2 = callers of callers, etc.).
+- `PRD-CGR-REQ-006` Where `--depth N` is provided on `wonk callees` then the system shall transitively expand callees up to N levels.
+- `PRD-CGR-REQ-007` While no `--depth` flag is specified on `wonk callers` or `wonk callees` then the system shall default to depth 1 (direct relationships only).
+- `PRD-CGR-REQ-008` Where `--depth N` exceeds 10 then the system shall cap traversal at depth 10 and emit a warning indicating the cap was applied.
+- `PRD-CGR-REQ-009` When the user runs `wonk callpath <from> <to>` then the system shall find and display at least one call chain from the `<from>` symbol to the `<to>` symbol, showing each intermediate caller/callee hop.
+- `PRD-CGR-REQ-010` If no call path exists between the two symbols then the system shall display a message indicating no path was found.
+- `PRD-CGR-REQ-011` When the named symbol has multiple definitions (e.g., overloaded methods across files) then the system shall include callers or callees from all definitions and indicate which definition each result corresponds to.
+- `PRD-CGR-REQ-012` When `wonk callers`, `wonk callees`, or `wonk callpath` is invoked without an existing index then the system shall auto-initialize the index consistent with PRD-AUT behavior.
+- `PRD-CGR-REQ-013` The system shall expose `wonk_callers` and `wonk_callees` as MCP tools with parameters: name (required string), depth (optional integer, default 1, max 10), format (json|toon).
+- `PRD-CGR-REQ-014` The system shall expose `wonk_callpath` as an MCP tool with parameters: from (required string), to (required string), format (json|toon).
+
+**Acceptance criteria**
+- `wonk callers dispatch` lists all functions whose bodies call `dispatch`
+- `wonk callers dispatch --depth 2` lists direct callers and their callers
+- `wonk callees main` lists all functions called within `main`
+- `wonk callpath main dispatch` shows the call chain from `main` to `dispatch`
+- `wonk callpath foo bar` where no path exists prints "no path found"
+- `wonk callers X --depth 15` warns about depth cap and uses depth 10
+- Symbol with multiple definitions shows callers from all definitions
+- MCP tools `wonk_callers`, `wonk_callees`, `wonk_callpath` work through Claude Code
+- Running any call graph command on an unindexed repo triggers auto-init
+
 ---
 
 ## 4) Traceability
@@ -618,7 +764,10 @@ When a developer modifies code, they need to know what other code might be affec
 | Semantic Dependency Analysis | PRD-SDEP-REQ-001 to 003 | 3 |
 | Semantic Clustering | PRD-SCLST-REQ-001 to 003 | 3 |
 | Semantic Change Impact | PRD-SIMP-REQ-001 to 004 | 4 |
-| **Total** | | **111** |
+| Source Display | PRD-SHOW-REQ-001 to 013 | 13 |
+| Code Summary | PRD-SUM-REQ-001 to 018 | 18 |
+| Call Graph Analysis | PRD-CGR-REQ-001 to 014 | 14 |
+| **Total** | | **156** |
 
 ---
 
@@ -626,7 +775,7 @@ When a developer modifies code, they need to know what other code might be affec
 
 | ID | Question | Resolution | Status |
 |---|---|---|---|
-| OQ-001 | Grammar bundling strategy | Bundle all 10 grammars in the binary | Resolved |
+| OQ-001 | Grammar bundling strategy | Bundle all 11 grammars in the binary | Resolved |
 | OQ-002 | Reference accuracy | Name-based only, no heuristic disambiguation for V1 | Resolved |
 | OQ-003 | Auto-init threshold | No cap; always auto-init with progress indicator | Resolved |
 | OQ-004 | Tool name | Renamed from `csi` to `wonk` | Resolved |
@@ -641,7 +790,7 @@ When a developer modifies code, they need to know what other code might be affec
 
 - **LSP server integration.** V1 uses Tree-sitter only. LSP backends (for type-aware resolution) are a V2 feature.
 - ~~**Semantic / embedding search.** Natural language queries require an embedding model. Deferred to V2.~~ **Moved to V2 scope: PRD-SEM, PRD-SDEP, PRD-SCLST, PRD-SIMP.**
-- **Directory summaries.** LLM-generated descriptions of what each directory does. Deferred to V2.
+- ~~**Directory summaries.** LLM-generated descriptions of what each directory does. Deferred to V2.~~ **Moved to V2 scope: PRD-SUM.**
 - **Cross-language call graphs.** Connecting a Python HTTP call to a Go handler. Deferred to V2.
 - **Editor integrations.** VS Code extension, Neovim plugin, etc. V1 is CLI-only.
 - **Remote / monorepo support.** V1 targets single local repos. Multi-root workspaces and remote indexing are future work.

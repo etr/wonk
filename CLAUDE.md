@@ -35,7 +35,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 |--------|------|
 | `cli.rs` | Clap-derived argument parsing, delegates to `router::dispatch()` |
 | `router.rs` | Query dispatch — routes commands to index or grep fallback, auto-initializes index on first use |
-| `indexer.rs` | Tree-sitter parsing — extracts symbols, references, and imports for 11 languages |
+| `indexer.rs` | Tree-sitter parsing — extracts symbols, references, and imports for 12 languages |
 | `db.rs` | SQLite layer — schema (WAL mode), repo root detection, index path computation |
 | `pipeline.rs` | Index build orchestration — parallel file walk + parse + batch insert; incremental re-indexing for daemon; embedding build pipeline (chunking → Ollama batch embed → vector storage) |
 | `walker.rs` | File enumeration with gitignore/wonkignore support; worktree-aware boundary detection |
@@ -62,7 +62,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 
 ### Supported Languages (tree-sitter)
 
-TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C, C++, Ruby, PHP
+TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C, C++, Ruby, PHP, C#
 
 ## Specifications
 
