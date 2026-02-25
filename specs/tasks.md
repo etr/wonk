@@ -4,15 +4,15 @@
 - PRD: `specs/product_specs.md`
 - Architecture: `specs/architecture.md`
 
-**Last updated:** 2026-02-24
+**Last updated:** 2026-02-25
 **Status:** In Progress
 
 ---
 
 ## Overview
 
-**Total Tasks:** 64
-**Milestones:** 18
+**Total Tasks:** 74
+**Milestones:** 25
 
 ### Milestone Summary
 
@@ -36,6 +36,13 @@
 | M16 | Source Display (`wonk show`) | 2 | Not Started |
 | M17 | Call Graph Commands | 2 | Not Started |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Not Started |
+| M19 | Edge Confidence & Inheritance Infrastructure | 3 | Not Started |
+| M20 | Hybrid Search Fusion (RRF) | 1 | Not Started |
+| M21 | Execution Flow Detection (`wonk flows`) | 1 | Not Started |
+| M22 | Blast Radius Analysis (`wonk blast`) | 1 | Not Started |
+| M23 | Scoped Change Detection (`wonk changes`) | 2 | Not Started |
+| M24 | Unified Symbol Context (`wonk context`) | 1 | Not Started |
+| M25 | Multi-Repo MCP | 1 | Not Started |
 
 ### Dependency Graph
 
@@ -78,6 +85,28 @@ M17: Call Graph Commands (depends: M15)
 │
 M18: Code Summary Engine (independent, parallel with M15/M16)
 ├── TASK-063 ── TASK-064
+
+M19: Edge Confidence & Inheritance Infrastructure (independent)
+├── TASK-065 ──┬── TASK-066
+│              └── TASK-067 ←── TASK-065 + TASK-066
+│
+M20: Hybrid Search Fusion (independent, parallel with M19)
+├── TASK-068
+│
+M21: Execution Flow Detection (depends: V3 M15 + M19)
+├── TASK-069 ←── TASK-058 + TASK-067
+│
+M22: Blast Radius Analysis (depends: V3 M15 + M19)
+├── TASK-070 ←── TASK-058 + TASK-067
+│
+M23: Scoped Change Detection (depends: M21 + M22)
+├── TASK-071 ── TASK-072 ←── TASK-071 + TASK-069 + TASK-070
+│
+M24: Unified Symbol Context (depends: M21 + M19)
+├── TASK-073 ←── TASK-069 + TASK-067
+│
+M25: Multi-Repo MCP (independent)
+├── TASK-074
 ```
 
 ### Critical Path
@@ -102,6 +131,16 @@ TASK-057 → TASK-058 (M15) → TASK-061 → TASK-062 (M17)
 **V3 Parallel Tracks:**
 Track A: TASK-059 → TASK-060 (M16 — Source Display)
 Track B: TASK-063 → TASK-064 (M18 — Code Summary)
+
+**V4 Critical Path (Graph Intelligence):**
+TASK-065 → TASK-066 → TASK-067 (M19)
+→ TASK-069 (M21) + TASK-070 (M22) [also depends: TASK-058 from V3]
+→ TASK-072 (M23) + TASK-073 (M24)
+
+**V4 Parallel Tracks:**
+Track A: TASK-068 (M20 — RRF) — can start immediately
+Track B: TASK-074 (M25 — Multi-Repo MCP) — can start immediately
+Track C: TASK-071 (M23 — Hunk-to-symbol mapping) — can start immediately
 
 ---
 
@@ -2603,6 +2642,487 @@ Add `--semantic` flag to `wonk summary` that generates LLM descriptions via Olla
 
 ---
 
+## Milestone 19: Edge Confidence & Inheritance Infrastructure
+
+**Goal:** Enrich the call graph with confidence scores on reference edges and inheritance (extends/implements) relationships, enabling V4 commands to filter low-confidence edges and traverse type hierarchies.
+**Exit Criteria:** `references` table has `confidence` column populated during indexing, `type_edges` table stores inheritance relationships, daemon re-index propagates both.
+
+### TASK-065: V4 schema migration and edge confidence scoring
+
+**Milestone:** M19 - Edge Confidence & Inheritance Infrastructure
+**Component:** SQLite Database, Indexer
+**Estimate:** M
+
+**Goal:**
+Add `confidence REAL` column to the `references` table, create the `type_edges` table, and implement confidence scoring logic in the indexer.
+
+**Action Items:**
+- [ ] Add `confidence REAL DEFAULT 0.5` column to `references` table via `ALTER TABLE` (O(1) migration, no row rewriting) (DR-028)
+- [ ] Create index `idx_references_confidence` on the new column
+- [ ] Create `type_edges` table with columns: `id INTEGER PRIMARY KEY`, `child_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE`, `parent_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE`, `relationship TEXT NOT NULL` (DR-029)
+- [ ] Add `UNIQUE(child_id, parent_id, relationship)` constraint on `type_edges`
+- [ ] Create indexes on both `child_id` and `parent_id` for bidirectional queries
+- [ ] Implement confidence scoring logic in `indexer.rs`: import-resolved → 0.95 (PRD-CONF-REQ-002), same-file definition → 0.85 (PRD-CONF-REQ-003), same-scope → 0.80, cross-file name match → 0.50 (PRD-CONF-REQ-004)
+- [ ] During reference extraction, check import resolution evidence and assign confidence per reference (PRD-CONF-REQ-001)
+- [ ] Add `--min-confidence <N>` flag to graph traversal CLI commands: `blast`, `flows`, `callers`, `callees`, `callpath`, `context` (PRD-CONF-REQ-005)
+- [ ] Include `confidence` field in JSON/TOON output for all graph commands (PRD-CONF-REQ-006)
+- [ ] Backward compatibility: existing indexes get all refs at 0.5 (the DEFAULT); re-index recalculates
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-066, TASK-067
+
+**Acceptance Criteria:**
+- `ALTER TABLE` migration succeeds on existing indexes without row rewriting
+- `type_edges` table created with proper constraints and indexes
+- Import-resolved references have confidence >= 0.9
+- Same-file references have confidence >= 0.8
+- Fuzzy cross-file name-matched references have confidence <= 0.5
+- `wonk callers foo --min-confidence 0.8` excludes low-confidence matches
+- JSON output includes confidence field on all graph edges
+- Existing indexes work without re-index (all refs get 0.5)
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CONF-REQ-001 through PRD-CONF-REQ-006
+**Related Decisions:** DR-028, DR-029
+
+**Status:** Not Started
+
+---
+
+### TASK-066: Inheritance extraction across OOP languages
+
+**Milestone:** M19 - Edge Confidence & Inheritance Infrastructure
+**Component:** Indexer
+**Estimate:** L
+
+**Goal:**
+Extract `extends` and `implements` relationships from Tree-sitter parse trees for 8+ OOP languages and store them as typed edges in the `type_edges` table.
+
+**Action Items:**
+- [ ] TypeScript/JavaScript: extract `class_heritage` → `extends_clause` for extends, `implements_clause` for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
+- [ ] Python: extract `class_definition` → `argument_list` for superclass (PRD-HRTG-REQ-001)
+- [ ] Java: extract `superclass` node for extends, `super_interfaces` node for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
+- [ ] C#: extract `base_list` → class types for extends, interface types for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
+- [ ] C++: extract `base_class_clause` for extends (PRD-HRTG-REQ-001)
+- [ ] Ruby: extract `superclass` node for extends (PRD-HRTG-REQ-001)
+- [ ] Rust: extract `impl_item` for trait implementation → implements edge (PRD-HRTG-REQ-002)
+- [ ] PHP: extract `class_declaration` → `base_clause` for extends, `class_interface_clause` for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
+- [ ] C and Go: skip (no class inheritance; Go interfaces are implicit)
+- [ ] Parent resolution: look up parent symbol in same-file symbols or resolved via imports; skip edge if no match found
+- [ ] Store edges with `relationship` = `"extends"` or `"implements"` (PRD-HRTG-REQ-005)
+- [ ] Include `relationship` field in JSON/TOON output for type edges (PRD-HRTG-REQ-005)
+
+**Dependencies:**
+- Blocked by: TASK-065
+- Blocks: TASK-067
+
+**Acceptance Criteria:**
+- `wonk init` on a TypeScript project extracts extends/implements relationships
+- `wonk init` on a Java project extracts class hierarchy and interface implementations
+- `wonk init` on a Rust project extracts trait implementations
+- Parent resolution correctly links child to parent symbol
+- Unresolvable parents are silently skipped (no edge stored)
+- Type edges include `relationship` field in output
+- C and Go projects produce no type edges
+- Tests cover at least TypeScript, Python, Java, Rust, C# extraction
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-HRTG-REQ-001, PRD-HRTG-REQ-002, PRD-HRTG-REQ-005
+**Related Decisions:** DR-029
+
+**Status:** Not Started
+
+---
+
+### TASK-067: Wire confidence + inheritance into build pipeline and daemon
+
+**Milestone:** M19 - Edge Confidence & Inheritance Infrastructure
+**Component:** Pipeline, Background Daemon
+**Estimate:** M
+
+**Goal:**
+Ensure full index builds (`wonk init`/`wonk update`) and daemon incremental re-indexing populate confidence scores on all references and extract/store inheritance edges in `type_edges`.
+
+**Action Items:**
+- [ ] During full index build (pipeline.rs), compute confidence for each reference after extraction (using the import-resolution evidence from TASK-065)
+- [ ] During full index build, extract inheritance relationships per file and batch-insert into `type_edges`
+- [ ] During daemon incremental re-indexing, compute confidence for new/updated references
+- [ ] During daemon incremental re-indexing, delete stale type_edges for re-indexed files and insert fresh ones
+- [ ] For `wonk update`: full rebuild recalculates all confidence scores and rebuilds type_edges
+- [ ] Log confidence and inheritance stats during init (e.g., "Scored N references, extracted M type edges")
+- [ ] Stats messages emitted to stderr, not stdout
+
+**Dependencies:**
+- Blocked by: TASK-065, TASK-066
+- Blocks: TASK-069, TASK-070, TASK-073
+
+**Acceptance Criteria:**
+- After `wonk init`, references have varied confidence values (not all 0.5)
+- After `wonk init`, type_edges table populated for OOP codebases
+- After daemon re-indexes a file, new references have confidence recalculated
+- After daemon re-indexes a file, stale type_edges removed, fresh ones inserted
+- `wonk update` rebuilds all confidence and type_edge data
+- Stats displayed during init progress
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CONF-REQ-001, PRD-HRTG-REQ-001, PRD-HRTG-REQ-002
+**Related Decisions:** DR-028, DR-029
+
+**Status:** Not Started
+
+---
+
+## Milestone 20: Hybrid Search Fusion (RRF)
+
+**Goal:** Replace simple structural-first/semantic-append blending with Reciprocal Rank Fusion for `wonk search --semantic`, producing optimally ranked interleaved results.
+**Exit Criteria:** `wonk search --semantic "auth"` returns results ranked by RRF score, with high-relevance semantic matches interleaved above low-relevance structural matches.
+
+### TASK-068: Reciprocal Rank Fusion for `wonk search --semantic`
+
+**Milestone:** M20 - Hybrid Search Fusion
+**Component:** Ranker, Router, Configuration
+**Estimate:** S
+
+**Goal:**
+Implement `fuse_rrf()` in `ranker.rs` that merges structural and semantic result lists using the RRF formula, and wire it into the search pipeline replacing the existing blending logic.
+
+**Action Items:**
+- [ ] Add `fuse_rrf(structural: &[RankedResult], semantic: &[SemanticResult], k: f32) -> Vec<FusedResult>` to `ranker.rs` (~40 lines) (PRD-RRF-REQ-001)
+- [ ] Implement RRF formula: `score(d) = Sum 1/(K + rank_i(d))` across all result lists (PRD-RRF-REQ-001)
+- [ ] Default K=60 (PRD-RRF-REQ-002)
+- [ ] Add `rrf_k` to `[search]` section in config.toml schema; use configured value when present (PRD-RRF-REQ-003)
+- [ ] Define `FusedResult` with: result data, rrf_score, source tracking (Structural, Semantic, or Both)
+- [ ] Sort output by descending RRF score (PRD-RRF-REQ-004)
+- [ ] Replace existing `blended_search()` call in `router.rs` with `fuse_rrf()` call
+- [ ] Apply existing budget/ranking post-processing after fusion
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk search --semantic "auth"` returns interleaved results ranked by RRF score
+- A high-ranked semantic result can appear before a low-ranked structural result
+- Default K=60 produces reasonable interleaving
+- Custom `rrf_k` value from config.toml is respected
+- Existing non-semantic search (`wonk search "auth"`) is unaffected
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-RRF-REQ-001 through PRD-RRF-REQ-004
+**Related Decisions:** DR-027
+
+**Status:** Not Started
+
+---
+
+## Milestone 21: Execution Flow Detection (`wonk flows`)
+
+**Goal:** `wonk flows` detects entry point symbols and traces execution paths through the call graph via BFS.
+**Exit Criteria:** `wonk flows` lists entry points, `wonk flows main` traces the full flow, `--from` file filtering works, MCP tool exposed.
+
+### TASK-069: `wonk flows` entry point detection and flow tracing
+
+**Milestone:** M21 - Execution Flow Detection
+**Component:** Flow Detection, CLI, MCP Server
+**Estimate:** L
+
+**Goal:**
+Implement `flows.rs` module with entry point detection via SQL anti-join and forward BFS flow tracing, plus CLI subcommand and MCP tool.
+
+**Action Items:**
+- [ ] Create `flows.rs` module (~200 lines) (DR-023)
+- [ ] Implement `detect_entry_points(db, options) -> Vec<Symbol>`: SQL anti-join to find functions/methods with no indexed callers (PRD-FLOW-REQ-001)
+  - Query: `SELECT s.* FROM symbols s WHERE s.kind IN ('function', 'method') AND s.id NOT IN (SELECT DISTINCT caller_id FROM "references" WHERE caller_id IS NOT NULL)`
+- [ ] Implement `trace_flow(db, entry, options) -> ExecutionFlow`: BFS from entry point expanding callees at each level (PRD-FLOW-REQ-002, PRD-FLOW-REQ-003)
+- [ ] `--depth N` caps BFS traversal (default: 10, maximum: 20) (PRD-FLOW-REQ-004)
+- [ ] `--branching N` limits callees followed per symbol (default: 4), sorted by confidence descending (PRD-FLOW-REQ-005)
+- [ ] Exclude flows with fewer than 2 steps (PRD-FLOW-REQ-006)
+- [ ] Each step includes: symbol name, kind, file path, line number, depth (PRD-FLOW-REQ-007)
+- [ ] `--from <file>` restricts entry point detection to symbols in the specified file (PRD-FLOW-REQ-008)
+- [ ] Honor `--min-confidence` to exclude low-confidence edges during traversal (PRD-CONF-REQ-005)
+- [ ] Define `ExecutionFlow` in types.rs: entry_point, steps (ordered array), step_count (PRD-FLOW-REQ-009)
+- [ ] Add `flows` subcommand to CLI with args: `[entry]` (optional), `--from`, `--depth`, `--branching`, `--min-confidence`, `--format`
+- [ ] JSON/TOON output includes structured fields (PRD-FLOW-REQ-009)
+- [ ] Add MCP tool `wonk_flows` with parameters: entry, from, depth, branching, min_confidence, format (PRD-FLOW-REQ-010)
+- [ ] Auto-init: consistent with PRD-AUT behavior
+
+**Dependencies:**
+- Blocked by: TASK-058 (V3 — caller_id population), TASK-067
+- Blocks: TASK-072, TASK-073
+
+**Acceptance Criteria:**
+- `wonk flows` lists all detected entry points with call depth
+- `wonk flows main` traces the full execution flow from `main`
+- `wonk flows --from src/api.ts` shows flows starting from that file only
+- Flows with only 1 step are excluded
+- `--depth 5` limits BFS to 5 levels
+- `--branching 2` follows at most 2 callees per symbol
+- `--min-confidence 0.8` excludes fuzzy-matched edges
+- MCP tool `wonk_flows` works through Claude Code
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-FLOW-REQ-001 through PRD-FLOW-REQ-010, PRD-CONF-REQ-005
+**Related Decisions:** DR-023
+
+**Status:** Not Started
+
+---
+
+## Milestone 22: Blast Radius Analysis (`wonk blast`)
+
+**Goal:** `wonk blast <symbol>` traverses the call graph outward from a symbol, grouping results by depth-based severity tiers with risk level assessment.
+**Exit Criteria:** `wonk blast processPayment` shows callers grouped by severity, risk levels computed, test files excluded by default, MCP tool exposed.
+
+### TASK-070: `wonk blast` depth-annotated traversal with severity tiers
+
+**Milestone:** M22 - Blast Radius Analysis
+**Component:** Blast Radius, CLI, MCP Server
+**Estimate:** L
+
+**Goal:**
+Implement `blast.rs` module with depth-annotated BFS, severity tiers, risk levels, inheritance integration, and test exclusion, plus CLI subcommand and MCP tool.
+
+**Action Items:**
+- [ ] Create `blast.rs` module (~200 lines) (DR-024)
+- [ ] Implement `analyze_blast(db, symbol, options) -> BlastAnalysis`: depth-annotated BFS from target symbol (PRD-BLAST-REQ-001)
+- [ ] Direction control: upstream (default) traverses callers + type_edges children, downstream traverses callees (PRD-BLAST-REQ-004, PRD-BLAST-REQ-005)
+- [ ] Severity tiers by depth: depth 1 = "WILL BREAK", depth 2 = "LIKELY AFFECTED", depth 3+ = "MAY NEED TESTING" (PRD-BLAST-REQ-002)
+- [ ] Risk level from total affected count: LOW ≤3, MEDIUM 4-10, HIGH 11-25, CRITICAL >25 (PRD-BLAST-REQ-003)
+- [ ] `--depth N` caps traversal (default: 3, maximum: 10) (PRD-BLAST-REQ-006)
+- [ ] Affected files summary: deduplicated list of files containing affected symbols (PRD-BLAST-REQ-007)
+- [ ] Test exclusion by default: reuse ranker.rs path heuristics (test/, tests/, *_test.*, *.test.*, *.spec.*); `--include-tests` overrides (PRD-BLAST-REQ-008)
+- [ ] Inheritance integration: query `type_edges WHERE parent_id = ?` to include child classes as depth-1 dependants during upstream traversal (PRD-HRTG-REQ-003)
+- [ ] Honor `--min-confidence` to exclude low-confidence edges (PRD-CONF-REQ-005)
+- [ ] Define `BlastAnalysis` in types.rs: target, direction, risk_level, total_affected, tiers[], affected_files[] (PRD-BLAST-REQ-009)
+- [ ] Add `blast` subcommand to CLI with args: `<symbol>` (required), `--direction`, `--depth`, `--include-tests`, `--min-confidence`, `--format`
+- [ ] JSON/TOON output includes all BlastAnalysis fields (PRD-BLAST-REQ-009)
+- [ ] Add MCP tool `wonk_blast` with parameters: symbol, direction, depth, include_tests, min_confidence, format (PRD-BLAST-REQ-010)
+- [ ] Auto-init: consistent with PRD-AUT behavior
+
+**Dependencies:**
+- Blocked by: TASK-058 (V3 — caller_id population), TASK-067
+- Blocks: TASK-072
+
+**Acceptance Criteria:**
+- `wonk blast processPayment` shows callers grouped by depth with severity labels
+- `wonk blast processPayment --direction downstream` shows callees grouped by depth
+- Risk levels correctly reflect affected symbol counts
+- Test files excluded by default; included with `--include-tests`
+- `wonk blast IPaymentProvider` includes all implementors in depth-1 tier (inheritance)
+- `--min-confidence 0.8` excludes fuzzy-matched edges
+- Affected files summary included in output
+- MCP tool works through Claude Code
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-BLAST-REQ-001 through PRD-BLAST-REQ-010, PRD-HRTG-REQ-003, PRD-CONF-REQ-005
+**Related Decisions:** DR-024
+
+**Status:** Not Started
+
+---
+
+## Milestone 23: Scoped Change Detection (`wonk changes`)
+
+**Goal:** `wonk changes` maps git diff hunks to indexed symbols and optionally chains into blast radius and flow analysis.
+**Exit Criteria:** `wonk changes` detects symbols affected by unstaged changes, `--scope` variants work, `--blast` and `--flows` chaining produce aggregated impact.
+
+### TASK-071: Hunk-to-symbol mapping for scoped change detection
+
+**Milestone:** M23 - Scoped Change Detection
+**Component:** Change Detection (impact.rs)
+**Estimate:** M
+
+**Goal:**
+Extend `impact.rs` with `ChangeScope` enum and git diff hunk-to-symbol mapping that identifies which indexed symbols overlap with changed line ranges.
+
+**Action Items:**
+- [ ] Add `ChangeScope` enum to `impact.rs`: `Unstaged` (default), `Staged`, `All`, `Compare(ref)` (PRD-CHG-REQ-001 through PRD-CHG-REQ-004)
+- [ ] Implement git diff scoping commands:
+  - Unstaged: `git diff --name-only` (PRD-CHG-REQ-001)
+  - Staged: `git diff --cached --name-only` (PRD-CHG-REQ-002)
+  - All: `git diff HEAD --name-only` (PRD-CHG-REQ-003)
+  - Compare: `git diff <ref> --name-only` (PRD-CHG-REQ-004)
+- [ ] Implement hunk-to-symbol mapping (PRD-CHG-REQ-005):
+  1. Run `git diff --unified=0 [flags] <file>` to get precise line ranges
+  2. Parse diff output to extract changed line ranges from hunk headers (`@@ -start,count +start,count @@`)
+  3. Query indexed symbols for the file: `SELECT * FROM symbols WHERE file = ?`
+  4. Overlap check: symbol is Modified if any changed line range overlaps `line..end_line`
+  5. Re-parse file with Tree-sitter for Added (new) and Removed (absent) symbols
+- [ ] Reuse existing `detect_changed_symbols()` for Added/Removed detection
+- [ ] Define `ChangeAnalysis` in types.rs: scope, changed_symbols[] (each with name, kind, file, line, change_type)
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-072
+
+**Acceptance Criteria:**
+- `detect_changes(db, Unstaged, options)` correctly identifies symbols affected by unstaged changes
+- `detect_changes(db, Staged, options)` works for staged changes
+- `detect_changes(db, Compare("main"), options)` works for branch comparison
+- Hunk-to-symbol mapping correctly identifies Modified symbols from overlapping line ranges
+- Added and Removed symbols detected via Tree-sitter re-parse
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CHG-REQ-001 through PRD-CHG-REQ-005
+**Related Decisions:** DR-025
+
+**Status:** Not Started
+
+---
+
+### TASK-072: `wonk changes` CLI with blast/flow chaining
+
+**Milestone:** M23 - Scoped Change Detection
+**Component:** CLI, MCP Server, Change Detection (impact.rs)
+**Estimate:** M
+
+**Goal:**
+Add `wonk changes` CLI subcommand with `--blast` and `--flows` chaining that calls blast radius and flow detection for each changed symbol, plus MCP tool exposure.
+
+**Action Items:**
+- [ ] Add `changes` subcommand to CLI with args: `--scope` (unstaged|staged|all|compare), `--base <ref>` (required when scope=compare), `--blast`, `--flows`, `--min-confidence`, `--format`
+- [ ] Wire CLI to `detect_changes()` from TASK-071
+- [ ] `--blast` chaining (PRD-CHG-REQ-006): for each changed symbol, call `analyze_blast()` from `blast.rs` and include aggregated per-symbol blast radius in output; compute combined risk level
+- [ ] `--flows` chaining (PRD-CHG-REQ-007): identify execution flows (from `flows.rs`) containing any changed symbols; a flow is "affected" if any of its steps match a changed symbol
+- [ ] JSON/TOON output includes: scope, changed_symbols[], blast_radius (optional), affected_flows (optional) (PRD-CHG-REQ-008)
+- [ ] Add MCP tool `wonk_changes` with parameters: scope, base, blast, flows, min_confidence, format (PRD-CHG-REQ-009)
+- [ ] Auto-init: consistent with PRD-AUT behavior
+
+**Dependencies:**
+- Blocked by: TASK-071, TASK-069, TASK-070
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk changes` shows symbols affected by unstaged changes
+- `wonk changes --scope staged` shows symbols in staged changes
+- `wonk changes --scope compare --base main` shows changes vs. main
+- `wonk changes --blast` includes blast radius per changed symbol with aggregated risk level
+- `wonk changes --flows` lists affected execution flows
+- MCP tool works through Claude Code
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CHG-REQ-006 through PRD-CHG-REQ-009
+**Related Decisions:** DR-025
+
+**Status:** Not Started
+
+---
+
+## Milestone 24: Unified Symbol Context (`wonk context`)
+
+**Goal:** `wonk context <name>` aggregates definition, categorized incoming/outgoing references, flow participation, and children into a single response.
+**Exit Criteria:** `wonk context processPayment` shows definition, callers, callees, importers, flows, and children in one response. MCP tool exposed.
+
+### TASK-073: `wonk context` symbol information aggregation
+
+**Milestone:** M24 - Unified Symbol Context
+**Component:** Context, CLI, MCP Server
+**Estimate:** L
+
+**Goal:**
+Implement `context.rs` orchestration module that aggregates definition, categorized incoming/outgoing references, flow participation, and children for a symbol, plus CLI subcommand and MCP tool.
+
+**Action Items:**
+- [ ] Create `context.rs` module (~150 lines) (DR-026)
+- [ ] Implement `symbol_context(db, name, options) -> Vec<SymbolContext>` (PRD-CTX-REQ-001)
+- [ ] Aggregate definition: file, line, end_line, kind, signature (from symbols table)
+- [ ] Incoming references categorized as (PRD-CTX-REQ-005):
+  - Callers: functions whose body calls this symbol (`references JOIN symbols ON caller_id`)
+  - Importers: files that import this symbol (`file_imports WHERE name = ?`)
+  - Type Users: symbols referencing this symbol's type in annotations/signatures
+- [ ] Outgoing references categorized as (PRD-CTX-REQ-006):
+  - Callees: symbols called within this function's body (`references WHERE caller_id = self.id`)
+  - Imports: modules/symbols imported by this symbol's file
+- [ ] Flow participation: which execution flows include this symbol and at which step (PRD-CTX-REQ-007)
+- [ ] Children: classes extending or implementing this symbol from `type_edges WHERE parent_id = ?` (PRD-HRTG-REQ-004)
+- [ ] `--file <path>` restricts to symbols in that file (PRD-CTX-REQ-002)
+- [ ] `--kind <kind>` restricts to symbol kind (PRD-CTX-REQ-003)
+- [ ] Multiple matches: return context for all, clearly labeled (PRD-CTX-REQ-004)
+- [ ] Honor `--min-confidence` to filter low-confidence edges (PRD-CONF-REQ-005)
+- [ ] Define `SymbolContext` in types.rs: symbol, incoming {callers[], importers[], type_users[]}, outgoing {callees[], imports[]}, flows[], children[] (PRD-CTX-REQ-008)
+- [ ] Add `context` subcommand to CLI with args: `<name>` (required), `--file`, `--kind`, `--min-confidence`, `--format`
+- [ ] JSON/TOON output includes all SymbolContext fields (PRD-CTX-REQ-008)
+- [ ] Add MCP tool `wonk_context` with parameters: name, file, kind, min_confidence, format (PRD-CTX-REQ-009)
+- [ ] Auto-init: consistent with PRD-AUT behavior
+
+**Dependencies:**
+- Blocked by: TASK-069, TASK-067
+- Blocks: None
+
+**Acceptance Criteria:**
+- `wonk context processPayment` shows definition, callers, callees, importers, and flows in one response
+- `wonk context --file src/auth.ts verifyToken` narrows to that file
+- `wonk context --kind class StripeClient` narrows to class only
+- `wonk context BaseHandler` shows extending classes under "Children"
+- Categories are clearly separated in output
+- Multiple matching symbols each get full context
+- MCP tool works through Claude Code
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-CTX-REQ-001 through PRD-CTX-REQ-009, PRD-HRTG-REQ-004, PRD-CONF-REQ-005
+**Related Decisions:** DR-026
+
+**Status:** Not Started
+
+---
+
+## Milestone 25: Multi-Repo MCP
+
+**Goal:** A single MCP server instance can serve queries across all indexed repositories via an optional `repo` parameter.
+**Exit Criteria:** `wonk_repos` lists all indexed repos, `repo` parameter routes queries correctly, lazy-loaded connections, backward compatible default.
+
+### TASK-074: Multi-repo MCP discovery and routing
+
+**Milestone:** M25 - Multi-Repo MCP
+**Component:** MCP Server
+**Estimate:** M
+
+**Goal:**
+Extend `mcp.rs` to discover all indexed repositories at startup, lazy-load connections per repo, add optional `repo` parameter to all existing tools, and expose `wonk_repos` tool.
+
+**Action Items:**
+- [ ] Repo discovery at startup: glob `~/.wonk/repos/*/meta.json` to find all indexed repositories (PRD-MREP-REQ-001)
+- [ ] Build repo registry: map of repo name (last path component) → repo metadata (path, index location)
+- [ ] Implement lazy-load `HashMap<String, Connection>`: open connection on first query, cache for session lifetime (PRD-MREP-REQ-006)
+- [ ] Default behavior: when no `repo` parameter provided, use working directory repo (PRD-MREP-REQ-002)
+- [ ] Repo routing: when `repo` parameter provided, look up in registry, open/reuse connection, route query (PRD-MREP-REQ-003)
+- [ ] Name matching: match by last path component of repo root; return error listing all matches for ambiguous names (PRD-MREP-REQ-004)
+- [ ] Add `wonk_repos` MCP tool: lists all available repos with name, path, file count, symbol count, last indexed time (PRD-MREP-REQ-005)
+- [ ] Add optional `repo` string parameter to all 18 existing MCP tool definitions
+- [ ] Server restart required to discover newly indexed repos (documented limitation)
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: None
+
+**Acceptance Criteria:**
+- Single MCP server can answer queries about multiple repos
+- `wonk_repos` lists all indexed repos with stats
+- `wonk_search` with `repo: "other-project"` queries the other project's index
+- Default (no `repo` param) uses working directory repo — backward compatible
+- Lazy-loaded connections don't block server startup
+- Ambiguous repo names return an error with all matching paths
+- First query to a new repo opens connection (~5ms latency, negligible)
+- Typecheck passes
+- Tests pass
+
+**Related Requirements:** PRD-MREP-REQ-001 through PRD-MREP-REQ-006
+**Related Decisions:** DR-030
+
+**Status:** Not Started
+
+---
+
 ## Parking Lot
 
 Tasks identified but not yet scheduled:
@@ -2630,3 +3150,4 @@ Tasks identified but not yet scheduled:
 | 2026-02-12 | Added Git Worktree Support milestone (M8, TASK-035 to TASK-037). 3 tasks: walker boundary exclusion, watcher boundary filtering, integration tests. Total tasks: 37 across 8 milestones. | TBD |
 | 2026-02-13 | Added V2 semantic search milestones (M9-M14, TASK-038 to TASK-056). 19 tasks across 6 milestones: Embedding Infrastructure, Semantic Search, Daemon Embedding & Lifecycle, Semantic Blending & Dependency Scoping, Semantic Clustering, Change Impact Analysis. Total tasks: 56 across 14 milestones. | TBD |
 | 2026-02-24 | Added V3 milestones (M15-M18, TASK-057 to TASK-064). 8 tasks across 4 milestones: Call Graph Data Model & Indexing, Source Display, Call Graph Commands, Code Summary Engine. Marked M11/M12 as Complete. Updated parking lot. Total tasks: 64 across 18 milestones. | TBD |
+| 2026-02-25 | Added V4 milestones (M19-M25, TASK-065 to TASK-074). 10 tasks across 7 milestones: Edge Confidence & Inheritance Infrastructure, Hybrid Search Fusion (RRF), Execution Flow Detection, Blast Radius Analysis, Scoped Change Detection, Unified Symbol Context, Multi-Repo MCP. Total tasks: 74 across 25 milestones. | TBD |

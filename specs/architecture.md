@@ -1,7 +1,7 @@
 # System Architecture
 
-**Version:** 0.3
-**Last updated:** 2026-02-24
+**Version:** 0.4
+**Last updated:** 2026-02-25
 **Status:** Draft
 **Owner:** TBD
 
@@ -19,6 +19,8 @@ The architecture prioritizes simplicity and low resource usage. A single Rust cr
 
 **V3 adds source display, code summaries, and call graph analysis.** `wonk show` collapses symbol lookup + file reading into a single call that returns exactly the source span tree-sitter already knows — halving round-trip latency for LLM agents. `wonk summary` provides structural metrics and optional LLM-generated descriptions of files and directories via Ollama's `/api/generate` endpoint. `wonk callers`, `wonk callees`, and `wonk callpath` enable symbol-level call graph navigation by recording the enclosing function for each call-site reference during indexing, enabling agents to trace execution paths and understand blast radius at the function level.
 
+**V4 adds graph intelligence features.** Building on V3's call graph, V4 enables higher-level analysis: execution flow detection traces entry-point-to-leaf paths through the call graph, blast radius analysis walks the dependency graph outward from a symbol grouping results by depth-based severity, scoped change detection maps git diff hunks to symbols and chains into blast/flow analysis, and unified symbol context aggregates all relationships into a single response. Supporting infrastructure includes Reciprocal Rank Fusion (RRF) for hybrid structural+semantic search, edge confidence scoring for graph traversal filtering, inheritance tracking via a new `type_edges` table, and multi-repo MCP serving from a single server instance. All V4 features depend on V3's `caller_id` call graph data.
+
 Key technology choices: Rust for single static binary distribution and native Tree-sitter/SQLite FFI, SQLite with FTS5 for persistent symbol storage, the `grep` and `ignore` crates from ripgrep for text search and file filtering, `notify` for cross-platform filesystem watching, `ureq` for sync HTTP to Ollama, and `linfa-clustering` for K-Means clustering.
 
 ---
@@ -32,6 +34,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - Single binary, no external dependencies (V1) — trivial to install and distribute
 - **Vocabulary gap bridging (V2):** Semantic search finds functionally related code even when terminology doesn't overlap — essential for LLM agents searching by intent rather than exact names
 - **Round-trip reduction (V3):** `wonk show` eliminates the symbol-lookup-then-file-read round-trip; `wonk summary` provides high-level orientation without reading every file; call graph commands trace execution paths without manual grep chains
+- **Graph intelligence (V4):** Execution flows, blast radius, and scoped change detection turn raw call graph data into actionable insights — agents can understand impact, trace paths, and scope changes without manual multi-command workflows. Unified symbol context collapses 4+ commands into one.
 
 ### 2.2 Quality Attributes (from PRD NFRs)
 
@@ -52,6 +55,12 @@ Key technology choices: Rust for single static binary distribution and native Tr
 | Latency (show) | < 50ms for source display | Index lookup + file read; no re-parse needed |
 | Latency (summary) | < 100ms structural; 1-5s with `--semantic` | Index aggregation; LLM generation cached in SQLite |
 | Latency (callers/callees) | < 100ms depth-1; < 500ms depth-10 | SQL JOIN on `caller_id`; BFS traversal for callpath |
+| Latency (flows) | < 200ms entry point detection; < 500ms flow trace | SQL anti-join for entry points; BFS over caller_id edges |
+| Latency (blast) | < 500ms depth-3 traversal | Depth-annotated BFS over callers/callees + type_edges |
+| Latency (changes) | < 1s for unstaged scope | git diff + hunk-to-symbol mapping + optional blast/flow chaining |
+| Latency (context) | < 200ms aggregation | Parallel queries to existing tables (symbols, references, type_edges) |
+| Latency (RRF fusion) | < 10ms additional over existing search | In-memory rank merge, no additional I/O |
+| Storage (V4 additions) | ~8 bytes per reference (confidence f32); ~24 bytes per type edge | Additive: `confidence` column via ALTER TABLE DEFAULT; `type_edges` table negligible for typical repos |
 
 ### 2.3 Constraints
 - **Language:** Rust (required for single static binary, native Tree-sitter FFI, grep crate access)
@@ -59,6 +68,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **No IPC:** CLI and daemon communicate only via shared SQLite (DR-003)
 - **WAL mode:** SQLite WAL journal mode for concurrent reader/writer access (DR-004)
 - **Conditional network dependency (V2):** Ollama required only for semantic features; all V1 features remain fully offline
+- **V3 call graph dependency (V4):** All V4 graph intelligence features (flows, blast, changes, context) depend on V3's `caller_id` data being populated in the `references` table. Repos must re-index (`wonk update`) after V3 support to enable V4 features.
 
 ---
 
@@ -75,6 +85,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 │               ask, cluster, impact                  [V2]     │
 │               show, summary, callers, callees,      [V3]     │
 │               callpath                              [V3]     │
+│               flows, blast, changes, context        [V4]     │
 ├─────────────────────────────────────────────────────────────┤
 │                     Query Router                              │
 │  Routes queries to index, grep, or semantic backends          │
@@ -82,14 +93,23 @@ Key technology choices: Rust for single static binary distribution and native Tr
 │             Smart Search Ranker                               │
 │  Ranks, deduplicates, and budget-caps results                 │
 │  Blends structural + semantic results for --semantic  [V2]    │
+│  RRF fusion for hybrid search                         [V4]    │
 ├──────────────────┬──────────────────┬───────────────────────┤
 │ Structural Index │   Text Search    │  Semantic Engine [V2]  │
 │ (Tree-sitter +   │   (grep crate)   │  (Embedding + Cosine)  │
 │  SQLite + FTS5)  │                  │                        │
-├──────────────────┴──────────────────┴───────────────────────┤
+├──────────────────┴──────────┬───────┴───────────────────────┤
+│        Graph Intelligence [V4]                               │
+│  Flow Detection │ Blast Radius │ Symbol Context              │
+│  Scoped Changes │ Confidence   │ Inheritance                 │
+├─────────────────────────────┴───────────────────────────────┤
 │                     SQLite Database                           │
 │  symbols, references, files, symbols_fts,                     │
-│  daemon_status, embeddings [V2]                               │
+│  daemon_status, embeddings [V2], summaries [V3],              │
+│  type_edges [V4]                                              │
+├─────────────────────────────────────────────────────────────┤
+│              MCP Server (JSON-RPC 2.0 stdio)                  │
+│  19 tools, multi-repo support via lazy connections    [V4]    │
 ├─────────────────────────────────────────────────────────────┤
 │                   Background Daemon                           │
 │  notify + crossbeam-channel + rayon                           │
@@ -121,6 +141,14 @@ Key technology choices: Rust for single static binary distribution and native Tr
 | Source Display [V3] | Look up symbol in index, read source span from file | Custom module (index query + file read) |
 | Code Summary Engine [V3] | Structural metrics aggregation, LLM description generation + caching | Custom module, ureq (Ollama `/api/generate`) |
 | Call Graph [V3] | Record enclosing callers during indexing, traverse caller/callee relationships | Custom module (Tree-sitter parent traversal, BFS) |
+| Flow Detection [V4] | Identify entry points, trace execution flows via BFS on call graph | Custom module (SQL anti-join, BFS) |
+| Blast Radius [V4] | Depth-annotated call graph traversal with severity tiers and risk levels | Custom module (BFS, type_edges integration) |
+| Scoped Change Detection [V4] | Map git diff hunks to symbols, chain into blast/flow analysis | Extends impact.rs (git CLI, hunk-to-symbol mapping) |
+| Unified Symbol Context [V4] | Aggregate definition, incoming/outgoing refs, flow participation | Custom module (parallel SQL queries) |
+| Hybrid Search Fusion [V4] | Reciprocal Rank Fusion merging structural + semantic ranked lists | Extends ranker.rs (~40 lines) |
+| Edge Confidence [V4] | Score reference reliability at index time, filter graph traversals | Extends indexer.rs + references schema |
+| Inheritance Tracking [V4] | Extract extends/implements relationships, integrate with blast/context | Custom module (Tree-sitter extraction, type_edges table) |
+| Multi-Repo MCP [V4] | Serve multiple indexed repos from single MCP server | Extends mcp.rs (lazy HashMap<String, Connection>) |
 
 ---
 
@@ -154,10 +182,15 @@ Key technology choices: Rust for single static binary distribution and native Tr
   - `wonk callers <symbol>` — list caller functions with `--depth` flag
   - `wonk callees <symbol>` — list callee functions with `--depth` flag
   - `wonk callpath <from> <to>` — find call chain between two symbols
+- V4 subcommands:
+  - `wonk flows [<entry>]` — entry point detection and flow tracing with `--depth`, `--branching`, `--from`, `--min-confidence` flags
+  - `wonk blast <symbol>` — blast radius analysis with `--direction`, `--depth`, `--include-tests`, `--min-confidence` flags
+  - `wonk changes` — scoped change detection with `--scope`, `--base`, `--blast`, `--flows` flags
+  - `wonk context <name>` — unified symbol context with `--file`, `--kind`, `--min-confidence` flags
 - **Auto-init embedding delegation (PRD-SEM-REQ-009):** When auto-init is triggered by a query, the CLI builds the structural index synchronously, then writes a `embedding_build_requested = 1` flag to the `daemon_status` table. The daemon reads this flag on startup and begins embedding generation in the background.
 - **Block-and-wait for incomplete embeddings (PRD-SEM-REQ-013):** When `wonk ask` detects embeddings are incomplete, the CLI calls `Embedding Engine::embed_repo()` directly with a progress callback that prints to stderr, blocking until complete, then proceeds with the semantic query.
 
-**Related Requirements:** PRD-OUT-REQ-001, PRD-OUT-REQ-002, PRD-OUT-REQ-003, PRD-AUT-REQ-001, PRD-DMN-REQ-002, PRD-DMN-REQ-011 through PRD-DMN-REQ-015, PRD-SSRCH-REQ-006, PRD-SEM-REQ-001 through PRD-SEM-REQ-005, PRD-SEM-REQ-009, PRD-SEM-REQ-013, PRD-SCLST-REQ-001 through PRD-SCLST-REQ-003, PRD-SIMP-REQ-001 through PRD-SIMP-REQ-004, PRD-SHOW-REQ-001 through PRD-SHOW-REQ-013, PRD-SUM-REQ-001 through PRD-SUM-REQ-018, PRD-CGR-REQ-001 through PRD-CGR-REQ-014
+**Related Requirements:** PRD-OUT-REQ-001, PRD-OUT-REQ-002, PRD-OUT-REQ-003, PRD-AUT-REQ-001, PRD-DMN-REQ-002, PRD-DMN-REQ-011 through PRD-DMN-REQ-015, PRD-SSRCH-REQ-006, PRD-SEM-REQ-001 through PRD-SEM-REQ-005, PRD-SEM-REQ-009, PRD-SEM-REQ-013, PRD-SCLST-REQ-001 through PRD-SCLST-REQ-003, PRD-SIMP-REQ-001 through PRD-SIMP-REQ-004, PRD-SHOW-REQ-001 through PRD-SHOW-REQ-013, PRD-SUM-REQ-001 through PRD-SUM-REQ-018, PRD-CGR-REQ-001 through PRD-CGR-REQ-014, PRD-FLOW-REQ-001 through PRD-FLOW-REQ-010, PRD-BLAST-REQ-001 through PRD-BLAST-REQ-010, PRD-CHG-REQ-001 through PRD-CHG-REQ-009, PRD-CTX-REQ-001 through PRD-CTX-REQ-009, PRD-RRF-REQ-001 through PRD-RRF-REQ-004, PRD-CONF-REQ-001 through PRD-CONF-REQ-006, PRD-HRTG-REQ-001 through PRD-HRTG-REQ-005, PRD-MREP-REQ-001 through PRD-MREP-REQ-006
 
 ### 4.2 Query Router
 
@@ -184,6 +217,10 @@ Key technology choices: Rust for single static binary distribution and native Tr
   | `wonk ask` [V2] | Semantic engine (embeddings) | Error if Ollama unavailable |
   | `wonk cluster` [V2] | Clustering engine (embeddings) | Error if no embeddings |
   | `wonk impact` [V2] | Impact analyzer (embeddings + git) | Error if no embeddings |
+  | `wonk flows` [V4] | Flow Detection (call graph BFS) | Error if no caller_id data |
+  | `wonk blast` [V4] | Blast Radius (call graph BFS + type_edges) | Error if no caller_id data |
+  | `wonk changes` [V4] | Scoped Change Detection (git + index) | Error if not in git repo |
+  | `wonk context` [V4] | Unified Symbol Context (index aggregation) | Error if no index |
 - Fallback is triggered when primary returns no results
 - Error types from `thiserror` enable matching on `NoIndex` vs `QueryFailed` vs `NoEmbeddings` (V2)
 
@@ -212,9 +249,10 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Bypass:** `--raw` flag skips the ranker entirely, returning unranked grep-style output
 - **Symbol detection:** On `wonk search <pattern>`, check if pattern matches any symbol name in the index. If yes, use ranked mode. If no, use plain text search (no ranking).
 - Applied as a post-processing step — does not change the underlying search engines
-- **V2 blending (PRD-SEM-REQ-002):** When `--semantic` is provided on `wonk search`, structural matches are presented first, followed by additional semantic matches not already present, each annotated with cosine similarity score.
+- **V2 blending (PRD-SEM-REQ-002):** ~~When `--semantic` is provided on `wonk search`, structural matches are presented first, followed by additional semantic matches not already present, each annotated with cosine similarity score.~~ *Superseded by V4 RRF fusion (DR-027, PRD-RRF-REQ-001).*
+- **V4 RRF fusion (PRD-RRF-REQ-001):** When `--semantic` is provided, `fuse_rrf()` merges structural and semantic ranked lists using Reciprocal Rank Fusion with K=60 (configurable via `[search].rrf_k`). Results are interleaved by descending fused score. See section 4.20 for details.
 
-**Related Requirements:** PRD-SSRCH-REQ-001 through PRD-SSRCH-REQ-006, PRD-SEM-REQ-002, PRD-SEM-REQ-004
+**Related Requirements:** PRD-SSRCH-REQ-001 through PRD-SSRCH-REQ-006, PRD-SEM-REQ-002, PRD-SEM-REQ-004, PRD-RRF-REQ-001 through PRD-RRF-REQ-004
 
 ### 4.4 Structural Index (Indexer)
 
@@ -234,7 +272,10 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - Tree-sitter grammars bundled at compile time — one `tree-sitter-{lang}` crate per language
 - **Worktree boundary exclusion (DR-008):** The `WalkBuilder` uses a `filter_entry` callback that checks each directory for a `.git` entry (file or directory). If found and the directory is not the repo root itself, the entire subtree is skipped — treating it as a separate repository or worktree boundary.
 
-**Related Requirements:** PRD-IDX-REQ-001 through PRD-IDX-REQ-011, PRD-SYM-REQ-001 through PRD-SYM-REQ-004, PRD-REF-REQ-001 through PRD-REF-REQ-003, PRD-WKT-REQ-003
+- **V4 confidence scoring (DR-028, PRD-CONF-REQ-001):** During reference extraction, assign confidence scores based on resolution method. Check if the referenced name appears in the file's imports (0.95), has a same-file definition (0.85), is in the same scope (0.80), or is a cross-file name match (0.50). Scores stored in the `confidence` column on each reference row.
+- **V4 inheritance extraction (DR-029, PRD-HRTG-REQ-001, PRD-HRTG-REQ-002):** During class/struct/trait parsing, extract extends/implements relationships from Tree-sitter nodes and insert into `type_edges` table. Resolve parent symbols via same-file lookup or import resolution. See section 4.22 for per-language node kinds.
+
+**Related Requirements:** PRD-IDX-REQ-001 through PRD-IDX-REQ-011, PRD-SYM-REQ-001 through PRD-SYM-REQ-004, PRD-REF-REQ-001 through PRD-REF-REQ-003, PRD-WKT-REQ-003, PRD-CONF-REQ-001 through PRD-CONF-REQ-004, PRD-HRTG-REQ-001, PRD-HRTG-REQ-002
 
 ### 4.5 Text Search
 
@@ -278,6 +319,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Worktree boundary filtering (DR-008):** The `should_process` event filter checks whether an event path falls within a nested worktree boundary by walking ancestor directories (between the event path and the repo root) for `.git` entries. Events inside a nested boundary are discarded. Cost is O(depth) `exists()` calls per event, negligible since events are debounced.
 - **V2 embedding re-indexing:** After structural re-indexing of changed files, if Ollama is reachable, re-generate chunks and re-embed all symbols belonging to the changed files (PRD-SEM-REQ-010). If Ollama is unreachable, skip embedding update silently and mark affected files as stale in the embeddings table (PRD-SEM-REQ-011).
 - **V3 caller_id population:** Incremental re-indexing of changed files must also populate `caller_id` on new reference rows using the same Tree-sitter parent traversal logic as the full index build (DR-021). This ensures call graph data stays current as files change.
+- **V4 confidence + type_edges population:** Incremental re-indexing must also compute confidence scores (DR-028) and extract type_edges (DR-029) for changed files, using the same logic as the full index build.
 
 **Related Requirements:** PRD-DMN-REQ-001 through PRD-DMN-REQ-015, PRD-WKT-REQ-004, PRD-SEM-REQ-009, PRD-SEM-REQ-010, PRD-SEM-REQ-011
 
@@ -294,11 +336,12 @@ Key technology choices: Rust for single static binary distribution and native Tr
 **Key Design Notes:**
 - Load order: defaults → global config → per-repo config (last wins)
 - All config is optional — sensible defaults baked in
-- Config sections: `[daemon]`, `[index]`, `[output]`, `[ignore]`, `[llm]` [V3]
+- Config sections: `[daemon]`, `[index]`, `[output]`, `[ignore]`, `[llm]` [V3], `[search]` [V4]
 - **V2 change:** `daemon.idle_timeout_minutes` config key removed — daemons now run indefinitely (PRD-DMN-REQ-003 removed, PRD-CFG-REQ-004 struck through). See DR-013 for rationale.
 - **V3 change:** `[llm]` section added with `model` key (default: `"llama3.2:3b"`) for `wonk summary --semantic` text generation (DR-018, PRD-SUM-REQ-014).
+- **V4 change:** `[search]` section added with `rrf_k` key (default: 60) for hybrid search fusion constant (DR-027, PRD-RRF-REQ-003).
 
-**Related Requirements:** PRD-CFG-REQ-001 through PRD-CFG-REQ-010, PRD-SUM-REQ-014
+**Related Requirements:** PRD-CFG-REQ-001 through PRD-CFG-REQ-010, PRD-SUM-REQ-014, PRD-RRF-REQ-003
 
 ### 4.8 Embedding Engine [V2]
 
@@ -477,14 +520,14 @@ Key technology choices: Rust for single static binary distribution and native Tr
 **Technology:** Custom Rust module, serde_json for JSON-RPC serialization
 
 **Interfaces:**
-- Exposes: 14 MCP tools over stdio (JSON-RPC 2.0)
-- Consumes: All query backends (Query Router, Semantic Search, Clustering Engine, Impact Analyzer, Source Display, Code Summary Engine, Call Graph)
+- Exposes: 19 MCP tools over stdio (JSON-RPC 2.0), multi-repo capable [V4]
+- Consumes: All query backends (Query Router, Semantic Search, Clustering Engine, Impact Analyzer, Source Display, Code Summary Engine, Call Graph, Flow Detection [V4], Blast Radius [V4], Scoped Change Detection [V4], Unified Symbol Context [V4])
 
 **Key Design Notes:**
-- **Tool manifest (14 tools):**
+- **Tool manifest (19 tools):**
   | Tool | Backend | Added |
   |------|---------|-------|
-  | `wonk_search` | Text Search + Smart Search Ranker | V1 |
+  | `wonk_search` | Text Search + Smart Search Ranker (+ RRF [V4]) | V1 |
   | `wonk_sym` | Structural Index | V1 |
   | `wonk_ref` | Structural Index | V1 |
   | `wonk_sig` | Structural Index | V1 |
@@ -498,11 +541,246 @@ Key technology choices: Rust for single static binary distribution and native Tr
   | `wonk_callers` | Call Graph | V3 |
   | `wonk_callees` | Call Graph | V3 |
   | `wonk_callpath` | Call Graph | V3 |
+  | `wonk_flows` | Flow Detection | V4 |
+  | `wonk_blast` | Blast Radius | V4 |
+  | `wonk_changes` | Scoped Change Detection | V4 |
+  | `wonk_context` | Unified Symbol Context | V4 |
+  | `wonk_repos` | Multi-Repo Registry | V4 |
 - **Routing:** Each tool handler delegates to its backend component using the same code paths as the CLI subcommands. MCP tools and CLI commands produce identical results.
-- **Parameter mapping:** MCP tool parameters map 1:1 to CLI flags. See sections 4.12, 4.13, 4.14 for parameter specifications per tool.
+- **Parameter mapping:** MCP tool parameters map 1:1 to CLI flags. See sections 4.12, 4.13, 4.14 for parameter specifications per tool. See sections 4.16 through 4.23 for V4 tool parameters.
+- **Multi-repo support [V4] (PRD-MREP-REQ-002, PRD-MREP-REQ-003):** All 18 existing tools gain an optional `repo` parameter. When provided, the query is routed to the specified repo's index. When omitted, defaults to the working directory repo. See section 4.23 for details.
 - **Error handling:** Backend errors are returned as JSON-RPC error responses with human-readable messages.
 
-**Related Requirements:** PRD-SHOW-REQ-013, PRD-SUM-REQ-018, PRD-CGR-REQ-013, PRD-CGR-REQ-014
+**Related Requirements:** PRD-SHOW-REQ-013, PRD-SUM-REQ-018, PRD-CGR-REQ-013, PRD-CGR-REQ-014, PRD-FLOW-REQ-010, PRD-BLAST-REQ-010, PRD-CHG-REQ-009, PRD-CTX-REQ-009, PRD-MREP-REQ-001 through PRD-MREP-REQ-006
+
+### 4.16 Execution Flow Detection [V4]
+
+**Responsibility:** Identify entry point symbols (functions with no indexed callers) and trace execution flows forward through the call graph via BFS.
+
+**Technology:** Custom Rust module (`flows.rs`, ~200 lines), no additional dependencies
+
+**Interfaces:**
+- Exposes: `detect_entry_points(db, options) -> Vec<Symbol>`, `trace_flow(db, entry, options) -> ExecutionFlow`
+- Consumes: SQLite Database (references + symbols tables via `caller_id` JOIN)
+
+**Key Design Notes:**
+- **Entry point detection (PRD-FLOW-REQ-001):** SQL anti-join — symbols that appear as definitions but never as `caller_id` targets in references. Query: `SELECT s.* FROM symbols s WHERE s.kind IN ('function', 'method') AND s.id NOT IN (SELECT DISTINCT caller_id FROM "references" WHERE caller_id IS NOT NULL)`. File-scope filtering via `--from <file>` adds `AND s.file = ?` (PRD-FLOW-REQ-008).
+- **Flow tracing (PRD-FLOW-REQ-002, PRD-FLOW-REQ-003):** BFS from the named entry point expanding callees at each level. Each step records: symbol name, kind, file, line, depth. Uses the same `caller_id` JOIN pattern as `wonk callees` (section 4.14).
+- **Depth limit (PRD-FLOW-REQ-004):** `--depth N` caps BFS traversal. Default: 10, maximum: 20. Exceeding maximum emits a warning.
+- **Branching limit (PRD-FLOW-REQ-005):** `--branching N` limits the number of callees followed per symbol during BFS. Default: 4. At each BFS node, sort callees by confidence (descending) and take the top N. This prevents combinatorial explosion in heavily-connected code.
+- **Minimum flow length (PRD-FLOW-REQ-006):** Flows with fewer than 2 steps are excluded from output.
+- **Confidence filtering:** Honors `--min-confidence` to exclude low-confidence edges during traversal (PRD-CONF-REQ-005).
+- **On-the-fly computation:** No caching — flows are computed fresh on each query. The BFS is fast enough (< 500ms for depth 20) given the call graph is already indexed.
+- **Output (PRD-FLOW-REQ-007, PRD-FLOW-REQ-009):** Each step includes name, kind, file, line, depth. JSON/TOON output includes: `entry_point`, `steps` (ordered array), `step_count`.
+- **MCP tool (PRD-FLOW-REQ-010):** `wonk_flows` with parameters: entry (optional string), from (optional file path), depth (optional integer, default 10, max 20), branching (optional integer, default 4), min_confidence (optional float), format (json|toon).
+
+**Related Requirements:** PRD-FLOW-REQ-001 through PRD-FLOW-REQ-010
+
+### 4.17 Blast Radius Analysis [V4]
+
+**Responsibility:** Traverse the call graph outward from a symbol, grouping results by depth-based severity tiers and assessing risk level.
+
+**Technology:** Custom Rust module (`blast.rs`, ~200 lines), no additional dependencies
+
+**Interfaces:**
+- Exposes: `analyze_blast(db, symbol, options) -> BlastAnalysis`
+- Consumes: SQLite Database (references + symbols + type_edges tables)
+
+**Key Design Notes:**
+- **Depth-annotated BFS (PRD-BLAST-REQ-001):** BFS from the target symbol, tracking depth for each discovered node. Direction determines edge traversal:
+  - Upstream (default, PRD-BLAST-REQ-004): follow callers (who calls this symbol?) + type_edges children (classes extending/implementing this symbol)
+  - Downstream (PRD-BLAST-REQ-005): follow callees (what does this symbol call?)
+- **Severity tiers (PRD-BLAST-REQ-002):**
+  - Depth 1: `WILL BREAK` — direct callers/importers, child classes
+  - Depth 2: `LIKELY AFFECTED` — callers of callers
+  - Depth 3+: `MAY NEED TESTING` — transitively reachable
+- **Risk level (PRD-BLAST-REQ-003):** Based on total affected symbol count across all tiers:
+  - LOW: ≤ 3 symbols
+  - MEDIUM: 4–10 symbols
+  - HIGH: 11–25 symbols
+  - CRITICAL: > 25 symbols
+- **Depth limit (PRD-BLAST-REQ-006):** `--depth N` caps traversal. Default: 3, maximum: 10.
+- **Inheritance integration (PRD-HRTG-REQ-003):** During upstream traversal, query `type_edges WHERE parent_id = ?` to include child classes and implementors as depth-1 dependants. These represent overrides that may break if the parent method's contract changes.
+- **Test exclusion (PRD-BLAST-REQ-008):** By default, symbols in test files are excluded from results and counts. Reuses the test path heuristics from `ranker.rs` (paths matching `test/`, `tests/`, `*_test.*`, `*.test.*`, `*.spec.*`). `--include-tests` overrides this.
+- **Affected files summary (PRD-BLAST-REQ-007):** Deduplicated list of all files containing affected symbols.
+- **Confidence filtering:** Honors `--min-confidence` to exclude low-confidence edges (PRD-CONF-REQ-005).
+- **Output (PRD-BLAST-REQ-009):** JSON/TOON includes: `target` (symbol info), `direction`, `risk_level`, `total_affected`, `tiers` (array of `{severity, depth, symbols[]}`), `affected_files[]`.
+- **MCP tool (PRD-BLAST-REQ-010):** `wonk_blast` with parameters: symbol (required), direction (optional: upstream|downstream, default upstream), depth (optional integer, default 3, max 10), include_tests (optional boolean, default false), min_confidence (optional float), format (json|toon).
+
+**Related Requirements:** PRD-BLAST-REQ-001 through PRD-BLAST-REQ-010, PRD-HRTG-REQ-003
+
+### 4.18 Scoped Change Detection [V4]
+
+**Responsibility:** Map git diff hunks to indexed symbols, detect Added/Modified/Removed symbols, and optionally chain into blast radius and flow analysis.
+
+**Technology:** Extends existing `impact.rs` module, git CLI for diff scoping
+
+**Interfaces:**
+- Exposes: `detect_changes(db, scope, options) -> ChangeAnalysis`
+- Consumes: SQLite Database (symbols + references tables), git CLI, Blast Radius (optional), Flow Detection (optional)
+
+**Key Design Notes:**
+- **Change scope (PRD-CHG-REQ-001 through PRD-CHG-REQ-004):** `ChangeScope` enum:
+  - `Unstaged` (default): `git diff --name-only` — files modified but not staged
+  - `Staged`: `git diff --cached --name-only` — files staged for commit
+  - `All`: `git diff HEAD --name-only` — all uncommitted changes
+  - `Compare(ref)`: `git diff <ref> --name-only` — changes since a specific ref/branch
+- **Hunk-to-symbol mapping (PRD-CHG-REQ-005):** For each changed file:
+  1. Run `git diff --unified=0 [flags] <file>` to get precise line ranges of changes
+  2. Parse diff output to extract changed line ranges (hunk headers: `@@ -start,count +start,count @@`)
+  3. Query indexed symbols for the file: `SELECT * FROM symbols WHERE file = ?`
+  4. Overlap check: a symbol is Modified if any changed line range overlaps its `line..end_line`
+  5. Re-parse the file with Tree-sitter to detect Added symbols (new symbols not in index) and Removed symbols (indexed symbols absent from re-parse)
+  - Reuses existing `detect_changed_symbols()` from `impact.rs` for the Added/Removed detection
+- **Blast radius chaining (PRD-CHG-REQ-006):** When `--blast` is provided, run `analyze_blast()` for each changed symbol and aggregate results. Includes per-symbol blast and a combined summary with total risk level.
+- **Flow chaining (PRD-CHG-REQ-007):** When `--flows` is provided, check which execution flows (from `flows.rs`) contain any changed symbols. A flow is "affected" if any of its steps correspond to a changed symbol.
+- **Output (PRD-CHG-REQ-008):** JSON/TOON includes: `scope` (string), `changed_symbols[]` (each with name, kind, file, line, change_type: Added|Modified|Removed), `blast_radius` (optional: aggregated blast if `--blast`), `affected_flows` (optional: list of flows if `--flows`).
+- **MCP tool (PRD-CHG-REQ-009):** `wonk_changes` with parameters: scope (optional: unstaged|staged|all|compare, default unstaged), base (optional string, required when scope=compare), blast (optional boolean), flows (optional boolean), min_confidence (optional float), format (json|toon).
+
+**Related Requirements:** PRD-CHG-REQ-001 through PRD-CHG-REQ-009
+
+### 4.19 Unified Symbol Context [V4]
+
+**Responsibility:** Aggregate all relevant information about a symbol — definition, categorized incoming/outgoing references, flow participation, and children — into a single response.
+
+**Technology:** Custom Rust module (`context.rs`, ~150 lines), no additional dependencies
+
+**Interfaces:**
+- Exposes: `symbol_context(db, name, options) -> Vec<SymbolContext>`
+- Consumes: SQLite Database (symbols, references, file_imports, type_edges tables), Flow Detection
+
+**Key Design Notes:**
+- **Aggregation (PRD-CTX-REQ-001):** Single command returning:
+  - **Definition:** file, line, end_line, kind, signature (from `symbols` table)
+  - **Incoming references** (PRD-CTX-REQ-005):
+    - *Callers:* functions whose body contains a call to this symbol (`references JOIN symbols ON caller_id`)
+    - *Importers:* files that import this symbol (`file_imports WHERE name = ?`)
+    - *Type Users:* symbols that reference this symbol's type in annotations/signatures
+  - **Outgoing references** (PRD-CTX-REQ-006):
+    - *Callees:* symbols called within this function's body (`references WHERE caller_id = self.id`)
+    - *Imports:* modules/symbols imported by this symbol's file
+  - **Flow participation** (PRD-CTX-REQ-007): which execution flows include this symbol and at which step
+  - **Children** (PRD-HRTG-REQ-004): classes that extend or implement this symbol (`type_edges WHERE parent_id = ?`)
+- **All queries use existing SQL patterns** from callers/callees (section 4.14), file_imports, and type_edges. No new query patterns needed.
+- **Disambiguation (PRD-CTX-REQ-002, PRD-CTX-REQ-003):** `--file <path>` restricts to symbols in that file. `--kind <kind>` restricts to symbol kind.
+- **Multiple matches (PRD-CTX-REQ-004):** When multiple symbols match, return context for each, clearly labeled.
+- **Output (PRD-CTX-REQ-008):** JSON/TOON includes: `symbol` (definition info), `incoming` (`{callers[], importers[], type_users[]}`), `outgoing` (`{callees[], imports[]}`), `flows[]` (flow name + step index), `children[]` (extending/implementing symbols).
+- **MCP tool (PRD-CTX-REQ-009):** `wonk_context` with parameters: name (required), file (optional), kind (optional), min_confidence (optional float), format (json|toon).
+
+**Related Requirements:** PRD-CTX-REQ-001 through PRD-CTX-REQ-009, PRD-HRTG-REQ-004
+
+### 4.20 Hybrid Search Fusion [V4]
+
+**Responsibility:** Replace the simple structural-first/semantic-append blending with Reciprocal Rank Fusion (RRF) for `wonk search --semantic`.
+
+**Technology:** Extends `ranker.rs` with `fuse_rrf()` function (~40 lines), no additional dependencies
+
+**Interfaces:**
+- Exposes: `fuse_rrf(structural_results, semantic_results, k) -> Vec<FusedResult>`
+- Consumes: Structural search results, Semantic search results
+
+**Key Design Notes:**
+- **RRF formula (PRD-RRF-REQ-001):** `score(d) = Sum 1/(K + rank_i(d))` across all result lists where `d` appears. Documents appearing in multiple lists get scores from both.
+  - *Supersedes PRD-SEM-REQ-002* (simple concatenation blending).
+- **Fusion constant K (PRD-RRF-REQ-002, PRD-RRF-REQ-003):** Default K=60. Configurable via `[search].rrf_k` in config.toml. Higher K reduces the influence of high-ranked items; K=60 is the standard value from the original RRF paper.
+- **Result ordering (PRD-RRF-REQ-004):** Output sorted by descending RRF score. Structural and semantic results are interleaved as their fused scores dictate — a high-relevance semantic match can appear before a low-relevance structural match.
+- **Source tracking:** Each `FusedResult` tracks which source(s) contributed it (`FusedSource::Structural`, `FusedSource::Semantic`, `FusedSource::Both`) for downstream display.
+- **Integration point:** Called in `router.rs` where the current `blended_search()` call exists. Replaces the existing blending logic with a single `fuse_rrf()` call.
+- **Implementation:**
+  1. Build a `HashMap<ResultId, f32>` for RRF scores
+  2. Iterate structural results: `score[id] += 1.0 / (K + rank)`
+  3. Iterate semantic results: `score[id] += 1.0 / (K + rank)`
+  4. Sort by descending score
+  5. Apply existing budget/ranking post-processing
+
+**Related Requirements:** PRD-RRF-REQ-001 through PRD-RRF-REQ-004
+
+### 4.21 Edge Confidence Scoring [V4]
+
+**Responsibility:** Assign a confidence score (0.0–1.0) to each reference edge at index time based on how reliably the reference was resolved, and support filtering by minimum confidence on graph traversal commands.
+
+**Technology:** Extends `indexer.rs` (scoring logic) and `db.rs` (schema migration), no additional dependencies
+
+**Interfaces:**
+- Exposes: Confidence value on each reference row; `--min-confidence <N>` flag on graph commands
+- Consumes: SQLite Database (references table)
+
+**Key Design Notes:**
+- **Confidence assignment (PRD-CONF-REQ-001):** Computed during indexing based on resolution method:
+  - **0.95 — Import-resolved (PRD-CONF-REQ-002):** The referenced name appears in an import statement in the same file, and the imported file contains a matching symbol definition. Strongest evidence.
+  - **0.85 — Same-file definition (PRD-CONF-REQ-003):** A symbol definition with the same name exists in the same file. No import needed.
+  - **0.80 — Same-scope:** The reference is within the same scope (class/module) as a definition of that name.
+  - **0.50 — Cross-file name match (PRD-CONF-REQ-004):** A symbol with that name exists in the index but is in a different file with no import path connecting them. May be a coincidental name match.
+- **Schema change:** `ALTER TABLE "references" ADD COLUMN confidence REAL DEFAULT 0.5`. The DEFAULT 0.5 makes this an O(1) migration in SQLite (no row rewriting). New index: `idx_references_confidence`.
+- **Filtering (PRD-CONF-REQ-005):** `--min-confidence <N>` on `blast`, `flows`, `callers`, `callees`, `callpath`, `context`. Adds `AND r.confidence >= ?` to all graph traversal SQL queries.
+- **Output (PRD-CONF-REQ-006):** JSON/TOON results for all graph commands include a `confidence` field on each edge/reference.
+- **Backward compatibility:** Existing indexes get all references at confidence 0.5 (the DEFAULT). Re-indexing (`wonk update`) recalculates confidence based on actual resolution evidence.
+
+**Related Requirements:** PRD-CONF-REQ-001 through PRD-CONF-REQ-006
+
+### 4.22 Inheritance Tracking [V4]
+
+**Responsibility:** Extract class inheritance (extends) and interface implementation (implements) relationships during indexing, store them as typed edges, and integrate with blast radius and context commands.
+
+**Technology:** Extends `indexer.rs` (Tree-sitter extraction) and `db.rs` (new table), no additional dependencies
+
+**Interfaces:**
+- Exposes: `type_edges` table with `(child_id, parent_id, relationship)` tuples
+- Consumes: SQLite Database (symbols + type_edges tables), Tree-sitter parse trees
+
+**Key Design Notes:**
+- **Tree-sitter extraction (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002):** Per-language node kinds:
+  | Language | Extends | Implements |
+  |----------|---------|------------|
+  | TypeScript/JavaScript | `class_heritage` → `extends_clause` | `class_heritage` → `implements_clause` |
+  | Python | `class_definition` → `argument_list` (superclass) | — (duck typing) |
+  | Java | `superclass` node | `super_interfaces` node |
+  | C# | `base_list` → class types | `base_list` → interface types |
+  | C++ | `base_class_clause` | — (no interface keyword) |
+  | Ruby | `superclass` node | — (mixins via include, out of scope) |
+  | Rust | — (no class inheritance) | `impl_item` → trait implementation |
+  | Go | — (no class inheritance) | — (implicit interfaces, out of scope) |
+  | C | — (no classes) | — |
+  | PHP | `class_declaration` → `base_clause` | `class_interface_clause` |
+- **6 OOP languages first:** TypeScript, JavaScript, Python, Java, C#, Ruby, PHP, C++. Rust gets `impl Trait` tracking. C and Go skip (no class inheritance).
+- **Schema — `type_edges` table:**
+  ```sql
+  CREATE TABLE IF NOT EXISTS type_edges (
+      id INTEGER PRIMARY KEY,
+      child_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+      parent_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+      relationship TEXT NOT NULL,  -- 'extends' or 'implements'
+      UNIQUE(child_id, parent_id, relationship)
+  );
+  ```
+  Indexed on both `child_id` and `parent_id` for bidirectional queries.
+- **Parent resolution:** During indexing, when an `extends SomeClass` node is found, look up `SomeClass` in the symbols extracted from the same file or resolved via imports. If no match found, skip the edge (confidence too low). This reuses the same resolution logic as confidence scoring (section 4.21).
+- **Blast radius integration (PRD-HRTG-REQ-003):** During upstream BFS in `blast.rs`, query `type_edges WHERE parent_id = target_id` to include child classes as depth-1 dependants.
+- **Context integration (PRD-HRTG-REQ-004):** `context.rs` includes a "Children" category listing classes that extend or implement the symbol.
+- **Output (PRD-HRTG-REQ-005):** JSON/TOON includes `relationship` field with value `"extends"` or `"implements"` on each type edge.
+
+**Related Requirements:** PRD-HRTG-REQ-001 through PRD-HRTG-REQ-005
+
+### 4.23 Multi-Repo MCP [V4]
+
+**Responsibility:** Enable the MCP server to serve queries across multiple indexed repositories from a single instance, with lazy-loaded connections and a repo listing tool.
+
+**Technology:** Extends `mcp.rs`, no additional dependencies
+
+**Interfaces:**
+- Exposes: `wonk_repos` MCP tool, optional `repo` parameter on all existing tools
+- Consumes: SQLite Databases (one per repo), filesystem (repo registry discovery)
+
+**Key Design Notes:**
+- **Repo discovery (PRD-MREP-REQ-001):** On server startup, glob `~/.wonk/repos/*/meta.json` to discover all indexed repositories. Each `meta.json` contains the repo path and detected languages. Discovery is done once at startup; new repos indexed after server start require a server restart.
+- **Lazy connection loading (PRD-MREP-REQ-006):** `HashMap<String, Connection>` where the key is the repo name (last path component of the repo root). Connections are opened on first query to each repo and cached for the session lifetime. This avoids opening all database connections at startup.
+- **Default repo (PRD-MREP-REQ-002):** When no `repo` parameter is provided, use the repository at the server's working directory (current behavior). This ensures backward compatibility.
+- **Repo routing (PRD-MREP-REQ-003):** When `repo` parameter is provided, look up the repo name in the discovered registry, open (or reuse) its connection, and route the query to that connection.
+- **Name matching (PRD-MREP-REQ-004):** Match by last path component of the repo root (e.g., repo at `/home/user/projects/wonk` is matched by `repo: "wonk"`). Ambiguous matches (multiple repos with same directory name) return an error listing options.
+- **`wonk_repos` tool (PRD-MREP-REQ-005):** Lists all available repositories with: name (directory name), path (full repo root), index stats (file count, symbol count from `files` and `symbols` tables), last indexed time.
+- **All tools gain `repo` parameter:** Added as optional string parameter to all 18 existing MCP tool definitions. Default: null (use working directory repo).
+
+**Related Requirements:** PRD-MREP-REQ-001 through PRD-MREP-REQ-006
 
 ---
 
@@ -542,7 +820,8 @@ CREATE TABLE references (
     line INTEGER NOT NULL,
     col INTEGER NOT NULL,
     context TEXT,                -- the full line of source for display
-    caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL  -- [V3] enclosing function (DR-015); NULL for file-scope calls
+    caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,  -- [V3] enclosing function (DR-015); NULL for file-scope calls
+    confidence REAL DEFAULT 0.5  -- [V4] edge confidence score 0.0-1.0 (DR-028); 0.5 default for backward compat
 );
 
 -- File metadata
@@ -589,6 +868,15 @@ CREATE TABLE summaries (
     created_at INTEGER NOT NULL
 );
 
+-- [V4] Inheritance and interface implementation edges (DR-029)
+CREATE TABLE IF NOT EXISTS type_edges (
+    id INTEGER PRIMARY KEY,
+    child_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    parent_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    relationship TEXT NOT NULL,  -- 'extends' or 'implements'
+    UNIQUE(child_id, parent_id, relationship)
+);
+
 -- Indexes
 CREATE INDEX idx_symbols_name ON symbols(name);
 CREATE INDEX idx_symbols_file ON symbols(file);
@@ -596,6 +884,9 @@ CREATE INDEX idx_symbols_kind ON symbols(kind);
 CREATE INDEX idx_references_name ON references(name);
 CREATE INDEX idx_references_file ON references(file);
 CREATE INDEX idx_references_caller ON references(caller_id);  -- [V3] for callers/callees queries (DR-015)
+CREATE INDEX idx_references_confidence ON "references"(confidence);  -- [V4] for confidence filtering (DR-028)
+CREATE INDEX idx_type_edges_child ON type_edges(child_id);   -- [V4] for child→parent lookups
+CREATE INDEX idx_type_edges_parent ON type_edges(parent_id); -- [V4] for parent→child lookups (blast radius, context)
 ```
 
 ### 5.3 Data Flow
@@ -603,12 +894,13 @@ CREATE INDEX idx_references_caller ON references(caller_id);  -- [V3] for caller
 **Index build (`wonk init`):**
 1. Walk repo with `ignore` crate (respects .gitignore, .wonkignore, default exclusions)
 2. Parallel parse with rayon: each file → Tree-sitter → symbols + references + metadata
-3. Batch insert into SQLite (within transactions for atomicity)
-4. Populate FTS5 index
-5. Write meta.json
-6. Spawn daemon
-7. [V2] If Ollama is reachable: generate chunks from each symbol, batch-embed via Ollama, store vectors in `embeddings` table, display progress (PRD-SEM-REQ-008)
-8. [V2] If Ollama is unreachable: skip embedding with warning, structural index only (PRD-SEM-REQ-014)
+3. [V4] During reference extraction: compute confidence scores based on resolution method (DR-028), extract type_edges for extends/implements relationships (DR-029)
+4. Batch insert into SQLite (within transactions for atomicity)
+5. Populate FTS5 index
+6. Write meta.json
+7. Spawn daemon
+8. [V2] If Ollama is reachable: generate chunks from each symbol, batch-embed via Ollama, store vectors in `embeddings` table, display progress (PRD-SEM-REQ-008)
+9. [V2] If Ollama is unreachable: skip embedding with warning, structural index only (PRD-SEM-REQ-014)
 
 **Incremental update (daemon):**
 1. `notify` detects filesystem event
@@ -664,6 +956,52 @@ CREATE INDEX idx_references_caller ON references(caller_id);  -- [V3] for caller
 8. If `--from` or `--to` specified: filter by dependency reachability (PRD-SDEP)
 9. If `--budget` specified: truncate to token budget (PRD-SEM-REQ-004)
 10. Format output with file path, line, symbol name, kind, similarity score (PRD-SEM-REQ-003)
+
+**Flows query (`wonk flows [entry]`) [V4]:**
+1. CLI opens read-only SQLite connection
+2. If no entry specified: run entry point detection SQL anti-join to find functions with no callers
+3. If `--from <file>`: restrict entry points to symbols in that file
+4. If entry specified: resolve to symbol ID, then BFS forward through callees
+5. At each BFS level, honor `--branching N` (sort callees by confidence, take top N)
+6. Honor `--depth N` (max 20) and `--min-confidence` during traversal
+7. Exclude flows with fewer than 2 steps
+8. Format each step with name, kind, file, line, depth
+
+**Blast radius query (`wonk blast <symbol>`) [V4]:**
+1. CLI opens read-only SQLite connection
+2. Resolve symbol to ID(s) via `symbols` table
+3. BFS in specified direction (upstream=callers, downstream=callees) tracking depth
+4. At depth 1 (upstream): also query `type_edges WHERE parent_id = ?` for child classes
+5. Honor `--depth N` (max 10) and `--min-confidence`
+6. Exclude test files by default (reuse ranker.rs path heuristics); include if `--include-tests`
+7. Group results into severity tiers: depth 1 = WILL BREAK, depth 2 = LIKELY AFFECTED, depth 3+ = MAY NEED TESTING
+8. Compute risk level from total affected count
+9. Collect affected files list
+10. Format with tiers, risk level, affected files summary
+
+**Scoped change detection (`wonk changes`) [V4]:**
+1. Determine change scope: run `git diff --name-only [flags]` per scope type
+2. For each changed file: run `git diff --unified=0 [flags] <file>` to get hunk line ranges
+3. Query indexed symbols for each file; overlap hunks with symbol `line..end_line` ranges
+4. Re-parse changed files with Tree-sitter to detect Added/Removed symbols (reuse `detect_changed_symbols()`)
+5. If `--blast`: run `analyze_blast()` for each changed symbol, aggregate results
+6. If `--flows`: check which execution flows contain changed symbols
+7. Format with changed symbols, optional blast radius, optional affected flows
+
+**Unified context query (`wonk context <name>`) [V4]:**
+1. CLI opens read-only SQLite connection
+2. Resolve symbol by name (with optional `--file`, `--kind` filters)
+3. Parallel queries:
+   a. Definition: `SELECT * FROM symbols WHERE name = ?`
+   b. Callers: `SELECT DISTINCT s.* FROM "references" r JOIN symbols s ON r.caller_id = s.id WHERE r.name = ? [AND r.confidence >= ?]`
+   c. Importers: files importing this symbol (via file_imports patterns)
+   d. Type Users: references to this symbol in type annotation contexts
+   e. Callees: `SELECT DISTINCT r.name FROM "references" r WHERE r.caller_id IN (SELECT id FROM symbols WHERE name = ?)`
+   f. Imports: file-level imports from the symbol's file
+   g. Children: `SELECT s.* FROM type_edges te JOIN symbols s ON te.child_id = s.id WHERE te.parent_id = ?`
+   h. Flows: check flow participation via `flows.rs`
+4. Aggregate all results into `SymbolContext` struct
+5. Format with categorized sections
 
 ### 5.4 Index Location Strategy
 
@@ -1480,6 +1818,235 @@ GitHub Actions workflow:
 
 ---
 
+### DR-023: Execution Flow Architecture [V4]
+
+**Status:** Accepted
+**Date:** 2026-02-25
+**Context:** V4 adds execution flow detection — identifying entry points (functions with no callers) and tracing paths through the call graph. Need to decide where this logic lives and whether to cache flow results. (PRD-FLOW-REQ-001 through PRD-FLOW-REQ-010)
+
+**Options Considered:**
+1. **New `flows.rs` module with on-the-fly BFS** — Compute flows fresh each query, no caching
+   - Pros: Simple, no stale cache issues, BFS over caller_id is fast (< 500ms for depth 20), entry point detection is a single SQL anti-join
+   - Cons: Repeated queries recompute from scratch (acceptable given latency)
+2. **Materialized flow cache** — Pre-compute and store detected flows in a table, invalidate on index changes
+   - Pros: Instant flow lookups after first computation
+   - Cons: Cache invalidation complexity (any reference change could alter flows), storage overhead, over-engineered for the latency target
+3. **Extend callgraph.rs** — Add flow logic to the existing call graph module
+   - Pros: Colocated with related BFS code
+   - Cons: callgraph.rs focuses on point-to-point queries; flow detection is a distinct concept (entry point analysis + forward tracing); module becomes too large
+
+**Decision:** Option 1 — New `flows.rs` with on-the-fly BFS
+
+**Rationale:** Entry point detection is a simple SQL anti-join (< 200ms). Flow tracing reuses the same BFS pattern as callpath but from a different starting condition (entry points vs. named symbols). On-the-fly computation avoids cache invalidation complexity while meeting the < 500ms latency target. Separate module keeps concerns clean — `callgraph.rs` handles point queries, `flows.rs` handles flow analysis.
+
+**Consequences:**
+- New `flows.rs` module (~200 lines)
+- Entry points computed via SQL: `WHERE s.id NOT IN (SELECT DISTINCT caller_id FROM references WHERE caller_id IS NOT NULL)`
+- BFS reuses callee expansion pattern from callgraph.rs (may share helper functions)
+- `--branching` limit prevents combinatorial explosion in dense call graphs
+- No cache — acceptable for interactive query latency
+
+---
+
+### DR-024: Blast Radius Architecture [V4]
+
+**Status:** Accepted
+**Date:** 2026-02-25
+**Context:** V4 adds blast radius analysis — traversing the call graph outward from a symbol and grouping results by depth-based severity. Need to decide the traversal strategy and how to integrate with inheritance tracking. (PRD-BLAST-REQ-001 through PRD-BLAST-REQ-010)
+
+**Options Considered:**
+1. **New `blast.rs` with depth-annotated BFS** — Dedicated module, BFS tracking depth per node, severity tiers assigned by depth
+   - Pros: Clean separation, depth annotation enables severity grouping, integrates naturally with type_edges for inheritance
+   - Cons: Another module (acceptable for distinct responsibility)
+2. **Extend callgraph.rs with severity annotations** — Add blast logic to existing callers/callees queries
+   - Pros: Fewer modules
+   - Cons: Blast has distinct output format (tiers, risk levels, affected files), would bloat callgraph.rs, different responsibility
+
+**Decision:** Option 1 — New `blast.rs` with depth-annotated BFS
+
+**Rationale:** Blast radius is a distinct analysis with its own output format (severity tiers, risk levels, affected files summary). A dedicated module keeps callgraph.rs focused on raw caller/callee queries. The depth-annotated BFS naturally enables severity grouping and integrates cleanly with type_edges for inheritance-aware traversal.
+
+**Consequences:**
+- New `blast.rs` module (~200 lines)
+- Depth tracked per BFS node: depth 1 → WILL BREAK, depth 2 → LIKELY AFFECTED, depth 3+ → MAY NEED TESTING
+- Risk levels computed from total count: LOW ≤3, MEDIUM 4-10, HIGH 11-25, CRITICAL >25
+- Upstream traversal includes `type_edges` children at depth 1
+- Test file exclusion reuses ranker.rs path heuristics
+
+---
+
+### DR-025: Scoped Change Detection Architecture [V4]
+
+**Status:** Accepted
+**Date:** 2026-02-25
+**Context:** V4 extends change detection with git-diff scoping (unstaged, staged, compare) and optional chaining into blast radius and flow analysis. Need to decide whether to create a new module or extend existing `impact.rs`. (PRD-CHG-REQ-001 through PRD-CHG-REQ-009)
+
+**Options Considered:**
+1. **Extend `impact.rs`** — Add `ChangeScope` enum, git diff scoping, hunk-to-symbol mapping, and blast/flow chaining to the existing impact module
+   - Pros: Reuses `detect_changed_symbols()`, git CLI helpers, and the existing module's responsibility (change analysis); avoids duplicating symbol-diff logic
+   - Cons: Module grows larger (~150 additional lines)
+2. **New `changes.rs` module** — Separate from impact.rs
+   - Pros: Clean separation
+   - Cons: Duplicates git CLI helpers and symbol-diff logic from impact.rs, or requires refactoring impact.rs to export shared functions anyway
+
+**Decision:** Option 1 — Extend `impact.rs`
+
+**Rationale:** Scoped change detection is a natural evolution of `impact.rs`'s existing responsibility (detect what changed). The existing `detect_changed_symbols()` and git CLI wrapper functions are directly reused. The new functionality adds `ChangeScope` (4 variants), hunk-to-symbol mapping, and optional chaining to blast.rs/flows.rs. Keeping it in one module avoids the overhead of extracting shared functions.
+
+**Consequences:**
+- `impact.rs` gains `ChangeScope` enum, `detect_changes()` function, and hunk-to-symbol mapping
+- Existing `detect_changed_symbols()` reused for Added/Removed detection
+- New git diff commands: `--cached`, `HEAD`, `<ref>` for different scopes
+- Optional chaining calls `blast::analyze_blast()` and `flows::trace_flow()` from other modules
+- Module size grows from ~150 to ~300 lines (acceptable)
+
+---
+
+### DR-026: Unified Symbol Context Architecture [V4]
+
+**Status:** Accepted
+**Date:** 2026-02-25
+**Context:** V4 adds a unified context command that aggregates definition, incoming/outgoing references, flow participation, and children for a symbol. Need to decide the module design. (PRD-CTX-REQ-001 through PRD-CTX-REQ-009)
+
+**Options Considered:**
+1. **New `context.rs` orchestration module** — Calls into existing query patterns from callgraph, flows, and db modules
+   - Pros: Single responsibility (aggregation), reuses existing SQL patterns, clean interface
+   - Cons: Another module
+2. **Extend router.rs** — Add context aggregation to the query router
+   - Pros: Router already orchestrates queries
+   - Cons: Router dispatches to single backends; context requires multi-backend aggregation, different pattern
+
+**Decision:** Option 1 — New `context.rs` orchestration module
+
+**Rationale:** Context aggregation is a composition of existing queries, not a new query type. A dedicated module orchestrates parallel calls to symbols, references, file_imports, type_edges, and flows — each using SQL patterns already established in their respective modules. This keeps the router focused on dispatching single-backend queries.
+
+**Consequences:**
+- New `context.rs` module (~150 lines)
+- Aggregates results from 5+ existing query patterns
+- Returns `SymbolContext` struct with categorized sections
+- No new SQL queries — reuses existing JOIN patterns
+- Parallel query execution where possible (multiple independent SELECTs)
+
+---
+
+### DR-027: Hybrid Search Fusion (RRF) [V4]
+
+**Status:** Accepted
+**Date:** 2026-02-25
+**Context:** V4 replaces simple structural-first/semantic-append blending with Reciprocal Rank Fusion for `wonk search --semantic`. Need to choose the fusion algorithm. (PRD-RRF-REQ-001 through PRD-RRF-REQ-004). *Supersedes PRD-SEM-REQ-002 blending behavior.*
+
+**Options Considered:**
+1. **RRF in `ranker.rs`** — Add `fuse_rrf()` function (~40 lines) to the existing ranker module
+   - Pros: Minimal code (HashMap + two iterations + sort), K=60 is well-studied, ranker already handles result ordering
+   - Cons: Slightly different responsibility (fusion vs. ranking) in same module
+2. **CombMNZ or CombSUM** — Alternative metasearch fusion algorithms
+   - Pros: Well-known alternatives
+   - Cons: Require score normalization across different backends (structural results have no inherent score); RRF is rank-based and score-agnostic
+3. **Learning-to-rank** — ML model to combine features
+   - Pros: Optimal ranking quality
+   - Cons: Requires training data, adds ML dependency, over-engineered for this use case
+
+**Decision:** Option 1 — RRF in `ranker.rs`
+
+**Rationale:** RRF is the ideal choice because it's rank-based — no score normalization needed between structural (unscored ranks) and semantic (cosine similarity) result lists. K=60 is the standard default from the original RRF paper. Implementation is ~40 lines: build a HashMap, iterate both lists, sort by descending RRF score. Adding to `ranker.rs` makes sense since the ranker already owns result ordering.
+
+**Consequences:**
+- `ranker.rs` gains `fuse_rrf(structural, semantic, k) -> Vec<FusedResult>` (~40 lines)
+- Replaces the existing `blended_search()` call in router.rs
+- K=60 default, configurable via `[search].rrf_k` in config.toml
+- High-relevance semantic results can now outrank low-relevance structural results
+
+---
+
+### DR-028: Edge Confidence Scoring [V4]
+
+**Status:** Accepted
+**Date:** 2026-02-25
+**Context:** Not all call-graph edges are equally reliable. Need to assign confidence scores to references at index time and support filtering during graph traversal. (PRD-CONF-REQ-001 through PRD-CONF-REQ-006)
+
+**Options Considered:**
+1. **New `confidence REAL` column on `references` table** — Computed at index time, stored per reference row
+   - Pros: O(1) migration via `ALTER TABLE ADD COLUMN ... DEFAULT 0.5` in SQLite, no row rewriting; filtering is a simple `AND confidence >= ?` in existing queries; backward compatible
+   - Cons: Heuristic scoring may not be perfectly accurate
+2. **Separate `edge_metadata` table** — Store confidence and other metadata per reference
+   - Pros: Extensible for future metadata
+   - Cons: Requires JOIN on every graph query, over-engineered
+3. **No storage — compute on the fly** — Check import resolution at query time
+   - Pros: No schema change
+   - Cons: Expensive: would need to re-check imports for every edge during every traversal
+
+**Decision:** Option 1 — New `confidence REAL` column on `references` table
+
+**Rationale:** `ALTER TABLE ADD COLUMN ... DEFAULT` is O(1) in SQLite (no page rewriting) — the gentlest possible migration. Existing indexes get all references at 0.5 (the cross-file name match default). Re-indexing recalculates confidence based on actual resolution evidence. Adding `AND r.confidence >= ?` to existing graph queries is trivial. Import resolution checking at index time is a natural extension of the existing reference extraction code.
+
+**Consequences:**
+- `references` table gains `confidence REAL DEFAULT 0.5`
+- New index: `idx_references_confidence`
+- Indexer computes confidence during reference extraction: import-resolved (0.95), same-file (0.85), same-scope (0.80), cross-file name match (0.50)
+- All graph commands gain `--min-confidence <N>` flag
+- Existing indexes work without re-index (all refs get 0.5); re-index improves accuracy
+
+---
+
+### DR-029: Inheritance Tracking [V4]
+
+**Status:** Accepted
+**Date:** 2026-02-25
+**Context:** Blast radius and context need to know about class inheritance and interface implementation. Need to decide where to store these relationships — in the existing `references` table or a new table. (PRD-HRTG-REQ-001 through PRD-HRTG-REQ-005)
+
+**Options Considered:**
+1. **New `type_edges` table** — `(child_id, parent_id, relationship)` with FKs to symbols
+   - Pros: Clean semantics (inheritance ≠ reference), proper bidirectional indexes, UNIQUE constraint prevents duplicates, easy to query in either direction
+   - Cons: New table (acceptable — different data model)
+2. **Encode in `references` table** — Add a `ref_type` column to distinguish call references from inheritance edges
+   - Pros: No new table
+   - Cons: Mixes fundamentally different relationship types, complicates existing reference queries with WHERE filters, inheritance has no `caller_id` (it's a type-level relationship, not a call site)
+
+**Decision:** Option 1 — New `type_edges` table
+
+**Rationale:** Inheritance (extends/implements) is semantically different from call references — it's a type-level relationship, not a code-location reference. It has no file/line (it's between symbols, not at a specific call site), no `caller_id`, and no `context` line. A dedicated table with bidirectional indexes enables clean queries in both directions: parent→children (blast radius) and child→parent (context). The UNIQUE constraint prevents duplicate edges.
+
+**Consequences:**
+- New `type_edges` table with `child_id`, `parent_id`, `relationship` columns
+- Indexed on both `child_id` and `parent_id`
+- Tree-sitter extraction added for 8+ languages (TS/JS, Python, Java, C#, C++, Ruby, PHP, Rust)
+- `blast.rs` queries `type_edges WHERE parent_id = ?` for children at depth 1
+- `context.rs` includes "Children" category from `type_edges`
+- C and Go skip (no class inheritance; Go interfaces are implicit)
+
+---
+
+### DR-030: Multi-Repo MCP [V4]
+
+**Status:** Accepted
+**Date:** 2026-02-25
+**Context:** The MCP server currently serves one repo. V4 requires serving multiple indexed repos from a single server instance. Need to decide the connection management strategy. (PRD-MREP-REQ-001 through PRD-MREP-REQ-006)
+
+**Options Considered:**
+1. **Lazy-load `HashMap<String, Connection>` in MCP server loop** — Discover repos at startup, open connections on first query
+   - Pros: No startup delay, minimal memory for unused repos, simple HashMap lookup, backward compatible (default = working directory repo)
+   - Cons: First query to a new repo has connection open overhead (~5ms, negligible)
+2. **Eager-load all connections at startup** — Open all repo connections immediately
+   - Pros: No first-query delay
+   - Cons: Wastes resources on repos never queried, slower startup for many repos
+3. **Separate MCP server per repo** — Keep current architecture, let the client manage multiple servers
+   - Pros: No server changes needed
+   - Cons: Violates PRD-MREP requirements, forces client-side complexity
+
+**Decision:** Option 1 — Lazy-load `HashMap<String, Connection>`
+
+**Rationale:** Lazy loading fits the MCP server's single-threaded event loop — connections are opened when needed and cached for the session. Repo discovery via `glob("~/.wonk/repos/*/meta.json")` at startup is fast (< 10ms for 100 repos). The default behavior (working directory repo when no `repo` param) maintains full backward compatibility.
+
+**Consequences:**
+- MCP server loop gains `HashMap<String, Connection>` for repo connections
+- Repo discovery at startup via existing `meta.json` glob pattern
+- All 18 existing tools gain optional `repo` parameter
+- New `wonk_repos` tool lists discovered repos with stats
+- Name matching by last path component; ambiguous names return error
+- Server restart required to discover newly indexed repos
+
+---
+
 ## 12) Open Questions & Risks
 
 | ID | Question/Risk | Impact | Mitigation | Owner |
@@ -1496,6 +2063,10 @@ GitHub Actions workflow:
 | AR-010 | Index migration for `caller_id` — existing repos need re-index for call graph features | L | Detect missing `caller_id` at query time; display re-index hint; non-breaking for existing features | Eng |
 | AR-011 | Default LLM model (`llama3.2:3b`) may not be pulled in Ollama | L | Clear error message guiding user to `ollama pull` or configure alternative model | Eng |
 | AR-012 | Summary cache invalidation precision — content hash based on symbol IDs + file hashes may trigger regeneration on unrelated file changes within the target path | L | Acceptable: regeneration is correct behavior; cost is 1-5s per call | Eng |
+| AR-013 | Confidence scoring accuracy — heuristic-based scoring (import-resolved vs. name-match) may miscategorize some edges | M | Conservative defaults (0.5 for unresolved); `--min-confidence` lets users tune filtering; re-index improves accuracy | Eng |
+| AR-014 | Inheritance extraction across 12 languages — each language has different Tree-sitter node kinds for extends/implements | M | 8 OOP languages supported initially; C/Go skip (no class inheritance); comprehensive test matrix per language | Eng |
+| AR-015 | Flow explosion in large repos — entry point detection may return many results; BFS may expand exponentially at high branching | M | `--branching N` limits per-node expansion (default 4); `--depth N` caps traversal (default 10, max 20); entry points filtered by `--from <file>` | Eng |
+| AR-016 | Multi-repo name collisions — multiple repos with same directory name cause ambiguous `repo` parameter matches | L | Return error listing all matches with full paths; user can disambiguate | Eng |
 
 ---
 
@@ -1521,6 +2092,13 @@ GitHub Actions workflow:
 | Call graph | Directed graph of caller→callee relationships between functions/methods (V3) |
 | `caller_id` | Foreign key in `references` table pointing to the enclosing function's `symbols.id` (V3) |
 | BFS | Breadth-First Search — graph traversal that explores all neighbors at each depth before going deeper (V3) |
+| Entry point | A function/method with no indexed callers — likely an API handler, CLI command, or test entry (V4) |
+| Blast radius | The set of symbols transitively reachable from a changed symbol via call graph or inheritance edges (V4) |
+| Severity tier | Depth-based impact classification: WILL BREAK (depth 1), LIKELY AFFECTED (depth 2), MAY NEED TESTING (depth 3+) (V4) |
+| RRF | Reciprocal Rank Fusion — metasearch algorithm that merges ranked lists using `1/(K+rank)` scoring (V4) |
+| Edge confidence | A 0.0–1.0 score on reference edges indicating resolution reliability (V4) |
+| Type edge | An extends or implements relationship between two class/interface/trait symbols (V4) |
+| Change scope | The git diff context for change detection: unstaged, staged, all, or compare against a ref (V4) |
 
 ### B. Module Layout
 
@@ -1535,7 +2113,7 @@ src/
   search.rs          # grep crate text search wrapper
   daemon.rs          # Daemon process: file watching, event loop, lifecycle
   config.rs          # TOML config loading and merging
-  types.rs           # Shared types (Symbol, Reference, FileMetadata, SemanticResult, ImpactResult, Cluster, etc.)
+  types.rs           # Shared types (Symbol, Reference, FileMetadata, SemanticResult, ImpactResult, Cluster, FlowStep, ExecutionFlow, BlastAnalysis, ChangeAnalysis, SymbolContext, TypeEdge, FusedResult, etc.)
   errors.rs          # thiserror error types (DbError, IndexError, SearchError, EmbeddingError)
   embedding.rs       # [V2] Ollama API client, chunking, vector storage/retrieval
   semantic.rs        # [V2] Cosine similarity search, result blending, dependency scoping
@@ -1544,6 +2122,9 @@ src/
   show.rs            # [V3] Source display — symbol lookup + file read + shallow mode
   summary.rs         # [V3] Structural metrics aggregation, LLM description generation + caching
   callgraph.rs       # [V3] Caller/callee queries, BFS call path traversal
+  flows.rs           # [V4] Entry point detection, execution flow tracing via BFS
+  blast.rs           # [V4] Blast radius analysis — depth-annotated BFS, severity tiers, risk levels
+  context.rs         # [V4] Unified symbol context — aggregation of definition, refs, flows, children
 ```
 
 ### C. References

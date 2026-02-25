@@ -31,7 +31,7 @@
   - Time to first result (warm index) < 100ms
   - Precision of `wonk sym` (correct definitions returned) > 90%
   - Recall of `wonk ref` (usages found vs grep baseline) > 80%
-- **Release strategy:** V1 is CLI-only. Editor integrations, LSP backends, and cross-language call graphs are deferred to V2. V2 semantic search features (embedding-based search, clustering, impact analysis) are now specified below.
+- **Release strategy:** V1 is CLI-only. Editor integrations, LSP backends, and cross-language call graphs are deferred to V2. V2 semantic search features (embedding-based search, clustering, impact analysis) are now specified below. V3 adds source display, code summary, and call graph analysis. V4 adds graph intelligence features: execution flow detection, blast radius analysis, scoped change detection, unified symbol context, hybrid search fusion, edge confidence scoring, inheritance tracking, and multi-repo MCP.
 
 ---
 
@@ -492,7 +492,7 @@ Structural and text search can only find code that matches syntactically — sea
 
 **EARS Requirements**
 - `PRD-SEM-REQ-001` When the user runs `wonk ask <query>` then the system shall embed the query via Ollama, perform cosine similarity search against all stored symbol embeddings, and return results ranked by descending similarity score.
-- `PRD-SEM-REQ-002` When the user provides `--semantic` on `wonk search` then the system shall blend structural results with semantic results, presenting structural matches first followed by additional semantic matches not already present.
+- `PRD-SEM-REQ-002` When the user provides `--semantic` on `wonk search` then the system shall blend structural results with semantic results, presenting structural matches first followed by additional semantic matches not already present. *Superseded by PRD-RRF-REQ-001 in V4 — replaced by Reciprocal Rank Fusion.*
 - `PRD-SEM-REQ-003` When returning semantic search results then each result shall include file path, line number, symbol name, symbol kind, and cosine similarity score.
 - `PRD-SEM-REQ-004` When the user provides `--budget <n>` on `wonk ask` then the system shall limit output to approximately `n` tokens, prioritizing results with highest similarity.
 - `PRD-SEM-REQ-005` When the user provides `--json` on `wonk ask` then the system shall output results as JSON objects including all fields plus the similarity score.
@@ -741,6 +741,267 @@ Wonk provides flat reference lookup (`wonk ref`) and file-level dependency graph
 
 ---
 
+### 3.23 Execution Flow Detection (PRD-FLOW) [V4]
+
+**Problem / outcome**
+LLM agents need to understand how code executes end-to-end — "how does an API request flow through the system?" Currently, wonk provides flat reference lists and file-level dependencies, but no way to trace an execution path from entry point to leaf. Flow detection identifies entry points (functions with no internal callers), traces outward through the call graph, and produces named execution flows.
+
+**In scope**
+- Entry point detection (functions/methods with no indexed callers)
+- BFS tracing from entry points through call graph edges (PRD-CGR)
+- Configurable depth and branching limits
+- File-scoped entry point filtering
+- MCP tool exposure
+
+**Out of scope**
+- Dynamic dispatch resolution (virtual calls, trait objects)
+- Cross-language flow tracing
+- LLM-generated flow labels/descriptions
+- Framework-aware entry point detection (e.g., Express routes, Spring controllers)
+
+**EARS Requirements**
+- `PRD-FLOW-REQ-001` When the user runs `wonk flows` then the system shall identify entry point symbols (functions/methods with no indexed callers) and display them with their call depth.
+- `PRD-FLOW-REQ-002` When the user runs `wonk flows <entry>` then the system shall trace the call graph forward from the named symbol via BFS and display the ordered sequence of symbols forming the execution flow.
+- `PRD-FLOW-REQ-003` When tracing a flow then the system shall follow call-graph edges recorded in the index (PRD-CGR-REQ-001) up to a configurable maximum depth.
+- `PRD-FLOW-REQ-004` Where `--depth N` is provided then the system shall limit BFS traversal to N levels (default: 10, maximum: 20).
+- `PRD-FLOW-REQ-005` Where `--branching N` is provided then the system shall follow at most N callees per symbol during BFS (default: 4).
+- `PRD-FLOW-REQ-006` When a traced flow has fewer than 2 steps then the system shall exclude it from flow output.
+- `PRD-FLOW-REQ-007` When displaying a flow then each step shall include the symbol name, kind, file path, and line number.
+- `PRD-FLOW-REQ-008` Where `--from <file>` is provided then the system shall restrict entry point detection to symbols defined in the specified file.
+- `PRD-FLOW-REQ-009` When output format is JSON or TOON then the system shall include structured fields: entry_point, steps (ordered array of {name, kind, file, line, depth}), step_count.
+- `PRD-FLOW-REQ-010` The system shall expose `wonk_flows` as an MCP tool with parameters: entry (optional string), from (optional file path), depth (optional integer, default 10, max 20), branching (optional integer, default 4), format (json|toon).
+
+**Acceptance criteria**
+- `wonk flows` lists all detected entry points with call depth
+- `wonk flows main` traces the full execution flow from `main`
+- `wonk flows --from src/api.ts` shows flows starting from that file only
+- Flows with only 1 step are excluded
+- MCP tool `wonk_flows` works through Claude Code
+
+---
+
+### 3.24 Blast Radius Impact Analysis (PRD-BLAST) [V4]
+
+**Problem / outcome**
+When modifying a symbol, developers need to know the consequence — not just "what changed" (PRD-SIMP) but "what would break." The current `wonk impact` detects Added/Modified/Removed symbols but doesn't trace the call graph outward. Blast radius analysis walks the dependency graph from a symbol, grouping results by depth to indicate severity.
+
+**In scope**
+- Symbol-level blast radius via call graph traversal
+- Depth-based severity tiers
+- Risk level assessment
+- Direction control (upstream dependants vs. downstream dependencies)
+- MCP tool exposure
+
+**Out of scope**
+- Automatic fix suggestions
+- Cross-repo impact analysis
+- Semantic similarity impact (existing PRD-SIMP handles this)
+
+**EARS Requirements**
+- `PRD-BLAST-REQ-001` When the user runs `wonk blast <symbol>` then the system shall traverse the call graph outward from the named symbol and display all directly and transitively dependent symbols grouped by depth.
+- `PRD-BLAST-REQ-002` When displaying results then the system shall group by severity: depth 1 = "WILL BREAK" (direct callers/importers), depth 2 = "LIKELY AFFECTED", depth 3+ = "MAY NEED TESTING".
+- `PRD-BLAST-REQ-003` When displaying results then the system shall assign a risk level: LOW (<=3 affected symbols), MEDIUM (4-10), HIGH (11-25), CRITICAL (>25).
+- `PRD-BLAST-REQ-004` Where `--direction upstream` is provided (default) then the system shall traverse callers.
+- `PRD-BLAST-REQ-005` Where `--direction downstream` is provided then the system shall traverse callees.
+- `PRD-BLAST-REQ-006` Where `--depth N` is provided then the system shall limit traversal to N levels (default: 3, maximum: 10).
+- `PRD-BLAST-REQ-007` When results span multiple files then the system shall include an affected-files summary.
+- `PRD-BLAST-REQ-008` Where `--include-tests` is provided then the system shall include test file symbols; otherwise test files are excluded.
+- `PRD-BLAST-REQ-009` When output format is JSON or TOON then the system shall include: target, direction, risk_level, total_affected, tiers[], affected_files[].
+- `PRD-BLAST-REQ-010` The system shall expose `wonk_blast` as an MCP tool with parameters: symbol (required), direction (optional), depth (optional), include_tests (optional), format.
+
+**Acceptance criteria**
+- `wonk blast processPayment` shows callers grouped by depth with severity labels
+- Risk levels correctly reflect affected symbol counts
+- Test files excluded by default
+- MCP tool works through Claude Code
+
+---
+
+### 3.25 Scoped Change Detection (PRD-CHG) [V4]
+
+**Problem / outcome**
+Developers need to understand the impact of in-progress changes before committing. The existing `wonk impact` supports `--since <commit>` but lacks ergonomic scoping for common git workflows (unstaged, staged, branch compare) and doesn't connect to blast radius or flow analysis. Scoped change detection maps git diffs to symbols and chains into blast radius/flow analysis.
+
+**In scope**
+- Git-diff scoping: unstaged, staged, all, compare (vs. branch/commit)
+- Symbol-level change detection from diff hunks
+- Optional chaining to blast radius (PRD-BLAST) and flow detection (PRD-FLOW)
+- MCP tool exposure
+
+**Out of scope**
+- Untracked new file analysis without git diff
+- Automatic commit/review workflow
+
+**EARS Requirements**
+- `PRD-CHG-REQ-001` When the user runs `wonk changes` then the system shall detect all symbols affected by unstaged git changes (default scope).
+- `PRD-CHG-REQ-002` Where `--scope staged` is provided then the system shall analyze only staged changes.
+- `PRD-CHG-REQ-003` Where `--scope all` is provided then the system shall analyze both unstaged and staged changes.
+- `PRD-CHG-REQ-004` Where `--scope compare --base <ref>` is provided then the system shall analyze changes between working tree and the specified git ref.
+- `PRD-CHG-REQ-005` When mapping diff hunks to symbols then the system shall identify which indexed symbols overlap with changed line ranges (Modified), which are absent from the re-parsed file (Removed), and which are new (Added).
+- `PRD-CHG-REQ-006` Where `--blast` is provided then the system shall run blast radius analysis for each changed symbol and include aggregated impact.
+- `PRD-CHG-REQ-007` Where `--flows` is provided then the system shall identify execution flows containing any changed symbols and list them as affected.
+- `PRD-CHG-REQ-008` When output format is JSON or TOON then the system shall include: scope, changed_symbols[], blast_radius (optional), affected_flows (optional).
+- `PRD-CHG-REQ-009` The system shall expose `wonk_changes` as an MCP tool with parameters: scope, base, blast, flows, format.
+
+**Acceptance criteria**
+- `wonk changes` shows symbols affected by unstaged changes
+- `wonk changes --scope compare --base main` shows changes vs. main
+- `wonk changes --blast` includes blast radius per changed symbol
+- `wonk changes --flows` lists affected execution flows
+
+---
+
+### 3.26 Unified Symbol Context (PRD-CTX) [V4]
+
+**Problem / outcome**
+Understanding a symbol currently requires 3-4 separate commands: `wonk sym` for definition, `wonk ref` for references, `wonk callers`/`wonk callees` for call graph, `wonk deps`/`wonk rdeps` for file context. Each round-trip costs latency and budget. A unified context command aggregates all relevant information into a single response.
+
+**In scope**
+- Single command aggregating definition, categorized incoming/outgoing references, and flow participation
+- Disambiguation by file path and kind
+- MCP tool exposure
+
+**Out of scope**
+- Source code display (use `wonk show`)
+- Semantic similarity neighbors
+
+**EARS Requirements**
+- `PRD-CTX-REQ-001` When the user runs `wonk context <name>` then the system shall display: definition (file, line, kind, signature), incoming references grouped by category (Callers, Importers, Type Users), outgoing references (Callees, Imports), and flow participation.
+- `PRD-CTX-REQ-002` Where `--file <path>` is provided then the system shall restrict to symbols in that file.
+- `PRD-CTX-REQ-003` Where `--kind <kind>` is provided then the system shall restrict to symbols of that kind.
+- `PRD-CTX-REQ-004` When multiple symbols match then the system shall display context for all, clearly labeled.
+- `PRD-CTX-REQ-005` When displaying incoming references then the system shall categorize as: Callers, Importers, Type Users.
+- `PRD-CTX-REQ-006` When displaying outgoing references then the system shall categorize as: Callees, Imports.
+- `PRD-CTX-REQ-007` Where execution flows are available then the system shall list which flows the symbol participates in and at which step.
+- `PRD-CTX-REQ-008` When output format is JSON or TOON then the system shall include: symbol, incoming {callers[], importers[], type_users[]}, outgoing {callees[], imports[]}, flows[].
+- `PRD-CTX-REQ-009` The system shall expose `wonk_context` as an MCP tool with parameters: name (required), file (optional), kind (optional), format.
+
+**Acceptance criteria**
+- `wonk context processPayment` shows definition, callers, callees, importers, and flows in one response
+- `wonk context --file src/auth.ts verifyToken` narrows to that file
+- Categories are clearly separated
+- MCP tool works through Claude Code
+
+---
+
+### 3.27 Hybrid Search Fusion (PRD-RRF) [V4]
+
+**Problem / outcome**
+The current `wonk search --semantic` blending presents structural matches first, then appends semantic matches. This simple concatenation doesn't optimize for relevance — a high-relevance semantic match may appear after a low-relevance structural match. Reciprocal Rank Fusion (RRF) merges ranked lists from multiple sources into a single optimally ranked list.
+
+**In scope**
+- RRF algorithm for merging structural and semantic result lists
+- Configurable fusion constant (K)
+- Supersedes PRD-SEM-REQ-002 blending behavior
+
+**Out of scope**
+- BM25 indexing (wonk uses grep-based search)
+- Additional ranking signals beyond structural and semantic
+
+**EARS Requirements**
+- `PRD-RRF-REQ-001` When the user provides `--semantic` on `wonk search` then the system shall merge structural and semantic result lists using Reciprocal Rank Fusion with formula: score(d) = Sum 1/(K + rank_i(d)) across all result lists. *Supersedes PRD-SEM-REQ-002.*
+- `PRD-RRF-REQ-002` When computing RRF scores then the system shall use K=60 as the default fusion constant.
+- `PRD-RRF-REQ-003` Where `rrf_k` is configured in the `[search]` section of config.toml then the system shall use that value instead of the default.
+- `PRD-RRF-REQ-004` When displaying RRF-fused results then the system shall present them in descending RRF score order, interleaving structural and semantic matches as their fused scores dictate.
+
+**Acceptance criteria**
+- `wonk search --semantic "auth"` returns interleaved results ranked by RRF score
+- A high-ranked semantic result can appear before a low-ranked structural result
+- Custom K value from config.toml is respected
+
+---
+
+### 3.28 Edge Confidence Scoring (PRD-CONF) [V4]
+
+**Problem / outcome**
+Not all call-graph and import edges are equally reliable. An import resolved via explicit `import` statement is near-certain, while a call matched by name alone may be a false positive. Without confidence metadata, graph traversals treat all edges equally, producing noisy results. Confidence scoring lets consumers filter or weight edges by reliability.
+
+**In scope**
+- Confidence score (0.0-1.0) on reference and call-graph edges
+- Scoring based on resolution method during indexing
+- Filtering by minimum confidence in graph traversal commands
+
+**Out of scope**
+- Runtime/dynamic confidence adjustment
+- ML-based confidence estimation
+
+**EARS Requirements**
+- `PRD-CONF-REQ-001` When indexing references and call-graph edges then the system shall assign a confidence score between 0.0 and 1.0 based on the resolution method.
+- `PRD-CONF-REQ-002` When a reference is resolved via explicit import then the system shall assign confidence >= 0.9.
+- `PRD-CONF-REQ-003` When a reference is resolved via same-file definition then the system shall assign confidence >= 0.8.
+- `PRD-CONF-REQ-004` When a reference is resolved via fuzzy name matching (no import path) then the system shall assign confidence <= 0.5.
+- `PRD-CONF-REQ-005` Where `--min-confidence <N>` is provided on graph traversal commands (blast, flows, callers, callees, callpath, context) then the system shall exclude edges with confidence below N.
+- `PRD-CONF-REQ-006` When output format is JSON or TOON then reference and call-graph results shall include a `confidence` field.
+
+**Acceptance criteria**
+- Import-resolved references have confidence >= 0.9
+- Fuzzy name-matched references have confidence <= 0.5
+- `wonk callers foo --min-confidence 0.8` excludes fuzzy matches
+- JSON output includes confidence field on all graph edges
+
+---
+
+### 3.29 Inheritance Tracking (PRD-HRTG) [V4]
+
+**Problem / outcome**
+The index tracks call and import relationships but not inheritance or interface implementation. When a base class method changes, subclass overrides may be affected. Without these edges, blast radius analysis and flow detection miss an entire category of dependencies.
+
+**In scope**
+- Tree-sitter extraction of extends/implements relationships
+- Storage as typed edges in the index
+- Integration with blast radius, flow detection, and context commands
+
+**Out of scope**
+- Mixin/composition tracking
+- Generic/template specialization tracking
+- Cross-language inheritance
+
+**EARS Requirements**
+- `PRD-HRTG-REQ-001` When indexing a class that extends another class then the system shall record an "extends" edge between child and parent class symbols.
+- `PRD-HRTG-REQ-002` When indexing a class or struct that implements an interface or trait then the system shall record an "implements" edge between implementor and interface/trait symbol.
+- `PRD-HRTG-REQ-003` When blast radius analysis (PRD-BLAST) traverses upstream from a class or interface then the system shall include child classes and implementors as depth-1 dependants.
+- `PRD-HRTG-REQ-004` When `wonk context` displays incoming references then the system shall include a "Children" category listing classes that extend or implement the symbol.
+- `PRD-HRTG-REQ-005` When output format is JSON or TOON then inheritance edges shall include a `relationship` field with value "extends" or "implements".
+
+**Acceptance criteria**
+- `wonk context BaseHandler` shows extending classes under "Children"
+- `wonk blast IPaymentProvider` includes all implementors in depth-1 tier
+- Inheritance edges extracted for all 12 supported languages where applicable
+
+---
+
+### 3.30 Multi-Repo MCP (PRD-MREP) [V4]
+
+**Problem / outcome**
+When an LLM agent works across related repositories, it must start a separate MCP server per repo. The current `wonk mcp serve` operates on the current repo only. Multi-repo support enables a single MCP server to serve all indexed repositories via a `repo` parameter.
+
+**In scope**
+- Global repository registry discovery
+- MCP tools accept optional `repo` parameter
+- Repo listing via MCP tool
+- Lazy-load index connections per repo
+
+**Out of scope**
+- Cross-repo search (querying multiple repos in a single call)
+- Cross-repo call graph traversal
+- Remote repo serving
+
+**EARS Requirements**
+- `PRD-MREP-REQ-001` When `wonk mcp serve` is started then the system shall discover all indexed repositories from the global registry and make them available.
+- `PRD-MREP-REQ-002` When an MCP tool is invoked without a `repo` parameter then the system shall default to the repository at the server's working directory.
+- `PRD-MREP-REQ-003` When an MCP tool is invoked with a `repo` parameter then the system shall route the query to the specified repository's index.
+- `PRD-MREP-REQ-004` When a repo is specified by name then the system shall match against the repository directory name (last path component).
+- `PRD-MREP-REQ-005` The system shall expose a `wonk_repos` MCP tool that lists all available repositories with names, paths, and index statistics.
+- `PRD-MREP-REQ-006` When loading a repository's index for the first time during a session then the system shall open the connection lazily and cache it.
+
+**Acceptance criteria**
+- Single MCP server can answer queries about multiple repos
+- `wonk_repos` lists all indexed repos
+- Default is working directory repo when no `repo` param
+- Lazy-loaded connections don't block server startup
+
+---
+
 ## 4) Traceability
 
 | Feature | Requirement IDs | Count |
@@ -767,7 +1028,15 @@ Wonk provides flat reference lookup (`wonk ref`) and file-level dependency graph
 | Source Display | PRD-SHOW-REQ-001 to 013 | 13 |
 | Code Summary | PRD-SUM-REQ-001 to 018 | 18 |
 | Call Graph Analysis | PRD-CGR-REQ-001 to 014 | 14 |
-| **Total** | | **156** |
+| Execution Flow Detection | PRD-FLOW-REQ-001 to 010 | 10 |
+| Blast Radius Impact Analysis | PRD-BLAST-REQ-001 to 010 | 10 |
+| Scoped Change Detection | PRD-CHG-REQ-001 to 009 | 9 |
+| Unified Symbol Context | PRD-CTX-REQ-001 to 009 | 9 |
+| Hybrid Search Fusion | PRD-RRF-REQ-001 to 004 | 4 |
+| Edge Confidence Scoring | PRD-CONF-REQ-001 to 006 | 6 |
+| Inheritance Tracking | PRD-HRTG-REQ-001 to 005 | 5 |
+| Multi-Repo MCP | PRD-MREP-REQ-001 to 006 | 6 |
+| **Total** | | **215** |
 
 ---
 
@@ -791,7 +1060,9 @@ Wonk provides flat reference lookup (`wonk ref`) and file-level dependency graph
 - **LSP server integration.** V1 uses Tree-sitter only. LSP backends (for type-aware resolution) are a V2 feature.
 - ~~**Semantic / embedding search.** Natural language queries require an embedding model. Deferred to V2.~~ **Moved to V2 scope: PRD-SEM, PRD-SDEP, PRD-SCLST, PRD-SIMP.**
 - ~~**Directory summaries.** LLM-generated descriptions of what each directory does. Deferred to V2.~~ **Moved to V2 scope: PRD-SUM.**
-- **Cross-language call graphs.** Connecting a Python HTTP call to a Go handler. Deferred to V2.
+- **Cross-language call graphs.** Connecting a Python HTTP call to a Go handler. Remains out of scope through V4.
 - **Editor integrations.** VS Code extension, Neovim plugin, etc. V1 is CLI-only.
-- **Remote / monorepo support.** V1 targets single local repos. Multi-root workspaces and remote indexing are future work.
+- ~~**Remote / monorepo support.** V1 targets single local repos. Multi-root workspaces and remote indexing are future work.~~ **Multi-repo MCP partially addressed in V4 (PRD-MREP). Cross-repo search and remote indexing remain out of scope.**
 - **Web UI.** All interaction is through the CLI.
+- **Dynamic dispatch resolution.** Virtual calls, trait objects, and function pointers are not resolved by static analysis. Out of scope through V4.
+- **ML-based confidence estimation.** Edge confidence uses static heuristics only (PRD-CONF). ML/runtime adjustment is out of scope.
