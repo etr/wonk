@@ -4,7 +4,7 @@
 //! in SQLite to detect which symbols were added, modified, or removed.
 //! Also provides git-based file change detection for `--since` support.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
@@ -12,8 +12,12 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
+use crate::embedding;
 use crate::indexer;
-use crate::types::{ChangeType, ChangedSymbol, Symbol, SymbolKind};
+use crate::semantic;
+use crate::types::{
+    ChangeType, ChangedSymbol, ImpactResult, SemanticResult, Symbol, SymbolKind, SymbolRef,
+};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -84,13 +88,7 @@ pub fn detect_changed_symbols(
     file: &str,
     repo_root: &Path,
 ) -> Result<Vec<ChangedSymbol>> {
-    // Guard against path traversal: reject `..` components before any filesystem access.
-    if Path::new(file)
-        .components()
-        .any(|c| c == std::path::Component::ParentDir)
-    {
-        bail!("path escapes repository root: {file}");
-    }
+    validate_file_path(file)?;
 
     let abs_path = repo_root.join(file);
 
@@ -121,19 +119,7 @@ pub fn detect_changed_symbols(
         return Ok(Vec::new());
     }
 
-    // Detect language.
-    let lang = match indexer::detect_language(Path::new(file)) {
-        Some(l) => l,
-        None => bail!("unsupported language for file: {file}"),
-    };
-
-    // Parse with Tree-sitter.
-    let mut parser = indexer::get_parser(lang);
-    let tree = parser
-        .parse(content_str.as_bytes(), None)
-        .context("tree-sitter parse failed")?;
-
-    let current_symbols = indexer::extract_symbols(&tree, &content_str, file, lang);
+    let current_symbols = parse_file_to_symbols(file, &content_str)?;
 
     // If file not in index at all, all current symbols are Added.
     let indexed_symbols = query_indexed_symbols(conn, file)?;
@@ -210,11 +196,223 @@ pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<
     Ok(files)
 }
 
+/// Parse file content with Tree-sitter and return extracted symbols.
+///
+/// Shared helper for both [`detect_changed_symbols`] and [`parse_current_symbols`].
+fn parse_file_to_symbols(file: &str, content: &str) -> Result<Vec<Symbol>> {
+    let lang = match indexer::detect_language(Path::new(file)) {
+        Some(l) => l,
+        None => bail!("unsupported language for file: {file}"),
+    };
+
+    let mut parser = indexer::get_parser(lang);
+    let tree = parser
+        .parse(content.as_bytes(), None)
+        .context("tree-sitter parse failed")?;
+
+    Ok(indexer::extract_symbols(&tree, content, file, lang))
+}
+
+/// Validate that a file path is safe: no `..` components and no absolute paths.
+fn validate_file_path(file: &str) -> Result<()> {
+    let path = Path::new(file);
+    if path.is_absolute() {
+        bail!("absolute path not allowed: {file}");
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        bail!("path escapes repository root: {file}");
+    }
+    Ok(())
+}
+
+/// Re-parse a file from disk to get full [`Symbol`] structs (with `end_line`).
+///
+/// This is needed because `detect_changed_symbols` only returns [`ChangedSymbol`]
+/// which lacks `end_line`, `signature`, and other fields needed for embedding.
+pub fn parse_current_symbols(file: &str, repo_root: &Path) -> Result<Vec<Symbol>> {
+    validate_file_path(file)?;
+
+    let abs_path = repo_root.join(file);
+    let content =
+        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
+
+    parse_file_to_symbols(file, &content)
+}
+
+/// Build [`ImpactResult`] entries from semantic search results, excluding
+/// self-matches.
+///
+/// `self_ids` contains the symbol IDs of the changed symbol(s) in the index
+/// that should be excluded from results.
+pub fn build_impact_results(
+    changed: &SymbolRef,
+    semantic_results: &[SemanticResult],
+    self_ids: &HashSet<i64>,
+) -> Vec<ImpactResult> {
+    semantic_results
+        .iter()
+        .filter(|sr| !self_ids.contains(&sr.symbol_id))
+        .map(|sr| ImpactResult {
+            changed_symbol: changed.clone(),
+            impacted_symbol: SymbolRef {
+                name: sr.symbol_name.clone(),
+                kind: sr.symbol_kind,
+                file: sr.file.clone(),
+                line: sr.line,
+            },
+            similarity_score: sr.similarity_score,
+        })
+        .collect()
+}
+
+/// Lookup the symbol IDs for a given name, kind, and file in the index.
+///
+/// Returns a set of matching symbol IDs for self-exclusion.
+fn query_self_symbol_ids(
+    conn: &Connection,
+    name: &str,
+    kind: SymbolKind,
+    file: &str,
+) -> HashSet<i64> {
+    let mut ids = HashSet::new();
+    let kind_str = kind.to_string();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT id FROM symbols WHERE name = ?1 AND kind = ?2 AND file = ?3")
+        && let Ok(rows) = stmt.query_map(rusqlite::params![name, kind_str, file], |row| {
+            row.get::<_, i64>(0)
+        })
+    {
+        for r in rows.flatten() {
+            ids.insert(r);
+        }
+    }
+    ids
+}
+
+/// Analyze the impact of changed symbols in a file.
+///
+/// Detects changed symbols, embeds each one, and finds semantically similar
+/// symbols in the index. Returns results sorted by descending similarity.
+///
+/// `all_embeddings` should be pre-loaded via [`embedding::load_all_embeddings`]
+/// and shared across multiple calls (e.g. `--since` mode) to avoid redundant
+/// SQLite I/O.
+///
+/// Returns an empty `Vec` if the file has no changes.
+pub fn analyze_impact(
+    conn: &Connection,
+    file: &str,
+    repo_root: &Path,
+    client: &embedding::OllamaClient,
+    all_embeddings: &[(i64, Vec<f32>)],
+) -> Result<Vec<ImpactResult>> {
+    validate_file_path(file)?;
+
+    // Step 1: Detect changed symbols.
+    let changes = detect_changed_symbols(conn, file, repo_root)?;
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Step 2: Filter out Removed symbols (no current source to embed).
+    let embeddable: Vec<_> = changes
+        .iter()
+        .filter(|c| c.change_type != ChangeType::Removed)
+        .collect();
+
+    if embeddable.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Step 3: Nothing to compare against if no embeddings were provided.
+    if all_embeddings.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Step 4: Read file content once (shared for parsing + chunking).
+    let abs_path = repo_root.join(file);
+    let source_code =
+        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
+
+    // Step 4: Parse to get full Symbol structs (with end_line for chunking).
+    let current_symbols = parse_file_to_symbols(file, &source_code)?;
+
+    // Build a lookup map from (name, kind) to full Symbol for chunking.
+    let sym_map: HashMap<(String, SymbolKind), &Symbol> = current_symbols
+        .iter()
+        .map(|s| ((s.name.clone(), s.kind), s))
+        .collect();
+
+    // Step 5: Load file imports for chunk context.
+    // Imports are optional context for embedding; silently skip on DB error.
+    let file_imports = conn
+        .prepare("SELECT import_path FROM file_imports WHERE source_file = ?1")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map(rusqlite::params![file], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+
+    // Step 6: For each changed symbol, embed and search.
+    let mut all_results = Vec::new();
+
+    for changed in &embeddable {
+        let changed_ref = SymbolRef::from(*changed);
+
+        // Find the full Symbol for chunking.
+        let full_sym = match sym_map.get(&(changed.name.clone(), changed.kind)) {
+            Some(s) => *s,
+            None => continue, // Symbol not found in parse, skip.
+        };
+
+        // Build chunk text.
+        let chunk = embedding::chunk_symbol(full_sym, &file_imports, &source_code);
+
+        // Embed the chunk.
+        let mut query_vec = client.embed_single(&chunk)?;
+        embedding::normalize(&mut query_vec);
+
+        // Semantic search (limit to 20 results per changed symbol).
+        let scored = semantic::semantic_search(&query_vec, all_embeddings, 20);
+        let resolved = semantic::resolve_results(conn, &scored)?;
+
+        // Self-exclusion: find IDs of the changed symbol itself.
+        let self_ids = query_self_symbol_ids(conn, &changed.name, changed.kind, &changed.file);
+
+        let results = build_impact_results(&changed_ref, &resolved, &self_ids);
+        all_results.extend(results);
+    }
+
+    // Step 7: Sort by descending similarity and deduplicate.
+    all_results.sort_by(|a, b| {
+        b.similarity_score
+            .partial_cmp(&a.similarity_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Deduplicate: keep only the highest-scoring entry per impacted symbol.
+    let mut seen = HashSet::new();
+    all_results.retain(|r| {
+        seen.insert((
+            r.impacted_symbol.name.clone(),
+            r.impacted_symbol.kind,
+            r.impacted_symbol.file.clone(),
+            r.impacted_symbol.line,
+        ))
+    });
+
+    Ok(all_results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db;
     use crate::pipeline;
+    use crate::types::{ChangeType, SymbolKind, SymbolRef};
     use std::fs;
     use tempfile::TempDir;
 
@@ -465,10 +663,7 @@ impl Bar {
     fn git_diff_rejects_special_characters() {
         let dir = TempDir::new().unwrap();
         let result = detect_changed_files_since("HEAD:../../etc/passwd", dir.path());
-        assert!(
-            result.is_err(),
-            "commit ref with colon should be rejected"
-        );
+        assert!(result.is_err(), "commit ref with colon should be rejected");
     }
 
     #[test]
@@ -560,6 +755,196 @@ impl Bar {
             files.contains(&"b.rs".to_string()),
             "should detect new file"
         );
+    }
+
+    // -- parse_current_symbols tests -------------------------------------------
+
+    #[test]
+    fn parse_current_symbols_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn alpha() { }\nfn beta(x: i32) -> i32 { x }\n",
+        )
+        .unwrap();
+
+        let symbols = parse_current_symbols("src/lib.rs", root).unwrap();
+
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert_eq!(symbols.len(), 2);
+        // Symbols should have end_line filled in
+        for sym in &symbols {
+            assert!(
+                sym.end_line.is_some(),
+                "end_line should be set for {}",
+                sym.name
+            );
+        }
+    }
+
+    #[test]
+    fn parse_current_symbols_nonexistent_file() {
+        let dir = TempDir::new().unwrap();
+        let result = parse_current_symbols("nonexistent.rs", dir.path());
+        assert!(result.is_err());
+    }
+
+    // -- filter_and_match_symbols tests ----------------------------------------
+
+    #[test]
+    fn filter_removed_symbols_excluded() {
+        // Only Added and Modified should remain after filtering
+        let changes = [
+            ChangedSymbol {
+                name: "added_fn".into(),
+                kind: SymbolKind::Function,
+                file: "src/lib.rs".into(),
+                line: 1,
+                change_type: ChangeType::Added,
+            },
+            ChangedSymbol {
+                name: "modified_fn".into(),
+                kind: SymbolKind::Function,
+                file: "src/lib.rs".into(),
+                line: 5,
+                change_type: ChangeType::Modified,
+            },
+            ChangedSymbol {
+                name: "removed_fn".into(),
+                kind: SymbolKind::Function,
+                file: "src/lib.rs".into(),
+                line: 10,
+                change_type: ChangeType::Removed,
+            },
+        ];
+
+        let filtered: Vec<_> = changes
+            .iter()
+            .filter(|c| c.change_type != ChangeType::Removed)
+            .collect();
+
+        assert_eq!(filtered.len(), 2);
+        assert!(
+            filtered
+                .iter()
+                .all(|c| c.change_type != ChangeType::Removed)
+        );
+    }
+
+    // -- build_impact_results tests (unit test for the aggregation helper) ----
+
+    #[test]
+    fn build_impact_results_excludes_self_match() {
+        let results = build_impact_results(
+            &SymbolRef {
+                name: "foo".into(),
+                kind: SymbolKind::Function,
+                file: "a.rs".into(),
+                line: 1,
+            },
+            &[crate::types::SemanticResult {
+                symbol_id: 1,
+                file: "a.rs".into(),
+                line: 1,
+                symbol_name: "foo".into(),
+                symbol_kind: SymbolKind::Function,
+                similarity_score: 1.0,
+            }],
+            &HashSet::from([1i64]),
+        );
+        assert!(results.is_empty(), "self-match should be excluded");
+    }
+
+    #[test]
+    fn build_impact_results_includes_non_self() {
+        let results = build_impact_results(
+            &SymbolRef {
+                name: "foo".into(),
+                kind: SymbolKind::Function,
+                file: "a.rs".into(),
+                line: 1,
+            },
+            &[
+                crate::types::SemanticResult {
+                    symbol_id: 1,
+                    file: "a.rs".into(),
+                    line: 1,
+                    symbol_name: "foo".into(),
+                    symbol_kind: SymbolKind::Function,
+                    similarity_score: 1.0,
+                },
+                crate::types::SemanticResult {
+                    symbol_id: 2,
+                    file: "b.rs".into(),
+                    line: 10,
+                    symbol_name: "bar".into(),
+                    symbol_kind: SymbolKind::Function,
+                    similarity_score: 0.85,
+                },
+            ],
+            &HashSet::from([1i64]),
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].impacted_symbol.name, "bar");
+        assert!((results[0].similarity_score - 0.85).abs() < 1e-6);
+    }
+
+    // -- analyze_impact with no embeddings returns error -----------------------
+
+    #[test]
+    fn analyze_impact_empty_embeddings_returns_empty() {
+        let source = "fn hello() { }\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        // Modify the file so changes are detected
+        fs::write(dir.path().join("src/lib.rs"), "fn hello(x: i32) { }\n").unwrap();
+
+        // Dead-port client
+        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+
+        // Pass empty embeddings — should return empty (no embeddings to compare against)
+        let all_embeddings = Vec::new();
+        let results =
+            analyze_impact(&conn, "src/lib.rs", dir.path(), &client, &all_embeddings).unwrap();
+        assert!(results.is_empty(), "empty embeddings should return empty");
+    }
+
+    // -- analyze_impact with unchanged file returns empty ----------------------
+
+    #[test]
+    fn analyze_impact_unchanged_returns_empty() {
+        let source = "fn hello() { }\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        // File unchanged, no client needed
+        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+
+        let all_embeddings = Vec::new();
+        let results =
+            analyze_impact(&conn, "src/lib.rs", dir.path(), &client, &all_embeddings).unwrap();
+        assert!(
+            results.is_empty(),
+            "unchanged file should produce no impact results"
+        );
+    }
+
+    #[test]
+    fn parse_current_symbols_rejects_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let result = parse_current_symbols("../../etc/passwd", dir.path());
+        assert!(result.is_err(), "path with .. should be rejected");
+    }
+
+    #[test]
+    fn parse_current_symbols_rejects_absolute_path() {
+        let dir = TempDir::new().unwrap();
+        let result = parse_current_symbols("/etc/passwd", dir.path());
+        assert!(result.is_err(), "absolute path should be rejected");
     }
 
     #[test]

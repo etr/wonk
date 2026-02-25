@@ -31,7 +31,7 @@
 | M11 | Daemon Embedding & Lifecycle Updates | 4 | Not Started |
 | M12 | Semantic Blending & Dependency Scoping | 3 | Not Started |
 | M13 | Semantic Clustering (`wonk cluster`) | 2 | Complete |
-| M14 | Change Impact Analysis (`wonk impact`) | 2 | Not Started |
+| M14 | Change Impact Analysis (`wonk impact`) | 2 | Complete |
 
 ### Dependency Graph
 
@@ -2174,7 +2174,7 @@ Detect which symbols changed in a file by comparing a fresh Tree-sitter parse ag
 **Related Requirements:** PRD-SIMP-REQ-001, PRD-SIMP-REQ-002
 **Related Decisions:** DR-014
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
@@ -2188,20 +2188,20 @@ Detect which symbols changed in a file by comparing a fresh Tree-sitter parse ag
 Implement `wonk impact <file>` that finds semantically similar code that might be affected by changes in the specified file.
 
 **Action Items:**
-- [ ] Add `impact` subcommand to CLI with args: `<file>` (required), `--since <commit>` (optional), `--json` (global)
-- [ ] Wire through Query Router: detect changed symbols (TASK-055), embed each changed symbol's current source via Ollama, compare against all stored embeddings (TASK-043)
-- [ ] For `--since <commit>`: get changed files list (TASK-055), analyze each file, aggregate results
-- [ ] Define `ImpactResult` struct in `types.rs`: `changed_symbol` (name, kind, file, line), `impacted_symbol` (name, kind, file, line), `similarity_score`, `file_path`
-- [ ] Exclude the changed symbol itself from impact results (don't report a symbol as impacted by itself)
-- [ ] Sort results by descending similarity score
-- [ ] Default output format:
+- [x] Add `impact` subcommand to CLI with args: `<file>` (required), `--since <commit>` (optional), `--json` (global)
+- [x] Wire through Query Router: detect changed symbols (TASK-055), embed each changed symbol's current source via Ollama, compare against all stored embeddings (TASK-043)
+- [x] For `--since <commit>`: get changed files list (TASK-055), analyze each file, aggregate results
+- [x] Define `ImpactResult` struct in `types.rs`: `changed_symbol` (name, kind, file, line), `impacted_symbol` (name, kind, file, line), `similarity_score`, `file_path`
+- [x] Exclude the changed symbol itself from impact results (don't report a symbol as impacted by itself)
+- [x] Sort results by descending similarity score
+- [x] Default output format:
   ```
   Changed: verifyToken (function) in src/auth/middleware.ts:15
     → src/auth/session.ts:8      validateSession (function) [0.89]
     → src/auth/credentials.ts:22 checkCredentials (function) [0.84]
   ```
-- [ ] JSON output: structured ImpactResult array
-- [ ] If no embeddings exist, return error with hint
+- [x] JSON output: structured ImpactResult array
+- [x] If no embeddings exist, return error with hint
 
 **Dependencies:**
 - Blocked by: TASK-044, TASK-055
@@ -2221,7 +2221,7 @@ Implement `wonk impact <file>` that finds semantically similar code that might b
 **Related Requirements:** PRD-SIMP-REQ-001, PRD-SIMP-REQ-002, PRD-SIMP-REQ-003, PRD-SIMP-REQ-004
 **Related Decisions:** DR-014, DR-010
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
