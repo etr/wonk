@@ -51,7 +51,7 @@ Environment variables:
 Example:
 
 ```sh
-WONK_VERSION=0.2.0 WONK_INSTALL=$HOME/.local/bin \
+WONK_VERSION=2.0.0 WONK_INSTALL=$HOME/.local/bin \
   curl -fsSL https://raw.githubusercontent.com/etr/wonk/main/install.sh | sh
 ```
 
@@ -89,6 +89,7 @@ wonk search "render" -- src/components/
 | `-i`, `--ignore-case` | Case-insensitive search |
 | `--raw` | Skip ranking, deduplication, and category headers |
 | `--smart` | Force smart ranking even if pattern does not match known symbols |
+| `--semantic` | Blend structural results with embedding-based semantic results |
 | `-- <paths>` | Restrict search to specific paths |
 
 ### `wonk sym <name>`
@@ -202,15 +203,21 @@ Show indexing status for the current repository.
 wonk status
 ```
 
-### `wonk daemon <start|stop|status>`
+### `wonk daemon <start|stop|status|list>`
 
 Manage the background daemon.
 
 ```
 wonk daemon start
 wonk daemon stop
+wonk daemon stop --all
 wonk daemon status
+wonk daemon list
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--all` | Stop all running daemons (with `stop`) |
 
 ### `wonk repos <list|clean>`
 
@@ -232,6 +239,49 @@ wonk mcp serve
 
 The server communicates via JSON-RPC 2.0 over NDJSON on stdin/stdout. It
 auto-indexes the repository on first startup if no index exists.
+
+### `wonk ask <query>`
+
+Semantic search: find symbols related to a natural language query.
+Requires Ollama running locally with `nomic-embed-text`.
+
+```
+wonk ask "error handling logic"
+wonk ask --from src/api.rs "authentication"
+wonk ask --to src/db.rs "query builder"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--from <file>` | Restrict to symbols reachable from this file |
+| `--to <file>` | Restrict to symbols that can reach this file |
+
+### `wonk cluster <path>`
+
+Cluster symbols by semantic similarity within a directory.
+Uses K-Means with automatic K selection via silhouette scoring.
+
+```
+wonk cluster src/
+wonk cluster --top 3 src/components/
+```
+
+| Flag | Description |
+|------|-------------|
+| `--top <N>` | Representative symbols per cluster (default: 5) |
+
+### `wonk impact <file>`
+
+Analyze symbol changes and find semantically impacted downstream code.
+
+```
+wonk impact src/lib.rs
+wonk impact --since HEAD~5
+```
+
+| Flag | Description |
+|------|-------------|
+| `--since <commit>` | Analyze all files changed since this commit |
 
 ## Global flags
 
@@ -280,6 +330,22 @@ own `-- imports --` header.
 Use `--raw` to disable all ranking, deduplication, and headers. Use `--smart`
 to force smart mode even when the pattern does not match known symbols.
 
+## Semantic search
+
+Wonk supports embedding-based semantic search via [Ollama](https://ollama.ai/)
+with the `nomic-embed-text` model. This lets you search by meaning rather than
+exact text patterns.
+
+- **Setup**: Install Ollama and pull `nomic-embed-text` (`ollama pull nomic-embed-text`)
+- **Embedding build**: Embeddings are built on first semantic query or explicitly via `wonk init`
+- **Freshness**: The background daemon keeps embeddings up to date as files change
+- **Dependency scoping**: Use `--from <file>` and `--to <file>` to restrict
+  semantic results to symbols reachable from or leading to a specific file,
+  using the indexed dependency graph
+
+Use `wonk ask` for pure semantic search, or `wonk search --semantic` to blend
+structural and semantic results.
+
 ## Supported languages
 
 Wonk ships with Tree-sitter grammars for:
@@ -294,6 +360,7 @@ Wonk ships with Tree-sitter grammars for:
 - C++
 - Ruby
 - PHP
+- C#
 
 ## Configuration
 
@@ -457,8 +524,8 @@ The server exposes 9 tools over stdio (JSON-RPC 2.0):
 | `wonk_ls` | List files and symbols in a path |
 | `wonk_deps` | Show file dependencies (imports) |
 | `wonk_rdeps` | Show reverse dependencies |
-| `wonk_status` | Check index status (file/symbol/reference counts) |
-| `wonk_init` | Initialize or rebuild the index |
+| `wonk_status` | Check index status (file/symbol/reference/embedding counts) |
+| `wonk_init` | Initialize or rebuild the index (supports Ollama embedding build) |
 
 All file paths are validated against the repository boundary. The index is
 built automatically on first use if it does not already exist.
