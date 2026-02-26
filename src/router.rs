@@ -18,8 +18,9 @@ use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
 use crate::output::{
-    self, BudgetStatus, CalleeOutput, CallerOutput, Formatter, LsSymbolEntry, OutputFormat,
-    RefOutput, SearchOutput, SemanticOutput, ShowOutput, SignatureOutput, SymbolOutput,
+    self, BudgetStatus, CallPathHopOutput, CalleeOutput, CallerOutput, Formatter, LsSymbolEntry,
+    OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput, SignatureOutput,
+    SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -1110,6 +1111,34 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
+        Command::Callpath(args) => {
+            // Reuse callgraph_setup with a dummy depth (we don't use depth for callpath).
+            let (conn, _depth) = match callgraph_setup(1, suppress) {
+                Some(pair) => pair,
+                None => return Ok(()),
+            };
+
+            let path = crate::callgraph::callpath(&conn, &args.from, &args.to)?;
+
+            match path {
+                Some(hops) => {
+                    let outputs: Vec<CallPathHopOutput> = hops
+                        .iter()
+                        .map(|h| CallPathHopOutput {
+                            symbol_name: h.symbol_name.clone(),
+                            symbol_kind: h.symbol_kind.to_string(),
+                            file: h.file.clone(),
+                            line: h.line,
+                        })
+                        .collect();
+
+                    fmt.format_callpath(&outputs)?;
+                }
+                None => {
+                    output::print_hint("no path found", suppress);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1177,6 +1206,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Impact(_)
             | Command::Callers(_)
             | Command::Callees(_)
+            | Command::Callpath(_)
     )
 }
 
@@ -4602,6 +4632,16 @@ mod tests {
         let cmd = Command::Callees(CalleesArgs {
             name: "main".into(),
             depth: 1,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_callpath() {
+        use crate::cli::CallpathArgs;
+        let cmd = Command::Callpath(CallpathArgs {
+            from: "main".into(),
+            to: "dispatch".into(),
         });
         assert!(is_query_command(&cmd));
     }

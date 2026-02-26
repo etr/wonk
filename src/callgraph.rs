@@ -5,13 +5,13 @@
 //! (callees). Supports transitive expansion via BFS up to a configurable
 //! depth cap.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
-use crate::types::{CalleeResult, CallerResult, SymbolKind};
+use crate::types::{CallPathHop, CalleeResult, CallerResult, SymbolKind};
 
 /// Maximum allowed depth for transitive expansion.
 pub const MAX_DEPTH_CAP: usize = 10;
@@ -216,6 +216,132 @@ pub fn callees(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
     });
 
     Ok(results)
+}
+
+/// Find the shortest call chain from `from` to `to` via BFS callee expansion.
+///
+/// Returns `Some(path)` where `path` is a `Vec<CallPathHop>` representing the
+/// chain `from -> hop1 -> ... -> to`. Returns `None` when no path exists within
+/// the depth cap ([`MAX_DEPTH_CAP`]).
+///
+/// Special case: when `from == to`, returns a single-hop path.
+pub fn callpath(conn: &Connection, from: &str, to: &str) -> Result<Option<Vec<CallPathHop>>> {
+    // Degenerate case: same symbol.
+    if from == to {
+        return Ok(resolve_symbol_hop(conn, from)?.map(|hop| vec![hop]));
+    }
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut parent_map: HashMap<String, String> = HashMap::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+
+    queue.push_back((from.to_string(), 0));
+    visited.insert(from.to_string());
+
+    // Reuse the same SQL statement across all BFS iterations.
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT r.name \
+         FROM \"references\" r \
+         JOIN symbols s ON s.id = r.caller_id \
+         WHERE s.name = ?1",
+    )?;
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= MAX_DEPTH_CAP {
+            continue;
+        }
+
+        let callees: Vec<String> = stmt
+            .query_map(rusqlite::params![&current], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for callee_name in callees {
+            if visited.contains(&callee_name) {
+                continue;
+            }
+            visited.insert(callee_name.clone());
+            parent_map.insert(callee_name.clone(), current.clone());
+
+            if callee_name == to {
+                return reconstruct_path(conn, from, to, &parent_map);
+            }
+
+            queue.push_back((callee_name, depth + 1));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Reconstruct the call path from `from` to `to` using the parent map,
+/// resolving each symbol to a `CallPathHop` with file/line/kind.
+fn reconstruct_path(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    parent_map: &HashMap<String, String>,
+) -> Result<Option<Vec<CallPathHop>>> {
+    // Walk backwards from `to` to `from` via parent_map.
+    let mut chain: Vec<String> = vec![to.to_string()];
+    let mut current = to.to_string();
+    while current != from {
+        match parent_map.get(&current) {
+            Some(parent) => {
+                chain.push(parent.clone());
+                current = parent.clone();
+            }
+            None => return Ok(None), // should not happen if BFS is correct
+        }
+    }
+    chain.reverse();
+
+    // Resolve each name to a CallPathHop.
+    let mut hops = Vec::with_capacity(chain.len());
+    for name in &chain {
+        match resolve_symbol_hop(conn, name)? {
+            Some(hop) => hops.push(hop),
+            None => {
+                // Symbol not found in index; use placeholder.
+                hops.push(CallPathHop {
+                    symbol_name: name.clone(),
+                    symbol_kind: SymbolKind::Function,
+                    file: String::new(),
+                    line: 0,
+                });
+            }
+        }
+    }
+
+    Ok(Some(hops))
+}
+
+/// Look up a symbol by name and return a `CallPathHop` with its metadata.
+fn resolve_symbol_hop(conn: &Connection, name: &str) -> Result<Option<CallPathHop>> {
+    let mut stmt =
+        conn.prepare("SELECT name, kind, file, line FROM symbols WHERE name = ?1 LIMIT 1")?;
+
+    let hop = stmt
+        .query_row(rusqlite::params![name], |row| {
+            let sym_name: String = row.get(0)?;
+            let kind_str: String = row.get(1)?;
+            let file: String = row.get(2)?;
+            let line: i64 = row.get(3)?;
+            Ok((sym_name, kind_str, file, line))
+        })
+        .optional()?;
+
+    match hop {
+        Some((sym_name, kind_str, file, line)) => {
+            let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
+            Ok(Some(CallPathHop {
+                symbol_name: sym_name,
+                symbol_kind: kind,
+                file,
+                line: line as usize,
+            }))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Clamp a requested depth to `MAX_DEPTH_CAP`, returning the capped value and
@@ -537,6 +663,122 @@ fn b() {
             names.contains(&"caller_b"),
             "caller_b should be a caller of helper"
         );
+    }
+
+    // -- callpath tests -------------------------------------------------------
+
+    #[test]
+    fn callpath_basic() {
+        // Chain: a -> b -> c. callpath("a", "c") should return [a, b, c].
+        let source = r#"
+fn a() {
+    b();
+}
+
+fn b() {
+    c();
+}
+
+fn c() { }
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        let path = callpath(&conn, "a", "c").unwrap();
+        assert!(path.is_some(), "should find a path from a to c");
+        let hops = path.unwrap();
+        assert_eq!(hops.len(), 3);
+        assert_eq!(hops[0].symbol_name, "a");
+        assert_eq!(hops[1].symbol_name, "b");
+        assert_eq!(hops[2].symbol_name, "c");
+    }
+
+    #[test]
+    fn callpath_direct() {
+        // a calls b directly. callpath("a", "b") should return [a, b].
+        let source = r#"
+fn a() {
+    b();
+}
+
+fn b() { }
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        let path = callpath(&conn, "a", "b").unwrap();
+        assert!(path.is_some());
+        let hops = path.unwrap();
+        assert_eq!(hops.len(), 2);
+        assert_eq!(hops[0].symbol_name, "a");
+        assert_eq!(hops[1].symbol_name, "b");
+    }
+
+    #[test]
+    fn callpath_no_path() {
+        // Disconnected functions, no path exists.
+        let source = r#"
+fn a() { }
+
+fn b() { }
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        let path = callpath(&conn, "a", "b").unwrap();
+        assert!(
+            path.is_none(),
+            "should return None for disconnected symbols"
+        );
+    }
+
+    #[test]
+    fn callpath_same_symbol() {
+        // callpath("a", "a") should return a single hop.
+        let source = "fn a() { }\n";
+        let (_dir, conn) = make_indexed_repo(source);
+        let path = callpath(&conn, "a", "a").unwrap();
+        assert!(path.is_some());
+        let hops = path.unwrap();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].symbol_name, "a");
+    }
+
+    #[test]
+    fn callpath_cycle_does_not_hang() {
+        // Mutual recursion: a -> b -> a. callpath("a", "c") should terminate and find no path.
+        let source = r#"
+fn a() {
+    b();
+}
+
+fn b() {
+    a();
+}
+
+fn c() { }
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        let path = callpath(&conn, "a", "c").unwrap();
+        assert!(path.is_none(), "should not find path through cycle");
+    }
+
+    #[test]
+    fn callpath_shortest_path() {
+        // a -> b -> c and a -> c directly. Should return shortest: [a, c].
+        let source = r#"
+fn a() {
+    b();
+    c();
+}
+
+fn b() {
+    c();
+}
+
+fn c() { }
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        let path = callpath(&conn, "a", "c").unwrap();
+        assert!(path.is_some());
+        let hops = path.unwrap();
+        assert_eq!(hops.len(), 2, "should find shortest path [a, c]");
+        assert_eq!(hops[0].symbol_name, "a");
+        assert_eq!(hops[1].symbol_name, "c");
     }
 
     #[test]
