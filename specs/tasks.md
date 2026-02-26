@@ -2505,7 +2505,7 @@ Implement `wonk callers <symbol>` and `wonk callees <symbol>` commands with tran
 **Related Requirements:** PRD-CGR-REQ-002 through PRD-CGR-REQ-008, PRD-CGR-REQ-011, PRD-CGR-REQ-012, PRD-CGR-REQ-013
 **Related Decisions:** DR-015, DR-021, DR-022
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
