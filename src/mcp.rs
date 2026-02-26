@@ -1029,7 +1029,7 @@ impl McpServer {
 
         if !crate::callgraph::has_caller_id_data(conn) {
             return Err(CallToolResult::error(
-                "index lacks call graph data; run wonk_update to re-index".into(),
+                "index lacks call graph data; run wonk_init to re-index".into(),
             ));
         }
 
@@ -1103,7 +1103,7 @@ impl McpServer {
 // ---------------------------------------------------------------------------
 
 /// Collect serializable outputs, applying optional token budget, and format the
-/// final `CallToolResult`. Shared by tool_show, tool_callers, and tool_callees.
+/// final `CallToolResult`. Shared by tool_callers and tool_callees.
 fn collect_with_budget<T: serde::Serialize>(
     outputs: Vec<T>,
     budget_limit: Option<usize>,
