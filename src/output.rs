@@ -218,6 +218,31 @@ impl From<&ShowResult> for ShowOutput {
     }
 }
 
+/// A caller of a symbol, for `wonk callers` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallerOutput {
+    pub caller_name: String,
+    pub caller_kind: String,
+    pub file: String,
+    pub line: usize,
+    pub signature: String,
+    pub depth: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_file: Option<String>,
+}
+
+/// A callee of a symbol, for `wonk callees` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalleeOutput {
+    pub callee_name: String,
+    pub file: String,
+    pub line: usize,
+    pub context: String,
+    pub depth: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+}
+
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
 /// output. In grep mode the summary goes to stderr instead.
 #[derive(Debug, Clone, Serialize)]
@@ -799,6 +824,60 @@ impl<W: Write> Formatter<W> {
                 writeln!(fmt.writer, "| {content}")?;
             }
             Ok(())
+        }
+    }
+
+    /// Format a single caller result.
+    pub fn format_caller(&mut self, out: &CallerOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_caller(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_caller(fmt, &out))
+    }
+
+    /// Shared render logic for a caller result.
+    fn render_caller<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &CallerOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&out.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(out.line)?;
+            fmt.write_sep()?;
+            writeln!(fmt.writer, "  {}", out.signature)
+        }
+    }
+
+    /// Format a single callee result.
+    pub fn format_callee(&mut self, out: &CalleeOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_callee(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_callee(fmt, &out))
+    }
+
+    /// Shared render logic for a callee result.
+    fn render_callee<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &CalleeOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&out.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(out.line)?;
+            fmt.write_sep()?;
+            writeln!(fmt.writer, "{}", out.context)
         }
     }
 }
@@ -2376,5 +2455,112 @@ mod tests {
         };
         let rendered = render(OutputFormat::Grep, |fmt| fmt.format_show(&out));
         assert_eq!(rendered, "   3| const MAX: usize = 1024;\n");
+    }
+
+    // -- CallerOutput --------------------------------------------------------
+
+    #[test]
+    fn caller_grep_format() {
+        let out = CallerOutput {
+            caller_name: "dispatch".into(),
+            caller_kind: "function".into(),
+            file: "src/router.rs".into(),
+            line: 50,
+            signature: "fn dispatch()".into(),
+            depth: 1,
+            target_file: None,
+        };
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_caller(&out));
+        assert!(rendered.contains("src/router.rs"));
+        assert!(rendered.contains("50"));
+        assert!(rendered.contains("fn dispatch()"));
+    }
+
+    #[test]
+    fn caller_json_format() {
+        let out = CallerOutput {
+            caller_name: "dispatch".into(),
+            caller_kind: "function".into(),
+            file: "src/router.rs".into(),
+            line: 50,
+            signature: "fn dispatch()".into(),
+            depth: 1,
+            target_file: Some("src/db.rs".into()),
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_caller(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["caller_name"], "dispatch");
+        assert_eq!(v["file"], "src/router.rs");
+        assert_eq!(v["line"], 50);
+        assert_eq!(v["depth"], 1);
+        assert_eq!(v["target_file"], "src/db.rs");
+    }
+
+    #[test]
+    fn caller_json_omits_null_target_file() {
+        let out = CallerOutput {
+            caller_name: "foo".into(),
+            caller_kind: "function".into(),
+            file: "a.rs".into(),
+            line: 1,
+            signature: "fn foo()".into(),
+            depth: 1,
+            target_file: None,
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_caller(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert!(v.get("target_file").is_none());
+    }
+
+    // -- CalleeOutput --------------------------------------------------------
+
+    #[test]
+    fn callee_grep_format() {
+        let out = CalleeOutput {
+            callee_name: "open_db".into(),
+            file: "src/db.rs".into(),
+            line: 10,
+            context: "    let conn = open_db(&path);".into(),
+            depth: 1,
+            source_file: None,
+        };
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_callee(&out));
+        assert!(rendered.contains("src/db.rs"));
+        assert!(rendered.contains("10"));
+        assert!(rendered.contains("open_db"));
+    }
+
+    #[test]
+    fn callee_json_format() {
+        let out = CalleeOutput {
+            callee_name: "open_db".into(),
+            file: "src/db.rs".into(),
+            line: 10,
+            context: "    let conn = open_db(&path);".into(),
+            depth: 1,
+            source_file: Some("src/router.rs".into()),
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_callee(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["callee_name"], "open_db");
+        assert_eq!(v["file"], "src/db.rs");
+        assert_eq!(v["line"], 10);
+        assert_eq!(v["depth"], 1);
+        assert_eq!(v["source_file"], "src/router.rs");
+    }
+
+    #[test]
+    fn callee_json_omits_null_source_file() {
+        let out = CalleeOutput {
+            callee_name: "bar".into(),
+            file: "b.rs".into(),
+            line: 5,
+            context: "bar()".into(),
+            depth: 1,
+            source_file: None,
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_callee(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert!(v.get("source_file").is_none());
     }
 }

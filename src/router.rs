@@ -18,8 +18,8 @@ use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
 use crate::output::{
-    self, BudgetStatus, Formatter, LsSymbolEntry, OutputFormat, RefOutput, SearchOutput,
-    SemanticOutput, ShowOutput, SignatureOutput, SymbolOutput,
+    self, BudgetStatus, CalleeOutput, CallerOutput, Formatter, LsSymbolEntry, OutputFormat,
+    RefOutput, SearchOutput, SemanticOutput, ShowOutput, SignatureOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -1049,8 +1049,115 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
+        Command::Callers(args) => {
+            let (conn, depth) = match callgraph_setup(args.depth, suppress) {
+                Some(pair) => pair,
+                None => return Ok(()),
+            };
+
+            let results = crate::callgraph::callers(&conn, &args.name, depth)?;
+
+            if results.is_empty() {
+                output::print_hint("no callers found", suppress);
+            }
+
+            let mut truncated = 0usize;
+            for cr in &results {
+                let out = CallerOutput {
+                    caller_name: cr.caller_name.clone(),
+                    caller_kind: cr.caller_kind.to_string(),
+                    file: cr.file.clone(),
+                    line: cr.line,
+                    signature: cr.signature.clone(),
+                    depth: cr.depth,
+                    target_file: cr.target_file.clone(),
+                };
+
+                if fmt.format_caller(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
+            }
+
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+        }
+        Command::Callees(args) => {
+            let (conn, depth) = match callgraph_setup(args.depth, suppress) {
+                Some(pair) => pair,
+                None => return Ok(()),
+            };
+
+            let results = crate::callgraph::callees(&conn, &args.name, depth)?;
+
+            if results.is_empty() {
+                output::print_hint("no callees found", suppress);
+            }
+
+            let mut truncated = 0usize;
+            for cr in &results {
+                let out = CalleeOutput {
+                    callee_name: cr.callee_name.clone(),
+                    file: cr.file.clone(),
+                    line: cr.line,
+                    context: cr.context.clone(),
+                    depth: cr.depth,
+                    source_file: cr.source_file.clone(),
+                };
+
+                if fmt.format_callee(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
+            }
+
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+        }
     }
     Ok(())
+}
+
+/// Shared setup for `Command::Callers` and `Command::Callees`: resolve repo
+/// root, open connection, check caller_id data, and clamp depth.
+/// Returns `None` when an early-exit error/hint was emitted.
+fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection, usize)> {
+    let repo_root = match std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+    {
+        Some(r) => r,
+        None => {
+            output::print_error("no repository root found");
+            return None;
+        }
+    };
+
+    let conn = match db::find_existing_index(&repo_root).and_then(|path| db::open(&path).ok()) {
+        Some(c) => c,
+        None => {
+            output::print_error("no index found; run `wonk init` to build the index");
+            return None;
+        }
+    };
+
+    if !crate::callgraph::has_caller_id_data(&conn) {
+        output::print_hint(
+            "index lacks call graph data; run `wonk update` to re-index",
+            suppress,
+        );
+        return None;
+    }
+
+    let (depth, clamped) = crate::callgraph::clamp_depth(requested_depth);
+    if clamped {
+        output::print_hint(
+            &format!(
+                "depth {} exceeds cap; using max depth {}",
+                requested_depth,
+                crate::callgraph::MAX_DEPTH_CAP
+            ),
+            suppress,
+        );
+    }
+
+    Some((conn, depth))
 }
 
 /// Returns `true` for commands that query the index and should trigger
@@ -1068,6 +1175,8 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Ask(_)
             | Command::Cluster(_)
             | Command::Impact(_)
+            | Command::Callers(_)
+            | Command::Callees(_)
     )
 }
 
@@ -4473,6 +4582,26 @@ mod tests {
         let cmd = Command::Impact(ImpactArgs {
             file: "src/main.rs".into(),
             since: Some("HEAD~3".into()),
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_callers() {
+        use crate::cli::CallersArgs;
+        let cmd = Command::Callers(CallersArgs {
+            name: "dispatch".into(),
+            depth: 1,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_callees() {
+        use crate::cli::CalleesArgs;
+        let cmd = Command::Callees(CalleesArgs {
+            name: "main".into(),
+            depth: 1,
         });
         assert!(is_query_command(&cmd));
     }

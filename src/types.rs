@@ -307,6 +307,43 @@ pub struct ShowResult {
     pub language: String,
 }
 
+/// A caller of a symbol, discovered via the call graph (caller_id references).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerResult {
+    /// Name of the calling function/method.
+    pub caller_name: String,
+    /// What kind of symbol the caller is.
+    pub caller_kind: SymbolKind,
+    /// File containing the caller definition.
+    pub file: String,
+    /// 1-based line number of the caller definition.
+    pub line: usize,
+    /// Signature of the calling function.
+    pub signature: String,
+    /// BFS depth at which this caller was discovered (1 = direct).
+    pub depth: usize,
+    /// File containing the specific definition that was called (when multiple
+    /// definitions exist). `None` when there is only one definition.
+    pub target_file: Option<String>,
+}
+
+/// A callee of a symbol, discovered via the call graph (caller_id references).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalleeResult {
+    /// Name of the called function/symbol.
+    pub callee_name: String,
+    /// File where the call site (reference) is located.
+    pub file: String,
+    /// 1-based line number of the call site.
+    pub line: usize,
+    /// Source context of the call site.
+    pub context: String,
+    /// BFS depth at which this callee was discovered (1 = direct).
+    pub depth: usize,
+    /// File of the parent function that makes this call.
+    pub source_file: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +490,72 @@ mod tests {
         };
         assert!(sr.end_line.is_none());
         assert!(sr.source.contains("MAX_SIZE"));
+    }
+
+    #[test]
+    fn caller_result_creation() {
+        let cr = CallerResult {
+            caller_name: "dispatch".into(),
+            caller_kind: SymbolKind::Function,
+            file: "src/router.rs".into(),
+            line: 50,
+            signature: "fn dispatch()".into(),
+            depth: 1,
+            target_file: Some("src/db.rs".into()),
+        };
+        assert_eq!(cr.caller_name, "dispatch");
+        assert_eq!(cr.caller_kind, SymbolKind::Function);
+        assert_eq!(cr.file, "src/router.rs");
+        assert_eq!(cr.line, 50);
+        assert_eq!(cr.signature, "fn dispatch()");
+        assert_eq!(cr.depth, 1);
+        assert_eq!(cr.target_file.as_deref(), Some("src/db.rs"));
+    }
+
+    #[test]
+    fn caller_result_equality_by_value() {
+        let a = CallerResult {
+            caller_name: "foo".into(),
+            caller_kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 1,
+            signature: "fn foo()".into(),
+            depth: 1,
+            target_file: None,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn callee_result_creation() {
+        let cr = CalleeResult {
+            callee_name: "open_db".into(),
+            file: "src/db.rs".into(),
+            line: 10,
+            context: "    let conn = open_db(&path);".into(),
+            depth: 1,
+            source_file: Some("src/router.rs".into()),
+        };
+        assert_eq!(cr.callee_name, "open_db");
+        assert_eq!(cr.file, "src/db.rs");
+        assert_eq!(cr.line, 10);
+        assert!(cr.context.contains("open_db"));
+        assert_eq!(cr.depth, 1);
+        assert_eq!(cr.source_file.as_deref(), Some("src/router.rs"));
+    }
+
+    #[test]
+    fn callee_result_equality_by_value() {
+        let a = CalleeResult {
+            callee_name: "bar".into(),
+            file: "b.rs".into(),
+            line: 5,
+            context: "bar()".into(),
+            depth: 2,
+            source_file: None,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
     }
 }

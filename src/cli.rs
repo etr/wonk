@@ -74,6 +74,12 @@ pub enum Command {
 
     /// Show full source body of a symbol
     Show(ShowArgs),
+
+    /// Find all callers of a symbol (functions whose bodies reference it)
+    Callers(CallersArgs),
+
+    /// Find all callees of a symbol (symbols referenced within its body)
+    Callees(CalleesArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -257,6 +263,26 @@ pub struct ShowArgs {
     /// mode: signature + child signatures without bodies
     #[arg(long)]
     pub shallow: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CallersArgs {
+    /// Symbol name to find callers for
+    pub name: String,
+
+    /// Transitive expansion depth (default: 1 = direct callers only, max: 10)
+    #[arg(long, default_value_t = 1)]
+    pub depth: usize,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CalleesArgs {
+    /// Symbol name to find callees for
+    pub name: String,
+
+    /// Transitive expansion depth (default: 1 = direct callees only, max: 10)
+    #[arg(long, default_value_t = 1)]
+    pub depth: usize,
 }
 
 #[derive(clap::Args, Debug)]
@@ -537,6 +563,92 @@ mod tests {
                 assert_eq!(args.path, "src/auth/");
             }
             _ => panic!("expected Command::Cluster"),
+        }
+    }
+
+    // -- Callers/Callees tests -----------------------------------------------
+
+    #[test]
+    fn parse_callers_basic() {
+        let cli = Cli::try_parse_from(["wonk", "callers", "dispatch"]).unwrap();
+        match cli.command {
+            Command::Callers(args) => {
+                assert_eq!(args.name, "dispatch");
+                assert_eq!(args.depth, 1);
+            }
+            _ => panic!("expected Command::Callers"),
+        }
+    }
+
+    #[test]
+    fn parse_callers_with_depth() {
+        let cli = Cli::try_parse_from(["wonk", "callers", "--depth", "3", "dispatch"]).unwrap();
+        match cli.command {
+            Command::Callers(args) => {
+                assert_eq!(args.name, "dispatch");
+                assert_eq!(args.depth, 3);
+            }
+            _ => panic!("expected Command::Callers"),
+        }
+    }
+
+    #[test]
+    fn parse_callers_requires_name() {
+        let result = Cli::try_parse_from(["wonk", "callers"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_callees_basic() {
+        let cli = Cli::try_parse_from(["wonk", "callees", "main"]).unwrap();
+        match cli.command {
+            Command::Callees(args) => {
+                assert_eq!(args.name, "main");
+                assert_eq!(args.depth, 1);
+            }
+            _ => panic!("expected Command::Callees"),
+        }
+    }
+
+    #[test]
+    fn parse_callees_with_depth() {
+        let cli = Cli::try_parse_from(["wonk", "callees", "--depth", "5", "main"]).unwrap();
+        match cli.command {
+            Command::Callees(args) => {
+                assert_eq!(args.name, "main");
+                assert_eq!(args.depth, 5);
+            }
+            _ => panic!("expected Command::Callees"),
+        }
+    }
+
+    #[test]
+    fn parse_callees_requires_name() {
+        let result = Cli::try_parse_from(["wonk", "callees"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_callers_with_global_json() {
+        let cli = Cli::try_parse_from(["wonk", "--format", "json", "callers", "dispatch"]).unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Callers(args) => {
+                assert_eq!(args.name, "dispatch");
+            }
+            _ => panic!("expected Command::Callers"),
+        }
+    }
+
+    #[test]
+    fn parse_callers_with_global_budget() {
+        let cli = Cli::try_parse_from(["wonk", "--budget", "500", "callers", "dispatch"]).unwrap();
+        assert_eq!(cli.budget, Some(500));
+        match cli.command {
+            Command::Callers(args) => {
+                assert_eq!(args.name, "dispatch");
+            }
+            _ => panic!("expected Command::Callers"),
         }
     }
 }
