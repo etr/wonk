@@ -1012,7 +1012,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 match db::find_existing_index(&repo_root).and_then(|path| db::open(&path).ok()) {
                     Some(c) => c,
                     None => {
-                        output::print_error("no index found; run `wonk init` to build the index");
+                        output::print_hint(
+                            "no index found; run `wonk init` to build the index",
+                            suppress,
+                        );
                         return Ok(());
                     }
                 };
@@ -1021,12 +1024,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 file: args.file,
                 kind: args.kind,
                 exact: args.exact,
+                suppress,
             };
 
             let results = crate::show::show_symbol(&conn, &args.name, &repo_root, &options)?;
 
             if results.is_empty() {
-                output::print_hint("no symbols found", suppress);
+                output::print_hint(
+                    "no symbols found; try a broader query or omit --exact",
+                    suppress,
+                );
             }
 
             let mut truncated = 0usize;
@@ -1071,7 +1078,6 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Ask(_)
             | Command::Cluster(_)
             | Command::Impact(_)
-            | Command::Show(_)
     )
 }
 

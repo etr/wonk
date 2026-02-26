@@ -2384,18 +2384,18 @@ Wire enclosing function detection into the full index build (`wonk init`/`wonk u
 Implement the core `wonk show <name>` command that looks up symbols in the index, reads their source spans from source files, and formats output with line numbers.
 
 **Action Items:**
-- [ ] Create `show.rs` module with `show_symbol(db, name, options) -> Vec<ShowResult>` function
-- [ ] Add `show` subcommand to CLI with args: `<name>` (required), `--file <path>`, `--kind <kind>`, `--exact`, `--format` (grep|json|toon)
-- [ ] Query symbols table for matching name (substring by default, exact with --exact)
-- [ ] Filter by --file (file path prefix match) and --kind (symbol kind filter)
-- [ ] For each match: read source file lines from `line` to `end_line`, prefix each with 1-based line number (PRD-SHOW-REQ-008)
-- [ ] Multiple matches: display all, each preceded by file header `file:start_line-end_line` (PRD-SHOW-REQ-002)
-- [ ] No end_line fallback: display signature text from index (PRD-SHOW-REQ-010)
-- [ ] Missing source file: skip result, emit warning to stderr (PRD-SHOW-REQ-011)
-- [ ] No index fallback: return error directing user to `wonk init` (PRD-SHOW-REQ-009)
-- [ ] Define `ShowResult` in types.rs: name, kind, file, line, end_line, source, language (PRD-SHOW-REQ-012)
-- [ ] JSON/TOON output includes all ShowResult fields
-- [ ] Wire to CLI dispatch
+- [x] Create `show.rs` module with `show_symbol(db, name, options) -> Vec<ShowResult>` function
+- [x] Add `show` subcommand to CLI with args: `<name>` (required), `--file <path>`, `--kind <kind>`, `--exact`, `--format` (grep|json|toon)
+- [x] Query symbols table for matching name (substring by default, exact with --exact)
+- [x] Filter by --file (file path prefix match) and --kind (symbol kind filter)
+- [x] For each match: read source file lines from `line` to `end_line`, prefix each with 1-based line number (PRD-SHOW-REQ-008)
+- [x] Multiple matches: display all, each preceded by file header `file:start_line-end_line` (PRD-SHOW-REQ-002)
+- [x] No end_line fallback: display signature text from index (PRD-SHOW-REQ-010)
+- [x] Missing source file: skip result, emit warning to stderr (PRD-SHOW-REQ-011)
+- [x] No index fallback: return error directing user to `wonk init` (PRD-SHOW-REQ-009)
+- [x] Define `ShowResult` in types.rs: name, kind, file, line, end_line, source, language (PRD-SHOW-REQ-012)
+- [x] JSON/TOON output includes all ShowResult fields
+- [x] Wire to CLI dispatch
 
 **Dependencies:**
 - Blocked by: None
@@ -2417,7 +2417,7 @@ Implement the core `wonk show <name>` command that looks up symbols in the index
 **Related Requirements:** PRD-SHOW-REQ-001 through PRD-SHOW-REQ-005, PRD-SHOW-REQ-008 through PRD-SHOW-REQ-012 (PRD-SHOW-REQ-006, REQ-007, REQ-013 covered by TASK-060)
 **Related Decisions:** DR-017, DR-022
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 

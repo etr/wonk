@@ -780,8 +780,8 @@ impl<W: Write> Formatter<W> {
             // Grep mode: number each source line starting from `out.line`.
             for (i, content) in out.source.lines().enumerate() {
                 let line_no = out.line + i;
-                write!(fmt.writer, "{:>4}| ", line_no)?;
-                writeln!(fmt.writer, "{content}")?;
+                fmt.write_line_no(format_args!("{line_no:>4}"))?;
+                writeln!(fmt.writer, "| {content}")?;
             }
             Ok(())
         }
@@ -2291,6 +2291,24 @@ mod tests {
         assert!(rendered.contains("  10| function processPayment()"));
         assert!(rendered.contains("  11|   return true;"));
         assert!(rendered.contains("  12| }"));
+    }
+
+    #[test]
+    fn show_grep_colorized_line_numbers() {
+        let out = ShowOutput {
+            name: "foo".into(),
+            kind: "function".into(),
+            file: "src/lib.rs".into(),
+            line: 5,
+            end_line: Some(5),
+            source: "fn foo() {}".into(),
+            language: "Rust".into(),
+        };
+        let rendered = render_color(|fmt| fmt.format_show(&out));
+        assert!(
+            rendered.contains(crate::color::LINE_NO),
+            "expected colorized line number in show output, got: {rendered:?}"
+        );
     }
 
     #[test]
