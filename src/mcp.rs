@@ -909,7 +909,7 @@ impl McpServer {
         let results = match crate::show::show_symbol(conn, &name, self.router.repo_root(), &options)
         {
             Ok(r) => r,
-            Err(_) => return CallToolResult::error("show query failed".into()),
+            Err(e) => return CallToolResult::error(format!("show query failed: {e}")),
         };
 
         let mut budget = budget_limit.map(TokenBudget::new);
@@ -1210,6 +1210,46 @@ mod tests {
             text.contains("no index") || text.contains("[]"),
             "expected 'no index' error or empty results, got: {text}"
         );
+    }
+
+    #[test]
+    fn tool_show_budget_truncates() {
+        use crate::pipeline;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "fn alpha() {\n    1\n}\nfn beta() {\n    2\n}\nfn gamma() {\n    3\n}\n",
+        )
+        .unwrap();
+
+        pipeline::build_index(root, true).unwrap();
+        let server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+        };
+
+        // Budget of 1 token (~4 chars) should truncate most results.
+        let params = serde_json::json!({
+            "name": "wonk_show",
+            "arguments": {"name": "a", "budget": 1, "format": "json"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap_or_default();
+
+        // With a tiny budget, the response should be a wrapper with truncation metadata.
+        if parsed.get("truncated").is_some() {
+            assert!(parsed["truncated"].as_u64().unwrap() > 0);
+            assert!(parsed["budget_limit"].as_u64().unwrap() == 1);
+        } else {
+            // If only one result fits, it's returned as a plain array — that's fine too.
+            let arr = parsed.as_array().unwrap();
+            assert!(arr.len() <= 1, "with budget=1, at most 1 result should fit");
+        }
     }
 
     #[test]

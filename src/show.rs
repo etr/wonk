@@ -94,6 +94,15 @@ pub fn show_symbol(
 
     let mut results = Vec::new();
 
+    // Prepare child-signature statement once outside the loop to avoid N+1 prepare calls.
+    let mut child_stmt = if options.shallow {
+        Some(conn.prepare(
+            "SELECT signature FROM symbols WHERE scope = ?1 AND file = ?2 ORDER BY line",
+        )?)
+    } else {
+        None
+    };
+
     for (sym_name, kind_str, file, line, end_line, signature, language) in rows {
         let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
         let line = line as usize;
@@ -101,7 +110,8 @@ pub fn show_symbol(
 
         // Shallow mode for container types: show container signature + child signatures.
         if options.shallow && kind.is_container() {
-            let child_sigs = query_child_signatures(conn, &sym_name, &file)?;
+            let child_sigs =
+                query_child_signatures_with_stmt(child_stmt.as_mut().unwrap(), &sym_name, &file)?;
             let source = if child_sigs.is_empty() {
                 signature.clone()
             } else {
@@ -169,13 +179,15 @@ pub fn show_symbol(
     Ok(results)
 }
 
-/// Query child symbol signatures for a container (class/struct/enum/trait/interface).
+/// Query child symbol signatures using a pre-prepared statement.
 ///
 /// Returns signatures of symbols whose `scope` matches the parent name and
 /// that reside in the same file, ordered by line number.
-fn query_child_signatures(conn: &Connection, parent_name: &str, file: &str) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT signature FROM symbols WHERE scope = ?1 AND file = ?2 ORDER BY line")?;
+fn query_child_signatures_with_stmt(
+    stmt: &mut rusqlite::Statement<'_>,
+    parent_name: &str,
+    file: &str,
+) -> Result<Vec<String>> {
     let sigs = stmt
         .query_map(rusqlite::params![parent_name, file], |row| {
             row.get::<_, String>(0)
