@@ -91,6 +91,9 @@ pub struct RefOutput {
     pub line: usize,
     pub col: usize,
     pub context: String,
+    /// Name of the enclosing function/method (from call graph).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_name: Option<String>,
 }
 
 /// A function/method signature result.
@@ -988,6 +991,7 @@ mod tests {
             line: 99,
             col: 4,
             context: "    foo(42);".into(),
+            caller_name: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_reference(&reference));
         assert_eq!(out, "src/lib.rs:99:    foo(42);\n");
@@ -1002,6 +1006,7 @@ mod tests {
             line: 99,
             col: 4,
             context: "    foo(42);".into(),
+            caller_name: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_reference(&reference));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -1932,6 +1937,7 @@ mod tests {
             line: 99,
             col: 4,
             context: "    foo(42);".into(),
+            caller_name: None,
         };
         let out = render(OutputFormat::Toon, |fmt| fmt.format_reference(&reference));
         let parsed: RefOutput = serde_toon2::from_str(out.trim()).unwrap();

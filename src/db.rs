@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS "references" (
     file TEXT NOT NULL,
     line INTEGER NOT NULL,
     col INTEGER NOT NULL,
-    context TEXT
+    context TEXT,
+    caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -59,6 +60,7 @@ CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_references_name ON "references"(name);
 CREATE INDEX IF NOT EXISTS idx_references_file ON "references"(file);
+CREATE INDEX IF NOT EXISTS idx_references_caller ON "references"(caller_id);
 
 -- File-level import tracking for dependency graph
 CREATE TABLE IF NOT EXISTS file_imports (
@@ -167,6 +169,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating FTS5 virtual table")?;
     conn.execute_batch(TRIGGERS_SQL)
         .context("creating FTS5 sync triggers")?;
+    ensure_caller_id_column(conn)?;
     Ok(())
 }
 
@@ -178,6 +181,34 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 pub fn ensure_embeddings_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(EMBEDDINGS_SQL)
         .context("creating embeddings table (migration)")?;
+    Ok(())
+}
+
+/// Ensure the `caller_id` column exists on the `references` table.
+///
+/// Handles schema migration for pre-V3 indexes that lack the call graph
+/// FK.  Uses `PRAGMA table_info` to check before altering.
+pub fn ensure_caller_id_column(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("PRAGMA table_info(\"references\")")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "caller_id");
+
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE \"references\" ADD COLUMN caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL;",
+        )
+        .context("adding caller_id column to references table")?;
+
+        // New databases already have this index via SCHEMA_SQL; only needed
+        // for the ALTER TABLE migration path.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_references_caller ON \"references\"(caller_id);",
+        )
+        .context("creating caller_id index")?;
+    }
+
     Ok(())
 }
 
@@ -1027,5 +1058,193 @@ mod tests {
         let conn = open(&db_path).unwrap();
 
         assert!(!file_exists_in_index(&conn, "src/nonexistent.ts").unwrap());
+    }
+
+    // -- caller_id column tests -----------------------------------------------
+
+    #[test]
+    fn test_new_db_has_caller_id_column() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(\"references\")")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(columns.contains(&"caller_id".to_string()));
+    }
+
+    #[test]
+    fn test_caller_id_index_exists() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_references_caller'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(indexes.len(), 1);
+    }
+
+    #[test]
+    fn test_caller_id_nullable() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        // Insert without caller_id — should default to NULL.
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["foo", "a.rs", 1, 0, "foo()"],
+        )
+        .unwrap();
+
+        let caller_id: Option<i64> = conn
+            .query_row(
+                "SELECT caller_id FROM \"references\" WHERE name = 'foo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(caller_id.is_none());
+    }
+
+    #[test]
+    fn test_caller_id_with_valid_fk() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'main', 'function', 'a.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context, caller_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["foo", "a.rs", 5, 4, "foo()", 1i64],
+        )
+        .unwrap();
+
+        let caller_id: Option<i64> = conn
+            .query_row(
+                "SELECT caller_id FROM \"references\" WHERE name = 'foo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(caller_id, Some(1));
+    }
+
+    #[test]
+    fn test_caller_id_on_delete_set_null() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'main', 'function', 'a.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context, caller_id) VALUES ('foo', 'a.rs', 5, 4, 'foo()', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Delete the symbol — FK should SET NULL.
+        conn.execute("DELETE FROM symbols WHERE id = 1", [])
+            .unwrap();
+
+        let caller_id: Option<i64> = conn
+            .query_row(
+                "SELECT caller_id FROM \"references\" WHERE name = 'foo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(caller_id.is_none());
+    }
+
+    #[test]
+    fn test_ensure_caller_id_migration_on_v2_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // Simulate a V2 database: base schema + embeddings but no caller_id.
+        // Use the old schema SQL without caller_id.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS symbols (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER NOT NULL,
+                end_line INTEGER,
+                scope TEXT,
+                signature TEXT,
+                language TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS "references" (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER NOT NULL,
+                context TEXT
+            );
+            "#,
+        )
+        .unwrap();
+
+        // caller_id should NOT exist yet.
+        let has_caller_id: bool = conn
+            .prepare("PRAGMA table_info(\"references\")")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|name| name == "caller_id");
+        assert!(!has_caller_id);
+
+        // Run migration.
+        ensure_caller_id_column(&conn).unwrap();
+
+        let has_caller_id: bool = conn
+            .prepare("PRAGMA table_info(\"references\")")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|name| name == "caller_id");
+        assert!(has_caller_id);
+    }
+
+    #[test]
+    fn test_ensure_caller_id_column_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        // Column already exists via open(). Calling again should not fail.
+        ensure_caller_id_column(&conn).unwrap();
+        ensure_caller_id_column(&conn).unwrap();
     }
 }

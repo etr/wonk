@@ -122,6 +122,9 @@ pub struct Reference {
     pub col: usize,
     /// Full source line for display context.
     pub context: String,
+    /// Name of the enclosing function/method for call-site references.
+    /// `None` for file-scope calls, type refs, and import refs.
+    pub caller_name: Option<String>,
 }
 
 /// Import and export data for a single file.

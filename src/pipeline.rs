@@ -11,7 +11,7 @@
 //! file watcher: [`reindex_file`], [`remove_file`], [`index_new_file`],
 //! and [`process_events`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -415,7 +415,8 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         ],
     )?;
 
-    // Insert new symbols.
+    // Insert new symbols and build a name -> id map for caller_id resolution.
+    let mut caller_map: HashMap<&str, i64> = HashMap::new();
     {
         let mut stmt = tx.prepare(
             "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language) \
@@ -433,22 +434,28 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
                 sym.signature,
                 sym.language,
             ])?;
+            caller_map.insert(&sym.name, tx.last_insert_rowid());
         }
     }
 
-    // Insert new references.
+    // Insert new references, resolving caller_name to caller_id.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO \"references\" (name, file, line, col, context) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO \"references\" (name, file, line, col, context, caller_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for reference in &result.refs {
+            let caller_id = reference
+                .caller_name
+                .as_deref()
+                .and_then(|name| caller_map.get(name).copied());
             stmt.execute(rusqlite::params![
                 reference.name,
                 reference.file,
                 reference.line as i64,
                 reference.col as i64,
                 reference.context,
+                caller_id,
             ])?;
         }
     }
@@ -547,13 +554,15 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
         }
     }
 
-    // Insert symbols.
+    // Insert symbols and build per-file name -> id maps for caller_id resolution.
+    let mut file_caller_maps: HashMap<&str, HashMap<&str, i64>> = HashMap::new();
     {
         let mut stmt = tx.prepare(
             "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         for r in results {
+            let file_map = file_caller_maps.entry(&r.rel_path).or_default();
             for sym in &r.symbols {
                 stmt.execute(rusqlite::params![
                     sym.name,
@@ -566,25 +575,32 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
                     sym.signature,
                     sym.language,
                 ])?;
+                file_map.insert(&sym.name, tx.last_insert_rowid());
                 total_syms += 1;
             }
         }
     }
 
-    // Insert references.
+    // Insert references, resolving caller_name to caller_id.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO \"references\" (name, file, line, col, context) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO \"references\" (name, file, line, col, context, caller_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for r in results {
+            let file_map = file_caller_maps.get(r.rel_path.as_str());
             for reference in &r.refs {
+                let caller_id = reference
+                    .caller_name
+                    .as_deref()
+                    .and_then(|name| file_map?.get(name).copied());
                 stmt.execute(rusqlite::params![
                     reference.name,
                     reference.file,
                     reference.line as i64,
                     reference.col as i64,
                     reference.context,
+                    caller_id,
                 ])?;
                 total_refs += 1;
             }

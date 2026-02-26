@@ -647,6 +647,7 @@ impl McpServer {
                 line: r.line,
                 col: r.col,
                 context: r.context.clone(),
+                caller_name: r.caller_name.clone(),
             })
             .collect();
 

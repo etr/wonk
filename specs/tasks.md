@@ -32,7 +32,7 @@
 | M12 | Semantic Blending & Dependency Scoping | 3 | Complete |
 | M13 | Semantic Clustering (`wonk cluster`) | 2 | Complete |
 | M14 | Change Impact Analysis (`wonk impact`) | 2 | Complete |
-| M15 | Call Graph Data Model & Indexing | 2 | Not Started |
+| M15 | Call Graph Data Model & Indexing | 2 | In Progress |
 | M16 | Source Display (`wonk show`) | 2 | Not Started |
 | M17 | Call Graph Commands | 2 | Not Started |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Not Started |
@@ -2302,13 +2302,13 @@ Implement `wonk impact <file>` that finds semantically similar code that might b
 Add `caller_id` column to the references table and implement Tree-sitter parent traversal to detect the enclosing function for each call-site reference.
 
 **Action Items:**
-- [ ] Add `caller_id INTEGER REFERENCES symbols(id)` column to `references` table (nullable for file-scope calls)
-- [ ] Add index on `caller_id` for efficient JOIN queries (DR-015)
-- [ ] Handle schema migration: detect existing indexes without caller_id, add column via ALTER TABLE
-- [ ] Implement enclosing symbol detection (DR-021): when a call-site node is encountered during Tree-sitter parsing, walk `node.parent()` to find the nearest enclosing function/method node
-- [ ] Map enclosing node to its `symbols.id` (match by file, name, line range)
-- [ ] Set `caller_id = NULL` for file-scope calls (no enclosing function) — treated as `<module>` at query time (PRD-CGR-REQ-002)
-- [ ] Support all 11 languages for enclosing function detection
+- [x] Add `caller_id INTEGER REFERENCES symbols(id)` column to `references` table (nullable for file-scope calls)
+- [x] Add index on `caller_id` for efficient JOIN queries (DR-015)
+- [x] Handle schema migration: detect existing indexes without caller_id, add column via ALTER TABLE
+- [x] Implement enclosing symbol detection (DR-021): when a call-site node is encountered during Tree-sitter parsing, walk `node.parent()` to find the nearest enclosing function/method node
+- [x] Map enclosing node to its `symbols.id` (match by file, name, line range)
+- [x] Set `caller_id = NULL` for file-scope calls (no enclosing function) — treated as `<module>` at query time (PRD-CGR-REQ-002)
+- [x] Support all 11 languages for enclosing function detection
 
 **Dependencies:**
 - Blocked by: None
@@ -2327,7 +2327,7 @@ Add `caller_id` column to the references table and implement Tree-sitter parent 
 **Related Requirements:** PRD-CGR-REQ-001, PRD-CGR-REQ-002
 **Related Decisions:** DR-015, DR-021
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
@@ -2341,10 +2341,10 @@ Add `caller_id` column to the references table and implement Tree-sitter parent 
 Wire enclosing function detection into the full index build (`wonk init`/`wonk update`) and daemon incremental re-indexing so caller_id is populated on all reference rows.
 
 **Action Items:**
-- [ ] During full index build (pipeline.rs), after extracting references for each file, resolve enclosing functions and set caller_id on each reference row
-- [ ] Use two-pass approach within each file: first extract symbols (to get their IDs), then extract references with caller_id resolution
-- [ ] During daemon incremental re-indexing, populate caller_id on new reference rows using the same logic
-- [ ] For `wonk update` on existing indexes: full rebuild includes caller_id population
+- [x] During full index build (pipeline.rs), after extracting references for each file, resolve enclosing functions and set caller_id on each reference row
+- [x] Use two-pass approach within each file: first extract symbols (to get their IDs), then extract references with caller_id resolution
+- [x] During daemon incremental re-indexing, populate caller_id on new reference rows using the same logic
+- [x] For `wonk update` on existing indexes: full rebuild includes caller_id population
 - [ ] When indexes lack caller_id data, call graph queries should return empty results with a hint to re-index
 - [ ] Log caller_id population stats during init (e.g., "Populated N caller relationships")
 
@@ -2365,7 +2365,7 @@ Wire enclosing function detection into the full index build (`wonk init`/`wonk u
 **Related Requirements:** PRD-CGR-REQ-001
 **Related Decisions:** DR-015, DR-021
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
@@ -3151,3 +3151,4 @@ Tasks identified but not yet scheduled:
 | 2026-02-13 | Added V2 semantic search milestones (M9-M14, TASK-038 to TASK-056). 19 tasks across 6 milestones: Embedding Infrastructure, Semantic Search, Daemon Embedding & Lifecycle, Semantic Blending & Dependency Scoping, Semantic Clustering, Change Impact Analysis. Total tasks: 56 across 14 milestones. | TBD |
 | 2026-02-24 | Added V3 milestones (M15-M18, TASK-057 to TASK-064). 8 tasks across 4 milestones: Call Graph Data Model & Indexing, Source Display, Call Graph Commands, Code Summary Engine. Marked M11/M12 as Complete. Updated parking lot. Total tasks: 64 across 18 milestones. | TBD |
 | 2026-02-25 | Added V4 milestones (M19-M25, TASK-065 to TASK-074). 10 tasks across 7 milestones: Edge Confidence & Inheritance Infrastructure, Hybrid Search Fusion (RRF), Execution Flow Detection, Blast Radius Analysis, Scoped Change Detection, Unified Symbol Context, Multi-Repo MCP. Total tasks: 74 across 25 milestones. | TBD |
+| 2026-02-25 | TASK-057 Complete, TASK-058 In Progress. caller_id column + migration + enclosing function detection implemented. Pipeline now resolves caller_name to caller_id FK in both batch_insert and upsert_file_data. Router query_references_db JOINs on caller_id. RefOutput includes caller_name for MCP/JSON consumers. M15 marked In Progress. | TBD |

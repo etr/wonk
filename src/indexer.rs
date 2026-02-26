@@ -1469,7 +1469,8 @@ fn walk_refs(
     let kind = node.kind();
 
     // Check for call expressions
-    if let Some(r) = match_call_ref(node, kind, src, file, lang, source_lines) {
+    if let Some(mut r) = match_call_ref(node, kind, src, file, lang, source_lines) {
+        r.caller_name = find_enclosing_function(node, src, lang);
         refs.push(r);
     }
 
@@ -1512,7 +1513,84 @@ fn make_ref(
         line: row + 1,
         col: node.start_position().column,
         context: get_context_line(source_lines, row),
+        caller_name: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Enclosing function detection (for call graph caller_name)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the tree-sitter node kind represents a function or method
+/// definition in the given language.
+fn is_function_node(kind: &str, lang: Lang) -> bool {
+    match lang {
+        Lang::Rust => kind == "function_item",
+        Lang::Python => kind == "function_definition",
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => matches!(
+            kind,
+            "function_declaration"
+                | "generator_function_declaration"
+                | "method_definition"
+                | "arrow_function"
+        ),
+        Lang::Go => matches!(kind, "function_declaration" | "method_declaration"),
+        Lang::Java => matches!(kind, "method_declaration" | "constructor_declaration"),
+        Lang::C | Lang::Cpp => kind == "function_definition",
+        Lang::Ruby => matches!(kind, "method" | "singleton_method"),
+        Lang::Php => matches!(kind, "function_definition" | "method_declaration"),
+        Lang::CSharp => matches!(kind, "method_declaration" | "constructor_declaration"),
+    }
+}
+
+/// Extract the function/method name from a function node.
+///
+/// Uses `child_by_field_name("name")` for most languages.  For JS/TS
+/// `arrow_function`, walks the parent to find a `variable_declarator` name.
+/// Returns `None` for anonymous functions.
+fn function_name_from_node(node: Node, src: &[u8], lang: Lang) -> Option<String> {
+    let kind = node.kind();
+
+    // Arrow functions don't have a "name" field — look at the parent for
+    // `variable_declarator` (e.g. `const foo = () => { ... }`).
+    if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx) && kind == "arrow_function" {
+        let parent = node.parent()?;
+        if parent.kind() == "variable_declarator" {
+            let name_node = parent.child_by_field_name("name")?;
+            let name = name_node.utf8_text(src).ok()?;
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        return None;
+    }
+
+    // C/C++ function_definition uses a `declarator` field (which may be
+    // nested: pointer_declarator → function_declarator → identifier).
+    if matches!(lang, Lang::C | Lang::Cpp) && kind == "function_definition" {
+        let declarator = node.child_by_field_name("declarator")?;
+        return find_identifier_in_declarator(declarator, src).map(|s| s.to_string());
+    }
+
+    let name_node = node.child_by_field_name("name")?;
+    let name = name_node.utf8_text(src).ok()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Walk `node.parent()` upward until a function/method node is found, then
+/// return its name.  Returns `None` for file-scope calls.
+fn find_enclosing_function(node: Node, src: &[u8], lang: Lang) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if is_function_node(parent.kind(), lang) {
+            return function_name_from_node(parent, src, lang);
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3774,6 +3852,146 @@ mod tests {
         assert!(fi.imports.iter().any(|i| i == "System"));
         assert!(fi.imports.iter().any(|i| i == "System.Linq"));
     }
+
+    // ======================================================================
+    // Enclosing function detection tests
+    // ======================================================================
+
+    /// Helper: parse source, find first call reference, return its caller_name.
+    fn caller_of_first_call(lang: Lang, source: &str) -> Option<String> {
+        let refs = refs_from(lang, source);
+        refs.into_iter()
+            .find(|r| r.kind == ReferenceKind::Call)
+            .and_then(|r| r.caller_name)
+    }
+
+    #[test]
+    fn enclosing_rust() {
+        let src = "fn outer() {\n    inner();\n}";
+        assert_eq!(caller_of_first_call(Lang::Rust, src), Some("outer".into()));
+    }
+
+    #[test]
+    fn enclosing_python() {
+        let src = "def outer():\n    inner()\n";
+        assert_eq!(
+            caller_of_first_call(Lang::Python, src),
+            Some("outer".into())
+        );
+    }
+
+    #[test]
+    fn enclosing_javascript() {
+        let src = "function outer() {\n    inner();\n}";
+        assert_eq!(
+            caller_of_first_call(Lang::JavaScript, src),
+            Some("outer".into())
+        );
+    }
+
+    #[test]
+    fn enclosing_typescript() {
+        let src = "function outer() {\n    inner();\n}";
+        assert_eq!(
+            caller_of_first_call(Lang::TypeScript, src),
+            Some("outer".into())
+        );
+    }
+
+    #[test]
+    fn enclosing_tsx() {
+        let src = "function Component() {\n    helper();\n    return null;\n}";
+        assert_eq!(
+            caller_of_first_call(Lang::Tsx, src),
+            Some("Component".into())
+        );
+    }
+
+    #[test]
+    fn enclosing_go() {
+        let src = "package main\n\nfunc outer() {\n    inner()\n}\n";
+        assert_eq!(caller_of_first_call(Lang::Go, src), Some("outer".into()));
+    }
+
+    #[test]
+    fn enclosing_java() {
+        let src = "class Foo {\n    void outer() {\n        inner();\n    }\n}";
+        assert_eq!(caller_of_first_call(Lang::Java, src), Some("outer".into()));
+    }
+
+    #[test]
+    fn enclosing_c() {
+        let src = "void outer() {\n    inner();\n}";
+        assert_eq!(caller_of_first_call(Lang::C, src), Some("outer".into()));
+    }
+
+    #[test]
+    fn enclosing_cpp() {
+        let src = "void outer() {\n    inner();\n}";
+        assert_eq!(caller_of_first_call(Lang::Cpp, src), Some("outer".into()));
+    }
+
+    #[test]
+    fn enclosing_ruby() {
+        let src = "def outer\n  inner()\nend\n";
+        assert_eq!(caller_of_first_call(Lang::Ruby, src), Some("outer".into()));
+    }
+
+    #[test]
+    fn enclosing_php() {
+        let src = "<?php\nfunction outer() {\n    inner();\n}\n?>";
+        assert_eq!(caller_of_first_call(Lang::Php, src), Some("outer".into()));
+    }
+
+    #[test]
+    fn enclosing_csharp() {
+        let src = "class Foo {\n    void Outer() {\n        Inner();\n    }\n}";
+        assert_eq!(
+            caller_of_first_call(Lang::CSharp, src),
+            Some("Outer".into())
+        );
+    }
+
+    #[test]
+    fn enclosing_file_scope_returns_none() {
+        // Call at file scope (no enclosing function).
+        let src = "foo();";
+        assert_eq!(caller_of_first_call(Lang::JavaScript, src), None);
+    }
+
+    #[test]
+    fn enclosing_nested_finds_innermost() {
+        let src = "function outer() {\n    function inner() {\n        target();\n    }\n}";
+        assert_eq!(
+            caller_of_first_call(Lang::JavaScript, src),
+            Some("inner".into())
+        );
+    }
+
+    #[test]
+    fn enclosing_js_arrow_function() {
+        let src = "const handler = () => {\n    doWork();\n};";
+        assert_eq!(
+            caller_of_first_call(Lang::JavaScript, src),
+            Some("handler".into())
+        );
+    }
+
+    #[test]
+    fn enclosing_type_ref_has_no_caller() {
+        // Type references should NOT get caller_name (only call refs do).
+        let src = "fn process(x: MyType) {}";
+        let refs = refs_from(Lang::Rust, src);
+        let type_ref = refs
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Type)
+            .expect("should find a type reference for MyType");
+        assert!(type_ref.caller_name.is_none());
+    }
+
+    // ======================================================================
+    // Debug tree helpers (ignored by default)
+    // ======================================================================
 
     /// Debug helper: print the tree structure to understand node kinds.
     #[allow(dead_code)]

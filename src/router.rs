@@ -274,6 +274,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     line: r.line,
                     col: r.col,
                     context: r.context.clone(),
+                    caller_name: r.caller_name.clone(),
                 };
                 if fmt.format_reference(&out)? == BudgetStatus::Skipped {
                     truncated += 1;
@@ -1659,6 +1660,7 @@ impl QueryRouter {
                     line: r.line as usize,
                     col: r.col as usize,
                     context: r.content.clone(),
+                    caller_name: None,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -1887,7 +1889,10 @@ fn query_symbols_db(
 
 /// Query references from the SQLite index.
 fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Reference>, DbError> {
-    let sql = "SELECT name, file, line, col, context FROM \"references\" WHERE name LIKE ?1";
+    let sql = "SELECT r.name, r.file, r.line, r.col, r.context, s.name \
+               FROM \"references\" r \
+               LEFT JOIN symbols s ON r.caller_id = s.id \
+               WHERE r.name LIKE ?1";
     let name_param = format!("%{}%", name);
     let mut stmt = conn.prepare(sql)?;
 
@@ -1901,6 +1906,7 @@ fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Reference>, 
             line: line as usize,
             col: col as usize,
             context: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            caller_name: row.get(5)?,
         })
     })?;
 
@@ -3657,6 +3663,7 @@ mod tests {
             line: 42,
             col: 8,
             context: "    processPayment(order);".into(),
+            caller_name: None,
         };
 
         let mut buf = Vec::new();
@@ -3679,6 +3686,7 @@ mod tests {
             line: 42,
             col: 8,
             context: "    processPayment(order);".into(),
+            caller_name: None,
         };
 
         let mut buf = Vec::new();
