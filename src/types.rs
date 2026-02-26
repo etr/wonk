@@ -19,6 +19,21 @@ pub enum SymbolKind {
     Module,
 }
 
+impl SymbolKind {
+    /// Returns `true` for container types that can hold child symbols
+    /// (class, struct, enum, trait, interface).
+    pub fn is_container(self) -> bool {
+        matches!(
+            self,
+            SymbolKind::Class
+                | SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Trait
+                | SymbolKind::Interface
+        )
+    }
+}
+
 impl fmt::Display for SymbolKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -404,6 +419,25 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn is_container_true_for_container_kinds() {
+        assert!(SymbolKind::Class.is_container());
+        assert!(SymbolKind::Struct.is_container());
+        assert!(SymbolKind::Enum.is_container());
+        assert!(SymbolKind::Trait.is_container());
+        assert!(SymbolKind::Interface.is_container());
+    }
+
+    #[test]
+    fn is_container_false_for_non_container_kinds() {
+        assert!(!SymbolKind::Function.is_container());
+        assert!(!SymbolKind::Method.is_container());
+        assert!(!SymbolKind::TypeAlias.is_container());
+        assert!(!SymbolKind::Constant.is_container());
+        assert!(!SymbolKind::Variable.is_container());
+        assert!(!SymbolKind::Module.is_container());
     }
 
     #[test]
