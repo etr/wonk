@@ -17,7 +17,8 @@ use serde_json::Value;
 use crate::budget::TokenBudget;
 use crate::db;
 use crate::output::{
-    DepOutput, OutputFormat, RefOutput, SearchOutput, ShowOutput, SignatureOutput, SymbolOutput,
+    CalleeOutput, CallerOutput, DepOutput, OutputFormat, RefOutput, SearchOutput, ShowOutput,
+    SignatureOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::Progress;
@@ -524,6 +525,64 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     "required": ["name"]
                 }),
             },
+            Tool {
+                name: "wonk_callers",
+                description: "Find all callers of a symbol (functions whose bodies reference it). Supports transitive expansion via depth parameter.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Symbol name to find callers for"
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "Transitive expansion depth (default: 1 = direct callers, max: 10)",
+                            "default": 1
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Limit output to approximately N tokens"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            Tool {
+                name: "wonk_callees",
+                description: "Find all callees of a symbol (symbols referenced within its body). Supports transitive expansion via depth parameter.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Symbol name to find callees for"
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "Transitive expansion depth (default: 1 = direct callees, max: 10)",
+                            "default": 1
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Limit output to approximately N tokens"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
         ]
     })
 }
@@ -582,6 +641,8 @@ impl McpServer {
             "wonk_status" => self.tool_status(call.arguments),
             "wonk_init" => self.tool_init(call.arguments),
             "wonk_show" => self.tool_show(call.arguments),
+            "wonk_callers" => self.tool_callers(call.arguments),
+            "wonk_callees" => self.tool_callees(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -941,6 +1002,137 @@ impl McpServer {
             format_result(&outputs, format)
         }
     }
+
+    fn tool_callers(&self, args: Value) -> CallToolResult {
+        let name = match require_str(&args, "name") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let depth_raw = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let depth = depth_raw.min(crate::callgraph::MAX_DEPTH_CAP);
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let format = extract_format(&args);
+
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        if !crate::callgraph::has_caller_id_data(conn) {
+            return CallToolResult::error(
+                "index lacks call graph data; run wonk_init to re-index".into(),
+            );
+        }
+
+        let results = match crate::callgraph::callers(conn, &name, depth) {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("callers query failed: {e}")),
+        };
+
+        let mut budget = budget_limit.map(TokenBudget::new);
+        let mut outputs: Vec<CallerOutput> = Vec::new();
+        let mut truncated = 0usize;
+
+        for cr in &results {
+            let out = CallerOutput {
+                caller_name: cr.caller_name.clone(),
+                caller_kind: cr.caller_kind.to_string(),
+                file: cr.file.clone(),
+                line: cr.line,
+                signature: cr.signature.clone(),
+                depth: cr.depth,
+                target_file: cr.target_file.clone(),
+            };
+
+            if let Some(ref mut b) = budget {
+                let serialized = serde_json::to_string(&out).unwrap_or_default();
+                if !b.try_consume(&serialized) {
+                    truncated += 1;
+                    continue;
+                }
+            }
+            outputs.push(out);
+        }
+
+        if truncated > 0 {
+            let wrapper = serde_json::json!({
+                "results": outputs,
+                "truncated": truncated,
+                "budget_limit": budget_limit,
+            });
+            format_result(&wrapper, format)
+        } else {
+            format_result(&outputs, format)
+        }
+    }
+
+    fn tool_callees(&self, args: Value) -> CallToolResult {
+        let name = match require_str(&args, "name") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let depth_raw = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let depth = depth_raw.min(crate::callgraph::MAX_DEPTH_CAP);
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let format = extract_format(&args);
+
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        if !crate::callgraph::has_caller_id_data(conn) {
+            return CallToolResult::error(
+                "index lacks call graph data; run wonk_init to re-index".into(),
+            );
+        }
+
+        let results = match crate::callgraph::callees(conn, &name, depth) {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("callees query failed: {e}")),
+        };
+
+        let mut budget = budget_limit.map(TokenBudget::new);
+        let mut outputs: Vec<CalleeOutput> = Vec::new();
+        let mut truncated = 0usize;
+
+        for cr in &results {
+            let out = CalleeOutput {
+                callee_name: cr.callee_name.clone(),
+                file: cr.file.clone(),
+                line: cr.line,
+                context: cr.context.clone(),
+                depth: cr.depth,
+                source_file: cr.source_file.clone(),
+            };
+
+            if let Some(ref mut b) = budget {
+                let serialized = serde_json::to_string(&out).unwrap_or_default();
+                if !b.try_consume(&serialized) {
+                    truncated += 1;
+                    continue;
+                }
+            }
+            outputs.push(out);
+        }
+
+        if truncated > 0 {
+            let wrapper = serde_json::json!({
+                "results": outputs,
+                "truncated": truncated,
+                "budget_limit": budget_limit,
+            });
+            format_result(&wrapper, format)
+        } else {
+            format_result(&outputs, format)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,7 +1251,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -1097,7 +1289,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -1273,6 +1465,71 @@ mod tests {
         assert!(
             json.get("ollama_reachable").is_some(),
             "missing ollama_reachable"
+        );
+    }
+
+    // -- Callers/Callees MCP tests -------------------------------------------
+
+    #[test]
+    fn tools_list_returns_twelve_tools() {
+        let server = test_server();
+        let result = server.handle_tools_list();
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 12);
+    }
+
+    #[test]
+    fn tool_callers_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_callers").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("name"), "missing 'name' property");
+        assert!(props.contains_key("depth"), "missing 'depth' property");
+        assert!(props.contains_key("format"), "missing 'format' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("name")));
+    }
+
+    #[test]
+    fn tool_callees_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_callees").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("name"), "missing 'name' property");
+        assert!(props.contains_key("depth"), "missing 'depth' property");
+        assert!(props.contains_key("format"), "missing 'format' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("name")));
+    }
+
+    #[test]
+    fn tool_callers_dispatches_correctly() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_callers",
+            "arguments": {"name": "nonexistent_symbol_xyz"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        // Should be "no index" error, not "unknown tool".
+        assert!(
+            text.contains("no index") || text.contains("[]") || text.contains("call graph"),
+            "expected index/callgraph error, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_callees_dispatches_correctly() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_callees",
+            "arguments": {"name": "nonexistent_symbol_xyz"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("no index") || text.contains("[]") || text.contains("call graph"),
+            "expected index/callgraph error, got: {text}"
         );
     }
 }

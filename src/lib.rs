@@ -1,4 +1,5 @@
 pub mod budget;
+pub mod callgraph;
 pub mod cli;
 pub mod cluster;
 pub mod color;
