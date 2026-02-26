@@ -50,8 +50,8 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `daemon.rs` | Background file watcher — double-fork daemonization, PID file, SIGTERM handler, embedding worker thread, daemon status table |
 | `watcher.rs` | Filesystem event classification and debouncing via `notify` |
 | `config.rs` | Layered TOML config: built-in defaults → `~/.wonk/config.toml` → `<repo>/.wonk/config.toml` |
-| `callgraph.rs` | Call graph traversal — BFS callers/callees expansion via caller_id JOIN, cycle detection via visited HashSet, depth cap enforcement |
-| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 12 query tools for AI coding assistants |
+| `callgraph.rs` | Call graph traversal — BFS callers/callees expansion and callpath shortest-path finder via caller_id JOIN, cycle detection via visited HashSet, depth cap enforcement |
+| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 13 query tools for AI coding assistants |
 | `budget.rs` | Token budget tracking (~4 chars/token heuristic) |
 
 ### Key Design Decisions

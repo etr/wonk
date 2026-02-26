@@ -1112,9 +1112,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Callpath(args) => {
-            // Reuse callgraph_setup with a dummy depth (we don't use depth for callpath).
-            let (conn, _depth) = match callgraph_setup(1, suppress) {
-                Some(pair) => pair,
+            let conn = match callgraph_conn(suppress) {
+                Some(c) => c,
                 None => return Ok(()),
             };
 
@@ -1143,10 +1142,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Shared setup for `Command::Callers` and `Command::Callees`: resolve repo
-/// root, open connection, check caller_id data, and clamp depth.
-/// Returns `None` when an early-exit error/hint was emitted.
-fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection, usize)> {
+/// Open a call graph connection: resolve repo root, open index, check
+/// caller_id data. Returns `None` when an early-exit error/hint was emitted.
+fn callgraph_conn(suppress: bool) -> Option<Connection> {
     let repo_root = match std::env::current_dir()
         .ok()
         .and_then(|cwd| db::find_repo_root(&cwd).ok())
@@ -1173,6 +1171,14 @@ fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection
         );
         return None;
     }
+
+    Some(conn)
+}
+
+/// Shared setup for `Command::Callers` and `Command::Callees`: open connection
+/// and clamp depth. Returns `None` when an early-exit error/hint was emitted.
+fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection, usize)> {
+    let conn = callgraph_conn(suppress)?;
 
     let (depth, clamped) = crate::callgraph::clamp_depth(requested_depth);
     if clamped {

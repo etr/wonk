@@ -1159,7 +1159,7 @@ impl McpServer {
                     .collect();
                 format_result(&outputs, format)
             }
-            Ok(None) => format_result(&serde_json::json!({"message": "no path found"}), format),
+            Ok(None) => format_result(&Vec::<CallPathHopOutput>::new(), format),
             Err(e) => CallToolResult::error(format!("callpath query failed: {e}")),
         }
     }

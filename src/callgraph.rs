@@ -287,19 +287,39 @@ fn reconstruct_path(
     while current != from {
         match parent_map.get(&current) {
             Some(parent) => {
-                chain.push(parent.clone());
                 current = parent.clone();
+                chain.push(current.clone());
             }
             None => return Ok(None), // should not happen if BFS is correct
         }
     }
     chain.reverse();
 
-    // Resolve each name to a CallPathHop.
+    // Resolve each name to a CallPathHop. Prepare statement once for reuse.
+    let mut stmt =
+        conn.prepare("SELECT name, kind, file, line FROM symbols WHERE name = ?1 LIMIT 1")?;
     let mut hops = Vec::with_capacity(chain.len());
     for name in &chain {
-        match resolve_symbol_hop(conn, name)? {
-            Some(hop) => hops.push(hop),
+        let row = stmt
+            .query_row(rusqlite::params![name], |row| {
+                let sym_name: String = row.get(0)?;
+                let kind_str: String = row.get(1)?;
+                let file: String = row.get(2)?;
+                let line: i64 = row.get(3)?;
+                Ok((sym_name, kind_str, file, line))
+            })
+            .optional()?;
+
+        match row {
+            Some((sym_name, kind_str, file, line)) => {
+                let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
+                hops.push(CallPathHop {
+                    symbol_name: sym_name,
+                    symbol_kind: kind,
+                    file,
+                    line: line as usize,
+                });
+            }
             None => {
                 // Symbol not found in index; use placeholder.
                 hops.push(CallPathHop {
@@ -315,12 +335,23 @@ fn reconstruct_path(
     Ok(Some(hops))
 }
 
+/// Clamp a requested depth to `MAX_DEPTH_CAP`, returning the capped value and
+/// whether clamping occurred.
+pub fn clamp_depth(requested: usize) -> (usize, bool) {
+    if requested > MAX_DEPTH_CAP {
+        (MAX_DEPTH_CAP, true)
+    } else {
+        (requested, false)
+    }
+}
+
 /// Look up a symbol by name and return a `CallPathHop` with its metadata.
+/// Used for the degenerate `from == to` case in `callpath`.
 fn resolve_symbol_hop(conn: &Connection, name: &str) -> Result<Option<CallPathHop>> {
     let mut stmt =
         conn.prepare("SELECT name, kind, file, line FROM symbols WHERE name = ?1 LIMIT 1")?;
 
-    let hop = stmt
+    let row = stmt
         .query_row(rusqlite::params![name], |row| {
             let sym_name: String = row.get(0)?;
             let kind_str: String = row.get(1)?;
@@ -330,7 +361,7 @@ fn resolve_symbol_hop(conn: &Connection, name: &str) -> Result<Option<CallPathHo
         })
         .optional()?;
 
-    match hop {
+    match row {
         Some((sym_name, kind_str, file, line)) => {
             let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
             Ok(Some(CallPathHop {
@@ -341,16 +372,6 @@ fn resolve_symbol_hop(conn: &Connection, name: &str) -> Result<Option<CallPathHo
             }))
         }
         None => Ok(None),
-    }
-}
-
-/// Clamp a requested depth to `MAX_DEPTH_CAP`, returning the capped value and
-/// whether clamping occurred.
-pub fn clamp_depth(requested: usize) -> (usize, bool) {
-    if requested > MAX_DEPTH_CAP {
-        (MAX_DEPTH_CAP, true)
-    } else {
-        (requested, false)
     }
 }
 

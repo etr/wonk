@@ -34,7 +34,7 @@
 | M14 | Change Impact Analysis (`wonk impact`) | 2 | Complete |
 | M15 | Call Graph Data Model & Indexing | 2 | In Progress |
 | M16 | Source Display (`wonk show`) | 2 | Complete |
-| M17 | Call Graph Commands | 2 | Not Started |
+| M17 | Call Graph Commands | 2 | Complete |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Not Started |
 | M19 | Edge Confidence & Inheritance Infrastructure | 3 | Not Started |
 | M20 | Hybrid Search Fusion (RRF) | 1 | Not Started |
@@ -2519,16 +2519,16 @@ Implement `wonk callers <symbol>` and `wonk callees <symbol>` commands with tran
 Implement `wonk callpath <from> <to>` that finds call chains between two symbols via BFS traversal.
 
 **Action Items:**
-- [ ] Implement `callpath(db, from, to) -> Option<Vec<CallPathHop>>` (DR-016): BFS from `<from>` expanding callees at each level
-- [ ] Maintain visited set (HashSet) and parent map (HashMap) for path reconstruction
-- [ ] When `<to>` is reached, reconstruct shortest path via parent map
-- [ ] If BFS exhausts the graph without reaching `<to>`, report "no path found" (PRD-CGR-REQ-010)
-- [ ] Cap BFS depth at 10 (consistent with callers/callees cap)
-- [ ] Define `CallPathHop` struct: symbol_name, symbol_kind, file, line
-- [ ] Add `callpath` subcommand to CLI with args: `<from>` (required), `<to>` (required)
-- [ ] Output formatting: chain display `from -> hop1 -> hop2 -> to` with file:line per hop (use ASCII `->`, not Unicode arrows, for terminal compatibility)
-- [ ] JSON/TOON output: array of CallPathHop structs
-- [ ] Add MCP tool `wonk_callpath` with parameters: from, to, format (PRD-CGR-REQ-014)
+- [x] Implement `callpath(db, from, to) -> Option<Vec<CallPathHop>>` (DR-016): BFS from `<from>` expanding callees at each level
+- [x] Maintain visited set (HashSet) and parent map (HashMap) for path reconstruction
+- [x] When `<to>` is reached, reconstruct shortest path via parent map
+- [x] If BFS exhausts the graph without reaching `<to>`, report "no path found" (PRD-CGR-REQ-010)
+- [x] Cap BFS depth at 10 (consistent with callers/callees cap)
+- [x] Define `CallPathHop` struct: symbol_name, symbol_kind, file, line
+- [x] Add `callpath` subcommand to CLI with args: `<from>` (required), `<to>` (required)
+- [x] Output formatting: chain display `from -> hop1 -> hop2 -> to` with file:line per hop (use ASCII `->`, not Unicode arrows, for terminal compatibility)
+- [x] JSON/TOON output: array of CallPathHop structs
+- [x] Add MCP tool `wonk_callpath` with parameters: from, to, format (PRD-CGR-REQ-014)
 
 **Dependencies:**
 - Blocked by: TASK-061
