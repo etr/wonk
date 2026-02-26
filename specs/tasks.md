@@ -2473,18 +2473,18 @@ Add shallow mode for container types, budget truncation, and expose `wonk_show` 
 Implement `wonk callers <symbol>` and `wonk callees <symbol>` commands with transitive depth expansion and MCP tool exposure.
 
 **Action Items:**
-- [ ] Create `callgraph.rs` module
-- [ ] Implement `callers(db, name, depth) -> Vec<CallerResult>`: SQL query `SELECT DISTINCT s.* FROM references r JOIN symbols s ON r.caller_id = s.id WHERE r.name = ?` (PRD-CGR-REQ-003)
-- [ ] Implement `callees(db, name, depth) -> Vec<CalleeResult>`: SQL query `SELECT DISTINCT r.name, ... FROM references r WHERE r.caller_id IN (SELECT id FROM symbols WHERE name LIKE ?)` (PRD-CGR-REQ-004)
-- [ ] Implement transitive expansion (PRD-CGR-REQ-005, PRD-CGR-REQ-006): --depth N iteratively expands at each level
-- [ ] Default depth 1 (PRD-CGR-REQ-007), cap at 10 with warning (PRD-CGR-REQ-008)
-- [ ] Handle multiple definitions (PRD-CGR-REQ-011): include results from all definitions, indicate which definition
-- [ ] Handle file-scope callers: display as `<module>` scope
-- [ ] Auto-init: consistent with PRD-AUT behavior (PRD-CGR-REQ-012)
-- [ ] Old indexes without caller_id: return empty results with hint to re-index via `wonk update`
-- [ ] Add `callers` and `callees` subcommands to CLI with args: `<symbol>` (required), `--depth <n>` (optional, default 1)
-- [ ] Output formatting: grep-compatible + JSON/TOON
-- [ ] Add MCP tools `wonk_callers` and `wonk_callees` with parameters: name, depth, format (PRD-CGR-REQ-013)
+- [x] Create `callgraph.rs` module
+- [x] Implement `callers(db, name, depth) -> Vec<CallerResult>`: SQL query `SELECT DISTINCT s.* FROM references r JOIN symbols s ON r.caller_id = s.id WHERE r.name = ?` (PRD-CGR-REQ-003)
+- [x] Implement `callees(db, name, depth) -> Vec<CalleeResult>`: SQL query `SELECT DISTINCT r.name, ... FROM references r JOIN symbols s ON s.id = r.caller_id WHERE s.name = ?` (PRD-CGR-REQ-004)
+- [x] Implement transitive expansion (PRD-CGR-REQ-005, PRD-CGR-REQ-006): --depth N iteratively expands at each level
+- [x] Default depth 1 (PRD-CGR-REQ-007), cap at 10 with warning (PRD-CGR-REQ-008)
+- [x] Handle multiple definitions (PRD-CGR-REQ-011): include results from all definitions, indicate which definition
+- [x] Handle file-scope callers: display as `<module>` scope
+- [x] Auto-init: consistent with PRD-AUT behavior (PRD-CGR-REQ-012)
+- [x] Old indexes without caller_id: return empty results with hint to re-index via `wonk update`
+- [x] Add `callers` and `callees` subcommands to CLI with args: `<symbol>` (required), `--depth <n>` (optional, default 1)
+- [x] Output formatting: grep-compatible + JSON/TOON
+- [x] Add MCP tools `wonk_callers` and `wonk_callees` with parameters: name, depth, format (PRD-CGR-REQ-013)
 
 **Dependencies:**
 - Blocked by: TASK-057, TASK-058

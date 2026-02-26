@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Result;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1003,41 +1004,56 @@ impl McpServer {
         }
     }
 
+    /// Shared setup for callgraph tools: extract depth + budget + format,
+    /// open connection, and verify caller_id data exists.
+    fn callgraph_setup(
+        &self,
+        args: &Value,
+    ) -> Result<(&Connection, usize, Option<usize>, OutputFormat), CallToolResult> {
+        let depth_raw = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let (depth, _) = crate::callgraph::clamp_depth(depth_raw);
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let format = extract_format(args);
+
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => {
+                return Err(CallToolResult::error(
+                    "no index available; run wonk_init first".into(),
+                ));
+            }
+        };
+
+        if !crate::callgraph::has_caller_id_data(conn) {
+            return Err(CallToolResult::error(
+                "index lacks call graph data; run wonk_update to re-index".into(),
+            ));
+        }
+
+        Ok((conn, depth, budget_limit, format))
+    }
+
     fn tool_callers(&self, args: Value) -> CallToolResult {
         let name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
         };
-        let depth_raw = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-        let depth = depth_raw.min(crate::callgraph::MAX_DEPTH_CAP);
-        let budget_limit: Option<usize> = args
-            .get("budget")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let format = extract_format(&args);
-
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        let (conn, depth, budget_limit, format) = match self.callgraph_setup(&args) {
+            Ok(setup) => setup,
+            Err(e) => return e,
         };
-
-        if !crate::callgraph::has_caller_id_data(conn) {
-            return CallToolResult::error(
-                "index lacks call graph data; run wonk_init to re-index".into(),
-            );
-        }
 
         let results = match crate::callgraph::callers(conn, &name, depth) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("callers query failed: {e}")),
         };
 
-        let mut budget = budget_limit.map(TokenBudget::new);
-        let mut outputs: Vec<CallerOutput> = Vec::new();
-        let mut truncated = 0usize;
-
-        for cr in &results {
-            let out = CallerOutput {
+        let outputs: Vec<CallerOutput> = results
+            .iter()
+            .map(|cr| CallerOutput {
                 caller_name: cr.caller_name.clone(),
                 caller_kind: cr.caller_kind.to_string(),
                 file: cr.file.clone(),
@@ -1045,28 +1061,10 @@ impl McpServer {
                 signature: cr.signature.clone(),
                 depth: cr.depth,
                 target_file: cr.target_file.clone(),
-            };
+            })
+            .collect();
 
-            if let Some(ref mut b) = budget {
-                let serialized = serde_json::to_string(&out).unwrap_or_default();
-                if !b.try_consume(&serialized) {
-                    truncated += 1;
-                    continue;
-                }
-            }
-            outputs.push(out);
-        }
-
-        if truncated > 0 {
-            let wrapper = serde_json::json!({
-                "results": outputs,
-                "truncated": truncated,
-                "budget_limit": budget_limit,
-            });
-            format_result(&wrapper, format)
-        } else {
-            format_result(&outputs, format)
-        }
+        collect_with_budget(outputs, budget_limit, format)
     }
 
     fn tool_callees(&self, args: Value) -> CallToolResult {
@@ -1074,65 +1072,68 @@ impl McpServer {
             Ok(n) => n,
             Err(e) => return e,
         };
-        let depth_raw = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-        let depth = depth_raw.min(crate::callgraph::MAX_DEPTH_CAP);
-        let budget_limit: Option<usize> = args
-            .get("budget")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let format = extract_format(&args);
-
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        let (conn, depth, budget_limit, format) = match self.callgraph_setup(&args) {
+            Ok(setup) => setup,
+            Err(e) => return e,
         };
-
-        if !crate::callgraph::has_caller_id_data(conn) {
-            return CallToolResult::error(
-                "index lacks call graph data; run wonk_init to re-index".into(),
-            );
-        }
 
         let results = match crate::callgraph::callees(conn, &name, depth) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("callees query failed: {e}")),
         };
 
-        let mut budget = budget_limit.map(TokenBudget::new);
-        let mut outputs: Vec<CalleeOutput> = Vec::new();
-        let mut truncated = 0usize;
-
-        for cr in &results {
-            let out = CalleeOutput {
+        let outputs: Vec<CalleeOutput> = results
+            .iter()
+            .map(|cr| CalleeOutput {
                 callee_name: cr.callee_name.clone(),
                 file: cr.file.clone(),
                 line: cr.line,
                 context: cr.context.clone(),
                 depth: cr.depth,
                 source_file: cr.source_file.clone(),
-            };
+            })
+            .collect();
 
-            if let Some(ref mut b) = budget {
-                let serialized = serde_json::to_string(&out).unwrap_or_default();
-                if !b.try_consume(&serialized) {
-                    truncated += 1;
-                    continue;
-                }
+        collect_with_budget(outputs, budget_limit, format)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Budget collection helper
+// ---------------------------------------------------------------------------
+
+/// Collect serializable outputs, applying optional token budget, and format the
+/// final `CallToolResult`. Shared by tool_show, tool_callers, and tool_callees.
+fn collect_with_budget<T: serde::Serialize>(
+    outputs: Vec<T>,
+    budget_limit: Option<usize>,
+    format: OutputFormat,
+) -> CallToolResult {
+    if let Some(limit) = budget_limit {
+        let mut budget = TokenBudget::new(limit);
+        let mut kept: Vec<&T> = Vec::new();
+        let mut truncated = 0usize;
+
+        for out in &outputs {
+            let serialized = serde_json::to_string(out).unwrap_or_default();
+            if budget.try_consume(&serialized) {
+                kept.push(out);
+            } else {
+                truncated += 1;
             }
-            outputs.push(out);
         }
 
         if truncated > 0 {
             let wrapper = serde_json::json!({
-                "results": outputs,
+                "results": kept,
                 "truncated": truncated,
                 "budget_limit": budget_limit,
             });
-            format_result(&wrapper, format)
-        } else {
-            format_result(&outputs, format)
+            return format_result(&wrapper, format);
         }
     }
+
+    format_result(&outputs, format)
 }
 
 // ---------------------------------------------------------------------------
