@@ -1012,10 +1012,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 match db::find_existing_index(&repo_root).and_then(|path| db::open(&path).ok()) {
                     Some(c) => c,
                     None => {
-                        output::print_hint(
-                            "no index found; run `wonk init` to build the index",
-                            suppress,
-                        );
+                        output::print_error("no index found; run `wonk init` to build the index");
                         return Ok(());
                     }
                 };
@@ -1038,15 +1035,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             let mut truncated = 0usize;
             for sr in &results {
-                let out = ShowOutput {
-                    name: sr.name.clone(),
-                    kind: sr.kind.to_string(),
-                    file: sr.file.clone(),
-                    line: sr.line,
-                    end_line: sr.end_line,
-                    source: sr.source.clone(),
-                    language: sr.language.clone(),
-                };
+                let out = ShowOutput::from(sr);
 
                 if !format.is_structured() {
                     output::print_show_header(&sr.file, sr.line, sr.end_line, suppress);

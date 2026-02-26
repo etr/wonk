@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::TokenBudget;
 use crate::color;
+use crate::types::ShowResult;
 
 // ---------------------------------------------------------------------------
 // Output format
@@ -201,6 +202,20 @@ pub struct ShowOutput {
     pub end_line: Option<usize>,
     pub source: String,
     pub language: String,
+}
+
+impl From<&ShowResult> for ShowOutput {
+    fn from(sr: &ShowResult) -> Self {
+        Self {
+            name: sr.name.clone(),
+            kind: sr.kind.to_string(),
+            file: sr.file.clone(),
+            line: sr.line,
+            end_line: sr.end_line,
+            source: sr.source.clone(),
+            language: sr.language.clone(),
+        }
+    }
 }
 
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates

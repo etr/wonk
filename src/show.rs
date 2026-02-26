@@ -49,8 +49,8 @@ pub fn show_symbol(
         sql.push_str("name = ?");
         params.push(Box::new(name.to_string()));
     } else {
-        sql.push_str("name LIKE ?");
-        params.push(Box::new(format!("%{name}%")));
+        sql.push_str("name LIKE ? ESCAPE '\\'");
+        params.push(Box::new(format!("%{}%", escape_like(name))));
     }
 
     if let Some(ref kind_str) = options.kind {
@@ -61,8 +61,8 @@ pub fn show_symbol(
     }
 
     if let Some(ref file_filter) = options.file {
-        sql.push_str(" AND file LIKE ?");
-        params.push(Box::new(format!("%{file_filter}%")));
+        sql.push_str(" AND file LIKE ? ESCAPE '\\'");
+        params.push(Box::new(format!("%{}%", escape_like(file_filter))));
     }
 
     sql.push_str(" ORDER BY file, line");
@@ -99,6 +99,7 @@ pub fn show_symbol(
 
         // Read source body from disk.
         let source = if let Some(end) = end_line {
+            let suppress = options.suppress;
             let content = file_cache.entry(file.clone()).or_insert_with(|| {
                 let abs_path = repo_root.join(&file);
                 // Validate resolved path stays within repo root (CWE-22).
@@ -109,19 +110,19 @@ pub fn show_symbol(
                     Ok(_) => {
                         output::print_hint(
                             &format!("path outside repo root, skipping: {file}"),
-                            options.suppress,
+                            suppress,
                         );
                         None
                     }
-                    Err(_) => None,
+                    Err(_) => {
+                        output::print_hint(&format!("source file not found: {file}"), suppress);
+                        None
+                    }
                 }
             });
             match content {
                 Some(c) => extract_lines(c, line, end),
-                None => {
-                    output::print_hint(&format!("source file not found: {file}"), options.suppress);
-                    continue;
-                }
+                None => continue,
             }
         } else {
             // No end_line: fall back to signature.
@@ -140,6 +141,13 @@ pub fn show_symbol(
     }
 
     Ok(results)
+}
+
+/// Escape SQLite LIKE wildcards (`%`, `_`, `\`) in user input.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Extract lines `start..=end` (1-based) from content.
@@ -325,6 +333,15 @@ mod tests {
     fn extract_lines_single() {
         let content = "line1\nline2\nline3\n";
         assert_eq!(extract_lines(content, 2, 2), "line2");
+    }
+
+    #[test]
+    fn escape_like_wildcards() {
+        assert_eq!(escape_like("hello"), "hello");
+        assert_eq!(escape_like("100%"), "100\\%");
+        assert_eq!(escape_like("foo_bar"), "foo\\_bar");
+        assert_eq!(escape_like("a\\b"), "a\\\\b");
+        assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
     }
 
     #[test]
