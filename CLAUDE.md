@@ -45,12 +45,12 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `ranker.rs` | Classifies results (Definition > CallSite > Import > Other > Comment > Test), deduplicates re-exports |
 | `output.rs` | Dual format: grep-compatible (stdout+stderr) or NDJSON (stdout) |
 | `embedding.rs` | Ollama API client, symbol chunking engine, and vector storage — sync HTTP client for embedding generation, context-rich text chunk formatting for `nomic-embed-text`, BLOB storage/retrieval with bytemuck zero-copy deserialization |
-| `show.rs` | Source body retrieval — queries symbol index by name with optional file/kind/exact filters, reads source file lines line..end_line per match, falls back to signature when end_line is absent |
+| `show.rs` | Source body retrieval — queries symbol index by name with optional file/kind/exact filters, reads source file lines line..end_line per match, falls back to signature when end_line is absent; shallow mode for containers shows signature + child signatures without bodies |
 | `impact.rs` | Symbol change detection — Tree-sitter re-parse vs. indexed symbols for Added/Modified/Removed; git CLI wrapper for `--since` file listing |
 | `daemon.rs` | Background file watcher — double-fork daemonization, PID file, SIGTERM handler, embedding worker thread, daemon status table |
 | `watcher.rs` | Filesystem event classification and debouncing via `notify` |
 | `config.rs` | Layered TOML config: built-in defaults → `~/.wonk/config.toml` → `<repo>/.wonk/config.toml` |
-| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 9 query tools for AI coding assistants |
+| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 10 query tools for AI coding assistants |
 | `budget.rs` | Token budget tracking (~4 chars/token heuristic) |
 
 ### Key Design Decisions

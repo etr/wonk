@@ -24,6 +24,8 @@ pub struct ShowOptions {
     pub exact: bool,
     /// Whether to suppress stderr hints (--quiet or structured format).
     pub suppress: bool,
+    /// Show container types in shallow mode (signature + child signatures only).
+    pub shallow: bool,
 }
 
 /// Query the index for symbols matching `name` and read their source bodies
@@ -92,10 +94,44 @@ pub fn show_symbol(
 
     let mut results = Vec::new();
 
+    // Prepare child-signature statement once outside the loop to avoid N+1 prepare calls.
+    let mut child_stmt = if options.shallow {
+        Some(conn.prepare(
+            "SELECT signature FROM symbols WHERE scope = ?1 AND file = ?2 ORDER BY line",
+        )?)
+    } else {
+        None
+    };
+
     for (sym_name, kind_str, file, line, end_line, signature, language) in rows {
         let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
         let line = line as usize;
         let end_line = end_line.map(|v| v as usize);
+
+        // Shallow mode for container types: show container signature + child signatures.
+        if options.shallow && kind.is_container() {
+            let child_sigs =
+                query_child_signatures_with_stmt(child_stmt.as_mut().unwrap(), &sym_name, &file)?;
+            let source = if child_sigs.is_empty() {
+                signature.clone()
+            } else {
+                let mut parts = vec![signature.clone()];
+                for sig in &child_sigs {
+                    parts.push(format!("    {sig}"));
+                }
+                parts.join("\n")
+            };
+            results.push(ShowResult {
+                name: sym_name,
+                kind,
+                file,
+                line,
+                end_line,
+                source,
+                language,
+            });
+            continue;
+        }
 
         // Read source body from disk.
         let source = if let Some(end) = end_line {
@@ -141,6 +177,23 @@ pub fn show_symbol(
     }
 
     Ok(results)
+}
+
+/// Query child symbol signatures using a pre-prepared statement.
+///
+/// Returns signatures of symbols whose `scope` matches the parent name and
+/// that reside in the same file, ordered by line number.
+fn query_child_signatures_with_stmt(
+    stmt: &mut rusqlite::Statement<'_>,
+    parent_name: &str,
+    file: &str,
+) -> Result<Vec<String>> {
+    let sigs = stmt
+        .query_map(rusqlite::params![parent_name, file], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(sigs)
 }
 
 /// Escape SQLite LIKE wildcards (`%`, `_`, `\`) in user input.
@@ -191,6 +244,7 @@ mod tests {
             kind: None,
             exact: false,
             suppress: true,
+            shallow: false,
         }
     }
 
@@ -342,6 +396,84 @@ mod tests {
         assert_eq!(escape_like("foo_bar"), "foo\\_bar");
         assert_eq!(escape_like("a\\b"), "a\\\\b");
         assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
+    }
+
+    #[test]
+    fn shallow_struct_shows_child_signatures() {
+        let source = "struct Foo {\n    x: i32,\n}\n\nimpl Foo {\n    fn bar(&self) -> i32 {\n        self.x\n    }\n    fn baz(&self) -> bool {\n        true\n    }\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let opts = ShowOptions {
+            shallow: true,
+            exact: true,
+            kind: Some("struct".into()),
+            ..default_options()
+        };
+        let results = show_symbol(&conn, "Foo", dir.path(), &opts).unwrap();
+
+        // Should find the struct Foo
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.name, "Foo");
+        // Source should contain the struct signature and child method signatures
+        // but NOT the method bodies
+        assert!(r.source.contains("Foo"), "should contain struct name");
+        assert!(r.source.contains("bar"), "should contain child method bar");
+        assert!(r.source.contains("baz"), "should contain child method baz");
+        assert!(
+            !r.source.contains("self.x"),
+            "should NOT contain method body"
+        );
+        assert!(!r.source.contains("true"), "should NOT contain method body");
+    }
+
+    #[test]
+    fn shallow_non_container_shows_full_body() {
+        let source = "fn hello() {\n    println!(\"hi\");\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let opts = ShowOptions {
+            shallow: true,
+            ..default_options()
+        };
+        let results = show_symbol(&conn, "hello", dir.path(), &opts).unwrap();
+
+        assert_eq!(results.len(), 1);
+        // Non-container with shallow: falls through to full body
+        assert!(results[0].source.contains("println!"));
+    }
+
+    #[test]
+    fn shallow_no_children_shows_signature_only() {
+        // Insert a synthetic struct with no children via direct DB insert
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "struct Empty;\n").unwrap();
+
+        pipeline::build_index(root, true).unwrap();
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Override: insert a container with no children to test edge case
+        conn.execute("DELETE FROM symbols WHERE name = 'Empty'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language) \
+             VALUES ('EmptyClass', 'class', 'src/lib.rs', 1, 0, 5, NULL, 'class EmptyClass', 'TypeScript')",
+            [],
+        ).unwrap();
+
+        let opts = ShowOptions {
+            shallow: true,
+            exact: true,
+            ..default_options()
+        };
+        let results = show_symbol(&conn, "EmptyClass", root, &opts).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, "class EmptyClass");
     }
 
     #[test]

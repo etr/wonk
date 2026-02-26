@@ -33,7 +33,7 @@
 | M13 | Semantic Clustering (`wonk cluster`) | 2 | Complete |
 | M14 | Change Impact Analysis (`wonk impact`) | 2 | Complete |
 | M15 | Call Graph Data Model & Indexing | 2 | In Progress |
-| M16 | Source Display (`wonk show`) | 2 | Not Started |
+| M16 | Source Display (`wonk show`) | 2 | In Progress |
 | M17 | Call Graph Commands | 2 | Not Started |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Not Started |
 | M19 | Edge Confidence & Inheritance Infrastructure | 3 | Not Started |
@@ -2431,12 +2431,12 @@ Implement the core `wonk show <name>` command that looks up symbols in the index
 Add shallow mode for container types, budget truncation, and expose `wonk_show` as an MCP tool.
 
 **Action Items:**
-- [ ] Implement `--shallow` flag (PRD-SHOW-REQ-006, DR-017): for container types (class, struct, enum, trait, interface), query child symbols via `scope` column match in the same file
-- [ ] Shallow display: container's signature line followed by each child's `signature` field (no bodies)
-- [ ] No Tree-sitter re-parse needed — uses existing index data
-- [ ] Implement `--budget <n>` flag (PRD-SHOW-REQ-007): use existing budget module (~4 chars/token heuristic) to truncate output and indicate omission
-- [ ] Add `wonk_show` MCP tool with parameters: name (required), kind (optional), file (optional), exact (boolean), shallow (boolean), budget (integer), format (json|toon) (PRD-SHOW-REQ-013)
-- [ ] Wire MCP tool handler to existing show_symbol backend
+- [x] Implement `--shallow` flag (PRD-SHOW-REQ-006, DR-017): for container types (class, struct, enum, trait, interface), query child symbols via `scope` column match in the same file
+- [x] Shallow display: container's signature line followed by each child's `signature` field (no bodies)
+- [x] No Tree-sitter re-parse needed — uses existing index data
+- [x] Implement `--budget <n>` flag (PRD-SHOW-REQ-007): use existing budget module (~4 chars/token heuristic) to truncate output and indicate omission
+- [x] Add `wonk_show` MCP tool with parameters: name (required), kind (optional), file (optional), exact (boolean), shallow (boolean), budget (integer), format (json|toon) (PRD-SHOW-REQ-013)
+- [x] Wire MCP tool handler to existing show_symbol backend
 
 **Dependencies:**
 - Blocked by: TASK-059
@@ -2454,7 +2454,7 @@ Add shallow mode for container types, budget truncation, and expose `wonk_show` 
 **Related Requirements:** PRD-SHOW-REQ-006, PRD-SHOW-REQ-007, PRD-SHOW-REQ-013
 **Related Decisions:** DR-017, DR-022
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

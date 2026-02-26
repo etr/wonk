@@ -1022,6 +1022,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 kind: args.kind,
                 exact: args.exact,
                 suppress,
+                shallow: args.shallow,
             };
 
             let results = crate::show::show_symbol(&conn, &args.name, &repo_root, &options)?;

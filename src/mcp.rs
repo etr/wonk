@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::budget::TokenBudget;
 use crate::db;
 use crate::output::{
-    DepOutput, OutputFormat, RefOutput, SearchOutput, SignatureOutput, SymbolOutput,
+    DepOutput, OutputFormat, RefOutput, SearchOutput, ShowOutput, SignatureOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::Progress;
@@ -482,6 +482,48 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     }
                 }),
             },
+            Tool {
+                name: "wonk_show",
+                description: "Show full source body of a symbol. For container types (class, struct, enum, trait, interface), use shallow=true to get the container signature plus child signatures without bodies.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Symbol name to look up"
+                        },
+                        "kind": {
+                            "type": "string",
+                            "description": "Filter by symbol kind (function, method, class, struct, interface, enum, trait, type_alias, constant, variable, module)"
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Restrict results to a specific file path (substring match)"
+                        },
+                        "exact": {
+                            "type": "boolean",
+                            "description": "Require exact name match",
+                            "default": false
+                        },
+                        "shallow": {
+                            "type": "boolean",
+                            "description": "Show container types in shallow mode (signature + child signatures only)",
+                            "default": false
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Limit output to approximately N tokens"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
         ]
     })
 }
@@ -539,6 +581,7 @@ impl McpServer {
             "wonk_rdeps" => self.tool_rdeps(call.arguments),
             "wonk_status" => self.tool_status(call.arguments),
             "wonk_init" => self.tool_init(call.arguments),
+            "wonk_show" => self.tool_show(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -831,6 +874,73 @@ impl McpServer {
         });
         format_result(&result, format)
     }
+
+    fn tool_show(&self, args: Value) -> CallToolResult {
+        let name = match require_str(&args, "name") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let kind = args.get("kind").and_then(|v| v.as_str()).map(String::from);
+        let file = args.get("file").and_then(|v| v.as_str()).map(String::from);
+        let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+        let shallow = args
+            .get("shallow")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let format = extract_format(&args);
+
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        let options = crate::show::ShowOptions {
+            file,
+            kind,
+            exact,
+            suppress: true,
+            shallow,
+        };
+
+        let results = match crate::show::show_symbol(conn, &name, self.router.repo_root(), &options)
+        {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("show query failed: {e}")),
+        };
+
+        let mut budget = budget_limit.map(TokenBudget::new);
+        let mut outputs: Vec<ShowOutput> = Vec::new();
+        let mut truncated = 0usize;
+
+        for sr in &results {
+            let out = ShowOutput::from(sr);
+
+            if let Some(ref mut b) = budget {
+                let serialized = serde_json::to_string(&out).unwrap_or_default();
+                if !b.try_consume(&serialized) {
+                    truncated += 1;
+                    continue;
+                }
+            }
+            outputs.push(out);
+        }
+
+        if truncated > 0 {
+            // Append truncation metadata as a wrapper.
+            let wrapper = serde_json::json!({
+                "results": outputs,
+                "truncated": truncated,
+                "budget_limit": budget_limit,
+            });
+            format_result(&wrapper, format)
+        } else {
+            format_result(&outputs, format)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +1059,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]
@@ -987,7 +1097,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]
@@ -1065,6 +1175,81 @@ mod tests {
         let result = format_result(&data, OutputFormat::Toon);
         assert!(!result.is_error);
         assert!(!result.content[0].text.is_empty());
+    }
+
+    #[test]
+    fn tool_show_definition_schema() {
+        let tools = tool_definitions();
+        let show_tool = tools.iter().find(|t| t.name == "wonk_show").unwrap();
+        let props = show_tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("name"), "missing 'name' property");
+        assert!(props.contains_key("kind"), "missing 'kind' property");
+        assert!(props.contains_key("file"), "missing 'file' property");
+        assert!(props.contains_key("exact"), "missing 'exact' property");
+        assert!(props.contains_key("shallow"), "missing 'shallow' property");
+        assert!(props.contains_key("budget"), "missing 'budget' property");
+        assert!(props.contains_key("format"), "missing 'format' property");
+        let required = show_tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("name")));
+    }
+
+    #[test]
+    fn tool_show_dispatches_correctly() {
+        // The test_server has no index, so wonk_show returns an error about
+        // missing index — but it should dispatch to the correct handler
+        // (not "unknown tool").
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_show",
+            "arguments": {"name": "nonexistent_symbol_xyz"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        // Should be the "no index" error, not "unknown tool".
+        assert!(
+            text.contains("no index") || text.contains("[]"),
+            "expected 'no index' error or empty results, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_show_budget_truncates() {
+        use crate::pipeline;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "fn alpha() {\n    1\n}\nfn beta() {\n    2\n}\nfn gamma() {\n    3\n}\n",
+        )
+        .unwrap();
+
+        pipeline::build_index(root, true).unwrap();
+        let server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+        };
+
+        // Budget of 1 token (~4 chars) should truncate most results.
+        let params = serde_json::json!({
+            "name": "wonk_show",
+            "arguments": {"name": "a", "budget": 1, "format": "json"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap_or_default();
+
+        // With a tiny budget, the response should be a wrapper with truncation metadata.
+        if parsed.get("truncated").is_some() {
+            assert!(parsed["truncated"].as_u64().unwrap() > 0);
+            assert!(parsed["budget_limit"].as_u64().unwrap() == 1);
+        } else {
+            // If only one result fits, it's returned as a plain array — that's fine too.
+            let arr = parsed.as_array().unwrap();
+            assert!(arr.len() <= 1, "with budget=1, at most 1 result should fit");
+        }
     }
 
     #[test]

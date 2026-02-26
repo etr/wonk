@@ -252,6 +252,11 @@ pub struct ShowArgs {
     /// Require an exact match on the symbol name
     #[arg(long)]
     pub exact: bool,
+
+    /// Show container types (class, struct, enum, trait, interface) in shallow
+    /// mode: signature + child signatures without bodies
+    #[arg(long)]
+    pub shallow: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -476,6 +481,29 @@ mod tests {
         match cli.command {
             Command::Show(args) => {
                 assert!(args.exact);
+            }
+            _ => panic!("expected Command::Show"),
+        }
+    }
+
+    #[test]
+    fn parse_show_with_shallow() {
+        let cli = Cli::try_parse_from(["wonk", "show", "--shallow", "MyClass"]).unwrap();
+        match cli.command {
+            Command::Show(args) => {
+                assert_eq!(args.name, "MyClass");
+                assert!(args.shallow);
+            }
+            _ => panic!("expected Command::Show"),
+        }
+    }
+
+    #[test]
+    fn parse_show_shallow_default_false() {
+        let cli = Cli::try_parse_from(["wonk", "show", "MyClass"]).unwrap();
+        match cli.command {
+            Command::Show(args) => {
+                assert!(!args.shallow);
             }
             _ => panic!("expected Command::Show"),
         }
