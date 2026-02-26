@@ -33,7 +33,7 @@
 | M13 | Semantic Clustering (`wonk cluster`) | 2 | Complete |
 | M14 | Change Impact Analysis (`wonk impact`) | 2 | Complete |
 | M15 | Call Graph Data Model & Indexing | 2 | In Progress |
-| M16 | Source Display (`wonk show`) | 2 | In Progress |
+| M16 | Source Display (`wonk show`) | 2 | Complete |
 | M17 | Call Graph Commands | 2 | Not Started |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Not Started |
 | M19 | Edge Confidence & Inheritance Infrastructure | 3 | Not Started |
@@ -2454,7 +2454,7 @@ Add shallow mode for container types, budget truncation, and expose `wonk_show` 
 **Related Requirements:** PRD-SHOW-REQ-006, PRD-SHOW-REQ-007, PRD-SHOW-REQ-013
 **Related Decisions:** DR-017, DR-022
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
