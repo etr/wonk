@@ -19,7 +19,7 @@ use crate::errors::DbError;
 use crate::errors::SearchError;
 use crate::output::{
     self, BudgetStatus, Formatter, LsSymbolEntry, OutputFormat, RefOutput, SearchOutput,
-    SemanticOutput, SignatureOutput, SymbolOutput,
+    SemanticOutput, ShowOutput, SignatureOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -996,6 +996,62 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
+        Command::Show(args) => {
+            let repo_root = match std::env::current_dir()
+                .ok()
+                .and_then(|cwd| db::find_repo_root(&cwd).ok())
+            {
+                Some(r) => r,
+                None => {
+                    output::print_error("no repository root found");
+                    return Ok(());
+                }
+            };
+
+            let conn =
+                match db::find_existing_index(&repo_root).and_then(|path| db::open(&path).ok()) {
+                    Some(c) => c,
+                    None => {
+                        output::print_error("no index found; run `wonk init` to build the index");
+                        return Ok(());
+                    }
+                };
+
+            let options = crate::show::ShowOptions {
+                file: args.file,
+                kind: args.kind,
+                exact: args.exact,
+            };
+
+            let results = crate::show::show_symbol(&conn, &args.name, &repo_root, &options)?;
+
+            if results.is_empty() {
+                output::print_hint("no symbols found", suppress);
+            }
+
+            let mut truncated = 0usize;
+            for sr in &results {
+                let out = ShowOutput {
+                    name: sr.name.clone(),
+                    kind: sr.kind.to_string(),
+                    file: sr.file.clone(),
+                    line: sr.line,
+                    end_line: sr.end_line,
+                    source: sr.source.clone(),
+                    language: sr.language.clone(),
+                };
+
+                if !format.is_structured() {
+                    output::print_show_header(&sr.file, sr.line, sr.end_line, suppress);
+                }
+
+                if fmt.format_show(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
+            }
+
+            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+        }
     }
     Ok(())
 }
@@ -1015,6 +1071,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Ask(_)
             | Command::Cluster(_)
             | Command::Impact(_)
+            | Command::Show(_)
     )
 }
 

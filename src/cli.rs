@@ -71,6 +71,9 @@ pub enum Command {
 
     /// Analyze impact of changed symbols via semantic similarity
     Impact(ImpactArgs),
+
+    /// Show full source body of a symbol
+    Show(ShowArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -231,6 +234,24 @@ pub struct ImpactArgs {
     /// Analyze all files changed since this commit (e.g. HEAD~3)
     #[arg(long)]
     pub since: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ShowArgs {
+    /// Symbol name to look up
+    pub name: String,
+
+    /// Restrict results to a specific file path
+    #[arg(long)]
+    pub file: Option<String>,
+
+    /// Filter by symbol kind (e.g. function, class, variable)
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Require an exact match on the symbol name
+    #[arg(long)]
+    pub exact: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -406,6 +427,76 @@ mod tests {
                 assert_eq!(args.file, "src/main.rs");
             }
             _ => panic!("expected Command::Impact"),
+        }
+    }
+
+    #[test]
+    fn parse_show_basic() {
+        let cli = Cli::try_parse_from(["wonk", "show", "processPayment"]).unwrap();
+        match cli.command {
+            Command::Show(args) => {
+                assert_eq!(args.name, "processPayment");
+                assert!(args.file.is_none());
+                assert!(args.kind.is_none());
+                assert!(!args.exact);
+            }
+            _ => panic!("expected Command::Show"),
+        }
+    }
+
+    #[test]
+    fn parse_show_with_file() {
+        let cli =
+            Cli::try_parse_from(["wonk", "show", "--file", "src/billing.ts", "processPayment"])
+                .unwrap();
+        match cli.command {
+            Command::Show(args) => {
+                assert_eq!(args.name, "processPayment");
+                assert_eq!(args.file.as_deref(), Some("src/billing.ts"));
+            }
+            _ => panic!("expected Command::Show"),
+        }
+    }
+
+    #[test]
+    fn parse_show_with_kind() {
+        let cli =
+            Cli::try_parse_from(["wonk", "show", "--kind", "function", "processPayment"]).unwrap();
+        match cli.command {
+            Command::Show(args) => {
+                assert_eq!(args.kind.as_deref(), Some("function"));
+            }
+            _ => panic!("expected Command::Show"),
+        }
+    }
+
+    #[test]
+    fn parse_show_with_exact() {
+        let cli = Cli::try_parse_from(["wonk", "show", "--exact", "processPayment"]).unwrap();
+        match cli.command {
+            Command::Show(args) => {
+                assert!(args.exact);
+            }
+            _ => panic!("expected Command::Show"),
+        }
+    }
+
+    #[test]
+    fn parse_show_requires_name() {
+        let result = Cli::try_parse_from(["wonk", "show"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_show_with_global_format() {
+        let cli =
+            Cli::try_parse_from(["wonk", "--format", "json", "show", "processPayment"]).unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Show(args) => {
+                assert_eq!(args.name, "processPayment");
+            }
+            _ => panic!("expected Command::Show"),
         }
     }
 

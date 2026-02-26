@@ -190,6 +190,19 @@ pub struct ImpactOutput {
     pub impacted: Vec<ImpactEntryOutput>,
 }
 
+/// A symbol with its full source body, returned by `wonk show`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShowOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    pub source: String,
+    pub language: String,
+}
+
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
 /// output. In grep mode the summary goes to stderr instead.
 #[derive(Debug, Clone, Serialize)]
@@ -745,6 +758,43 @@ impl<W: Write> Formatter<W> {
                 "  {} ({}) [{:.4}]",
                 entry.symbol_name, entry.symbol_kind, entry.similarity_score
             )
+        }
+    }
+
+    /// Format a single `wonk show` result.
+    pub fn format_show(&mut self, out: &ShowOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_show(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_show(fmt, &out))
+    }
+
+    /// Shared render logic for a show result.
+    fn render_show<W2: Write>(fmt: &mut Formatter<W2>, out: &ShowOutput) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            // Grep mode: number each source line starting from `out.line`.
+            for (i, content) in out.source.lines().enumerate() {
+                let line_no = out.line + i;
+                write!(fmt.writer, "{:>4}| ", line_no)?;
+                writeln!(fmt.writer, "{content}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Print a show header to stderr (grep mode): "file:start-end".
+pub fn print_show_header(file: &str, start_line: usize, end_line: Option<usize>, suppress: bool) {
+    if !suppress {
+        if let Some(end) = end_line {
+            eprintln!("{file}:{start_line}-{end}");
+        } else {
+            eprintln!("{file}:{start_line}");
         }
     }
 }
@@ -2222,5 +2272,76 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["changed_symbol"]["name"], "verifyToken");
         assert_eq!(v["impacted"][0]["symbol_name"], "validateSession");
+    }
+
+    // -- ShowOutput ----------------------------------------------------------
+
+    #[test]
+    fn show_grep_format_numbered_lines() {
+        let out = ShowOutput {
+            name: "processPayment".into(),
+            kind: "function".into(),
+            file: "src/billing.ts".into(),
+            line: 10,
+            end_line: Some(12),
+            source: "function processPayment() {\n  return true;\n}".into(),
+            language: "TypeScript".into(),
+        };
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_show(&out));
+        assert!(rendered.contains("  10| function processPayment()"));
+        assert!(rendered.contains("  11|   return true;"));
+        assert!(rendered.contains("  12| }"));
+    }
+
+    #[test]
+    fn show_json_format() {
+        let out = ShowOutput {
+            name: "foo".into(),
+            kind: "function".into(),
+            file: "src/lib.rs".into(),
+            line: 5,
+            end_line: Some(8),
+            source: "fn foo() {\n  42\n}".into(),
+            language: "Rust".into(),
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_show(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["name"], "foo");
+        assert_eq!(v["kind"], "function");
+        assert_eq!(v["file"], "src/lib.rs");
+        assert_eq!(v["line"], 5);
+        assert_eq!(v["end_line"], 8);
+        assert!(v["source"].as_str().unwrap().contains("fn foo()"));
+        assert_eq!(v["language"], "Rust");
+    }
+
+    #[test]
+    fn show_json_skips_end_line_when_none() {
+        let out = ShowOutput {
+            name: "MAX".into(),
+            kind: "constant".into(),
+            file: "src/config.rs".into(),
+            line: 3,
+            end_line: None,
+            source: "const MAX: usize = 1024;".into(),
+            language: "Rust".into(),
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_show(&out));
+        assert!(!rendered.contains("end_line"));
+    }
+
+    #[test]
+    fn show_grep_single_line() {
+        let out = ShowOutput {
+            name: "MAX".into(),
+            kind: "constant".into(),
+            file: "src/config.rs".into(),
+            line: 3,
+            end_line: None,
+            source: "const MAX: usize = 1024;".into(),
+            language: "Rust".into(),
+        };
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_show(&out));
+        assert_eq!(rendered, "   3| const MAX: usize = 1024;\n");
     }
 }

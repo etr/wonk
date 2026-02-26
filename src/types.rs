@@ -273,6 +273,25 @@ pub struct ImpactResult {
     pub similarity_score: f32,
 }
 
+/// A symbol with its full source body, returned by `wonk show`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowResult {
+    /// The symbol name.
+    pub name: String,
+    /// What kind of symbol this is.
+    pub kind: SymbolKind,
+    /// Path of the source file (relative to repo root).
+    pub file: String,
+    /// 1-based line number where the symbol starts.
+    pub line: usize,
+    /// 1-based line number where the symbol ends (if applicable).
+    pub end_line: Option<usize>,
+    /// Full source body (lines between start and end) or signature fallback.
+    pub source: String,
+    /// Language name (e.g. "Rust", "Python").
+    pub language: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +369,55 @@ mod tests {
         assert_eq!(sr.kind, SymbolKind::Function);
         assert_eq!(sr.file, "src/lib.rs");
         assert_eq!(sr.line, 5);
+    }
+
+    #[test]
+    fn show_result_creation() {
+        let sr = ShowResult {
+            name: "processPayment".into(),
+            kind: SymbolKind::Function,
+            file: "src/billing.ts".into(),
+            line: 10,
+            end_line: Some(25),
+            source: "function processPayment() {\n  // ...\n}".into(),
+            language: "TypeScript".into(),
+        };
+        assert_eq!(sr.name, "processPayment");
+        assert_eq!(sr.kind, SymbolKind::Function);
+        assert_eq!(sr.file, "src/billing.ts");
+        assert_eq!(sr.line, 10);
+        assert_eq!(sr.end_line, Some(25));
+        assert!(sr.source.contains("processPayment"));
+        assert_eq!(sr.language, "TypeScript");
+    }
+
+    #[test]
+    fn show_result_equality_by_value() {
+        let a = ShowResult {
+            name: "foo".into(),
+            kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 1,
+            end_line: Some(5),
+            source: "fn foo() {}".into(),
+            language: "Rust".into(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn show_result_without_end_line() {
+        let sr = ShowResult {
+            name: "MAX_SIZE".into(),
+            kind: SymbolKind::Constant,
+            file: "src/config.rs".into(),
+            line: 3,
+            end_line: None,
+            source: "const MAX_SIZE: usize = 1024;".into(),
+            language: "Rust".into(),
+        };
+        assert!(sr.end_line.is_none());
+        assert!(sr.source.contains("MAX_SIZE"));
     }
 }
