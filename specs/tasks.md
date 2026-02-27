@@ -2547,7 +2547,7 @@ Implement `wonk callpath <from> <to>` that finds call chains between two symbols
 **Related Requirements:** PRD-CGR-REQ-009, PRD-CGR-REQ-010, PRD-CGR-REQ-014
 **Related Decisions:** DR-016, DR-022
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
