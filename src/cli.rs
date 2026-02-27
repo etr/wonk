@@ -80,6 +80,9 @@ pub enum Command {
 
     /// Find all callees of a symbol (symbols referenced within its body)
     Callees(CalleesArgs),
+
+    /// Find a call chain between two symbols
+    Callpath(CallpathArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -283,6 +286,14 @@ pub struct CalleesArgs {
     /// Transitive expansion depth (default: 1 = direct callees only, max: 10)
     #[arg(long, default_value_t = 1)]
     pub depth: usize,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CallpathArgs {
+    /// Starting symbol name
+    pub from: String,
+    /// Target symbol name
+    pub to: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -650,5 +661,39 @@ mod tests {
             }
             _ => panic!("expected Command::Callers"),
         }
+    }
+
+    // -- Callpath tests -------------------------------------------------------
+
+    #[test]
+    fn parse_callpath_basic() {
+        let cli = Cli::try_parse_from(["wonk", "callpath", "main", "dispatch"]).unwrap();
+        match cli.command {
+            Command::Callpath(args) => {
+                assert_eq!(args.from, "main");
+                assert_eq!(args.to, "dispatch");
+            }
+            _ => panic!("expected Command::Callpath"),
+        }
+    }
+
+    #[test]
+    fn parse_callpath_with_format() {
+        let cli =
+            Cli::try_parse_from(["wonk", "--format", "json", "callpath", "foo", "bar"]).unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Callpath(args) => {
+                assert_eq!(args.from, "foo");
+                assert_eq!(args.to, "bar");
+            }
+            _ => panic!("expected Command::Callpath"),
+        }
+    }
+
+    #[test]
+    fn parse_callpath_requires_both_args() {
+        let result = Cli::try_parse_from(["wonk", "callpath", "foo"]);
+        assert!(result.is_err(), "callpath requires both from and to");
     }
 }

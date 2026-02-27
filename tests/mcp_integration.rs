@@ -113,7 +113,7 @@ fn mcp_server_initialize_and_list_tools() {
     assert_eq!(list_resp["id"], 2);
     assert!(list_resp["error"].is_null());
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 13);
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(tool_names.contains(&"wonk_search"));
@@ -126,6 +126,7 @@ fn mcp_server_initialize_and_list_tools() {
     assert!(tool_names.contains(&"wonk_rdeps"));
     assert!(tool_names.contains(&"wonk_status"));
     assert!(tool_names.contains(&"wonk_init"));
+    assert!(tool_names.contains(&"wonk_callpath"));
 
     // 4. Send tools/call for wonk_status.
     let status_req = serde_json::json!({

@@ -18,8 +18,8 @@ use serde_json::Value;
 use crate::budget::TokenBudget;
 use crate::db;
 use crate::output::{
-    CalleeOutput, CallerOutput, DepOutput, OutputFormat, RefOutput, SearchOutput, ShowOutput,
-    SignatureOutput, SymbolOutput,
+    CallPathHopOutput, CalleeOutput, CallerOutput, DepOutput, OutputFormat, RefOutput,
+    SearchOutput, ShowOutput, SignatureOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::Progress;
@@ -584,6 +584,30 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     "required": ["name"]
                 }),
             },
+            Tool {
+                name: "wonk_callpath",
+                description: "Find a call chain between two symbols via BFS traversal. Returns the shortest path from the source symbol to the target symbol.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "from": {
+                            "type": "string",
+                            "description": "Source symbol name (start of call chain)"
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "Target symbol name (end of call chain)"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["from", "to"]
+                }),
+            },
         ]
     })
 }
@@ -644,6 +668,7 @@ impl McpServer {
             "wonk_show" => self.tool_show(call.arguments),
             "wonk_callers" => self.tool_callers(call.arguments),
             "wonk_callees" => self.tool_callees(call.arguments),
+            "wonk_callpath" => self.tool_callpath(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1096,6 +1121,48 @@ impl McpServer {
 
         collect_with_budget(outputs, budget_limit, format)
     }
+
+    fn tool_callpath(&self, args: Value) -> CallToolResult {
+        let from = match require_str(&args, "from") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let to = match require_str(&args, "to") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let format = extract_format(&args);
+
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => {
+                return CallToolResult::error("no index available; run wonk_init first".into());
+            }
+        };
+
+        if !crate::callgraph::has_caller_id_data(conn) {
+            return CallToolResult::error(
+                "index lacks call graph data; run wonk_init to re-index".into(),
+            );
+        }
+
+        match crate::callgraph::callpath(conn, &from, &to) {
+            Ok(Some(hops)) => {
+                let outputs: Vec<CallPathHopOutput> = hops
+                    .iter()
+                    .map(|h| CallPathHopOutput {
+                        symbol_name: h.symbol_name.clone(),
+                        symbol_kind: h.symbol_kind.to_string(),
+                        file: h.file.clone(),
+                        line: h.line,
+                    })
+                    .collect();
+                format_result(&outputs, format)
+            }
+            Ok(None) => format_result(&Vec::<CallPathHopOutput>::new(), format),
+            Err(e) => CallToolResult::error(format!("callpath query failed: {e}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,7 +1319,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -1290,7 +1357,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -1472,11 +1539,11 @@ mod tests {
     // -- Callers/Callees MCP tests -------------------------------------------
 
     #[test]
-    fn tools_list_returns_twelve_tools() {
+    fn tools_list_returns_thirteen_tools() {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -1530,6 +1597,34 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap_or("");
         assert!(
             text.contains("no index") || text.contains("[]") || text.contains("call graph"),
+            "expected index/callgraph error, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_callpath_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_callpath").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("from"), "missing 'from' property");
+        assert!(props.contains_key("to"), "missing 'to' property");
+        assert!(props.contains_key("format"), "missing 'format' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("from")));
+        assert!(required.contains(&serde_json::json!("to")));
+    }
+
+    #[test]
+    fn tool_callpath_dispatches_correctly() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_callpath",
+            "arguments": {"from": "nonexistent_xyz", "to": "nonexistent_abc"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("no index") || text.contains("no path") || text.contains("call graph"),
             "expected index/callgraph error, got: {text}"
         );
     }

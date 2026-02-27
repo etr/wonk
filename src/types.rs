@@ -344,6 +344,19 @@ pub struct CalleeResult {
     pub source_file: Option<String>,
 }
 
+/// A single hop in a call path between two symbols, returned by `wonk callpath`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallPathHop {
+    /// The symbol name at this hop.
+    pub symbol_name: String,
+    /// What kind of symbol this is.
+    pub symbol_kind: SymbolKind,
+    /// Path of the source file containing the symbol.
+    pub file: String,
+    /// 1-based line number of the symbol definition.
+    pub line: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +567,32 @@ mod tests {
             context: "bar()".into(),
             depth: 2,
             source_file: None,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn callpath_hop_creation() {
+        let hop = CallPathHop {
+            symbol_name: "dispatch".into(),
+            symbol_kind: SymbolKind::Function,
+            file: "src/router.rs".into(),
+            line: 50,
+        };
+        assert_eq!(hop.symbol_name, "dispatch");
+        assert_eq!(hop.symbol_kind, SymbolKind::Function);
+        assert_eq!(hop.file, "src/router.rs");
+        assert_eq!(hop.line, 50);
+    }
+
+    #[test]
+    fn callpath_hop_equality_by_value() {
+        let a = CallPathHop {
+            symbol_name: "foo".into(),
+            symbol_kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 1,
         };
         let b = a.clone();
         assert_eq!(a, b);

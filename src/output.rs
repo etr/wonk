@@ -231,6 +231,15 @@ pub struct CallerOutput {
     pub target_file: Option<String>,
 }
 
+/// A single hop in a call path, for `wonk callpath` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallPathHopOutput {
+    pub symbol_name: String,
+    pub symbol_kind: String,
+    pub file: String,
+    pub line: usize,
+}
+
 /// A callee of a symbol, for `wonk callees` output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalleeOutput {
@@ -878,6 +887,43 @@ impl<W: Write> Formatter<W> {
             fmt.write_line_no(out.line)?;
             fmt.write_sep()?;
             writeln!(fmt.writer, "{}", out.context)
+        }
+    }
+
+    /// Format a call path (sequence of hops from source to target).
+    pub fn format_callpath(&mut self, hops: &[CallPathHopOutput]) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_callpath(self, hops)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let hops = hops.to_vec();
+        self.budgeted_write(move |fmt| Self::render_callpath(fmt, &hops))
+    }
+
+    /// Shared render logic for a call path.
+    fn render_callpath<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        hops: &[CallPathHopOutput],
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            // Emit each hop as a separate JSON/TOON line.
+            for hop in hops {
+                let line = Self::serialize_structured(fmt.format, hop)?;
+                writeln!(fmt.writer, "{line}")?;
+            }
+            Ok(())
+        } else {
+            // Grep format: chain line then per-hop file:line details.
+            let chain: Vec<&str> = hops.iter().map(|h| h.symbol_name.as_str()).collect();
+            writeln!(fmt.writer, "{}", chain.join(" -> "))?;
+            for hop in hops {
+                writeln!(
+                    fmt.writer,
+                    "  {} ({})\t{}:{}",
+                    hop.symbol_name, hop.symbol_kind, hop.file, hop.line
+                )?;
+            }
+            Ok(())
         }
     }
 }
@@ -2562,5 +2608,68 @@ mod tests {
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_callee(&out));
         let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
         assert!(v.get("source_file").is_none());
+    }
+
+    // -- CallPathHopOutput ---------------------------------------------------
+
+    #[test]
+    fn callpath_grep_format() {
+        let hops = vec![
+            CallPathHopOutput {
+                symbol_name: "main".into(),
+                symbol_kind: "function".into(),
+                file: "src/main.rs".into(),
+                line: 1,
+            },
+            CallPathHopOutput {
+                symbol_name: "dispatch".into(),
+                symbol_kind: "function".into(),
+                file: "src/router.rs".into(),
+                line: 50,
+            },
+            CallPathHopOutput {
+                symbol_name: "open_db".into(),
+                symbol_kind: "function".into(),
+                file: "src/db.rs".into(),
+                line: 10,
+            },
+        ];
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_callpath(&hops));
+        // First line should be the chain.
+        assert!(rendered.contains("main -> dispatch -> open_db"));
+        // Should include file:line details for each hop.
+        assert!(rendered.contains("src/main.rs:1"));
+        assert!(rendered.contains("src/router.rs:50"));
+        assert!(rendered.contains("src/db.rs:10"));
+    }
+
+    #[test]
+    fn callpath_json_format() {
+        let hops = vec![
+            CallPathHopOutput {
+                symbol_name: "a".into(),
+                symbol_kind: "function".into(),
+                file: "a.rs".into(),
+                line: 1,
+            },
+            CallPathHopOutput {
+                symbol_name: "b".into(),
+                symbol_kind: "function".into(),
+                file: "b.rs".into(),
+                line: 5,
+            },
+        ];
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_callpath(&hops));
+        // Each line should be a valid JSON object.
+        let lines: Vec<&str> = rendered.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v0["symbol_name"], "a");
+        assert_eq!(v0["file"], "a.rs");
+        assert_eq!(v0["line"], 1);
+        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v1["symbol_name"], "b");
+        assert_eq!(v1["file"], "b.rs");
+        assert_eq!(v1["line"], 5);
     }
 }

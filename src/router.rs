@@ -18,8 +18,9 @@ use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
 use crate::output::{
-    self, BudgetStatus, CalleeOutput, CallerOutput, Formatter, LsSymbolEntry, OutputFormat,
-    RefOutput, SearchOutput, SemanticOutput, ShowOutput, SignatureOutput, SymbolOutput,
+    self, BudgetStatus, CallPathHopOutput, CalleeOutput, CallerOutput, Formatter, LsSymbolEntry,
+    OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput, SignatureOutput,
+    SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -1110,14 +1111,40 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
+        Command::Callpath(args) => {
+            let conn = match callgraph_conn(suppress) {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+
+            let path = crate::callgraph::callpath(&conn, &args.from, &args.to)?;
+
+            match path {
+                Some(hops) => {
+                    let outputs: Vec<CallPathHopOutput> = hops
+                        .iter()
+                        .map(|h| CallPathHopOutput {
+                            symbol_name: h.symbol_name.clone(),
+                            symbol_kind: h.symbol_kind.to_string(),
+                            file: h.file.clone(),
+                            line: h.line,
+                        })
+                        .collect();
+
+                    fmt.format_callpath(&outputs)?;
+                }
+                None => {
+                    output::print_hint("no path found", suppress);
+                }
+            }
+        }
     }
     Ok(())
 }
 
-/// Shared setup for `Command::Callers` and `Command::Callees`: resolve repo
-/// root, open connection, check caller_id data, and clamp depth.
-/// Returns `None` when an early-exit error/hint was emitted.
-fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection, usize)> {
+/// Open a call graph connection: resolve repo root, open index, check
+/// caller_id data. Returns `None` when an early-exit error/hint was emitted.
+fn callgraph_conn(suppress: bool) -> Option<Connection> {
     let repo_root = match std::env::current_dir()
         .ok()
         .and_then(|cwd| db::find_repo_root(&cwd).ok())
@@ -1144,6 +1171,14 @@ fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection
         );
         return None;
     }
+
+    Some(conn)
+}
+
+/// Shared setup for `Command::Callers` and `Command::Callees`: open connection
+/// and clamp depth. Returns `None` when an early-exit error/hint was emitted.
+fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection, usize)> {
+    let conn = callgraph_conn(suppress)?;
 
     let (depth, clamped) = crate::callgraph::clamp_depth(requested_depth);
     if clamped {
@@ -1177,6 +1212,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Impact(_)
             | Command::Callers(_)
             | Command::Callees(_)
+            | Command::Callpath(_)
     )
 }
 
@@ -4602,6 +4638,16 @@ mod tests {
         let cmd = Command::Callees(CalleesArgs {
             name: "main".into(),
             depth: 1,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_callpath() {
+        use crate::cli::CallpathArgs;
+        let cmd = Command::Callpath(CallpathArgs {
+            from: "main".into(),
+            to: "dispatch".into(),
         });
         assert!(is_query_command(&cmd));
     }
