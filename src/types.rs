@@ -403,7 +403,7 @@ impl fmt::Display for SummaryPathType {
 }
 
 /// Aggregated structural metrics for a file or directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SummaryMetrics {
     /// Number of indexed files.
     pub file_count: usize,
