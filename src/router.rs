@@ -20,7 +20,7 @@ use crate::errors::SearchError;
 use crate::output::{
     self, BudgetStatus, CallPathHopOutput, CalleeOutput, CallerOutput, Formatter, LsSymbolEntry,
     OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput, SignatureOutput,
-    SymbolOutput,
+    SummaryOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -1138,6 +1138,54 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Summary(args) => {
+            let repo_root = match std::env::current_dir()
+                .ok()
+                .and_then(|cwd| db::find_repo_root(&cwd).ok())
+            {
+                Some(r) => r,
+                None => {
+                    output::print_error("no repository root found");
+                    return Ok(());
+                }
+            };
+
+            let conn =
+                match db::find_existing_index(&repo_root).and_then(|path| db::open(&path).ok()) {
+                    Some(c) => c,
+                    None => {
+                        output::print_error("no index found; run `wonk init` to build the index");
+                        return Ok(());
+                    }
+                };
+
+            let detail = match args.detail.parse::<crate::types::DetailLevel>() {
+                Ok(d) => d,
+                Err(e) => {
+                    output::print_error(&e);
+                    return Ok(());
+                }
+            };
+
+            let depth = if args.recursive {
+                None // unlimited
+            } else if args.depth == 0 {
+                Some(0)
+            } else {
+                Some(args.depth)
+            };
+
+            let options = crate::summary::SummaryOptions {
+                detail,
+                depth,
+                suppress,
+            };
+
+            let result = crate::summary::summarize_path(&conn, &args.path, &repo_root, &options)?;
+
+            let out = SummaryOutput::from_result(&result);
+            fmt.format_summary(&out)?;
+        }
     }
     Ok(())
 }
@@ -1213,6 +1261,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Callers(_)
             | Command::Callees(_)
             | Command::Callpath(_)
+            | Command::Summary(_)
     )
 }
 

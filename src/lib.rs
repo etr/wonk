@@ -19,6 +19,7 @@ pub mod router;
 pub mod search;
 pub mod semantic;
 pub mod show;
+pub mod summary;
 pub mod types;
 pub mod walker;
 pub mod watcher;
