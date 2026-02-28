@@ -2596,7 +2596,7 @@ Implement `wonk summary <path>` with structural metrics aggregation, three detai
 **Related Requirements:** PRD-SUM-REQ-001 through PRD-SUM-REQ-008, PRD-SUM-REQ-016, PRD-SUM-REQ-017, PRD-SUM-REQ-018
 **Related Decisions:** DR-018, DR-019, DR-020, DR-022
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
