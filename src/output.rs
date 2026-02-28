@@ -231,6 +231,111 @@ pub struct CallerOutput {
     pub target_file: Option<String>,
 }
 
+/// A symbol count entry for summary output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolCountEntry {
+    pub kind: String,
+    pub count: usize,
+}
+
+/// A language entry for summary output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageEntry {
+    pub language: String,
+    pub count: usize,
+}
+
+/// Aggregated metrics for summary output, with optional fields for detail-level control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryMetricsOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_counts: Option<Vec<SymbolCountEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<LanguageEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_count: Option<usize>,
+}
+
+/// Structural summary output for a file or directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryOutput {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub path_type: String,
+    pub detail_level: String,
+    pub metrics: SummaryMetricsOutput,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<SummaryOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl SummaryOutput {
+    /// Build a `SummaryOutput` from a `SummaryResult`, applying detail-level filtering.
+    pub fn from_result(sr: &crate::types::SummaryResult) -> Self {
+        use crate::types::DetailLevel;
+
+        let m = &sr.metrics;
+
+        // Build shared mappings once, referenced per detail level.
+        let symbol_counts_out: Vec<SymbolCountEntry> = m
+            .symbol_counts
+            .iter()
+            .map(|(k, c)| SymbolCountEntry {
+                kind: k.clone(),
+                count: *c,
+            })
+            .collect();
+        let languages_out: Vec<LanguageEntry> = m
+            .language_breakdown
+            .iter()
+            .map(|(l, c)| LanguageEntry {
+                language: l.clone(),
+                count: *c,
+            })
+            .collect();
+
+        let metrics = match sr.detail_level {
+            DetailLevel::Rich => SummaryMetricsOutput {
+                file_count: Some(m.file_count),
+                line_count: Some(m.line_count),
+                symbol_counts: Some(symbol_counts_out),
+                languages: Some(languages_out),
+                dependency_count: Some(m.dependency_count),
+            },
+            DetailLevel::Light => SummaryMetricsOutput {
+                file_count: Some(m.file_count),
+                line_count: None,
+                symbol_counts: Some(symbol_counts_out),
+                languages: Some(languages_out),
+                dependency_count: None,
+            },
+            DetailLevel::Symbols => SummaryMetricsOutput {
+                file_count: None,
+                line_count: None,
+                symbol_counts: Some(symbol_counts_out),
+                languages: None,
+                dependency_count: None,
+            },
+        };
+
+        let children = sr.children.iter().map(SummaryOutput::from_result).collect();
+
+        Self {
+            path: sr.path.clone(),
+            path_type: sr.path_type.to_string(),
+            detail_level: sr.detail_level.to_string(),
+            metrics,
+            children,
+            description: sr.description.clone(),
+        }
+    }
+}
+
 /// A single hop in a call path, for `wonk callpath` output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallPathHopOutput {
@@ -898,6 +1003,77 @@ impl<W: Write> Formatter<W> {
         }
         let hops = hops.to_vec();
         self.budgeted_write(move |fmt| Self::render_callpath(fmt, &hops))
+    }
+
+    /// Format a summary result.
+    pub fn format_summary(&mut self, out: &SummaryOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_summary(self, out, 0)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_summary(fmt, &out, 0))
+    }
+
+    /// Shared render logic for a summary result (recursive with indent level).
+    fn render_summary<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &SummaryOutput,
+        indent: usize,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            let prefix = "  ".repeat(indent);
+
+            // Path header.
+            writeln!(
+                fmt.writer,
+                "{prefix}Summary: {} ({})",
+                out.path, out.path_type
+            )?;
+
+            let m = &out.metrics;
+
+            if let Some(fc) = m.file_count {
+                writeln!(fmt.writer, "{prefix}  Files: {fc}")?;
+            }
+            if let Some(lc) = m.line_count {
+                writeln!(fmt.writer, "{prefix}  Lines: {lc}")?;
+            }
+            if let Some(ref syms) = m.symbol_counts
+                && !syms.is_empty()
+            {
+                let parts: Vec<String> = syms
+                    .iter()
+                    .map(|s| format!("{}: {}", s.kind, s.count))
+                    .collect();
+                writeln!(fmt.writer, "{prefix}  Symbols: {}", parts.join(", "))?;
+            }
+            if let Some(ref langs) = m.languages
+                && !langs.is_empty()
+            {
+                let parts: Vec<String> = langs
+                    .iter()
+                    .map(|l| format!("{}: {}", l.language, l.count))
+                    .collect();
+                writeln!(fmt.writer, "{prefix}  Languages: {}", parts.join(", "))?;
+            }
+            if let Some(dc) = m.dependency_count {
+                writeln!(fmt.writer, "{prefix}  Dependencies: {dc}")?;
+            }
+            if let Some(ref desc) = out.description {
+                writeln!(fmt.writer, "{prefix}  Description: {desc}")?;
+            }
+
+            // Render children recursively.
+            for child in &out.children {
+                Self::render_summary(fmt, child, indent + 1)?;
+            }
+
+            Ok(())
+        }
     }
 
     /// Shared render logic for a call path.
@@ -2671,5 +2847,185 @@ mod tests {
         assert_eq!(v1["symbol_name"], "b");
         assert_eq!(v1["file"], "b.rs");
         assert_eq!(v1["line"], 5);
+    }
+
+    // -- SummaryOutput --------------------------------------------------------
+
+    fn make_summary_output() -> SummaryOutput {
+        SummaryOutput {
+            path: "src/".into(),
+            path_type: "directory".into(),
+            detail_level: "rich".into(),
+            metrics: SummaryMetricsOutput {
+                file_count: Some(10),
+                line_count: Some(500),
+                symbol_counts: Some(vec![
+                    SymbolCountEntry {
+                        kind: "function".into(),
+                        count: 20,
+                    },
+                    SymbolCountEntry {
+                        kind: "class".into(),
+                        count: 5,
+                    },
+                ]),
+                languages: Some(vec![LanguageEntry {
+                    language: "Rust".into(),
+                    count: 10,
+                }]),
+                dependency_count: Some(15),
+            },
+            children: vec![],
+            description: None,
+        }
+    }
+
+    #[test]
+    fn summary_grep_format_shows_metrics() {
+        let out = make_summary_output();
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_summary(&out));
+        assert!(rendered.contains("Summary: src/ (directory)"));
+        assert!(rendered.contains("Files: 10"));
+        assert!(rendered.contains("Lines: 500"));
+        assert!(rendered.contains("function: 20"));
+        assert!(rendered.contains("class: 5"));
+        assert!(rendered.contains("Rust: 10"));
+        assert!(rendered.contains("Dependencies: 15"));
+    }
+
+    #[test]
+    fn summary_json_format() {
+        let out = make_summary_output();
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_summary(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["path"], "src/");
+        assert_eq!(v["type"], "directory");
+        assert_eq!(v["detail_level"], "rich");
+        assert_eq!(v["metrics"]["file_count"], 10);
+        assert_eq!(v["metrics"]["line_count"], 500);
+        assert_eq!(v["metrics"]["dependency_count"], 15);
+        assert!(v["metrics"]["symbol_counts"].is_array());
+        assert!(v["metrics"]["languages"].is_array());
+    }
+
+    #[test]
+    fn summary_json_omits_empty_children() {
+        let out = make_summary_output();
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_summary(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert!(v.get("children").is_none());
+    }
+
+    #[test]
+    fn summary_json_omits_null_description() {
+        let out = make_summary_output();
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_summary(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert!(v.get("description").is_none());
+    }
+
+    #[test]
+    fn summary_output_from_result_rich() {
+        use crate::types::{DetailLevel, SummaryMetrics, SummaryPathType, SummaryResult};
+
+        let sr = SummaryResult {
+            path: "src/".into(),
+            path_type: SummaryPathType::Directory,
+            detail_level: DetailLevel::Rich,
+            metrics: SummaryMetrics {
+                file_count: 5,
+                line_count: 200,
+                symbol_counts: vec![("function".into(), 10)],
+                language_breakdown: vec![("Rust".into(), 5)],
+                dependency_count: 3,
+            },
+            children: vec![],
+            description: None,
+        };
+
+        let out = SummaryOutput::from_result(&sr);
+        assert_eq!(out.path, "src/");
+        assert_eq!(out.metrics.file_count, Some(5));
+        assert_eq!(out.metrics.line_count, Some(200));
+        assert_eq!(out.metrics.dependency_count, Some(3));
+        assert!(out.metrics.symbol_counts.is_some());
+        assert!(out.metrics.languages.is_some());
+    }
+
+    #[test]
+    fn summary_output_from_result_light() {
+        use crate::types::{DetailLevel, SummaryMetrics, SummaryPathType, SummaryResult};
+
+        let sr = SummaryResult {
+            path: "src/".into(),
+            path_type: SummaryPathType::Directory,
+            detail_level: DetailLevel::Light,
+            metrics: SummaryMetrics {
+                file_count: 5,
+                line_count: 200,
+                symbol_counts: vec![("function".into(), 10)],
+                language_breakdown: vec![("Rust".into(), 5)],
+                dependency_count: 3,
+            },
+            children: vec![],
+            description: None,
+        };
+
+        let out = SummaryOutput::from_result(&sr);
+        assert_eq!(out.metrics.file_count, Some(5));
+        assert!(out.metrics.line_count.is_none());
+        assert!(out.metrics.dependency_count.is_none());
+        assert!(out.metrics.symbol_counts.is_some());
+        assert!(out.metrics.languages.is_some());
+    }
+
+    #[test]
+    fn summary_output_from_result_symbols() {
+        use crate::types::{DetailLevel, SummaryMetrics, SummaryPathType, SummaryResult};
+
+        let sr = SummaryResult {
+            path: "src/".into(),
+            path_type: SummaryPathType::Directory,
+            detail_level: DetailLevel::Symbols,
+            metrics: SummaryMetrics {
+                file_count: 5,
+                line_count: 200,
+                symbol_counts: vec![("function".into(), 10)],
+                language_breakdown: vec![("Rust".into(), 5)],
+                dependency_count: 3,
+            },
+            children: vec![],
+            description: None,
+        };
+
+        let out = SummaryOutput::from_result(&sr);
+        assert!(out.metrics.file_count.is_none());
+        assert!(out.metrics.line_count.is_none());
+        assert!(out.metrics.dependency_count.is_none());
+        assert!(out.metrics.symbol_counts.is_some());
+        assert!(out.metrics.languages.is_none());
+    }
+
+    #[test]
+    fn summary_grep_with_children() {
+        let child = SummaryOutput {
+            path: "src/lib.rs".into(),
+            path_type: "file".into(),
+            detail_level: "rich".into(),
+            metrics: SummaryMetricsOutput {
+                file_count: Some(1),
+                line_count: Some(100),
+                symbol_counts: Some(vec![]),
+                languages: Some(vec![]),
+                dependency_count: Some(0),
+            },
+            children: vec![],
+            description: None,
+        };
+        let mut out = make_summary_output();
+        out.children = vec![child];
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_summary(&out));
+        // Child should be indented.
+        assert!(rendered.contains("  Summary: src/lib.rs (file)"));
     }
 }

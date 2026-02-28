@@ -83,6 +83,9 @@ pub enum Command {
 
     /// Find a call chain between two symbols
     Callpath(CallpathArgs),
+
+    /// Show a structural summary of a file or directory
+    Summary(SummaryArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -294,6 +297,28 @@ pub struct CallpathArgs {
     pub from: String,
     /// Target symbol name
     pub to: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SummaryArgs {
+    /// Path to summarize (file or directory)
+    pub path: String,
+
+    /// Detail level: rich (default), light, or symbols
+    #[arg(long, default_value = "rich")]
+    pub detail: String,
+
+    /// Recursion depth for child summaries (0 = target only)
+    #[arg(long, default_value_t = 0)]
+    pub depth: usize,
+
+    /// Show full recursive hierarchy (unlimited depth)
+    #[arg(long, conflicts_with = "depth")]
+    pub recursive: bool,
+
+    /// Include AI-generated description (requires embeddings)
+    #[arg(long)]
+    pub semantic: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -695,5 +720,104 @@ mod tests {
     fn parse_callpath_requires_both_args() {
         let result = Cli::try_parse_from(["wonk", "callpath", "foo"]);
         assert!(result.is_err(), "callpath requires both from and to");
+    }
+
+    // -- Summary tests --------------------------------------------------------
+
+    #[test]
+    fn parse_summary_basic() {
+        let cli = Cli::try_parse_from(["wonk", "summary", "src/"]).unwrap();
+        match cli.command {
+            Command::Summary(args) => {
+                assert_eq!(args.path, "src/");
+                assert_eq!(args.detail, "rich");
+                assert_eq!(args.depth, 0);
+                assert!(!args.recursive);
+                assert!(!args.semantic);
+            }
+            _ => panic!("expected Command::Summary"),
+        }
+    }
+
+    #[test]
+    fn parse_summary_with_detail() {
+        let cli = Cli::try_parse_from(["wonk", "summary", "--detail", "light", "src/"]).unwrap();
+        match cli.command {
+            Command::Summary(args) => {
+                assert_eq!(args.detail, "light");
+            }
+            _ => panic!("expected Command::Summary"),
+        }
+    }
+
+    #[test]
+    fn parse_summary_with_depth() {
+        let cli = Cli::try_parse_from(["wonk", "summary", "--depth", "2", "src/"]).unwrap();
+        match cli.command {
+            Command::Summary(args) => {
+                assert_eq!(args.depth, 2);
+                assert!(!args.recursive);
+            }
+            _ => panic!("expected Command::Summary"),
+        }
+    }
+
+    #[test]
+    fn parse_summary_recursive() {
+        let cli = Cli::try_parse_from(["wonk", "summary", "--recursive", "src/"]).unwrap();
+        match cli.command {
+            Command::Summary(args) => {
+                assert!(args.recursive);
+            }
+            _ => panic!("expected Command::Summary"),
+        }
+    }
+
+    #[test]
+    fn parse_summary_recursive_conflicts_with_depth() {
+        let result =
+            Cli::try_parse_from(["wonk", "summary", "--recursive", "--depth", "2", "src/"]);
+        assert!(result.is_err(), "--recursive and --depth should conflict");
+    }
+
+    #[test]
+    fn parse_summary_semantic_flag() {
+        let cli = Cli::try_parse_from(["wonk", "summary", "--semantic", "src/"]).unwrap();
+        match cli.command {
+            Command::Summary(args) => {
+                assert!(args.semantic);
+            }
+            _ => panic!("expected Command::Summary"),
+        }
+    }
+
+    #[test]
+    fn parse_summary_requires_path() {
+        let result = Cli::try_parse_from(["wonk", "summary"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_summary_with_global_format() {
+        let cli = Cli::try_parse_from(["wonk", "--format", "json", "summary", "src/"]).unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Summary(args) => {
+                assert_eq!(args.path, "src/");
+            }
+            _ => panic!("expected Command::Summary"),
+        }
+    }
+
+    #[test]
+    fn parse_summary_with_global_budget() {
+        let cli = Cli::try_parse_from(["wonk", "--budget", "500", "summary", "src/"]).unwrap();
+        assert_eq!(cli.budget, Some(500));
+        match cli.command {
+            Command::Summary(args) => {
+                assert_eq!(args.path, "src/");
+            }
+            _ => panic!("expected Command::Summary"),
+        }
     }
 }

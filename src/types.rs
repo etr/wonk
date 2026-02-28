@@ -344,6 +344,96 @@ pub struct CalleeResult {
     pub source_file: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Summary types
+// ---------------------------------------------------------------------------
+
+/// Detail level for `wonk summary` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailLevel {
+    /// All metrics: file count, line count, symbol counts, language breakdown, dependency count.
+    Rich,
+    /// Lightweight: file count, symbol count, languages only.
+    Light,
+    /// Symbol counts by kind only.
+    Symbols,
+}
+
+impl fmt::Display for DetailLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            DetailLevel::Rich => "rich",
+            DetailLevel::Light => "light",
+            DetailLevel::Symbols => "symbols",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl FromStr for DetailLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "rich" => Ok(DetailLevel::Rich),
+            "light" => Ok(DetailLevel::Light),
+            "symbols" => Ok(DetailLevel::Symbols),
+            other => Err(format!(
+                "unknown detail level: {other} (expected: rich, light, symbols)"
+            )),
+        }
+    }
+}
+
+/// Whether a summary path refers to a file or directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryPathType {
+    File,
+    Directory,
+}
+
+impl fmt::Display for SummaryPathType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            SummaryPathType::File => "file",
+            SummaryPathType::Directory => "directory",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Aggregated structural metrics for a file or directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SummaryMetrics {
+    /// Number of indexed files.
+    pub file_count: usize,
+    /// Total line count across all files.
+    pub line_count: usize,
+    /// Symbol counts by kind, sorted alphabetically.
+    pub symbol_counts: Vec<(String, usize)>,
+    /// File counts by language, sorted alphabetically.
+    pub language_breakdown: Vec<(String, usize)>,
+    /// Number of distinct import paths (dependencies).
+    pub dependency_count: usize,
+}
+
+/// Structural summary result for a path (file or directory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryResult {
+    /// The path being summarized (relative to repo root).
+    pub path: String,
+    /// Whether this path is a file or directory.
+    pub path_type: SummaryPathType,
+    /// The detail level used.
+    pub detail_level: DetailLevel,
+    /// Aggregated metrics.
+    pub metrics: SummaryMetrics,
+    /// Child summaries (populated when depth > 0).
+    pub children: Vec<SummaryResult>,
+    /// Optional natural language description (populated by `--semantic`, TASK-064).
+    pub description: Option<String>,
+}
+
 /// A single hop in a call path between two symbols, returned by `wonk callpath`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallPathHop {
@@ -596,5 +686,108 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    // -- DetailLevel tests ---------------------------------------------------
+
+    #[test]
+    fn detail_level_display_round_trip() {
+        for (level, expected) in [
+            (DetailLevel::Rich, "rich"),
+            (DetailLevel::Light, "light"),
+            (DetailLevel::Symbols, "symbols"),
+        ] {
+            assert_eq!(level.to_string(), expected);
+            assert_eq!(DetailLevel::from_str(expected).unwrap(), level);
+        }
+    }
+
+    #[test]
+    fn detail_level_from_str_invalid() {
+        assert!(DetailLevel::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn summary_path_type_display_round_trip() {
+        for (pt, expected) in [
+            (SummaryPathType::File, "file"),
+            (SummaryPathType::Directory, "directory"),
+        ] {
+            assert_eq!(pt.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn summary_metrics_creation() {
+        let m = SummaryMetrics {
+            file_count: 10,
+            line_count: 500,
+            symbol_counts: vec![("function".into(), 20), ("class".into(), 5)],
+            language_breakdown: vec![("Rust".into(), 8), ("Python".into(), 2)],
+            dependency_count: 15,
+        };
+        assert_eq!(m.file_count, 10);
+        assert_eq!(m.line_count, 500);
+        assert_eq!(m.symbol_counts.len(), 2);
+        assert_eq!(m.language_breakdown.len(), 2);
+        assert_eq!(m.dependency_count, 15);
+    }
+
+    #[test]
+    fn summary_result_creation() {
+        let sr = SummaryResult {
+            path: "src/".into(),
+            path_type: SummaryPathType::Directory,
+            detail_level: DetailLevel::Rich,
+            metrics: SummaryMetrics {
+                file_count: 5,
+                line_count: 200,
+                symbol_counts: vec![("function".into(), 10)],
+                language_breakdown: vec![("Rust".into(), 5)],
+                dependency_count: 3,
+            },
+            children: vec![],
+            description: None,
+        };
+        assert_eq!(sr.path, "src/");
+        assert_eq!(sr.path_type, SummaryPathType::Directory);
+        assert_eq!(sr.detail_level, DetailLevel::Rich);
+        assert_eq!(sr.metrics.file_count, 5);
+        assert!(sr.children.is_empty());
+        assert!(sr.description.is_none());
+    }
+
+    #[test]
+    fn summary_result_with_children() {
+        let child = SummaryResult {
+            path: "src/lib.rs".into(),
+            path_type: SummaryPathType::File,
+            detail_level: DetailLevel::Rich,
+            metrics: SummaryMetrics {
+                file_count: 1,
+                line_count: 100,
+                symbol_counts: vec![("function".into(), 5)],
+                language_breakdown: vec![("Rust".into(), 1)],
+                dependency_count: 1,
+            },
+            children: vec![],
+            description: None,
+        };
+        let parent = SummaryResult {
+            path: "src/".into(),
+            path_type: SummaryPathType::Directory,
+            detail_level: DetailLevel::Rich,
+            metrics: SummaryMetrics {
+                file_count: 3,
+                line_count: 300,
+                symbol_counts: vec![],
+                language_breakdown: vec![],
+                dependency_count: 0,
+            },
+            children: vec![child],
+            description: None,
+        };
+        assert_eq!(parent.children.len(), 1);
+        assert_eq!(parent.children[0].path, "src/lib.rs");
     }
 }

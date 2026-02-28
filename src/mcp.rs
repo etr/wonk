@@ -19,7 +19,7 @@ use crate::budget::TokenBudget;
 use crate::db;
 use crate::output::{
     CallPathHopOutput, CalleeOutput, CallerOutput, DepOutput, OutputFormat, RefOutput,
-    SearchOutput, ShowOutput, SignatureOutput, SymbolOutput,
+    SearchOutput, ShowOutput, SignatureOutput, SummaryOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::Progress;
@@ -230,19 +230,15 @@ fn validate_path(path: &Path, repo_root: &Path) -> Result<PathBuf, CallToolResul
     }
     let resolved = repo_root.join(path);
     // Use canonicalize on the parent for non-existent files.
-    let canonical = resolved.canonicalize().or_else(|_| {
-        resolved
+    let canonical: io::Result<PathBuf> = resolved.canonicalize().or_else(|_| {
+        let parent = resolved
             .parent()
             .and_then(|p| p.canonicalize().ok())
-            .map(|p| {
-                p.join(
-                    resolved
-                        .file_name()
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))
-                        .unwrap_or_default(),
-                )
-            })
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "path not found"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "path not found"))?;
+        let name = resolved
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+        Ok(parent.join(name))
     });
     let root_canonical = repo_root
         .canonicalize()
@@ -608,6 +604,51 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     "required": ["from", "to"]
                 }),
             },
+            Tool {
+                name: "wonk_summary",
+                description: "Show a structural summary of a file or directory: file count, line count, symbol counts by kind, language breakdown, and dependency count.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to summarize (file or directory, relative to repo root)"
+                        },
+                        "detail": {
+                            "type": "string",
+                            "enum": ["rich", "light", "symbols"],
+                            "description": "Detail level: rich (all metrics), light (file count, symbol count, languages), symbols (symbol counts by kind only)",
+                            "default": "rich"
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "Recursion depth for child summaries (0 = target only, default: 0)",
+                            "default": 0
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "Show full recursive hierarchy (unlimited depth)",
+                            "default": false
+                        },
+                        "semantic": {
+                            "type": "boolean",
+                            "description": "Include AI-generated description (requires embeddings, not yet implemented)",
+                            "default": false
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Limit output to approximately N tokens"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
         ]
     })
 }
@@ -669,6 +710,7 @@ impl McpServer {
             "wonk_callers" => self.tool_callers(call.arguments),
             "wonk_callees" => self.tool_callees(call.arguments),
             "wonk_callpath" => self.tool_callpath(call.arguments),
+            "wonk_summary" => self.tool_summary(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1163,6 +1205,56 @@ impl McpServer {
             Err(e) => CallToolResult::error(format!("callpath query failed: {e}")),
         }
     }
+
+    fn tool_summary(&self, args: Value) -> CallToolResult {
+        let path = match require_str(&args, "path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+
+        // Validate path stays within repo boundary.
+        if let Err(e) = validate_path(Path::new(&path), self.router.repo_root()) {
+            return e;
+        }
+
+        let detail_str = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("rich");
+        let detail = match detail_str.parse::<crate::types::DetailLevel>() {
+            Ok(d) => d,
+            Err(e) => return CallToolResult::error(e),
+        };
+
+        let recursive = args
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let depth_raw = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let depth = if recursive { None } else { Some(depth_raw) };
+
+        let format = extract_format(&args);
+
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        let options = crate::summary::SummaryOptions {
+            detail,
+            depth,
+            suppress: true,
+        };
+
+        let result =
+            match crate::summary::summarize_path(conn, &path, self.router.repo_root(), &options) {
+                Ok(r) => r,
+                Err(e) => return CallToolResult::error(format!("summary query failed: {e}")),
+            };
+
+        let out = SummaryOutput::from_result(&result);
+        format_result(&out, format)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,7 +1411,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]
@@ -1350,14 +1442,6 @@ mod tests {
             PROTOCOL_VERSION
         );
         assert_eq!(result["serverInfo"]["name"].as_str().unwrap(), "wonk");
-    }
-
-    #[test]
-    fn tools_list_returns_all_tools() {
-        let server = test_server();
-        let result = server.handle_tools_list();
-        let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -1539,11 +1623,11 @@ mod tests {
     // -- Callers/Callees MCP tests -------------------------------------------
 
     #[test]
-    fn tools_list_returns_thirteen_tools() {
+    fn tools_list_returns_fourteen_tools() {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]
@@ -1627,5 +1711,144 @@ mod tests {
             text.contains("no index") || text.contains("no path") || text.contains("call graph"),
             "expected index/callgraph error, got: {text}"
         );
+    }
+
+    // -- Summary tool tests ---------------------------------------------------
+
+    #[test]
+    fn tool_summary_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_summary").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("path"), "missing 'path' property");
+        assert!(props.contains_key("detail"), "missing 'detail' property");
+        assert!(props.contains_key("depth"), "missing 'depth' property");
+        assert!(
+            props.contains_key("recursive"),
+            "missing 'recursive' property"
+        );
+        assert!(
+            props.contains_key("semantic"),
+            "missing 'semantic' property"
+        );
+        assert!(props.contains_key("budget"), "missing 'budget' property");
+        assert!(props.contains_key("format"), "missing 'format' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("path")));
+    }
+
+    #[test]
+    fn tool_summary_dispatches_correctly() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_summary",
+            "arguments": {"path": "src/"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        // test_server has no index, so we expect a "no index" error
+        assert!(
+            text.contains("no index"),
+            "expected 'no index' error, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_summary_with_indexed_repo() {
+        use crate::pipeline;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn hello() {}\nfn world() {}\n").unwrap();
+
+        pipeline::build_index(root, true).unwrap();
+
+        let server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+        };
+        let params = serde_json::json!({
+            "name": "wonk_summary",
+            "arguments": {"path": "src/", "detail": "rich", "format": "json"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let v: Value = serde_json::from_str(text).expect("should be valid JSON");
+        assert_eq!(v["path"], "src");
+        assert_eq!(v["type"], "directory");
+        assert_eq!(v["detail_level"], "rich");
+        assert!(v["metrics"]["file_count"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn tool_summary_light_detail() {
+        use crate::pipeline;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn hello() {}\n").unwrap();
+
+        pipeline::build_index(root, true).unwrap();
+
+        let server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+        };
+        let params = serde_json::json!({
+            "name": "wonk_summary",
+            "arguments": {"path": "src/", "detail": "light", "format": "json"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let v: Value = serde_json::from_str(text).expect("should be valid JSON");
+        assert_eq!(v["detail_level"], "light");
+        assert!(v["metrics"]["file_count"].is_number());
+        // line_count and dependency_count should be absent in light mode
+        assert!(v["metrics"].get("line_count").is_none());
+        assert!(v["metrics"].get("dependency_count").is_none());
+    }
+
+    #[test]
+    fn tool_summary_with_depth() {
+        use crate::pipeline;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("src/sub/b.rs"), "fn beta() {}\n").unwrap();
+
+        pipeline::build_index(root, true).unwrap();
+
+        let server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+        };
+        let params = serde_json::json!({
+            "name": "wonk_summary",
+            "arguments": {"path": "src/", "depth": 1, "format": "json"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let v: Value = serde_json::from_str(text).expect("should be valid JSON");
+        assert!(v["children"].is_array());
+        assert!(!v["children"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_summary_missing_path() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_summary",
+            "arguments": {}
+        });
+        let result = server.handle_tools_call(&params);
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        assert!(is_error, "should error on missing path");
     }
 }
