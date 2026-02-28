@@ -150,8 +150,9 @@ fn query_metrics(
         SummaryPathType::Directory => like_pattern,
     };
 
-    // Files and lines, grouped by language.
-    let mut lang_stmt = conn.prepare(file_query)?;
+    // Use prepare_cached for LRU statement caching — avoids re-parsing
+    // identical SQL strings on repeated calls during recursive traversal.
+    let mut lang_stmt = conn.prepare_cached(file_query)?;
     let lang_rows: Vec<(String, usize, usize)> = lang_stmt
         .query_map(rusqlite::params![param], |row| {
             Ok((
@@ -173,7 +174,7 @@ fn query_metrics(
     }
 
     // Symbol counts by kind.
-    let mut sym_stmt = conn.prepare(sym_query)?;
+    let mut sym_stmt = conn.prepare_cached(sym_query)?;
     let symbol_counts: Vec<(String, usize)> = sym_stmt
         .query_map(rusqlite::params![param], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
@@ -181,7 +182,8 @@ fn query_metrics(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Dependency count.
-    let dep_count: i64 = conn.query_row(dep_query, rusqlite::params![param], |row| row.get(0))?;
+    let mut dep_stmt = conn.prepare_cached(dep_query)?;
+    let dep_count: i64 = dep_stmt.query_row(rusqlite::params![param], |row| row.get(0))?;
 
     Ok(SummaryMetrics {
         file_count,
@@ -215,8 +217,19 @@ fn load_subtree_paths(conn: &Connection, like_pattern: &str) -> Result<Vec<Strin
     Ok(paths)
 }
 
+/// Find the subslice of sorted paths that start with the given prefix,
+/// using binary search for O(log N) instead of scanning the full list.
+fn paths_with_prefix<'a>(sorted_paths: &'a [String], prefix: &str) -> &'a [String] {
+    let start = sorted_paths.partition_point(|p| p.as_str() < prefix);
+    // End boundary: first path that doesn't start with prefix.
+    // Since paths are sorted, all matching paths are contiguous.
+    let end = sorted_paths[start..].partition_point(|p| p.starts_with(prefix)) + start;
+    &sorted_paths[start..end]
+}
+
 /// Build children from a pre-fetched list of all descendant paths.
 /// This avoids the N+1 query pattern by partitioning paths in memory.
+/// Uses binary search on the sorted path list for O(log N) slicing.
 fn build_children_from_paths(
     all_paths: &[String],
     dir_prefix: &str,
@@ -224,16 +237,15 @@ fn build_children_from_paths(
     options: &SummaryOptions,
     current_depth: usize,
 ) -> Result<Vec<SummaryResult>> {
+    // Narrow to only paths under this prefix using binary search.
+    let subtree = paths_with_prefix(all_paths, dir_prefix);
     let prefix_len = dir_prefix.len();
 
-    // Extract unique immediate children from the path list.
+    // Extract unique immediate children from the narrowed slice.
     let mut seen = std::collections::HashSet::new();
     let mut child_entries: Vec<(String, SummaryPathType)> = Vec::new();
 
-    for path in all_paths {
-        if !path.starts_with(dir_prefix) {
-            continue;
-        }
+    for path in subtree {
         let suffix = &path[prefix_len..];
         if let Some(slash_pos) = suffix.find('/') {
             let dir_name = &suffix[..=slash_pos];
@@ -261,7 +273,7 @@ fn build_children_from_paths(
         let grandchildren = if *child_type == SummaryPathType::Directory
             && should_recurse(options.depth, current_depth)
         {
-            // Reuse the already-loaded paths instead of re-querying.
+            // Pass full sorted paths — binary search narrows at each level.
             build_children_from_paths(all_paths, child_path, conn, options, current_depth + 1)?
         } else {
             vec![]
