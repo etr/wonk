@@ -1169,8 +1169,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             let depth = if args.recursive {
                 None // unlimited
-            } else if args.depth == 0 {
-                Some(0)
             } else {
                 Some(args.depth)
             };

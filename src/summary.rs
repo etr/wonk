@@ -11,14 +11,24 @@ use rusqlite::Connection;
 
 use crate::types::{DetailLevel, SummaryMetrics, SummaryPathType, SummaryResult};
 
+/// Maximum recursion depth to prevent unbounded resource consumption.
+const MAX_RECURSIVE_DEPTH: usize = 20;
+
 /// Options for the summary engine.
 pub struct SummaryOptions {
     /// Detail level for the output.
     pub detail: DetailLevel,
-    /// Maximum recursion depth. `None` means unlimited.
+    /// Maximum recursion depth. `None` means unlimited (up to `MAX_RECURSIVE_DEPTH`).
     pub depth: Option<usize>,
     /// Whether to suppress stderr hints.
     pub suppress: bool,
+}
+
+/// Escape SQLite LIKE metacharacters (`%` and `_`) in a string.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Summarize a path (file or directory) using the index.
@@ -29,19 +39,19 @@ pub struct SummaryOptions {
 ///
 /// Returns a `SummaryResult` with zero metrics for empty/unknown paths
 /// (not an error), consistent with other wonk commands.
+///
+/// The `_repo_root` parameter is reserved for the `--semantic` path (TASK-064).
 pub fn summarize_path(
     conn: &Connection,
     path: &str,
     _repo_root: &Path,
     options: &SummaryOptions,
 ) -> Result<SummaryResult> {
-    // Normalize path: strip leading `./`, ensure directories end with `/`.
     let normalized = normalize_path(path);
-
-    // Determine if this is a file or directory by checking the DB.
     let path_type = detect_path_type(conn, &normalized)?;
 
-    // Build the LIKE pattern.
+    // Build LIKE pattern and exact path for queries.
+    // Files use exact match only; directories use `prefix/%` LIKE pattern.
     let (like_pattern, exact_path) = match path_type {
         SummaryPathType::File => (normalized.clone(), normalized.clone()),
         SummaryPathType::Directory => {
@@ -50,7 +60,8 @@ pub fn summarize_path(
             } else {
                 format!("{normalized}/")
             };
-            (format!("{prefix}%"), prefix)
+            let safe_prefix = escape_like(&prefix);
+            (format!("{safe_prefix}%"), prefix)
         }
     };
 
@@ -58,7 +69,9 @@ pub fn summarize_path(
 
     // Recurse into children if depth allows.
     let children = if should_recurse(options.depth, 0) && path_type == SummaryPathType::Directory {
-        enumerate_children(conn, &exact_path, options, 1)?
+        // Load all descendant paths in a single query and partition in-memory.
+        let all_paths = load_subtree_paths(conn, &like_pattern)?;
+        build_children_from_paths(&all_paths, &exact_path, conn, options, 1)?
     } else {
         vec![]
     };
@@ -75,21 +88,17 @@ pub fn summarize_path(
 
 /// Normalize a user-supplied path for DB queries.
 fn normalize_path(path: &str) -> String {
-    let mut p = path.to_string();
-    // Strip leading `./`
-    while p.starts_with("./") {
-        p = p[2..].to_string();
+    let p = path.trim_start_matches("./");
+    let p = p.trim_end_matches('/');
+    if p.is_empty() {
+        ".".to_string()
+    } else {
+        p.to_string()
     }
-    // Strip trailing `/` for consistent handling; we'll add it back for directories.
-    while p.len() > 1 && p.ends_with('/') {
-        p.pop();
-    }
-    if p.is_empty() { ".".to_string() } else { p }
 }
 
 /// Check whether a path refers to a file or directory in the index.
 fn detect_path_type(conn: &Connection, path: &str) -> Result<SummaryPathType> {
-    // Check for exact file match first.
     let file_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM files WHERE path = ?1",
         rusqlite::params![path],
@@ -100,26 +109,51 @@ fn detect_path_type(conn: &Connection, path: &str) -> Result<SummaryPathType> {
         return Ok(SummaryPathType::File);
     }
 
-    // Otherwise treat as directory.
     Ok(SummaryPathType::Directory)
 }
 
-/// Query aggregated metrics for a path.
+/// Query aggregated metrics for a path using the LIKE pattern and exact path.
 fn query_metrics(
     conn: &Connection,
     like_pattern: &str,
     exact_path: &str,
     path_type: SummaryPathType,
 ) -> Result<SummaryMetrics> {
-    // Files and lines, grouped by language.
-    let mut lang_stmt = conn.prepare(
-        "SELECT language, COUNT(*), COALESCE(SUM(line_count), 0) \
-         FROM files WHERE path LIKE ?1 OR path = ?2 \
-         GROUP BY language ORDER BY language",
-    )?;
+    // For files, use exact match only (more efficient, avoids LIKE overhead).
+    // For directories, use LIKE pattern with ESCAPE clause.
+    let (file_query, sym_query, dep_query) = match path_type {
+        SummaryPathType::File => (
+            "SELECT language, COUNT(*), COALESCE(SUM(line_count), 0) \
+             FROM files WHERE path = ?1 \
+             GROUP BY language ORDER BY language",
+            "SELECT kind, COUNT(*) FROM symbols \
+             WHERE file = ?1 \
+             GROUP BY kind ORDER BY kind",
+            "SELECT COUNT(DISTINCT import_path) FROM file_imports \
+             WHERE source_file = ?1",
+        ),
+        SummaryPathType::Directory => (
+            "SELECT language, COUNT(*), COALESCE(SUM(line_count), 0) \
+             FROM files WHERE path LIKE ?1 ESCAPE '\\' \
+             GROUP BY language ORDER BY language",
+            "SELECT kind, COUNT(*) FROM symbols \
+             WHERE file LIKE ?1 ESCAPE '\\' \
+             GROUP BY kind ORDER BY kind",
+            "SELECT COUNT(DISTINCT import_path) FROM file_imports \
+             WHERE source_file LIKE ?1 ESCAPE '\\'",
+        ),
+    };
 
+    // The query param is exact_path for files, like_pattern for directories.
+    let param = match path_type {
+        SummaryPathType::File => exact_path,
+        SummaryPathType::Directory => like_pattern,
+    };
+
+    // Files and lines, grouped by language.
+    let mut lang_stmt = conn.prepare(file_query)?;
     let lang_rows: Vec<(String, usize, usize)> = lang_stmt
-        .query_map(rusqlite::params![like_pattern, exact_path], |row| {
+        .query_map(rusqlite::params![param], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as usize,
@@ -139,30 +173,15 @@ fn query_metrics(
     }
 
     // Symbol counts by kind.
-    let mut sym_stmt = conn.prepare(
-        "SELECT kind, COUNT(*) FROM symbols \
-         WHERE file LIKE ?1 OR file = ?2 \
-         GROUP BY kind ORDER BY kind",
-    )?;
-
-    let (sym_like, sym_exact) = match path_type {
-        SummaryPathType::File => (exact_path.to_string(), exact_path.to_string()),
-        SummaryPathType::Directory => (like_pattern.to_string(), exact_path.to_string()),
-    };
-
+    let mut sym_stmt = conn.prepare(sym_query)?;
     let symbol_counts: Vec<(String, usize)> = sym_stmt
-        .query_map(rusqlite::params![sym_like, sym_exact], |row| {
+        .query_map(rusqlite::params![param], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
     // Dependency count.
-    let dep_count: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT import_path) FROM file_imports \
-         WHERE source_file LIKE ?1 OR source_file = ?2",
-        rusqlite::params![like_pattern, exact_path],
-        |row| row.get(0),
-    )?;
+    let dep_count: i64 = conn.query_row(dep_query, rusqlite::params![param], |row| row.get(0))?;
 
     Ok(SummaryMetrics {
         file_count,
@@ -175,62 +194,66 @@ fn query_metrics(
 
 /// Check whether we should recurse at the given current depth.
 fn should_recurse(max_depth: Option<usize>, current_depth: usize) -> bool {
+    if current_depth >= MAX_RECURSIVE_DEPTH {
+        return false;
+    }
     match max_depth {
-        None => true, // Unlimited
+        None => true,
         Some(d) => current_depth < d,
     }
 }
 
-/// Enumerate immediate children of a directory prefix from the files table
-/// and recursively summarize each.
-fn enumerate_children(
-    conn: &Connection,
-    dir_prefix: &str,
-    options: &SummaryOptions,
-    current_depth: usize,
-) -> Result<Vec<SummaryResult>> {
-    // Find distinct immediate children (files and subdirectories).
-    // For paths like "src/foo.rs" under prefix "src/", the immediate child is "foo.rs".
-    // For paths like "src/bar/baz.rs" under prefix "src/", the immediate child is "bar/".
-    let prefix_len = dir_prefix.len();
-
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT path FROM files WHERE path LIKE ?1 ORDER BY path")?;
-
-    let like_pattern = format!("{dir_prefix}%");
+/// Load all file paths under a LIKE prefix in a single query.
+fn load_subtree_paths(conn: &Connection, like_pattern: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT path FROM files WHERE path LIKE ?1 ESCAPE '\\' ORDER BY path")?;
     let paths: Vec<String> = stmt
         .query_map(rusqlite::params![like_pattern], |row| {
             row.get::<_, String>(0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    Ok(paths)
+}
 
-    // Extract unique immediate children.
+/// Build children from a pre-fetched list of all descendant paths.
+/// This avoids the N+1 query pattern by partitioning paths in memory.
+fn build_children_from_paths(
+    all_paths: &[String],
+    dir_prefix: &str,
+    conn: &Connection,
+    options: &SummaryOptions,
+    current_depth: usize,
+) -> Result<Vec<SummaryResult>> {
+    let prefix_len = dir_prefix.len();
+
+    // Extract unique immediate children from the path list.
     let mut seen = std::collections::HashSet::new();
-    let mut child_paths: Vec<(String, SummaryPathType)> = Vec::new();
+    let mut child_entries: Vec<(String, SummaryPathType)> = Vec::new();
 
-    for path in &paths {
+    for path in all_paths {
+        if !path.starts_with(dir_prefix) {
+            continue;
+        }
         let suffix = &path[prefix_len..];
         if let Some(slash_pos) = suffix.find('/') {
-            // Subdirectory: take up to the slash.
             let dir_name = &suffix[..=slash_pos];
             let full_child = format!("{dir_prefix}{dir_name}");
             if seen.insert(full_child.clone()) {
-                child_paths.push((full_child, SummaryPathType::Directory));
+                child_entries.push((full_child, SummaryPathType::Directory));
             }
-        } else {
-            // Direct file.
-            if seen.insert(path.clone()) {
-                child_paths.push((path.clone(), SummaryPathType::File));
-            }
+        } else if seen.insert(path.clone()) {
+            child_entries.push((path.clone(), SummaryPathType::File));
         }
     }
 
-    // Summarize each child.
     let mut results = Vec::new();
-    for (child_path, child_type) in &child_paths {
+    for (child_path, child_type) in &child_entries {
         let (child_like, child_exact) = match child_type {
             SummaryPathType::File => (child_path.clone(), child_path.clone()),
-            SummaryPathType::Directory => (format!("{child_path}%"), child_path.clone()),
+            SummaryPathType::Directory => {
+                let safe = escape_like(child_path);
+                (format!("{safe}%"), child_path.clone())
+            }
         };
 
         let metrics = query_metrics(conn, &child_like, &child_exact, *child_type)?;
@@ -238,7 +261,8 @@ fn enumerate_children(
         let grandchildren = if *child_type == SummaryPathType::Directory
             && should_recurse(options.depth, current_depth)
         {
-            enumerate_children(conn, child_path, options, current_depth + 1)?
+            // Reuse the already-loaded paths instead of re-querying.
+            build_children_from_paths(all_paths, child_path, conn, options, current_depth + 1)?
         } else {
             vec![]
         };

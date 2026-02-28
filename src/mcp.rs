@@ -230,19 +230,15 @@ fn validate_path(path: &Path, repo_root: &Path) -> Result<PathBuf, CallToolResul
     }
     let resolved = repo_root.join(path);
     // Use canonicalize on the parent for non-existent files.
-    let canonical = resolved.canonicalize().or_else(|_| {
-        resolved
+    let canonical: io::Result<PathBuf> = resolved.canonicalize().or_else(|_| {
+        let parent = resolved
             .parent()
             .and_then(|p| p.canonicalize().ok())
-            .map(|p| {
-                p.join(
-                    resolved
-                        .file_name()
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))
-                        .unwrap_or_default(),
-                )
-            })
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "path not found"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "path not found"))?;
+        let name = resolved
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+        Ok(parent.join(name))
     });
     let root_canonical = repo_root
         .canonicalize()
@@ -1216,6 +1212,11 @@ impl McpServer {
             Err(e) => return e,
         };
 
+        // Validate path stays within repo boundary.
+        if let Err(e) = validate_path(Path::new(&path), self.router.repo_root()) {
+            return e;
+        }
+
         let detail_str = args
             .get("detail")
             .and_then(|v| v.as_str())
@@ -1630,7 +1631,7 @@ mod tests {
     // -- Callers/Callees MCP tests -------------------------------------------
 
     #[test]
-    fn tools_list_returns_thirteen_tools() {
+    fn tools_list_returns_fourteen_tools() {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();

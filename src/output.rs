@@ -281,65 +281,43 @@ impl SummaryOutput {
 
         let m = &sr.metrics;
 
+        // Build shared mappings once, referenced per detail level.
+        let symbol_counts_out: Vec<SymbolCountEntry> = m
+            .symbol_counts
+            .iter()
+            .map(|(k, c)| SymbolCountEntry {
+                kind: k.clone(),
+                count: *c,
+            })
+            .collect();
+        let languages_out: Vec<LanguageEntry> = m
+            .language_breakdown
+            .iter()
+            .map(|(l, c)| LanguageEntry {
+                language: l.clone(),
+                count: *c,
+            })
+            .collect();
+
         let metrics = match sr.detail_level {
             DetailLevel::Rich => SummaryMetricsOutput {
                 file_count: Some(m.file_count),
                 line_count: Some(m.line_count),
-                symbol_counts: Some(
-                    m.symbol_counts
-                        .iter()
-                        .map(|(k, c)| SymbolCountEntry {
-                            kind: k.clone(),
-                            count: *c,
-                        })
-                        .collect(),
-                ),
-                languages: Some(
-                    m.language_breakdown
-                        .iter()
-                        .map(|(l, c)| LanguageEntry {
-                            language: l.clone(),
-                            count: *c,
-                        })
-                        .collect(),
-                ),
+                symbol_counts: Some(symbol_counts_out),
+                languages: Some(languages_out),
                 dependency_count: Some(m.dependency_count),
             },
             DetailLevel::Light => SummaryMetricsOutput {
                 file_count: Some(m.file_count),
                 line_count: None,
-                symbol_counts: Some(
-                    m.symbol_counts
-                        .iter()
-                        .map(|(k, c)| SymbolCountEntry {
-                            kind: k.clone(),
-                            count: *c,
-                        })
-                        .collect(),
-                ),
-                languages: Some(
-                    m.language_breakdown
-                        .iter()
-                        .map(|(l, c)| LanguageEntry {
-                            language: l.clone(),
-                            count: *c,
-                        })
-                        .collect(),
-                ),
+                symbol_counts: Some(symbol_counts_out),
+                languages: Some(languages_out),
                 dependency_count: None,
             },
             DetailLevel::Symbols => SummaryMetricsOutput {
                 file_count: None,
                 line_count: None,
-                symbol_counts: Some(
-                    m.symbol_counts
-                        .iter()
-                        .map(|(k, c)| SymbolCountEntry {
-                            kind: k.clone(),
-                            count: *c,
-                        })
-                        .collect(),
-                ),
+                symbol_counts: Some(symbol_counts_out),
                 languages: None,
                 dependency_count: None,
             },

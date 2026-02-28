@@ -35,7 +35,7 @@
 | M15 | Call Graph Data Model & Indexing | 2 | In Progress |
 | M16 | Source Display (`wonk show`) | 2 | Complete |
 | M17 | Call Graph Commands | 2 | Complete |
-| M18 | Code Summary Engine (`wonk summary`) | 2 | Not Started |
+| M18 | Code Summary Engine (`wonk summary`) | 2 | In Progress |
 | M19 | Edge Confidence & Inheritance Infrastructure | 3 | Not Started |
 | M20 | Hybrid Search Fusion (RRF) | 1 | Not Started |
 | M21 | Execution Flow Detection (`wonk flows`) | 1 | Not Started |
@@ -2566,16 +2566,16 @@ Implement `wonk callpath <from> <to>` that finds call chains between two symbols
 Implement `wonk summary <path>` with structural metrics aggregation, three detail levels, recursive depth, and MCP tool exposure.
 
 **Action Items:**
-- [ ] Create `summary.rs` module
-- [ ] Implement `summarize_path(db, path, options) -> SummaryResult`: query files and symbols tables to aggregate metrics
-- [ ] Structural metrics: file count, line count, symbol count by kind, language breakdown, dependency count (PRD-SUM-REQ-001, PRD-SUM-REQ-002)
-- [ ] Detail levels: `--detail rich` (default, all metrics), `--detail light` (file count, symbol count, languages), `--detail symbols` (symbol counts by kind only) (PRD-SUM-REQ-003 through PRD-SUM-REQ-005)
-- [ ] Recursion: `--depth N` summarizes nested directories/files up to N levels (PRD-SUM-REQ-006), default depth 0 (PRD-SUM-REQ-007), `--recursive` for unlimited depth (PRD-SUM-REQ-008)
-- [ ] Define `SummaryResult` in types.rs: path, type (file|directory), detail_level, metrics, children (array), description (optional) (PRD-SUM-REQ-017)
-- [ ] Add `summary` subcommand to CLI with args: `<path>` (required), `--detail`, `--depth`, `--recursive`, `--semantic` (wired in TASK-064)
-- [ ] Output formatting: human-readable default, JSON/TOON structured output
-- [ ] Auto-init: consistent with PRD-AUT behavior (PRD-SUM-REQ-016)
-- [ ] Add MCP tool `wonk_summary` with parameters: path, detail, depth, recursive, semantic, format (PRD-SUM-REQ-018)
+- [x] Create `summary.rs` module
+- [x] Implement `summarize_path(db, path, options) -> SummaryResult`: query files and symbols tables to aggregate metrics
+- [x] Structural metrics: file count, line count, symbol count by kind, language breakdown, dependency count (PRD-SUM-REQ-001, PRD-SUM-REQ-002)
+- [x] Detail levels: `--detail rich` (default, all metrics), `--detail light` (file count, symbol count, languages), `--detail symbols` (symbol counts by kind only) (PRD-SUM-REQ-003 through PRD-SUM-REQ-005)
+- [x] Recursion: `--depth N` summarizes nested directories/files up to N levels (PRD-SUM-REQ-006), default depth 0 (PRD-SUM-REQ-007), `--recursive` for unlimited depth (PRD-SUM-REQ-008)
+- [x] Define `SummaryResult` in types.rs: path, type (file|directory), detail_level, metrics, children (array), description (optional) (PRD-SUM-REQ-017)
+- [x] Add `summary` subcommand to CLI with args: `<path>` (required), `--detail`, `--depth`, `--recursive`, `--semantic` (wired in TASK-064)
+- [x] Output formatting: human-readable default, JSON/TOON structured output
+- [x] Auto-init: consistent with PRD-AUT behavior (PRD-SUM-REQ-016)
+- [x] Add MCP tool `wonk_summary` with parameters: path, detail, depth, recursive, semantic, format (PRD-SUM-REQ-018)
 
 **Dependencies:**
 - Blocked by: None
@@ -2596,7 +2596,7 @@ Implement `wonk summary <path>` with structural metrics aggregation, three detai
 **Related Requirements:** PRD-SUM-REQ-001 through PRD-SUM-REQ-008, PRD-SUM-REQ-016, PRD-SUM-REQ-017, PRD-SUM-REQ-018
 **Related Decisions:** DR-018, DR-019, DR-020, DR-022
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
