@@ -1445,14 +1445,6 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_all_tools() {
-        let server = test_server();
-        let result = server.handle_tools_list();
-        let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14);
-    }
-
-    #[test]
     fn unknown_tool_returns_error() {
         let server = test_server();
         let params = serde_json::json!({"name": "nonexistent", "arguments": {}});

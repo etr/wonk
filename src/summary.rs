@@ -228,7 +228,8 @@ fn paths_with_prefix<'a>(sorted_paths: &'a [String], prefix: &str) -> &'a [Strin
 }
 
 /// Build children from a pre-fetched list of all descendant paths.
-/// This avoids the N+1 query pattern by partitioning paths in memory.
+/// Path discovery uses the pre-loaded list (no additional path queries);
+/// metric aggregation still runs one `query_metrics` call per child.
 /// Uses binary search on the sorted path list for O(log N) slicing.
 fn build_children_from_paths(
     all_paths: &[String],
