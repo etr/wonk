@@ -69,9 +69,10 @@ pub fn summarize_path(
 
     // Recurse into children if depth allows.
     let children = if should_recurse(options.depth, 0) && path_type == SummaryPathType::Directory {
-        // Load all descendant paths in a single query and partition in-memory.
-        let all_paths = load_subtree_paths(conn, &like_pattern)?;
-        build_children_from_paths(&all_paths, &exact_path, conn, options, 1)?
+        // Pre-fetch all subtree data in exactly 4 SQL queries, then build
+        // the entire child tree in-memory with zero additional SQL.
+        let subtree_data = SubtreeData::load(conn, &like_pattern)?;
+        build_children_from_data(&subtree_data, &exact_path, options, 1)?
     } else {
         vec![]
     };
@@ -205,17 +206,110 @@ fn should_recurse(max_depth: Option<usize>, current_depth: usize) -> bool {
     }
 }
 
-/// Load all file paths under a LIKE prefix in a single query.
-fn load_subtree_paths(conn: &Connection, like_pattern: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT DISTINCT path FROM files WHERE path LIKE ?1 ESCAPE '\\' ORDER BY path",
-    )?;
-    let paths: Vec<String> = stmt
-        .query_map(rusqlite::params![like_pattern], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(paths)
+/// Pre-fetched subtree data for fully in-memory metric aggregation.
+/// Loaded once with 4 SQL queries; all recursive child building uses this
+/// data with zero additional SQL.
+struct SubtreeData {
+    /// All file paths under the subtree, sorted.
+    paths: Vec<String>,
+    /// (path, language, line_count) for every file in the subtree.
+    file_rows: Vec<(String, String, usize)>,
+    /// (file, kind) for every symbol in the subtree.
+    symbol_rows: Vec<(String, String)>,
+    /// (source_file, import_path) for every import in the subtree.
+    import_rows: Vec<(String, String)>,
+}
+
+impl SubtreeData {
+    /// Load all subtree data in exactly 4 SQL queries.
+    fn load(conn: &Connection, like_pattern: &str) -> Result<Self> {
+        let mut path_stmt = conn.prepare_cached(
+            "SELECT DISTINCT path FROM files WHERE path LIKE ?1 ESCAPE '\\' ORDER BY path",
+        )?;
+        let paths: Vec<String> = path_stmt
+            .query_map(rusqlite::params![like_pattern], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut file_stmt = conn.prepare_cached(
+            "SELECT path, language, COALESCE(line_count, 0) \
+             FROM files WHERE path LIKE ?1 ESCAPE '\\'",
+        )?;
+        let file_rows: Vec<(String, String, usize)> = file_stmt
+            .query_map(rusqlite::params![like_pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as usize,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut sym_stmt =
+            conn.prepare_cached("SELECT file, kind FROM symbols WHERE file LIKE ?1 ESCAPE '\\'")?;
+        let symbol_rows: Vec<(String, String)> = sym_stmt
+            .query_map(rusqlite::params![like_pattern], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut imp_stmt = conn.prepare_cached(
+            "SELECT source_file, import_path FROM file_imports \
+             WHERE source_file LIKE ?1 ESCAPE '\\'",
+        )?;
+        let import_rows: Vec<(String, String)> = imp_stmt
+            .query_map(rusqlite::params![like_pattern], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            paths,
+            file_rows,
+            symbol_rows,
+            import_rows,
+        })
+    }
+
+    /// Compute aggregated metrics for all paths matching a prefix, in memory.
+    fn metrics_for_prefix(&self, prefix: &str, is_file: bool) -> SummaryMetrics {
+        use std::collections::{BTreeMap, HashSet};
+
+        let mut file_count = 0usize;
+        let mut line_count = 0usize;
+        let mut lang_map: BTreeMap<String, usize> = BTreeMap::new();
+
+        for (path, lang, lines) in &self.file_rows {
+            if (is_file && path == prefix) || (!is_file && path.starts_with(prefix)) {
+                file_count += 1;
+                line_count += lines;
+                *lang_map.entry(lang.clone()).or_default() += 1;
+            }
+        }
+
+        let mut sym_map: BTreeMap<String, usize> = BTreeMap::new();
+        for (file, kind) in &self.symbol_rows {
+            if (is_file && file == prefix) || (!is_file && file.starts_with(prefix)) {
+                *sym_map.entry(kind.clone()).or_default() += 1;
+            }
+        }
+
+        let mut dep_set: HashSet<&str> = HashSet::new();
+        for (source_file, import_path) in &self.import_rows {
+            if (is_file && source_file == prefix) || (!is_file && source_file.starts_with(prefix)) {
+                dep_set.insert(import_path);
+            }
+        }
+
+        SummaryMetrics {
+            file_count,
+            line_count,
+            symbol_counts: sym_map.into_iter().collect(),
+            language_breakdown: lang_map.into_iter().collect(),
+            dependency_count: dep_set.len(),
+        }
+    }
 }
 
 /// Find the subslice of sorted paths that start with the given prefix,
@@ -226,113 +320,16 @@ fn paths_with_prefix<'a>(sorted_paths: &'a [String], prefix: &str) -> &'a [Strin
     &sorted_paths[start..end]
 }
 
-/// Compute metrics for all immediate children of a directory in 3 bulk SQL
-/// queries (files/languages, symbols, dependencies). Each query groups by
-/// a computed child_key using SUBSTR/INSTR, reducing O(3N) queries to O(3).
-fn bulk_query_child_metrics(
-    conn: &Connection,
-    like_pattern: &str,
-    prefix_len: usize,
-) -> Result<std::collections::HashMap<String, SummaryMetrics>> {
-    use std::collections::HashMap;
-    let plen = prefix_len as i64;
-
-    // SQL child_key expression: maps each path to its immediate child prefix.
-    // Direct files (no slash after prefix) → full path.
-    // Nested paths → directory prefix up to the first slash after the prefix.
-    const CHILD_KEY_FILES: &str = "\
-        SELECT \
-          CASE WHEN INSTR(SUBSTR(path, ?2 + 1), '/') > 0 \
-            THEN SUBSTR(path, 1, ?2 + INSTR(SUBSTR(path, ?2 + 1), '/')) \
-            ELSE path \
-          END as child_key, \
-          language, COUNT(*), COALESCE(SUM(line_count), 0) \
-        FROM files WHERE path LIKE ?1 ESCAPE '\\' \
-        GROUP BY child_key, language \
-        ORDER BY child_key, language";
-
-    const CHILD_KEY_SYMS: &str = "\
-        SELECT \
-          CASE WHEN INSTR(SUBSTR(file, ?2 + 1), '/') > 0 \
-            THEN SUBSTR(file, 1, ?2 + INSTR(SUBSTR(file, ?2 + 1), '/')) \
-            ELSE file \
-          END as child_key, \
-          kind, COUNT(*) \
-        FROM symbols WHERE file LIKE ?1 ESCAPE '\\' \
-        GROUP BY child_key, kind \
-        ORDER BY child_key, kind";
-
-    const CHILD_KEY_DEPS: &str = "\
-        SELECT \
-          CASE WHEN INSTR(SUBSTR(source_file, ?2 + 1), '/') > 0 \
-            THEN SUBSTR(source_file, 1, ?2 + INSTR(SUBSTR(source_file, ?2 + 1), '/')) \
-            ELSE source_file \
-          END as child_key, \
-          COUNT(DISTINCT import_path) \
-        FROM file_imports WHERE source_file LIKE ?1 ESCAPE '\\' \
-        GROUP BY child_key \
-        ORDER BY child_key";
-
-    let mut metrics_map: HashMap<String, SummaryMetrics> = HashMap::new();
-
-    // Bulk files/language.
-    let mut lang_stmt = conn.prepare_cached(CHILD_KEY_FILES)?;
-    let lang_rows = lang_stmt.query_map(rusqlite::params![like_pattern, plen], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)? as usize,
-            row.get::<_, i64>(3)? as usize,
-        ))
-    })?;
-    for row in lang_rows {
-        let (child_key, lang, count, lines) = row?;
-        let m = metrics_map.entry(child_key).or_default();
-        m.file_count += count;
-        m.line_count += lines;
-        m.language_breakdown.push((lang, count));
-    }
-
-    // Bulk symbols.
-    let mut sym_stmt = conn.prepare_cached(CHILD_KEY_SYMS)?;
-    let sym_rows = sym_stmt.query_map(rusqlite::params![like_pattern, plen], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)? as usize,
-        ))
-    })?;
-    for row in sym_rows {
-        let (child_key, kind, count) = row?;
-        let m = metrics_map.entry(child_key).or_default();
-        m.symbol_counts.push((kind, count));
-    }
-
-    // Bulk dependencies.
-    let mut dep_stmt = conn.prepare_cached(CHILD_KEY_DEPS)?;
-    let dep_rows = dep_stmt.query_map(rusqlite::params![like_pattern, plen], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
-    })?;
-    for row in dep_rows {
-        let (child_key, count) = row?;
-        let m = metrics_map.entry(child_key).or_default();
-        m.dependency_count = count;
-    }
-
-    Ok(metrics_map)
-}
-
-/// Build children from a pre-fetched list of all descendant paths.
-/// Uses binary search for O(log N) path slicing and bulk SQL queries
-/// for O(3) metric aggregation per directory level (not per child).
-fn build_children_from_paths(
-    all_paths: &[String],
+/// Build children from pre-fetched subtree data entirely in memory.
+/// After SubtreeData::load() runs 4 SQL queries at the top level, this
+/// function and its recursion perform zero additional SQL.
+fn build_children_from_data(
+    data: &SubtreeData,
     dir_prefix: &str,
-    conn: &Connection,
     options: &SummaryOptions,
     current_depth: usize,
 ) -> Result<Vec<SummaryResult>> {
-    let subtree = paths_with_prefix(all_paths, dir_prefix);
+    let subtree = paths_with_prefix(&data.paths, dir_prefix);
     let prefix_len = dir_prefix.len();
 
     // Extract unique immediate children from the narrowed slice.
@@ -352,19 +349,13 @@ fn build_children_from_paths(
         }
     }
 
-    // Compute metrics for all immediate children in 3 bulk queries.
-    let safe_prefix = escape_like(dir_prefix);
-    let like_pattern = format!("{safe_prefix}%");
-    let child_metrics = bulk_query_child_metrics(conn, &like_pattern, prefix_len)?;
-
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(child_entries.len());
     for (child_path, child_type) in &child_entries {
-        let metrics = child_metrics.get(child_path).cloned().unwrap_or_default();
+        let is_file = *child_type == SummaryPathType::File;
+        let metrics = data.metrics_for_prefix(child_path, is_file);
 
-        let grandchildren = if *child_type == SummaryPathType::Directory
-            && should_recurse(options.depth, current_depth)
-        {
-            build_children_from_paths(all_paths, child_path, conn, options, current_depth + 1)?
+        let grandchildren = if !is_file && should_recurse(options.depth, current_depth) {
+            build_children_from_data(data, child_path, options, current_depth + 1)?
         } else {
             vec![]
         };
