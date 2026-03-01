@@ -2345,8 +2345,8 @@ Wire enclosing function detection into the full index build (`wonk init`/`wonk u
 - [x] Use two-pass approach within each file: first extract symbols (to get their IDs), then extract references with caller_id resolution
 - [x] During daemon incremental re-indexing, populate caller_id on new reference rows using the same logic
 - [x] For `wonk update` on existing indexes: full rebuild includes caller_id population
-- [ ] When indexes lack caller_id data, call graph queries should return empty results with a hint to re-index
-- [ ] Log caller_id population stats during init (e.g., "Populated N caller relationships")
+- [x] When indexes lack caller_id data, call graph queries should return empty results with a hint to re-index
+- [x] Log caller_id population stats during init (e.g., "Populated N caller relationships")
 
 **Dependencies:**
 - Blocked by: TASK-057

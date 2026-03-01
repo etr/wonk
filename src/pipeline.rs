@@ -41,6 +41,8 @@ pub struct IndexStats {
     pub symbol_count: usize,
     /// Number of references extracted.
     pub ref_count: usize,
+    /// Number of references with a resolved caller_id.
+    pub caller_count: usize,
     /// Wall-clock elapsed time.
     pub elapsed: std::time::Duration,
 }
@@ -120,7 +122,7 @@ pub fn build_index_with_progress(
         .collect();
 
     // 5. Batch insert.
-    let (sym_count, ref_count) = batch_insert(&conn, &results)?;
+    let (sym_count, ref_count, caller_count) = batch_insert(&conn, &results)?;
 
     // 6. Collect languages seen and write meta.json.
     let languages: Vec<String> = {
@@ -138,6 +140,7 @@ pub fn build_index_with_progress(
         file_count: results.len(),
         symbol_count: sym_count,
         ref_count,
+        caller_count,
         elapsed: start.elapsed(),
     })
 }
@@ -522,8 +525,8 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
 
 /// Insert all results into the database in a single transaction.
 ///
-/// Returns (symbol_count, ref_count).
-fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usize)> {
+/// Returns (symbol_count, ref_count, caller_count).
+fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usize, usize)> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -535,6 +538,7 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
 
     let mut total_syms = 0usize;
     let mut total_refs = 0usize;
+    let mut caller_count = 0usize;
 
     // Insert files.
     {
@@ -594,6 +598,9 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
                     .caller_name
                     .as_deref()
                     .and_then(|name| file_map?.get(name).copied());
+                if caller_id.is_some() {
+                    caller_count += 1;
+                }
                 stmt.execute(rusqlite::params![
                     reference.name,
                     reference.file,
@@ -619,7 +626,7 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
     }
 
     tx.commit().context("committing transaction")?;
-    Ok((total_syms, total_refs))
+    Ok((total_syms, total_refs, caller_count))
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,6 +1044,26 @@ class Component {
         // ref_count is usize so it's always >= 0; just ensure indexing ran.
         let _ = stats.ref_count;
         assert!(stats.elapsed.as_nanos() > 0, "elapsed should be positive");
+    }
+
+    #[test]
+    fn test_build_index_caller_count() {
+        // The test repo has src/main.rs with fn main() calling helper(),
+        // so there should be at least one resolved caller_id relationship.
+        let dir = make_test_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+
+        assert!(
+            stats.caller_count > 0,
+            "should have caller relationships, got {}",
+            stats.caller_count
+        );
+        assert!(
+            stats.caller_count <= stats.ref_count,
+            "caller_count ({}) should not exceed ref_count ({})",
+            stats.caller_count,
+            stats.ref_count
+        );
     }
 
     #[test]
