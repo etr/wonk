@@ -2747,13 +2747,13 @@ Extract `extends` and `implements` relationships from Tree-sitter parse trees fo
 Ensure full index builds (`wonk init`/`wonk update`) and daemon incremental re-indexing populate confidence scores on all references and extract/store inheritance edges in `type_edges`.
 
 **Action Items:**
-- [ ] During full index build (pipeline.rs), compute confidence for each reference after extraction (using the import-resolution evidence from TASK-065)
-- [ ] During full index build, extract inheritance relationships per file and batch-insert into `type_edges`
-- [ ] During daemon incremental re-indexing, compute confidence for new/updated references
-- [ ] During daemon incremental re-indexing, delete stale type_edges for re-indexed files and insert fresh ones
-- [ ] For `wonk update`: full rebuild recalculates all confidence scores and rebuilds type_edges
-- [ ] Log confidence and inheritance stats during init (e.g., "Scored N references, extracted M type edges")
-- [ ] Stats messages emitted to stderr, not stdout
+- [x] During full index build (pipeline.rs), compute confidence for each reference after extraction (using the import-resolution evidence from TASK-065)
+- [x] During full index build, extract inheritance relationships per file and batch-insert into `type_edges`
+- [x] During daemon incremental re-indexing, compute confidence for new/updated references
+- [x] During daemon incremental re-indexing, delete stale type_edges for re-indexed files and insert fresh ones
+- [x] For `wonk update`: full rebuild recalculates all confidence scores and rebuilds type_edges
+- [x] Log confidence and inheritance stats during init (e.g., "Scored N references, extracted M type edges")
+- [x] Stats messages emitted to stderr, not stdout
 
 **Dependencies:**
 - Blocked by: TASK-065, TASK-066
@@ -2772,7 +2772,7 @@ Ensure full index builds (`wonk init`/`wonk update`) and daemon incremental re-i
 **Related Requirements:** PRD-CONF-REQ-001, PRD-HRTG-REQ-001, PRD-HRTG-REQ-002
 **Related Decisions:** DR-028, DR-029
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
