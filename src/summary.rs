@@ -9,6 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 use rusqlite::Connection;
 
+use crate::config::LlmConfig;
 use crate::types::{DetailLevel, SummaryMetrics, SummaryPathType, SummaryResult};
 
 /// Maximum recursion depth to prevent unbounded resource consumption.
@@ -22,6 +23,9 @@ pub struct SummaryOptions {
     pub depth: Option<usize>,
     /// Whether to suppress stderr hints.
     pub suppress: bool,
+    /// LLM config for `--semantic` descriptions.
+    /// `None` means structural only; `Some` triggers LLM generation.
+    pub semantic: Option<LlmConfig>,
 }
 
 /// Escape SQLite LIKE metacharacters (`%` and `_`) in a string.
@@ -77,13 +81,28 @@ pub fn summarize_path(
         vec![]
     };
 
+    // Generate LLM description (top-level only, not per-child).
+    let description = if let Some(ref llm_config) = options.semantic {
+        generate_description(
+            conn,
+            &normalized,
+            &like_pattern,
+            path_type,
+            &metrics,
+            llm_config,
+            options.suppress,
+        )
+    } else {
+        None
+    };
+
     Ok(SummaryResult {
         path: normalized,
         path_type,
         detail_level: options.detail,
         metrics,
         children,
-        description: None,
+        description,
     })
 }
 
@@ -373,6 +392,74 @@ fn build_children_from_data(
     Ok(results)
 }
 
+/// Attempt to generate an LLM description for the given path.
+///
+/// Returns `Some(description)` on success or cache hit, `None` if Ollama is
+/// unreachable (with a stderr warning), or `None` on other errors.
+fn generate_description(
+    conn: &Connection,
+    path: &str,
+    like_pattern: &str,
+    path_type: SummaryPathType,
+    metrics: &SummaryMetrics,
+    config: &LlmConfig,
+    suppress: bool,
+) -> Option<String> {
+    use crate::errors::LlmError;
+    use crate::llm;
+    use crate::output;
+
+    // 1. Compute content hash.
+    let content_hash = match llm::compute_content_hash(conn, like_pattern, path_type) {
+        Ok(h) => h,
+        Err(e) => {
+            output::print_hint(&format!("failed to compute content hash: {e}"), suppress);
+            return None;
+        }
+    };
+
+    // 2. Check cache.
+    if let Some(cached) = llm::get_cached(conn, path, &content_hash) {
+        return Some(cached);
+    }
+
+    // 3. Build prompt.
+    let prompt = match llm::build_prompt(conn, path, like_pattern, path_type, metrics) {
+        Ok(p) => p,
+        Err(e) => {
+            output::print_hint(&format!("failed to build prompt: {e}"), suppress);
+            return None;
+        }
+    };
+
+    // 4. Call Ollama generate.
+    match llm::generate(config, &prompt) {
+        Ok(description) => {
+            // Store in cache (ignore cache write errors).
+            let _ = llm::store_cache(conn, path, &content_hash, &description);
+            Some(description)
+        }
+        Err(LlmError::OllamaUnreachable) => {
+            output::print_hint(
+                "Ollama is not reachable; returning structural summary only",
+                suppress,
+            );
+            None
+        }
+        Err(LlmError::ModelNotFound(model)) => {
+            output::print_error(&format!(
+                "model '{model}' not found; run `ollama pull {model}` \
+                 or configure [llm].model in .wonk/config.toml"
+            ));
+            None
+        }
+        Err(e) => {
+            output::print_hint(&format!("LLM generation failed: {e}"), suppress);
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +495,7 @@ mod tests {
             detail: DetailLevel::Rich,
             depth: Some(0),
             suppress: true,
+            semantic: None,
         }
     }
 
@@ -597,5 +685,90 @@ mod tests {
 
         assert_eq!(result.path_type, SummaryPathType::Directory);
         assert_eq!(result.metrics.file_count, 1);
+    }
+
+    // -- Semantic (--semantic) tests -------------------------------------------
+
+    #[test]
+    fn summary_without_semantic_has_no_description() {
+        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+
+        let opts = SummaryOptions {
+            semantic: None,
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        assert!(result.description.is_none());
+    }
+
+    #[test]
+    fn summary_semantic_ollama_unreachable_returns_none_description() {
+        // When Ollama is down, description should be None (graceful degradation).
+        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        crate::db::ensure_summaries_table(&conn).unwrap();
+
+        let config = crate::config::LlmConfig {
+            model: "llama3.2:3b".to_string(),
+            generate_url: "http://127.0.0.1:19999/api/generate".to_string(),
+        };
+        let opts = SummaryOptions {
+            semantic: Some(config),
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        // Should succeed, but description is None since Ollama is unreachable.
+        assert!(result.description.is_none());
+    }
+
+    #[test]
+    fn summary_semantic_cached_description_returned() {
+        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        crate::db::ensure_summaries_table(&conn).unwrap();
+
+        // Pre-populate the cache with the correct content hash.
+        let hash =
+            crate::llm::compute_content_hash(&conn, "src/%", SummaryPathType::Directory).unwrap();
+        crate::llm::store_cache(&conn, "src", &hash, "Cached description.").unwrap();
+
+        let config = crate::config::LlmConfig {
+            model: "llama3.2:3b".to_string(),
+            generate_url: "http://127.0.0.1:19999/api/generate".to_string(),
+        };
+        let opts = SummaryOptions {
+            semantic: Some(config),
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        assert_eq!(result.description, Some("Cached description.".to_string()));
+    }
+
+    #[test]
+    fn summary_semantic_only_at_top_level() {
+        // Children should NOT get LLM descriptions even when semantic is enabled.
+        let (dir, conn) = make_indexed_repo(&[
+            ("src/a.rs", "fn alpha() {}\n"),
+            ("src/sub/b.rs", "fn beta() {}\n"),
+        ]);
+        crate::db::ensure_summaries_table(&conn).unwrap();
+
+        let config = crate::config::LlmConfig {
+            model: "llama3.2:3b".to_string(),
+            generate_url: "http://127.0.0.1:19999/api/generate".to_string(),
+        };
+        let opts = SummaryOptions {
+            depth: Some(1),
+            semantic: Some(config),
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+
+        // Children should have no description.
+        for child in &result.children {
+            assert!(
+                child.description.is_none(),
+                "child {} should not have description",
+                child.path
+            );
+        }
     }
 }
