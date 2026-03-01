@@ -143,20 +143,7 @@ impl Progress {
             return;
         }
 
-        let caller_suffix = if stats.caller_count > 0 {
-            format!(", {} caller relationships", stats.caller_count)
-        } else {
-            String::new()
-        };
-        let summary = format!(
-            "{} {} files ({} symbols, {} references{}) in {:.1}s",
-            self.done_label,
-            stats.file_count,
-            stats.symbol_count,
-            stats.ref_count,
-            caller_suffix,
-            stats.elapsed.as_secs_f64(),
-        );
+        let summary = self.format_summary(stats);
 
         match self.mode {
             ProgressMode::Silent => unreachable!(),
@@ -168,6 +155,32 @@ impl Progress {
                 eprintln!("{}", summary);
             }
         }
+    }
+
+    /// Format the completion summary string.
+    ///
+    /// Public for testing; used internally by [`finish`].
+    pub fn format_summary(&self, stats: &IndexStats) -> String {
+        let caller_suffix = if stats.caller_count > 0 {
+            format!(", {} caller relationships", stats.caller_count)
+        } else {
+            String::new()
+        };
+        let type_edge_suffix = if stats.type_edge_count > 0 {
+            format!(", {} type edges", stats.type_edge_count)
+        } else {
+            String::new()
+        };
+        format!(
+            "{} {} files ({} symbols, {} references{}{}) in {:.1}s",
+            self.done_label,
+            stats.file_count,
+            stats.symbol_count,
+            stats.ref_count,
+            caller_suffix,
+            type_edge_suffix,
+            stats.elapsed.as_secs_f64(),
+        )
     }
 
     // -- internal rendering ---------------------------------------------------
@@ -310,5 +323,41 @@ mod tests {
         assert_ne!(ProgressMode::Silent, ProgressMode::InPlace);
         assert_ne!(ProgressMode::Silent, ProgressMode::LineBased);
         assert_ne!(ProgressMode::InPlace, ProgressMode::LineBased);
+    }
+
+    #[test]
+    fn test_finish_summary_includes_type_edges_when_nonzero() {
+        let p = Progress::new("Indexing", "Indexed", ProgressMode::InPlace);
+        let stats = IndexStats {
+            file_count: 42,
+            symbol_count: 100,
+            ref_count: 200,
+            caller_count: 50,
+            type_edge_count: 3,
+            elapsed: Duration::from_secs_f64(1.5),
+        };
+        let summary = p.format_summary(&stats);
+        assert!(
+            summary.contains("3 type edges"),
+            "summary should include type edge count when > 0, got: {summary}"
+        );
+    }
+
+    #[test]
+    fn test_finish_summary_omits_type_edges_when_zero() {
+        let p = Progress::new("Indexing", "Indexed", ProgressMode::InPlace);
+        let stats = IndexStats {
+            file_count: 42,
+            symbol_count: 100,
+            ref_count: 200,
+            caller_count: 50,
+            type_edge_count: 0,
+            elapsed: Duration::from_secs_f64(1.5),
+        };
+        let summary = p.format_summary(&stats);
+        assert!(
+            !summary.contains("type edge"),
+            "summary should not mention type edges when count is 0, got: {summary}"
+        );
     }
 }

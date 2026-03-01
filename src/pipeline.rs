@@ -2483,6 +2483,249 @@ class Worker implements Runnable { run() {} }
     }
 
     #[test]
+    fn test_reindex_file_updates_type_edges() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+
+        // Write a TypeScript file with class hierarchy: Dog extends Animal.
+        fs::write(
+            root.join("app.ts"),
+            "class Animal {}\nclass Dog extends Animal {}\n",
+        )
+        .unwrap();
+
+        let _stats = build_index(root, true).unwrap();
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Verify initial type_edge exists (Dog -> Animal, extends).
+        let initial_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM type_edges te \
+                 JOIN symbols child ON te.child_id = child.id \
+                 JOIN symbols parent ON te.parent_id = parent.id \
+                 WHERE child.name = 'Dog' AND parent.name = 'Animal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(initial_edges, 1, "should have Dog->Animal edge initially");
+
+        // Modify file: change Dog to extend Creature instead of Animal.
+        fs::write(
+            root.join("app.ts"),
+            "class Creature {}\nclass Dog extends Creature {}\n",
+        )
+        .unwrap();
+
+        let changed = reindex_file(&conn, &root.join("app.ts"), root).unwrap();
+        assert!(changed, "modified file should be re-indexed");
+
+        // Old edge (Dog -> Animal) should be gone.
+        let old_edge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM type_edges te \
+                 JOIN symbols child ON te.child_id = child.id \
+                 JOIN symbols parent ON te.parent_id = parent.id \
+                 WHERE child.name = 'Dog' AND parent.name = 'Animal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_edge, 0, "old Dog->Animal edge should be removed");
+
+        // New edge (Dog -> Creature) should exist.
+        let new_edge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM type_edges te \
+                 JOIN symbols child ON te.child_id = child.id \
+                 JOIN symbols parent ON te.parent_id = parent.id \
+                 WHERE child.name = 'Dog' AND parent.name = 'Creature'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_edge, 1, "new Dog->Creature edge should exist");
+    }
+
+    #[test]
+    fn test_remove_file_deletes_type_edges() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+
+        // Write a TypeScript file with class hierarchy.
+        fs::write(
+            root.join("app.ts"),
+            "class Animal {}\nclass Dog extends Animal {}\n",
+        )
+        .unwrap();
+
+        let stats = build_index(root, true).unwrap();
+        assert!(
+            stats.type_edge_count > 0,
+            "should have type edges after build"
+        );
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Verify type_edges exist before removal.
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
+            .unwrap();
+        assert!(before > 0, "should have type edges before removal");
+
+        // Remove the file.
+        remove_file(&conn, &root.join("app.ts"), root).unwrap();
+
+        // Type edges should be gone.
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "type edges should be removed after file removal");
+    }
+
+    #[test]
+    fn test_rebuild_index_recalculates_confidence_and_type_edges() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+
+        // TypeScript file with class hierarchy and function calls.
+        // Using import to get 0.95 confidence and same-file def for 0.85.
+        fs::write(
+            root.join("app.ts"),
+            r#"import { helper } from './util';
+class Animal {}
+class Dog extends Animal {}
+function greet() { return helper(); }
+function unknown() { return mystery(); }
+"#,
+        )
+        .unwrap();
+
+        // Build initial index.
+        let stats1 = build_index(root, true).unwrap();
+        assert!(stats1.type_edge_count > 0, "should have type edges");
+
+        let index_path = db::local_index_path(root);
+        let conn1 = db::open_existing(&index_path).unwrap();
+
+        let edges_before: i64 = conn1
+            .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
+            .unwrap();
+        assert!(edges_before > 0, "should have type edges before rebuild");
+
+        // Verify confidence is NOT all default 0.5 (we have import-resolved refs).
+        let has_non_default: i64 = conn1
+            .query_row(
+                "SELECT COUNT(*) FROM \"references\" WHERE ABS(confidence - 0.5) > 0.01",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_non_default > 0,
+            "should have non-default confidence values before rebuild, got {}",
+            has_non_default
+        );
+        drop(conn1);
+
+        // Rebuild from scratch.
+        let stats2 = rebuild_index(root, true).unwrap();
+        assert!(
+            stats2.type_edge_count > 0,
+            "should have type edges after rebuild"
+        );
+
+        let conn2 = db::open_existing(&index_path).unwrap();
+
+        let edges_after: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            edges_before, edges_after,
+            "rebuild should preserve same type edge count"
+        );
+
+        // Confidence should still be non-default after rebuild.
+        let has_non_default2: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM \"references\" WHERE ABS(confidence - 0.5) > 0.01",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_non_default2 > 0,
+            "should still have non-default confidence after rebuild, got {}",
+            has_non_default2
+        );
+    }
+
+    #[test]
+    fn test_process_events_handles_type_edges() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+
+        // TypeScript file with class hierarchy.
+        fs::write(
+            root.join("app.ts"),
+            "class Animal {}\nclass Dog extends Animal {}\n",
+        )
+        .unwrap();
+
+        let _stats = build_index(root, true).unwrap();
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // Verify initial type_edges.
+        let edges_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
+            .unwrap();
+        assert!(edges_before > 0, "should have type edges initially");
+
+        // Modify file: change class hierarchy.
+        fs::write(
+            root.join("app.ts"),
+            "class Creature {}\nclass Cat extends Creature {}\n",
+        )
+        .unwrap();
+
+        let events = vec![FileEvent::Modified(root.join("app.ts"))];
+        let result = process_events(&conn, &events, root).unwrap();
+        assert_eq!(result.updated_count, 1);
+
+        // Old edges (Dog -> Animal) should be gone.
+        let old_edge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM type_edges te \
+                 JOIN symbols child ON te.child_id = child.id \
+                 WHERE child.name = 'Dog'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_edge, 0, "old Dog edge should be removed");
+
+        // New edges (Cat -> Creature) should exist.
+        let new_edge: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM type_edges te \
+                 JOIN symbols child ON te.child_id = child.id \
+                 JOIN symbols parent ON te.parent_id = parent.id \
+                 WHERE child.name = 'Cat' AND parent.name = 'Creature'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_edge, 1, "new Cat->Creature edge should exist");
+    }
+
+    #[test]
     fn test_build_index_type_edges_unresolvable() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
