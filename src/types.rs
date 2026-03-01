@@ -442,6 +442,21 @@ pub struct SummaryResult {
     pub description: Option<String>,
 }
 
+/// A raw (name-based) type hierarchy edge extracted from a syntax tree.
+///
+/// Contains unresolved names (not database IDs).  The pipeline resolves
+/// `child_name` and `parent_name` to symbol IDs before inserting into the
+/// `type_edges` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTypeEdge {
+    /// Name of the child type (e.g. the class that extends or implements).
+    pub child_name: String,
+    /// Name of the parent type (e.g. the superclass or implemented interface).
+    pub parent_name: String,
+    /// Relationship kind: `"extends"` or `"implements"`.
+    pub relationship: String,
+}
+
 /// A single hop in a call path between two symbols, returned by `wonk callpath`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallPathHop {
@@ -831,5 +846,28 @@ mod tests {
         };
         assert_eq!(parent.children.len(), 1);
         assert_eq!(parent.children[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn raw_type_edge_creation() {
+        let edge = RawTypeEdge {
+            child_name: "Dog".into(),
+            parent_name: "Animal".into(),
+            relationship: "extends".into(),
+        };
+        assert_eq!(edge.child_name, "Dog");
+        assert_eq!(edge.parent_name, "Animal");
+        assert_eq!(edge.relationship, "extends");
+    }
+
+    #[test]
+    fn raw_type_edge_equality() {
+        let a = RawTypeEdge {
+            child_name: "Cat".into(),
+            parent_name: "Animal".into(),
+            relationship: "extends".into(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
     }
 }

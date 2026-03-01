@@ -24,7 +24,7 @@ use crate::embedding::{self, OllamaClient};
 use crate::errors::EmbeddingError;
 use crate::indexer;
 use crate::progress::{Progress, ProgressMode};
-use crate::types::{Reference, Symbol};
+use crate::types::{RawTypeEdge, Reference, Symbol};
 use crate::walker::Walker;
 use crate::watcher::FileEvent;
 
@@ -43,6 +43,8 @@ pub struct IndexStats {
     pub ref_count: usize,
     /// Number of references with a resolved caller_id.
     pub caller_count: usize,
+    /// Number of type hierarchy edges (extends/implements) stored.
+    pub type_edge_count: usize,
     /// Wall-clock elapsed time.
     pub elapsed: std::time::Duration,
 }
@@ -67,6 +69,8 @@ struct FileResult {
     refs: Vec<Reference>,
     /// Extracted import paths for dependency graph.
     imports: Vec<String>,
+    /// Extracted type hierarchy edges (extends/implements).
+    type_edges: Vec<RawTypeEdge>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +126,7 @@ pub fn build_index_with_progress(
         .collect();
 
     // 5. Batch insert.
-    let (sym_count, ref_count, caller_count) = batch_insert(&conn, &results)?;
+    let (sym_count, ref_count, caller_count, type_edge_count) = batch_insert(&conn, &results)?;
 
     // 6. Collect languages seen and write meta.json.
     let languages: Vec<String> = {
@@ -141,6 +145,7 @@ pub fn build_index_with_progress(
         symbol_count: sym_count,
         ref_count,
         caller_count,
+        type_edge_count,
         elapsed: start.elapsed(),
     })
 }
@@ -248,6 +253,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
     let symbols = indexer::extract_symbols(&tree, &content, &rel_path, lang);
     let mut refs = indexer::extract_references(&tree, &content, &rel_path, lang);
     let file_imports = indexer::extract_imports(&tree, &content, &rel_path, lang);
+    let type_edges = indexer::extract_type_edges(&tree, &content, &rel_path, lang);
 
     // Compute confidence for each reference.
     for r in &mut refs {
@@ -267,6 +273,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
             symbols,
             refs,
             imports: file_imports.imports,
+            type_edges,
         },
     )?;
 
@@ -479,6 +486,40 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         }
     }
 
+    // Insert type hierarchy edges, resolving names to symbol IDs.
+    {
+        let mut insert_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO type_edges (child_id, parent_id, relationship) \
+             VALUES (?1, ?2, ?3)",
+        )?;
+        let mut cross_file_lookup = tx.prepare("SELECT id FROM symbols WHERE name = ?1 LIMIT 1")?;
+
+        for edge in &result.type_edges {
+            // Resolve child_id: must be in the same file.
+            let Some(child_id) = caller_map.get(edge.child_name.as_str()).copied() else {
+                continue;
+            };
+
+            // Resolve parent_id: try same file first, then cross-file.
+            let Some(parent_id) =
+                caller_map
+                    .get(edge.parent_name.as_str())
+                    .copied()
+                    .or_else(|| {
+                        cross_file_lookup
+                            .query_row(rusqlite::params![edge.parent_name], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                            .ok()
+                    })
+            else {
+                continue;
+            };
+
+            insert_stmt.execute(rusqlite::params![child_id, parent_id, edge.relationship,])?;
+        }
+    }
+
     tx.commit().context("committing upsert transaction")?;
     Ok(())
 }
@@ -517,6 +558,9 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
     // Extract imports for dependency graph.
     let file_imports = indexer::extract_imports(&tree, &content, &rel_path, lang);
 
+    // Extract type hierarchy edges (extends/implements).
+    let type_edges = indexer::extract_type_edges(&tree, &content, &rel_path, lang);
+
     // Compute confidence for each reference.
     for r in &mut refs {
         r.confidence = indexer::compute_confidence(r, &symbols, &file_imports.imports);
@@ -532,13 +576,14 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
         symbols,
         refs,
         imports: file_imports.imports,
+        type_edges,
     })
 }
 
 /// Insert all results into the database in a single transaction.
 ///
-/// Returns (symbol_count, ref_count, caller_count).
-fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usize, usize)> {
+/// Returns (symbol_count, ref_count, caller_count, type_edge_count).
+fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usize, usize, usize)> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -638,8 +683,47 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
         }
     }
 
+    // Insert type hierarchy edges, resolving names to symbol IDs.
+    let mut type_edge_count = 0usize;
+    {
+        let mut insert_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO type_edges (child_id, parent_id, relationship) \
+             VALUES (?1, ?2, ?3)",
+        )?;
+        let mut cross_file_lookup = tx.prepare("SELECT id FROM symbols WHERE name = ?1 LIMIT 1")?;
+
+        for r in results {
+            let file_map = file_caller_maps.get(r.rel_path.as_str());
+            for edge in &r.type_edges {
+                // Resolve child_id: must be in the same file.
+                let Some(child_id) =
+                    file_map.and_then(|m| m.get(edge.child_name.as_str()).copied())
+                else {
+                    continue;
+                };
+
+                // Resolve parent_id: try same file first, then cross-file.
+                let Some(parent_id) = file_map
+                    .and_then(|m| m.get(edge.parent_name.as_str()).copied())
+                    .or_else(|| {
+                        cross_file_lookup
+                            .query_row(rusqlite::params![edge.parent_name], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                            .ok()
+                    })
+                else {
+                    continue;
+                };
+
+                insert_stmt.execute(rusqlite::params![child_id, parent_id, edge.relationship,])?;
+                type_edge_count += 1;
+            }
+        }
+    }
+
     tx.commit().context("committing transaction")?;
-    Ok((total_syms, total_refs, caller_count))
+    Ok((total_syms, total_refs, caller_count, type_edge_count))
 }
 
 // ---------------------------------------------------------------------------
@@ -2292,5 +2376,98 @@ fn helper() -> i32 {
             confidence > 0.5,
             "same-file reference after upsert should have confidence > 0.5, got {confidence}"
         );
+    }
+
+    // -- type_edges pipeline integration tests ---------------------------------
+
+    #[test]
+    fn test_build_index_type_edges() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+
+        // TypeScript file with class hierarchy.
+        fs::write(
+            root.join("app.ts"),
+            r#"class Animal {}
+class Dog extends Animal {}
+interface Runnable { run(): void; }
+class Worker implements Runnable { run() {} }
+"#,
+        )
+        .unwrap();
+
+        let stats = build_index(root, true).unwrap();
+        assert!(stats.symbol_count > 0);
+        assert!(
+            stats.type_edge_count > 0,
+            "should have type edges, got {}",
+            stats.type_edge_count
+        );
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        let edge_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            edge_count >= 2,
+            "should have at least 2 type edges (extends + implements), got {edge_count}"
+        );
+
+        // Verify specific edges exist.
+        let extends_rel: String = conn
+            .query_row(
+                "SELECT te.relationship FROM type_edges te \
+                 JOIN symbols child ON te.child_id = child.id \
+                 JOIN symbols parent ON te.parent_id = parent.id \
+                 WHERE child.name = 'Dog' AND parent.name = 'Animal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(extends_rel, "extends");
+
+        let impl_rel: String = conn
+            .query_row(
+                "SELECT te.relationship FROM type_edges te \
+                 JOIN symbols child ON te.child_id = child.id \
+                 JOIN symbols parent ON te.parent_id = parent.id \
+                 WHERE child.name = 'Worker' AND parent.name = 'Runnable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(impl_rel, "implements");
+    }
+
+    #[test]
+    fn test_build_index_type_edges_unresolvable() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+
+        // TypeScript file where parent class is not defined in any indexed file.
+        fs::write(
+            root.join("child.ts"),
+            "class Child extends UnknownParent {}\n",
+        )
+        .unwrap();
+
+        let stats = build_index(root, true).unwrap();
+        assert!(stats.symbol_count > 0);
+        assert_eq!(
+            stats.type_edge_count, 0,
+            "unresolvable parent should produce no type edges"
+        );
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        let edge_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 0);
     }
 }

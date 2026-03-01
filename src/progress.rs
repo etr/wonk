@@ -279,6 +279,7 @@ mod tests {
             symbol_count: 500,
             ref_count: 2000,
             caller_count: 150,
+            type_edge_count: 0,
             elapsed: Duration::from_secs_f64(1.5),
         };
         // Should not panic or produce stdout output

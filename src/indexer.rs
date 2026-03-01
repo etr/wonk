@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tree_sitter::{Language, Node, Parser, Tree};
 
-use crate::types::{FileImports, Reference, ReferenceKind, Symbol, SymbolKind};
+use crate::types::{FileImports, RawTypeEdge, Reference, ReferenceKind, Symbol, SymbolKind};
 
 /// Supported programming languages with bundled Tree-sitter grammars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2676,6 +2676,385 @@ fn walk_imports(
     }
 }
 
+// ===========================================================================
+// Type hierarchy edge extraction
+// ===========================================================================
+
+/// Extract type hierarchy edges (extends/implements) from a parsed syntax tree.
+///
+/// Returns a list of [`RawTypeEdge`] with unresolved names. The pipeline
+/// resolves these to symbol IDs before inserting into the `type_edges` table.
+///
+/// C and Go are skipped (no class-based inheritance).
+pub fn extract_type_edges(tree: &Tree, source: &str, _file: &str, lang: Lang) -> Vec<RawTypeEdge> {
+    // C and Go have no class-based inheritance.
+    if matches!(lang, Lang::C | Lang::Go) {
+        return Vec::new();
+    }
+
+    let src = source.as_bytes();
+    let mut edges = Vec::new();
+    walk_type_edges(tree.root_node(), src, lang, &mut edges);
+    edges
+}
+
+/// Recursively walk the tree collecting type hierarchy edges.
+fn walk_type_edges(node: Node, src: &[u8], lang: Lang, edges: &mut Vec<RawTypeEdge>) {
+    let kind = node.kind();
+
+    match lang {
+        Lang::TypeScript | Lang::Tsx => {
+            if kind == "class_declaration"
+                && let Some(class_name) = field_text(node, "name", src)
+            {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32)
+                        && child.kind() == "class_heritage"
+                    {
+                        extract_ts_heritage(child, src, class_name, edges);
+                    }
+                }
+            }
+        }
+        Lang::JavaScript => {
+            if (kind == "class_declaration" || kind == "class")
+                && let Some(class_name) = field_text(node, "name", src)
+            {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32)
+                        && child.kind() == "class_heritage"
+                    {
+                        // In JS, class_heritage children: extends keyword, then identifier.
+                        for j in 0..child.child_count() {
+                            if let Some(gchild) = child.child(j as u32)
+                                && gchild.kind() == "identifier"
+                            {
+                                let parent = node_text(gchild, src);
+                                if !parent.is_empty() {
+                                    edges.push(RawTypeEdge {
+                                        child_name: class_name.to_string(),
+                                        parent_name: parent.to_string(),
+                                        relationship: "extends".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Lang::Python => {
+            if kind == "class_definition"
+                && let Some(class_name) = field_text(node, "name", src)
+                && let Some(superclasses) = node.child_by_field_name("superclasses")
+            {
+                for i in 0..superclasses.named_child_count() {
+                    if let Some(arg) = superclasses.named_child(i as u32) {
+                        // Skip keyword_argument (e.g., metaclass=ABCMeta).
+                        if arg.kind() == "keyword_argument" {
+                            continue;
+                        }
+                        let parent = node_text(arg, src);
+                        if !parent.is_empty() {
+                            edges.push(RawTypeEdge {
+                                child_name: class_name.to_string(),
+                                parent_name: parent.to_string(),
+                                relationship: "extends".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Lang::Java => {
+            if (kind == "class_declaration" || kind == "interface_declaration")
+                && let Some(class_name) = field_text(node, "name", src)
+            {
+                let is_interface = kind == "interface_declaration";
+
+                // extends: superclass field for classes.
+                if !is_interface && let Some(superclass) = node.child_by_field_name("superclass") {
+                    extract_java_type_list(superclass, src, class_name, "extends", edges);
+                }
+
+                // implements for classes, extends for interfaces.
+                if let Some(interfaces) = node.child_by_field_name("interfaces") {
+                    let rel = if is_interface {
+                        "extends"
+                    } else {
+                        "implements"
+                    };
+                    extract_java_type_list(interfaces, src, class_name, rel, edges);
+                }
+            }
+        }
+        Lang::CSharp => {
+            if matches!(
+                kind,
+                "class_declaration" | "struct_declaration" | "interface_declaration"
+            ) && let Some(class_name) = field_text(node, "name", src)
+            {
+                let is_interface = kind == "interface_declaration";
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32)
+                        && child.kind() == "base_list"
+                    {
+                        extract_csharp_base_list(child, src, class_name, is_interface, edges);
+                    }
+                }
+            }
+        }
+        Lang::Cpp => {
+            if (kind == "class_specifier" || kind == "struct_specifier")
+                && let Some(class_name) = field_text(node, "name", src)
+            {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32)
+                        && child.kind() == "base_class_clause"
+                    {
+                        extract_cpp_bases(child, src, class_name, edges);
+                    }
+                }
+            }
+        }
+        Lang::Ruby => {
+            if kind == "class"
+                && let Some(class_name) = field_text(node, "name", src)
+                && let Some(superclass) = node.child_by_field_name("superclass")
+            {
+                for i in 0..superclass.child_count() {
+                    if let Some(child) = superclass.child(i as u32)
+                        && (child.kind() == "constant" || child.kind() == "scope_resolution")
+                    {
+                        let parent = node_text(child, src);
+                        if !parent.is_empty() {
+                            edges.push(RawTypeEdge {
+                                child_name: class_name.to_string(),
+                                parent_name: parent.to_string(),
+                                relationship: "extends".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Lang::Rust => {
+            if kind == "impl_item"
+                && let Some(trait_node) = node.child_by_field_name("trait")
+                && let Some(type_node) = node.child_by_field_name("type")
+            {
+                let trait_name = extract_type_name(trait_node, src);
+                let type_name = extract_type_name(type_node, src);
+                if !trait_name.is_empty() && !type_name.is_empty() {
+                    edges.push(RawTypeEdge {
+                        child_name: type_name,
+                        parent_name: trait_name,
+                        relationship: "implements".to_string(),
+                    });
+                }
+            }
+        }
+        Lang::Php => {
+            if kind == "class_declaration"
+                && let Some(class_name) = field_text(node, "name", src)
+            {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i as u32) {
+                        if child.kind() == "base_clause" {
+                            extract_php_clause(child, src, class_name, "extends", edges);
+                        } else if child.kind() == "class_interface_clause" {
+                            extract_php_clause(child, src, class_name, "implements", edges);
+                        }
+                    }
+                }
+            }
+        }
+        Lang::C | Lang::Go => {} // handled by early return above
+    }
+
+    // Recurse into children.
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            walk_type_edges(child, src, lang, edges);
+        }
+    }
+}
+
+/// Extract the type name from a type node, handling generic_type by taking
+/// just the type_identifier name.
+fn extract_type_name(node: Node, src: &[u8]) -> String {
+    if node.kind() == "generic_type" {
+        // generic_type has a "name" field that is the type_identifier.
+        if let Some(name) = field_text(node, "name", src) {
+            return name.to_string();
+        }
+    }
+    node_text(node, src).to_string()
+}
+
+/// Extract extends/implements from a TypeScript class_heritage node.
+fn extract_ts_heritage(heritage: Node, src: &[u8], class_name: &str, edges: &mut Vec<RawTypeEdge>) {
+    for i in 0..heritage.child_count() {
+        let Some(clause) = heritage.child(i as u32) else {
+            continue;
+        };
+        match clause.kind() {
+            "extends_clause" => {
+                if let Some(value) = clause.child_by_field_name("value") {
+                    let parent = extract_type_name(value, src);
+                    if !parent.is_empty() {
+                        edges.push(RawTypeEdge {
+                            child_name: class_name.to_string(),
+                            parent_name: parent,
+                            relationship: "extends".to_string(),
+                        });
+                    }
+                }
+            }
+            "implements_clause" => {
+                for j in 0..clause.child_count() {
+                    if let Some(type_node) = clause.child(j as u32)
+                        && matches!(type_node.kind(), "type_identifier" | "generic_type")
+                    {
+                        let parent = extract_type_name(type_node, src);
+                        if !parent.is_empty() {
+                            edges.push(RawTypeEdge {
+                                child_name: class_name.to_string(),
+                                parent_name: parent,
+                                relationship: "implements".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract type identifiers from a Java superclass or super_interfaces node.
+fn extract_java_type_list(
+    node: Node,
+    src: &[u8],
+    class_name: &str,
+    relationship: &str,
+    edges: &mut Vec<RawTypeEdge>,
+) {
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        match child.kind() {
+            "type_identifier" | "generic_type" => {
+                let parent = extract_type_name(child, src);
+                if !parent.is_empty() {
+                    edges.push(RawTypeEdge {
+                        child_name: class_name.to_string(),
+                        parent_name: parent,
+                        relationship: relationship.to_string(),
+                    });
+                }
+            }
+            "type_list" => {
+                extract_java_type_list(child, src, class_name, relationship, edges);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract type identifiers from a C# base_list node.
+///
+/// For classes/structs: first identifier = extends, rest = implements.
+/// For interfaces: all identifiers = extends.
+fn extract_csharp_base_list(
+    base_list: Node,
+    src: &[u8],
+    class_name: &str,
+    is_interface: bool,
+    edges: &mut Vec<RawTypeEdge>,
+) {
+    let mut found_first = false;
+    for i in 0..base_list.child_count() {
+        if let Some(child) = base_list.child(i as u32)
+            && matches!(
+                child.kind(),
+                "identifier" | "generic_name" | "qualified_name"
+            )
+        {
+            let parent = extract_type_name(child, src);
+            if parent.is_empty() {
+                continue;
+            }
+
+            let rel = if is_interface {
+                "extends"
+            } else if !found_first {
+                found_first = true;
+                "extends"
+            } else {
+                "implements"
+            };
+
+            edges.push(RawTypeEdge {
+                child_name: class_name.to_string(),
+                parent_name: parent,
+                relationship: rel.to_string(),
+            });
+        }
+    }
+}
+
+/// Extract base class identifiers from a C++ base_class_clause.
+fn extract_cpp_bases(
+    base_clause: Node,
+    src: &[u8],
+    class_name: &str,
+    edges: &mut Vec<RawTypeEdge>,
+) {
+    for i in 0..base_clause.child_count() {
+        if let Some(child) = base_clause.child(i as u32)
+            && matches!(
+                child.kind(),
+                "type_identifier" | "qualified_identifier" | "template_type"
+            )
+        {
+            let parent = extract_type_name(child, src);
+            if !parent.is_empty() {
+                edges.push(RawTypeEdge {
+                    child_name: class_name.to_string(),
+                    parent_name: parent,
+                    relationship: "extends".to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Extract type identifiers from a PHP base_clause or class_interface_clause.
+fn extract_php_clause(
+    clause: Node,
+    src: &[u8],
+    class_name: &str,
+    relationship: &str,
+    edges: &mut Vec<RawTypeEdge>,
+) {
+    for i in 0..clause.child_count() {
+        if let Some(child) = clause.child(i as u32)
+            && matches!(child.kind(), "name" | "qualified_name")
+        {
+            let parent = node_text(child, src);
+            if !parent.is_empty() {
+                edges.push(RawTypeEdge {
+                    child_name: class_name.to_string(),
+                    parent_name: parent.to_string(),
+                    relationship: relationship.to_string(),
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4308,5 +4687,238 @@ mod tests {
             (score - 0.80).abs() < 1e-9,
             "same-scope reference should have confidence 0.80, got {score}"
         );
+    }
+
+    // ---------- type edge extraction helper ----------
+
+    /// Parse source code for a given language and extract type edges.
+    fn edges_from(lang: Lang, source: &str) -> Vec<crate::types::RawTypeEdge> {
+        let mut parser = get_parser(lang);
+        let tree = parser.parse(source.as_bytes(), None).unwrap();
+        extract_type_edges(&tree, source, "test_file", lang)
+    }
+
+    /// Find edges by child name.
+    fn find_edges_for<'a>(
+        edges: &'a [crate::types::RawTypeEdge],
+        child: &str,
+    ) -> Vec<&'a crate::types::RawTypeEdge> {
+        edges.iter().filter(|e| e.child_name == child).collect()
+    }
+
+    // ---------- C and Go: no type edges ----------
+
+    #[test]
+    fn type_edges_c_produces_none() {
+        let src = "struct Foo { int x; };";
+        let edges = edges_from(Lang::C, src);
+        assert!(edges.is_empty(), "C should produce no type edges");
+    }
+
+    #[test]
+    fn type_edges_go_produces_none() {
+        let src = "package main\n\ntype Foo struct { X int }";
+        let edges = edges_from(Lang::Go, src);
+        assert!(edges.is_empty(), "Go should produce no type edges");
+    }
+
+    // ---------- TypeScript type edges ----------
+
+    #[test]
+    fn ts_type_edges_extends() {
+        let src = "class Animal {}\nclass Dog extends Animal {}";
+        let edges = edges_from(Lang::TypeScript, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Dog");
+        assert_eq!(edges[0].parent_name, "Animal");
+        assert_eq!(edges[0].relationship, "extends");
+    }
+
+    #[test]
+    fn ts_type_edges_implements() {
+        let src = "interface Runnable {}\nclass Worker implements Runnable {}";
+        let edges = edges_from(Lang::TypeScript, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Worker");
+        assert_eq!(edges[0].parent_name, "Runnable");
+        assert_eq!(edges[0].relationship, "implements");
+    }
+
+    #[test]
+    fn ts_type_edges_extends_and_implements() {
+        let src = "class Base {}\ninterface Iface {}\nclass Child extends Base implements Iface {}";
+        let edges = edges_from(Lang::TypeScript, src);
+        assert_eq!(edges.len(), 2);
+        let extends: Vec<_> = edges
+            .iter()
+            .filter(|e| e.relationship == "extends")
+            .collect();
+        let implements: Vec<_> = edges
+            .iter()
+            .filter(|e| e.relationship == "implements")
+            .collect();
+        assert_eq!(extends.len(), 1);
+        assert_eq!(extends[0].child_name, "Child");
+        assert_eq!(extends[0].parent_name, "Base");
+        assert_eq!(implements.len(), 1);
+        assert_eq!(implements[0].child_name, "Child");
+        assert_eq!(implements[0].parent_name, "Iface");
+    }
+
+    // ---------- JavaScript type edges ----------
+
+    #[test]
+    fn js_type_edges_extends() {
+        let src = "class Animal {}\nclass Dog extends Animal {}";
+        let edges = edges_from(Lang::JavaScript, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Dog");
+        assert_eq!(edges[0].parent_name, "Animal");
+        assert_eq!(edges[0].relationship, "extends");
+    }
+
+    // ---------- Python type edges ----------
+
+    #[test]
+    fn python_type_edges_single_base() {
+        let src = "class Animal:\n    pass\n\nclass Dog(Animal):\n    pass\n";
+        let edges = edges_from(Lang::Python, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Dog");
+        assert_eq!(edges[0].parent_name, "Animal");
+        assert_eq!(edges[0].relationship, "extends");
+    }
+
+    #[test]
+    fn python_type_edges_multiple_bases() {
+        let src = "class A:\n    pass\nclass B:\n    pass\nclass C(A, B):\n    pass\n";
+        let edges = edges_from(Lang::Python, src);
+        let c_edges = find_edges_for(&edges, "C");
+        assert_eq!(c_edges.len(), 2);
+        assert!(c_edges.iter().any(|e| e.parent_name == "A"));
+        assert!(c_edges.iter().any(|e| e.parent_name == "B"));
+        assert!(c_edges.iter().all(|e| e.relationship == "extends"));
+    }
+
+    // ---------- Java type edges ----------
+
+    #[test]
+    fn java_type_edges_extends() {
+        let src = "class Animal {}\nclass Dog extends Animal {}";
+        let edges = edges_from(Lang::Java, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Dog");
+        assert_eq!(edges[0].parent_name, "Animal");
+        assert_eq!(edges[0].relationship, "extends");
+    }
+
+    #[test]
+    fn java_type_edges_implements() {
+        let src = "interface Runnable {}\nclass Worker implements Runnable {}";
+        let edges = edges_from(Lang::Java, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Worker");
+        assert_eq!(edges[0].parent_name, "Runnable");
+        assert_eq!(edges[0].relationship, "implements");
+    }
+
+    // ---------- C# type edges ----------
+
+    #[test]
+    fn csharp_type_edges_extends() {
+        let src = "class Animal {}\nclass Dog : Animal {}";
+        let edges = edges_from(Lang::CSharp, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Dog");
+        assert_eq!(edges[0].parent_name, "Animal");
+        assert_eq!(edges[0].relationship, "extends");
+    }
+
+    #[test]
+    fn csharp_type_edges_implements() {
+        let src = "class Animal {}\ninterface IRunnable {}\nclass Dog : Animal, IRunnable {}";
+        let edges = edges_from(Lang::CSharp, src);
+        let dog_edges = find_edges_for(&edges, "Dog");
+        assert_eq!(dog_edges.len(), 2);
+        let extends: Vec<_> = dog_edges
+            .iter()
+            .filter(|e| e.relationship == "extends")
+            .collect();
+        let implements: Vec<_> = dog_edges
+            .iter()
+            .filter(|e| e.relationship == "implements")
+            .collect();
+        assert_eq!(extends.len(), 1);
+        assert_eq!(extends[0].parent_name, "Animal");
+        assert_eq!(implements.len(), 1);
+        assert_eq!(implements[0].parent_name, "IRunnable");
+    }
+
+    // ---------- C++ type edges ----------
+
+    #[test]
+    fn cpp_type_edges_extends() {
+        let src = "class Animal {};\nclass Dog : public Animal {};";
+        let edges = edges_from(Lang::Cpp, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Dog");
+        assert_eq!(edges[0].parent_name, "Animal");
+        assert_eq!(edges[0].relationship, "extends");
+    }
+
+    // ---------- Ruby type edges ----------
+
+    #[test]
+    fn ruby_type_edges_extends() {
+        let src = "class Animal\nend\nclass Dog < Animal\nend\n";
+        let edges = edges_from(Lang::Ruby, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Dog");
+        assert_eq!(edges[0].parent_name, "Animal");
+        assert_eq!(edges[0].relationship, "extends");
+    }
+
+    // ---------- Rust type edges ----------
+
+    #[test]
+    fn rust_type_edges_impl_trait() {
+        let src = "trait Drawable { fn draw(&self); }\nstruct Circle {}\nimpl Drawable for Circle { fn draw(&self) {} }";
+        let edges = edges_from(Lang::Rust, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Circle");
+        assert_eq!(edges[0].parent_name, "Drawable");
+        assert_eq!(edges[0].relationship, "implements");
+    }
+
+    #[test]
+    fn rust_type_edges_impl_no_trait() {
+        let src = "struct Point { x: f64 }\nimpl Point { fn new() -> Self { todo!() } }";
+        let edges = edges_from(Lang::Rust, src);
+        assert!(
+            edges.is_empty(),
+            "inherent impl should produce no type edges"
+        );
+    }
+
+    // ---------- PHP type edges ----------
+
+    #[test]
+    fn php_type_edges_extends() {
+        let src = "<?php\nclass Animal {}\nclass Dog extends Animal {}";
+        let edges = edges_from(Lang::Php, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Dog");
+        assert_eq!(edges[0].parent_name, "Animal");
+        assert_eq!(edges[0].relationship, "extends");
+    }
+
+    #[test]
+    fn php_type_edges_implements() {
+        let src = "<?php\ninterface Runnable {}\nclass Worker implements Runnable {}";
+        let edges = edges_from(Lang::Php, src);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_name, "Worker");
+        assert_eq!(edges[0].parent_name, "Runnable");
+        assert_eq!(edges[0].relationship, "implements");
     }
 }
