@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn summary_single_file() {
         let source = "fn hello() {\n    println!(\"hi\");\n}\nfn world() {}\n";
-        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", source)]);
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", source)]);
 
         let result = summarize_path(&conn, "src/lib.rs", &default_options()).unwrap();
 
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn summary_directory() {
-        let (dir, conn) = make_indexed_repo(&[
+        let (_dir, conn) = make_indexed_repo(&[
             ("src/a.rs", "fn alpha() {}\n"),
             ("src/b.rs", "fn beta() {}\n"),
         ]);
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn summary_empty_path_returns_zero_metrics() {
-        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
         let result = summarize_path(&conn, "nonexistent", &default_options()).unwrap();
 
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn summary_directory_does_not_match_prefix_files() {
         // "src" should NOT match "src_utils.rs"
-        let (dir, conn) = make_indexed_repo(&[
+        let (_dir, conn) = make_indexed_repo(&[
             ("src/lib.rs", "fn hello() {}\n"),
             ("src_utils.rs", "fn util() {}\n"),
         ]);
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn summary_depth_one_shows_children() {
-        let (dir, conn) = make_indexed_repo(&[
+        let (_dir, conn) = make_indexed_repo(&[
             ("src/a.rs", "fn alpha() {}\n"),
             ("src/sub/b.rs", "fn beta() {}\n"),
         ]);
@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn summary_depth_zero_no_children() {
-        let (dir, conn) = make_indexed_repo(&[
+        let (_dir, conn) = make_indexed_repo(&[
             ("src/a.rs", "fn alpha() {}\n"),
             ("src/b.rs", "fn beta() {}\n"),
         ]);
@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn summary_unlimited_depth() {
-        let (dir, conn) = make_indexed_repo(&[
+        let (_dir, conn) = make_indexed_repo(&[
             ("src/a.rs", "fn alpha() {}\n"),
             ("src/sub/b.rs", "fn beta() {}\n"),
             ("src/sub/deep/c.rs", "fn gamma() {}\n"),
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn summary_multi_language() {
-        let (dir, conn) = make_indexed_repo(&[
+        let (_dir, conn) = make_indexed_repo(&[
             ("src/lib.rs", "fn hello() {}\n"),
             ("src/main.py", "def world():\n    pass\n"),
         ]);
@@ -625,7 +625,7 @@ mod tests {
         // Create a JS file with imports that the indexer will pick up.
         let js_source =
             "import { foo } from './bar';\nimport { baz } from './qux';\nfunction main() {}\n";
-        let (dir, conn) = make_indexed_repo(&[
+        let (_dir, conn) = make_indexed_repo(&[
             ("src/app.js", js_source),
             ("src/bar.js", "export function foo() {}\n"),
             ("src/qux.js", "export function baz() {}\n"),
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn summary_detail_level_propagated() {
-        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
         for level in [DetailLevel::Rich, DetailLevel::Light, DetailLevel::Symbols] {
             let opts = SummaryOptions {
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn summary_with_trailing_slash() {
-        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
         let result = summarize_path(&conn, "src/", &default_options()).unwrap();
 
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn summary_with_dot_slash_prefix() {
-        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
         let result = summarize_path(&conn, "./src", &default_options()).unwrap();
 
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn summary_without_semantic_has_no_description() {
-        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
         let opts = SummaryOptions {
             semantic: None,
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn summary_semantic_ollama_unreachable_returns_none_description() {
         // When Ollama is down, description should be None (graceful degradation).
-        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
         crate::db::ensure_summaries_table(&conn).unwrap();
 
         let config = crate::config::LlmConfig {
@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn summary_semantic_cached_description_returned() {
-        let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
         crate::db::ensure_summaries_table(&conn).unwrap();
 
         // Pre-populate the cache with the correct content hash.
@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn summary_semantic_only_at_top_level() {
         // Children should NOT get LLM descriptions even when semantic is enabled.
-        let (dir, conn) = make_indexed_repo(&[
+        let (_dir, conn) = make_indexed_repo(&[
             ("src/a.rs", "fn alpha() {}\n"),
             ("src/sub/b.rs", "fn beta() {}\n"),
         ]);
