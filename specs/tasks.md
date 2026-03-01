@@ -36,7 +36,7 @@
 | M16 | Source Display (`wonk show`) | 2 | Complete |
 | M17 | Call Graph Commands | 2 | Complete |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Complete |
-| M19 | Edge Confidence & Inheritance Infrastructure | 3 | Not Started |
+| M19 | Edge Confidence & Inheritance Infrastructure | 3 | In Progress |
 | M20 | Hybrid Search Fusion (RRF) | 1 | Not Started |
 | M21 | Execution Flow Detection (`wonk flows`) | 1 | Not Started |
 | M22 | Blast Radius Analysis (`wonk blast`) | 1 | Not Started |
@@ -2701,18 +2701,18 @@ Add `confidence REAL` column to the `references` table, create the `type_edges` 
 Extract `extends` and `implements` relationships from Tree-sitter parse trees for 8+ OOP languages and store them as typed edges in the `type_edges` table.
 
 **Action Items:**
-- [ ] TypeScript/JavaScript: extract `class_heritage` → `extends_clause` for extends, `implements_clause` for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
-- [ ] Python: extract `class_definition` → `argument_list` for superclass (PRD-HRTG-REQ-001)
-- [ ] Java: extract `superclass` node for extends, `super_interfaces` node for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
-- [ ] C#: extract `base_list` → class types for extends, interface types for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
-- [ ] C++: extract `base_class_clause` for extends (PRD-HRTG-REQ-001)
-- [ ] Ruby: extract `superclass` node for extends (PRD-HRTG-REQ-001)
-- [ ] Rust: extract `impl_item` for trait implementation → implements edge (PRD-HRTG-REQ-002)
-- [ ] PHP: extract `class_declaration` → `base_clause` for extends, `class_interface_clause` for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
-- [ ] C and Go: skip (no class inheritance; Go interfaces are implicit)
-- [ ] Parent resolution: look up parent symbol in same-file symbols or resolved via imports; skip edge if no match found
-- [ ] Store edges with `relationship` = `"extends"` or `"implements"` (PRD-HRTG-REQ-005)
-- [ ] Include `relationship` field in JSON/TOON output for type edges (PRD-HRTG-REQ-005)
+- [x] TypeScript/JavaScript: extract `class_heritage` → `extends_clause` for extends, `implements_clause` for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
+- [x] Python: extract `class_definition` → `argument_list` for superclass (PRD-HRTG-REQ-001)
+- [x] Java: extract `superclass` node for extends, `super_interfaces` node for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
+- [x] C#: extract `base_list` → class types for extends, interface types for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
+- [x] C++: extract `base_class_clause` for extends (PRD-HRTG-REQ-001)
+- [x] Ruby: extract `superclass` node for extends (PRD-HRTG-REQ-001)
+- [x] Rust: extract `impl_item` for trait implementation → implements edge (PRD-HRTG-REQ-002)
+- [x] PHP: extract `class_declaration` → `base_clause` for extends, `class_interface_clause` for implements (PRD-HRTG-REQ-001, PRD-HRTG-REQ-002)
+- [x] C and Go: skip (no class inheritance; Go interfaces are implicit)
+- [x] Parent resolution: look up parent symbol in same-file symbols or resolved via imports; skip edge if no match found
+- [x] Store edges with `relationship` = `"extends"` or `"implements"` (PRD-HRTG-REQ-005)
+- [x] Include `relationship` field in JSON/TOON output for type edges (PRD-HRTG-REQ-005) — field stored in DB; output integration deferred to TASK-073 (`wonk context`)
 
 **Dependencies:**
 - Blocked by: TASK-065
@@ -2733,7 +2733,7 @@ Extract `extends` and `implements` relationships from Tree-sitter parse trees fo
 **Related Requirements:** PRD-HRTG-REQ-001, PRD-HRTG-REQ-002, PRD-HRTG-REQ-005
 **Related Decisions:** DR-029
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
