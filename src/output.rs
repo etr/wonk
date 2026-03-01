@@ -95,6 +95,7 @@ pub struct RefOutput {
     /// Name of the enclosing function/method (from call graph).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_name: Option<String>,
+    pub confidence: f64,
 }
 
 /// A function/method signature result.
@@ -229,6 +230,7 @@ pub struct CallerOutput {
     pub depth: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_file: Option<String>,
+    pub confidence: f64,
 }
 
 /// A symbol count entry for summary output.
@@ -355,6 +357,7 @@ pub struct CalleeOutput {
     pub depth: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
+    pub confidence: f64,
 }
 
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
@@ -1358,6 +1361,7 @@ mod tests {
             col: 4,
             context: "    foo(42);".into(),
             caller_name: None,
+            confidence: 0.5,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_reference(&reference));
         assert_eq!(out, "src/lib.rs:99:    foo(42);\n");
@@ -1373,6 +1377,7 @@ mod tests {
             col: 4,
             context: "    foo(42);".into(),
             caller_name: None,
+            confidence: 0.85,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_reference(&reference));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -2304,6 +2309,7 @@ mod tests {
             col: 4,
             context: "    foo(42);".into(),
             caller_name: None,
+            confidence: 0.5,
         };
         let out = render(OutputFormat::Toon, |fmt| fmt.format_reference(&reference));
         let parsed: RefOutput = serde_toon2::from_str(out.trim()).unwrap();
@@ -2691,6 +2697,7 @@ mod tests {
             signature: "fn dispatch()".into(),
             depth: 1,
             target_file: None,
+            confidence: 0.5,
         };
         let rendered = render(OutputFormat::Grep, |fmt| fmt.format_caller(&out));
         assert!(rendered.contains("src/router.rs"));
@@ -2708,6 +2715,7 @@ mod tests {
             signature: "fn dispatch()".into(),
             depth: 1,
             target_file: Some("src/db.rs".into()),
+            confidence: 0.5,
         };
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_caller(&out));
         let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
@@ -2728,10 +2736,28 @@ mod tests {
             signature: "fn foo()".into(),
             depth: 1,
             target_file: None,
+            confidence: 0.5,
         };
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_caller(&out));
         let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
         assert!(v.get("target_file").is_none());
+    }
+
+    #[test]
+    fn caller_json_includes_confidence() {
+        let out = CallerOutput {
+            caller_name: "dispatch".into(),
+            caller_kind: "function".into(),
+            file: "src/router.rs".into(),
+            line: 50,
+            signature: "fn dispatch()".into(),
+            depth: 1,
+            target_file: None,
+            confidence: 0.85,
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_caller(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["confidence"], 0.85);
     }
 
     // -- CalleeOutput --------------------------------------------------------
@@ -2745,6 +2771,7 @@ mod tests {
             context: "    let conn = open_db(&path);".into(),
             depth: 1,
             source_file: None,
+            confidence: 0.5,
         };
         let rendered = render(OutputFormat::Grep, |fmt| fmt.format_callee(&out));
         assert!(rendered.contains("src/db.rs"));
@@ -2761,6 +2788,7 @@ mod tests {
             context: "    let conn = open_db(&path);".into(),
             depth: 1,
             source_file: Some("src/router.rs".into()),
+            confidence: 0.5,
         };
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_callee(&out));
         let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
@@ -2780,10 +2808,27 @@ mod tests {
             context: "bar()".into(),
             depth: 1,
             source_file: None,
+            confidence: 0.5,
         };
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_callee(&out));
         let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
         assert!(v.get("source_file").is_none());
+    }
+
+    #[test]
+    fn callee_json_includes_confidence() {
+        let out = CalleeOutput {
+            callee_name: "open_db".into(),
+            file: "src/db.rs".into(),
+            line: 10,
+            context: "let conn = open_db(&path);".into(),
+            depth: 1,
+            source_file: None,
+            confidence: 0.95,
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_callee(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["confidence"], 0.95);
     }
 
     // -- CallPathHopOutput ---------------------------------------------------

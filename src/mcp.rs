@@ -537,6 +537,10 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "description": "Transitive expansion depth (default: 1 = direct callers, max: 10)",
                             "default": 1
                         },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Minimum edge confidence (0.0-1.0) to include in results"
+                        },
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
@@ -566,6 +570,10 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "description": "Transitive expansion depth (default: 1 = direct callees, max: 10)",
                             "default": 1
                         },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Minimum edge confidence (0.0-1.0) to include in results"
+                        },
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
@@ -593,6 +601,10 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "to": {
                             "type": "string",
                             "description": "Target symbol name (end of call chain)"
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Minimum edge confidence (0.0-1.0) to include in traversal"
                         },
                         "format": {
                             "type": "string",
@@ -820,6 +832,7 @@ impl McpServer {
                 col: r.col,
                 context: r.context.clone(),
                 caller_name: r.caller_name.clone(),
+                confidence: r.confidence,
             })
             .collect();
 
@@ -1113,7 +1126,18 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        let results = match crate::callgraph::callers(conn, &name, depth) {
+        let min_confidence: Option<f64> =
+            args.get("min_confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| {
+                    if c.is_nan() || c.is_infinite() {
+                        0.0
+                    } else {
+                        c.clamp(0.0, 1.0)
+                    }
+                });
+
+        let results = match crate::callgraph::callers(conn, &name, depth, min_confidence) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("callers query failed: {e}")),
         };
@@ -1128,6 +1152,7 @@ impl McpServer {
                 signature: cr.signature.clone(),
                 depth: cr.depth,
                 target_file: cr.target_file.clone(),
+                confidence: cr.confidence,
             })
             .collect();
 
@@ -1144,7 +1169,18 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        let results = match crate::callgraph::callees(conn, &name, depth) {
+        let min_confidence: Option<f64> =
+            args.get("min_confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| {
+                    if c.is_nan() || c.is_infinite() {
+                        0.0
+                    } else {
+                        c.clamp(0.0, 1.0)
+                    }
+                });
+
+        let results = match crate::callgraph::callees(conn, &name, depth, min_confidence) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("callees query failed: {e}")),
         };
@@ -1158,6 +1194,7 @@ impl McpServer {
                 context: cr.context.clone(),
                 depth: cr.depth,
                 source_file: cr.source_file.clone(),
+                confidence: cr.confidence,
             })
             .collect();
 
@@ -1188,7 +1225,18 @@ impl McpServer {
             );
         }
 
-        match crate::callgraph::callpath(conn, &from, &to) {
+        let min_confidence: Option<f64> =
+            args.get("min_confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| {
+                    if c.is_nan() || c.is_infinite() {
+                        0.0
+                    } else {
+                        c.clamp(0.0, 1.0)
+                    }
+                });
+
+        match crate::callgraph::callpath(conn, &from, &to, min_confidence) {
             Ok(Some(hops)) => {
                 let outputs: Vec<CallPathHopOutput> = hops
                     .iter()
@@ -1654,6 +1702,10 @@ mod tests {
         assert!(props.contains_key("name"), "missing 'name' property");
         assert!(props.contains_key("depth"), "missing 'depth' property");
         assert!(props.contains_key("format"), "missing 'format' property");
+        assert!(
+            props.contains_key("min_confidence"),
+            "missing 'min_confidence' property"
+        );
         let required = tool.input_schema["required"].as_array().unwrap();
         assert!(required.contains(&serde_json::json!("name")));
     }
@@ -1666,6 +1718,10 @@ mod tests {
         assert!(props.contains_key("name"), "missing 'name' property");
         assert!(props.contains_key("depth"), "missing 'depth' property");
         assert!(props.contains_key("format"), "missing 'format' property");
+        assert!(
+            props.contains_key("min_confidence"),
+            "missing 'min_confidence' property"
+        );
         let required = tool.input_schema["required"].as_array().unwrap();
         assert!(required.contains(&serde_json::json!("name")));
     }
@@ -1709,6 +1765,10 @@ mod tests {
         assert!(props.contains_key("from"), "missing 'from' property");
         assert!(props.contains_key("to"), "missing 'to' property");
         assert!(props.contains_key("format"), "missing 'format' property");
+        assert!(
+            props.contains_key("min_confidence"),
+            "missing 'min_confidence' property"
+        );
         let required = tool.input_schema["required"].as_array().unwrap();
         assert!(required.contains(&serde_json::json!("from")));
         assert!(required.contains(&serde_json::json!("to")));

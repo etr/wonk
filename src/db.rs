@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS "references" (
     line INTEGER NOT NULL,
     col INTEGER NOT NULL,
     context TEXT,
-    caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL
+    caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+    confidence REAL DEFAULT 0.5
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -61,6 +62,8 @@ CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_references_name ON "references"(name);
 CREATE INDEX IF NOT EXISTS idx_references_file ON "references"(file);
 CREATE INDEX IF NOT EXISTS idx_references_caller ON "references"(caller_id);
+CREATE INDEX IF NOT EXISTS idx_references_name_confidence ON "references"(name, confidence);
+CREATE INDEX IF NOT EXISTS idx_references_caller_confidence ON "references"(caller_id, confidence);
 
 -- File-level import tracking for dependency graph
 CREATE TABLE IF NOT EXISTS file_imports (
@@ -70,6 +73,19 @@ CREATE TABLE IF NOT EXISTS file_imports (
 );
 CREATE INDEX IF NOT EXISTS idx_file_imports_source ON file_imports(source_file);
 CREATE INDEX IF NOT EXISTS idx_file_imports_target ON file_imports(import_path);
+"#;
+
+// Table populated by TASK-066 (inheritance extraction) and TASK-067 (pipeline wiring).
+const TYPE_EDGES_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS type_edges (
+    id INTEGER PRIMARY KEY,
+    child_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    parent_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    relationship TEXT NOT NULL,
+    UNIQUE(child_id, parent_id, relationship)
+);
+CREATE INDEX IF NOT EXISTS idx_type_edges_child ON type_edges(child_id);
+CREATE INDEX IF NOT EXISTS idx_type_edges_parent ON type_edges(parent_id);
 "#;
 
 const EMBEDDINGS_SQL: &str = r#"
@@ -172,6 +188,8 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
 fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)
         .context("creating base tables and indexes")?;
+    conn.execute_batch(TYPE_EDGES_SQL)
+        .context("creating type_edges table")?;
     conn.execute_batch(EMBEDDINGS_SQL)
         .context("creating embeddings table")?;
     conn.execute_batch(SUMMARIES_SQL)
@@ -181,6 +199,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(TRIGGERS_SQL)
         .context("creating FTS5 sync triggers")?;
     ensure_caller_id_column(conn)?;
+    ensure_confidence_column(conn)?;
     Ok(())
 }
 
@@ -203,6 +222,43 @@ pub fn ensure_embeddings_table(conn: &Connection) -> Result<()> {
 pub fn ensure_summaries_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table (migration)")?;
+    Ok(())
+}
+
+/// Ensure the `confidence` column exists on the `references` table.
+///
+/// Handles schema migration for pre-V4 indexes that lack the confidence
+/// scoring column.  Uses `PRAGMA table_info` to check before altering.
+pub fn ensure_confidence_column(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("PRAGMA table_info(\"references\")")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "confidence");
+
+    if !has_column {
+        conn.execute_batch("ALTER TABLE \"references\" ADD COLUMN confidence REAL DEFAULT 0.5;")
+            .context("adding confidence column to references table")?;
+    }
+
+    // Always run CREATE INDEX IF NOT EXISTS for idempotent migration.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_references_name_confidence ON \"references\"(name, confidence);
+         CREATE INDEX IF NOT EXISTS idx_references_caller_confidence ON \"references\"(caller_id, confidence);",
+    )
+    .context("creating confidence indexes")?;
+
+    Ok(())
+}
+
+/// Ensure the `type_edges` table exists, creating it if missing.
+///
+/// Handles schema migration for indexes created before type hierarchy
+/// support was added.  Safe to call on databases that already have the
+/// table (uses `CREATE TABLE IF NOT EXISTS`).
+pub fn ensure_type_edges_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(TYPE_EDGES_SQL)
+        .context("creating type_edges table (migration)")?;
     Ok(())
 }
 
@@ -447,6 +503,7 @@ mod tests {
         assert!(tables.contains(&"symbols_fts".to_string()));
         assert!(tables.contains(&"file_imports".to_string()));
         assert!(tables.contains(&"embeddings".to_string()));
+        assert!(tables.contains(&"type_edges".to_string()));
     }
 
     #[test]
@@ -1382,5 +1439,307 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(tables.len(), 1);
+    }
+
+    // -- confidence column tests -----------------------------------------------
+
+    #[test]
+    fn test_new_db_has_confidence_column() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(\"references\")")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            columns.contains(&"confidence".to_string()),
+            "references table should have confidence column"
+        );
+    }
+
+    #[test]
+    fn test_confidence_default_is_0_5() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        // Insert without specifying confidence -- should default to 0.5.
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["foo", "a.rs", 1, 0, "foo()"],
+        )
+        .unwrap();
+
+        let confidence: f64 = conn
+            .query_row(
+                "SELECT confidence FROM \"references\" WHERE name = 'foo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((confidence - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_confidence_indexes_exist() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_references_%confidence%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(indexes.contains(&"idx_references_name_confidence".to_string()));
+        assert!(indexes.contains(&"idx_references_caller_confidence".to_string()));
+    }
+
+    #[test]
+    fn test_ensure_confidence_column_migration() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // Simulate a pre-V4 database without confidence column.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS symbols (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER NOT NULL,
+                end_line INTEGER,
+                scope TEXT,
+                signature TEXT,
+                language TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS "references" (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER NOT NULL,
+                context TEXT,
+                caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL
+            );
+            "#,
+        )
+        .unwrap();
+
+        // confidence should NOT exist yet.
+        let has_confidence: bool = conn
+            .prepare("PRAGMA table_info(\"references\")")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|name| name == "confidence");
+        assert!(!has_confidence);
+
+        // Run migration.
+        ensure_confidence_column(&conn).unwrap();
+
+        let has_confidence: bool = conn
+            .prepare("PRAGMA table_info(\"references\")")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|name| name == "confidence");
+        assert!(has_confidence);
+    }
+
+    #[test]
+    fn test_ensure_confidence_column_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        ensure_confidence_column(&conn).unwrap();
+        ensure_confidence_column(&conn).unwrap();
+    }
+
+    // -- type_edges table tests ------------------------------------------------
+
+    #[test]
+    fn test_new_db_has_type_edges_table() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='type_edges'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(tables.len(), 1);
+    }
+
+    #[test]
+    fn test_type_edges_insert_and_query() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        // Create parent and child symbols.
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'Animal', 'class', 'a.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (2, 'Dog', 'class', 'a.rs', 10, 0, 'rust')",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO type_edges (child_id, parent_id, relationship) VALUES (?1, ?2, ?3)",
+            rusqlite::params![2, 1, "extends"],
+        )
+        .unwrap();
+
+        let rel: String = conn
+            .query_row(
+                "SELECT relationship FROM type_edges WHERE child_id = 2 AND parent_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rel, "extends");
+    }
+
+    #[test]
+    fn test_type_edges_unique_constraint() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'A', 'class', 'a.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (2, 'B', 'class', 'a.rs', 10, 0, 'rust')",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO type_edges (child_id, parent_id, relationship) VALUES (2, 1, 'extends')",
+            [],
+        )
+        .unwrap();
+
+        // Duplicate should fail.
+        let result = conn.execute(
+            "INSERT INTO type_edges (child_id, parent_id, relationship) VALUES (2, 1, 'extends')",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_type_edges_cascade_delete() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'A', 'class', 'a.rs', 1, 0, 'rust')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (2, 'B', 'class', 'a.rs', 10, 0, 'rust')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO type_edges (child_id, parent_id, relationship) VALUES (2, 1, 'extends')",
+            [],
+        )
+        .unwrap();
+
+        // Delete child symbol -- cascade should remove edge.
+        conn.execute("DELETE FROM symbols WHERE id = 2", [])
+            .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_type_edges_bidirectional_indexes() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_type_edges_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(indexes.contains(&"idx_type_edges_child".to_string()));
+        assert!(indexes.contains(&"idx_type_edges_parent".to_string()));
+    }
+
+    #[test]
+    fn test_ensure_type_edges_table_migration() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // Simulate old database without type_edges.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+
+        // No type_edges table yet.
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='type_edges'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.is_empty());
+
+        // Migrate.
+        ensure_type_edges_table(&conn).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='type_edges'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(tables.len(), 1);
+    }
+
+    #[test]
+    fn test_ensure_type_edges_table_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        ensure_type_edges_table(&conn).unwrap();
+        ensure_type_edges_table(&conn).unwrap();
     }
 }

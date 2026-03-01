@@ -246,8 +246,14 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
         .context("tree-sitter parse failed")?;
 
     let symbols = indexer::extract_symbols(&tree, &content, &rel_path, lang);
-    let refs = indexer::extract_references(&tree, &content, &rel_path, lang);
+    let mut refs = indexer::extract_references(&tree, &content, &rel_path, lang);
     let file_imports = indexer::extract_imports(&tree, &content, &rel_path, lang);
+
+    // Compute confidence for each reference.
+    for r in &mut refs {
+        r.confidence = indexer::compute_confidence(r, &symbols, &file_imports.imports);
+    }
+
     let line_count = content.lines().count();
 
     // Single transaction: delete old data, insert new data.
@@ -444,8 +450,8 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     // Insert new references, resolving caller_name to caller_id.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO \"references\" (name, file, line, col, context, caller_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO \"references\" (name, file, line, col, context, caller_id, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for reference in &result.refs {
             let caller_id = reference
@@ -459,6 +465,7 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
                 reference.col as i64,
                 reference.context,
                 caller_id,
+                reference.confidence,
             ])?;
         }
     }
@@ -505,10 +512,15 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
     let symbols = indexer::extract_symbols(&tree, &content, &rel_path, lang);
 
     // Extract references.
-    let refs = indexer::extract_references(&tree, &content, &rel_path, lang);
+    let mut refs = indexer::extract_references(&tree, &content, &rel_path, lang);
 
     // Extract imports for dependency graph.
     let file_imports = indexer::extract_imports(&tree, &content, &rel_path, lang);
+
+    // Compute confidence for each reference.
+    for r in &mut refs {
+        r.confidence = indexer::compute_confidence(r, &symbols, &file_imports.imports);
+    }
 
     let line_count = content.lines().count();
 
@@ -588,8 +600,8 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
     // Insert references, resolving caller_name to caller_id.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO \"references\" (name, file, line, col, context, caller_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO \"references\" (name, file, line, col, context, caller_id, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for r in results {
             let file_map = file_caller_maps.get(r.rel_path.as_str());
@@ -608,6 +620,7 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
                     reference.col as i64,
                     reference.context,
                     caller_id,
+                    reference.confidence,
                 ])?;
                 total_refs += 1;
             }
@@ -949,6 +962,7 @@ pub fn reembed_changed_files(
 fn drop_all_data(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM embeddings;
+         DELETE FROM type_edges;
          DELETE FROM symbols;
          DELETE FROM \"references\";
          DELETE FROM file_imports;
@@ -2179,5 +2193,104 @@ class Component {
 
         let count = reembed_changed_files(&conn, root, &files, &client).unwrap();
         assert_eq!(count, 0, "deleted file should not produce embeddings");
+    }
+
+    // -- Confidence scoring integration tests -----------------------------------
+
+    #[test]
+    fn test_index_stores_confidence_values() {
+        // Build an index with a Rust file that has same-file calls and imports.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"use std::io;
+
+fn main() {
+    helper();
+}
+
+fn helper() -> i32 {
+    42
+}
+"#,
+        )
+        .unwrap();
+
+        build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // "helper" is called from within the same file where it's defined,
+        // so its reference should have confidence > 0.5.
+        let confidence: f64 = conn
+            .query_row(
+                "SELECT confidence FROM \"references\" WHERE name = 'helper'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            confidence > 0.5,
+            "same-file reference to 'helper' should have confidence > 0.5, got {confidence}"
+        );
+
+        // Import references (e.g. "io" from "use std::io") should have confidence 0.95.
+        let import_conf: Option<f64> = conn
+            .query_row(
+                "SELECT confidence FROM \"references\" WHERE name = 'io' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(c) = import_conf {
+            assert!(
+                c >= 0.9,
+                "import reference should have confidence >= 0.9, got {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_upsert_preserves_confidence() {
+        // Verify that incremental re-index via upsert_file_data also stores confidence.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn caller() {\n    callee();\n}\n\nfn callee() {}\n",
+        )
+        .unwrap();
+
+        build_index(root, true).unwrap();
+
+        // Modify the file and re-index.
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn caller() {\n    callee();\n    callee();\n}\n\nfn callee() {}\n",
+        )
+        .unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+        reindex_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+
+        // Check that confidence is stored for the re-indexed reference.
+        let confidence: f64 = conn
+            .query_row(
+                "SELECT confidence FROM \"references\" WHERE name = 'callee' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            confidence > 0.5,
+            "same-file reference after upsert should have confidence > 0.5, got {confidence}"
+        );
     }
 }
