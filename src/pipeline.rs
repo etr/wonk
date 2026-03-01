@@ -370,6 +370,11 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         .unchecked_transaction()
         .context("starting delete transaction")?;
 
+    // Delete type edges before symbols (explicit, mirrors references/imports pattern).
+    tx.execute(
+        "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
+        rusqlite::params![rel_path],
+    )?;
     tx.execute(
         "DELETE FROM symbols WHERE file = ?1",
         rusqlite::params![rel_path],
@@ -403,7 +408,13 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         .unchecked_transaction()
         .context("starting upsert transaction")?;
 
-    // Delete old symbols, references, and imports for this file.
+    // Delete old type edges, symbols, references, and imports for this file.
+    // type_edges has ON DELETE CASCADE from symbols, but we delete explicitly
+    // for clarity and to mirror the pattern used for references and imports.
+    tx.execute(
+        "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
+        rusqlite::params![result.rel_path],
+    )?;
     tx.execute(
         "DELETE FROM symbols WHERE file = ?1",
         rusqlite::params![result.rel_path],
@@ -684,13 +695,48 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
     }
 
     // Insert type hierarchy edges, resolving names to symbol IDs.
+    // Batch-resolve cross-file parent names to avoid N+1 queries.
     let mut type_edge_count = 0usize;
     {
+        // Collect parent names that need cross-file resolution.
+        let mut unresolved_parents: HashSet<&str> = HashSet::new();
+        for r in results.iter() {
+            let file_map = file_caller_maps.get(r.rel_path.as_str());
+            for edge in &r.type_edges {
+                if file_map
+                    .and_then(|m| m.get(edge.parent_name.as_str()))
+                    .is_none()
+                {
+                    unresolved_parents.insert(&edge.parent_name);
+                }
+            }
+        }
+
+        // Batch-resolve unresolved parents in a single query per chunk.
+        let mut cross_file_map: HashMap<String, i64> = HashMap::new();
+        if !unresolved_parents.is_empty() {
+            let names: Vec<&str> = unresolved_parents.into_iter().collect();
+            // SQLite variable limit is 999; chunk to stay under it.
+            for chunk in names.chunks(900) {
+                let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT name, id FROM symbols WHERE name IN ({placeholders}) GROUP BY name"
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                for row in rows {
+                    let (name, id) = row?;
+                    cross_file_map.insert(name, id);
+                }
+            }
+        }
+
         let mut insert_stmt = tx.prepare(
             "INSERT OR IGNORE INTO type_edges (child_id, parent_id, relationship) \
              VALUES (?1, ?2, ?3)",
         )?;
-        let mut cross_file_lookup = tx.prepare("SELECT id FROM symbols WHERE name = ?1 LIMIT 1")?;
 
         for r in results {
             let file_map = file_caller_maps.get(r.rel_path.as_str());
@@ -702,16 +748,10 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
                     continue;
                 };
 
-                // Resolve parent_id: try same file first, then cross-file.
+                // Resolve parent_id: try same file first, then cross-file batch map.
                 let Some(parent_id) = file_map
                     .and_then(|m| m.get(edge.parent_name.as_str()).copied())
-                    .or_else(|| {
-                        cross_file_lookup
-                            .query_row(rusqlite::params![edge.parent_name], |row| {
-                                row.get::<_, i64>(0)
-                            })
-                            .ok()
-                    })
+                    .or_else(|| cross_file_map.get(edge.parent_name.as_str()).copied())
                 else {
                     continue;
                 };
