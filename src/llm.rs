@@ -100,7 +100,7 @@ pub fn build_prompt(
 ) -> std::result::Result<String, LlmError> {
     let mut prompt = String::with_capacity(2048);
 
-    writeln!(prompt, "Describe the following code path: `{path}`\n").unwrap();
+    writeln!(prompt, "Describe the following code path: `{}`\n", sanitize(path)).unwrap();
 
     // Language breakdown.
     if !metrics.language_breakdown.is_empty() {
@@ -244,7 +244,8 @@ pub fn generate(config: &LlmConfig, prompt: &str) -> std::result::Result<String,
             .into_body()
             .read_to_string()
             .unwrap_or_else(|_| "unknown error".to_string());
-        let body = if raw.len() > 512 { &raw[..512] } else { &raw };
+        // Truncate at char boundary to avoid panic on multi-byte UTF-8.
+        let body: String = raw.chars().take(512).collect();
         return Err(LlmError::OllamaError(format!("HTTP {status}: {body}")));
     }
 
