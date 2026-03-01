@@ -35,7 +35,7 @@
 | M15 | Call Graph Data Model & Indexing | 2 | In Progress |
 | M16 | Source Display (`wonk show`) | 2 | Complete |
 | M17 | Call Graph Commands | 2 | Complete |
-| M18 | Code Summary Engine (`wonk summary`) | 2 | In Progress |
+| M18 | Code Summary Engine (`wonk summary`) | 2 | Complete |
 | M19 | Edge Confidence & Inheritance Infrastructure | 3 | Not Started |
 | M20 | Hybrid Search Fusion (RRF) | 1 | Not Started |
 | M21 | Execution Flow Detection (`wonk flows`) | 1 | Not Started |
@@ -2638,7 +2638,7 @@ Add `--semantic` flag to `wonk summary` that generates LLM descriptions via Olla
 **Related Requirements:** PRD-SUM-REQ-009 through PRD-SUM-REQ-015
 **Related Decisions:** DR-018, DR-019, DR-020
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
