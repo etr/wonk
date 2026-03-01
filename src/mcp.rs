@@ -632,7 +632,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         },
                         "semantic": {
                             "type": "boolean",
-                            "description": "Include AI-generated description (requires embeddings, not yet implemented)",
+                            "description": "Include AI-generated description via Ollama LLM (requires Ollama running)",
                             "default": false
                         },
                         "budget": {
@@ -1240,17 +1240,33 @@ impl McpServer {
             None => return CallToolResult::error("no index available; run wonk_init first".into()),
         };
 
+        let semantic_flag = args
+            .get("semantic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let semantic = if semantic_flag {
+            let repo_root = self.router.repo_root();
+            let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
+            if let Err(e) = crate::db::ensure_summaries_table(conn) {
+                return CallToolResult::error(format!("failed to create summaries table: {e}"));
+            }
+            Some(config.llm)
+        } else {
+            None
+        };
+
         let options = crate::summary::SummaryOptions {
             detail,
             depth,
             suppress: true,
+            semantic,
         };
 
-        let result =
-            match crate::summary::summarize_path(conn, &path, self.router.repo_root(), &options) {
-                Ok(r) => r,
-                Err(e) => return CallToolResult::error(format!("summary query failed: {e}")),
-            };
+        let result = match crate::summary::summarize_path(conn, &path, &options) {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("summary query failed: {e}")),
+        };
 
         let out = SummaryOutput::from_result(&result);
         format_result(&out, format)

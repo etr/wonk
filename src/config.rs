@@ -24,6 +24,7 @@ pub struct Config {
     pub index: IndexConfig,
     pub output: OutputConfig,
     pub ignore: IgnoreConfig,
+    pub llm: LlmConfig,
 }
 
 /// Daemon-related settings.
@@ -58,6 +59,15 @@ pub struct IgnoreConfig {
     pub patterns: Vec<String>,
 }
 
+/// LLM generation settings (for `--semantic` descriptions).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmConfig {
+    /// Ollama model name for text generation.
+    pub model: String,
+    /// Full URL for the Ollama `/api/generate` endpoint.
+    pub generate_url: String,
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -86,6 +96,15 @@ impl Default for OutputConfig {
     }
 }
 
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            model: "llama3.2:3b".to_string(),
+            generate_url: "http://localhost:11434/api/generate".to_string(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Option-based overlay types (for partial deserialization)
 // ---------------------------------------------------------------------------
@@ -100,6 +119,7 @@ struct ConfigOverlay {
     index: Option<IndexOverlay>,
     output: Option<OutputOverlay>,
     ignore: Option<IgnoreOverlay>,
+    llm: Option<LlmOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -126,6 +146,13 @@ struct OutputOverlay {
 #[serde(default)]
 struct IgnoreOverlay {
     patterns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct LlmOverlay {
+    model: Option<String>,
+    generate_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +188,14 @@ impl Config {
             && let Some(v) = ign.patterns
         {
             self.ignore.patterns = v;
+        }
+        if let Some(llm) = overlay.llm {
+            if let Some(v) = llm.model {
+                self.llm.model = v;
+            }
+            if let Some(v) = llm.generate_url {
+                self.llm.generate_url = v;
+            }
         }
     }
 }
@@ -602,5 +637,78 @@ color = "never"
 
         // Still at default (not set in either config):
         assert!(config.index.additional_extensions.is_empty());
+    }
+
+    // -- LLM config tests ---------------------------------------------------
+
+    #[test]
+    fn llm_defaults_applied_when_no_config() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert_eq!(config.llm.model, "llama3.2:3b");
+        assert_eq!(
+            config.llm.generate_url,
+            "http://localhost:11434/api/generate"
+        );
+    }
+
+    #[test]
+    fn llm_model_override_from_global() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[llm]
+model = "mistral:7b"
+"#,
+        );
+
+        let config = env.load().unwrap();
+        assert_eq!(config.llm.model, "mistral:7b");
+        // generate_url should remain default.
+        assert_eq!(
+            config.llm.generate_url,
+            "http://localhost:11434/api/generate"
+        );
+    }
+
+    #[test]
+    fn llm_generate_url_override() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[llm]
+generate_url = "http://myhost:8080/api/generate"
+"#,
+        );
+
+        let config = env.load().unwrap();
+        assert_eq!(config.llm.generate_url, "http://myhost:8080/api/generate");
+        // model should remain default.
+        assert_eq!(config.llm.model, "llama3.2:3b");
+    }
+
+    #[test]
+    fn llm_repo_overrides_global() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[llm]
+model = "mistral:7b"
+generate_url = "http://global:11434/api/generate"
+"#,
+        );
+
+        let repo = env.create_repo();
+        env.write_repo_config(
+            r#"
+[llm]
+model = "llama3.2:1b"
+"#,
+        );
+
+        let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
+        assert_eq!(config.llm.model, "llama3.2:1b");
+        // generate_url from global should survive.
+        assert_eq!(config.llm.generate_url, "http://global:11434/api/generate");
     }
 }

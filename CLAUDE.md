@@ -47,6 +47,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `embedding.rs` | Ollama API client, symbol chunking engine, and vector storage — sync HTTP client for embedding generation, context-rich text chunk formatting for `nomic-embed-text`, BLOB storage/retrieval with bytemuck zero-copy deserialization |
 | `show.rs` | Source body retrieval — queries symbol index by name with optional file/kind/exact filters, reads source file lines line..end_line per match, falls back to signature when end_line is absent; shallow mode for containers shows signature + child signatures without bodies |
 | `summary.rs` | Structural summary engine — queries SQLite to aggregate file count, line count, symbol counts by kind, language breakdown, and dependency count for a path; supports three detail levels (rich/light/symbols) and recursive depth traversal |
+| `llm.rs` | LLM description generation and caching — content hash computation from (symbol.id, file.hash) pairs, prompt construction from structural metrics, Ollama `/api/generate` sync client, SQLite cache get/store for `wonk summary --semantic` |
 | `impact.rs` | Symbol change detection — Tree-sitter re-parse vs. indexed symbols for Added/Modified/Removed; git CLI wrapper for `--since` file listing |
 | `daemon.rs` | Background file watcher — double-fork daemonization, PID file, SIGTERM handler, embedding worker thread, daemon status table |
 | `watcher.rs` | Filesystem event classification and debouncing via `notify` |

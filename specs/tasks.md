@@ -35,7 +35,7 @@
 | M15 | Call Graph Data Model & Indexing | 2 | In Progress |
 | M16 | Source Display (`wonk show`) | 2 | Complete |
 | M17 | Call Graph Commands | 2 | Complete |
-| M18 | Code Summary Engine (`wonk summary`) | 2 | In Progress |
+| M18 | Code Summary Engine (`wonk summary`) | 2 | Complete |
 | M19 | Edge Confidence & Inheritance Infrastructure | 3 | Not Started |
 | M20 | Hybrid Search Fusion (RRF) | 1 | Not Started |
 | M21 | Execution Flow Detection (`wonk flows`) | 1 | Not Started |
@@ -2610,16 +2610,16 @@ Implement `wonk summary <path>` with structural metrics aggregation, three detai
 Add `--semantic` flag to `wonk summary` that generates LLM descriptions via Ollama, with caching in SQLite and configurable model selection.
 
 **Action Items:**
-- [ ] Add `[llm]` section to Config with `model` key (default: `"llama3.2:3b"`) and `generate_url` (default: `"http://localhost:11434/api/generate"`) (DR-018, PRD-SUM-REQ-014)
-- [ ] Add `summaries` table to SQLite schema: path, content_hash, description, created_at (DR-020)
-- [ ] Implement content hash computation: sorted `(symbol.id, file.hash)` pairs under the path (DR-019)
-- [ ] Implement prompt construction (PRD-SUM-REQ-010): path, language breakdown, symbol signatures by kind, import/export relationships — ask for 2-3 sentence description
-- [ ] Implement Ollama `/api/generate` call via ureq: POST with model, prompt, stream=false
-- [ ] Cache hit: return cached description when path + content_hash match (PRD-SUM-REQ-012)
-- [ ] Ollama unreachable: display warning to stderr, return structural summary without description on stdout (PRD-SUM-REQ-013)
-- [ ] Model not found: return error with instructions to `ollama pull <model>` or configure `[llm].model` (PRD-SUM-REQ-015)
-- [ ] Semantic + recursion interaction: LLM description only for top-level path, not per-child
-- [ ] Default model llama3.2:3b when no config (PRD-SUM-REQ-015)
+- [x] Add `[llm]` section to Config with `model` key (default: `"llama3.2:3b"`) and `generate_url` (default: `"http://localhost:11434/api/generate"`) (DR-018, PRD-SUM-REQ-014)
+- [x] Add `summaries` table to SQLite schema: path, content_hash, description, created_at (DR-020)
+- [x] Implement content hash computation: sorted `(symbol.id, file.hash)` pairs under the path (DR-019)
+- [x] Implement prompt construction (PRD-SUM-REQ-010): path, language breakdown, symbol signatures by kind, import/export relationships — ask for 2-3 sentence description
+- [x] Implement Ollama `/api/generate` call via ureq: POST with model, prompt, stream=false
+- [x] Cache hit: return cached description when path + content_hash match (PRD-SUM-REQ-012)
+- [x] Ollama unreachable: display warning to stderr, return structural summary without description on stdout (PRD-SUM-REQ-013)
+- [x] Model not found: return error with instructions to `ollama pull <model>` or configure `[llm].model` (PRD-SUM-REQ-015)
+- [x] Semantic + recursion interaction: LLM description only for top-level path, not per-child
+- [x] Default model llama3.2:3b when no config (PRD-SUM-REQ-015)
 
 **Dependencies:**
 - Blocked by: TASK-063
@@ -2638,7 +2638,7 @@ Add `--semantic` flag to `wonk summary` that generates LLM descriptions via Olla
 **Related Requirements:** PRD-SUM-REQ-009 through PRD-SUM-REQ-015
 **Related Decisions:** DR-018, DR-019, DR-020
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 

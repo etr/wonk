@@ -10,6 +10,7 @@ pub mod embedding;
 pub mod errors;
 pub mod impact;
 pub mod indexer;
+pub mod llm;
 pub mod mcp;
 pub mod output;
 pub mod pipeline;

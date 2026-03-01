@@ -81,6 +81,30 @@ pub enum EmbeddingError {
     StorageFailed(String),
 }
 
+/// Errors arising from the LLM description generation layer.
+#[derive(Error, Debug)]
+pub enum LlmError {
+    /// Cannot connect to the Ollama server.
+    #[error("cannot connect to Ollama server")]
+    OllamaUnreachable,
+
+    /// The requested model is not available on the Ollama server.
+    #[error("model not found: {0}")]
+    ModelNotFound(String),
+
+    /// Ollama returned an error response.
+    #[error("Ollama error: {0}")]
+    OllamaError(String),
+
+    /// The response from Ollama could not be parsed.
+    #[error("invalid LLM response")]
+    InvalidResponse,
+
+    /// A database operation in the LLM cache layer failed.
+    #[error("LLM query failed: {0}")]
+    QueryFailed(String),
+}
+
 // ---------------------------------------------------------------------------
 // Unified application error
 // ---------------------------------------------------------------------------
@@ -99,6 +123,9 @@ pub enum WonkError {
 
     #[error(transparent)]
     Embedding(#[from] EmbeddingError),
+
+    #[error(transparent)]
+    Llm(#[from] LlmError),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -140,6 +167,15 @@ impl WonkError {
                 Some("run `wonk init --embed` to generate embeddings")
             }
             WonkError::Embedding(EmbeddingError::StorageFailed(_)) => {
+                Some("the index may be corrupt; try `wonk init` to rebuild it")
+            }
+            WonkError::Llm(LlmError::OllamaUnreachable) => {
+                Some("ensure Ollama is running: `ollama serve`")
+            }
+            WonkError::Llm(LlmError::ModelNotFound(_)) => {
+                Some("run `ollama pull <model>` or configure [llm].model in .wonk/config.toml")
+            }
+            WonkError::Llm(LlmError::QueryFailed(_)) => {
                 Some("the index may be corrupt; try `wonk init` to rebuild it")
             }
             WonkError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -352,6 +388,76 @@ mod tests {
     #[test]
     fn hint_storage_failed() {
         let err = WonkError::Embedding(EmbeddingError::StorageFailed("test".to_string()));
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("rebuild"));
+    }
+
+    // -- LlmError tests -------------------------------------------------------
+
+    #[test]
+    fn llm_error_ollama_unreachable_display() {
+        let err = LlmError::OllamaUnreachable;
+        assert_eq!(format!("{err}"), "cannot connect to Ollama server");
+    }
+
+    #[test]
+    fn llm_error_model_not_found_display() {
+        let err = LlmError::ModelNotFound("llama3.2:3b".to_string());
+        let msg = format!("{err}");
+        assert!(msg.contains("llama3.2:3b"));
+    }
+
+    #[test]
+    fn llm_error_ollama_error_display() {
+        let err = LlmError::OllamaError("internal failure".to_string());
+        assert_eq!(format!("{err}"), "Ollama error: internal failure");
+    }
+
+    #[test]
+    fn llm_error_invalid_response_display() {
+        let err = LlmError::InvalidResponse;
+        assert_eq!(format!("{err}"), "invalid LLM response");
+    }
+
+    #[test]
+    fn wonk_error_from_llm_error() {
+        let llm_err = LlmError::OllamaUnreachable;
+        let wonk_err: WonkError = llm_err.into();
+        assert!(matches!(
+            wonk_err,
+            WonkError::Llm(LlmError::OllamaUnreachable)
+        ));
+    }
+
+    #[test]
+    fn hint_llm_ollama_unreachable() {
+        let err = WonkError::Llm(LlmError::OllamaUnreachable);
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("ollama serve"));
+    }
+
+    #[test]
+    fn hint_llm_model_not_found() {
+        let err = WonkError::Llm(LlmError::ModelNotFound("llama3.2:3b".to_string()));
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("ollama pull"));
+    }
+
+    #[test]
+    fn exit_code_llm_error() {
+        let err = WonkError::Llm(LlmError::OllamaUnreachable);
+        assert_eq!(err.exit_code(), EXIT_ERROR);
+    }
+
+    #[test]
+    fn llm_error_query_failed_display() {
+        let err = LlmError::QueryFailed("table missing".to_string());
+        assert_eq!(format!("{err}"), "LLM query failed: table missing");
+    }
+
+    #[test]
+    fn hint_llm_query_failed() {
+        let err = WonkError::Llm(LlmError::QueryFailed("test".to_string()));
         let hint = err.hint().unwrap();
         assert!(hint.contains("rebuild"));
     }

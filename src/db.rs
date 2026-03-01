@@ -86,6 +86,15 @@ CREATE TABLE IF NOT EXISTS embeddings (
 CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file);
 "#;
 
+const SUMMARIES_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS summaries (
+    path TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    description TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+"#;
+
 const FTS_SQL: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     name, kind, file, content=symbols, content_rowid=id
@@ -165,6 +174,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating base tables and indexes")?;
     conn.execute_batch(EMBEDDINGS_SQL)
         .context("creating embeddings table")?;
+    conn.execute_batch(SUMMARIES_SQL)
+        .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
         .context("creating FTS5 virtual table")?;
     conn.execute_batch(TRIGGERS_SQL)
@@ -181,6 +192,17 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 pub fn ensure_embeddings_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(EMBEDDINGS_SQL)
         .context("creating embeddings table (migration)")?;
+    Ok(())
+}
+
+/// Ensure the `summaries` table exists, creating it if missing.
+///
+/// This handles schema migration for indexes created before LLM description
+/// caching was added.  Safe to call on databases that already have the table
+/// (uses `CREATE TABLE IF NOT EXISTS`).
+pub fn ensure_summaries_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SUMMARIES_SQL)
+        .context("creating summaries table (migration)")?;
     Ok(())
 }
 
@@ -1246,5 +1268,119 @@ mod tests {
         // Column already exists via open(). Calling again should not fail.
         ensure_caller_id_column(&conn).unwrap();
         ensure_caller_id_column(&conn).unwrap();
+    }
+
+    // -- Summaries table tests ------------------------------------------------
+
+    #[test]
+    fn test_open_creates_summaries_table() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='summaries'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(tables.len(), 1);
+    }
+
+    #[test]
+    fn test_summaries_insert_and_query() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO summaries (path, content_hash, description, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["src/", "abc123", "This module handles routing.", 1700000000i64],
+        ).unwrap();
+
+        let desc: String = conn
+            .query_row(
+                "SELECT description FROM summaries WHERE path = ?1 AND content_hash = ?2",
+                rusqlite::params!["src/", "abc123"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(desc, "This module handles routing.");
+    }
+
+    #[test]
+    fn test_summaries_upsert_on_path() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT OR REPLACE INTO summaries (path, content_hash, description, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["src/", "hash1", "Old description.", 1000],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT OR REPLACE INTO summaries (path, content_hash, description, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["src/", "hash2", "New description.", 2000],
+        ).unwrap();
+
+        // Should have only one row (path is PRIMARY KEY).
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let desc: String = conn
+            .query_row(
+                "SELECT description FROM summaries WHERE path = 'src/'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(desc, "New description.");
+    }
+
+    #[test]
+    fn test_ensure_summaries_table_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        ensure_summaries_table(&conn).unwrap();
+        ensure_summaries_table(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_ensure_summaries_table_on_old_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // Simulate old database without summaries.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+
+        // No summaries table yet.
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='summaries'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.is_empty());
+
+        // Migrate.
+        ensure_summaries_table(&conn).unwrap();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='summaries'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(tables.len(), 1);
     }
 }

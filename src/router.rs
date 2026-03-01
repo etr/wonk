@@ -1173,13 +1173,21 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 Some(args.depth)
             };
 
+            let semantic = if args.semantic {
+                crate::db::ensure_summaries_table(&conn)?;
+                Some(config.llm.clone())
+            } else {
+                None
+            };
+
             let options = crate::summary::SummaryOptions {
                 detail,
                 depth,
                 suppress,
+                semantic,
             };
 
-            let result = crate::summary::summarize_path(&conn, &args.path, &repo_root, &options)?;
+            let result = crate::summary::summarize_path(&conn, &args.path, &options)?;
 
             let out = SummaryOutput::from_result(&result);
             fmt.format_summary(&out)?;
