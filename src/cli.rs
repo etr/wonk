@@ -279,6 +279,10 @@ pub struct CallersArgs {
     /// Transitive expansion depth (default: 1 = direct callers only, max: 10)
     #[arg(long, default_value_t = 1)]
     pub depth: usize,
+
+    /// Minimum confidence threshold (0.0-1.0) to filter results
+    #[arg(long)]
+    pub min_confidence: Option<f64>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -289,6 +293,10 @@ pub struct CalleesArgs {
     /// Transitive expansion depth (default: 1 = direct callees only, max: 10)
     #[arg(long, default_value_t = 1)]
     pub depth: usize,
+
+    /// Minimum confidence threshold (0.0-1.0) to filter results
+    #[arg(long)]
+    pub min_confidence: Option<f64>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -297,6 +305,10 @@ pub struct CallpathArgs {
     pub from: String,
     /// Target symbol name
     pub to: String,
+
+    /// Minimum confidence threshold (0.0-1.0) to filter edges
+    #[arg(long)]
+    pub min_confidence: Option<f64>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -685,6 +697,61 @@ mod tests {
                 assert_eq!(args.name, "dispatch");
             }
             _ => panic!("expected Command::Callers"),
+        }
+    }
+
+    #[test]
+    fn parse_callers_with_min_confidence() {
+        let cli = Cli::try_parse_from(["wonk", "callers", "--min-confidence", "0.8", "dispatch"])
+            .unwrap();
+        match cli.command {
+            Command::Callers(args) => {
+                assert_eq!(args.name, "dispatch");
+                assert_eq!(args.min_confidence, Some(0.8));
+            }
+            _ => panic!("expected Command::Callers"),
+        }
+    }
+
+    #[test]
+    fn parse_callers_min_confidence_default_none() {
+        let cli = Cli::try_parse_from(["wonk", "callers", "dispatch"]).unwrap();
+        match cli.command {
+            Command::Callers(args) => {
+                assert!(args.min_confidence.is_none());
+            }
+            _ => panic!("expected Command::Callers"),
+        }
+    }
+
+    #[test]
+    fn parse_callees_with_min_confidence() {
+        let cli =
+            Cli::try_parse_from(["wonk", "callees", "--min-confidence", "0.9", "main"]).unwrap();
+        match cli.command {
+            Command::Callees(args) => {
+                assert_eq!(args.min_confidence, Some(0.9));
+            }
+            _ => panic!("expected Command::Callees"),
+        }
+    }
+
+    #[test]
+    fn parse_callpath_with_min_confidence() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "callpath",
+            "--min-confidence",
+            "0.7",
+            "main",
+            "dispatch",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Callpath(args) => {
+                assert_eq!(args.min_confidence, Some(0.7));
+            }
+            _ => panic!("expected Command::Callpath"),
         }
     }
 

@@ -35,10 +35,17 @@ pub fn has_caller_id_data(conn: &Connection) -> bool {
 /// At depth N > 1, also returns callers of callers up to N levels.
 /// File-scope call sites (where `caller_id` is NULL) are returned with
 /// `caller_name` set to `"<module>"`.
-pub fn callers(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<CallerResult>> {
+pub fn callers(
+    conn: &Connection,
+    name: &str,
+    max_depth: usize,
+    min_confidence: Option<f64>,
+) -> Result<Vec<CallerResult>> {
     if max_depth == 0 {
         return Ok(Vec::new());
     }
+
+    let conf_threshold = min_confidence.unwrap_or(0.0);
 
     let mut results = Vec::new();
     let mut visited: HashSet<(String, String)> = HashSet::new();
@@ -50,23 +57,23 @@ pub fn callers(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
 
     // Prepare statements once, reuse across all BFS iterations.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT s.name, s.kind, s.file, s.line, s.signature, r.file AS ref_file \
+        "SELECT DISTINCT s.name, s.kind, s.file, s.line, s.signature, r.file AS ref_file, r.confidence \
          FROM \"references\" r \
          JOIN symbols s ON r.caller_id = s.id \
-         WHERE r.name = ?1",
+         WHERE r.name = ?1 AND r.confidence >= ?2",
     )?;
 
     // File-scope callers: references with no enclosing function.
     let mut stmt_module = conn.prepare(
-        "SELECT DISTINCT r.file, r.line \
+        "SELECT DISTINCT r.file, r.line, r.confidence \
          FROM \"references\" r \
-         WHERE r.name = ?1 AND r.caller_id IS NULL",
+         WHERE r.name = ?1 AND r.caller_id IS NULL AND r.confidence >= ?2",
     )?;
 
     while let Some((target_name, depth)) = queue.pop_front() {
         // Named callers (functions/methods).
         let rows: Vec<_> = stmt
-            .query_map(rusqlite::params![&target_name], |row| {
+            .query_map(rusqlite::params![&target_name, conf_threshold], |row| {
                 Ok((
                     row.get::<_, String>(0)?, // caller name
                     row.get::<_, String>(1)?, // caller kind
@@ -74,11 +81,12 @@ pub fn callers(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
                     row.get::<_, i64>(3)?,    // caller line
                     row.get::<_, String>(4)?, // caller signature
                     row.get::<_, String>(5)?, // ref file (where the call happens)
+                    row.get::<_, f64>(6)?,    // confidence
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (caller_name, kind_str, file, line, signature, ref_file) in rows {
+        for (caller_name, kind_str, file, line, signature, ref_file, confidence) in rows {
             let key = (caller_name.clone(), file.clone());
             if visited.contains(&key) {
                 continue;
@@ -95,6 +103,7 @@ pub fn callers(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
                 signature,
                 depth,
                 target_file: Some(ref_file),
+                confidence,
             });
 
             if depth < max_depth && !queued.contains(&caller_name) {
@@ -106,15 +115,16 @@ pub fn callers(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
         // File-scope callers (only at depth 1 — modules don't have callers).
         if depth == 1 {
             let module_rows: Vec<_> = stmt_module
-                .query_map(rusqlite::params![&target_name], |row| {
+                .query_map(rusqlite::params![&target_name, conf_threshold], |row| {
                     Ok((
                         row.get::<_, String>(0)?, // file
                         row.get::<_, i64>(1)?,    // line
+                        row.get::<_, f64>(2)?,    // confidence
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            for (file, line) in module_rows {
+            for (file, line, confidence) in module_rows {
                 let key = ("<module>".to_string(), file.clone());
                 if visited.contains(&key) {
                     continue;
@@ -129,6 +139,7 @@ pub fn callers(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
                     signature: format!("<module> {file}"),
                     depth,
                     target_file: Some(file),
+                    confidence,
                 });
             }
         }
@@ -149,10 +160,17 @@ pub fn callers(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
 ///
 /// At depth 1, returns direct callees (symbols referenced within the body of
 /// functions named `name`). At depth N > 1, also returns callees of callees.
-pub fn callees(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<CalleeResult>> {
+pub fn callees(
+    conn: &Connection,
+    name: &str,
+    max_depth: usize,
+    min_confidence: Option<f64>,
+) -> Result<Vec<CalleeResult>> {
     if max_depth == 0 {
         return Ok(Vec::new());
     }
+
+    let conf_threshold = min_confidence.unwrap_or(0.0);
 
     let mut results = Vec::new();
     let mut visited: HashSet<(String, String)> = HashSet::new();
@@ -165,26 +183,27 @@ pub fn callees(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
     // Prepare statement once, reuse across all BFS iterations.
     // Uses explicit JOIN instead of correlated subquery for better query planning.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT r.name, r.file, r.line, r.context, s.file AS source_file \
+        "SELECT DISTINCT r.name, r.file, r.line, r.context, s.file AS source_file, r.confidence \
          FROM \"references\" r \
          JOIN symbols s ON s.id = r.caller_id \
-         WHERE s.name = ?1",
+         WHERE s.name = ?1 AND r.confidence >= ?2",
     )?;
 
     while let Some((source_name, depth)) = queue.pop_front() {
         let rows: Vec<_> = stmt
-            .query_map(rusqlite::params![&source_name], |row| {
+            .query_map(rusqlite::params![&source_name, conf_threshold], |row| {
                 Ok((
                     row.get::<_, String>(0)?,         // callee name
                     row.get::<_, String>(1)?,         // ref file
                     row.get::<_, i64>(2)?,            // ref line
                     row.get::<_, Option<String>>(3)?, // context
                     row.get::<_, String>(4)?,         // source file (caller's definition file)
+                    row.get::<_, f64>(5)?,            // confidence
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (callee_name, file, line, context, source_file) in rows {
+        for (callee_name, file, line, context, source_file, confidence) in rows {
             let key = (callee_name.clone(), file.clone());
             if visited.contains(&key) {
                 continue;
@@ -198,6 +217,7 @@ pub fn callees(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
                 context: context.unwrap_or_default(),
                 depth,
                 source_file: Some(source_file),
+                confidence,
             });
 
             if depth < max_depth && !queued.contains(&callee_name) {
@@ -225,11 +245,18 @@ pub fn callees(conn: &Connection, name: &str, max_depth: usize) -> Result<Vec<Ca
 /// the depth cap ([`MAX_DEPTH_CAP`]).
 ///
 /// Special case: when `from == to`, returns a single-hop path.
-pub fn callpath(conn: &Connection, from: &str, to: &str) -> Result<Option<Vec<CallPathHop>>> {
+pub fn callpath(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    min_confidence: Option<f64>,
+) -> Result<Option<Vec<CallPathHop>>> {
     // Degenerate case: same symbol.
     if from == to {
         return Ok(resolve_symbol_hop(conn, from)?.map(|hop| vec![hop]));
     }
+
+    let conf_threshold = min_confidence.unwrap_or(0.0);
 
     let mut visited: HashSet<String> = HashSet::new();
     let mut parent_map: HashMap<String, String> = HashMap::new();
@@ -243,7 +270,7 @@ pub fn callpath(conn: &Connection, from: &str, to: &str) -> Result<Option<Vec<Ca
         "SELECT DISTINCT r.name \
          FROM \"references\" r \
          JOIN symbols s ON s.id = r.caller_id \
-         WHERE s.name = ?1",
+         WHERE s.name = ?1 AND r.confidence >= ?2",
     )?;
 
     while let Some((current, depth)) = queue.pop_front() {
@@ -252,7 +279,9 @@ pub fn callpath(conn: &Connection, from: &str, to: &str) -> Result<Option<Vec<Ca
         }
 
         let callees: Vec<String> = stmt
-            .query_map(rusqlite::params![&current], |row| row.get::<_, String>(0))?
+            .query_map(rusqlite::params![&current, conf_threshold], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
 
         for callee_name in callees {
@@ -412,7 +441,7 @@ fn bar() {
 }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callers(&conn, "bar", 1).unwrap();
+        let results = callers(&conn, "bar", 1, None).unwrap();
 
         assert!(
             !results.is_empty(),
@@ -428,7 +457,7 @@ fn bar() {
         // No one calls standalone_fn.
         let source = "fn standalone_fn() { }\n";
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callers(&conn, "standalone_fn", 1).unwrap();
+        let results = callers(&conn, "standalone_fn", 1, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -447,7 +476,7 @@ fn b() {
 fn c() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callers(&conn, "c", 2).unwrap();
+        let results = callers(&conn, "c", 2, None).unwrap();
 
         let names: Vec<&str> = results.iter().map(|r| r.caller_name.as_str()).collect();
         assert!(names.contains(&"b"), "b should be a direct caller of c");
@@ -474,7 +503,7 @@ fn b() {
 fn c() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callers(&conn, "c", 1).unwrap();
+        let results = callers(&conn, "c", 1, None).unwrap();
 
         let names: Vec<&str> = results.iter().map(|r| r.caller_name.as_str()).collect();
         assert!(names.contains(&"b"));
@@ -485,7 +514,7 @@ fn c() { }
     fn callers_depth_0_returns_empty() {
         let source = "fn foo() { bar(); }\nfn bar() { }\n";
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callers(&conn, "bar", 0).unwrap();
+        let results = callers(&conn, "bar", 0, None).unwrap();
         assert!(results.is_empty(), "depth 0 should return no results");
     }
 
@@ -502,7 +531,7 @@ fn bar() { }
 fn baz() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callees(&conn, "foo", 1).unwrap();
+        let results = callees(&conn, "foo", 1, None).unwrap();
 
         let names: Vec<&str> = results.iter().map(|r| r.callee_name.as_str()).collect();
         assert!(names.contains(&"bar"), "bar should be a callee of foo");
@@ -514,7 +543,7 @@ fn baz() { }
         // leaf_fn calls nothing.
         let source = "fn leaf_fn() { let x = 1; }\n";
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callees(&conn, "leaf_fn", 1).unwrap();
+        let results = callees(&conn, "leaf_fn", 1, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -533,7 +562,7 @@ fn b() {
 fn c() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callees(&conn, "a", 2).unwrap();
+        let results = callees(&conn, "a", 2, None).unwrap();
 
         let names: Vec<&str> = results.iter().map(|r| r.callee_name.as_str()).collect();
         assert!(names.contains(&"b"), "b should be a direct callee of a");
@@ -555,7 +584,7 @@ fn b() {
 fn c() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callees(&conn, "a", 1).unwrap();
+        let results = callees(&conn, "a", 1, None).unwrap();
 
         let names: Vec<&str> = results.iter().map(|r| r.callee_name.as_str()).collect();
         assert!(names.contains(&"b"), "b should be a direct callee");
@@ -566,7 +595,7 @@ fn c() { }
     fn callees_depth_0_returns_empty() {
         let source = "fn foo() { bar(); }\nfn bar() { }\n";
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callees(&conn, "foo", 0).unwrap();
+        let results = callees(&conn, "foo", 0, None).unwrap();
         assert!(results.is_empty(), "depth 0 should return no results");
     }
 
@@ -580,7 +609,7 @@ fn foo() {
 fn bar() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let results = callees(&conn, "foo", 1).unwrap();
+        let results = callees(&conn, "foo", 1, None).unwrap();
         assert!(!results.is_empty());
         // source_file should be populated with the caller's definition file.
         assert!(
@@ -635,7 +664,7 @@ fn b() {
         let (_dir, conn) = make_indexed_repo(source);
 
         // callers of "a" at depth 5 should terminate (visited set prevents cycles).
-        let results = callers(&conn, "a", 5).unwrap();
+        let results = callers(&conn, "a", 5, None).unwrap();
         // b is a caller of a, a is a caller of b.
         let names: Vec<&str> = results.iter().map(|r| r.caller_name.as_str()).collect();
         assert!(names.contains(&"b"), "b should be a caller of a");
@@ -644,7 +673,7 @@ fn b() {
         assert_eq!(names.len(), unique.len(), "no duplicate callers");
 
         // callees of "a" at depth 5 should also terminate.
-        let results = callees(&conn, "a", 5).unwrap();
+        let results = callees(&conn, "a", 5, None).unwrap();
         let names: Vec<&str> = results.iter().map(|r| r.callee_name.as_str()).collect();
         assert!(names.contains(&"b"), "b should be a callee of a");
         let unique: HashSet<&str> = names.iter().copied().collect();
@@ -674,7 +703,7 @@ fn b() {
         let index_path = db::local_index_path(root);
         let conn = db::open_existing(&index_path).unwrap();
 
-        let results = callers(&conn, "helper", 1).unwrap();
+        let results = callers(&conn, "helper", 1, None).unwrap();
         let names: Vec<&str> = results.iter().map(|r| r.caller_name.as_str()).collect();
         assert!(
             names.contains(&"caller_a"),
@@ -703,7 +732,7 @@ fn b() {
 fn c() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let path = callpath(&conn, "a", "c").unwrap();
+        let path = callpath(&conn, "a", "c", None).unwrap();
         assert!(path.is_some(), "should find a path from a to c");
         let hops = path.unwrap();
         assert_eq!(hops.len(), 3);
@@ -723,7 +752,7 @@ fn a() {
 fn b() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let path = callpath(&conn, "a", "b").unwrap();
+        let path = callpath(&conn, "a", "b", None).unwrap();
         assert!(path.is_some());
         let hops = path.unwrap();
         assert_eq!(hops.len(), 2);
@@ -740,7 +769,7 @@ fn a() { }
 fn b() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let path = callpath(&conn, "a", "b").unwrap();
+        let path = callpath(&conn, "a", "b", None).unwrap();
         assert!(
             path.is_none(),
             "should return None for disconnected symbols"
@@ -752,7 +781,7 @@ fn b() { }
         // callpath("a", "a") should return a single hop.
         let source = "fn a() { }\n";
         let (_dir, conn) = make_indexed_repo(source);
-        let path = callpath(&conn, "a", "a").unwrap();
+        let path = callpath(&conn, "a", "a", None).unwrap();
         assert!(path.is_some());
         let hops = path.unwrap();
         assert_eq!(hops.len(), 1);
@@ -774,7 +803,7 @@ fn b() {
 fn c() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let path = callpath(&conn, "a", "c").unwrap();
+        let path = callpath(&conn, "a", "c", None).unwrap();
         assert!(path.is_none(), "should not find path through cycle");
     }
 
@@ -794,12 +823,100 @@ fn b() {
 fn c() { }
 "#;
         let (_dir, conn) = make_indexed_repo(source);
-        let path = callpath(&conn, "a", "c").unwrap();
+        let path = callpath(&conn, "a", "c", None).unwrap();
         assert!(path.is_some());
         let hops = path.unwrap();
         assert_eq!(hops.len(), 2, "should find shortest path [a, c]");
         assert_eq!(hops[0].symbol_name, "a");
         assert_eq!(hops[1].symbol_name, "c");
+    }
+
+    #[test]
+    fn callers_with_min_confidence_filter() {
+        let source = r#"
+fn foo() {
+    bar();
+}
+
+fn bar() {
+    println!("hello");
+}
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        // With a high min_confidence, results with confidence < threshold should be excluded.
+        let results = callers(&conn, "bar", 1, Some(0.9)).unwrap();
+        // All refs should be same-file (0.85), so filtering at 0.9 should exclude them.
+        assert!(
+            results.is_empty(),
+            "callers with min_confidence 0.9 should exclude 0.85 confidence results"
+        );
+
+        // With a lower threshold, results should appear.
+        let results = callers(&conn, "bar", 1, Some(0.5)).unwrap();
+        assert!(
+            !results.is_empty(),
+            "callers with min_confidence 0.5 should include results"
+        );
+    }
+
+    #[test]
+    fn callees_with_min_confidence_filter() {
+        let source = r#"
+fn foo() {
+    bar();
+}
+
+fn bar() { }
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        let results = callees(&conn, "foo", 1, Some(0.9)).unwrap();
+        assert!(
+            results.is_empty(),
+            "callees with min_confidence 0.9 should exclude 0.85 results"
+        );
+
+        let results = callees(&conn, "foo", 1, Some(0.5)).unwrap();
+        assert!(
+            !results.is_empty(),
+            "callees with min_confidence 0.5 should include results"
+        );
+    }
+
+    #[test]
+    fn callers_result_has_confidence_field() {
+        let source = r#"
+fn foo() {
+    bar();
+}
+
+fn bar() { }
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        let results = callers(&conn, "bar", 1, None).unwrap();
+        assert!(!results.is_empty());
+        // The confidence should be > 0.0 (same-file definition = 0.85).
+        assert!(
+            results[0].confidence > 0.0,
+            "CallerResult should have a non-zero confidence"
+        );
+    }
+
+    #[test]
+    fn callees_result_has_confidence_field() {
+        let source = r#"
+fn foo() {
+    bar();
+}
+
+fn bar() { }
+"#;
+        let (_dir, conn) = make_indexed_repo(source);
+        let results = callees(&conn, "foo", 1, None).unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results[0].confidence > 0.0,
+            "CalleeResult should have a non-zero confidence"
+        );
     }
 
     #[test]

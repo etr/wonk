@@ -123,7 +123,7 @@ impl fmt::Display for ReferenceKind {
 ///
 /// References include function/method calls, type annotations, and import
 /// statements.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Reference {
     /// The referenced name (e.g. function name, type name, imported module).
     pub name: String,
@@ -140,6 +140,10 @@ pub struct Reference {
     /// Name of the enclosing function/method for call-site references.
     /// `None` for file-scope calls, type refs, and import refs.
     pub caller_name: Option<String>,
+    /// Confidence score for this reference (0.0 = lowest, 1.0 = highest).
+    /// Import-resolved: 0.95, same-file definition: 0.85, same-scope: 0.80,
+    /// cross-file name match: 0.50 (default).
+    pub confidence: f64,
 }
 
 /// Import and export data for a single file.
@@ -308,7 +312,7 @@ pub struct ShowResult {
 }
 
 /// A caller of a symbol, discovered via the call graph (caller_id references).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CallerResult {
     /// Name of the calling function/method.
     pub caller_name: String,
@@ -325,10 +329,12 @@ pub struct CallerResult {
     /// File containing the specific definition that was called (when multiple
     /// definitions exist). `None` when there is only one definition.
     pub target_file: Option<String>,
+    /// Confidence score of the underlying reference (0.0-1.0).
+    pub confidence: f64,
 }
 
 /// A callee of a symbol, discovered via the call graph (caller_id references).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CalleeResult {
     /// Name of the called function/symbol.
     pub callee_name: String,
@@ -342,6 +348,8 @@ pub struct CalleeResult {
     pub depth: usize,
     /// File of the parent function that makes this call.
     pub source_file: Option<String>,
+    /// Confidence score of the underlying reference (0.0-1.0).
+    pub confidence: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +613,7 @@ mod tests {
             signature: "fn dispatch()".into(),
             depth: 1,
             target_file: Some("src/db.rs".into()),
+            confidence: 0.85,
         };
         assert_eq!(cr.caller_name, "dispatch");
         assert_eq!(cr.caller_kind, SymbolKind::Function);
@@ -625,6 +634,7 @@ mod tests {
             signature: "fn foo()".into(),
             depth: 1,
             target_file: None,
+            confidence: 0.5,
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -639,6 +649,7 @@ mod tests {
             context: "    let conn = open_db(&path);".into(),
             depth: 1,
             source_file: Some("src/router.rs".into()),
+            confidence: 0.85,
         };
         assert_eq!(cr.callee_name, "open_db");
         assert_eq!(cr.file, "src/db.rs");
@@ -657,9 +668,40 @@ mod tests {
             context: "bar()".into(),
             depth: 2,
             source_file: None,
+            confidence: 0.5,
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn reference_confidence_field() {
+        let r = Reference {
+            name: "foo".into(),
+            kind: ReferenceKind::Call,
+            file: "a.rs".into(),
+            line: 10,
+            col: 4,
+            context: "foo()".into(),
+            caller_name: Some("bar".into()),
+            confidence: 0.85,
+        };
+        assert!((r.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reference_default_confidence() {
+        let r = Reference {
+            name: "baz".into(),
+            kind: ReferenceKind::Import,
+            file: "b.rs".into(),
+            line: 1,
+            col: 0,
+            context: "use baz;".into(),
+            caller_name: None,
+            confidence: 0.5,
+        };
+        assert!((r.confidence - 0.5).abs() < 1e-9);
     }
 
     #[test]

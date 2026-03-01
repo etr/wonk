@@ -1056,7 +1056,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 None => return Ok(()),
             };
 
-            let results = crate::callgraph::callers(&conn, &args.name, depth)?;
+            let results = crate::callgraph::callers(&conn, &args.name, depth, args.min_confidence)?;
 
             if results.is_empty() {
                 output::print_hint("no callers found", suppress);
@@ -1072,6 +1072,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     signature: cr.signature.clone(),
                     depth: cr.depth,
                     target_file: cr.target_file.clone(),
+                    confidence: cr.confidence,
                 };
 
                 if fmt.format_caller(&out)? == BudgetStatus::Skipped {
@@ -1087,7 +1088,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 None => return Ok(()),
             };
 
-            let results = crate::callgraph::callees(&conn, &args.name, depth)?;
+            let results = crate::callgraph::callees(&conn, &args.name, depth, args.min_confidence)?;
 
             if results.is_empty() {
                 output::print_hint("no callees found", suppress);
@@ -1102,6 +1103,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     context: cr.context.clone(),
                     depth: cr.depth,
                     source_file: cr.source_file.clone(),
+                    confidence: cr.confidence,
                 };
 
                 if fmt.format_callee(&out)? == BudgetStatus::Skipped {
@@ -1117,7 +1119,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 None => return Ok(()),
             };
 
-            let path = crate::callgraph::callpath(&conn, &args.from, &args.to)?;
+            let path =
+                crate::callgraph::callpath(&conn, &args.from, &args.to, args.min_confidence)?;
 
             match path {
                 Some(hops) => {
@@ -1914,6 +1917,7 @@ impl QueryRouter {
                     col: r.col as usize,
                     context: r.content.clone(),
                     caller_name: None,
+                    confidence: 0.5,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -2142,7 +2146,7 @@ fn query_symbols_db(
 
 /// Query references from the SQLite index.
 fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Reference>, DbError> {
-    let sql = "SELECT r.name, r.file, r.line, r.col, r.context, s.name \
+    let sql = "SELECT r.name, r.file, r.line, r.col, r.context, s.name, r.confidence \
                FROM \"references\" r \
                LEFT JOIN symbols s ON r.caller_id = s.id \
                WHERE r.name LIKE ?1";
@@ -2160,6 +2164,7 @@ fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Reference>, 
             col: col as usize,
             context: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
             caller_name: row.get(5)?,
+            confidence: row.get::<_, Option<f64>>(6)?.unwrap_or(0.5),
         })
     })?;
 
@@ -4683,6 +4688,7 @@ mod tests {
         let cmd = Command::Callers(CallersArgs {
             name: "dispatch".into(),
             depth: 1,
+            min_confidence: None,
         });
         assert!(is_query_command(&cmd));
     }
@@ -4693,6 +4699,7 @@ mod tests {
         let cmd = Command::Callees(CalleesArgs {
             name: "main".into(),
             depth: 1,
+            min_confidence: None,
         });
         assert!(is_query_command(&cmd));
     }
@@ -4703,6 +4710,7 @@ mod tests {
         let cmd = Command::Callpath(CallpathArgs {
             from: "main".into(),
             to: "dispatch".into(),
+            min_confidence: None,
         });
         assert!(is_query_command(&cmd));
     }

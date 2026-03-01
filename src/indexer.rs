@@ -1442,6 +1442,66 @@ fn extract_csharp(
 }
 
 // ===========================================================================
+// Confidence scoring
+// ===========================================================================
+
+/// Compute a confidence score for a reference based on available evidence.
+///
+/// Scoring rules (highest applicable wins):
+/// - Import reference kind -> 0.95
+/// - Name appears in the file's import list -> 0.95
+/// - Same-file definition exists (name matches a symbol in the same file) -> 0.85
+/// - Same-scope (caller shares scope with a definition of the referenced name) -> 0.80
+/// - Cross-file name match (default) -> 0.50
+pub fn compute_confidence(reference: &Reference, symbols: &[Symbol], imports: &[String]) -> f64 {
+    // Rule 1: Import reference kind.
+    if reference.kind == ReferenceKind::Import {
+        return 0.95;
+    }
+
+    // Rule 2: Name is in the file's import list (import-resolved).
+    if imports.iter().any(|imp| {
+        // Check if the import path ends with the reference name (e.g. "std::collections::HashMap" contains "HashMap")
+        imp == &reference.name
+            || imp.ends_with(&format!("::{}", reference.name))
+            || imp.ends_with(&format!("/{}", reference.name))
+            || imp.ends_with(&format!(".{}", reference.name))
+    }) {
+        return 0.95;
+    }
+
+    // Rule 3: Same-file definition exists.
+    let same_file_def = symbols
+        .iter()
+        .any(|s| s.name == reference.name && s.file == reference.file);
+    if same_file_def {
+        return 0.85;
+    }
+
+    // Rule 4: Same-scope — the caller and a definition of the referenced name
+    // share the same scope (e.g. both are methods of the same class).
+    if let Some(ref caller_name) = reference.caller_name {
+        // Find the scope of the caller.
+        let caller_scope = symbols
+            .iter()
+            .find(|s| s.name == *caller_name && s.file == reference.file)
+            .and_then(|s| s.scope.as_deref());
+
+        if let Some(scope) = caller_scope {
+            let same_scope_def = symbols
+                .iter()
+                .any(|s| s.name == reference.name && s.scope.as_deref() == Some(scope));
+            if same_scope_def {
+                return 0.80;
+            }
+        }
+    }
+
+    // Default: cross-file name match.
+    0.50
+}
+
+// ===========================================================================
 // Reference extraction
 // ===========================================================================
 
@@ -1514,6 +1574,7 @@ fn make_ref(
         col: node.start_position().column,
         context: get_context_line(source_lines, row),
         caller_name: None,
+        confidence: 0.5,
     }
 }
 
@@ -4039,5 +4100,208 @@ mod tests {
         let mut parser = get_parser(Lang::Cpp);
         let tree = parser.parse(src.as_bytes(), None).unwrap();
         dump_tree(tree.root_node(), src, 0);
+    }
+
+    // -- compute_confidence tests -----------------------------------------------
+
+    #[test]
+    fn confidence_import_kind_is_0_95() {
+        let r = Reference {
+            name: "HashMap".into(),
+            kind: ReferenceKind::Import,
+            file: "a.rs".into(),
+            line: 1,
+            col: 0,
+            context: "use std::collections::HashMap;".into(),
+            caller_name: None,
+            confidence: 0.5,
+        };
+        let symbols: Vec<Symbol> = vec![];
+        let imports: Vec<String> = vec![];
+        let score = compute_confidence(&r, &symbols, &imports);
+        assert!(
+            (score - 0.95).abs() < 1e-9,
+            "import references should have confidence 0.95, got {score}"
+        );
+    }
+
+    #[test]
+    fn confidence_name_in_imports_is_0_95() {
+        let r = Reference {
+            name: "HashMap".into(),
+            kind: ReferenceKind::Call,
+            file: "a.rs".into(),
+            line: 10,
+            col: 4,
+            context: "let m = HashMap::new();".into(),
+            caller_name: Some("main".into()),
+            confidence: 0.5,
+        };
+        let symbols: Vec<Symbol> = vec![];
+        let imports = vec!["HashMap".to_string(), "Vec".to_string()];
+        let score = compute_confidence(&r, &symbols, &imports);
+        assert!(
+            (score - 0.95).abs() < 1e-9,
+            "import-resolved references should have confidence 0.95, got {score}"
+        );
+    }
+
+    #[test]
+    fn confidence_same_file_definition_is_0_85() {
+        let r = Reference {
+            name: "helper".into(),
+            kind: ReferenceKind::Call,
+            file: "a.rs".into(),
+            line: 10,
+            col: 4,
+            context: "helper();".into(),
+            caller_name: Some("main".into()),
+            confidence: 0.5,
+        };
+        let symbols = vec![Symbol {
+            name: "helper".into(),
+            kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 1,
+            col: 0,
+            end_line: Some(5),
+            scope: None,
+            signature: "fn helper()".into(),
+            language: "Rust".into(),
+        }];
+        let imports: Vec<String> = vec![];
+        let score = compute_confidence(&r, &symbols, &imports);
+        assert!(
+            (score - 0.85).abs() < 1e-9,
+            "same-file definition should have confidence 0.85, got {score}"
+        );
+    }
+
+    #[test]
+    fn confidence_same_scope_is_0_80() {
+        // Reference inside "MyClass" calling a method defined in "MyClass" scope
+        // but not the same name as a top-level symbol.
+        let r = Reference {
+            name: "do_work".into(),
+            kind: ReferenceKind::Call,
+            file: "a.rs".into(),
+            line: 20,
+            col: 8,
+            context: "self.do_work();".into(),
+            caller_name: Some("run".into()),
+            confidence: 0.5,
+        };
+        // "run" is in scope "MyClass", "do_work" is also in scope "MyClass".
+        let symbols = vec![
+            Symbol {
+                name: "run".into(),
+                kind: SymbolKind::Method,
+                file: "a.rs".into(),
+                line: 15,
+                col: 4,
+                end_line: Some(25),
+                scope: Some("MyClass".into()),
+                signature: "fn run(&self)".into(),
+                language: "Rust".into(),
+            },
+            Symbol {
+                name: "do_work".into(),
+                kind: SymbolKind::Method,
+                file: "a.rs".into(),
+                line: 30,
+                col: 4,
+                end_line: Some(35),
+                scope: Some("MyClass".into()),
+                signature: "fn do_work(&self)".into(),
+                language: "Rust".into(),
+            },
+        ];
+        let imports: Vec<String> = vec![];
+        let score = compute_confidence(&r, &symbols, &imports);
+        // do_work is in the same file (0.85) AND same scope as caller "run" (0.80).
+        // Same-file def should win (0.85) since it's higher.
+        assert!(
+            (score - 0.85).abs() < 1e-9,
+            "same-file definition should win over same-scope, got {score}"
+        );
+    }
+
+    #[test]
+    fn confidence_cross_file_default_is_0_50() {
+        let r = Reference {
+            name: "external_func".into(),
+            kind: ReferenceKind::Call,
+            file: "a.rs".into(),
+            line: 10,
+            col: 4,
+            context: "external_func();".into(),
+            caller_name: Some("main".into()),
+            confidence: 0.5,
+        };
+        // No matching symbol in same file, no matching import.
+        let symbols = vec![Symbol {
+            name: "unrelated".into(),
+            kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 1,
+            col: 0,
+            end_line: Some(5),
+            scope: None,
+            signature: "fn unrelated()".into(),
+            language: "Rust".into(),
+        }];
+        let imports: Vec<String> = vec![];
+        let score = compute_confidence(&r, &symbols, &imports);
+        assert!(
+            (score - 0.50).abs() < 1e-9,
+            "cross-file name match should have confidence 0.50, got {score}"
+        );
+    }
+
+    #[test]
+    fn confidence_scope_only_match_is_0_80() {
+        // The caller is in scope "MyClass", the reference target is also in scope
+        // "MyClass" but lives in a DIFFERENT file. This tests the scope-only path.
+        let r = Reference {
+            name: "helper".into(),
+            kind: ReferenceKind::Call,
+            file: "a.rs".into(),
+            line: 20,
+            col: 8,
+            context: "self.helper();".into(),
+            caller_name: Some("run".into()),
+            confidence: 0.5,
+        };
+        let symbols = vec![
+            Symbol {
+                name: "run".into(),
+                kind: SymbolKind::Method,
+                file: "a.rs".into(),
+                line: 15,
+                col: 4,
+                end_line: Some(25),
+                scope: Some("MyClass".into()),
+                signature: "fn run(&self)".into(),
+                language: "Rust".into(),
+            },
+            // helper is in scope "MyClass" but different file
+            Symbol {
+                name: "helper".into(),
+                kind: SymbolKind::Method,
+                file: "b.rs".into(),
+                line: 5,
+                col: 4,
+                end_line: Some(10),
+                scope: Some("MyClass".into()),
+                signature: "fn helper(&self)".into(),
+                language: "Rust".into(),
+            },
+        ];
+        let imports: Vec<String> = vec![];
+        let score = compute_confidence(&r, &symbols, &imports);
+        assert!(
+            (score - 0.80).abs() < 1e-9,
+            "same-scope reference should have confidence 0.80, got {score}"
+        );
     }
 }
