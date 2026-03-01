@@ -2687,7 +2687,7 @@ Add `confidence REAL` column to the `references` table, create the `type_edges` 
 **Related Requirements:** PRD-CONF-REQ-001 through PRD-CONF-REQ-006
 **Related Decisions:** DR-028, DR-029
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
