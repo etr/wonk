@@ -2365,7 +2365,7 @@ Wire enclosing function detection into the full index build (`wonk init`/`wonk u
 **Related Requirements:** PRD-CGR-REQ-001
 **Related Decisions:** DR-015, DR-021
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
