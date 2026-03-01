@@ -100,7 +100,12 @@ pub fn build_prompt(
 ) -> std::result::Result<String, LlmError> {
     let mut prompt = String::with_capacity(2048);
 
-    writeln!(prompt, "Describe the following code path: `{}`\n", sanitize(path)).unwrap();
+    writeln!(
+        prompt,
+        "Describe the following code path: `{}`\n",
+        sanitize(path)
+    )
+    .unwrap();
 
     // Language breakdown.
     if !metrics.language_breakdown.is_empty() {

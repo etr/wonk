@@ -139,30 +139,33 @@ impl Progress {
 
     /// Print the final completion summary.
     pub fn finish(&self, stats: &IndexStats) {
+        if self.mode == ProgressMode::Silent {
+            return;
+        }
+
+        let caller_suffix = if stats.caller_count > 0 {
+            format!(", {} caller relationships", stats.caller_count)
+        } else {
+            String::new()
+        };
+        let summary = format!(
+            "{} {} files ({} symbols, {} references{}) in {:.1}s",
+            self.done_label,
+            stats.file_count,
+            stats.symbol_count,
+            stats.ref_count,
+            caller_suffix,
+            stats.elapsed.as_secs_f64(),
+        );
+
         match self.mode {
-            ProgressMode::Silent => {}
+            ProgressMode::Silent => unreachable!(),
             ProgressMode::InPlace => {
-                // Overwrite the progress line with the summary
-                let msg = format!(
-                    "\r{} {} files ({} symbols, {} references) in {:.1}s",
-                    self.done_label,
-                    stats.file_count,
-                    stats.symbol_count,
-                    stats.ref_count,
-                    stats.elapsed.as_secs_f64(),
-                );
                 // Pad with spaces to clear any leftover characters from progress line
-                eprintln!("{:<80}", msg);
+                eprintln!("\r{:<80}", summary);
             }
             ProgressMode::LineBased => {
-                eprintln!(
-                    "{} {} files ({} symbols, {} references) in {:.1}s",
-                    self.done_label,
-                    stats.file_count,
-                    stats.symbol_count,
-                    stats.ref_count,
-                    stats.elapsed.as_secs_f64(),
-                );
+                eprintln!("{}", summary);
             }
         }
     }
@@ -275,6 +278,7 @@ mod tests {
             file_count: 100,
             symbol_count: 500,
             ref_count: 2000,
+            caller_count: 150,
             elapsed: Duration::from_secs_f64(1.5),
         };
         // Should not panic or produce stdout output
