@@ -1174,7 +1174,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             };
 
             let semantic = if args.semantic {
-                crate::db::ensure_summaries_table(&conn).unwrap_or(());
+                crate::db::ensure_summaries_table(&conn)?;
                 Some(config.llm.clone())
             } else {
                 None
@@ -1187,7 +1187,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 semantic,
             };
 
-            let result = crate::summary::summarize_path(&conn, &args.path, &repo_root, &options)?;
+            let result = crate::summary::summarize_path(&conn, &args.path, &options)?;
 
             let out = SummaryOutput::from_result(&result);
             fmt.format_summary(&out)?;

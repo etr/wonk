@@ -6,9 +6,9 @@
 //! - Ollama `/api/generate` client (sync, ureq-based)
 //! - SQLite cache layer for generated descriptions
 
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use ureq::Agent;
@@ -16,6 +16,27 @@ use ureq::Agent;
 use crate::config::LlmConfig;
 use crate::errors::LlmError;
 use crate::types::{SummaryMetrics, SummaryPathType};
+
+// ---------------------------------------------------------------------------
+// Query helper
+// ---------------------------------------------------------------------------
+
+/// Execute a prepared SQL query and collect results into a Vec,
+/// mapping all rusqlite errors to `LlmError::QueryFailed`.
+fn query_vec<T>(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::types::ToSql],
+    mapper: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> std::result::Result<Vec<T>, LlmError> {
+    let mut stmt = conn
+        .prepare_cached(sql)
+        .map_err(|e| LlmError::QueryFailed(e.to_string()))?;
+    stmt.query_map(params, mapper)
+        .map_err(|e| LlmError::QueryFailed(e.to_string()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| LlmError::QueryFailed(e.to_string()))
+}
 
 // ---------------------------------------------------------------------------
 // Content hash computation (DR-019)
@@ -28,7 +49,7 @@ pub fn compute_content_hash(
     conn: &Connection,
     like_pattern: &str,
     path_type: SummaryPathType,
-) -> Result<String, LlmError> {
+) -> std::result::Result<String, LlmError> {
     let query = match path_type {
         SummaryPathType::File => {
             "SELECT s.id, f.hash FROM symbols s \
@@ -44,17 +65,9 @@ pub fn compute_content_hash(
         }
     };
 
-    let mut stmt = conn
-        .prepare_cached(query)
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?;
-
-    let rows: Vec<(i64, String)> = stmt
-        .query_map(rusqlite::params![like_pattern], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?;
+    let rows = query_vec(conn, query, &[&like_pattern], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
 
     let mut hasher = Sha256::new();
     for (id, hash) in &rows {
@@ -71,6 +84,12 @@ pub fn compute_content_hash(
 /// Maximum number of symbol signatures to include in the prompt.
 const MAX_PROMPT_SIGNATURES: usize = 100;
 
+/// Strip newlines and control characters from code-derived strings
+/// to prevent prompt injection via crafted source code.
+fn sanitize(s: &str) -> String {
+    s.replace(['\n', '\r', '\0'], " ")
+}
+
 /// Build a prompt for the LLM to generate a 2-3 sentence description.
 pub fn build_prompt(
     conn: &Connection,
@@ -78,16 +97,16 @@ pub fn build_prompt(
     like_pattern: &str,
     path_type: SummaryPathType,
     metrics: &SummaryMetrics,
-) -> Result<String, LlmError> {
+) -> std::result::Result<String, LlmError> {
     let mut prompt = String::with_capacity(2048);
 
-    prompt.push_str(&format!("Describe the following code path: `{path}`\n\n"));
+    writeln!(prompt, "Describe the following code path: `{path}`\n").unwrap();
 
     // Language breakdown.
     if !metrics.language_breakdown.is_empty() {
         prompt.push_str("Languages:\n");
         for (lang, count) in &metrics.language_breakdown {
-            prompt.push_str(&format!("- {lang}: {count} files\n"));
+            writeln!(prompt, "- {lang}: {count} files").unwrap();
         }
         prompt.push('\n');
     }
@@ -106,24 +125,19 @@ pub fn build_prompt(
         }
     };
 
-    let mut sig_stmt = conn
-        .prepare_cached(sig_query)
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?;
-
-    let sigs: Vec<(String, String, Option<String>)> = sig_stmt
-        .query_map(
-            rusqlite::params![like_pattern, MAX_PROMPT_SIGNATURES as i64],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?;
+    let limit = MAX_PROMPT_SIGNATURES as i64;
+    let sigs = query_vec(
+        conn,
+        sig_query,
+        &[&like_pattern as &dyn rusqlite::types::ToSql, &limit],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
 
     if !sigs.is_empty() {
         prompt.push_str("Symbol signatures:\n");
@@ -131,12 +145,12 @@ pub fn build_prompt(
         for (kind, name, sig) in &sigs {
             if kind.as_str() != current_kind {
                 current_kind = kind;
-                prompt.push_str(&format!("\n  [{kind}]\n"));
+                writeln!(prompt, "\n  [{kind}]").unwrap();
             }
             if let Some(s) = sig {
-                prompt.push_str(&format!("  - {s}\n"));
+                writeln!(prompt, "  - {}", sanitize(s)).unwrap();
             } else {
-                prompt.push_str(&format!("  - {name}\n"));
+                writeln!(prompt, "  - {}", sanitize(name)).unwrap();
             }
         }
         prompt.push('\n');
@@ -152,22 +166,14 @@ pub fn build_prompt(
         }
     };
 
-    let mut imp_stmt = conn
-        .prepare_cached(import_query)
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?;
-
-    let imports: Vec<String> = imp_stmt
-        .query_map(rusqlite::params![like_pattern], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| LlmError::OllamaError(format!("query failed: {e}")))?;
+    let imports = query_vec(conn, import_query, &[&like_pattern], |row| {
+        row.get::<_, String>(0)
+    })?;
 
     if !imports.is_empty() {
         prompt.push_str("Dependencies:\n");
         for imp in &imports {
-            prompt.push_str(&format!("- {imp}\n"));
+            writeln!(prompt, "- {}", sanitize(imp)).unwrap();
         }
         prompt.push('\n');
     }
@@ -187,9 +193,9 @@ pub fn build_prompt(
 
 /// Request body for Ollama `/api/generate`.
 #[derive(serde::Serialize)]
-struct GenerateRequest {
-    model: String,
-    prompt: String,
+struct GenerateRequest<'a> {
+    model: &'a str,
+    prompt: &'a str,
     stream: bool,
 }
 
@@ -200,7 +206,15 @@ struct GenerateResponse {
 }
 
 /// Call Ollama's `/api/generate` endpoint to produce a text completion.
-pub fn generate(config: &LlmConfig, prompt: &str) -> Result<String, LlmError> {
+pub fn generate(config: &LlmConfig, prompt: &str) -> std::result::Result<String, LlmError> {
+    // Validate URL scheme to prevent SSRF via crafted config.
+    if !config.generate_url.starts_with("http://") && !config.generate_url.starts_with("https://") {
+        return Err(LlmError::OllamaError(
+            "invalid generate_url: only http:// and https:// schemes are allowed".to_string(),
+        ));
+    }
+
+    // AgentBuilder::build() returns an AgentConfig; into() converts to Agent.
     let agent: Agent = Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(5)))
         .timeout_global(Some(std::time::Duration::from_secs(120)))
@@ -209,8 +223,8 @@ pub fn generate(config: &LlmConfig, prompt: &str) -> Result<String, LlmError> {
         .into();
 
     let req_body = GenerateRequest {
-        model: config.model.clone(),
-        prompt: prompt.to_string(),
+        model: &config.model,
+        prompt,
         stream: false,
     };
 
@@ -226,10 +240,11 @@ pub fn generate(config: &LlmConfig, prompt: &str) -> Result<String, LlmError> {
     }
 
     if status != 200 {
-        let body = response
+        let raw = response
             .into_body()
             .read_to_string()
             .unwrap_or_else(|_| "unknown error".to_string());
+        let body = if raw.len() > 512 { &raw[..512] } else { &raw };
         return Err(LlmError::OllamaError(format!("HTTP {status}: {body}")));
     }
 
@@ -264,7 +279,7 @@ pub fn store_cache(
     path: &str,
     content_hash: &str,
     description: &str,
-) -> Result<(), LlmError> {
+) -> std::result::Result<(), LlmError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -275,7 +290,7 @@ pub fn store_cache(
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![path, content_hash, description, now],
     )
-    .map_err(|e| LlmError::OllamaError(format!("cache write failed: {e}")))?;
+    .map_err(|e| LlmError::QueryFailed(format!("cache write failed: {e}")))?;
 
     Ok(())
 }
@@ -421,6 +436,13 @@ mod tests {
         assert!(prompt.contains("Dependencies:"));
     }
 
+    #[test]
+    fn sanitize_strips_newlines() {
+        assert_eq!(sanitize("fn foo()\nbar"), "fn foo() bar");
+        assert_eq!(sanitize("clean"), "clean");
+        assert_eq!(sanitize("a\r\nb\0c"), "a  b c");
+    }
+
     // -- Cache tests ---------------------------------------------------------
 
     #[test]
@@ -478,5 +500,17 @@ mod tests {
         let result = generate(&config, "test prompt");
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), LlmError::OllamaUnreachable));
+    }
+
+    #[test]
+    fn generate_rejects_invalid_url_scheme() {
+        let config = LlmConfig {
+            model: "llama3.2:3b".to_string(),
+            generate_url: "file:///etc/passwd".to_string(),
+        };
+
+        let result = generate(&config, "test prompt");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), LlmError::OllamaError(_)));
     }
 }

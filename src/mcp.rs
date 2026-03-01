@@ -1248,7 +1248,9 @@ impl McpServer {
         let semantic = if semantic_flag {
             let repo_root = self.router.repo_root();
             let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
-            let _ = crate::db::ensure_summaries_table(conn);
+            if let Err(e) = crate::db::ensure_summaries_table(conn) {
+                return CallToolResult::error(format!("failed to create summaries table: {e}"));
+            }
             Some(config.llm)
         } else {
             None
@@ -1261,11 +1263,10 @@ impl McpServer {
             semantic,
         };
 
-        let result =
-            match crate::summary::summarize_path(conn, &path, self.router.repo_root(), &options) {
-                Ok(r) => r,
-                Err(e) => return CallToolResult::error(format!("summary query failed: {e}")),
-            };
+        let result = match crate::summary::summarize_path(conn, &path, &options) {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("summary query failed: {e}")),
+        };
 
         let out = SummaryOutput::from_result(&result);
         format_result(&out, format)

@@ -2638,7 +2638,7 @@ Add `--semantic` flag to `wonk summary` that generates LLM descriptions via Olla
 **Related Requirements:** PRD-SUM-REQ-009 through PRD-SUM-REQ-015
 **Related Decisions:** DR-018, DR-019, DR-020
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

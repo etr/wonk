@@ -4,8 +4,6 @@
 //! count, symbol counts by kind, language breakdown, dependency count) for a
 //! given path. Supports three detail levels and recursive depth traversal.
 
-use std::path::Path;
-
 use anyhow::Result;
 use rusqlite::Connection;
 
@@ -43,12 +41,9 @@ fn escape_like(s: &str) -> String {
 ///
 /// Returns a `SummaryResult` with zero metrics for empty/unknown paths
 /// (not an error), consistent with other wonk commands.
-///
-/// The `_repo_root` parameter is reserved for the `--semantic` path (TASK-064).
 pub fn summarize_path(
     conn: &Connection,
     path: &str,
-    _repo_root: &Path,
     options: &SummaryOptions,
 ) -> Result<SummaryResult> {
     let normalized = normalize_path(path);
@@ -504,7 +499,7 @@ mod tests {
         let source = "fn hello() {\n    println!(\"hi\");\n}\nfn world() {}\n";
         let (dir, conn) = make_indexed_repo(&[("src/lib.rs", source)]);
 
-        let result = summarize_path(&conn, "src/lib.rs", dir.path(), &default_options()).unwrap();
+        let result = summarize_path(&conn, "src/lib.rs", &default_options()).unwrap();
 
         assert_eq!(result.path, "src/lib.rs");
         assert_eq!(result.path_type, SummaryPathType::File);
@@ -521,7 +516,7 @@ mod tests {
             ("src/b.rs", "fn beta() {}\n"),
         ]);
 
-        let result = summarize_path(&conn, "src", dir.path(), &default_options()).unwrap();
+        let result = summarize_path(&conn, "src", &default_options()).unwrap();
 
         assert_eq!(result.path_type, SummaryPathType::Directory);
         assert_eq!(result.metrics.file_count, 2);
@@ -534,7 +529,7 @@ mod tests {
     fn summary_empty_path_returns_zero_metrics() {
         let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
-        let result = summarize_path(&conn, "nonexistent", dir.path(), &default_options()).unwrap();
+        let result = summarize_path(&conn, "nonexistent", &default_options()).unwrap();
 
         assert_eq!(result.metrics.file_count, 0);
         assert_eq!(result.metrics.line_count, 0);
@@ -549,7 +544,7 @@ mod tests {
             ("src_utils.rs", "fn util() {}\n"),
         ]);
 
-        let result = summarize_path(&conn, "src", dir.path(), &default_options()).unwrap();
+        let result = summarize_path(&conn, "src", &default_options()).unwrap();
 
         assert_eq!(result.metrics.file_count, 1);
     }
@@ -565,7 +560,7 @@ mod tests {
             depth: Some(1),
             ..default_options()
         };
-        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        let result = summarize_path(&conn, "src", &opts).unwrap();
 
         assert!(!result.children.is_empty());
         let child_paths: Vec<&str> = result.children.iter().map(|c| c.path.as_str()).collect();
@@ -584,7 +579,7 @@ mod tests {
             depth: Some(0),
             ..default_options()
         };
-        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        let result = summarize_path(&conn, "src", &opts).unwrap();
 
         assert!(result.children.is_empty());
     }
@@ -601,7 +596,7 @@ mod tests {
             depth: None, // unlimited
             ..default_options()
         };
-        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        let result = summarize_path(&conn, "src", &opts).unwrap();
 
         // Should have children, and sub/ should have grandchildren.
         assert!(!result.children.is_empty());
@@ -620,7 +615,7 @@ mod tests {
             ("src/main.py", "def world():\n    pass\n"),
         ]);
 
-        let result = summarize_path(&conn, "src", dir.path(), &default_options()).unwrap();
+        let result = summarize_path(&conn, "src", &default_options()).unwrap();
 
         assert!(result.metrics.language_breakdown.len() >= 2);
     }
@@ -636,7 +631,7 @@ mod tests {
             ("src/qux.js", "export function baz() {}\n"),
         ]);
 
-        let result = summarize_path(&conn, "src/app.js", dir.path(), &default_options()).unwrap();
+        let result = summarize_path(&conn, "src/app.js", &default_options()).unwrap();
 
         // app.js imports from bar and qux.
         assert!(result.metrics.dependency_count >= 2);
@@ -651,7 +646,7 @@ mod tests {
                 detail: level,
                 ..default_options()
             };
-            let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+            let result = summarize_path(&conn, "src", &opts).unwrap();
             assert_eq!(result.detail_level, level);
         }
     }
@@ -671,7 +666,7 @@ mod tests {
     fn summary_with_trailing_slash() {
         let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
-        let result = summarize_path(&conn, "src/", dir.path(), &default_options()).unwrap();
+        let result = summarize_path(&conn, "src/", &default_options()).unwrap();
 
         assert_eq!(result.path_type, SummaryPathType::Directory);
         assert_eq!(result.metrics.file_count, 1);
@@ -681,7 +676,7 @@ mod tests {
     fn summary_with_dot_slash_prefix() {
         let (dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
-        let result = summarize_path(&conn, "./src", dir.path(), &default_options()).unwrap();
+        let result = summarize_path(&conn, "./src", &default_options()).unwrap();
 
         assert_eq!(result.path_type, SummaryPathType::Directory);
         assert_eq!(result.metrics.file_count, 1);
@@ -697,7 +692,7 @@ mod tests {
             semantic: None,
             ..default_options()
         };
-        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        let result = summarize_path(&conn, "src", &opts).unwrap();
         assert!(result.description.is_none());
     }
 
@@ -715,7 +710,7 @@ mod tests {
             semantic: Some(config),
             ..default_options()
         };
-        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        let result = summarize_path(&conn, "src", &opts).unwrap();
         // Should succeed, but description is None since Ollama is unreachable.
         assert!(result.description.is_none());
     }
@@ -738,7 +733,7 @@ mod tests {
             semantic: Some(config),
             ..default_options()
         };
-        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        let result = summarize_path(&conn, "src", &opts).unwrap();
         assert_eq!(result.description, Some("Cached description.".to_string()));
     }
 
@@ -760,7 +755,7 @@ mod tests {
             semantic: Some(config),
             ..default_options()
         };
-        let result = summarize_path(&conn, "src", dir.path(), &opts).unwrap();
+        let result = summarize_path(&conn, "src", &opts).unwrap();
 
         // Children should have no description.
         for child in &result.children {

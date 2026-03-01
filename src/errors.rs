@@ -99,6 +99,10 @@ pub enum LlmError {
     /// The response from Ollama could not be parsed.
     #[error("invalid LLM response")]
     InvalidResponse,
+
+    /// A database operation in the LLM cache layer failed.
+    #[error("LLM query failed: {0}")]
+    QueryFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +174,9 @@ impl WonkError {
             }
             WonkError::Llm(LlmError::ModelNotFound(_)) => {
                 Some("run `ollama pull <model>` or configure [llm].model in .wonk/config.toml")
+            }
+            WonkError::Llm(LlmError::QueryFailed(_)) => {
+                Some("the index may be corrupt; try `wonk init` to rebuild it")
             }
             WonkError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Some("verify the file or directory exists")
@@ -440,5 +447,18 @@ mod tests {
     fn exit_code_llm_error() {
         let err = WonkError::Llm(LlmError::OllamaUnreachable);
         assert_eq!(err.exit_code(), EXIT_ERROR);
+    }
+
+    #[test]
+    fn llm_error_query_failed_display() {
+        let err = LlmError::QueryFailed("table missing".to_string());
+        assert_eq!(format!("{err}"), "LLM query failed: table missing");
+    }
+
+    #[test]
+    fn hint_llm_query_failed() {
+        let err = WonkError::Llm(LlmError::QueryFailed("test".to_string()));
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("rebuild"));
     }
 }
