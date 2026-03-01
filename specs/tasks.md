@@ -2657,16 +2657,16 @@ Add `--semantic` flag to `wonk summary` that generates LLM descriptions via Olla
 Add `confidence REAL` column to the `references` table, create the `type_edges` table, and implement confidence scoring logic in the indexer.
 
 **Action Items:**
-- [ ] Add `confidence REAL DEFAULT 0.5` column to `references` table via `ALTER TABLE` (O(1) migration, no row rewriting) (DR-028)
-- [ ] Create index `idx_references_confidence` on the new column
-- [ ] Create `type_edges` table with columns: `id INTEGER PRIMARY KEY`, `child_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE`, `parent_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE`, `relationship TEXT NOT NULL` (DR-029)
-- [ ] Add `UNIQUE(child_id, parent_id, relationship)` constraint on `type_edges`
-- [ ] Create indexes on both `child_id` and `parent_id` for bidirectional queries
-- [ ] Implement confidence scoring logic in `indexer.rs`: import-resolved → 0.95 (PRD-CONF-REQ-002), same-file definition → 0.85 (PRD-CONF-REQ-003), same-scope → 0.80, cross-file name match → 0.50 (PRD-CONF-REQ-004)
-- [ ] During reference extraction, check import resolution evidence and assign confidence per reference (PRD-CONF-REQ-001)
-- [ ] Add `--min-confidence <N>` flag to graph traversal CLI commands: `blast`, `flows`, `callers`, `callees`, `callpath`, `context` (PRD-CONF-REQ-005)
-- [ ] Include `confidence` field in JSON/TOON output for all graph commands (PRD-CONF-REQ-006)
-- [ ] Backward compatibility: existing indexes get all refs at 0.5 (the DEFAULT); re-index recalculates
+- [x] Add `confidence REAL DEFAULT 0.5` column to `references` table via `ALTER TABLE` (O(1) migration, no row rewriting) (DR-028)
+- [x] Create composite indexes `idx_references_name_confidence` and `idx_references_caller_confidence` for efficient graph query filtering
+- [x] Create `type_edges` table with columns: `id INTEGER PRIMARY KEY`, `child_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE`, `parent_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE`, `relationship TEXT NOT NULL` (DR-029)
+- [x] Add `UNIQUE(child_id, parent_id, relationship)` constraint on `type_edges`
+- [x] Create indexes on both `child_id` and `parent_id` for bidirectional queries
+- [x] Implement confidence scoring logic in `indexer.rs`: import-resolved → 0.95 (PRD-CONF-REQ-002), same-file definition → 0.85 (PRD-CONF-REQ-003), same-scope → 0.80, cross-file name match → 0.50 (PRD-CONF-REQ-004)
+- [x] During reference extraction, check import resolution evidence and assign confidence per reference (PRD-CONF-REQ-001)
+- [x] Add `--min-confidence <N>` flag to graph traversal CLI commands: `callers`, `callees`, `callpath` (PRD-CONF-REQ-005); `blast`, `flows`, `context` deferred to their respective tasks (TASK-069, TASK-070, TASK-073)
+- [x] Include `confidence` field in JSON/TOON output for all graph commands (PRD-CONF-REQ-006)
+- [x] Backward compatibility: existing indexes get all refs at 0.5 (the DEFAULT); re-index recalculates
 
 **Dependencies:**
 - Blocked by: None
@@ -2687,7 +2687,7 @@ Add `confidence REAL` column to the `references` table, create the `type_edges` 
 **Related Requirements:** PRD-CONF-REQ-001 through PRD-CONF-REQ-006
 **Related Decisions:** DR-028, DR-029
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 

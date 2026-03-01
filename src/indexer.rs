@@ -1460,12 +1460,17 @@ pub fn compute_confidence(reference: &Reference, symbols: &[Symbol], imports: &[
     }
 
     // Rule 2: Name is in the file's import list (import-resolved).
+    // Pre-build suffix strings once to avoid repeated allocations per import.
+    let suffix_colon = format!("::{}", reference.name);
+    let suffix_slash = format!("/{}", reference.name);
+    let suffix_dot = format!(".{}", reference.name);
     if imports.iter().any(|imp| {
-        // Check if the import path ends with the reference name (e.g. "std::collections::HashMap" contains "HashMap")
+        // Check if the import path ends with the reference name
+        // e.g. "std::collections::HashMap" (::), "path/to/module" (/), or "module.Symbol" (.)
         imp == &reference.name
-            || imp.ends_with(&format!("::{}", reference.name))
-            || imp.ends_with(&format!("/{}", reference.name))
-            || imp.ends_with(&format!(".{}", reference.name))
+            || imp.ends_with(&suffix_colon)
+            || imp.ends_with(&suffix_slash)
+            || imp.ends_with(&suffix_dot)
     }) {
         return 0.95;
     }

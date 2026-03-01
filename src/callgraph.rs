@@ -16,6 +16,16 @@ use crate::types::{CallPathHop, CalleeResult, CallerResult, SymbolKind};
 /// Maximum allowed depth for transitive expansion.
 pub const MAX_DEPTH_CAP: usize = 10;
 
+/// Sanitize a user-provided confidence threshold to a valid [0.0, 1.0] range.
+/// Returns 0.0 (no filtering) when None. Rejects NaN and infinity.
+fn sanitize_confidence(min_confidence: Option<f64>) -> f64 {
+    match min_confidence {
+        Some(c) if c.is_nan() || c.is_infinite() => 0.0,
+        Some(c) => c.clamp(0.0, 1.0),
+        None => 0.0,
+    }
+}
+
 /// Check whether the index has any `caller_id` data populated.
 ///
 /// Returns `false` for old indexes that were built before call graph support
@@ -45,7 +55,7 @@ pub fn callers(
         return Ok(Vec::new());
     }
 
-    let conf_threshold = min_confidence.unwrap_or(0.0);
+    let conf_threshold = sanitize_confidence(min_confidence);
 
     let mut results = Vec::new();
     let mut visited: HashSet<(String, String)> = HashSet::new();
@@ -170,7 +180,7 @@ pub fn callees(
         return Ok(Vec::new());
     }
 
-    let conf_threshold = min_confidence.unwrap_or(0.0);
+    let conf_threshold = sanitize_confidence(min_confidence);
 
     let mut results = Vec::new();
     let mut visited: HashSet<(String, String)> = HashSet::new();
@@ -256,7 +266,7 @@ pub fn callpath(
         return Ok(resolve_symbol_hop(conn, from)?.map(|hop| vec![hop]));
     }
 
-    let conf_threshold = min_confidence.unwrap_or(0.0);
+    let conf_threshold = sanitize_confidence(min_confidence);
 
     let mut visited: HashSet<String> = HashSet::new();
     let mut parent_map: HashMap<String, String> = HashMap::new();

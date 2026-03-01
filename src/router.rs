@@ -276,6 +276,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     col: r.col,
                     context: r.context.clone(),
                     caller_name: r.caller_name.clone(),
+                    confidence: r.confidence,
                 };
                 if fmt.format_reference(&out)? == BudgetStatus::Skipped {
                     truncated += 1;
@@ -3922,6 +3923,7 @@ mod tests {
             col: 8,
             context: "    processPayment(order);".into(),
             caller_name: None,
+            confidence: 0.85,
         };
 
         let mut buf = Vec::new();
@@ -3945,6 +3947,7 @@ mod tests {
             col: 8,
             context: "    processPayment(order);".into(),
             caller_name: None,
+            confidence: 0.85,
         };
 
         let mut buf = Vec::new();

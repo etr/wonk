@@ -832,6 +832,7 @@ impl McpServer {
                 col: r.col,
                 context: r.context.clone(),
                 caller_name: r.caller_name.clone(),
+                confidence: r.confidence,
             })
             .collect();
 
@@ -1125,7 +1126,16 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
+        let min_confidence: Option<f64> =
+            args.get("min_confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| {
+                    if c.is_nan() || c.is_infinite() {
+                        0.0
+                    } else {
+                        c.clamp(0.0, 1.0)
+                    }
+                });
 
         let results = match crate::callgraph::callers(conn, &name, depth, min_confidence) {
             Ok(r) => r,
@@ -1159,7 +1169,16 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
+        let min_confidence: Option<f64> =
+            args.get("min_confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| {
+                    if c.is_nan() || c.is_infinite() {
+                        0.0
+                    } else {
+                        c.clamp(0.0, 1.0)
+                    }
+                });
 
         let results = match crate::callgraph::callees(conn, &name, depth, min_confidence) {
             Ok(r) => r,
@@ -1206,7 +1225,16 @@ impl McpServer {
             );
         }
 
-        let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
+        let min_confidence: Option<f64> =
+            args.get("min_confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| {
+                    if c.is_nan() || c.is_infinite() {
+                        0.0
+                    } else {
+                        c.clamp(0.0, 1.0)
+                    }
+                });
 
         match crate::callgraph::callpath(conn, &from, &to, min_confidence) {
             Ok(Some(hops)) => {

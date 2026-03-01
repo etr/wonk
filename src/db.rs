@@ -62,7 +62,8 @@ CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_references_name ON "references"(name);
 CREATE INDEX IF NOT EXISTS idx_references_file ON "references"(file);
 CREATE INDEX IF NOT EXISTS idx_references_caller ON "references"(caller_id);
-CREATE INDEX IF NOT EXISTS idx_references_confidence ON "references"(confidence);
+CREATE INDEX IF NOT EXISTS idx_references_name_confidence ON "references"(name, confidence);
+CREATE INDEX IF NOT EXISTS idx_references_caller_confidence ON "references"(caller_id, confidence);
 
 -- File-level import tracking for dependency graph
 CREATE TABLE IF NOT EXISTS file_imports (
@@ -74,6 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_file_imports_source ON file_imports(source_file);
 CREATE INDEX IF NOT EXISTS idx_file_imports_target ON file_imports(import_path);
 "#;
 
+// Table populated by TASK-066 (inheritance extraction) and TASK-067 (pipeline wiring).
 const TYPE_EDGES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS type_edges (
     id INTEGER PRIMARY KEY,
@@ -237,12 +239,14 @@ pub fn ensure_confidence_column(conn: &Connection) -> Result<()> {
     if !has_column {
         conn.execute_batch("ALTER TABLE \"references\" ADD COLUMN confidence REAL DEFAULT 0.5;")
             .context("adding confidence column to references table")?;
-
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_references_confidence ON \"references\"(confidence);",
-        )
-        .context("creating confidence index")?;
     }
+
+    // Always run CREATE INDEX IF NOT EXISTS for idempotent migration.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_references_name_confidence ON \"references\"(name, confidence);
+         CREATE INDEX IF NOT EXISTS idx_references_caller_confidence ON \"references\"(caller_id, confidence);",
+    )
+    .context("creating confidence indexes")?;
 
     Ok(())
 }
@@ -499,6 +503,7 @@ mod tests {
         assert!(tables.contains(&"symbols_fts".to_string()));
         assert!(tables.contains(&"file_imports".to_string()));
         assert!(tables.contains(&"embeddings".to_string()));
+        assert!(tables.contains(&"type_edges".to_string()));
     }
 
     #[test]
@@ -1481,21 +1486,22 @@ mod tests {
     }
 
     #[test]
-    fn test_confidence_index_exists() {
+    fn test_confidence_indexes_exist() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("index.db");
         let conn = open(&db_path).unwrap();
 
         let indexes: Vec<String> = conn
             .prepare(
-                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_references_confidence'",
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_references_%confidence%'",
             )
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert_eq!(indexes.len(), 1);
+        assert!(indexes.contains(&"idx_references_name_confidence".to_string()));
+        assert!(indexes.contains(&"idx_references_caller_confidence".to_string()));
     }
 
     #[test]
