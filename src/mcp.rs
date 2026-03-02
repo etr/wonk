@@ -794,6 +794,38 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     }
                 }),
             },
+            Tool {
+                name: "wonk_context",
+                description: "Aggregate full context for a symbol: definition, categorized incoming references (callers, importers, type users), outgoing references (callees, imports), flow participation, and children (extending/implementing types). Returns one context block per matching symbol.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Symbol name to look up"
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Restrict to symbols in this file"
+                        },
+                        "kind": {
+                            "type": "string",
+                            "description": "Filter by symbol kind (e.g. function, class)"
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Minimum edge confidence (0.0-1.0) to include"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
         ]
     })
 }
@@ -859,6 +891,7 @@ impl McpServer {
             "wonk_flows" => self.tool_flows(call.arguments),
             "wonk_blast" => self.tool_blast(call.arguments),
             "wonk_changes" => self.tool_changes(call.arguments),
+            "wonk_context" => self.tool_context(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1646,6 +1679,47 @@ impl McpServer {
 
         format_result(&changes_out, format)
     }
+
+    fn tool_context(&self, args: Value) -> CallToolResult {
+        let name = match require_str(&args, "name") {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        if !crate::callgraph::has_caller_id_data(conn) {
+            return CallToolResult::error(
+                "index lacks call graph data; run wonk_init to re-index".into(),
+            );
+        }
+
+        let format = extract_format(&args);
+
+        let file = args.get("file").and_then(|v| v.as_str()).map(String::from);
+        let kind = args.get("kind").and_then(|v| v.as_str()).map(String::from);
+        let min_confidence = args.get("min_confidence").and_then(|v| v.as_f64());
+
+        let options = crate::context::ContextOptions {
+            file,
+            kind,
+            min_confidence,
+        };
+
+        match crate::context::symbol_context(conn, &name, &options) {
+            Ok(contexts) => {
+                let outputs: Vec<crate::output::SymbolContextOutput> = contexts
+                    .iter()
+                    .map(crate::output::SymbolContextOutput::from)
+                    .collect();
+                format_result(&outputs, format)
+            }
+            Err(e) => CallToolResult::error(format!("context query failed: {e}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1802,7 +1876,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
     }
 
     #[test]
@@ -2018,7 +2092,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
     }
 
     #[test]
@@ -2379,5 +2453,45 @@ mod tests {
             "missing 'min_confidence' property"
         );
         assert!(props.contains_key("format"), "missing 'format' property");
+    }
+
+    // -- wonk_context tests (TASK-073) ----------------------------------------
+
+    #[test]
+    fn tool_context_definition_exists() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_context");
+        assert!(tool.is_some(), "wonk_context tool should exist");
+    }
+
+    #[test]
+    fn tool_context_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_context").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("name"), "missing 'name' property");
+        assert!(props.contains_key("file"), "missing 'file' property");
+        assert!(props.contains_key("kind"), "missing 'kind' property");
+        assert!(
+            props.contains_key("min_confidence"),
+            "missing 'min_confidence' property"
+        );
+        assert!(props.contains_key("format"), "missing 'format' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("name")));
+    }
+
+    #[test]
+    fn tool_context_missing_name() {
+        let server = test_server();
+        let result = server.handle_tools_call(&serde_json::json!({
+            "name": "wonk_context",
+            "arguments": {}
+        }));
+        let call_result = &result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            call_result.contains("missing"),
+            "should report missing name parameter"
+        );
     }
 }

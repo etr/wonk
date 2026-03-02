@@ -660,6 +660,95 @@ pub struct ChangeAnalysis {
     pub changed_symbols: Vec<ChangedSymbol>,
 }
 
+// ---------------------------------------------------------------------------
+// Symbol context types (TASK-073)
+// ---------------------------------------------------------------------------
+
+/// A function/method that calls this symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCaller {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub file: String,
+    pub line: usize,
+}
+
+/// A file-scope type annotation reference (not inside a function body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextTypeUser {
+    pub file: String,
+    pub line: usize,
+    pub context: String,
+}
+
+/// A file that imports this symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextImporter {
+    pub file: String,
+}
+
+/// A symbol called within this function's body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCallee {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub file: String,
+    pub line: usize,
+}
+
+/// An import from this symbol's file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextImport {
+    pub path: String,
+}
+
+/// An execution flow that includes this symbol and the step index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFlowParticipation {
+    pub entry_point: String,
+    pub step_index: usize,
+}
+
+/// A child class/type extending or implementing this symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextChild {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub file: String,
+    pub line: usize,
+    pub relationship: String,
+}
+
+/// Incoming references to a symbol, categorized by type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingRefs {
+    pub callers: Vec<ContextCaller>,
+    pub importers: Vec<ContextImporter>,
+    pub type_users: Vec<ContextTypeUser>,
+}
+
+/// Outgoing references from a symbol, categorized by type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingRefs {
+    pub callees: Vec<ContextCallee>,
+    pub imports: Vec<ContextImport>,
+}
+
+/// Complete context for a single symbol: definition, references, flows, children.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolContext {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub file: String,
+    pub line: usize,
+    pub end_line: Option<usize>,
+    pub signature: String,
+    pub incoming: IncomingRefs,
+    pub outgoing: OutgoingRefs,
+    pub flows: Vec<ContextFlowParticipation>,
+    pub children: Vec<ContextChild>,
+}
+
 /// A single hop in a call path between two symbols, returned by `wonk callpath`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallPathHop {
@@ -1339,5 +1428,113 @@ mod tests {
         assert!(BlastRiskLevel::Low < BlastRiskLevel::Medium);
         assert!(BlastRiskLevel::Medium < BlastRiskLevel::High);
         assert!(BlastRiskLevel::High < BlastRiskLevel::Critical);
+    }
+
+    // -- SymbolContext tests (TASK-073) ---------------------------------------
+
+    #[test]
+    fn symbol_context_creation() {
+        let ctx = SymbolContext {
+            name: "processPayment".into(),
+            kind: SymbolKind::Function,
+            file: "src/billing.ts".into(),
+            line: 10,
+            end_line: Some(25),
+            signature: "function processPayment(amount: number)".into(),
+            incoming: IncomingRefs {
+                callers: vec![ContextCaller {
+                    name: "checkout".into(),
+                    kind: SymbolKind::Function,
+                    file: "src/checkout.ts".into(),
+                    line: 5,
+                }],
+                importers: vec![ContextImporter {
+                    file: "src/api.ts".into(),
+                }],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefs {
+                callees: vec![ContextCallee {
+                    name: "charge".into(),
+                    kind: SymbolKind::Function,
+                    file: "src/stripe.ts".into(),
+                    line: 20,
+                }],
+                imports: vec![ContextImport {
+                    path: "stripe".into(),
+                }],
+            },
+            flows: vec![ContextFlowParticipation {
+                entry_point: "handleRequest".into(),
+                step_index: 2,
+            }],
+            children: vec![],
+        };
+        assert_eq!(ctx.name, "processPayment");
+        assert_eq!(ctx.kind, SymbolKind::Function);
+        assert_eq!(ctx.incoming.callers.len(), 1);
+        assert_eq!(ctx.incoming.importers.len(), 1);
+        assert!(ctx.incoming.type_users.is_empty());
+        assert_eq!(ctx.outgoing.callees.len(), 1);
+        assert_eq!(ctx.outgoing.imports.len(), 1);
+        assert_eq!(ctx.flows.len(), 1);
+        assert!(ctx.children.is_empty());
+    }
+
+    #[test]
+    fn symbol_context_with_children() {
+        let ctx = SymbolContext {
+            name: "BaseHandler".into(),
+            kind: SymbolKind::Class,
+            file: "src/handler.ts".into(),
+            line: 1,
+            end_line: Some(50),
+            signature: "class BaseHandler".into(),
+            incoming: IncomingRefs {
+                callers: vec![],
+                importers: vec![],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefs {
+                callees: vec![],
+                imports: vec![],
+            },
+            flows: vec![],
+            children: vec![ContextChild {
+                name: "PaymentHandler".into(),
+                kind: SymbolKind::Class,
+                file: "src/payment_handler.ts".into(),
+                line: 5,
+                relationship: "extends".into(),
+            }],
+        };
+        assert_eq!(ctx.children.len(), 1);
+        assert_eq!(ctx.children[0].name, "PaymentHandler");
+        assert_eq!(ctx.children[0].relationship, "extends");
+    }
+
+    #[test]
+    fn symbol_context_equality() {
+        let ctx = SymbolContext {
+            name: "foo".into(),
+            kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 1,
+            end_line: None,
+            signature: "fn foo()".into(),
+            incoming: IncomingRefs {
+                callers: vec![],
+                importers: vec![],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefs {
+                callees: vec![],
+                imports: vec![],
+            },
+            flows: vec![],
+            children: vec![],
+        };
+        let b = ctx.clone();
+        assert_eq!(ctx, b);
     }
 }

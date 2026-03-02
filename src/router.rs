@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::cli::{Cli, Command, DaemonCommand, LsArgs, McpCommand, ReposCommand};
+use crate::cli::{Cli, Command, ContextArgs, DaemonCommand, LsArgs, McpCommand, ReposCommand};
 use crate::db;
 use crate::errors::DbError;
 #[cfg(test)]
@@ -1307,6 +1307,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Changes(args) => {
             dispatch_changes(args, &mut fmt, suppress)?;
         }
+        Command::Context(args) => {
+            dispatch_context(args, &mut fmt, suppress)?;
+        }
     }
     Ok(())
 }
@@ -1365,6 +1368,42 @@ fn dispatch_changes<W: io::Write>(
     )?;
 
     fmt.format_changes(&changes_out)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `wonk context` dispatch (TASK-073)
+// ---------------------------------------------------------------------------
+
+fn dispatch_context<W: io::Write>(
+    args: ContextArgs,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+) -> Result<()> {
+    let conn = match callgraph_conn(suppress) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    let options = crate::context::ContextOptions {
+        file: args.file,
+        kind: args.kind,
+        min_confidence: args.min_confidence,
+    };
+
+    let contexts = crate::context::symbol_context(&conn, &args.name, &options)?;
+
+    if contexts.is_empty() {
+        output::print_hint("no matching symbols found", suppress);
+        return Ok(());
+    }
+
+    let outputs: Vec<output::SymbolContextOutput> = contexts
+        .iter()
+        .map(output::SymbolContextOutput::from)
+        .collect();
+    fmt.format_context(&outputs)?;
+
     Ok(())
 }
 
@@ -1565,6 +1604,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Flows(_)
             | Command::Blast(_)
             | Command::Changes(_)
+            | Command::Context(_)
     )
 }
 
@@ -4936,6 +4976,20 @@ mod tests {
             base: None,
             blast: false,
             flows: false,
+            min_confidence: None,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    // -- Context tests (TASK-073) --------------------------------------------
+
+    #[test]
+    fn test_is_query_command_context() {
+        use crate::cli::ContextArgs;
+        let cmd = Command::Context(ContextArgs {
+            name: "processPayment".into(),
+            file: None,
+            kind: None,
             min_confidence: None,
         });
         assert!(is_query_command(&cmd));
