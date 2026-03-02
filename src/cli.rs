@@ -86,6 +86,9 @@ pub enum Command {
 
     /// Show a structural summary of a file or directory
     Summary(SummaryArgs),
+
+    /// Detect entry points and trace execution flows
+    Flows(FlowsArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -331,6 +334,28 @@ pub struct SummaryArgs {
     /// Include AI-generated description (requires embeddings)
     #[arg(long)]
     pub semantic: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct FlowsArgs {
+    /// Entry point name to trace (omit to list all detected entry points)
+    pub entry: Option<String>,
+
+    /// Restrict entry point detection to symbols in this file
+    #[arg(long)]
+    pub from: Option<String>,
+
+    /// Maximum BFS traversal depth (default: 10, max: 20)
+    #[arg(long, default_value_t = 10)]
+    pub depth: usize,
+
+    /// Maximum callees to follow per symbol (default: 4)
+    #[arg(long, default_value_t = 4)]
+    pub branching: usize,
+
+    /// Minimum confidence threshold (0.0-1.0) to filter callee edges
+    #[arg(long)]
+    pub min_confidence: Option<f64>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -885,6 +910,103 @@ mod tests {
                 assert_eq!(args.path, "src/");
             }
             _ => panic!("expected Command::Summary"),
+        }
+    }
+
+    // -- Flows tests ----------------------------------------------------------
+
+    #[test]
+    fn parse_flows_no_args() {
+        let cli = Cli::try_parse_from(["wonk", "flows"]).unwrap();
+        match cli.command {
+            Command::Flows(args) => {
+                assert!(args.entry.is_none());
+                assert!(args.from.is_none());
+                assert_eq!(args.depth, 10);
+                assert_eq!(args.branching, 4);
+                assert!(args.min_confidence.is_none());
+            }
+            _ => panic!("expected Command::Flows"),
+        }
+    }
+
+    #[test]
+    fn parse_flows_with_entry() {
+        let cli = Cli::try_parse_from(["wonk", "flows", "main"]).unwrap();
+        match cli.command {
+            Command::Flows(args) => {
+                assert_eq!(args.entry.as_deref(), Some("main"));
+            }
+            _ => panic!("expected Command::Flows"),
+        }
+    }
+
+    #[test]
+    fn parse_flows_with_from() {
+        let cli = Cli::try_parse_from(["wonk", "flows", "--from", "src/api.ts"]).unwrap();
+        match cli.command {
+            Command::Flows(args) => {
+                assert!(args.entry.is_none());
+                assert_eq!(args.from.as_deref(), Some("src/api.ts"));
+            }
+            _ => panic!("expected Command::Flows"),
+        }
+    }
+
+    #[test]
+    fn parse_flows_with_depth() {
+        let cli = Cli::try_parse_from(["wonk", "flows", "--depth", "5", "main"]).unwrap();
+        match cli.command {
+            Command::Flows(args) => {
+                assert_eq!(args.depth, 5);
+                assert_eq!(args.entry.as_deref(), Some("main"));
+            }
+            _ => panic!("expected Command::Flows"),
+        }
+    }
+
+    #[test]
+    fn parse_flows_with_branching() {
+        let cli = Cli::try_parse_from(["wonk", "flows", "--branching", "2", "main"]).unwrap();
+        match cli.command {
+            Command::Flows(args) => {
+                assert_eq!(args.branching, 2);
+            }
+            _ => panic!("expected Command::Flows"),
+        }
+    }
+
+    #[test]
+    fn parse_flows_with_min_confidence() {
+        let cli =
+            Cli::try_parse_from(["wonk", "flows", "--min-confidence", "0.8", "main"]).unwrap();
+        match cli.command {
+            Command::Flows(args) => {
+                assert_eq!(args.min_confidence, Some(0.8));
+            }
+            _ => panic!("expected Command::Flows"),
+        }
+    }
+
+    #[test]
+    fn parse_flows_with_global_format() {
+        let cli = Cli::try_parse_from(["wonk", "--format", "json", "flows", "main"]).unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Flows(args) => {
+                assert_eq!(args.entry.as_deref(), Some("main"));
+            }
+            _ => panic!("expected Command::Flows"),
+        }
+    }
+
+    #[test]
+    fn parse_flows_with_global_budget() {
+        let cli = Cli::try_parse_from(["wonk", "--budget", "500", "flows"]).unwrap();
+        assert_eq!(cli.budget, Some(500));
+        match cli.command {
+            Command::Flows(_) => {}
+            _ => panic!("expected Command::Flows"),
         }
     }
 }

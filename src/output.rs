@@ -360,6 +360,46 @@ pub struct CalleeOutput {
     pub confidence: f64,
 }
 
+/// A single step in an execution flow, for `wonk flows` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowStepOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    pub depth: usize,
+}
+
+/// A traced execution flow, for `wonk flows <entry>` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowOutput {
+    pub entry_point: FlowStepOutput,
+    pub steps: Vec<FlowStepOutput>,
+    pub step_count: usize,
+}
+
+impl From<&crate::types::FlowStep> for FlowStepOutput {
+    fn from(step: &crate::types::FlowStep) -> Self {
+        Self {
+            name: step.name.clone(),
+            kind: step.kind.to_string(),
+            file: step.file.clone(),
+            line: step.line,
+            depth: step.depth,
+        }
+    }
+}
+
+impl From<&crate::types::ExecutionFlow> for FlowOutput {
+    fn from(flow: &crate::types::ExecutionFlow) -> Self {
+        Self {
+            entry_point: FlowStepOutput::from(&flow.entry_point),
+            steps: flow.steps.iter().map(FlowStepOutput::from).collect(),
+            step_count: flow.step_count,
+        }
+    }
+}
+
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
 /// output. In grep mode the summary goes to stderr instead.
 #[derive(Debug, Clone, Serialize)]
@@ -1075,6 +1115,64 @@ impl<W: Write> Formatter<W> {
                 Self::render_summary(fmt, child, indent + 1)?;
             }
 
+            Ok(())
+        }
+    }
+
+    /// Format a single flow entry point (list mode).
+    pub fn format_flow_entry(&mut self, out: &FlowStepOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_flow_entry(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_flow_entry(fmt, &out))
+    }
+
+    /// Shared render logic for a flow entry point.
+    fn render_flow_entry<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &FlowStepOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&out.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(out.line)?;
+            fmt.write_sep()?;
+            writeln!(fmt.writer, "{} ({})", out.name, out.kind)
+        }
+    }
+
+    /// Format a traced execution flow.
+    pub fn format_flow(&mut self, out: &FlowOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_flow(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_flow(fmt, &out))
+    }
+
+    /// Shared render logic for a traced flow.
+    fn render_flow<W2: Write>(fmt: &mut Formatter<W2>, out: &FlowOutput) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            // Chain line: entry -> step1 -> step2 ...
+            let chain: Vec<&str> = out.steps.iter().map(|s| s.name.as_str()).collect();
+            writeln!(fmt.writer, "{}", chain.join(" -> "))?;
+            // Per-step details.
+            for step in &out.steps {
+                writeln!(
+                    fmt.writer,
+                    "  {} ({})\t{}:{}",
+                    step.name, step.kind, step.file, step.line
+                )?;
+            }
             Ok(())
         }
     }
@@ -3072,5 +3170,65 @@ mod tests {
         let rendered = render(OutputFormat::Grep, |fmt| fmt.format_summary(&out));
         // Child should be indented.
         assert!(rendered.contains("  Summary: src/lib.rs (file)"));
+    }
+
+    // -- FlowStepOutput / FlowOutput -----------------------------------------
+
+    fn make_flow_step(name: &str, depth: usize) -> FlowStepOutput {
+        FlowStepOutput {
+            name: name.into(),
+            kind: "function".into(),
+            file: format!("src/{name}.rs"),
+            line: depth * 10 + 1,
+            depth,
+        }
+    }
+
+    #[test]
+    fn flow_entry_grep_format() {
+        let step = make_flow_step("main", 0);
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_flow_entry(&step));
+        assert!(rendered.contains("src/main.rs"));
+        assert!(rendered.contains("main"));
+    }
+
+    #[test]
+    fn flow_entry_json_format() {
+        let step = make_flow_step("main", 0);
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_flow_entry(&step));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["name"], "main");
+        assert_eq!(v["kind"], "function");
+        assert_eq!(v["file"], "src/main.rs");
+        assert_eq!(v["depth"], 0);
+    }
+
+    #[test]
+    fn flow_grep_format() {
+        let entry = make_flow_step("main", 0);
+        let flow = FlowOutput {
+            entry_point: entry.clone(),
+            steps: vec![entry, make_flow_step("dispatch", 1)],
+            step_count: 2,
+        };
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_flow(&flow));
+        // Should show entry point and steps.
+        assert!(rendered.contains("main"));
+        assert!(rendered.contains("dispatch"));
+    }
+
+    #[test]
+    fn flow_json_format() {
+        let entry = make_flow_step("main", 0);
+        let flow = FlowOutput {
+            entry_point: entry.clone(),
+            steps: vec![entry, make_flow_step("dispatch", 1)],
+            step_count: 2,
+        };
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_flow(&flow));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["entry_point"]["name"], "main");
+        assert_eq!(v["step_count"], 2);
+        assert_eq!(v["steps"].as_array().unwrap().len(), 2);
     }
 }

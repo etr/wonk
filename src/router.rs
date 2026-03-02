@@ -17,9 +17,9 @@ use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
 use crate::output::{
-    self, BudgetStatus, CallPathHopOutput, CalleeOutput, CallerOutput, Formatter, LsSymbolEntry,
-    OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput, SignatureOutput,
-    SummaryOutput, SymbolOutput,
+    self, BudgetStatus, CallPathHopOutput, CalleeOutput, CallerOutput, FlowOutput, FlowStepOutput,
+    Formatter, LsSymbolEntry, OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput,
+    SignatureOutput, SummaryOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -1204,6 +1204,64 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let out = SummaryOutput::from_result(&result);
             fmt.format_summary(&out)?;
         }
+        Command::Flows(args) => {
+            let conn = match callgraph_conn(suppress) {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+
+            let (depth, clamped) = crate::flows::clamp_depth(args.depth);
+            if clamped {
+                output::print_hint(
+                    &format!(
+                        "depth {} exceeds cap; using max depth {}",
+                        args.depth,
+                        crate::flows::MAX_DEPTH,
+                    ),
+                    suppress,
+                );
+            }
+
+            let options = crate::flows::FlowOptions {
+                depth,
+                branching: args.branching,
+                min_confidence: args.min_confidence,
+                from_file: args.from.clone(),
+            };
+
+            if let Some(entry_name) = &args.entry {
+                // Trace mode: trace a specific entry point.
+                match crate::flows::trace_flow(&conn, entry_name, &options)? {
+                    Some(ref flow) => {
+                        let out = FlowOutput::from(flow);
+                        fmt.format_flow(&out)?;
+                    }
+                    None => {
+                        output::print_hint(
+                            "no flow found (entry point not found or flow too short)",
+                            suppress,
+                        );
+                    }
+                }
+            } else {
+                // List mode: detect all entry points.
+                let entries = crate::flows::detect_entry_points(&conn, &options)?;
+
+                if entries.is_empty() {
+                    output::print_hint("no entry points detected", suppress);
+                }
+
+                let mut truncated = 0usize;
+                for entry in &entries {
+                    let out = FlowStepOutput::from(entry);
+                    if fmt.format_flow_entry(&out)? == BudgetStatus::Skipped {
+                        truncated += 1;
+                    }
+                }
+
+                emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1280,6 +1338,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Callees(_)
             | Command::Callpath(_)
             | Command::Summary(_)
+            | Command::Flows(_)
     )
 }
 
@@ -4610,6 +4669,19 @@ mod tests {
         let cmd = Command::Callpath(CallpathArgs {
             from: "main".into(),
             to: "dispatch".into(),
+            min_confidence: None,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_flows() {
+        use crate::cli::FlowsArgs;
+        let cmd = Command::Flows(FlowsArgs {
+            entry: None,
+            from: None,
+            depth: 10,
+            branching: 4,
             min_confidence: None,
         });
         assert!(is_query_command(&cmd));

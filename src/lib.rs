@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod db;
 pub mod embedding;
 pub mod errors;
+pub mod flows;
 pub mod impact;
 pub mod indexer;
 pub mod llm;

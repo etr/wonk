@@ -661,6 +661,47 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     "required": ["path"]
                 }),
             },
+            Tool {
+                name: "wonk_flows",
+                description: "Detect entry points (functions/methods with no callers) and trace execution flows via BFS callee expansion. Without an entry parameter, lists all detected entry points. With an entry parameter, traces the full execution flow from that function.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entry": {
+                            "type": "string",
+                            "description": "Entry point function name to trace (omit to list all detected entry points)"
+                        },
+                        "from": {
+                            "type": "string",
+                            "description": "Restrict entry point detection to symbols in this file"
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "Maximum BFS traversal depth (default: 10, max: 20)",
+                            "default": 10
+                        },
+                        "branching": {
+                            "type": "integer",
+                            "description": "Maximum callees to follow per symbol (default: 4)",
+                            "default": 4
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Minimum edge confidence (0.0-1.0) to include in traversal"
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Limit output to approximately N tokens"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    }
+                }),
+            },
         ]
     })
 }
@@ -723,6 +764,7 @@ impl McpServer {
             "wonk_callees" => self.tool_callees(call.arguments),
             "wonk_callpath" => self.tool_callpath(call.arguments),
             "wonk_summary" => self.tool_summary(call.arguments),
+            "wonk_flows" => self.tool_flows(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1319,6 +1361,82 @@ impl McpServer {
         let out = SummaryOutput::from_result(&result);
         format_result(&out, format)
     }
+
+    fn tool_flows(&self, args: Value) -> CallToolResult {
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        if !crate::callgraph::has_caller_id_data(conn) {
+            return CallToolResult::error(
+                "index lacks call graph data; run wonk_init to re-index".into(),
+            );
+        }
+
+        let format = extract_format(&args);
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let depth_raw = args
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(crate::flows::DEFAULT_DEPTH as u64) as usize;
+        let (depth, _clamped) = crate::flows::clamp_depth(depth_raw);
+
+        let branching = args
+            .get("branching")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(crate::flows::DEFAULT_BRANCHING as u64) as usize;
+
+        let min_confidence: Option<f64> =
+            args.get("min_confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| {
+                    if c.is_nan() || c.is_infinite() {
+                        0.0
+                    } else {
+                        c.clamp(0.0, 1.0)
+                    }
+                });
+
+        let from_file = args.get("from").and_then(|v| v.as_str()).map(String::from);
+
+        let options = crate::flows::FlowOptions {
+            depth,
+            branching,
+            min_confidence,
+            from_file,
+        };
+
+        let entry = args.get("entry").and_then(|v| v.as_str());
+
+        if let Some(entry_name) = entry {
+            // Trace mode.
+            match crate::flows::trace_flow(conn, entry_name, &options) {
+                Ok(Some(ref flow)) => {
+                    let out = crate::output::FlowOutput::from(flow);
+                    format_result(&out, format)
+                }
+                Ok(None) => format_result(&serde_json::json!({"message": "no flow found"}), format),
+                Err(e) => CallToolResult::error(format!("flows query failed: {e}")),
+            }
+        } else {
+            // List mode: detect entry points.
+            match crate::flows::detect_entry_points(conn, &options) {
+                Ok(entries) => {
+                    let outputs: Vec<crate::output::FlowStepOutput> = entries
+                        .iter()
+                        .map(crate::output::FlowStepOutput::from)
+                        .collect();
+                    collect_with_budget(outputs, budget_limit, format)
+                }
+                Err(e) => CallToolResult::error(format!("flows query failed: {e}")),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1475,7 +1593,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 15);
     }
 
     #[test]
@@ -1691,7 +1809,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 15);
     }
 
     #[test]
@@ -1926,5 +2044,49 @@ mod tests {
         let result = server.handle_tools_call(&params);
         let is_error = result["isError"].as_bool().unwrap_or(false);
         assert!(is_error, "should error on missing path");
+    }
+
+    // -- wonk_flows tests -----------------------------------------------------
+
+    #[test]
+    fn tool_flows_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_flows").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("entry"), "missing 'entry' property");
+        assert!(props.contains_key("from"), "missing 'from' property");
+        assert!(props.contains_key("depth"), "missing 'depth' property");
+        assert!(
+            props.contains_key("branching"),
+            "missing 'branching' property"
+        );
+        assert!(
+            props.contains_key("min_confidence"),
+            "missing 'min_confidence' property"
+        );
+    }
+
+    #[test]
+    fn tool_flows_dispatches_correctly() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_flows",
+            "arguments": {"entry": "nonexistent_symbol_xyz"}
+        });
+        let result = server.handle_tools_call(&params);
+        // Should not panic; returns a result (possibly empty or error).
+        assert!(result.get("content").is_some() || result.get("isError").is_some());
+    }
+
+    #[test]
+    fn tool_flows_list_mode() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_flows",
+            "arguments": {}
+        });
+        let result = server.handle_tools_call(&params);
+        // List mode: should return a result (possibly empty list).
+        assert!(result.get("content").is_some() || result.get("isError").is_some());
     }
 }
