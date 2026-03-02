@@ -16,7 +16,8 @@ use crate::embedding;
 use crate::indexer;
 use crate::semantic;
 use crate::types::{
-    ChangeType, ChangedSymbol, ImpactResult, SemanticResult, Symbol, SymbolKind, SymbolRef,
+    ChangeAnalysis, ChangeScope, ChangeType, ChangedSymbol, ImpactResult, SemanticResult, Symbol,
+    SymbolKind, SymbolRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -164,15 +165,7 @@ pub fn detect_changed_symbols(
 /// Shells out to `git diff --name-only <commit>` and parses the output.
 /// Returns a clear error if git is not installed (relevant only for `--since`).
 pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<String>> {
-    // Validate commit reference to prevent git argument injection (CWE-88).
-    // Allow alphanumeric chars plus common git-ref characters: / _ . - @ ~ ^
-    if commit.is_empty()
-        || !commit
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/_.-@~^".contains(c))
-    {
-        bail!("invalid commit reference: {commit}");
-    }
+    validate_git_ref(commit)?;
 
     let output = Command::new("git")
         .args(["diff", "--name-only", commit])
@@ -196,6 +189,174 @@ pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<
     Ok(files)
 }
 
+/// Apply [`ChangeScope`] flags to a `git diff` command, validating refs.
+fn apply_scope_args(cmd: &mut Command, scope: &ChangeScope) -> Result<()> {
+    match scope {
+        ChangeScope::Unstaged => {} // default: working tree vs index
+        ChangeScope::Staged => {
+            cmd.arg("--cached");
+        }
+        ChangeScope::All => {
+            cmd.arg("HEAD");
+        }
+        ChangeScope::Compare(git_ref) => {
+            validate_git_ref(git_ref)?;
+            cmd.arg(git_ref.as_str());
+        }
+    }
+    Ok(())
+}
+
+/// Return the list of files changed according to the given [`ChangeScope`].
+///
+/// Maps each scope variant to the appropriate `git diff --name-only` invocation:
+/// - `Unstaged`: working tree vs index
+/// - `Staged`: index vs HEAD
+/// - `All`: working tree vs HEAD
+/// - `Compare(ref)`: working tree vs the given ref
+pub fn detect_scoped_files(scope: &ChangeScope, repo_root: &Path) -> Result<Vec<String>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("diff").arg("--name-only");
+    apply_scope_args(&mut cmd, scope)?;
+
+    let output = cmd
+        .current_dir(repo_root)
+        .output()
+        .context("failed to run git — is git installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files: Vec<String> = stdout
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect();
+
+    Ok(files)
+}
+
+/// Map diff hunk ranges to indexed symbols, returning `Modified` entries for
+/// any symbol whose `line..end_line` range overlaps a changed hunk.
+///
+/// This is a pure function: it does no I/O. Symbols without `end_line` are
+/// treated as single-line (line..line). Each symbol appears at most once even
+/// if it overlaps multiple hunks.
+pub fn map_hunks_to_symbols(
+    symbols: &[Symbol],
+    hunks: &[(usize, usize)],
+    file: &str,
+) -> Vec<ChangedSymbol> {
+    if hunks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+
+    for sym in symbols {
+        let sym_start = sym.line;
+        let sym_end = sym.end_line.unwrap_or(sym.line);
+
+        for &(hunk_start, hunk_end) in hunks {
+            // Overlap check: two ranges [a, b] and [c, d] overlap iff a <= d && c <= b
+            if sym_start <= hunk_end && hunk_start <= sym_end {
+                let key = (sym.name.clone(), sym.kind, sym.scope.clone());
+                if seen.insert(key) {
+                    result.push(ChangedSymbol {
+                        name: sym.name.clone(),
+                        kind: sym.kind,
+                        file: file.to_string(),
+                        line: sym.line,
+                        change_type: ChangeType::Modified,
+                    });
+                }
+                break; // Already matched this symbol, no need to check more hunks
+            }
+        }
+    }
+
+    result
+}
+
+/// Run `git diff --unified=0` for a single file under the given scope and
+/// return the parsed hunk ranges via [`parse_diff_hunks`].
+pub fn get_diff_hunks_for_file(
+    scope: &ChangeScope,
+    file: &str,
+    repo_root: &Path,
+) -> Result<Vec<(usize, usize)>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("diff").arg("--unified=0");
+    apply_scope_args(&mut cmd, scope)?;
+    cmd.arg("--").arg(file);
+
+    let output = cmd
+        .current_dir(repo_root)
+        .output()
+        .context("failed to run git diff for hunks")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed for file {file}: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_diff_hunks(&stdout))
+}
+
+/// Parse `git diff --unified=0` output and extract changed line ranges.
+///
+/// Looks for hunk headers of the form `@@ -old_start[,old_count] +new_start[,new_count] @@`
+/// and returns `(start_line, end_line)` pairs from the **new** (right) side.
+///
+/// - When `count` is omitted it defaults to 1.
+/// - When `count` is 0 the hunk represents a pure deletion and is skipped.
+pub fn parse_diff_hunks(diff_output: &str) -> Vec<(usize, usize)> {
+    let mut hunks = Vec::new();
+
+    for line in diff_output.lines() {
+        if !line.starts_with("@@") {
+            continue;
+        }
+
+        // Find the +start[,count] portion.
+        // Format: @@ -old_start[,old_count] +new_start[,new_count] @@
+        let plus_pos = match line.find('+') {
+            Some(p) => p,
+            None => continue,
+        };
+        let after_plus = &line[plus_pos + 1..];
+
+        // Find the end of the new-side range (terminated by space or @@).
+        let range_end = after_plus.find([' ', '@']).unwrap_or(after_plus.len());
+        let range_str = &after_plus[..range_end];
+
+        let (start, count) = if let Some(comma) = range_str.find(',') {
+            let s = range_str[..comma].parse::<usize>().unwrap_or(0);
+            let c = range_str[comma + 1..].parse::<usize>().unwrap_or(1);
+            (s, c)
+        } else {
+            let s = range_str.parse::<usize>().unwrap_or(0);
+            (s, 1) // count defaults to 1 when omitted
+        };
+
+        // count=0 means pure deletion on the new side, skip.
+        if count == 0 {
+            continue;
+        }
+
+        let end = start + count - 1;
+        hunks.push((start, end));
+    }
+
+    hunks
+}
+
 /// Parse file content with Tree-sitter and return extracted symbols.
 ///
 /// Shared helper for both [`detect_changed_symbols`] and [`parse_current_symbols`].
@@ -211,6 +372,21 @@ fn parse_file_to_symbols(file: &str, content: &str) -> Result<Vec<Symbol>> {
         .context("tree-sitter parse failed")?;
 
     Ok(indexer::extract_symbols(&tree, content, file, lang))
+}
+
+/// Validate a git ref string to prevent argument injection (CWE-88).
+///
+/// Allows alphanumeric chars plus common git-ref characters: `/ _ . - @ ~ ^`
+/// Rejects empty strings and anything containing disallowed characters.
+pub fn validate_git_ref(git_ref: &str) -> Result<()> {
+    if git_ref.is_empty()
+        || !git_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/_.-@~^".contains(c))
+    {
+        bail!("invalid git reference: {git_ref}");
+    }
+    Ok(())
 }
 
 /// Validate that a file path is safe: no `..` components and no absolute paths.
@@ -240,6 +416,67 @@ pub fn parse_current_symbols(file: &str, repo_root: &Path) -> Result<Vec<Symbol>
         std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
 
     parse_file_to_symbols(file, &content)
+}
+
+/// Detect all changed symbols across files for a given [`ChangeScope`].
+///
+/// This is the main public entry point for scoped change detection.  It:
+/// 1. Discovers changed files via `git diff --name-only` with the appropriate flags.
+/// 2. For each file that is a supported language:
+///    a. Gets diff hunks to identify line ranges that changed.
+///    b. Queries indexed symbols and maps hunks to overlapping symbols (Modified).
+///    c. Runs Tree-sitter re-parse via [`detect_changed_symbols`] for Added/Removed.
+///    d. Merges results with dedup (Tree-sitter results take priority).
+/// 3. Returns a [`ChangeAnalysis`] with all changed symbols.
+pub fn detect_changes(
+    conn: &Connection,
+    scope: &ChangeScope,
+    repo_root: &Path,
+) -> Result<ChangeAnalysis> {
+    let changed_files = detect_scoped_files(scope, repo_root)?;
+
+    let mut all_changes: Vec<ChangedSymbol> = Vec::new();
+
+    for file in &changed_files {
+        // Skip files we can't parse (non-supported languages).
+        if indexer::detect_language(Path::new(file)).is_none() {
+            continue;
+        }
+
+        // Step 1: Hunk-based detection (Modified symbols).
+        let hunks = get_diff_hunks_for_file(scope, file, repo_root).unwrap_or_default();
+        let indexed_symbols = query_indexed_symbols(conn, file).unwrap_or_default();
+        let hunk_modified = map_hunks_to_symbols(&indexed_symbols, &hunks, file);
+
+        // Step 2: Tree-sitter based detection (Added/Removed/Modified via signature diff).
+        let ts_changes = detect_changed_symbols(conn, file, repo_root).unwrap_or_default();
+
+        // Step 3: Merge with dedup. Tree-sitter results take priority because they
+        // have more precise change classification (signature-based Modified vs
+        // hunk-overlap Modified, plus Added/Removed).
+        let mut seen: HashSet<(String, SymbolKind, Option<String>)> = HashSet::new();
+
+        // Add tree-sitter results first (they have priority).
+        for cs in &ts_changes {
+            let key = (cs.name.clone(), cs.kind, None); // scope not in ChangedSymbol
+            if seen.insert(key) {
+                all_changes.push(cs.clone());
+            }
+        }
+
+        // Add hunk-based Modified that weren't already covered by tree-sitter.
+        for cs in &hunk_modified {
+            let key = (cs.name.clone(), cs.kind, None);
+            if seen.insert(key) {
+                all_changes.push(cs.clone());
+            }
+        }
+    }
+
+    Ok(ChangeAnalysis {
+        scope: scope.clone(),
+        changed_symbols: all_changes,
+    })
 }
 
 /// Build [`ImpactResult`] entries from semantic search results, excluding
@@ -565,6 +802,39 @@ mod tests {
         assert!(err_msg.contains("path escapes repository root"));
     }
 
+    // -- validate_git_ref tests ------------------------------------------------
+
+    #[test]
+    fn validate_git_ref_accepts_valid_refs() {
+        assert!(validate_git_ref("HEAD").is_ok());
+        assert!(validate_git_ref("main").is_ok());
+        assert!(validate_git_ref("origin/main").is_ok());
+        assert!(validate_git_ref("v1.0.0").is_ok());
+        assert!(validate_git_ref("HEAD~3").is_ok());
+        assert!(validate_git_ref("HEAD^2").is_ok());
+        assert!(validate_git_ref("feature/my-branch").is_ok());
+        assert!(validate_git_ref("abc123").is_ok());
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_empty() {
+        assert!(validate_git_ref("").is_err());
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_flag_injection() {
+        let result = validate_git_ref("--upload-pack=evil");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("invalid git reference"));
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_special_characters() {
+        assert!(validate_git_ref("HEAD:../../etc/passwd").is_err());
+        assert!(validate_git_ref("ref;rm -rf /").is_err());
+    }
+
     #[test]
     fn git_diff_rejects_empty_commit() {
         let dir = TempDir::new().unwrap();
@@ -654,8 +924,8 @@ impl Bar {
         assert!(result.is_err(), "flag-shaped commit ref should be rejected");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("invalid commit reference"),
-            "error should mention invalid commit reference"
+            err_msg.contains("invalid git reference"),
+            "error should mention invalid git reference"
         );
     }
 
@@ -985,5 +1255,662 @@ impl Bar {
 
         let files = detect_changed_files_since("HEAD", root).unwrap();
         assert!(files.is_empty(), "no changes since HEAD");
+    }
+
+    // -- detect_scoped_files tests ---------------------------------------------
+
+    /// Helper: create a git repo with initial commit and return (TempDir, root).
+    fn make_git_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn detect_scoped_files_unstaged() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_repo();
+        let root = dir.path();
+
+        // Modify a tracked file without staging
+        fs::write(root.join("a.rs"), "fn a() { modified }\n").unwrap();
+
+        let files = detect_scoped_files(&ChangeScope::Unstaged, root).unwrap();
+        assert!(
+            files.contains(&"a.rs".to_string()),
+            "unstaged changes should show modified file"
+        );
+    }
+
+    #[test]
+    fn detect_scoped_files_staged() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_repo();
+        let root = dir.path();
+
+        // Stage a new file
+        fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "b.rs"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let files = detect_scoped_files(&ChangeScope::Staged, root).unwrap();
+        assert!(
+            files.contains(&"b.rs".to_string()),
+            "staged changes should show added file"
+        );
+
+        // Unstaged should NOT contain b.rs (it's staged)
+        let unstaged = detect_scoped_files(&ChangeScope::Unstaged, root).unwrap();
+        assert!(
+            !unstaged.contains(&"b.rs".to_string()),
+            "staged file should not appear in unstaged scope"
+        );
+    }
+
+    #[test]
+    fn detect_scoped_files_all() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_repo();
+        let root = dir.path();
+
+        // Stage one change, leave another unstaged
+        fs::write(root.join("a.rs"), "fn a() { modified }\n").unwrap();
+        fs::write(root.join("c.rs"), "fn c() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "c.rs"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let files = detect_scoped_files(&ChangeScope::All, root).unwrap();
+        assert!(
+            files.contains(&"a.rs".to_string()),
+            "all scope should include unstaged changes"
+        );
+        assert!(
+            files.contains(&"c.rs".to_string()),
+            "all scope should include staged changes"
+        );
+    }
+
+    #[test]
+    fn detect_scoped_files_compare() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_repo();
+        let root = dir.path();
+
+        // Get commit hash
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+        // Make and commit changes
+        fs::write(root.join("a.rs"), "fn a() { v2 }\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "v2"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let files = detect_scoped_files(&ChangeScope::Compare(commit), root).unwrap();
+        assert!(
+            files.contains(&"a.rs".to_string()),
+            "compare scope should show files changed since ref"
+        );
+    }
+
+    // -- parse_diff_hunks tests -----------------------------------------------
+
+    #[test]
+    fn parse_diff_hunks_single_line_change() {
+        let diff = "@@ -5,1 +5,1 @@ fn foo()\n";
+        let hunks = parse_diff_hunks(diff);
+        assert_eq!(hunks, vec![(5, 5)]);
+    }
+
+    #[test]
+    fn parse_diff_hunks_multi_line_change() {
+        let diff = "@@ -10,3 +10,5 @@ fn bar()\n";
+        let hunks = parse_diff_hunks(diff);
+        // +10,5 means lines 10 through 14
+        assert_eq!(hunks, vec![(10, 14)]);
+    }
+
+    #[test]
+    fn parse_diff_hunks_no_count_defaults_to_one() {
+        // When count is omitted, it defaults to 1
+        let diff = "@@ -1 +1 @@\n";
+        let hunks = parse_diff_hunks(diff);
+        assert_eq!(hunks, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn parse_diff_hunks_deletion_only_skipped() {
+        // count=0 on the new side means pure deletion, no new lines
+        let diff = "@@ -5,3 +5,0 @@ fn deleted()\n";
+        let hunks = parse_diff_hunks(diff);
+        assert!(hunks.is_empty(), "pure deletions should be skipped");
+    }
+
+    #[test]
+    fn parse_diff_hunks_multiple_hunks() {
+        let diff = "\
+diff --git a/foo.rs b/foo.rs
+index 1234..5678 100644
+--- a/foo.rs
++++ b/foo.rs
+@@ -3,1 +3,2 @@ fn one()
++added line
+@@ -10,2 +11,3 @@ fn two()
++another added
+";
+        let hunks = parse_diff_hunks(diff);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0], (3, 4)); // +3,2
+        assert_eq!(hunks[1], (11, 13)); // +11,3
+    }
+
+    #[test]
+    fn parse_diff_hunks_empty_input() {
+        let hunks = parse_diff_hunks("");
+        assert!(hunks.is_empty());
+    }
+
+    #[test]
+    fn parse_diff_hunks_addition_at_end() {
+        // Adding lines at the end of a file
+        let diff = "@@ -0,0 +1,3 @@\n";
+        let hunks = parse_diff_hunks(diff);
+        assert_eq!(hunks, vec![(1, 3)]);
+    }
+
+    // -- map_hunks_to_symbols tests -------------------------------------------
+
+    #[test]
+    fn map_hunks_no_overlap() {
+        let symbols = vec![Symbol {
+            name: "foo".into(),
+            kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 10,
+            col: 0,
+            end_line: Some(15),
+            scope: None,
+            signature: "fn foo()".into(),
+            language: "Rust".into(),
+        }];
+
+        // Hunk is on lines 1-5, symbol is on lines 10-15
+        let hunks = vec![(1, 5)];
+        let result = map_hunks_to_symbols(&symbols, &hunks, "a.rs");
+        assert!(
+            result.is_empty(),
+            "non-overlapping hunk should produce no matches"
+        );
+    }
+
+    #[test]
+    fn map_hunks_full_overlap() {
+        let symbols = vec![Symbol {
+            name: "bar".into(),
+            kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 5,
+            col: 0,
+            end_line: Some(10),
+            scope: None,
+            signature: "fn bar()".into(),
+            language: "Rust".into(),
+        }];
+
+        // Hunk covers lines 6-8, inside symbol 5-10
+        let hunks = vec![(6, 8)];
+        let result = map_hunks_to_symbols(&symbols, &hunks, "a.rs");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "bar");
+        assert_eq!(result[0].change_type, ChangeType::Modified);
+    }
+
+    #[test]
+    fn map_hunks_partial_overlap_start() {
+        let symbols = vec![Symbol {
+            name: "baz".into(),
+            kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 5,
+            col: 0,
+            end_line: Some(10),
+            scope: None,
+            signature: "fn baz()".into(),
+            language: "Rust".into(),
+        }];
+
+        // Hunk starts before symbol, ends inside it
+        let hunks = vec![(3, 6)];
+        let result = map_hunks_to_symbols(&symbols, &hunks, "a.rs");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "baz");
+    }
+
+    #[test]
+    fn map_hunks_symbol_without_end_line() {
+        let symbols = vec![Symbol {
+            name: "const_val".into(),
+            kind: SymbolKind::Constant,
+            file: "a.rs".into(),
+            line: 3,
+            col: 0,
+            end_line: None, // single-line symbol
+            scope: None,
+            signature: "const VAL: i32 = 42".into(),
+            language: "Rust".into(),
+        }];
+
+        // Hunk covers line 3
+        let hunks = vec![(3, 3)];
+        let result = map_hunks_to_symbols(&symbols, &hunks, "a.rs");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "const_val");
+    }
+
+    #[test]
+    fn map_hunks_multiple_symbols() {
+        let symbols = vec![
+            Symbol {
+                name: "alpha".into(),
+                kind: SymbolKind::Function,
+                file: "a.rs".into(),
+                line: 1,
+                col: 0,
+                end_line: Some(5),
+                scope: None,
+                signature: "fn alpha()".into(),
+                language: "Rust".into(),
+            },
+            Symbol {
+                name: "beta".into(),
+                kind: SymbolKind::Function,
+                file: "a.rs".into(),
+                line: 7,
+                col: 0,
+                end_line: Some(12),
+                scope: None,
+                signature: "fn beta()".into(),
+                language: "Rust".into(),
+            },
+            Symbol {
+                name: "gamma".into(),
+                kind: SymbolKind::Function,
+                file: "a.rs".into(),
+                line: 14,
+                col: 0,
+                end_line: Some(20),
+                scope: None,
+                signature: "fn gamma()".into(),
+                language: "Rust".into(),
+            },
+        ];
+
+        // Hunk covers lines 3-9, overlapping alpha (1-5) and beta (7-12)
+        let hunks = vec![(3, 9)];
+        let result = map_hunks_to_symbols(&symbols, &hunks, "a.rs");
+        let names: Vec<&str> = result.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(!names.contains(&"gamma"), "gamma should not overlap");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn map_hunks_no_duplicate_symbols() {
+        let symbols = vec![Symbol {
+            name: "foo".into(),
+            kind: SymbolKind::Function,
+            file: "a.rs".into(),
+            line: 1,
+            col: 0,
+            end_line: Some(10),
+            scope: None,
+            signature: "fn foo()".into(),
+            language: "Rust".into(),
+        }];
+
+        // Two hunks both overlap the same symbol
+        let hunks = vec![(2, 3), (8, 9)];
+        let result = map_hunks_to_symbols(&symbols, &hunks, "a.rs");
+        assert_eq!(result.len(), 1, "should not duplicate symbol");
+    }
+
+    // -- get_diff_hunks_for_file tests ----------------------------------------
+
+    #[test]
+    fn get_diff_hunks_for_file_unstaged() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_repo();
+        let root = dir.path();
+
+        // Modify a tracked file without staging
+        fs::write(root.join("a.rs"), "fn a() { modified }\n").unwrap();
+
+        let hunks = get_diff_hunks_for_file(&ChangeScope::Unstaged, "a.rs", root).unwrap();
+        assert!(!hunks.is_empty(), "should detect hunks in modified file");
+        // The change is on line 1
+        assert_eq!(hunks[0].0, 1);
+    }
+
+    #[test]
+    fn get_diff_hunks_for_file_staged() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_repo();
+        let root = dir.path();
+
+        // Modify and stage
+        fs::write(root.join("a.rs"), "fn a() { staged }\n").unwrap();
+        Command::new("git")
+            .args(["add", "a.rs"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let hunks = get_diff_hunks_for_file(&ChangeScope::Staged, "a.rs", root).unwrap();
+        assert!(!hunks.is_empty(), "should detect hunks in staged file");
+    }
+
+    #[test]
+    fn get_diff_hunks_for_file_no_changes() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_repo();
+        let root = dir.path();
+
+        // No changes to a.rs
+        let hunks = get_diff_hunks_for_file(&ChangeScope::Unstaged, "a.rs", root).unwrap();
+        assert!(hunks.is_empty(), "unchanged file should have no hunks");
+    }
+
+    #[test]
+    fn detect_scoped_files_compare_invalid_ref() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_repo();
+        let root = dir.path();
+
+        let result = detect_scoped_files(&ChangeScope::Compare("--evil-flag".into()), root);
+        assert!(result.is_err(), "invalid ref should produce error");
+    }
+
+    // -- detect_changes tests -------------------------------------------------
+
+    /// Helper: create a git repo with indexed Rust source and return (TempDir, Connection).
+    fn make_git_indexed_repo(source: &str) -> (TempDir, Connection) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Init git repo
+        Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        // Create source file
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), source).unwrap();
+
+        // Initial commit
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        // Build the wonk index
+        pipeline::build_index(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn detect_changes_unstaged_modified() {
+        if !git_available() {
+            return;
+        }
+        let source = "fn hello() -> i32 { 42 }\nfn world() { }\n";
+        let (dir, conn) = make_git_indexed_repo(source);
+        let root = dir.path();
+
+        // Modify hello's body (unstaged)
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn hello() -> i32 { 99 }\nfn world() { }\n",
+        )
+        .unwrap();
+
+        let analysis = detect_changes(&conn, &ChangeScope::Unstaged, root).unwrap();
+        assert_eq!(analysis.scope, ChangeScope::Unstaged);
+
+        // hello should be detected as Modified (hunk overlaps its line range)
+        let modified: Vec<&ChangedSymbol> = analysis
+            .changed_symbols
+            .iter()
+            .filter(|c| c.change_type == ChangeType::Modified)
+            .collect();
+        let names: Vec<&str> = modified.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"hello"),
+            "hello should be modified, got: {:?}",
+            analysis.changed_symbols
+        );
+
+        // world should NOT appear (unchanged)
+        let all_names: Vec<&str> = analysis
+            .changed_symbols
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            !all_names.contains(&"world"),
+            "world should not be in changes"
+        );
+    }
+
+    #[test]
+    fn detect_changes_staged_added_symbol() {
+        if !git_available() {
+            return;
+        }
+        let source = "fn existing() { }\n";
+        let (dir, conn) = make_git_indexed_repo(source);
+        let root = dir.path();
+
+        // Add a new function and stage it
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn existing() { }\nfn brand_new() { }\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["add", "src/lib.rs"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let analysis = detect_changes(&conn, &ChangeScope::Staged, root).unwrap();
+        assert_eq!(analysis.scope, ChangeScope::Staged);
+
+        // brand_new should be Added (tree-sitter detect)
+        let added: Vec<&str> = analysis
+            .changed_symbols
+            .iter()
+            .filter(|c| c.change_type == ChangeType::Added)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            added.contains(&"brand_new"),
+            "new function should be detected as Added, got: {:?}",
+            analysis.changed_symbols
+        );
+    }
+
+    #[test]
+    fn detect_changes_compare_ref() {
+        if !git_available() {
+            return;
+        }
+        let source = "fn original() { }\n";
+        let (dir, conn) = make_git_indexed_repo(source);
+        let root = dir.path();
+
+        // Get current commit
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let base_commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+        // Make a new commit with changes
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn original() { changed }\nfn added() { }\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "v2"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let analysis =
+            detect_changes(&conn, &ChangeScope::Compare(base_commit.clone()), root).unwrap();
+        assert_eq!(analysis.scope, ChangeScope::Compare(base_commit));
+
+        let names: Vec<&str> = analysis
+            .changed_symbols
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"original") || names.contains(&"added"),
+            "should detect changes against base commit, got: {:?}",
+            analysis.changed_symbols
+        );
+    }
+
+    #[test]
+    fn detect_changes_no_changes() {
+        if !git_available() {
+            return;
+        }
+        let source = "fn unchanged() { }\n";
+        let (dir, conn) = make_git_indexed_repo(source);
+        let root = dir.path();
+
+        // No modifications
+        let analysis = detect_changes(&conn, &ChangeScope::Unstaged, root).unwrap();
+        assert!(
+            analysis.changed_symbols.is_empty(),
+            "no changes should produce empty result"
+        );
+    }
+
+    #[test]
+    fn detect_changes_removed_symbol() {
+        if !git_available() {
+            return;
+        }
+        let source = "fn keep_me() { }\nfn remove_me() { }\n";
+        let (dir, conn) = make_git_indexed_repo(source);
+        let root = dir.path();
+
+        // Remove the second function (unstaged)
+        fs::write(root.join("src/lib.rs"), "fn keep_me() { }\n").unwrap();
+
+        let analysis = detect_changes(&conn, &ChangeScope::Unstaged, root).unwrap();
+
+        let removed: Vec<&str> = analysis
+            .changed_symbols
+            .iter()
+            .filter(|c| c.change_type == ChangeType::Removed)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"remove_me"),
+            "remove_me should be detected as Removed, got: {:?}",
+            analysis.changed_symbols
+        );
     }
 }
