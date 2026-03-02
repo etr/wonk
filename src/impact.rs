@@ -309,6 +309,30 @@ pub fn get_diff_hunks_for_file(
     Ok(parse_diff_hunks(&stdout))
 }
 
+/// Parse a single hunk header and return `(start, end)` for the new side,
+/// or `None` if the hunk is a pure deletion (count=0).
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    let plus_pos = line.find('+')?;
+    let after_plus = &line[plus_pos + 1..];
+    let range_end = after_plus.find([' ', '@']).unwrap_or(after_plus.len());
+    let range_str = &after_plus[..range_end];
+
+    let (start, count) = if let Some(comma) = range_str.find(',') {
+        let s = range_str[..comma].parse::<usize>().unwrap_or(0);
+        let c = range_str[comma + 1..].parse::<usize>().unwrap_or(1);
+        (s, c)
+    } else {
+        let s = range_str.parse::<usize>().unwrap_or(0);
+        (s, 1)
+    };
+
+    if count == 0 {
+        return None;
+    }
+
+    Some((start, start + count - 1))
+}
+
 /// Parse `git diff --unified=0` output and extract changed line ranges.
 ///
 /// Looks for hunk headers of the form `@@ -old_start[,old_count] +new_start[,new_count] @@`
@@ -317,44 +341,134 @@ pub fn get_diff_hunks_for_file(
 /// - When `count` is omitted it defaults to 1.
 /// - When `count` is 0 the hunk represents a pure deletion and is skipped.
 pub fn parse_diff_hunks(diff_output: &str) -> Vec<(usize, usize)> {
-    let mut hunks = Vec::new();
+    diff_output
+        .lines()
+        .filter(|line| line.starts_with("@@"))
+        .filter_map(parse_hunk_header)
+        .collect()
+}
+
+/// Parse multi-file `git diff --unified=0` output into per-file hunk maps.
+///
+/// Returns a `HashMap<String, Vec<(usize, usize)>>` keyed by file path (from
+/// `diff --git a/... b/...` headers). This allows a single git subprocess to
+/// provide all hunk data for all changed files.
+fn parse_all_diff_hunks(diff_output: &str) -> HashMap<String, Vec<(usize, usize)>> {
+    let mut result: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut current_file: Option<String> = None;
 
     for line in diff_output.lines() {
-        if !line.starts_with("@@") {
-            continue;
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            // Extract the b/ path: "diff --git a/foo b/foo"
+            if let Some(b_pos) = rest.find(" b/") {
+                current_file = Some(rest[b_pos + 3..].to_string());
+            }
+        } else if line.starts_with("@@")
+            && let (Some(file), Some(hunk)) = (&current_file, parse_hunk_header(line))
+        {
+            result.entry(file.clone()).or_default().push(hunk);
         }
-
-        // Find the +start[,count] portion.
-        // Format: @@ -old_start[,old_count] +new_start[,new_count] @@
-        let plus_pos = match line.find('+') {
-            Some(p) => p,
-            None => continue,
-        };
-        let after_plus = &line[plus_pos + 1..];
-
-        // Find the end of the new-side range (terminated by space or @@).
-        let range_end = after_plus.find([' ', '@']).unwrap_or(after_plus.len());
-        let range_str = &after_plus[..range_end];
-
-        let (start, count) = if let Some(comma) = range_str.find(',') {
-            let s = range_str[..comma].parse::<usize>().unwrap_or(0);
-            let c = range_str[comma + 1..].parse::<usize>().unwrap_or(1);
-            (s, c)
-        } else {
-            let s = range_str.parse::<usize>().unwrap_or(0);
-            (s, 1) // count defaults to 1 when omitted
-        };
-
-        // count=0 means pure deletion on the new side, skip.
-        if count == 0 {
-            continue;
-        }
-
-        let end = start + count - 1;
-        hunks.push((start, end));
     }
 
-    hunks
+    result
+}
+
+/// Run a single `git diff --unified=0` for all files under the given scope and
+/// return per-file hunk maps via [`parse_all_diff_hunks`].
+fn get_all_diff_hunks(
+    scope: &ChangeScope,
+    repo_root: &Path,
+) -> Result<HashMap<String, Vec<(usize, usize)>>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("diff").arg("--unified=0");
+    apply_scope_args(&mut cmd, scope)?;
+
+    let output = cmd
+        .current_dir(repo_root)
+        .output()
+        .context("failed to run git diff for hunks")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_all_diff_hunks(&stdout))
+}
+
+/// Detect changed symbols using pre-loaded indexed symbols and file content.
+///
+/// Internal variant of [`detect_changed_symbols`] that avoids redundant SQLite
+/// queries and disk reads when the caller has already loaded this data.
+fn detect_changed_symbols_with(
+    conn: &Connection,
+    file: &str,
+    repo_root: &Path,
+    indexed_symbols: &[Symbol],
+) -> Result<Vec<ChangedSymbol>> {
+    let abs_path = repo_root.join(file);
+
+    // If file doesn't exist on disk, all indexed symbols are Removed.
+    if !abs_path.exists() {
+        return Ok(indexed_symbols
+            .iter()
+            .map(|s| make_changed(s, ChangeType::Removed))
+            .collect());
+    }
+
+    let content_str =
+        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
+
+    // Fast path: compare content hash against stored hash.
+    let current_hash = file_content_hash(content_str.as_bytes());
+    let stored_hash: Option<String> = conn
+        .query_row(
+            "SELECT hash FROM files WHERE path = ?1",
+            rusqlite::params![file],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if stored_hash.as_deref() == Some(current_hash.as_str()) {
+        return Ok(Vec::new());
+    }
+
+    let current_symbols = parse_file_to_symbols(file, &content_str)?;
+
+    // If file not in index at all, all current symbols are Added.
+    if stored_hash.is_none() && indexed_symbols.is_empty() {
+        return Ok(current_symbols
+            .iter()
+            .map(|s| make_changed(s, ChangeType::Added))
+            .collect());
+    }
+
+    // Build lookup maps by identity key.
+    let current_map: HashMap<SymbolKey, &Symbol> =
+        current_symbols.iter().map(|s| (symbol_key(s), s)).collect();
+    let indexed_map: HashMap<SymbolKey, &Symbol> =
+        indexed_symbols.iter().map(|s| (symbol_key(s), s)).collect();
+
+    let mut changes = Vec::new();
+
+    for (key, sym) in &current_map {
+        if let Some(indexed_sym) = indexed_map.get(key) {
+            if sym.signature != indexed_sym.signature {
+                changes.push(make_changed(sym, ChangeType::Modified));
+            }
+        } else {
+            changes.push(make_changed(sym, ChangeType::Added));
+        }
+    }
+
+    for (key, sym) in &indexed_map {
+        if !current_map.contains_key(key) {
+            changes.push(make_changed(sym, ChangeType::Removed));
+        }
+    }
+
+    Ok(changes)
 }
 
 /// Parse file content with Tree-sitter and return extracted symbols.
@@ -422,18 +536,29 @@ pub fn parse_current_symbols(file: &str, repo_root: &Path) -> Result<Vec<Symbol>
 ///
 /// This is the main public entry point for scoped change detection.  It:
 /// 1. Discovers changed files via `git diff --name-only` with the appropriate flags.
-/// 2. For each file that is a supported language:
-///    a. Gets diff hunks to identify line ranges that changed.
-///    b. Queries indexed symbols and maps hunks to overlapping symbols (Modified).
-///    c. Runs Tree-sitter re-parse via [`detect_changed_symbols`] for Added/Removed.
-///    d. Merges results with dedup (Tree-sitter results take priority).
-/// 3. Returns a [`ChangeAnalysis`] with all changed symbols.
+/// 2. Fetches all diff hunks in a single `git diff --unified=0` subprocess.
+/// 3. For each file that is a supported language:
+///    - Queries indexed symbols once and shares them for both hunk mapping
+///      and tree-sitter comparison (avoids duplicate SQLite queries).
+///    - Maps hunks to overlapping symbols (Modified).
+///    - Runs Tree-sitter re-parse for Added/Removed/signature-Modified.
+///    - Merges results with dedup (Tree-sitter results take priority).
+/// 4. Returns a [`ChangeAnalysis`] with all changed symbols.
+///
+/// Per-file errors (git diff, SQLite query, tree-sitter parse) are logged to
+/// stderr and the file is skipped rather than aborting the entire analysis.
 pub fn detect_changes(
     conn: &Connection,
     scope: &ChangeScope,
     repo_root: &Path,
 ) -> Result<ChangeAnalysis> {
     let changed_files = detect_scoped_files(scope, repo_root)?;
+
+    // Single git subprocess for all hunks across all files.
+    let all_hunks = get_all_diff_hunks(scope, repo_root).unwrap_or_else(|e| {
+        eprintln!("wonk: warning: failed to get diff hunks: {e}");
+        HashMap::new()
+    });
 
     let mut all_changes: Vec<ChangedSymbol> = Vec::new();
 
@@ -443,31 +568,42 @@ pub fn detect_changes(
             continue;
         }
 
+        // Query indexed symbols once for both hunk mapping and tree-sitter comparison.
+        let indexed_symbols = match query_indexed_symbols(conn, file) {
+            Ok(syms) => syms,
+            Err(e) => {
+                eprintln!("wonk: warning: failed to query symbols for {file}: {e}");
+                continue;
+            }
+        };
+
         // Step 1: Hunk-based detection (Modified symbols).
-        let hunks = get_diff_hunks_for_file(scope, file, repo_root).unwrap_or_default();
-        let indexed_symbols = query_indexed_symbols(conn, file).unwrap_or_default();
+        let hunks = all_hunks.get(file.as_str()).cloned().unwrap_or_default();
         let hunk_modified = map_hunks_to_symbols(&indexed_symbols, &hunks, file);
 
-        // Step 2: Tree-sitter based detection (Added/Removed/Modified via signature diff).
-        let ts_changes = detect_changed_symbols(conn, file, repo_root).unwrap_or_default();
+        // Step 2: Tree-sitter based detection (Added/Removed/Modified via signature
+        // diff), reusing the already-loaded indexed symbols.
+        let ts_changes = detect_changed_symbols_with(conn, file, repo_root, &indexed_symbols)
+            .unwrap_or_else(|e| {
+                eprintln!("wonk: warning: failed to detect changes for {file}: {e}");
+                Vec::new()
+            });
 
         // Step 3: Merge with dedup. Tree-sitter results take priority because they
         // have more precise change classification (signature-based Modified vs
         // hunk-overlap Modified, plus Added/Removed).
-        let mut seen: HashSet<(String, SymbolKind, Option<String>)> = HashSet::new();
+        let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
 
         // Add tree-sitter results first (they have priority).
         for cs in &ts_changes {
-            let key = (cs.name.clone(), cs.kind, None); // scope not in ChangedSymbol
-            if seen.insert(key) {
+            if seen.insert((cs.name.clone(), cs.kind)) {
                 all_changes.push(cs.clone());
             }
         }
 
         // Add hunk-based Modified that weren't already covered by tree-sitter.
         for cs in &hunk_modified {
-            let key = (cs.name.clone(), cs.kind, None);
-            if seen.insert(key) {
+            if seen.insert((cs.name.clone(), cs.kind)) {
                 all_changes.push(cs.clone());
             }
         }
@@ -574,7 +710,7 @@ pub fn analyze_impact(
     let source_code =
         std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
 
-    // Step 4: Parse to get full Symbol structs (with end_line for chunking).
+    // Step 5: Parse to get full Symbol structs (with end_line for chunking).
     let current_symbols = parse_file_to_symbols(file, &source_code)?;
 
     // Build a lookup map from (name, kind) to full Symbol for chunking.
@@ -583,7 +719,7 @@ pub fn analyze_impact(
         .map(|s| ((s.name.clone(), s.kind), s))
         .collect();
 
-    // Step 5: Load file imports for chunk context.
+    // Step 6: Load file imports for chunk context.
     // Imports are optional context for embedding; silently skip on DB error.
     let file_imports = conn
         .prepare("SELECT import_path FROM file_imports WHERE source_file = ?1")
@@ -593,7 +729,7 @@ pub fn analyze_impact(
         })
         .unwrap_or_default();
 
-    // Step 6: For each changed symbol, embed and search.
+    // Step 7: For each changed symbol, embed and search.
     let mut all_results = Vec::new();
 
     for changed in &embeddable {
@@ -623,7 +759,7 @@ pub fn analyze_impact(
         all_results.extend(results);
     }
 
-    // Step 7: Sort by descending similarity and deduplicate.
+    // Step 8: Sort by descending similarity and deduplicate.
     all_results.sort_by(|a, b| {
         b.similarity_score
             .partial_cmp(&a.similarity_score)
@@ -1467,6 +1603,63 @@ index 1234..5678 100644
         let diff = "@@ -0,0 +1,3 @@\n";
         let hunks = parse_diff_hunks(diff);
         assert_eq!(hunks, vec![(1, 3)]);
+    }
+
+    // -- parse_all_diff_hunks tests --------------------------------------------
+
+    #[test]
+    fn parse_all_diff_hunks_single_file() {
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index abc123..def456 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,5 @@
+";
+        let result = parse_all_diff_hunks(diff);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["src/lib.rs"], vec![(1, 5)]);
+    }
+
+    #[test]
+    fn parse_all_diff_hunks_multiple_files() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -5,3 +5,7 @@
+@@ -20 +24 @@
+";
+        let result = parse_all_diff_hunks(diff);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["src/a.rs"], vec![(1, 1)]);
+        assert_eq!(result["src/b.rs"], vec![(5, 11), (24, 24)]);
+    }
+
+    #[test]
+    fn parse_all_diff_hunks_empty_input() {
+        let result = parse_all_diff_hunks("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_all_diff_hunks_deletion_only() {
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,3 +5,0 @@
+";
+        let result = parse_all_diff_hunks(diff);
+        // Pure deletion produces no new-side hunks.
+        assert!(
+            result.is_empty() || result.get("src/lib.rs").map_or(true, |h| h.is_empty()),
+            "pure deletion should produce no hunks"
+        );
     }
 
     // -- map_hunks_to_symbols tests -------------------------------------------
