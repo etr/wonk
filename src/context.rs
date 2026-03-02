@@ -3,6 +3,7 @@
 //! Gathers definition, categorized incoming/outgoing references, flow
 //! participation, and children for a symbol into a single [`SymbolContext`].
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::Result;
@@ -33,8 +34,20 @@ fn sanitize_confidence(min_confidence: Option<f64>) -> f64 {
     }
 }
 
+/// Escape SQLite LIKE metacharacters (`%` and `_`) in a string.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// Aggregate full context for all symbols matching `name`, applying optional
 /// file/kind filters.  Returns one [`SymbolContext`] per matching symbol.
+///
+/// Note: queries are executed sequentially because `rusqlite::Connection` is
+/// not `Send`/`Sync`, preventing per-query threading without connection cloning.
+/// All statements use `prepare_cached()` for compiled-statement reuse across
+/// iterations.
 pub fn symbol_context(
     conn: &Connection,
     name: &str,
@@ -45,28 +58,32 @@ pub fn symbol_context(
     // 1. Resolve matching symbols.
     let symbols = resolve_symbols(conn, name, options)?;
 
+    // 2. Hoist flow participation: detect entry points once, trace flows once,
+    //    then share results across all matched symbols with the same name.
+    let flow_map = gather_flow_participation_batch(conn, name, conf)?;
+
+    // 3. Cache file imports by source file to avoid duplicate queries.
+    let mut import_cache: HashMap<String, Vec<ContextImport>> = HashMap::new();
+
     let mut results = Vec::with_capacity(symbols.len());
 
     for (sym_id, sym_name, sym_kind, sym_file, sym_line, sym_end_line, sym_sig) in &symbols {
-        // 2. Gather callers: functions whose body references this symbol.
         let callers = gather_callers(conn, sym_name, conf)?;
-
-        // 3. Gather importers: files that import this symbol.
         let importers = gather_importers(conn, sym_name)?;
-
-        // 4. Gather type users: file-scope references (caller_id IS NULL).
         let type_users = gather_type_users(conn, sym_name, conf)?;
-
-        // 5. Gather callees: symbols referenced within this function's body.
         let callees = gather_callees(conn, *sym_id, conf)?;
 
-        // 6. Gather file imports: modules imported by this symbol's file.
-        let imports = gather_file_imports(conn, sym_file)?;
+        // Reuse cached file imports for same source file.
+        let imports = match import_cache.get(sym_file.as_str()) {
+            Some(cached) => cached.clone(),
+            None => {
+                let fresh = gather_file_imports(conn, sym_file)?;
+                import_cache.insert(sym_file.clone(), fresh.clone());
+                fresh
+            }
+        };
 
-        // 7. Flow participation (bounded).
-        let flows = gather_flow_participation(conn, sym_name, conf)?;
-
-        // 8. Children: classes extending/implementing this symbol.
+        let flows = flow_map.get(sym_name).cloned().unwrap_or_default();
         let children = gather_children(conn, *sym_id)?;
 
         results.push(SymbolContext {
@@ -107,18 +124,24 @@ fn resolve_symbols(
     name: &str,
     options: &ContextOptions,
 ) -> Result<Vec<SymbolRow>> {
-    let file_filter = options.file.as_deref().unwrap_or("");
     let kind_filter = options.kind.as_deref().unwrap_or("");
+
+    // Build file filter: escape LIKE metacharacters and use ESCAPE clause.
+    let file_filter = options
+        .file
+        .as_deref()
+        .map(escape_like)
+        .unwrap_or_default();
 
     let sql = "\
         SELECT id, name, kind, file, line, end_line, signature \
         FROM symbols \
         WHERE name = ?1 \
-        AND (?2 = '' OR file LIKE '%' || ?2) \
+        AND (?2 = '' OR file LIKE '%' || ?2 ESCAPE '\\') \
         AND (?3 = '' OR kind = ?3) \
         ORDER BY file, line";
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params![name, file_filter, kind_filter], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -157,7 +180,7 @@ fn gather_callers(conn: &Connection, name: &str, conf: f64) -> Result<Vec<Contex
         WHERE r.name = ?1 AND r.confidence >= ?2 \
         ORDER BY s.file, s.line";
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params![name, conf], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -182,15 +205,22 @@ fn gather_callers(conn: &Connection, name: &str, conf: f64) -> Result<Vec<Contex
 }
 
 /// Importers: files that import this symbol via `file_imports`.
+///
+/// Uses a suffix match on `import_path` with LIKE metacharacters escaped
+/// to prevent wildcard injection from symbol names containing `_` or `%`.
 fn gather_importers(conn: &Connection, name: &str) -> Result<Vec<ContextImporter>> {
+    let escaped_name = escape_like(name);
+
     let sql = "\
         SELECT DISTINCT source_file \
         FROM file_imports \
-        WHERE import_path LIKE '%' || ?1 \
+        WHERE import_path LIKE '%' || ?1 ESCAPE '\\' \
         ORDER BY source_file";
 
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params![name], |row| row.get::<_, String>(0))?;
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map(rusqlite::params![escaped_name], |row| {
+        row.get::<_, String>(0)
+    })?;
 
     let mut importers = Vec::new();
     for row in rows {
@@ -207,7 +237,7 @@ fn gather_type_users(conn: &Connection, name: &str, conf: f64) -> Result<Vec<Con
         WHERE r.name = ?1 AND r.caller_id IS NULL AND r.confidence >= ?2 \
         ORDER BY r.file, r.line";
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params![name, conf], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -237,7 +267,7 @@ fn gather_callees(conn: &Connection, symbol_id: i64, conf: f64) -> Result<Vec<Co
         WHERE r.caller_id = ?1 AND r.confidence >= ?2 \
         ORDER BY s2.file, s2.line";
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params![symbol_id, conf], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -272,7 +302,7 @@ fn gather_file_imports(conn: &Connection, file: &str) -> Result<Vec<ContextImpor
         WHERE source_file = ?1 \
         ORDER BY import_path";
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params![file], |row| row.get::<_, String>(0))?;
 
     let mut imports = Vec::new();
@@ -282,19 +312,18 @@ fn gather_file_imports(conn: &Connection, file: &str) -> Result<Vec<ContextImpor
     Ok(imports)
 }
 
-/// Flow participation: find execution flows that include this symbol.
-///
-/// Uses a bounded approach: check entry points, trace shallow flows, and
-/// report which ones include this symbol name.
-fn gather_flow_participation(
+/// Detect entry points once and trace flows once, returning a map of symbol
+/// name → flow participations.  Called once per `symbol_context` invocation
+/// (not per resolved symbol) to avoid redundant entry point scans.
+fn gather_flow_participation_batch(
     conn: &Connection,
     name: &str,
     conf: f64,
-) -> Result<Vec<ContextFlowParticipation>> {
+) -> Result<HashMap<String, Vec<ContextFlowParticipation>>> {
     use crate::flows;
 
     let options = flows::FlowOptions {
-        depth: 5, // shallow depth for performance
+        depth: 5,
         branching: 4,
         min_confidence: Some(conf),
         from_file: None,
@@ -302,25 +331,26 @@ fn gather_flow_participation(
 
     let entries = flows::detect_entry_points(conn, &options)?;
 
-    let mut participations = Vec::new();
+    let mut map: HashMap<String, Vec<ContextFlowParticipation>> = HashMap::new();
 
     // Limit entry point probing to avoid unbounded computation.
-    let probe_limit = entries.len().min(20);
-    for entry in entries.iter().take(probe_limit) {
+    for entry in entries.iter().take(20) {
         if let Ok(Some(flow)) = flows::trace_flow(conn, &entry.name, &options) {
             for (idx, step) in flow.steps.iter().enumerate() {
                 if step.name == name {
-                    participations.push(ContextFlowParticipation {
-                        entry_point: flow.entry_point.name.clone(),
-                        step_index: idx,
-                    });
+                    map.entry(name.to_string())
+                        .or_default()
+                        .push(ContextFlowParticipation {
+                            entry_point: flow.entry_point.name.clone(),
+                            step_index: idx,
+                        });
                     break; // Only report first occurrence per flow.
                 }
             }
         }
     }
 
-    Ok(participations)
+    Ok(map)
 }
 
 /// Children: symbols extending or implementing this symbol via type_edges.

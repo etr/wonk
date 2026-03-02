@@ -3032,27 +3032,27 @@ Add `wonk changes` CLI subcommand with `--blast` and `--flows` chaining that cal
 Implement `context.rs` orchestration module that aggregates definition, categorized incoming/outgoing references, flow participation, and children for a symbol, plus CLI subcommand and MCP tool.
 
 **Action Items:**
-- [ ] Create `context.rs` module (~150 lines) (DR-026)
-- [ ] Implement `symbol_context(db, name, options) -> Vec<SymbolContext>` (PRD-CTX-REQ-001)
-- [ ] Aggregate definition: file, line, end_line, kind, signature (from symbols table)
-- [ ] Incoming references categorized as (PRD-CTX-REQ-005):
+- [x] Create `context.rs` module (~150 lines) (DR-026)
+- [x] Implement `symbol_context(db, name, options) -> Vec<SymbolContext>` (PRD-CTX-REQ-001)
+- [x] Aggregate definition: file, line, end_line, kind, signature (from symbols table)
+- [x] Incoming references categorized as (PRD-CTX-REQ-005):
   - Callers: functions whose body calls this symbol (`references JOIN symbols ON caller_id`)
   - Importers: files that import this symbol (`file_imports WHERE name = ?`)
   - Type Users: symbols referencing this symbol's type in annotations/signatures
-- [ ] Outgoing references categorized as (PRD-CTX-REQ-006):
+- [x] Outgoing references categorized as (PRD-CTX-REQ-006):
   - Callees: symbols called within this function's body (`references WHERE caller_id = self.id`)
   - Imports: modules/symbols imported by this symbol's file
-- [ ] Flow participation: which execution flows include this symbol and at which step (PRD-CTX-REQ-007)
-- [ ] Children: classes extending or implementing this symbol from `type_edges WHERE parent_id = ?` (PRD-HRTG-REQ-004)
-- [ ] `--file <path>` restricts to symbols in that file (PRD-CTX-REQ-002)
-- [ ] `--kind <kind>` restricts to symbol kind (PRD-CTX-REQ-003)
-- [ ] Multiple matches: return context for all, clearly labeled (PRD-CTX-REQ-004)
-- [ ] Honor `--min-confidence` to filter low-confidence edges (PRD-CONF-REQ-005)
-- [ ] Define `SymbolContext` in types.rs: symbol, incoming {callers[], importers[], type_users[]}, outgoing {callees[], imports[]}, flows[], children[] (PRD-CTX-REQ-008)
-- [ ] Add `context` subcommand to CLI with args: `<name>` (required), `--file`, `--kind`, `--min-confidence`, `--format`
-- [ ] JSON/TOON output includes all SymbolContext fields (PRD-CTX-REQ-008)
-- [ ] Add MCP tool `wonk_context` with parameters: name, file, kind, min_confidence, format (PRD-CTX-REQ-009)
-- [ ] Auto-init: consistent with PRD-AUT behavior
+- [x] Flow participation: which execution flows include this symbol and at which step (PRD-CTX-REQ-007)
+- [x] Children: classes extending or implementing this symbol from `type_edges WHERE parent_id = ?` (PRD-HRTG-REQ-004)
+- [x] `--file <path>` restricts to symbols in that file (PRD-CTX-REQ-002)
+- [x] `--kind <kind>` restricts to symbol kind (PRD-CTX-REQ-003)
+- [x] Multiple matches: return context for all, clearly labeled (PRD-CTX-REQ-004)
+- [x] Honor `--min-confidence` to filter low-confidence edges (PRD-CONF-REQ-005)
+- [x] Define `SymbolContext` in types.rs: symbol, incoming {callers[], importers[], type_users[]}, outgoing {callees[], imports[]}, flows[], children[] (PRD-CTX-REQ-008)
+- [x] Add `context` subcommand to CLI with args: `<name>` (required), `--file`, `--kind`, `--min-confidence`, `--format`
+- [x] JSON/TOON output includes all SymbolContext fields (PRD-CTX-REQ-008)
+- [x] Add MCP tool `wonk_context` with parameters: name, file, kind, min_confidence, format (PRD-CTX-REQ-009)
+- [x] Auto-init: consistent with PRD-AUT behavior
 
 **Dependencies:**
 - Blocked by: TASK-069, TASK-067

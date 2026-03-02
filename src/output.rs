@@ -1611,6 +1611,7 @@ impl<W: Write> Formatter<W> {
     ) -> std::io::Result<()> {
         if fmt.format.is_structured() {
             // Structured output: emit as a JSON array or TOON.
+            // to_vec() needed because serialize_structured requires Sized (serde_toon2 constraint).
             let owned: Vec<SymbolContextOutput> = contexts.to_vec();
             let line = Self::serialize_structured(fmt.format, &owned)?;
             writeln!(fmt.writer, "{line}")
