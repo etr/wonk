@@ -3023,6 +3023,28 @@ mod tests {
     }
 
     #[test]
+    fn semantic_result_toon_format() {
+        let result = SemanticOutput {
+            file: "src/auth.rs".into(),
+            line: 42,
+            symbol_name: "authenticate".into(),
+            symbol_kind: "function".into(),
+            similarity_score: 0.8765,
+            symbol_id: 1,
+        };
+        let out = render(OutputFormat::Toon, |fmt| {
+            fmt.format_semantic_result(&result)
+        });
+        assert!(!out.is_empty());
+        let parsed: SemanticOutput = serde_toon2::from_str(out.trim()).unwrap();
+        assert_eq!(parsed.file, "src/auth.rs");
+        assert_eq!(parsed.line, 42);
+        assert_eq!(parsed.symbol_name, "authenticate");
+        assert_eq!(parsed.symbol_kind, "function");
+        assert!((parsed.similarity_score - 0.8765).abs() < 0.001);
+    }
+
+    #[test]
     fn semantic_result_budget_truncation() {
         let results: Vec<SemanticOutput> = (0..10)
             .map(|i| SemanticOutput {

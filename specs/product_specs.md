@@ -495,7 +495,7 @@ Structural and text search can only find code that matches syntactically — sea
 - `PRD-SEM-REQ-002` When the user provides `--semantic` on `wonk search` then the system shall blend structural results with semantic results, presenting structural matches first followed by additional semantic matches not already present. *Superseded by PRD-RRF-REQ-001 in V4 — replaced by Reciprocal Rank Fusion.*
 - `PRD-SEM-REQ-003` When returning semantic search results then each result shall include file path, line number, symbol name, symbol kind, and cosine similarity score.
 - `PRD-SEM-REQ-004` When the user provides `--budget <n>` on `wonk ask` then the system shall limit output to approximately `n` tokens, prioritizing results with highest similarity.
-- `PRD-SEM-REQ-005` When the user provides `--json` on `wonk ask` then the system shall output results as JSON objects including all fields plus the similarity score.
+- `PRD-SEM-REQ-005` When the user provides `--format json` on `wonk ask` then the system shall output results as JSON objects including all fields plus the similarity score.
 - `PRD-SEM-REQ-006` When building embeddings then the system shall create one chunk per tree-sitter symbol definition, including the file path, parent scope, import context, and the symbol's source code.
 - `PRD-SEM-REQ-007` When a file has no extractable tree-sitter symbols then the system shall treat the full file content as a single chunk for embedding.
 - `PRD-SEM-REQ-008` When the user runs `wonk init` explicitly and Ollama is reachable then the system shall build embeddings alongside the structural index, displaying progress.

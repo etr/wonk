@@ -129,6 +129,17 @@ impl OllamaClient {
             return Ok(Vec::new());
         }
 
+        const MAX_EMBED_BYTES: usize = 32_768; // ~8192 tokens at ~4 bytes/token
+        for text in texts {
+            if text.len() > MAX_EMBED_BYTES {
+                return Err(EmbeddingError::OllamaError(format!(
+                    "input text too long ({} bytes, max {})",
+                    text.len(),
+                    MAX_EMBED_BYTES
+                )));
+            }
+        }
+
         let url = format!("{}/api/embed", self.base_url);
         let request_body = EmbedRequest {
             model: self.model.clone(),
@@ -640,6 +651,11 @@ pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, Em
         .prepare("SELECT symbol_id, vector FROM embeddings")
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+    let count = count as usize;
+
     let rows = stmt
         .query_map([], |row| {
             let symbol_id: i64 = row.get(0)?;
@@ -648,7 +664,7 @@ pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, Em
         })
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(count);
     for r in rows {
         let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
         let floats: &[f32] = bytemuck::try_cast_slice(&blob)
@@ -684,6 +700,15 @@ pub fn load_embeddings_for_path_prefix(
         .prepare("SELECT symbol_id, vector FROM embeddings WHERE file GLOB ?1 AND NOT stale")
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM embeddings WHERE file GLOB ?1 AND NOT stale",
+            [&pattern],
+            |r| r.get(0),
+        )
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+    let count = count as usize;
+
     let rows = stmt
         .query_map([&pattern], |row| {
             let symbol_id: i64 = row.get(0)?;
@@ -692,7 +717,7 @@ pub fn load_embeddings_for_path_prefix(
         })
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(count);
     for r in rows {
         let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
         let floats: &[f32] = bytemuck::try_cast_slice(&blob)
@@ -732,6 +757,15 @@ pub fn load_embeddings_for_files(
         .map(|s| s as &dyn rusqlite::types::ToSql)
         .collect();
 
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM embeddings WHERE file IN ({})",
+        placeholders.join(", ")
+    );
+    let count: i64 = conn
+        .query_row(&count_sql, params.as_slice(), |r| r.get(0))
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+    let count = count as usize;
+
     let rows = stmt
         .query_map(params.as_slice(), |row| {
             let symbol_id: i64 = row.get(0)?;
@@ -740,7 +774,7 @@ pub fn load_embeddings_for_files(
         })
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(count);
     for r in rows {
         let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
         let floats: &[f32] = bytemuck::try_cast_slice(&blob)
@@ -1067,6 +1101,23 @@ mod tests {
         let result = client.embed_batch(&[]);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn embed_batch_rejects_oversized_input() {
+        let client = OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let oversized = "x".repeat(32_769);
+        let texts = vec![oversized];
+        let result = client.embed_batch(&texts);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            EmbeddingError::OllamaError(msg) => {
+                assert!(msg.contains("too long"), "expected 'too long' in: {msg}");
+                assert!(msg.contains("32769"), "expected byte count in: {msg}");
+            }
+            other => panic!("expected OllamaError, got: {other:?}"),
+        }
     }
 
     #[test]

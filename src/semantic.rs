@@ -42,8 +42,14 @@ pub fn semantic_search(
         .map(|(id, vec)| (*id, dot_product(query_vec, vec)))
         .collect();
 
-    scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(limit);
+    let cmp =
+        |a: &(i64, f32), b: &(i64, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    let k = limit.min(scored.len());
+    if k < scored.len() {
+        scored.select_nth_unstable_by(k - 1, cmp);
+        scored.truncate(k);
+    }
+    scored.sort_unstable_by(cmp);
     scored
 }
 
