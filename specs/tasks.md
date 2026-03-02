@@ -2889,21 +2889,21 @@ Implement `flows.rs` module with entry point detection via SQL anti-join and for
 Implement `blast.rs` module with depth-annotated BFS, severity tiers, risk levels, inheritance integration, and test exclusion, plus CLI subcommand and MCP tool.
 
 **Action Items:**
-- [ ] Create `blast.rs` module (~200 lines) (DR-024)
-- [ ] Implement `analyze_blast(db, symbol, options) -> BlastAnalysis`: depth-annotated BFS from target symbol (PRD-BLAST-REQ-001)
-- [ ] Direction control: upstream (default) traverses callers + type_edges children, downstream traverses callees (PRD-BLAST-REQ-004, PRD-BLAST-REQ-005)
-- [ ] Severity tiers by depth: depth 1 = "WILL BREAK", depth 2 = "LIKELY AFFECTED", depth 3+ = "MAY NEED TESTING" (PRD-BLAST-REQ-002)
-- [ ] Risk level from total affected count: LOW ≤3, MEDIUM 4-10, HIGH 11-25, CRITICAL >25 (PRD-BLAST-REQ-003)
-- [ ] `--depth N` caps traversal (default: 3, maximum: 10) (PRD-BLAST-REQ-006)
-- [ ] Affected files summary: deduplicated list of files containing affected symbols (PRD-BLAST-REQ-007)
-- [ ] Test exclusion by default: reuse ranker.rs path heuristics (test/, tests/, *_test.*, *.test.*, *.spec.*); `--include-tests` overrides (PRD-BLAST-REQ-008)
-- [ ] Inheritance integration: query `type_edges WHERE parent_id = ?` to include child classes as depth-1 dependants during upstream traversal (PRD-HRTG-REQ-003)
-- [ ] Honor `--min-confidence` to exclude low-confidence edges (PRD-CONF-REQ-005)
-- [ ] Define `BlastAnalysis` in types.rs: target, direction, risk_level, total_affected, tiers[], affected_files[] (PRD-BLAST-REQ-009)
-- [ ] Add `blast` subcommand to CLI with args: `<symbol>` (required), `--direction`, `--depth`, `--include-tests`, `--min-confidence`, `--format`
-- [ ] JSON/TOON output includes all BlastAnalysis fields (PRD-BLAST-REQ-009)
-- [ ] Add MCP tool `wonk_blast` with parameters: symbol, direction, depth, include_tests, min_confidence, format (PRD-BLAST-REQ-010)
-- [ ] Auto-init: consistent with PRD-AUT behavior
+- [x] Create `blast.rs` module (~200 lines) (DR-024)
+- [x] Implement `analyze_blast(db, symbol, options) -> BlastAnalysis`: depth-annotated BFS from target symbol (PRD-BLAST-REQ-001)
+- [x] Direction control: upstream (default) traverses callers + type_edges children, downstream traverses callees (PRD-BLAST-REQ-004, PRD-BLAST-REQ-005)
+- [x] Severity tiers by depth: depth 1 = "WILL BREAK", depth 2 = "LIKELY AFFECTED", depth 3+ = "MAY NEED TESTING" (PRD-BLAST-REQ-002)
+- [x] Risk level from total affected count: LOW ≤3, MEDIUM 4-10, HIGH 11-25, CRITICAL >25 (PRD-BLAST-REQ-003)
+- [x] `--depth N` caps traversal (default: 3, maximum: 10) (PRD-BLAST-REQ-006)
+- [x] Affected files summary: deduplicated list of files containing affected symbols (PRD-BLAST-REQ-007)
+- [x] Test exclusion by default: reuse ranker.rs path heuristics (test/, tests/, *_test.*, *.test.*, *.spec.*); `--include-tests` overrides (PRD-BLAST-REQ-008)
+- [x] Inheritance integration: query `type_edges WHERE parent_id = ?` to include child classes as depth-1 dependants during upstream traversal (PRD-HRTG-REQ-003)
+- [x] Honor `--min-confidence` to exclude low-confidence edges (PRD-CONF-REQ-005)
+- [x] Define `BlastAnalysis` in types.rs: target, direction, risk_level, total_affected, tiers[], affected_files[] (PRD-BLAST-REQ-009)
+- [x] Add `blast` subcommand to CLI with args: `<symbol>` (required), `--direction`, `--depth`, `--include-tests`, `--min-confidence`, `--format`
+- [x] JSON/TOON output includes all BlastAnalysis fields (PRD-BLAST-REQ-009)
+- [x] Add MCP tool `wonk_blast` with parameters: symbol, direction, depth, include_tests, min_confidence, format (PRD-BLAST-REQ-010)
+- [x] Auto-init: consistent with PRD-AUT behavior
 
 **Dependencies:**
 - Blocked by: TASK-058 (V3 — caller_id population), TASK-067

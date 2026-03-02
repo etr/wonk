@@ -5,7 +5,7 @@
 //! risk level. Supports upstream (callers + type hierarchy children) and
 //! downstream (callees) traversal directions.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -87,6 +87,50 @@ fn risk_level_for_count(count: usize) -> BlastRiskLevel {
     }
 }
 
+/// Try to add a discovered symbol to the affected set.
+///
+/// Checks visited/queued dedup and test-file exclusion. If the symbol passes,
+/// it is pushed to `affected` and optionally enqueued for further BFS expansion.
+#[allow(clippy::too_many_arguments)]
+fn push_if_new(
+    name: String,
+    kind: SymbolKind,
+    file: String,
+    line: usize,
+    depth: usize,
+    confidence: f64,
+    max_depth: usize,
+    include_tests: bool,
+    visited: &mut HashSet<(String, String)>,
+    queued: &mut HashSet<String>,
+    queue: &mut VecDeque<(String, usize)>,
+    affected: &mut Vec<BlastAffectedSymbol>,
+) {
+    let key = (name.clone(), file.clone());
+    if visited.contains(&key) {
+        return;
+    }
+    visited.insert(key);
+
+    if !include_tests && ranker::is_test_file(Path::new(&file)) {
+        return;
+    }
+
+    affected.push(BlastAffectedSymbol {
+        name: name.clone(),
+        kind,
+        file,
+        line,
+        depth,
+        confidence,
+    });
+
+    if depth < max_depth && !queued.contains(&name) {
+        queued.insert(name.clone());
+        queue.push_back((name, depth + 1));
+    }
+}
+
 /// Perform blast radius analysis from a target symbol.
 ///
 /// BFS traverses the call graph (upstream or downstream) from the target,
@@ -109,9 +153,12 @@ pub fn analyze_blast(
     }
 
     let conf_threshold = sanitize_confidence(options.min_confidence);
+    let max_depth = options.depth;
 
     let mut affected: Vec<BlastAffectedSymbol> = Vec::new();
+    // visited: (name, file) pairs already processed — prevents output duplicates.
     let mut visited: HashSet<(String, String)> = HashSet::new();
+    // queued: symbol names already enqueued — prevents BFS re-expansion.
     let mut queued: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
 
@@ -120,7 +167,6 @@ pub fn analyze_blast(
 
     match options.direction {
         BlastDirection::Upstream => {
-            // Callers via references.caller_id JOIN symbols
             let mut stmt_callers = conn.prepare(
                 "SELECT DISTINCT s.name, s.kind, s.file, s.line, r.confidence \
                  FROM \"references\" r \
@@ -128,7 +174,8 @@ pub fn analyze_blast(
                  WHERE r.name = ?1 AND r.confidence >= ?2",
             )?;
 
-            // Type hierarchy children: type_edges WHERE parent_id matches
+            // Type hierarchy children: include direct children of the target
+            // symbol only (PRD-HRTG-REQ-003 scopes this to depth-1 dependants).
             let mut stmt_children = conn.prepare(
                 "SELECT DISTINCT child.name, child.kind, child.file, child.line \
                  FROM type_edges te \
@@ -138,11 +185,10 @@ pub fn analyze_blast(
             )?;
 
             while let Some((target_name, depth)) = queue.pop_front() {
-                if depth > options.depth {
+                if depth > max_depth {
                     continue;
                 }
 
-                // Query callers
                 let rows: Vec<_> = stmt_callers
                     .query_map(rusqlite::params![&target_name, conf_threshold], |row| {
                         Ok((
@@ -156,35 +202,25 @@ pub fn analyze_blast(
                     .collect::<Result<Vec<_>, _>>()?;
 
                 for (name, kind_str, file, line, confidence) in rows {
-                    let key = (name.clone(), file.clone());
-                    if visited.contains(&key) {
-                        continue;
-                    }
-                    visited.insert(key);
-
-                    // Test file exclusion
-                    if !options.include_tests && ranker::is_test_file(Path::new(&file)) {
-                        continue;
-                    }
-
                     let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
-
-                    affected.push(BlastAffectedSymbol {
-                        name: name.clone(),
+                    push_if_new(
+                        name,
                         kind,
                         file,
-                        line: line as usize,
+                        line as usize,
                         depth,
                         confidence,
-                    });
-
-                    if depth < options.depth && !queued.contains(&name) {
-                        queued.insert(name.clone());
-                        queue.push_back((name, depth + 1));
-                    }
+                        max_depth,
+                        options.include_tests,
+                        &mut visited,
+                        &mut queued,
+                        &mut queue,
+                        &mut affected,
+                    );
                 }
 
-                // Query type hierarchy children (only at depth 1 for direct inheritance)
+                // Include type hierarchy children only for the initial target
+                // symbol (depth == 1), per PRD-HRTG-REQ-003.
                 if depth == 1 {
                     let child_rows: Vec<_> = stmt_children
                         .query_map(rusqlite::params![&target_name], |row| {
@@ -198,37 +234,26 @@ pub fn analyze_blast(
                         .collect::<Result<Vec<_>, _>>()?;
 
                     for (name, kind_str, file, line) in child_rows {
-                        let key = (name.clone(), file.clone());
-                        if visited.contains(&key) {
-                            continue;
-                        }
-                        visited.insert(key);
-
-                        if !options.include_tests && ranker::is_test_file(Path::new(&file)) {
-                            continue;
-                        }
-
                         let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
-
-                        affected.push(BlastAffectedSymbol {
-                            name: name.clone(),
+                        push_if_new(
+                            name,
                             kind,
                             file,
-                            line: line as usize,
+                            line as usize,
                             depth,
-                            confidence: 1.0, // Type edges are certain
-                        });
-
-                        if !queued.contains(&name) {
-                            queued.insert(name.clone());
-                            queue.push_back((name, depth + 1));
-                        }
+                            1.0,
+                            max_depth,
+                            options.include_tests,
+                            &mut visited,
+                            &mut queued,
+                            &mut queue,
+                            &mut affected,
+                        );
                     }
                 }
             }
         }
         BlastDirection::Downstream => {
-            // Callees via references WHERE caller_id IN (SELECT id FROM symbols WHERE name = ?)
             let mut stmt_callees = conn.prepare(
                 "SELECT DISTINCT r.name, s_def.kind, r.file, r.line, r.confidence \
                  FROM \"references\" r \
@@ -238,7 +263,7 @@ pub fn analyze_blast(
             )?;
 
             while let Some((target_name, depth)) = queue.pop_front() {
-                if depth > options.depth {
+                if depth > max_depth {
                     continue;
                 }
 
@@ -255,34 +280,24 @@ pub fn analyze_blast(
                     .collect::<Result<Vec<_>, _>>()?;
 
                 for (name, kind_str, file, line, confidence) in rows {
-                    let key = (name.clone(), file.clone());
-                    if visited.contains(&key) {
-                        continue;
-                    }
-                    visited.insert(key);
-
-                    if !options.include_tests && ranker::is_test_file(Path::new(&file)) {
-                        continue;
-                    }
-
                     let kind = kind_str
                         .as_deref()
                         .and_then(|k| SymbolKind::from_str(k).ok())
                         .unwrap_or(SymbolKind::Function);
-
-                    affected.push(BlastAffectedSymbol {
-                        name: name.clone(),
+                    push_if_new(
+                        name,
                         kind,
                         file,
-                        line: line as usize,
+                        line as usize,
                         depth,
                         confidence,
-                    });
-
-                    if depth < options.depth && !queued.contains(&name) {
-                        queued.insert(name.clone());
-                        queue.push_back((name, depth + 1));
-                    }
+                        max_depth,
+                        options.include_tests,
+                        &mut visited,
+                        &mut queued,
+                        &mut queue,
+                        &mut affected,
+                    );
                 }
             }
         }
@@ -296,30 +311,36 @@ pub fn analyze_blast(
             .then_with(|| a.line.cmp(&b.line))
     });
 
-    // Group into severity tiers.
-    let mut tier_map: Vec<(BlastSeverity, Vec<BlastAffectedSymbol>)> = Vec::new();
+    // Group into severity tiers using HashMap for clarity.
+    let mut tier_map: HashMap<BlastSeverity, Vec<BlastAffectedSymbol>> = HashMap::new();
     for sym in &affected {
-        let severity = severity_for_depth(sym.depth);
-        if let Some(tier) = tier_map.iter_mut().find(|(s, _)| *s == severity) {
-            tier.1.push(sym.clone());
-        } else {
-            tier_map.push((severity, vec![sym.clone()]));
-        }
+        tier_map
+            .entry(severity_for_depth(sym.depth))
+            .or_default()
+            .push(sym.clone());
     }
 
-    let tiers: Vec<BlastTier> = tier_map
-        .into_iter()
-        .map(|(severity, symbols)| BlastTier { severity, symbols })
-        .collect();
+    // Emit tiers in severity order: WillBreak, LikelyAffected, MayNeedTesting.
+    let tiers: Vec<BlastTier> = [
+        BlastSeverity::WillBreak,
+        BlastSeverity::LikelyAffected,
+        BlastSeverity::MayNeedTesting,
+    ]
+    .into_iter()
+    .filter_map(|severity| {
+        tier_map
+            .remove(&severity)
+            .map(|symbols| BlastTier { severity, symbols })
+    })
+    .collect();
 
     // Deduplicated affected files.
-    let mut files_seen: HashSet<String> = HashSet::new();
-    let mut affected_files: Vec<String> = Vec::new();
-    for sym in &affected {
-        if files_seen.insert(sym.file.clone()) {
-            affected_files.push(sym.file.clone());
-        }
-    }
+    let mut affected_files: Vec<String> = affected
+        .iter()
+        .map(|s| s.file.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     affected_files.sort();
 
     let total_affected = affected.len();

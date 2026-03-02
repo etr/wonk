@@ -1281,13 +1281,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
 
             let direction = match &args.direction {
-                Some(d) => match d.parse::<crate::types::BlastDirection>() {
-                    Ok(dir) => dir,
-                    Err(e) => {
-                        output::print_error(&e);
-                        return Ok(());
-                    }
-                },
+                Some(d) => d
+                    .parse::<crate::types::BlastDirection>()
+                    .map_err(crate::errors::WonkError::Usage)?,
                 None => crate::types::BlastDirection::Upstream,
             };
 
