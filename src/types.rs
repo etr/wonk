@@ -608,6 +608,43 @@ pub struct BlastAnalysis {
     pub affected_files: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Change scope types (TASK-071)
+// ---------------------------------------------------------------------------
+
+/// Scope for change detection: which git diff to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeScope {
+    /// Unstaged changes (working tree vs index): `git diff`.
+    Unstaged,
+    /// Staged changes (index vs HEAD): `git diff --cached`.
+    Staged,
+    /// All uncommitted changes (working tree vs HEAD): `git diff HEAD`.
+    All,
+    /// Compare against a specific git ref: `git diff <ref>`.
+    Compare(String),
+}
+
+impl fmt::Display for ChangeScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChangeScope::Unstaged => write!(f, "unstaged"),
+            ChangeScope::Staged => write!(f, "staged"),
+            ChangeScope::All => write!(f, "all"),
+            ChangeScope::Compare(r) => write!(f, "compare({r})"),
+        }
+    }
+}
+
+/// Result of scoped change analysis: all changed symbols across files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeAnalysis {
+    /// The scope that was used for detection.
+    pub scope: ChangeScope,
+    /// All changed symbols found across the scoped files.
+    pub changed_symbols: Vec<ChangedSymbol>,
+}
+
 /// A single hop in a call path between two symbols, returned by `wonk callpath`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallPathHop {
@@ -1199,6 +1236,71 @@ mod tests {
         assert_eq!(analysis.total_affected, 2);
         assert!(analysis.tiers.is_empty());
         assert_eq!(analysis.affected_files.len(), 1);
+    }
+
+    // -- ChangeScope tests ---------------------------------------------------
+
+    #[test]
+    fn change_scope_display_unstaged() {
+        assert_eq!(ChangeScope::Unstaged.to_string(), "unstaged");
+    }
+
+    #[test]
+    fn change_scope_display_staged() {
+        assert_eq!(ChangeScope::Staged.to_string(), "staged");
+    }
+
+    #[test]
+    fn change_scope_display_all() {
+        assert_eq!(ChangeScope::All.to_string(), "all");
+    }
+
+    #[test]
+    fn change_scope_display_compare() {
+        assert_eq!(
+            ChangeScope::Compare("main".into()).to_string(),
+            "compare(main)"
+        );
+    }
+
+    #[test]
+    fn change_scope_equality() {
+        assert_eq!(ChangeScope::Unstaged, ChangeScope::Unstaged);
+        assert_eq!(
+            ChangeScope::Compare("main".into()),
+            ChangeScope::Compare("main".into())
+        );
+        assert_ne!(ChangeScope::Unstaged, ChangeScope::Staged);
+        assert_ne!(
+            ChangeScope::Compare("main".into()),
+            ChangeScope::Compare("dev".into())
+        );
+    }
+
+    #[test]
+    fn change_analysis_creation() {
+        let analysis = ChangeAnalysis {
+            scope: ChangeScope::Unstaged,
+            changed_symbols: vec![ChangedSymbol {
+                name: "foo".into(),
+                kind: SymbolKind::Function,
+                file: "a.rs".into(),
+                line: 1,
+                change_type: ChangeType::Modified,
+            }],
+        };
+        assert_eq!(analysis.scope, ChangeScope::Unstaged);
+        assert_eq!(analysis.changed_symbols.len(), 1);
+        assert_eq!(analysis.changed_symbols[0].name, "foo");
+    }
+
+    #[test]
+    fn change_analysis_empty() {
+        let analysis = ChangeAnalysis {
+            scope: ChangeScope::Staged,
+            changed_symbols: vec![],
+        };
+        assert!(analysis.changed_symbols.is_empty());
     }
 
     #[test]

@@ -2943,20 +2943,20 @@ Implement `blast.rs` module with depth-annotated BFS, severity tiers, risk level
 Extend `impact.rs` with `ChangeScope` enum and git diff hunk-to-symbol mapping that identifies which indexed symbols overlap with changed line ranges.
 
 **Action Items:**
-- [ ] Add `ChangeScope` enum to `impact.rs`: `Unstaged` (default), `Staged`, `All`, `Compare(ref)` (PRD-CHG-REQ-001 through PRD-CHG-REQ-004)
-- [ ] Implement git diff scoping commands:
+- [x] Add `ChangeScope` enum to `impact.rs`: `Unstaged` (default), `Staged`, `All`, `Compare(ref)` (PRD-CHG-REQ-001 through PRD-CHG-REQ-004)
+- [x] Implement git diff scoping commands:
   - Unstaged: `git diff --name-only` (PRD-CHG-REQ-001)
   - Staged: `git diff --cached --name-only` (PRD-CHG-REQ-002)
   - All: `git diff HEAD --name-only` (PRD-CHG-REQ-003)
   - Compare: `git diff <ref> --name-only` (PRD-CHG-REQ-004)
-- [ ] Implement hunk-to-symbol mapping (PRD-CHG-REQ-005):
+- [x] Implement hunk-to-symbol mapping (PRD-CHG-REQ-005):
   1. Run `git diff --unified=0 [flags] <file>` to get precise line ranges
   2. Parse diff output to extract changed line ranges from hunk headers (`@@ -start,count +start,count @@`)
   3. Query indexed symbols for the file: `SELECT * FROM symbols WHERE file = ?`
   4. Overlap check: symbol is Modified if any changed line range overlaps `line..end_line`
   5. Re-parse file with Tree-sitter for Added (new) and Removed (absent) symbols
-- [ ] Reuse existing `detect_changed_symbols()` for Added/Removed detection
-- [ ] Define `ChangeAnalysis` in types.rs: scope, changed_symbols[] (each with name, kind, file, line, change_type)
+- [x] Reuse existing `detect_changed_symbols()` for Added/Removed detection
+- [x] Define `ChangeAnalysis` in types.rs: scope, changed_symbols[] (each with name, kind, file, line, change_type)
 
 **Dependencies:**
 - Blocked by: None
