@@ -392,10 +392,11 @@ impl From<&crate::types::FlowStep> for FlowStepOutput {
 
 impl From<&crate::types::ExecutionFlow> for FlowOutput {
     fn from(flow: &crate::types::ExecutionFlow) -> Self {
+        let steps: Vec<FlowStepOutput> = flow.steps.iter().map(FlowStepOutput::from).collect();
         Self {
             entry_point: FlowStepOutput::from(&flow.entry_point),
-            steps: flow.steps.iter().map(FlowStepOutput::from).collect(),
-            step_count: flow.step_count,
+            step_count: steps.len(),
+            steps,
         }
     }
 }

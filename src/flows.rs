@@ -20,6 +20,9 @@ pub const MAX_DEPTH: usize = 20;
 /// Default maximum callees to follow per symbol.
 pub const DEFAULT_BRANCHING: usize = 4;
 
+/// Maximum allowed branching factor.
+pub const MAX_BRANCHING: usize = 50;
+
 /// Minimum number of steps for a flow to be included in output.
 pub const MIN_FLOW_STEPS: usize = 2;
 
@@ -63,46 +66,26 @@ pub fn clamp_depth(requested: usize) -> (usize, bool) {
 pub fn detect_entry_points(conn: &Connection, options: &FlowOptions) -> Result<Vec<FlowStep>> {
     let conf_threshold = sanitize_confidence(options.min_confidence);
 
-    // Build query dynamically: add file filter when from_file is set.
-    let (sql, params) = if let Some(ref from_file) = options.from_file {
-        (
-            "SELECT s.id, s.name, s.kind, s.file, s.line \
-             FROM symbols s \
-             WHERE s.kind IN ('function', 'method') \
-             AND s.file = ?1 \
-             AND NOT EXISTS (\
-                 SELECT 1 FROM \"references\" r \
-                 WHERE r.name = s.name AND r.caller_id IS NOT NULL AND r.confidence >= ?2\
-             ) \
-             ORDER BY s.file, s.line"
-                .to_string(),
-            vec![
-                rusqlite::types::Value::Text(from_file.clone()),
-                rusqlite::types::Value::Real(conf_threshold),
-            ],
-        )
-    } else {
-        (
-            "SELECT s.id, s.name, s.kind, s.file, s.line \
-             FROM symbols s \
-             WHERE s.kind IN ('function', 'method') \
-             AND NOT EXISTS (\
-                 SELECT 1 FROM \"references\" r \
-                 WHERE r.name = s.name AND r.caller_id IS NOT NULL AND r.confidence >= ?1\
-             ) \
-             ORDER BY s.file, s.line"
-                .to_string(),
-            vec![rusqlite::types::Value::Real(conf_threshold)],
-        )
-    };
+    // Single query with optional file filter: when from_file is empty string,
+    // the condition is skipped via (?1 = '' OR s.file = ?1).
+    let sql = "SELECT s.name, s.kind, s.file, s.line \
+               FROM symbols s \
+               WHERE s.kind IN ('function', 'method') \
+               AND (?1 = '' OR s.file = ?1) \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM \"references\" r \
+                   WHERE r.name = s.name AND r.caller_id IS NOT NULL AND r.confidence >= ?2\
+               ) \
+               ORDER BY s.file, s.line";
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+    let file_filter = options.from_file.as_deref().unwrap_or("");
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![file_filter, conf_threshold], |row| {
         Ok((
-            row.get::<_, String>(1)?, // name
-            row.get::<_, String>(2)?, // kind
-            row.get::<_, String>(3)?, // file
-            row.get::<_, i64>(4)?,    // line
+            row.get::<_, String>(0)?, // name
+            row.get::<_, String>(1)?, // kind
+            row.get::<_, String>(2)?, // file
+            row.get::<_, i64>(3)?,    // line
         ))
     })?;
 
@@ -133,11 +116,12 @@ pub fn trace_flow(
 ) -> Result<Option<ExecutionFlow>> {
     let conf_threshold = sanitize_confidence(options.min_confidence);
     let max_depth = options.depth.min(MAX_DEPTH);
+    let branching = options.branching.min(MAX_BRANCHING);
 
-    // Resolve the entry point from the symbols table.
+    // Resolve the entry point from the symbols table (including ID for BFS).
     let entry = {
         let mut stmt = conn.prepare(
-            "SELECT name, kind, file, line FROM symbols \
+            "SELECT id, name, kind, file, line FROM symbols \
              WHERE name = ?1 AND kind IN ('function', 'method') \
              LIMIT 1",
         )?;
@@ -145,67 +129,73 @@ pub fn trace_flow(
         let row = stmt
             .query_row(rusqlite::params![entry_name], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .ok();
 
         match row {
-            Some((name, kind_str, file, line)) => {
+            Some((id, name, kind_str, file, line)) => {
                 let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
-                FlowStep {
-                    name,
-                    kind,
-                    file,
-                    line: line as usize,
-                    depth: 0,
-                }
+                (
+                    id,
+                    FlowStep {
+                        name,
+                        kind,
+                        file,
+                        line: line as usize,
+                        depth: 0,
+                    },
+                )
             }
             None => return Ok(None),
         }
     };
 
-    let mut steps: Vec<FlowStep> = vec![entry.clone()];
+    let (entry_id, entry_step) = entry;
+    let mut steps: Vec<FlowStep> = vec![entry_step.clone()];
     let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(entry.name.clone());
+    visited.insert(entry_step.name.clone());
 
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-    queue.push_back((entry.name.clone(), 0));
+    // BFS queue carries (symbol_id, symbol_name, depth) to avoid re-resolving IDs.
+    let mut queue: VecDeque<(i64, String, usize)> = VecDeque::new();
+    queue.push_back((entry_id, entry_step.name.clone(), 0));
 
-    // BFS callee expansion with branching limit.
+    // BFS callee expansion using caller_id directly (avoids name-to-ID re-resolution).
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT r.name, s2.kind, s2.file, s2.line \
+        "SELECT DISTINCT r.name, s2.id, s2.kind, s2.file, s2.line \
          FROM \"references\" r \
-         JOIN symbols s ON s.id = r.caller_id \
          LEFT JOIN symbols s2 ON s2.name = r.name AND s2.kind IN ('function', 'method') \
-         WHERE s.name = ?1 AND r.confidence >= ?2 \
+         WHERE r.caller_id = ?1 AND r.confidence >= ?2 \
          ORDER BY r.confidence DESC \
          LIMIT ?3",
     )?;
 
-    while let Some((current_name, current_depth)) = queue.pop_front() {
+    while let Some((current_id, _current_name, current_depth)) = queue.pop_front() {
         if current_depth >= max_depth {
             continue;
         }
 
         let rows: Vec<_> = stmt
             .query_map(
-                rusqlite::params![&current_name, conf_threshold, options.branching as i64],
+                rusqlite::params![current_id, conf_threshold, branching as i64],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,         // callee name
-                        row.get::<_, Option<String>>(1)?, // kind (may be NULL if no matching symbol)
-                        row.get::<_, Option<String>>(2)?, // file
-                        row.get::<_, Option<i64>>(3)?,    // line
+                        row.get::<_, Option<i64>>(1)?,    // callee symbol id
+                        row.get::<_, Option<String>>(2)?, // kind
+                        row.get::<_, Option<String>>(3)?, // file
+                        row.get::<_, Option<i64>>(4)?,    // line
                     ))
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (callee_name, kind_str_opt, file_opt, line_opt) in rows {
+        for (callee_name, callee_id_opt, kind_str_opt, file_opt, line_opt) in rows {
             if visited.contains(&callee_name) {
                 continue;
             }
@@ -227,19 +217,22 @@ pub fn trace_flow(
                 depth: current_depth + 1,
             };
             steps.push(step);
-            queue.push_back((callee_name, current_depth + 1));
+
+            // Only enqueue if we have a resolved symbol ID for further traversal.
+            if let Some(callee_id) = callee_id_opt {
+                queue.push_back((callee_id, callee_name, current_depth + 1));
+            }
         }
     }
 
+    // Exclude trivially short flows (entry point with no reachable callees).
     if steps.len() < MIN_FLOW_STEPS {
         return Ok(None);
     }
 
-    let step_count = steps.len();
     Ok(Some(ExecutionFlow {
-        entry_point: entry,
+        entry_point: entry_step,
         steps,
-        step_count,
     }))
 }
 
@@ -464,7 +457,7 @@ fn open_db() {
         assert!(flow.is_some(), "should find a flow from main");
         let flow = flow.unwrap();
         assert_eq!(flow.entry_point.name, "main");
-        assert!(flow.step_count >= 2, "should have at least 2 steps");
+        assert!(flow.steps.len() >= 2, "should have at least 2 steps");
 
         let names: Vec<&str> = flow.steps.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"main"), "flow should include main");
@@ -533,9 +526,9 @@ fn e() { }
         let flow = flow.unwrap();
         // Entry + at most 2 callees = at most 3 steps.
         assert!(
-            flow.step_count <= 3,
+            flow.steps.len() <= 3,
             "branching=2 should limit to at most 3 steps, got {}",
-            flow.step_count
+            flow.steps.len()
         );
     }
 

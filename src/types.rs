@@ -479,8 +479,6 @@ pub struct ExecutionFlow {
     pub entry_point: FlowStep,
     /// All steps in the flow (including the entry point).
     pub steps: Vec<FlowStep>,
-    /// Total number of steps.
-    pub step_count: usize,
 }
 
 /// A single hop in a call path between two symbols, returned by `wonk callpath`.
@@ -952,11 +950,9 @@ mod tests {
         let flow = ExecutionFlow {
             entry_point: entry.clone(),
             steps: steps.clone(),
-            step_count: steps.len(),
         };
         assert_eq!(flow.entry_point, entry);
         assert_eq!(flow.steps.len(), 2);
-        assert_eq!(flow.step_count, 2);
     }
 
     #[test]
@@ -971,7 +967,6 @@ mod tests {
         let a = ExecutionFlow {
             entry_point: entry.clone(),
             steps: vec![entry.clone()],
-            step_count: 1,
         };
         let b = a.clone();
         assert_eq!(a, b);

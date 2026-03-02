@@ -1391,18 +1391,14 @@ impl McpServer {
             .and_then(|v| v.as_u64())
             .unwrap_or(crate::flows::DEFAULT_BRANCHING as u64) as usize;
 
-        let min_confidence: Option<f64> =
-            args.get("min_confidence")
-                .and_then(|v| v.as_f64())
-                .map(|c| {
-                    if c.is_nan() || c.is_infinite() {
-                        0.0
-                    } else {
-                        c.clamp(0.0, 1.0)
-                    }
-                });
+        let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
 
         let from_file = args.get("from").and_then(|v| v.as_str()).map(String::from);
+        if let Some(ref f) = from_file
+            && validate_path(std::path::Path::new(f), self.router.repo_root()).is_err()
+        {
+            return CallToolResult::error(format!("path outside repository: {f}"));
+        }
 
         let options = crate::flows::FlowOptions {
             depth,

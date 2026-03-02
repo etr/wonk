@@ -2835,21 +2835,21 @@ Implement `fuse_rrf()` in `ranker.rs` that merges structural and semantic result
 Implement `flows.rs` module with entry point detection via SQL anti-join and forward BFS flow tracing, plus CLI subcommand and MCP tool.
 
 **Action Items:**
-- [ ] Create `flows.rs` module (~200 lines) (DR-023)
-- [ ] Implement `detect_entry_points(db, options) -> Vec<Symbol>`: SQL anti-join to find functions/methods with no indexed callers (PRD-FLOW-REQ-001)
+- [x] Create `flows.rs` module (~200 lines) (DR-023)
+- [x] Implement `detect_entry_points(db, options) -> Vec<Symbol>`: SQL anti-join to find functions/methods with no indexed callers (PRD-FLOW-REQ-001)
   - Query: `SELECT s.* FROM symbols s WHERE s.kind IN ('function', 'method') AND s.id NOT IN (SELECT DISTINCT caller_id FROM "references" WHERE caller_id IS NOT NULL)`
-- [ ] Implement `trace_flow(db, entry, options) -> ExecutionFlow`: BFS from entry point expanding callees at each level (PRD-FLOW-REQ-002, PRD-FLOW-REQ-003)
-- [ ] `--depth N` caps BFS traversal (default: 10, maximum: 20) (PRD-FLOW-REQ-004)
-- [ ] `--branching N` limits callees followed per symbol (default: 4), sorted by confidence descending (PRD-FLOW-REQ-005)
-- [ ] Exclude flows with fewer than 2 steps (PRD-FLOW-REQ-006)
-- [ ] Each step includes: symbol name, kind, file path, line number, depth (PRD-FLOW-REQ-007)
-- [ ] `--from <file>` restricts entry point detection to symbols in the specified file (PRD-FLOW-REQ-008)
-- [ ] Honor `--min-confidence` to exclude low-confidence edges during traversal (PRD-CONF-REQ-005)
-- [ ] Define `ExecutionFlow` in types.rs: entry_point, steps (ordered array), step_count (PRD-FLOW-REQ-009)
-- [ ] Add `flows` subcommand to CLI with args: `[entry]` (optional), `--from`, `--depth`, `--branching`, `--min-confidence`, `--format`
-- [ ] JSON/TOON output includes structured fields (PRD-FLOW-REQ-009)
-- [ ] Add MCP tool `wonk_flows` with parameters: entry, from, depth, branching, min_confidence, format (PRD-FLOW-REQ-010)
-- [ ] Auto-init: consistent with PRD-AUT behavior
+- [x] Implement `trace_flow(db, entry, options) -> ExecutionFlow`: BFS from entry point expanding callees at each level (PRD-FLOW-REQ-002, PRD-FLOW-REQ-003)
+- [x] `--depth N` caps BFS traversal (default: 10, maximum: 20) (PRD-FLOW-REQ-004)
+- [x] `--branching N` limits callees followed per symbol (default: 4), sorted by confidence descending (PRD-FLOW-REQ-005)
+- [x] Exclude flows with fewer than 2 steps (PRD-FLOW-REQ-006)
+- [x] Each step includes: symbol name, kind, file path, line number, depth (PRD-FLOW-REQ-007)
+- [x] `--from <file>` restricts entry point detection to symbols in the specified file (PRD-FLOW-REQ-008)
+- [x] Honor `--min-confidence` to exclude low-confidence edges during traversal (PRD-CONF-REQ-005)
+- [x] Define `ExecutionFlow` in types.rs: entry_point, steps (ordered array), step_count (PRD-FLOW-REQ-009)
+- [x] Add `flows` subcommand to CLI with args: `[entry]` (optional), `--from`, `--depth`, `--branching`, `--min-confidence`, `--format`
+- [x] JSON/TOON output includes structured fields (PRD-FLOW-REQ-009)
+- [x] Add MCP tool `wonk_flows` with parameters: entry, from, depth, branching, min_confidence, format (PRD-FLOW-REQ-010)
+- [x] Auto-init: consistent with PRD-AUT behavior
 
 **Dependencies:**
 - Blocked by: TASK-058 (V3 — caller_id population), TASK-067

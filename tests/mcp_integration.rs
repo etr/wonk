@@ -128,6 +128,7 @@ fn mcp_server_initialize_and_list_tools() {
     assert!(tool_names.contains(&"wonk_init"));
     assert!(tool_names.contains(&"wonk_callpath"));
     assert!(tool_names.contains(&"wonk_summary"));
+    assert!(tool_names.contains(&"wonk_flows"));
 
     // 4. Send tools/call for wonk_status.
     let status_req = serde_json::json!({
