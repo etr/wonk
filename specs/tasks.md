@@ -3119,7 +3119,7 @@ Extend `mcp.rs` to discover all indexed repositories at startup, lazy-load conne
 **Related Requirements:** PRD-MREP-REQ-001 through PRD-MREP-REQ-006
 **Related Decisions:** DR-030
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
