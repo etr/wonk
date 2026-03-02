@@ -2988,13 +2988,13 @@ Extend `impact.rs` with `ChangeScope` enum and git diff hunk-to-symbol mapping t
 Add `wonk changes` CLI subcommand with `--blast` and `--flows` chaining that calls blast radius and flow detection for each changed symbol, plus MCP tool exposure.
 
 **Action Items:**
-- [ ] Add `changes` subcommand to CLI with args: `--scope` (unstaged|staged|all|compare), `--base <ref>` (required when scope=compare), `--blast`, `--flows`, `--min-confidence`, `--format`
-- [ ] Wire CLI to `detect_changes()` from TASK-071
-- [ ] `--blast` chaining (PRD-CHG-REQ-006): for each changed symbol, call `analyze_blast()` from `blast.rs` and include aggregated per-symbol blast radius in output; compute combined risk level
-- [ ] `--flows` chaining (PRD-CHG-REQ-007): identify execution flows (from `flows.rs`) containing any changed symbols; a flow is "affected" if any of its steps match a changed symbol
-- [ ] JSON/TOON output includes: scope, changed_symbols[], blast_radius (optional), affected_flows (optional) (PRD-CHG-REQ-008)
-- [ ] Add MCP tool `wonk_changes` with parameters: scope, base, blast, flows, min_confidence, format (PRD-CHG-REQ-009)
-- [ ] Auto-init: consistent with PRD-AUT behavior
+- [x] Add `changes` subcommand to CLI with args: `--scope` (unstaged|staged|all|compare), `--base <ref>` (required when scope=compare), `--blast`, `--flows`, `--min-confidence`, `--format`
+- [x] Wire CLI to `detect_changes()` from TASK-071
+- [x] `--blast` chaining (PRD-CHG-REQ-006): for each changed symbol, call `analyze_blast()` from `blast.rs` and include aggregated per-symbol blast radius in output; compute combined risk level
+- [x] `--flows` chaining (PRD-CHG-REQ-007): identify execution flows (from `flows.rs`) containing any changed symbols; a flow is "affected" if any of its steps match a changed symbol
+- [x] JSON/TOON output includes: scope, changed_symbols[], blast_radius (optional), affected_flows (optional) (PRD-CHG-REQ-008)
+- [x] Add MCP tool `wonk_changes` with parameters: scope, base, blast, flows, min_confidence, format (PRD-CHG-REQ-009)
+- [x] Auto-init: consistent with PRD-AUT behavior
 
 **Dependencies:**
 - Blocked by: TASK-071, TASK-069, TASK-070

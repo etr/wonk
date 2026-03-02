@@ -204,6 +204,15 @@ fn extract_format(args: &Value) -> OutputFormat {
         .unwrap_or(OutputFormat::Json)
 }
 
+/// Clamp a confidence value to `[0.0, 1.0]`, mapping NaN/Inf to 0.0.
+fn clamp_confidence(c: f64) -> f64 {
+    if c.is_nan() || c.is_infinite() {
+        0.0
+    } else {
+        c.clamp(0.0, 1.0)
+    }
+}
+
 /// Convert a `Symbol` to the serializable `SymbolOutput`.
 fn symbol_to_output(sym: &Symbol) -> SymbolOutput {
     SymbolOutput {
@@ -746,6 +755,45 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     "required": ["symbol"]
                 }),
             },
+            Tool {
+                name: "wonk_changes",
+                description: "Detect changed symbols in working tree. Optionally chain blast radius analysis and execution flow detection for each changed symbol. Supports scoping to unstaged, staged, all uncommitted, or compare-to-ref changes.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["unstaged", "staged", "all", "compare"],
+                            "description": "Change scope (default: unstaged)",
+                            "default": "unstaged"
+                        },
+                        "base": {
+                            "type": "string",
+                            "description": "Base git ref for compare scope (required when scope=compare)"
+                        },
+                        "blast": {
+                            "type": "boolean",
+                            "description": "Include blast radius per changed symbol (default: false)",
+                            "default": false
+                        },
+                        "flows": {
+                            "type": "boolean",
+                            "description": "Identify affected execution flows (default: false)",
+                            "default": false
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Minimum edge confidence (0.0-1.0) for blast/flow analysis"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    }
+                }),
+            },
         ]
     })
 }
@@ -810,6 +858,7 @@ impl McpServer {
             "wonk_summary" => self.tool_summary(call.arguments),
             "wonk_flows" => self.tool_flows(call.arguments),
             "wonk_blast" => self.tool_blast(call.arguments),
+            "wonk_changes" => self.tool_changes(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1535,6 +1584,68 @@ impl McpServer {
             }
         }
     }
+
+    fn tool_changes(&self, args: Value) -> CallToolResult {
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        let repo_root = self.router.repo_root().to_path_buf();
+
+        let format = extract_format(&args);
+
+        // Parse scope.
+        let scope_str = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unstaged");
+        let scope = if scope_str == "compare" {
+            let base = match args.get("base").and_then(|v| v.as_str()) {
+                Some(b) => b.to_string(),
+                None => {
+                    return CallToolResult::error("'base' is required when scope=compare".into());
+                }
+            };
+            crate::types::ChangeScope::Compare(base)
+        } else {
+            match scope_str.parse::<crate::types::ChangeScope>() {
+                Ok(s) => s,
+                Err(e) => return CallToolResult::error(e),
+            }
+        };
+
+        let blast = args.get("blast").and_then(|v| v.as_bool()).unwrap_or(false);
+        let flows = args.get("flows").and_then(|v| v.as_bool()).unwrap_or(false);
+        let min_confidence = args
+            .get("min_confidence")
+            .and_then(|v| v.as_f64())
+            .map(clamp_confidence);
+
+        // Detect changes.
+        let analysis = match crate::impact::detect_changes(conn, &scope, &repo_root) {
+            Ok(a) => a,
+            Err(e) => return CallToolResult::error(format!("change detection failed: {e}")),
+        };
+
+        // Build output using shared helper.
+        let changes_out = match crate::router::build_changes_output(
+            conn,
+            &analysis,
+            &scope,
+            &crate::router::ChangesChainOptions {
+                blast,
+                flows,
+                min_confidence,
+            },
+            |_| {},
+        ) {
+            Ok(o) => o,
+            Err(e) => return CallToolResult::error(format!("changes analysis failed: {e}")),
+        };
+
+        format_result(&changes_out, format)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,7 +1802,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
     }
 
     #[test]
@@ -1907,7 +2018,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
     }
 
     #[test]
@@ -2243,5 +2354,30 @@ mod tests {
         let result = server.handle_tools_call(&params);
         let is_error = result["isError"].as_bool().unwrap_or(false);
         assert!(is_error, "should error on missing symbol");
+    }
+
+    // -- wonk_changes tests (TASK-072) ----------------------------------------
+
+    #[test]
+    fn tool_changes_definition_exists() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_changes");
+        assert!(tool.is_some(), "wonk_changes tool should exist");
+    }
+
+    #[test]
+    fn tool_changes_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_changes").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("scope"), "missing 'scope' property");
+        assert!(props.contains_key("base"), "missing 'base' property");
+        assert!(props.contains_key("blast"), "missing 'blast' property");
+        assert!(props.contains_key("flows"), "missing 'flows' property");
+        assert!(
+            props.contains_key("min_confidence"),
+            "missing 'min_confidence' property"
+        );
+        assert!(props.contains_key("format"), "missing 'format' property");
     }
 }

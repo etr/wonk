@@ -463,6 +463,38 @@ impl From<&crate::types::BlastAnalysis> for BlastOutput {
     }
 }
 
+/// A changed symbol with optional per-symbol blast radius, for `wonk changes` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangedSymbolOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    pub change_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blast_radius: Option<BlastOutput>,
+}
+
+/// An execution flow affected by changed symbols.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedFlowOutput {
+    pub entry_point: FlowStepOutput,
+    pub steps: Vec<FlowStepOutput>,
+    pub step_count: usize,
+    pub matched_symbols: Vec<String>,
+}
+
+/// Complete `wonk changes` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesOutput {
+    pub scope: String,
+    pub changed_symbols: Vec<ChangedSymbolOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub combined_risk_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected_flows: Option<Vec<AffectedFlowOutput>>,
+}
+
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
 /// output. In grep mode the summary goes to stderr instead.
 #[derive(Debug, Clone, Serialize)]
@@ -1310,6 +1342,69 @@ impl<W: Write> Formatter<W> {
                 writeln!(fmt.writer, "Affected files ({}):", out.affected_files.len())?;
                 for file in &out.affected_files {
                     writeln!(fmt.writer, "  {file}")?;
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Format a `wonk changes` result.
+    pub fn format_changes(&mut self, out: &ChangesOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_changes(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_changes(fmt, &out))
+    }
+
+    /// Shared render logic for `wonk changes` output.
+    fn render_changes<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &ChangesOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            // Changed symbols section.
+            writeln!(fmt.writer, "Changed symbols (scope: {}):", out.scope)?;
+            for sym in &out.changed_symbols {
+                writeln!(
+                    fmt.writer,
+                    "  {}:{}\t{} ({}) [{}]",
+                    sym.file, sym.line, sym.name, sym.kind, sym.change_type
+                )?;
+
+                // Per-symbol blast radius.
+                if let Some(ref blast) = sym.blast_radius {
+                    writeln!(
+                        fmt.writer,
+                        "    blast: {} affected, risk {}",
+                        blast.total_affected, blast.risk_level
+                    )?;
+                }
+            }
+
+            // Combined risk level.
+            if let Some(ref risk) = out.combined_risk_level {
+                writeln!(fmt.writer)?;
+                writeln!(fmt.writer, "Combined risk level: {risk}")?;
+            }
+
+            // Affected flows.
+            if let Some(ref flows) = out.affected_flows {
+                writeln!(fmt.writer)?;
+                writeln!(fmt.writer, "Affected Flows ({}):", flows.len())?;
+                for flow in flows {
+                    let chain: Vec<&str> = flow.steps.iter().map(|s| s.name.as_str()).collect();
+                    writeln!(
+                        fmt.writer,
+                        "  {} (via: {})",
+                        chain.join(" -> "),
+                        flow.matched_symbols.join(", ")
+                    )?;
                 }
             }
 
@@ -3441,5 +3536,138 @@ mod tests {
         assert_eq!(out.tiers.len(), 1);
         assert_eq!(out.tiers[0].severity, "WILL BREAK");
         assert_eq!(out.tiers[0].symbols[0].name, "bar");
+    }
+
+    // -- ChangesOutput (TASK-072) -------------------------------------------
+
+    #[test]
+    fn changes_output_json_serialization() {
+        let out = ChangesOutput {
+            scope: "unstaged".into(),
+            changed_symbols: vec![ChangedSymbolOutput {
+                name: "foo".into(),
+                kind: "function".into(),
+                file: "src/lib.rs".into(),
+                line: 10,
+                change_type: "modified".into(),
+                blast_radius: None,
+            }],
+            combined_risk_level: None,
+            affected_flows: None,
+        };
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"scope\":\"unstaged\""));
+        assert!(json.contains("\"changed_symbols\""));
+        assert!(json.contains("\"foo\""));
+        // Optional fields should be absent when None.
+        assert!(!json.contains("blast_radius"));
+        assert!(!json.contains("affected_flows"));
+        assert!(!json.contains("combined_risk_level"));
+    }
+
+    #[test]
+    fn changes_output_grep_format_basic() {
+        let out = ChangesOutput {
+            scope: "staged".into(),
+            changed_symbols: vec![
+                ChangedSymbolOutput {
+                    name: "foo".into(),
+                    kind: "function".into(),
+                    file: "src/lib.rs".into(),
+                    line: 10,
+                    change_type: "modified".into(),
+                    blast_radius: None,
+                },
+                ChangedSymbolOutput {
+                    name: "Bar".into(),
+                    kind: "class".into(),
+                    file: "src/bar.ts".into(),
+                    line: 1,
+                    change_type: "added".into(),
+                    blast_radius: None,
+                },
+            ],
+            combined_risk_level: None,
+            affected_flows: None,
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_changes(&out));
+        assert!(text.contains("foo"));
+        assert!(text.contains("modified"));
+        assert!(text.contains("Bar"));
+        assert!(text.contains("added"));
+    }
+
+    #[test]
+    fn changes_output_grep_format_with_blast() {
+        let out = ChangesOutput {
+            scope: "unstaged".into(),
+            changed_symbols: vec![ChangedSymbolOutput {
+                name: "process".into(),
+                kind: "function".into(),
+                file: "src/proc.rs".into(),
+                line: 5,
+                change_type: "modified".into(),
+                blast_radius: Some(BlastOutput {
+                    target: "process".into(),
+                    direction: "upstream".into(),
+                    risk_level: "MEDIUM".into(),
+                    total_affected: 5,
+                    tiers: vec![],
+                    affected_files: vec![],
+                }),
+            }],
+            combined_risk_level: Some("MEDIUM".into()),
+            affected_flows: None,
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_changes(&out));
+        assert!(text.contains("process"));
+        assert!(text.contains("MEDIUM"));
+    }
+
+    #[test]
+    fn changes_output_grep_format_with_flows() {
+        let out = ChangesOutput {
+            scope: "unstaged".into(),
+            changed_symbols: vec![ChangedSymbolOutput {
+                name: "handler".into(),
+                kind: "function".into(),
+                file: "src/api.rs".into(),
+                line: 20,
+                change_type: "modified".into(),
+                blast_radius: None,
+            }],
+            combined_risk_level: None,
+            affected_flows: Some(vec![AffectedFlowOutput {
+                entry_point: FlowStepOutput {
+                    name: "main".into(),
+                    kind: "function".into(),
+                    file: "src/main.rs".into(),
+                    line: 1,
+                    depth: 0,
+                },
+                steps: vec![
+                    FlowStepOutput {
+                        name: "main".into(),
+                        kind: "function".into(),
+                        file: "src/main.rs".into(),
+                        line: 1,
+                        depth: 0,
+                    },
+                    FlowStepOutput {
+                        name: "handler".into(),
+                        kind: "function".into(),
+                        file: "src/api.rs".into(),
+                        line: 20,
+                        depth: 1,
+                    },
+                ],
+                step_count: 2,
+                matched_symbols: vec!["handler".into()],
+            }]),
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_changes(&out));
+        assert!(text.contains("handler"));
+        assert!(text.contains("Affected Flows"));
+        assert!(text.contains("main"));
     }
 }

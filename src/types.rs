@@ -541,7 +541,7 @@ impl fmt::Display for BlastSeverity {
 }
 
 /// Overall risk level based on total affected symbol count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BlastRiskLevel {
     /// 0-3 affected symbols.
     Low,
@@ -632,6 +632,21 @@ impl fmt::Display for ChangeScope {
             ChangeScope::Staged => write!(f, "staged"),
             ChangeScope::All => write!(f, "all"),
             ChangeScope::Compare(r) => write!(f, "compare({r})"),
+        }
+    }
+}
+
+impl FromStr for ChangeScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "unstaged" => Ok(ChangeScope::Unstaged),
+            "staged" => Ok(ChangeScope::Staged),
+            "all" => Ok(ChangeScope::All),
+            other => Err(format!(
+                "unknown scope: {other} (expected: unstaged, staged, all, compare)"
+            )),
         }
     }
 }
@@ -1315,5 +1330,14 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    // -- BlastRiskLevel ordering tests (TASK-072) ----------------------------
+
+    #[test]
+    fn blast_risk_level_ordering() {
+        assert!(BlastRiskLevel::Low < BlastRiskLevel::Medium);
+        assert!(BlastRiskLevel::Medium < BlastRiskLevel::High);
+        assert!(BlastRiskLevel::High < BlastRiskLevel::Critical);
     }
 }
