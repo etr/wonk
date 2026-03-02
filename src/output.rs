@@ -495,6 +495,185 @@ pub struct ChangesOutput {
     pub affected_flows: Option<Vec<AffectedFlowOutput>>,
 }
 
+// ---------------------------------------------------------------------------
+// Symbol context output types (TASK-073)
+// ---------------------------------------------------------------------------
+
+/// A caller of a symbol in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCallerOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+}
+
+/// A type user reference in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTypeUserOutput {
+    pub file: String,
+    pub line: usize,
+    pub context: String,
+}
+
+/// An importer in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextImporterOutput {
+    pub file: String,
+}
+
+/// A callee in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCalleeOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+}
+
+/// An import in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextImportOutput {
+    pub path: String,
+}
+
+/// A flow participation in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextFlowOutput {
+    pub entry_point: String,
+    pub step_index: usize,
+}
+
+/// A child symbol in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextChildOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    pub relationship: String,
+}
+
+/// Incoming references in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingRefsOutput {
+    pub callers: Vec<ContextCallerOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub importers: Vec<ContextImporterOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub type_users: Vec<ContextTypeUserOutput>,
+}
+
+/// Outgoing references in context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutgoingRefsOutput {
+    pub callees: Vec<ContextCalleeOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<ContextImportOutput>,
+}
+
+/// Complete symbol context output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolContextOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    pub signature: String,
+    pub incoming: IncomingRefsOutput,
+    pub outgoing: OutgoingRefsOutput,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flows: Vec<ContextFlowOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ContextChildOutput>,
+}
+
+impl From<&crate::types::SymbolContext> for SymbolContextOutput {
+    fn from(ctx: &crate::types::SymbolContext) -> Self {
+        Self {
+            name: ctx.name.clone(),
+            kind: ctx.kind.to_string(),
+            file: ctx.file.clone(),
+            line: ctx.line,
+            end_line: ctx.end_line,
+            signature: ctx.signature.clone(),
+            incoming: IncomingRefsOutput {
+                callers: ctx
+                    .incoming
+                    .callers
+                    .iter()
+                    .map(|c| ContextCallerOutput {
+                        name: c.name.clone(),
+                        kind: c.kind.to_string(),
+                        file: c.file.clone(),
+                        line: c.line,
+                    })
+                    .collect(),
+                importers: ctx
+                    .incoming
+                    .importers
+                    .iter()
+                    .map(|i| ContextImporterOutput {
+                        file: i.file.clone(),
+                    })
+                    .collect(),
+                type_users: ctx
+                    .incoming
+                    .type_users
+                    .iter()
+                    .map(|u| ContextTypeUserOutput {
+                        file: u.file.clone(),
+                        line: u.line,
+                        context: u.context.clone(),
+                    })
+                    .collect(),
+            },
+            outgoing: OutgoingRefsOutput {
+                callees: ctx
+                    .outgoing
+                    .callees
+                    .iter()
+                    .map(|c| ContextCalleeOutput {
+                        name: c.name.clone(),
+                        kind: c.kind.to_string(),
+                        file: c.file.clone(),
+                        line: c.line,
+                    })
+                    .collect(),
+                imports: ctx
+                    .outgoing
+                    .imports
+                    .iter()
+                    .map(|i| ContextImportOutput {
+                        path: i.path.clone(),
+                    })
+                    .collect(),
+            },
+            flows: ctx
+                .flows
+                .iter()
+                .map(|f| ContextFlowOutput {
+                    entry_point: f.entry_point.clone(),
+                    step_index: f.step_index,
+                })
+                .collect(),
+            children: ctx
+                .children
+                .iter()
+                .map(|c| ContextChildOutput {
+                    name: c.name.clone(),
+                    kind: c.kind.to_string(),
+                    file: c.file.clone(),
+                    line: c.line,
+                    relationship: c.relationship.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
 /// output. In grep mode the summary goes to stderr instead.
 #[derive(Debug, Clone, Serialize)]
@@ -1408,6 +1587,126 @@ impl<W: Write> Formatter<W> {
                 }
             }
 
+            Ok(())
+        }
+    }
+
+    /// Format a `wonk context` result (one or more symbol contexts).
+    pub fn format_context(
+        &mut self,
+        contexts: &[SymbolContextOutput],
+    ) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_context(self, contexts)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let contexts = contexts.to_vec();
+        self.budgeted_write(move |fmt| Self::render_context(fmt, &contexts))
+    }
+
+    /// Shared render logic for symbol context output.
+    fn render_context<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        contexts: &[SymbolContextOutput],
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            // Structured output: emit as a JSON array or TOON.
+            // to_vec() needed because serialize_structured requires Sized (serde_toon2 constraint).
+            let owned: Vec<SymbolContextOutput> = contexts.to_vec();
+            let line = Self::serialize_structured(fmt.format, &owned)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            for (i, ctx) in contexts.iter().enumerate() {
+                if i > 0 {
+                    writeln!(fmt.writer)?;
+                    writeln!(fmt.writer, "---")?;
+                    writeln!(fmt.writer)?;
+                }
+
+                // Definition header.
+                writeln!(
+                    fmt.writer,
+                    "{} ({}) in {}:{}",
+                    ctx.name, ctx.kind, ctx.file, ctx.line
+                )?;
+                writeln!(fmt.writer, "  {}", ctx.signature)?;
+                writeln!(fmt.writer)?;
+
+                // Incoming references.
+                if !ctx.incoming.callers.is_empty() {
+                    writeln!(fmt.writer, "Callers ({}):", ctx.incoming.callers.len())?;
+                    for c in &ctx.incoming.callers {
+                        writeln!(
+                            fmt.writer,
+                            "  {}:{}\t{} ({})",
+                            c.file, c.line, c.name, c.kind
+                        )?;
+                    }
+                    writeln!(fmt.writer)?;
+                }
+
+                if !ctx.incoming.importers.is_empty() {
+                    writeln!(fmt.writer, "Importers ({}):", ctx.incoming.importers.len())?;
+                    for im in &ctx.incoming.importers {
+                        writeln!(fmt.writer, "  {}", im.file)?;
+                    }
+                    writeln!(fmt.writer)?;
+                }
+
+                if !ctx.incoming.type_users.is_empty() {
+                    writeln!(
+                        fmt.writer,
+                        "Type Users ({}):",
+                        ctx.incoming.type_users.len()
+                    )?;
+                    for u in &ctx.incoming.type_users {
+                        writeln!(fmt.writer, "  {}:{}\t{}", u.file, u.line, u.context)?;
+                    }
+                    writeln!(fmt.writer)?;
+                }
+
+                // Outgoing references.
+                if !ctx.outgoing.callees.is_empty() {
+                    writeln!(fmt.writer, "Callees ({}):", ctx.outgoing.callees.len())?;
+                    for c in &ctx.outgoing.callees {
+                        writeln!(
+                            fmt.writer,
+                            "  {}:{}\t{} ({})",
+                            c.file, c.line, c.name, c.kind
+                        )?;
+                    }
+                    writeln!(fmt.writer)?;
+                }
+
+                if !ctx.outgoing.imports.is_empty() {
+                    writeln!(fmt.writer, "Imports ({}):", ctx.outgoing.imports.len())?;
+                    for im in &ctx.outgoing.imports {
+                        writeln!(fmt.writer, "  {}", im.path)?;
+                    }
+                    writeln!(fmt.writer)?;
+                }
+
+                // Flow participation.
+                if !ctx.flows.is_empty() {
+                    writeln!(fmt.writer, "Flows ({}):", ctx.flows.len())?;
+                    for f in &ctx.flows {
+                        writeln!(fmt.writer, "  {} (step {})", f.entry_point, f.step_index)?;
+                    }
+                    writeln!(fmt.writer)?;
+                }
+
+                // Children.
+                if !ctx.children.is_empty() {
+                    writeln!(fmt.writer, "Children ({}):", ctx.children.len())?;
+                    for c in &ctx.children {
+                        writeln!(
+                            fmt.writer,
+                            "  {}:{}\t{} ({}) [{}]",
+                            c.file, c.line, c.name, c.kind, c.relationship
+                        )?;
+                    }
+                }
+            }
             Ok(())
         }
     }
@@ -3669,5 +3968,189 @@ mod tests {
         assert!(text.contains("handler"));
         assert!(text.contains("Affected Flows"));
         assert!(text.contains("main"));
+    }
+
+    // -- SymbolContext output tests (TASK-073) --------------------------------
+
+    #[test]
+    fn format_context_grep_shows_definition() {
+        let ctx = SymbolContextOutput {
+            name: "processPayment".into(),
+            kind: "function".into(),
+            file: "src/billing.ts".into(),
+            line: 10,
+            end_line: Some(25),
+            signature: "function processPayment(amount: number)".into(),
+            incoming: IncomingRefsOutput {
+                callers: vec![ContextCallerOutput {
+                    name: "checkout".into(),
+                    kind: "function".into(),
+                    file: "src/checkout.ts".into(),
+                    line: 5,
+                }],
+                importers: vec![],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefsOutput {
+                callees: vec![ContextCalleeOutput {
+                    name: "charge".into(),
+                    kind: "function".into(),
+                    file: "src/stripe.ts".into(),
+                    line: 20,
+                }],
+                imports: vec![],
+            },
+            flows: vec![],
+            children: vec![],
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_context(&[ctx]));
+        assert!(text.contains("processPayment (function) in src/billing.ts:10"));
+        assert!(text.contains("function processPayment(amount: number)"));
+        assert!(text.contains("Callers (1):"));
+        assert!(text.contains("checkout"));
+        assert!(text.contains("Callees (1):"));
+        assert!(text.contains("charge"));
+    }
+
+    #[test]
+    fn format_context_grep_shows_children() {
+        let ctx = SymbolContextOutput {
+            name: "BaseHandler".into(),
+            kind: "class".into(),
+            file: "src/handler.ts".into(),
+            line: 1,
+            end_line: None,
+            signature: "class BaseHandler".into(),
+            incoming: IncomingRefsOutput {
+                callers: vec![],
+                importers: vec![],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefsOutput {
+                callees: vec![],
+                imports: vec![],
+            },
+            flows: vec![],
+            children: vec![ContextChildOutput {
+                name: "PaymentHandler".into(),
+                kind: "class".into(),
+                file: "src/payment.ts".into(),
+                line: 5,
+                relationship: "extends".into(),
+            }],
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_context(&[ctx]));
+        assert!(text.contains("Children (1):"));
+        assert!(text.contains("PaymentHandler"));
+        assert!(text.contains("[extends]"));
+    }
+
+    #[test]
+    fn format_context_json_serializes() {
+        let ctx = SymbolContextOutput {
+            name: "foo".into(),
+            kind: "function".into(),
+            file: "a.rs".into(),
+            line: 1,
+            end_line: None,
+            signature: "fn foo()".into(),
+            incoming: IncomingRefsOutput {
+                callers: vec![],
+                importers: vec![],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefsOutput {
+                callees: vec![],
+                imports: vec![],
+            },
+            flows: vec![],
+            children: vec![],
+        };
+        let text = render(OutputFormat::Json, |fmt| fmt.format_context(&[ctx]));
+        assert!(text.contains("\"name\":\"foo\""));
+        assert!(text.contains("\"kind\":\"function\""));
+    }
+
+    #[test]
+    fn format_context_from_symbol_context_type() {
+        use crate::types::{ContextCaller, IncomingRefs, OutgoingRefs, SymbolContext, SymbolKind};
+        let ctx = SymbolContext {
+            name: "dispatch".into(),
+            kind: SymbolKind::Function,
+            file: "src/router.rs".into(),
+            line: 50,
+            end_line: Some(100),
+            signature: "fn dispatch()".into(),
+            incoming: IncomingRefs {
+                callers: vec![ContextCaller {
+                    name: "main".into(),
+                    kind: SymbolKind::Function,
+                    file: "src/main.rs".into(),
+                    line: 10,
+                }],
+                importers: vec![],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefs {
+                callees: vec![],
+                imports: vec![],
+            },
+            flows: vec![],
+            children: vec![],
+        };
+        let out = SymbolContextOutput::from(&ctx);
+        assert_eq!(out.name, "dispatch");
+        assert_eq!(out.kind, "function");
+        assert_eq!(out.incoming.callers.len(), 1);
+        assert_eq!(out.incoming.callers[0].name, "main");
+    }
+
+    #[test]
+    fn format_context_multiple_symbols_separated() {
+        let ctx1 = SymbolContextOutput {
+            name: "foo".into(),
+            kind: "function".into(),
+            file: "a.rs".into(),
+            line: 1,
+            end_line: None,
+            signature: "fn foo()".into(),
+            incoming: IncomingRefsOutput {
+                callers: vec![],
+                importers: vec![],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefsOutput {
+                callees: vec![],
+                imports: vec![],
+            },
+            flows: vec![],
+            children: vec![],
+        };
+        let ctx2 = SymbolContextOutput {
+            name: "bar".into(),
+            kind: "function".into(),
+            file: "b.rs".into(),
+            line: 5,
+            end_line: None,
+            signature: "fn bar()".into(),
+            incoming: IncomingRefsOutput {
+                callers: vec![],
+                importers: vec![],
+                type_users: vec![],
+            },
+            outgoing: OutgoingRefsOutput {
+                callees: vec![],
+                imports: vec![],
+            },
+            flows: vec![],
+            children: vec![],
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_context(&[ctx1, ctx2]));
+        assert!(text.contains("foo"));
+        assert!(text.contains("bar"));
+        assert!(
+            text.contains("---"),
+            "multiple symbols should be separated by ---"
+        );
     }
 }

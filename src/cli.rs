@@ -95,6 +95,9 @@ pub enum Command {
 
     /// Detect changed symbols and optionally chain blast/flow analysis
     Changes(ChangesArgs),
+
+    /// Aggregate full context for a symbol: definition, callers, callees, importers, flows, children
+    Context(ContextArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -405,6 +408,24 @@ pub struct ChangesArgs {
     pub flows: bool,
 
     /// Minimum confidence threshold (0.0-1.0) for blast/flow edges
+    #[arg(long)]
+    pub min_confidence: Option<f64>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ContextArgs {
+    /// Symbol name to look up
+    pub name: String,
+
+    /// Restrict to symbols in this file
+    #[arg(long)]
+    pub file: Option<String>,
+
+    /// Filter by symbol kind (e.g. function, class)
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Minimum confidence threshold (0.0-1.0) to filter edges
     #[arg(long)]
     pub min_confidence: Option<f64>,
 }
@@ -1260,6 +1281,97 @@ mod tests {
                 assert_eq!(args.min_confidence, Some(0.8));
             }
             _ => panic!("expected Command::Changes"),
+        }
+    }
+
+    // -- Context tests (TASK-073) ---------------------------------------------
+
+    #[test]
+    fn parse_context_basic() {
+        let cli = Cli::try_parse_from(["wonk", "context", "processPayment"]).unwrap();
+        match cli.command {
+            Command::Context(args) => {
+                assert_eq!(args.name, "processPayment");
+                assert!(args.file.is_none());
+                assert!(args.kind.is_none());
+                assert!(args.min_confidence.is_none());
+            }
+            _ => panic!("expected Command::Context"),
+        }
+    }
+
+    #[test]
+    fn parse_context_with_file() {
+        let cli = Cli::try_parse_from(["wonk", "context", "--file", "src/auth.ts", "verifyToken"])
+            .unwrap();
+        match cli.command {
+            Command::Context(args) => {
+                assert_eq!(args.name, "verifyToken");
+                assert_eq!(args.file.as_deref(), Some("src/auth.ts"));
+            }
+            _ => panic!("expected Command::Context"),
+        }
+    }
+
+    #[test]
+    fn parse_context_with_kind() {
+        let cli =
+            Cli::try_parse_from(["wonk", "context", "--kind", "class", "StripeClient"]).unwrap();
+        match cli.command {
+            Command::Context(args) => {
+                assert_eq!(args.kind.as_deref(), Some("class"));
+            }
+            _ => panic!("expected Command::Context"),
+        }
+    }
+
+    #[test]
+    fn parse_context_with_min_confidence() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "context",
+            "--min-confidence",
+            "0.8",
+            "processPayment",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Context(args) => {
+                assert_eq!(args.min_confidence, Some(0.8));
+            }
+            _ => panic!("expected Command::Context"),
+        }
+    }
+
+    #[test]
+    fn parse_context_requires_name() {
+        let result = Cli::try_parse_from(["wonk", "context"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_context_with_global_format() {
+        let cli =
+            Cli::try_parse_from(["wonk", "--format", "json", "context", "processPayment"]).unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Context(args) => {
+                assert_eq!(args.name, "processPayment");
+            }
+            _ => panic!("expected Command::Context"),
+        }
+    }
+
+    #[test]
+    fn parse_context_with_global_budget() {
+        let cli =
+            Cli::try_parse_from(["wonk", "--budget", "500", "context", "processPayment"]).unwrap();
+        assert_eq!(cli.budget, Some(500));
+        match cli.command {
+            Command::Context(args) => {
+                assert_eq!(args.name, "processPayment");
+            }
+            _ => panic!("expected Command::Context"),
         }
     }
 }

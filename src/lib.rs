@@ -5,6 +5,7 @@ pub mod cli;
 pub mod cluster;
 pub mod color;
 pub mod config;
+pub mod context;
 pub mod daemon;
 pub mod db;
 pub mod embedding;
