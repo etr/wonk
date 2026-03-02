@@ -636,6 +636,21 @@ impl fmt::Display for ChangeScope {
     }
 }
 
+impl FromStr for ChangeScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "unstaged" => Ok(ChangeScope::Unstaged),
+            "staged" => Ok(ChangeScope::Staged),
+            "all" => Ok(ChangeScope::All),
+            other => Err(format!(
+                "unknown scope: {other} (expected: unstaged, staged, all, compare)"
+            )),
+        }
+    }
+}
+
 /// Result of scoped change analysis: all changed symbols across files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeAnalysis {

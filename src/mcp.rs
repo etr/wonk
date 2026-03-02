@@ -204,6 +204,15 @@ fn extract_format(args: &Value) -> OutputFormat {
         .unwrap_or(OutputFormat::Json)
 }
 
+/// Clamp a confidence value to `[0.0, 1.0]`, mapping NaN/Inf to 0.0.
+fn clamp_confidence(c: f64) -> f64 {
+    if c.is_nan() || c.is_infinite() {
+        0.0
+    } else {
+        c.clamp(0.0, 1.0)
+    }
+}
+
 /// Convert a `Symbol` to the serializable `SymbolOutput`.
 fn symbol_to_output(sym: &Symbol) -> SymbolOutput {
     SymbolOutput {
@@ -1591,31 +1600,27 @@ impl McpServer {
             .get("scope")
             .and_then(|v| v.as_str())
             .unwrap_or("unstaged");
-        let scope = match scope_str {
-            "unstaged" => crate::types::ChangeScope::Unstaged,
-            "staged" => crate::types::ChangeScope::Staged,
-            "all" => crate::types::ChangeScope::All,
-            "compare" => {
-                let base = match args.get("base").and_then(|v| v.as_str()) {
-                    Some(b) => b.to_string(),
-                    None => {
-                        return CallToolResult::error(
-                            "'base' is required when scope=compare".into(),
-                        );
-                    }
-                };
-                crate::types::ChangeScope::Compare(base)
-            }
-            other => {
-                return CallToolResult::error(format!(
-                    "unknown scope: {other} (expected: unstaged, staged, all, compare)"
-                ));
+        let scope = if scope_str == "compare" {
+            let base = match args.get("base").and_then(|v| v.as_str()) {
+                Some(b) => b.to_string(),
+                None => {
+                    return CallToolResult::error("'base' is required when scope=compare".into());
+                }
+            };
+            crate::types::ChangeScope::Compare(base)
+        } else {
+            match scope_str.parse::<crate::types::ChangeScope>() {
+                Ok(s) => s,
+                Err(e) => return CallToolResult::error(e),
             }
         };
 
         let blast = args.get("blast").and_then(|v| v.as_bool()).unwrap_or(false);
         let flows = args.get("flows").and_then(|v| v.as_bool()).unwrap_or(false);
-        let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
+        let min_confidence = args
+            .get("min_confidence")
+            .and_then(|v| v.as_f64())
+            .map(clamp_confidence);
 
         // Detect changes.
         let analysis = match crate::impact::detect_changes(conn, &scope, &repo_root) {
@@ -1623,107 +1628,20 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("change detection failed: {e}")),
         };
 
-        // Build output.
-        let mut combined_risk: Option<crate::types::BlastRiskLevel> = None;
-        let mut changed_outputs: Vec<crate::output::ChangedSymbolOutput> = Vec::new();
-
-        for cs in &analysis.changed_symbols {
-            let blast_out = if blast && cs.change_type != crate::types::ChangeType::Removed {
-                let blast_opts = crate::blast::BlastOptions {
-                    depth: crate::blast::DEFAULT_DEPTH,
-                    direction: crate::types::BlastDirection::Upstream,
-                    include_tests: false,
-                    min_confidence,
-                };
-                match crate::blast::analyze_blast(conn, &cs.name, &blast_opts) {
-                    Ok(ref result) => {
-                        combined_risk = Some(match combined_risk {
-                            Some(current) => std::cmp::max(current, result.risk_level),
-                            None => result.risk_level,
-                        });
-                        Some(crate::output::BlastOutput::from(result))
-                    }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-
-            changed_outputs.push(crate::output::ChangedSymbolOutput {
-                name: cs.name.clone(),
-                kind: cs.kind.to_string(),
-                file: cs.file.clone(),
-                line: cs.line,
-                change_type: cs.change_type.to_string(),
-                blast_radius: blast_out,
-            });
-        }
-
-        // Affected flows.
-        let affected_flows = if flows {
-            let flow_opts = crate::flows::FlowOptions {
-                depth: crate::flows::DEFAULT_DEPTH,
-                branching: crate::flows::DEFAULT_BRANCHING,
+        // Build output using shared helper.
+        let changes_out = match crate::router::build_changes_output(
+            conn,
+            &analysis,
+            &scope,
+            &crate::router::ChangesChainOptions {
+                blast,
+                flows,
                 min_confidence,
-                from_file: None,
-            };
-
-            let changed_names: std::collections::HashSet<String> = analysis
-                .changed_symbols
-                .iter()
-                .map(|cs| cs.name.clone())
-                .collect();
-
-            let mut matched_flows = Vec::new();
-            if let Ok(entries) = crate::flows::detect_entry_points(conn, &flow_opts) {
-                for entry in &entries {
-                    if let Ok(Some(flow)) = crate::flows::trace_flow(conn, &entry.name, &flow_opts)
-                    {
-                        let matched: Vec<String> = flow
-                            .steps
-                            .iter()
-                            .filter(|step| changed_names.contains(&step.name))
-                            .map(|step| step.name.clone())
-                            .collect();
-
-                        if !matched.is_empty() {
-                            let steps: Vec<crate::output::FlowStepOutput> = flow
-                                .steps
-                                .iter()
-                                .map(crate::output::FlowStepOutput::from)
-                                .collect();
-                            matched_flows.push(crate::output::AffectedFlowOutput {
-                                entry_point: crate::output::FlowStepOutput::from(&flow.entry_point),
-                                step_count: steps.len(),
-                                steps,
-                                matched_symbols: matched,
-                            });
-                        }
-                    }
-                }
-            }
-
-            if matched_flows.is_empty() {
-                None
-            } else {
-                Some(matched_flows)
-            }
-        } else {
-            None
-        };
-
-        let scope_display = match &scope {
-            crate::types::ChangeScope::Unstaged => "unstaged".to_string(),
-            crate::types::ChangeScope::Staged => "staged".to_string(),
-            crate::types::ChangeScope::All => "all".to_string(),
-            crate::types::ChangeScope::Compare(r) => format!("compare({r})"),
-        };
-
-        let changes_out = crate::output::ChangesOutput {
-            scope: scope_display,
-            changed_symbols: changed_outputs,
-            combined_risk_level: combined_risk.map(|r| r.to_string()),
-            affected_flows,
+            },
+            |_| {},
+        ) {
+            Ok(o) => o,
+            Err(e) => return CallToolResult::error(format!("changes analysis failed: {e}")),
         };
 
         format_result(&changes_out, format)

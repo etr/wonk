@@ -1320,7 +1320,7 @@ fn dispatch_changes<W: io::Write>(
     fmt: &mut Formatter<W>,
     suppress: bool,
 ) -> Result<()> {
-    use crate::types::{BlastRiskLevel, ChangeScope, ChangeType};
+    use crate::types::ChangeScope;
 
     // 1. Resolve repo root and open connection.
     let repo_root = std::env::current_dir()
@@ -1333,17 +1333,15 @@ fn dispatch_changes<W: io::Write>(
         .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
 
     // 2. Parse scope string to ChangeScope enum.
-    let scope = match args.scope.as_str() {
-        "unstaged" => ChangeScope::Unstaged,
-        "staged" => ChangeScope::Staged,
-        "all" => ChangeScope::All,
-        "compare" => {
-            let base = args
-                .base
-                .ok_or_else(|| anyhow::anyhow!("--base is required when --scope=compare"))?;
-            ChangeScope::Compare(base)
-        }
-        other => anyhow::bail!("unknown scope: {other} (expected: unstaged, staged, all, compare)"),
+    let scope = if args.scope == "compare" {
+        let base = args
+            .base
+            .ok_or_else(|| anyhow::anyhow!("--base is required when --scope=compare"))?;
+        ChangeScope::Compare(base)
+    } else {
+        args.scope
+            .parse::<ChangeScope>()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
     };
 
     // 3. Detect changes.
@@ -1353,29 +1351,68 @@ fn dispatch_changes<W: io::Write>(
         output::print_hint("no changed symbols detected", suppress);
     }
 
-    // 4. Build ChangedSymbolOutput vec, optionally with blast radius.
+    // 4. Build output with optional blast/flow chaining.
+    let changes_out = build_changes_output(
+        &conn,
+        &analysis,
+        &scope,
+        &ChangesChainOptions {
+            blast: args.blast,
+            flows: args.flows,
+            min_confidence: args.min_confidence,
+        },
+        |msg| output::print_hint(msg, suppress),
+    )?;
+
+    fmt.format_changes(&changes_out)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared changes output builder (used by CLI dispatch and MCP tool)
+// ---------------------------------------------------------------------------
+
+/// Options for blast/flow chaining in `build_changes_output`.
+pub(crate) struct ChangesChainOptions {
+    pub blast: bool,
+    pub flows: bool,
+    pub min_confidence: Option<f64>,
+}
+
+/// Build a [`ChangesOutput`] from a [`ChangeAnalysis`], optionally chaining
+/// blast radius and flow detection. `warn_fn` is called for non-fatal blast
+/// errors (CLI prints to stderr; MCP can ignore).
+pub(crate) fn build_changes_output(
+    conn: &rusqlite::Connection,
+    analysis: &crate::types::ChangeAnalysis,
+    scope: &crate::types::ChangeScope,
+    opts: &ChangesChainOptions,
+    mut warn_fn: impl FnMut(&str),
+) -> Result<ChangesOutput> {
+    use crate::types::{BlastRiskLevel, ChangeType};
+
+    // Build ChangedSymbolOutput vec, optionally with blast radius.
     let mut combined_risk: Option<BlastRiskLevel> = None;
     let mut changed_outputs: Vec<ChangedSymbolOutput> = Vec::new();
 
     for cs in &analysis.changed_symbols {
-        let blast_out = if args.blast && cs.change_type != ChangeType::Removed {
+        let blast_out = if opts.blast && cs.change_type != ChangeType::Removed {
             let blast_opts = crate::blast::BlastOptions {
                 depth: crate::blast::DEFAULT_DEPTH,
                 direction: crate::types::BlastDirection::Upstream,
                 include_tests: false,
-                min_confidence: args.min_confidence,
+                min_confidence: opts.min_confidence,
             };
-            match crate::blast::analyze_blast(&conn, &cs.name, &blast_opts) {
+            match crate::blast::analyze_blast(conn, &cs.name, &blast_opts) {
                 Ok(ref result) => {
-                    // Track combined risk level (take the max).
-                    combined_risk = Some(match combined_risk {
-                        Some(current) => std::cmp::max(current, result.risk_level),
-                        None => result.risk_level,
-                    });
+                    combined_risk = Some(
+                        combined_risk
+                            .map_or(result.risk_level, |c| std::cmp::max(c, result.risk_level)),
+                    );
                     Some(BlastOutput::from(result))
                 }
                 Err(e) => {
-                    eprintln!("wonk: warning: blast analysis failed for {}: {e}", cs.name);
+                    warn_fn(&format!("blast analysis failed for {}: {e}", cs.name));
                     None
                 }
             }
@@ -1393,33 +1430,30 @@ fn dispatch_changes<W: io::Write>(
         });
     }
 
-    // 5. If --flows: detect affected execution flows.
-    let affected_flows = if args.flows {
+    // Detect affected execution flows.
+    let affected_flows = if opts.flows && !analysis.changed_symbols.is_empty() {
         let flow_opts = crate::flows::FlowOptions {
             depth: crate::flows::DEFAULT_DEPTH,
             branching: crate::flows::DEFAULT_BRANCHING,
-            min_confidence: args.min_confidence,
+            min_confidence: opts.min_confidence,
             from_file: None,
         };
 
-        // Collect changed symbol names for matching.
-        let changed_names: std::collections::HashSet<String> = analysis
+        let changed_names: std::collections::HashSet<&str> = analysis
             .changed_symbols
             .iter()
-            .map(|cs| cs.name.clone())
+            .map(|cs| cs.name.as_str())
             .collect();
 
-        // Detect entry points and trace each flow.
-        let entries = crate::flows::detect_entry_points(&conn, &flow_opts)?;
+        let entries = crate::flows::detect_entry_points(conn, &flow_opts)?;
         let mut matched_flows: Vec<AffectedFlowOutput> = Vec::new();
 
         for entry in &entries {
-            if let Some(flow) = crate::flows::trace_flow(&conn, &entry.name, &flow_opts)? {
-                // Check if any step matches a changed symbol.
-                let matched: Vec<String> = flow
-                    .steps
-                    .iter()
-                    .filter(|step| changed_names.contains(&step.name))
+            if let Some(flow) = crate::flows::trace_flow(conn, &entry.name, &flow_opts)? {
+                // Check entry point AND steps for changed symbol matches.
+                let matched: Vec<String> = std::iter::once(&flow.entry_point)
+                    .chain(flow.steps.iter())
+                    .filter(|step| changed_names.contains(step.name.as_str()))
                     .map(|step| step.name.clone())
                     .collect();
 
@@ -1448,24 +1482,12 @@ fn dispatch_changes<W: io::Write>(
         None
     };
 
-    // 6. Build ChangesOutput.
-    let scope_str = match &scope {
-        ChangeScope::Unstaged => "unstaged".to_string(),
-        ChangeScope::Staged => "staged".to_string(),
-        ChangeScope::All => "all".to_string(),
-        ChangeScope::Compare(r) => format!("compare({r})"),
-    };
-
-    let changes_out = ChangesOutput {
-        scope: scope_str,
+    Ok(ChangesOutput {
+        scope: scope.to_string(),
         changed_symbols: changed_outputs,
         combined_risk_level: combined_risk.map(|r| r.to_string()),
         affected_flows,
-    };
-
-    // 7. Format and emit.
-    fmt.format_changes(&changes_out)?;
-    Ok(())
+    })
 }
 
 /// Open a call graph connection: resolve repo root, open index, check
