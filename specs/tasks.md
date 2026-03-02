@@ -3013,7 +3013,7 @@ Add `wonk changes` CLI subcommand with `--blast` and `--flows` chaining that cal
 **Related Requirements:** PRD-CHG-REQ-006 through PRD-CHG-REQ-009
 **Related Decisions:** DR-025
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
