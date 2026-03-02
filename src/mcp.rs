@@ -6,6 +6,7 @@
 //!
 //! Transport: NDJSON over stdin/stdout. No async runtime required.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -275,7 +276,12 @@ fn validate_path(path: &Path, repo_root: &Path) -> Result<PathBuf, CallToolResul
 fn tool_definitions() -> &'static Vec<Tool> {
     static TOOLS: OnceLock<Vec<Tool>> = OnceLock::new();
     TOOLS.get_or_init(|| {
-        vec![
+        let repo_prop = serde_json::json!({
+            "type": "string",
+            "description": "Target repository name (last path component). Omit to use the working directory repo."
+        });
+
+        let mut tools = vec![
             Tool {
                 name: "wonk_search",
                 description: "Full-text search across the codebase with structural ranking. Results are classified (definition > call site > import > other > comment > test) and deduplicated.",
@@ -826,8 +832,175 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     "required": ["name"]
                 }),
             },
-        ]
+        ];
+
+        // Inject optional `repo` parameter into all existing tools.
+        for tool in &mut tools {
+            if let Some(props) = tool.input_schema.get_mut("properties")
+                && let Some(obj) = props.as_object_mut()
+            {
+                obj.insert("repo".to_string(), repo_prop.clone());
+            }
+        }
+
+        // Add the wonk_repos tool (does not get repo param — it lists all repos).
+        tools.push(Tool {
+            name: "wonk_repos",
+            description: "List all indexed repositories available for querying. Returns name, path, file count, symbol count, and last indexed time for each repo.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "format": {
+                        "type": "string",
+                        "enum": ["json", "toon"],
+                        "description": "Output format (default: json)",
+                        "default": "json"
+                    }
+                }
+            }),
+        });
+
+        tools
     })
+}
+
+// ---------------------------------------------------------------------------
+// Multi-repo registry
+// ---------------------------------------------------------------------------
+
+/// Metadata for a discovered indexed repository.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct RepoEntry {
+    /// Absolute path to the repository root.
+    repo_path: PathBuf,
+    /// Absolute path to the index.db file.
+    index_path: PathBuf,
+    /// Short name (last component of repo_path).
+    name: String,
+    /// Languages detected during indexing.
+    languages: Vec<String>,
+    /// Unix timestamp when the index was created.
+    created: u64,
+}
+
+/// Registry of all discovered indexed repositories.
+#[allow(dead_code)]
+struct RepoRegistry {
+    entries: Vec<RepoEntry>,
+    /// Lazy-opened connections keyed by index_path string.
+    connections: HashMap<String, Connection>,
+}
+
+/// Result of resolving a repo reference.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ResolvedRepo {
+    index_path: PathBuf,
+    repo_path: PathBuf,
+    name: String,
+}
+
+#[allow(dead_code)]
+impl RepoRegistry {
+    fn new(entries: Vec<RepoEntry>) -> Self {
+        Self {
+            entries,
+            connections: HashMap::new(),
+        }
+    }
+
+    /// Resolve a repo name to a single `ResolvedRepo`.
+    ///
+    /// Matches by last path component of the repo root. Returns an error
+    /// listing all matching paths if the name is ambiguous.
+    fn resolve(&self, name: &str) -> Result<ResolvedRepo, String> {
+        let matches: Vec<&RepoEntry> = self.entries.iter().filter(|e| e.name == name).collect();
+
+        match matches.len() {
+            0 => {
+                let available: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+                Err(format!(
+                    "unknown repo '{}'; available repos: {}",
+                    name,
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ))
+            }
+            1 => {
+                let entry = matches[0];
+                Ok(ResolvedRepo {
+                    index_path: entry.index_path.clone(),
+                    repo_path: entry.repo_path.clone(),
+                    name: entry.name.clone(),
+                })
+            }
+            _ => {
+                let paths: Vec<String> = matches
+                    .iter()
+                    .map(|e| e.repo_path.display().to_string())
+                    .collect();
+                Err(format!(
+                    "ambiguous repo name '{}'; matches: {}",
+                    name,
+                    paths.join(", ")
+                ))
+            }
+        }
+    }
+
+    /// Get or lazily open a connection for the given index path.
+    fn get_or_open_connection(&mut self, index_path: &Path) -> Result<&Connection, String> {
+        let key = index_path.to_string_lossy().into_owned();
+        if !self.connections.contains_key(&key) {
+            let conn = db::open_existing(index_path)
+                .map_err(|e| format!("failed to open index at {}: {e}", index_path.display()))?;
+            self.connections.insert(key.clone(), conn);
+        }
+        Ok(self.connections.get(&key).expect("just inserted"))
+    }
+}
+
+/// Discover all indexed repositories under a repos directory.
+///
+/// Scans `repos_dir/*/meta.json` to find all indexed repos and reads their
+/// metadata. Also checks for a local index at `<repo_root>/.wonk/index.db`.
+fn discover_repos(repos_dir: &Path) -> Vec<RepoEntry> {
+    let mut entries = Vec::new();
+
+    if repos_dir.is_dir()
+        && let Ok(read_dir) = std::fs::read_dir(repos_dir)
+    {
+        for dir_entry in read_dir.flatten() {
+            let index_dir = dir_entry.path();
+            if !index_dir.is_dir() {
+                continue;
+            }
+            let index_path = index_dir.join("index.db");
+            if !index_path.exists() {
+                continue;
+            }
+            if let Ok(meta) = db::read_meta(&index_path) {
+                let repo_path = PathBuf::from(&meta.repo_path);
+                let name = repo_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".to_string());
+                entries.push(RepoEntry {
+                    repo_path,
+                    index_path,
+                    name,
+                    languages: meta.languages,
+                    created: meta.created,
+                });
+            }
+        }
+    }
+
+    entries
 }
 
 // ---------------------------------------------------------------------------
@@ -836,12 +1009,58 @@ fn tool_definitions() -> &'static Vec<Tool> {
 
 struct McpServer {
     router: QueryRouter,
+    #[allow(dead_code)]
+    default_repo_root: PathBuf,
+    #[allow(dead_code)]
+    registry: RepoRegistry,
 }
 
 impl McpServer {
-    fn new(repo_root: PathBuf) -> Self {
-        let router = QueryRouter::new(Some(repo_root), false);
-        Self { router }
+    fn new(repo_root: PathBuf, registry: RepoRegistry) -> Self {
+        let router = QueryRouter::new(Some(repo_root.clone()), false);
+        Self {
+            router,
+            default_repo_root: repo_root,
+            registry,
+        }
+    }
+
+    /// Resolve which repo connection and root to use for a tool call.
+    ///
+    /// If `args` contains a `"repo"` string, look it up in the registry and
+    /// lazily open a connection. Otherwise, use the default (working directory)
+    /// router's connection and repo root.
+    ///
+    /// Returns `Ok((conn_ref, repo_root))` or `Err(CallToolResult)` on failure.
+    fn resolve_repo<'a>(
+        &'a mut self,
+        args: &Value,
+    ) -> Result<(&'a Connection, PathBuf), CallToolResult> {
+        if let Some(repo_name) = args.get("repo").and_then(|v| v.as_str()) {
+            let resolved = self
+                .registry
+                .resolve(repo_name)
+                .map_err(CallToolResult::error)?;
+            let repo_path = resolved.repo_path.clone();
+            let index_path = resolved.index_path.clone();
+            let conn = self
+                .registry
+                .get_or_open_connection(&index_path)
+                .map_err(CallToolResult::error)?;
+            Ok((conn, repo_path))
+        } else {
+            match self.router.conn() {
+                Some(c) => Ok((c, self.router.repo_root().to_path_buf())),
+                None => Err(CallToolResult::error(
+                    "no index available; run wonk_init first".into(),
+                )),
+            }
+        }
+    }
+
+    /// Check if a `repo` param is present in the args.
+    fn has_repo_param(args: &Value) -> bool {
+        args.get("repo").and_then(|v| v.as_str()).is_some()
     }
 
     fn handle_initialize(&self, _params: &Value) -> Value {
@@ -862,7 +1081,7 @@ impl McpServer {
         serde_json::json!({ "tools": tool_definitions() })
     }
 
-    fn handle_tools_call(&self, params: &Value) -> Value {
+    fn handle_tools_call(&mut self, params: &Value) -> Value {
         let call: CallToolParams = match serde_json::from_value(params.clone()) {
             Ok(p) => p,
             Err(_) => {
@@ -892,6 +1111,7 @@ impl McpServer {
             "wonk_blast" => self.tool_blast(call.arguments),
             "wonk_changes" => self.tool_changes(call.arguments),
             "wonk_context" => self.tool_context(call.arguments),
+            "wonk_repos" => self.tool_repos(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -900,7 +1120,7 @@ impl McpServer {
 
     // -- Tool handlers -------------------------------------------------------
 
-    fn tool_search(&self, args: Value) -> CallToolResult {
+    fn tool_search(&mut self, args: Value) -> CallToolResult {
         let query = match require_str(&args, "query") {
             Ok(q) => q,
             Err(e) => return e,
@@ -910,7 +1130,7 @@ impl McpServer {
             .get("case_insensitive")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let paths: Vec<String> = args
+        let mut paths: Vec<String> = args
             .get("paths")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
@@ -920,12 +1140,26 @@ impl McpServer {
             .map(|v| v as usize);
         let format = extract_format(&args);
 
+        // For cross-repo search, set the search path to the target repo root.
+        let ranker_conn: Option<&Connection> = if Self::has_repo_param(&args) {
+            let (conn, repo_root) = match self.resolve_repo(&args) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if paths.is_empty() {
+                paths.push(repo_root.to_string_lossy().into_owned());
+            }
+            Some(conn)
+        } else {
+            self.router.conn()
+        };
+
         let results = match search::text_search(&query, regex, case_insensitive, &paths) {
             Ok(r) => r,
             Err(_) => return CallToolResult::error("search failed".into()),
         };
 
-        let groups = ranker::rank_and_dedup(&results, self.router.conn(), &query);
+        let groups = ranker::rank_and_dedup(&results, ranker_conn, &query);
 
         let mut budget = budget_limit.map(TokenBudget::new);
         let mut outputs: Vec<SearchOutput> = Vec::new();
@@ -957,7 +1191,7 @@ impl McpServer {
         format_result(&outputs, format)
     }
 
-    fn tool_sym(&self, args: Value) -> CallToolResult {
+    fn tool_sym(&mut self, args: Value) -> CallToolResult {
         let name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
@@ -966,16 +1200,28 @@ impl McpServer {
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
 
-        let results = match self.router.query_symbols(&name, kind, exact) {
-            Ok(r) => r,
-            Err(_) => return CallToolResult::error("symbol query failed".into()),
+        let results = if args.get("repo").and_then(|v| v.as_str()).is_some() {
+            let (conn, _repo_root) = match self.resolve_repo(&args) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            crate::router::query_symbols_db(conn, &name, kind, exact).map_err(|e| e.to_string())
+        } else {
+            self.router
+                .query_symbols(&name, kind, exact)
+                .map_err(|e| e.to_string())
         };
 
-        let outputs: Vec<SymbolOutput> = results.iter().map(symbol_to_output).collect();
-        format_result(&outputs, format)
+        match results {
+            Ok(r) => {
+                let outputs: Vec<SymbolOutput> = r.iter().map(symbol_to_output).collect();
+                format_result(&outputs, format)
+            }
+            Err(_) => CallToolResult::error("symbol query failed".into()),
+        }
     }
 
-    fn tool_ref(&self, args: Value) -> CallToolResult {
+    fn tool_ref(&mut self, args: Value) -> CallToolResult {
         let name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
@@ -986,9 +1232,20 @@ impl McpServer {
             .unwrap_or_default();
         let format = extract_format(&args);
 
-        let results = match self.router.query_references(&name, &paths) {
-            Ok(r) => r,
-            Err(_) => return CallToolResult::error("reference query failed".into()),
+        let results = if Self::has_repo_param(&args) {
+            let (conn, _) = match self.resolve_repo(&args) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match crate::router::query_references_db(conn, &name) {
+                Ok(r) => r,
+                Err(_) => return CallToolResult::error("reference query failed".into()),
+            }
+        } else {
+            match self.router.query_references(&name, &paths) {
+                Ok(r) => r,
+                Err(_) => return CallToolResult::error("reference query failed".into()),
+            }
         };
 
         let outputs: Vec<RefOutput> = results
@@ -1008,16 +1265,27 @@ impl McpServer {
         format_result(&outputs, format)
     }
 
-    fn tool_sig(&self, args: Value) -> CallToolResult {
+    fn tool_sig(&mut self, args: Value) -> CallToolResult {
         let name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
         };
         let format = extract_format(&args);
 
-        let results = match self.router.query_signatures(&name) {
-            Ok(r) => r,
-            Err(_) => return CallToolResult::error("signature query failed".into()),
+        let results = if Self::has_repo_param(&args) {
+            let (conn, _) = match self.resolve_repo(&args) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match crate::router::query_signatures_db(conn, &name) {
+                Ok(r) => r,
+                Err(_) => return CallToolResult::error("signature query failed".into()),
+            }
+        } else {
+            match self.router.query_signatures(&name) {
+                Ok(r) => r,
+                Err(_) => return CallToolResult::error("signature query failed".into()),
+            }
         };
 
         let outputs: Vec<SignatureOutput> = results
@@ -1034,10 +1302,41 @@ impl McpServer {
         format_result(&outputs, format)
     }
 
-    fn tool_ls(&self, args: Value) -> CallToolResult {
+    fn tool_ls(&mut self, args: Value) -> CallToolResult {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let tree = args.get("tree").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
+
+        if Self::has_repo_param(&args) {
+            let (conn, repo_root) = match self.resolve_repo(&args) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let path_buf = match validate_path(Path::new(path), &repo_root) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let files: Vec<String> = if path_buf.is_dir() {
+                let walker = crate::walker::Walker::new(&path_buf);
+                walker
+                    .collect_paths()
+                    .into_iter()
+                    .filter(|p| p.is_file())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            } else {
+                vec![path_buf.to_string_lossy().into_owned()]
+            };
+            let mut all_symbols = Vec::new();
+            for file in &files {
+                match crate::router::query_symbols_in_file_db(conn, file) {
+                    Ok(syms) => all_symbols.extend(syms),
+                    Err(_) => return CallToolResult::error("symbol listing failed".into()),
+                }
+            }
+            let outputs: Vec<SymbolOutput> = all_symbols.iter().map(symbol_to_output).collect();
+            return format_result(&outputs, format);
+        }
 
         let path_buf = match validate_path(Path::new(path), self.router.repo_root()) {
             Ok(p) => p,
@@ -1068,19 +1367,33 @@ impl McpServer {
         format_result(&outputs, format)
     }
 
-    fn tool_deps(&self, args: Value) -> CallToolResult {
+    fn tool_deps(&mut self, args: Value) -> CallToolResult {
         let file = match require_str(&args, "file") {
             Ok(f) => f,
             Err(e) => return e,
         };
         let format = extract_format(&args);
-        if validate_path(Path::new(&file), self.router.repo_root()).is_err() {
-            return CallToolResult::error("path is outside the repository".into());
-        }
 
-        let results = match self.router.query_deps(&file) {
-            Ok(r) => r,
-            Err(_) => return CallToolResult::error("dependency query failed".into()),
+        let results = if Self::has_repo_param(&args) {
+            let (conn, repo_root) = match self.resolve_repo(&args) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if validate_path(Path::new(&file), &repo_root).is_err() {
+                return CallToolResult::error("path is outside the repository".into());
+            }
+            match crate::router::query_deps_db(conn, &file) {
+                Ok(r) => r,
+                Err(_) => return CallToolResult::error("dependency query failed".into()),
+            }
+        } else {
+            if validate_path(Path::new(&file), self.router.repo_root()).is_err() {
+                return CallToolResult::error("path is outside the repository".into());
+            }
+            match self.router.query_deps(&file) {
+                Ok(r) => r,
+                Err(_) => return CallToolResult::error("dependency query failed".into()),
+            }
         };
 
         let outputs: Vec<DepOutput> = results
@@ -1094,19 +1407,33 @@ impl McpServer {
         format_result(&outputs, format)
     }
 
-    fn tool_rdeps(&self, args: Value) -> CallToolResult {
+    fn tool_rdeps(&mut self, args: Value) -> CallToolResult {
         let file = match require_str(&args, "file") {
             Ok(f) => f,
             Err(e) => return e,
         };
         let format = extract_format(&args);
-        if validate_path(Path::new(&file), self.router.repo_root()).is_err() {
-            return CallToolResult::error("path is outside the repository".into());
-        }
 
-        let results = match self.router.query_rdeps(&file) {
-            Ok(r) => r,
-            Err(_) => return CallToolResult::error("reverse dependency query failed".into()),
+        let results = if Self::has_repo_param(&args) {
+            let (conn, repo_root) = match self.resolve_repo(&args) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if validate_path(Path::new(&file), &repo_root).is_err() {
+                return CallToolResult::error("path is outside the repository".into());
+            }
+            match crate::router::query_rdeps_db(conn, &file) {
+                Ok(r) => r,
+                Err(_) => return CallToolResult::error("reverse dependency query failed".into()),
+            }
+        } else {
+            if validate_path(Path::new(&file), self.router.repo_root()).is_err() {
+                return CallToolResult::error("path is outside the repository".into());
+            }
+            match self.router.query_rdeps(&file) {
+                Ok(r) => r,
+                Err(_) => return CallToolResult::error("reverse dependency query failed".into()),
+            }
         };
 
         let outputs: Vec<DepOutput> = results
@@ -1120,14 +1447,23 @@ impl McpServer {
         format_result(&outputs, format)
     }
 
-    fn tool_status(&self, args: Value) -> CallToolResult {
+    fn tool_status(&mut self, args: Value) -> CallToolResult {
         let format = extract_format(&args);
-        let info = crate::router::query_status_info(self.router.conn());
+        let conn = if Self::has_repo_param(&args) {
+            let (c, _) = match self.resolve_repo(&args) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            Some(c)
+        } else {
+            self.router.conn()
+        };
+        let info = crate::router::query_status_info(conn);
         let status = serde_json::to_value(&info).unwrap_or_default();
         format_result(&status, format)
     }
 
-    fn tool_init(&self, args: Value) -> CallToolResult {
+    fn tool_init(&mut self, args: Value) -> CallToolResult {
         let local = args.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
 
@@ -1186,7 +1522,7 @@ impl McpServer {
         format_result(&result, format)
     }
 
-    fn tool_show(&self, args: Value) -> CallToolResult {
+    fn tool_show(&mut self, args: Value) -> CallToolResult {
         let name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
@@ -1204,9 +1540,9 @@ impl McpServer {
             .map(|v| v as usize);
         let format = extract_format(&args);
 
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
 
         let options = crate::show::ShowOptions {
@@ -1217,8 +1553,7 @@ impl McpServer {
             shallow,
         };
 
-        let results = match crate::show::show_symbol(conn, &name, self.router.repo_root(), &options)
-        {
+        let results = match crate::show::show_symbol(conn, &name, &repo_root, &options) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("show query failed: {e}")),
         };
@@ -1256,7 +1591,7 @@ impl McpServer {
     /// Shared setup for callgraph tools: extract depth + budget + format,
     /// open connection, and verify caller_id data exists.
     fn callgraph_setup(
-        &self,
+        &mut self,
         args: &Value,
     ) -> Result<(&Connection, usize, Option<usize>, OutputFormat), CallToolResult> {
         let depth_raw = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
@@ -1267,14 +1602,7 @@ impl McpServer {
             .map(|v| v as usize);
         let format = extract_format(args);
 
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => {
-                return Err(CallToolResult::error(
-                    "no index available; run wonk_init first".into(),
-                ));
-            }
-        };
+        let (conn, _) = self.resolve_repo(args)?;
 
         if !crate::callgraph::has_caller_id_data(conn) {
             return Err(CallToolResult::error(
@@ -1285,7 +1613,7 @@ impl McpServer {
         Ok((conn, depth, budget_limit, format))
     }
 
-    fn tool_callers(&self, args: Value) -> CallToolResult {
+    fn tool_callers(&mut self, args: Value) -> CallToolResult {
         let name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
@@ -1328,7 +1656,7 @@ impl McpServer {
         collect_with_budget(outputs, budget_limit, format)
     }
 
-    fn tool_callees(&self, args: Value) -> CallToolResult {
+    fn tool_callees(&mut self, args: Value) -> CallToolResult {
         let name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
@@ -1370,7 +1698,7 @@ impl McpServer {
         collect_with_budget(outputs, budget_limit, format)
     }
 
-    fn tool_callpath(&self, args: Value) -> CallToolResult {
+    fn tool_callpath(&mut self, args: Value) -> CallToolResult {
         let from = match require_str(&args, "from") {
             Ok(n) => n,
             Err(e) => return e,
@@ -1381,11 +1709,9 @@ impl McpServer {
         };
         let format = extract_format(&args);
 
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => {
-                return CallToolResult::error("no index available; run wonk_init first".into());
-            }
+        let (conn, _) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
 
         if !crate::callgraph::has_caller_id_data(conn) {
@@ -1423,14 +1749,19 @@ impl McpServer {
         }
     }
 
-    fn tool_summary(&self, args: Value) -> CallToolResult {
+    fn tool_summary(&mut self, args: Value) -> CallToolResult {
         let path = match require_str(&args, "path") {
             Ok(p) => p,
             Err(e) => return e,
         };
 
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+
         // Validate path stays within repo boundary.
-        if let Err(e) = validate_path(Path::new(&path), self.router.repo_root()) {
+        if let Err(e) = validate_path(Path::new(&path), &repo_root) {
             return e;
         }
 
@@ -1452,19 +1783,13 @@ impl McpServer {
 
         let format = extract_format(&args);
 
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => return CallToolResult::error("no index available; run wonk_init first".into()),
-        };
-
         let semantic_flag = args
             .get("semantic")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
         let semantic = if semantic_flag {
-            let repo_root = self.router.repo_root();
-            let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
+            let config = crate::config::Config::load(Some(&repo_root)).unwrap_or_default();
             if let Err(e) = crate::db::ensure_summaries_table(conn) {
                 return CallToolResult::error(format!("failed to create summaries table: {e}"));
             }
@@ -1489,15 +1814,15 @@ impl McpServer {
         format_result(&out, format)
     }
 
-    fn tool_blast(&self, args: Value) -> CallToolResult {
+    fn tool_blast(&mut self, args: Value) -> CallToolResult {
         let symbol = match require_str(&args, "symbol") {
             Ok(s) => s,
             Err(e) => return e,
         };
 
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        let (conn, _) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
 
         if !crate::callgraph::has_caller_id_data(conn) {
@@ -1546,10 +1871,10 @@ impl McpServer {
         }
     }
 
-    fn tool_flows(&self, args: Value) -> CallToolResult {
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+    fn tool_flows(&mut self, args: Value) -> CallToolResult {
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
 
         if !crate::callgraph::has_caller_id_data(conn) {
@@ -1579,7 +1904,7 @@ impl McpServer {
 
         let from_file = args.get("from").and_then(|v| v.as_str()).map(String::from);
         if let Some(ref f) = from_file
-            && validate_path(std::path::Path::new(f), self.router.repo_root()).is_err()
+            && validate_path(std::path::Path::new(f), &repo_root).is_err()
         {
             return CallToolResult::error(format!("path outside repository: {f}"));
         }
@@ -1618,13 +1943,11 @@ impl McpServer {
         }
     }
 
-    fn tool_changes(&self, args: Value) -> CallToolResult {
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+    fn tool_changes(&mut self, args: Value) -> CallToolResult {
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
-
-        let repo_root = self.router.repo_root().to_path_buf();
 
         let format = extract_format(&args);
 
@@ -1680,15 +2003,15 @@ impl McpServer {
         format_result(&changes_out, format)
     }
 
-    fn tool_context(&self, args: Value) -> CallToolResult {
+    fn tool_context(&mut self, args: Value) -> CallToolResult {
         let name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
         };
 
-        let conn = match self.router.conn() {
-            Some(c) => c,
-            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        let (conn, _) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
 
         if !crate::callgraph::has_caller_id_data(conn) {
@@ -1719,6 +2042,65 @@ impl McpServer {
             }
             Err(e) => CallToolResult::error(format!("context query failed: {e}")),
         }
+    }
+
+    fn tool_repos(&mut self, args: Value) -> CallToolResult {
+        let format = extract_format(&args);
+
+        #[derive(serde::Serialize)]
+        struct RepoInfo {
+            name: String,
+            path: String,
+            file_count: u64,
+            symbol_count: u64,
+            last_indexed: u64,
+            languages: Vec<String>,
+        }
+
+        // Collect entry metadata first to avoid borrow conflict with get_or_open_connection.
+        let entry_data: Vec<(PathBuf, String, String, u64, Vec<String>)> = self
+            .registry
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.index_path.clone(),
+                    e.name.clone(),
+                    e.repo_path.display().to_string(),
+                    e.created,
+                    e.languages.clone(),
+                )
+            })
+            .collect();
+
+        let mut repos: Vec<RepoInfo> = Vec::new();
+
+        for (index_path, name, path, created, languages) in &entry_data {
+            let (file_count, symbol_count) = match self.registry.get_or_open_connection(index_path)
+            {
+                Ok(conn) => {
+                    let fc: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                        .unwrap_or(0);
+                    let sc: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+                        .unwrap_or(0);
+                    (fc as u64, sc as u64)
+                }
+                Err(_) => (0, 0),
+            };
+
+            repos.push(RepoInfo {
+                name: name.clone(),
+                path: path.clone(),
+                file_count,
+                symbol_count,
+                last_indexed: *created,
+                languages: languages.clone(),
+            });
+        }
+
+        format_result(&repos, format)
     }
 }
 
@@ -1771,7 +2153,13 @@ pub fn serve() -> Result<()> {
         pipeline::build_index(&repo_root, false)?;
     }
 
-    let server = McpServer::new(repo_root);
+    // Discover all indexed repos at startup.
+    let repos_dir = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".wonk").join("repos"))
+        .unwrap_or_default();
+    let registry = RepoRegistry::new(discover_repos(&repos_dir));
+
+    let mut server = McpServer::new(repo_root, registry);
 
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -1847,6 +2235,8 @@ mod tests {
     fn test_server() -> McpServer {
         McpServer {
             router: QueryRouter::new(None, false),
+            default_repo_root: PathBuf::from("."),
+            registry: RepoRegistry::new(Vec::new()),
         }
     }
 
@@ -1876,7 +2266,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
     }
 
     #[test]
@@ -1911,7 +2301,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_returns_error() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({"name": "nonexistent", "arguments": {}});
         let result = server.handle_tools_call(&params);
         assert!(result["isError"].as_bool().unwrap_or(false));
@@ -2007,7 +2397,7 @@ mod tests {
         // The test_server has no index, so wonk_show returns an error about
         // missing index — but it should dispatch to the correct handler
         // (not "unknown tool").
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_show",
             "arguments": {"name": "nonexistent_symbol_xyz"}
@@ -2037,8 +2427,10 @@ mod tests {
         .unwrap();
 
         pipeline::build_index(root, true).unwrap();
-        let server = McpServer {
+        let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
+            default_repo_root: root.to_path_buf(),
+            registry: RepoRegistry::new(Vec::new()),
         };
 
         // Budget of 1 token (~4 chars) should truncate most results.
@@ -2065,7 +2457,7 @@ mod tests {
     fn tool_status_includes_embedding_fields() {
         // The test_server has no index, so status will show indexed=false.
         // But the JSON should still contain the embedding fields.
-        let server = test_server();
+        let mut server = test_server();
         let result = server.tool_status(serde_json::json!({}));
         assert!(!result.is_error);
         let text = &result.content[0].text;
@@ -2088,11 +2480,11 @@ mod tests {
     // -- Callers/Callees MCP tests -------------------------------------------
 
     #[test]
-    fn tools_list_returns_fourteen_tools() {
+    fn tools_list_returns_nineteen_tools() {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
     }
 
     #[test]
@@ -2129,7 +2521,7 @@ mod tests {
 
     #[test]
     fn tool_callers_dispatches_correctly() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_callers",
             "arguments": {"name": "nonexistent_symbol_xyz"}
@@ -2145,7 +2537,7 @@ mod tests {
 
     #[test]
     fn tool_callees_dispatches_correctly() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_callees",
             "arguments": {"name": "nonexistent_symbol_xyz"}
@@ -2177,7 +2569,7 @@ mod tests {
 
     #[test]
     fn tool_callpath_dispatches_correctly() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_callpath",
             "arguments": {"from": "nonexistent_xyz", "to": "nonexistent_abc"}
@@ -2216,7 +2608,7 @@ mod tests {
 
     #[test]
     fn tool_summary_dispatches_correctly() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_summary",
             "arguments": {"path": "src/"}
@@ -2243,8 +2635,10 @@ mod tests {
 
         pipeline::build_index(root, true).unwrap();
 
-        let server = McpServer {
+        let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
+            default_repo_root: root.to_path_buf(),
+            registry: RepoRegistry::new(Vec::new()),
         };
         let params = serde_json::json!({
             "name": "wonk_summary",
@@ -2272,8 +2666,10 @@ mod tests {
 
         pipeline::build_index(root, true).unwrap();
 
-        let server = McpServer {
+        let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
+            default_repo_root: root.to_path_buf(),
+            registry: RepoRegistry::new(Vec::new()),
         };
         let params = serde_json::json!({
             "name": "wonk_summary",
@@ -2303,8 +2699,10 @@ mod tests {
 
         pipeline::build_index(root, true).unwrap();
 
-        let server = McpServer {
+        let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
+            default_repo_root: root.to_path_buf(),
+            registry: RepoRegistry::new(Vec::new()),
         };
         let params = serde_json::json!({
             "name": "wonk_summary",
@@ -2319,7 +2717,7 @@ mod tests {
 
     #[test]
     fn tool_summary_missing_path() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_summary",
             "arguments": {}
@@ -2351,7 +2749,7 @@ mod tests {
 
     #[test]
     fn tool_flows_dispatches_correctly() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_flows",
             "arguments": {"entry": "nonexistent_symbol_xyz"}
@@ -2363,7 +2761,7 @@ mod tests {
 
     #[test]
     fn tool_flows_list_mode() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_flows",
             "arguments": {}
@@ -2401,7 +2799,7 @@ mod tests {
 
     #[test]
     fn tool_blast_dispatches_correctly() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_blast",
             "arguments": {"symbol": "nonexistent_symbol_xyz"}
@@ -2420,7 +2818,7 @@ mod tests {
 
     #[test]
     fn tool_blast_missing_symbol() {
-        let server = test_server();
+        let mut server = test_server();
         let params = serde_json::json!({
             "name": "wonk_blast",
             "arguments": {}
@@ -2483,7 +2881,7 @@ mod tests {
 
     #[test]
     fn tool_context_missing_name() {
-        let server = test_server();
+        let mut server = test_server();
         let result = server.handle_tools_call(&serde_json::json!({
             "name": "wonk_context",
             "arguments": {}
@@ -2492,6 +2890,491 @@ mod tests {
         assert!(
             call_result.contains("missing"),
             "should report missing name parameter"
+        );
+    }
+
+    // -- Multi-repo discovery tests (TASK-074) --------------------------------
+
+    #[test]
+    fn discover_repos_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        std::fs::create_dir(&repos_dir).unwrap();
+
+        let entries = discover_repos(&repos_dir);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn discover_repos_nonexistent_dir() {
+        let entries = discover_repos(Path::new("/tmp/nonexistent_wonk_test_dir"));
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn discover_repos_finds_indexed_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abcdef1234567890");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+
+        // Create a minimal repo to index.
+        let repo_dir = dir.path().join("my-project");
+        std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(repo_dir.join("src/lib.rs"), "fn hello() {}\n").unwrap();
+
+        // Create index.db and meta.json in hash_dir.
+        let index_path = hash_dir.join("index.db");
+        let conn = db::open(&index_path).unwrap();
+        drop(conn);
+        db::write_meta(&index_path, &repo_dir, &["rust".to_string()]).unwrap();
+
+        let entries = discover_repos(&repos_dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "my-project");
+        assert_eq!(entries[0].repo_path, repo_dir);
+        assert_eq!(entries[0].index_path, index_path);
+        assert_eq!(entries[0].languages, vec!["rust".to_string()]);
+        assert!(entries[0].created > 0);
+    }
+
+    #[test]
+    fn discover_repos_skips_dir_without_index_db() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abcdef1234567890");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        // Only meta.json, no index.db
+        std::fs::write(
+            hash_dir.join("meta.json"),
+            r#"{"repo_path":"/tmp/foo","created":123,"languages":[]}"#,
+        )
+        .unwrap();
+
+        let entries = discover_repos(&repos_dir);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn registry_resolve_single_match() {
+        let entries = vec![
+            RepoEntry {
+                repo_path: PathBuf::from("/home/user/projects/alpha"),
+                index_path: PathBuf::from("/home/user/.wonk/repos/abc/index.db"),
+                name: "alpha".to_string(),
+                languages: vec![],
+                created: 100,
+            },
+            RepoEntry {
+                repo_path: PathBuf::from("/home/user/projects/beta"),
+                index_path: PathBuf::from("/home/user/.wonk/repos/def/index.db"),
+                name: "beta".to_string(),
+                languages: vec![],
+                created: 200,
+            },
+        ];
+        let registry = RepoRegistry::new(entries);
+
+        let resolved = registry.resolve("alpha").unwrap();
+        assert_eq!(
+            resolved.repo_path,
+            PathBuf::from("/home/user/projects/alpha")
+        );
+        assert_eq!(
+            resolved.index_path,
+            PathBuf::from("/home/user/.wonk/repos/abc/index.db")
+        );
+    }
+
+    #[test]
+    fn registry_resolve_unknown_repo() {
+        let entries = vec![RepoEntry {
+            repo_path: PathBuf::from("/home/user/projects/alpha"),
+            index_path: PathBuf::from("/home/user/.wonk/repos/abc/index.db"),
+            name: "alpha".to_string(),
+            languages: vec![],
+            created: 100,
+        }];
+        let registry = RepoRegistry::new(entries);
+
+        let err = registry.resolve("nonexistent").unwrap_err();
+        assert!(err.contains("unknown repo"));
+        assert!(err.contains("alpha"));
+    }
+
+    #[test]
+    fn registry_resolve_ambiguous_name() {
+        let entries = vec![
+            RepoEntry {
+                repo_path: PathBuf::from("/home/user/work/myapp"),
+                index_path: PathBuf::from("/home/user/.wonk/repos/aaa/index.db"),
+                name: "myapp".to_string(),
+                languages: vec![],
+                created: 100,
+            },
+            RepoEntry {
+                repo_path: PathBuf::from("/home/user/personal/myapp"),
+                index_path: PathBuf::from("/home/user/.wonk/repos/bbb/index.db"),
+                name: "myapp".to_string(),
+                languages: vec![],
+                created: 200,
+            },
+        ];
+        let registry = RepoRegistry::new(entries);
+
+        let err = registry.resolve("myapp").unwrap_err();
+        assert!(err.contains("ambiguous"));
+        assert!(err.contains("/home/user/work/myapp"));
+        assert!(err.contains("/home/user/personal/myapp"));
+    }
+
+    #[test]
+    fn registry_lazy_connection_opens_and_caches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let index_path = dir.path().join("index.db");
+        let conn = db::open(&index_path).unwrap();
+        drop(conn);
+
+        let mut registry = RepoRegistry::new(Vec::new());
+
+        // First call should open the connection.
+        assert!(registry.connections.is_empty());
+        let result = registry.get_or_open_connection(&index_path);
+        assert!(result.is_ok());
+        assert_eq!(registry.connections.len(), 1);
+
+        // Second call should reuse the cached connection.
+        let result2 = registry.get_or_open_connection(&index_path);
+        assert!(result2.is_ok());
+        assert_eq!(registry.connections.len(), 1);
+    }
+
+    #[test]
+    fn registry_lazy_connection_error_on_missing_db() {
+        let mut registry = RepoRegistry::new(Vec::new());
+        let result = registry.get_or_open_connection(Path::new("/tmp/nonexistent_wonk_test.db"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn all_tools_have_repo_param() {
+        let tools = tool_definitions();
+        for tool in tools.iter() {
+            // wonk_repos itself doesn't need a repo param
+            if tool.name == "wonk_repos" {
+                continue;
+            }
+            let props = tool.input_schema["properties"].as_object().unwrap();
+            assert!(
+                props.contains_key("repo"),
+                "tool {} is missing 'repo' property",
+                tool.name
+            );
+            let repo_prop = &props["repo"];
+            assert_eq!(
+                repo_prop["type"].as_str().unwrap(),
+                "string",
+                "tool {} repo param should be string type",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn repo_param_is_not_required() {
+        let tools = tool_definitions();
+        for tool in tools.iter() {
+            if tool.name == "wonk_repos" {
+                continue;
+            }
+            if let Some(required) = tool.input_schema.get("required") {
+                if let Some(arr) = required.as_array() {
+                    assert!(
+                        !arr.contains(&serde_json::json!("repo")),
+                        "tool {} should not require 'repo' param",
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_repo_defaults_to_working_dir() {
+        // When no repo param, resolve_repo should return the default router's connection
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn hello() {}\n").unwrap();
+        pipeline::build_index(root, true).unwrap();
+
+        let mut server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+            default_repo_root: root.to_path_buf(),
+            registry: RepoRegistry::new(Vec::new()),
+        };
+
+        let args = serde_json::json!({"name": "hello"});
+        let resolved = server.resolve_repo(&args);
+        assert!(
+            resolved.is_ok(),
+            "resolve_repo with no repo param should succeed"
+        );
+    }
+
+    #[test]
+    fn resolve_repo_with_unknown_repo_returns_error() {
+        let mut server = test_server();
+        let args = serde_json::json!({"repo": "nonexistent_project"});
+        let resolved = server.resolve_repo(&args);
+        assert!(resolved.is_err());
+        let err = resolved.unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content[0].text.contains("unknown repo"));
+    }
+
+    #[test]
+    fn resolve_repo_with_valid_repo_opens_connection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_dir = dir.path().join("my-project");
+        std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(repo_dir.join("src/lib.rs"), "fn hello() {}\n").unwrap();
+
+        // Create an index in a fake repos dir.
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abc123");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+
+        let index_path = hash_dir.join("index.db");
+        let conn = db::open(&index_path).unwrap();
+        drop(conn);
+        db::write_meta(&index_path, &repo_dir, &["rust".to_string()]).unwrap();
+
+        let entries = discover_repos(&repos_dir);
+        let mut server = McpServer {
+            router: QueryRouter::new(None, false),
+            default_repo_root: PathBuf::from("."),
+            registry: RepoRegistry::new(entries),
+        };
+
+        let args = serde_json::json!({"repo": "my-project"});
+        let resolved = server.resolve_repo(&args);
+        assert!(
+            resolved.is_ok(),
+            "resolve_repo should succeed for registered repo"
+        );
+    }
+
+    // -- wonk_repos tests (TASK-074) ------------------------------------------
+
+    #[test]
+    fn tool_repos_definition_exists() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_repos");
+        assert!(tool.is_some(), "wonk_repos tool should exist");
+    }
+
+    #[test]
+    fn tool_repos_dispatches_and_returns_empty_list() {
+        let mut server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_repos",
+            "arguments": {}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(parsed.is_array(), "repos result should be an array");
+        assert!(parsed.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_repos_returns_registered_repos_with_stats() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_dir = dir.path().join("my-project");
+        std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/lib.rs"),
+            "fn hello() {}\nfn world() {}\n",
+        )
+        .unwrap();
+
+        // Build a real index via pipeline into the central-style location.
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("abc123");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+
+        // First build a local index, then copy db + write meta to the repos dir.
+        pipeline::build_index(&repo_dir, true).unwrap();
+        let local_db = repo_dir.join(".wonk/index.db");
+        let central_db = hash_dir.join("index.db");
+        std::fs::copy(&local_db, &central_db).unwrap();
+        db::write_meta(&central_db, &repo_dir, &["rust".to_string()]).unwrap();
+
+        let entries = discover_repos(&repos_dir);
+        let mut server = McpServer {
+            router: QueryRouter::new(None, false),
+            default_repo_root: PathBuf::from("."),
+            registry: RepoRegistry::new(entries),
+        };
+
+        let params = serde_json::json!({
+            "name": "wonk_repos",
+            "arguments": {}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let repos = parsed.as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["name"].as_str().unwrap(), "my-project");
+        assert!(repos[0]["path"].as_str().is_some());
+        assert!(repos[0]["file_count"].as_u64().is_some());
+        assert!(repos[0]["symbol_count"].as_u64().is_some());
+        assert!(repos[0]["last_indexed"].as_u64().is_some());
+    }
+
+    // -- Cross-repo routing tests (TASK-074) ----------------------------------
+
+    /// Helper: create a temp repo with source, build a local index, copy it to
+    /// a central-style repos_dir, and return (repo_dir, repos_dir).
+    fn setup_multi_repo_env() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Primary repo (working directory)
+        let primary_dir = dir.path().join("primary-repo");
+        std::fs::create_dir_all(primary_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(primary_dir.join("src")).unwrap();
+        std::fs::write(primary_dir.join("src/lib.rs"), "fn primary_func() {}\n").unwrap();
+        pipeline::build_index(&primary_dir, true).unwrap();
+
+        // Other repo
+        let other_dir = dir.path().join("other-project");
+        std::fs::create_dir_all(other_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(other_dir.join("src")).unwrap();
+        std::fs::write(
+            other_dir.join("src/lib.rs"),
+            "fn other_func() {}\nstruct OtherStruct {}\n",
+        )
+        .unwrap();
+        pipeline::build_index(&other_dir, true).unwrap();
+
+        // Copy other repo's index to central repos dir.
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join("other_hash");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        let local_db = other_dir.join(".wonk/index.db");
+        let central_db = hash_dir.join("index.db");
+        std::fs::copy(&local_db, &central_db).unwrap();
+        db::write_meta(&central_db, &other_dir, &["rust".to_string()]).unwrap();
+
+        (dir, primary_dir, repos_dir)
+    }
+
+    #[test]
+    fn cross_repo_sym_query() {
+        let (_dir, primary_dir, repos_dir) = setup_multi_repo_env();
+
+        let entries = discover_repos(&repos_dir);
+        let mut server = McpServer {
+            router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
+            default_repo_root: primary_dir.to_path_buf(),
+            registry: RepoRegistry::new(entries),
+        };
+
+        // Query default repo (should find primary_func).
+        let params = serde_json::json!({
+            "name": "wonk_sym",
+            "arguments": {"name": "primary_func"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert!(!arr.is_empty(), "should find primary_func in default repo");
+
+        // Query other-project repo (should find other_func).
+        let params = serde_json::json!({
+            "name": "wonk_sym",
+            "arguments": {"name": "other_func", "repo": "other-project"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert!(
+            !arr.is_empty(),
+            "should find other_func in other-project repo"
+        );
+        assert_eq!(arr[0]["name"].as_str().unwrap(), "other_func");
+    }
+
+    #[test]
+    fn cross_repo_ref_query() {
+        let (_dir, primary_dir, repos_dir) = setup_multi_repo_env();
+
+        let entries = discover_repos(&repos_dir);
+        let mut server = McpServer {
+            router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
+            default_repo_root: primary_dir.to_path_buf(),
+            registry: RepoRegistry::new(entries),
+        };
+
+        // Query refs in other repo.
+        let params = serde_json::json!({
+            "name": "wonk_ref",
+            "arguments": {"name": "OtherStruct", "repo": "other-project"}
+        });
+        let result = server.handle_tools_call(&params);
+        // Should not be an error (might be empty array, but not "unknown tool").
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        assert!(!is_error, "ref query on other repo should not error");
+    }
+
+    #[test]
+    fn cross_repo_status_query() {
+        let (_dir, primary_dir, repos_dir) = setup_multi_repo_env();
+
+        let entries = discover_repos(&repos_dir);
+        let mut server = McpServer {
+            router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
+            default_repo_root: primary_dir.to_path_buf(),
+            registry: RepoRegistry::new(entries),
+        };
+
+        // Status for other-project.
+        let params = serde_json::json!({
+            "name": "wonk_status",
+            "arguments": {"repo": "other-project"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        // Should show indexed=true for the other repo.
+        assert_eq!(
+            parsed["indexed"], true,
+            "other repo should show indexed=true"
+        );
+    }
+
+    #[test]
+    fn cross_repo_unknown_repo_returns_error() {
+        let mut server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_sym",
+            "arguments": {"name": "foo", "repo": "nonexistent"}
+        });
+        let result = server.handle_tools_call(&params);
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        assert!(is_error, "unknown repo should return error");
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("unknown repo"),
+            "error should mention unknown repo"
         );
     }
 }

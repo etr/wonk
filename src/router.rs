@@ -2383,7 +2383,7 @@ impl QueryRouter {
 // ---------------------------------------------------------------------------
 
 /// Query symbols from the SQLite index.
-fn query_symbols_db(
+pub fn query_symbols_db(
     conn: &Connection,
     name: &str,
     kind: Option<&str>,
@@ -2431,7 +2431,7 @@ fn query_symbols_db(
 }
 
 /// Query references from the SQLite index.
-fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Reference>, DbError> {
+pub fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Reference>, DbError> {
     let sql = "SELECT r.name, r.file, r.line, r.col, r.context, s.name, r.confidence \
                FROM \"references\" r \
                LEFT JOIN symbols s ON r.caller_id = s.id \
@@ -2462,7 +2462,7 @@ fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Reference>, 
 }
 
 /// Query function/method signatures from the SQLite index.
-fn query_signatures_db(conn: &Connection, name: &str) -> Result<Vec<Symbol>, DbError> {
+pub fn query_signatures_db(conn: &Connection, name: &str) -> Result<Vec<Symbol>, DbError> {
     let sql = "SELECT name, kind, file, line, col, end_line, scope, signature, language \
                FROM symbols WHERE name LIKE ?1 AND kind IN ('function', 'method')";
     let name_param = format!("%{}%", name);
@@ -2478,7 +2478,7 @@ fn query_signatures_db(conn: &Connection, name: &str) -> Result<Vec<Symbol>, DbE
 }
 
 /// Query all symbols in a specific file from the SQLite index.
-fn query_symbols_in_file_db(conn: &Connection, path: &str) -> Result<Vec<Symbol>, DbError> {
+pub fn query_symbols_in_file_db(conn: &Connection, path: &str) -> Result<Vec<Symbol>, DbError> {
     let sql = "SELECT name, kind, file, line, col, end_line, scope, signature, language \
                FROM symbols WHERE file = ?1 ORDER BY line";
     let mut stmt = conn.prepare(sql)?;
@@ -2495,7 +2495,7 @@ fn query_symbols_in_file_db(conn: &Connection, path: &str) -> Result<Vec<Symbol>
 /// Query file dependencies from the `file_imports` table.
 ///
 /// Returns the list of import paths for the given source file.
-fn query_deps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> {
+pub fn query_deps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> {
     let sql = "SELECT DISTINCT import_path FROM file_imports WHERE source_file = ?1";
     let mut stmt = conn.prepare(sql)?;
 
@@ -2513,7 +2513,7 @@ fn query_deps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> 
 /// Finds all files whose import paths contain the target file's stem
 /// (e.g. searching for "utils.ts" matches imports like "./utils",
 /// "../utils", "utils" etc.).
-fn query_rdeps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> {
+pub fn query_rdeps_db(conn: &Connection, file: &str) -> Result<Vec<String>, DbError> {
     let stem = Path::new(file)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
