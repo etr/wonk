@@ -2870,7 +2870,7 @@ Implement `flows.rs` module with entry point detection via SQL anti-join and for
 **Related Requirements:** PRD-FLOW-REQ-001 through PRD-FLOW-REQ-010, PRD-CONF-REQ-005
 **Related Decisions:** DR-023
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
