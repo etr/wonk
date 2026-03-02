@@ -834,8 +834,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
         ];
 
-        // Inject optional `repo` parameter into all existing tools.
+        // Inject optional `repo` parameter into all existing tools except wonk_init
+        // (init always operates on the working directory repo).
         for tool in &mut tools {
+            if tool.name == "wonk_init" {
+                continue;
+            }
             if let Some(props) = tool.input_schema.get_mut("properties")
                 && let Some(obj) = props.as_object_mut()
             {
@@ -870,7 +874,6 @@ fn tool_definitions() -> &'static Vec<Tool> {
 
 /// Metadata for a discovered indexed repository.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct RepoEntry {
     /// Absolute path to the repository root.
     repo_path: PathBuf,
@@ -885,7 +888,6 @@ struct RepoEntry {
 }
 
 /// Registry of all discovered indexed repositories.
-#[allow(dead_code)]
 struct RepoRegistry {
     entries: Vec<RepoEntry>,
     /// Lazy-opened connections keyed by index_path string.
@@ -894,14 +896,11 @@ struct RepoRegistry {
 
 /// Result of resolving a repo reference.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct ResolvedRepo {
     index_path: PathBuf,
     repo_path: PathBuf,
-    name: String,
 }
 
-#[allow(dead_code)]
 impl RepoRegistry {
     fn new(entries: Vec<RepoEntry>) -> Self {
         Self {
@@ -935,7 +934,6 @@ impl RepoRegistry {
                 Ok(ResolvedRepo {
                     index_path: entry.index_path.clone(),
                     repo_path: entry.repo_path.clone(),
-                    name: entry.name.clone(),
                 })
             }
             _ => {
@@ -966,8 +964,8 @@ impl RepoRegistry {
 
 /// Discover all indexed repositories under a repos directory.
 ///
-/// Scans `repos_dir/*/meta.json` to find all indexed repos and reads their
-/// metadata. Also checks for a local index at `<repo_root>/.wonk/index.db`.
+/// Scans `repos_dir/*/index.db`, reads the adjacent `meta.json` for metadata,
+/// and validates that the claimed repo path contains a `.git` or `.wonk` marker.
 fn discover_repos(repos_dir: &Path) -> Vec<RepoEntry> {
     let mut entries = Vec::new();
 
@@ -985,6 +983,10 @@ fn discover_repos(repos_dir: &Path) -> Vec<RepoEntry> {
             }
             if let Ok(meta) = db::read_meta(&index_path) {
                 let repo_path = PathBuf::from(&meta.repo_path);
+                // Validate the claimed repo path has a git or wonk marker.
+                if !repo_path.join(".git").exists() && !repo_path.join(".wonk").exists() {
+                    continue;
+                }
                 let name = repo_path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -1009,20 +1011,13 @@ fn discover_repos(repos_dir: &Path) -> Vec<RepoEntry> {
 
 struct McpServer {
     router: QueryRouter,
-    #[allow(dead_code)]
-    default_repo_root: PathBuf,
-    #[allow(dead_code)]
     registry: RepoRegistry,
 }
 
 impl McpServer {
     fn new(repo_root: PathBuf, registry: RepoRegistry) -> Self {
-        let router = QueryRouter::new(Some(repo_root.clone()), false);
-        Self {
-            router,
-            default_repo_root: repo_root,
-            registry,
-        }
+        let router = QueryRouter::new(Some(repo_root), false);
+        Self { router, registry }
     }
 
     /// Resolve which repo connection and root to use for a tool call.
@@ -1056,11 +1051,6 @@ impl McpServer {
                 )),
             }
         }
-    }
-
-    /// Check if a `repo` param is present in the args.
-    fn has_repo_param(args: &Value) -> bool {
-        args.get("repo").and_then(|v| v.as_str()).is_some()
     }
 
     fn handle_initialize(&self, _params: &Value) -> Value {
@@ -1140,23 +1130,26 @@ impl McpServer {
             .map(|v| v as usize);
         let format = extract_format(&args);
 
-        // For cross-repo search, set the search path to the target repo root.
-        let ranker_conn: Option<&Connection> = if Self::has_repo_param(&args) {
-            let (conn, repo_root) = match self.resolve_repo(&args) {
-                Ok(r) => r,
-                Err(e) => return e,
-            };
-            if paths.is_empty() {
-                paths.push(repo_root.to_string_lossy().into_owned());
-            }
-            Some(conn)
-        } else {
-            self.router.conn()
+        let (ranker_conn, repo_root) = match self.resolve_repo(&args) {
+            Ok((conn, root)) => (Some(conn), root),
+            Err(e) => return e,
         };
+
+        // Validate user-supplied paths against the repo boundary.
+        for p in &paths {
+            if validate_path(Path::new(p), &repo_root).is_err() {
+                return CallToolResult::error(format!("path outside repository: {p}"));
+            }
+        }
+
+        // Default to repo root when no paths specified.
+        if paths.is_empty() {
+            paths.push(repo_root.to_string_lossy().into_owned());
+        }
 
         let results = match search::text_search(&query, regex, case_insensitive, &paths) {
             Ok(r) => r,
-            Err(_) => return CallToolResult::error("search failed".into()),
+            Err(e) => return CallToolResult::error(format!("search failed: {e}")),
         };
 
         let groups = ranker::rank_and_dedup(&results, ranker_conn, &query);
@@ -1200,24 +1193,16 @@ impl McpServer {
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
 
-        let results = if args.get("repo").and_then(|v| v.as_str()).is_some() {
-            let (conn, _repo_root) = match self.resolve_repo(&args) {
-                Ok(r) => r,
-                Err(e) => return e,
-            };
-            crate::router::query_symbols_db(conn, &name, kind, exact).map_err(|e| e.to_string())
-        } else {
-            self.router
-                .query_symbols(&name, kind, exact)
-                .map_err(|e| e.to_string())
+        let (conn, _) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
         };
-
-        match results {
+        match crate::router::query_symbols_db(conn, &name, kind, exact) {
             Ok(r) => {
                 let outputs: Vec<SymbolOutput> = r.iter().map(symbol_to_output).collect();
                 format_result(&outputs, format)
             }
-            Err(_) => CallToolResult::error("symbol query failed".into()),
+            Err(e) => CallToolResult::error(format!("symbol query failed: {e}")),
         }
     }
 
@@ -1226,26 +1211,15 @@ impl McpServer {
             Ok(n) => n,
             Err(e) => return e,
         };
-        let paths: Vec<String> = args
-            .get("paths")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
         let format = extract_format(&args);
 
-        let results = if Self::has_repo_param(&args) {
-            let (conn, _) = match self.resolve_repo(&args) {
-                Ok(r) => r,
-                Err(e) => return e,
-            };
-            match crate::router::query_references_db(conn, &name) {
-                Ok(r) => r,
-                Err(_) => return CallToolResult::error("reference query failed".into()),
-            }
-        } else {
-            match self.router.query_references(&name, &paths) {
-                Ok(r) => r,
-                Err(_) => return CallToolResult::error("reference query failed".into()),
-            }
+        let (conn, _) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        let results = match crate::router::query_references_db(conn, &name) {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("reference query failed: {e}")),
         };
 
         let outputs: Vec<RefOutput> = results
@@ -1272,20 +1246,13 @@ impl McpServer {
         };
         let format = extract_format(&args);
 
-        let results = if Self::has_repo_param(&args) {
-            let (conn, _) = match self.resolve_repo(&args) {
-                Ok(r) => r,
-                Err(e) => return e,
-            };
-            match crate::router::query_signatures_db(conn, &name) {
-                Ok(r) => r,
-                Err(_) => return CallToolResult::error("signature query failed".into()),
-            }
-        } else {
-            match self.router.query_signatures(&name) {
-                Ok(r) => r,
-                Err(_) => return CallToolResult::error("signature query failed".into()),
-            }
+        let (conn, _) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        let results = match crate::router::query_signatures_db(conn, &name) {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("signature query failed: {e}")),
         };
 
         let outputs: Vec<SignatureOutput> = results
@@ -1304,45 +1271,16 @@ impl McpServer {
 
     fn tool_ls(&mut self, args: Value) -> CallToolResult {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let tree = args.get("tree").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
 
-        if Self::has_repo_param(&args) {
-            let (conn, repo_root) = match self.resolve_repo(&args) {
-                Ok(r) => r,
-                Err(e) => return e,
-            };
-            let path_buf = match validate_path(Path::new(path), &repo_root) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-            let files: Vec<String> = if path_buf.is_dir() {
-                let walker = crate::walker::Walker::new(&path_buf);
-                walker
-                    .collect_paths()
-                    .into_iter()
-                    .filter(|p| p.is_file())
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect()
-            } else {
-                vec![path_buf.to_string_lossy().into_owned()]
-            };
-            let mut all_symbols = Vec::new();
-            for file in &files {
-                match crate::router::query_symbols_in_file_db(conn, file) {
-                    Ok(syms) => all_symbols.extend(syms),
-                    Err(_) => return CallToolResult::error("symbol listing failed".into()),
-                }
-            }
-            let outputs: Vec<SymbolOutput> = all_symbols.iter().map(symbol_to_output).collect();
-            return format_result(&outputs, format);
-        }
-
-        let path_buf = match validate_path(Path::new(path), self.router.repo_root()) {
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        let path_buf = match validate_path(Path::new(path), &repo_root) {
             Ok(p) => p,
             Err(e) => return e,
         };
-
         let files: Vec<String> = if path_buf.is_dir() {
             let walker = crate::walker::Walker::new(&path_buf);
             walker
@@ -1354,15 +1292,13 @@ impl McpServer {
         } else {
             vec![path_buf.to_string_lossy().into_owned()]
         };
-
         let mut all_symbols = Vec::new();
         for file in &files {
-            match self.router.query_symbols_in_file(file, tree) {
+            match crate::router::query_symbols_in_file_db(conn, file) {
                 Ok(syms) => all_symbols.extend(syms),
-                Err(_) => return CallToolResult::error("symbol listing failed".into()),
+                Err(e) => return CallToolResult::error(format!("symbol listing failed: {e}")),
             }
         }
-
         let outputs: Vec<SymbolOutput> = all_symbols.iter().map(symbol_to_output).collect();
         format_result(&outputs, format)
     }
@@ -1374,26 +1310,16 @@ impl McpServer {
         };
         let format = extract_format(&args);
 
-        let results = if Self::has_repo_param(&args) {
-            let (conn, repo_root) = match self.resolve_repo(&args) {
-                Ok(r) => r,
-                Err(e) => return e,
-            };
-            if validate_path(Path::new(&file), &repo_root).is_err() {
-                return CallToolResult::error("path is outside the repository".into());
-            }
-            match crate::router::query_deps_db(conn, &file) {
-                Ok(r) => r,
-                Err(_) => return CallToolResult::error("dependency query failed".into()),
-            }
-        } else {
-            if validate_path(Path::new(&file), self.router.repo_root()).is_err() {
-                return CallToolResult::error("path is outside the repository".into());
-            }
-            match self.router.query_deps(&file) {
-                Ok(r) => r,
-                Err(_) => return CallToolResult::error("dependency query failed".into()),
-            }
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        if validate_path(Path::new(&file), &repo_root).is_err() {
+            return CallToolResult::error("path is outside the repository".into());
+        }
+        let results = match crate::router::query_deps_db(conn, &file) {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("dependency query failed: {e}")),
         };
 
         let outputs: Vec<DepOutput> = results
@@ -1414,25 +1340,17 @@ impl McpServer {
         };
         let format = extract_format(&args);
 
-        let results = if Self::has_repo_param(&args) {
-            let (conn, repo_root) = match self.resolve_repo(&args) {
-                Ok(r) => r,
-                Err(e) => return e,
-            };
-            if validate_path(Path::new(&file), &repo_root).is_err() {
-                return CallToolResult::error("path is outside the repository".into());
-            }
-            match crate::router::query_rdeps_db(conn, &file) {
-                Ok(r) => r,
-                Err(_) => return CallToolResult::error("reverse dependency query failed".into()),
-            }
-        } else {
-            if validate_path(Path::new(&file), self.router.repo_root()).is_err() {
-                return CallToolResult::error("path is outside the repository".into());
-            }
-            match self.router.query_rdeps(&file) {
-                Ok(r) => r,
-                Err(_) => return CallToolResult::error("reverse dependency query failed".into()),
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        if validate_path(Path::new(&file), &repo_root).is_err() {
+            return CallToolResult::error("path is outside the repository".into());
+        }
+        let results = match crate::router::query_rdeps_db(conn, &file) {
+            Ok(r) => r,
+            Err(e) => {
+                return CallToolResult::error(format!("reverse dependency query failed: {e}"));
             }
         };
 
@@ -1449,12 +1367,16 @@ impl McpServer {
 
     fn tool_status(&mut self, args: Value) -> CallToolResult {
         let format = extract_format(&args);
-        let conn = if Self::has_repo_param(&args) {
-            let (c, _) = match self.resolve_repo(&args) {
+        // status works even without a connection (shows "not indexed").
+        let conn = if let Some(repo_name) = args.get("repo").and_then(|v| v.as_str()) {
+            let resolved = match self.registry.resolve(repo_name) {
                 Ok(r) => r,
-                Err(e) => return e,
+                Err(e) => return CallToolResult::error(e),
             };
-            Some(c)
+            match self.registry.get_or_open_connection(&resolved.index_path) {
+                Ok(c) => Some(c as &Connection),
+                Err(e) => return CallToolResult::error(e),
+            }
         } else {
             self.router.conn()
         };
@@ -1473,7 +1395,7 @@ impl McpServer {
             &Progress::silent(),
         ) {
             Ok(s) => s,
-            Err(_) => return CallToolResult::error("index build failed".into()),
+            Err(e) => return CallToolResult::error(format!("index build failed: {e}")),
         };
 
         // Build embeddings after structural index.
@@ -1623,16 +1545,10 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        let min_confidence: Option<f64> =
-            args.get("min_confidence")
-                .and_then(|v| v.as_f64())
-                .map(|c| {
-                    if c.is_nan() || c.is_infinite() {
-                        0.0
-                    } else {
-                        c.clamp(0.0, 1.0)
-                    }
-                });
+        let min_confidence: Option<f64> = args
+            .get("min_confidence")
+            .and_then(|v| v.as_f64())
+            .map(clamp_confidence);
 
         let results = match crate::callgraph::callers(conn, &name, depth, min_confidence) {
             Ok(r) => r,
@@ -1666,16 +1582,10 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        let min_confidence: Option<f64> =
-            args.get("min_confidence")
-                .and_then(|v| v.as_f64())
-                .map(|c| {
-                    if c.is_nan() || c.is_infinite() {
-                        0.0
-                    } else {
-                        c.clamp(0.0, 1.0)
-                    }
-                });
+        let min_confidence: Option<f64> = args
+            .get("min_confidence")
+            .and_then(|v| v.as_f64())
+            .map(clamp_confidence);
 
         let results = match crate::callgraph::callees(conn, &name, depth, min_confidence) {
             Ok(r) => r,
@@ -1720,16 +1630,10 @@ impl McpServer {
             );
         }
 
-        let min_confidence: Option<f64> =
-            args.get("min_confidence")
-                .and_then(|v| v.as_f64())
-                .map(|c| {
-                    if c.is_nan() || c.is_infinite() {
-                        0.0
-                    } else {
-                        c.clamp(0.0, 1.0)
-                    }
-                });
+        let min_confidence: Option<f64> = args
+            .get("min_confidence")
+            .and_then(|v| v.as_f64())
+            .map(clamp_confidence);
 
         match crate::callgraph::callpath(conn, &from, &to, min_confidence) {
             Ok(Some(hops)) => {
@@ -2235,7 +2139,6 @@ mod tests {
     fn test_server() -> McpServer {
         McpServer {
             router: QueryRouter::new(None, false),
-            default_repo_root: PathBuf::from("."),
             registry: RepoRegistry::new(Vec::new()),
         }
     }
@@ -2429,7 +2332,6 @@ mod tests {
         pipeline::build_index(root, true).unwrap();
         let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
-            default_repo_root: root.to_path_buf(),
             registry: RepoRegistry::new(Vec::new()),
         };
 
@@ -2637,7 +2539,6 @@ mod tests {
 
         let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
-            default_repo_root: root.to_path_buf(),
             registry: RepoRegistry::new(Vec::new()),
         };
         let params = serde_json::json!({
@@ -2668,7 +2569,6 @@ mod tests {
 
         let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
-            default_repo_root: root.to_path_buf(),
             registry: RepoRegistry::new(Vec::new()),
         };
         let params = serde_json::json!({
@@ -2701,7 +2601,6 @@ mod tests {
 
         let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
-            default_repo_root: root.to_path_buf(),
             registry: RepoRegistry::new(Vec::new()),
         };
         let params = serde_json::json!({
@@ -3061,8 +2960,8 @@ mod tests {
     fn all_tools_have_repo_param() {
         let tools = tool_definitions();
         for tool in tools.iter() {
-            // wonk_repos itself doesn't need a repo param
-            if tool.name == "wonk_repos" {
+            // wonk_repos lists all repos; wonk_init always targets working directory.
+            if tool.name == "wonk_repos" || tool.name == "wonk_init" {
                 continue;
             }
             let props = tool.input_schema["properties"].as_object().unwrap();
@@ -3085,7 +2984,7 @@ mod tests {
     fn repo_param_is_not_required() {
         let tools = tool_definitions();
         for tool in tools.iter() {
-            if tool.name == "wonk_repos" {
+            if tool.name == "wonk_repos" || tool.name == "wonk_init" {
                 continue;
             }
             if let Some(required) = tool.input_schema.get("required") {
@@ -3112,7 +3011,6 @@ mod tests {
 
         let mut server = McpServer {
             router: QueryRouter::new(Some(root.to_path_buf()), true),
-            default_repo_root: root.to_path_buf(),
             registry: RepoRegistry::new(Vec::new()),
         };
 
@@ -3156,7 +3054,6 @@ mod tests {
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
             router: QueryRouter::new(None, false),
-            default_repo_root: PathBuf::from("."),
             registry: RepoRegistry::new(entries),
         };
 
@@ -3218,7 +3115,6 @@ mod tests {
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
             router: QueryRouter::new(None, false),
-            default_repo_root: PathBuf::from("."),
             registry: RepoRegistry::new(entries),
         };
 
@@ -3282,7 +3178,6 @@ mod tests {
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
             router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
-            default_repo_root: primary_dir.to_path_buf(),
             registry: RepoRegistry::new(entries),
         };
 
@@ -3320,7 +3215,6 @@ mod tests {
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
             router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
-            default_repo_root: primary_dir.to_path_buf(),
             registry: RepoRegistry::new(entries),
         };
 
@@ -3342,7 +3236,6 @@ mod tests {
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
             router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
-            default_repo_root: primary_dir.to_path_buf(),
             registry: RepoRegistry::new(entries),
         };
 
