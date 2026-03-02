@@ -1,3 +1,4 @@
+pub mod blast;
 pub mod budget;
 pub mod callgraph;
 pub mod cli;

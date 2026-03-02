@@ -481,6 +481,133 @@ pub struct ExecutionFlow {
     pub steps: Vec<FlowStep>,
 }
 
+// ---------------------------------------------------------------------------
+// Blast radius types
+// ---------------------------------------------------------------------------
+
+/// Direction of blast radius traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlastDirection {
+    /// Traverse callers (who calls this symbol?).
+    Upstream,
+    /// Traverse callees (what does this symbol call?).
+    Downstream,
+}
+
+impl fmt::Display for BlastDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            BlastDirection::Upstream => "upstream",
+            BlastDirection::Downstream => "downstream",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl FromStr for BlastDirection {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "upstream" => Ok(BlastDirection::Upstream),
+            "downstream" => Ok(BlastDirection::Downstream),
+            other => Err(format!(
+                "unknown blast direction: {other} (expected: upstream, downstream)"
+            )),
+        }
+    }
+}
+
+/// Severity tier based on BFS depth from the target symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlastSeverity {
+    /// Depth 1: direct dependants that will definitely break.
+    WillBreak,
+    /// Depth 2: symbols one hop removed, likely affected.
+    LikelyAffected,
+    /// Depth 3+: symbols further out that may need testing.
+    MayNeedTesting,
+}
+
+impl fmt::Display for BlastSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            BlastSeverity::WillBreak => "WILL BREAK",
+            BlastSeverity::LikelyAffected => "LIKELY AFFECTED",
+            BlastSeverity::MayNeedTesting => "MAY NEED TESTING",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Overall risk level based on total affected symbol count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlastRiskLevel {
+    /// 0-3 affected symbols.
+    Low,
+    /// 4-10 affected symbols.
+    Medium,
+    /// 11-25 affected symbols.
+    High,
+    /// More than 25 affected symbols.
+    Critical,
+}
+
+impl fmt::Display for BlastRiskLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            BlastRiskLevel::Low => "LOW",
+            BlastRiskLevel::Medium => "MEDIUM",
+            BlastRiskLevel::High => "HIGH",
+            BlastRiskLevel::Critical => "CRITICAL",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// A symbol affected by a blast radius analysis.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlastAffectedSymbol {
+    /// The symbol name.
+    pub name: String,
+    /// What kind of symbol this is.
+    pub kind: SymbolKind,
+    /// Path of the source file.
+    pub file: String,
+    /// 1-based line number.
+    pub line: usize,
+    /// BFS depth at which this symbol was discovered.
+    pub depth: usize,
+    /// Confidence score of the edge (0.0-1.0).
+    pub confidence: f64,
+}
+
+/// A group of affected symbols at the same severity tier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlastTier {
+    /// The severity label for this group.
+    pub severity: BlastSeverity,
+    /// All affected symbols at this severity level.
+    pub symbols: Vec<BlastAffectedSymbol>,
+}
+
+/// Complete blast radius analysis result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlastAnalysis {
+    /// The target symbol being analyzed.
+    pub target: String,
+    /// Direction of traversal.
+    pub direction: BlastDirection,
+    /// Overall risk level.
+    pub risk_level: BlastRiskLevel,
+    /// Total number of affected symbols across all tiers.
+    pub total_affected: usize,
+    /// Affected symbols grouped by severity tier.
+    pub tiers: Vec<BlastTier>,
+    /// Deduplicated list of files containing affected symbols.
+    pub affected_files: Vec<String>,
+}
+
 /// A single hop in a call path between two symbols, returned by `wonk callpath`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallPathHop {
@@ -967,6 +1094,122 @@ mod tests {
         let a = ExecutionFlow {
             entry_point: entry.clone(),
             steps: vec![entry.clone()],
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // -- BlastDirection tests -------------------------------------------------
+
+    #[test]
+    fn blast_direction_display() {
+        assert_eq!(BlastDirection::Upstream.to_string(), "upstream");
+        assert_eq!(BlastDirection::Downstream.to_string(), "downstream");
+    }
+
+    #[test]
+    fn blast_direction_from_str() {
+        assert_eq!(
+            BlastDirection::from_str("upstream").unwrap(),
+            BlastDirection::Upstream
+        );
+        assert_eq!(
+            BlastDirection::from_str("downstream").unwrap(),
+            BlastDirection::Downstream
+        );
+        assert!(BlastDirection::from_str("invalid").is_err());
+    }
+
+    // -- BlastSeverity tests --------------------------------------------------
+
+    #[test]
+    fn blast_severity_display() {
+        assert_eq!(BlastSeverity::WillBreak.to_string(), "WILL BREAK");
+        assert_eq!(BlastSeverity::LikelyAffected.to_string(), "LIKELY AFFECTED");
+        assert_eq!(
+            BlastSeverity::MayNeedTesting.to_string(),
+            "MAY NEED TESTING"
+        );
+    }
+
+    // -- BlastRiskLevel tests -------------------------------------------------
+
+    #[test]
+    fn blast_risk_level_display() {
+        assert_eq!(BlastRiskLevel::Low.to_string(), "LOW");
+        assert_eq!(BlastRiskLevel::Medium.to_string(), "MEDIUM");
+        assert_eq!(BlastRiskLevel::High.to_string(), "HIGH");
+        assert_eq!(BlastRiskLevel::Critical.to_string(), "CRITICAL");
+    }
+
+    // -- BlastAffectedSymbol tests --------------------------------------------
+
+    #[test]
+    fn blast_affected_symbol_creation() {
+        let s = BlastAffectedSymbol {
+            name: "handlePayment".into(),
+            kind: SymbolKind::Function,
+            file: "src/billing.ts".into(),
+            line: 42,
+            depth: 1,
+            confidence: 0.85,
+        };
+        assert_eq!(s.name, "handlePayment");
+        assert_eq!(s.kind, SymbolKind::Function);
+        assert_eq!(s.file, "src/billing.ts");
+        assert_eq!(s.line, 42);
+        assert_eq!(s.depth, 1);
+        assert!((s.confidence - 0.85).abs() < 1e-9);
+    }
+
+    // -- BlastTier tests ------------------------------------------------------
+
+    #[test]
+    fn blast_tier_creation() {
+        let tier = BlastTier {
+            severity: BlastSeverity::WillBreak,
+            symbols: vec![BlastAffectedSymbol {
+                name: "foo".into(),
+                kind: SymbolKind::Function,
+                file: "a.rs".into(),
+                line: 1,
+                depth: 1,
+                confidence: 0.9,
+            }],
+        };
+        assert_eq!(tier.severity, BlastSeverity::WillBreak);
+        assert_eq!(tier.symbols.len(), 1);
+    }
+
+    // -- BlastAnalysis tests --------------------------------------------------
+
+    #[test]
+    fn blast_analysis_creation() {
+        let analysis = BlastAnalysis {
+            target: "processPayment".into(),
+            direction: BlastDirection::Upstream,
+            risk_level: BlastRiskLevel::Low,
+            total_affected: 2,
+            tiers: vec![],
+            affected_files: vec!["src/billing.ts".into()],
+        };
+        assert_eq!(analysis.target, "processPayment");
+        assert_eq!(analysis.direction, BlastDirection::Upstream);
+        assert_eq!(analysis.risk_level, BlastRiskLevel::Low);
+        assert_eq!(analysis.total_affected, 2);
+        assert!(analysis.tiers.is_empty());
+        assert_eq!(analysis.affected_files.len(), 1);
+    }
+
+    #[test]
+    fn blast_analysis_equality() {
+        let a = BlastAnalysis {
+            target: "foo".into(),
+            direction: BlastDirection::Downstream,
+            risk_level: BlastRiskLevel::Medium,
+            total_affected: 5,
+            tiers: vec![],
+            affected_files: vec![],
         };
         let b = a.clone();
         assert_eq!(a, b);

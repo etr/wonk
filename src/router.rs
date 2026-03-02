@@ -17,9 +17,9 @@ use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
 use crate::output::{
-    self, BudgetStatus, CallPathHopOutput, CalleeOutput, CallerOutput, FlowOutput, FlowStepOutput,
-    Formatter, LsSymbolEntry, OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput,
-    SignatureOutput, SummaryOutput, SymbolOutput,
+    self, BlastOutput, BudgetStatus, CallPathHopOutput, CalleeOutput, CallerOutput, FlowOutput,
+    FlowStepOutput, Formatter, LsSymbolEntry, OutputFormat, RefOutput, SearchOutput,
+    SemanticOutput, ShowOutput, SignatureOutput, SummaryOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -1262,6 +1262,51 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
             }
         }
+        Command::Blast(args) => {
+            let conn = match callgraph_conn(suppress) {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+
+            let (depth, clamped) = crate::blast::clamp_depth(args.depth);
+            if clamped {
+                output::print_hint(
+                    &format!(
+                        "depth {} exceeds cap; using max depth {}",
+                        args.depth,
+                        crate::blast::MAX_DEPTH,
+                    ),
+                    suppress,
+                );
+            }
+
+            let direction = match &args.direction {
+                Some(d) => match d.parse::<crate::types::BlastDirection>() {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        output::print_error(&e);
+                        return Ok(());
+                    }
+                },
+                None => crate::types::BlastDirection::Upstream,
+            };
+
+            let options = crate::blast::BlastOptions {
+                depth,
+                direction,
+                include_tests: args.include_tests,
+                min_confidence: args.min_confidence,
+            };
+
+            let result = crate::blast::analyze_blast(&conn, &args.symbol, &options)?;
+
+            if result.total_affected == 0 {
+                output::print_hint("no affected symbols found", suppress);
+            }
+
+            let out = BlastOutput::from(&result);
+            fmt.format_blast(&out)?;
+        }
     }
     Ok(())
 }
@@ -1339,6 +1384,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Callpath(_)
             | Command::Summary(_)
             | Command::Flows(_)
+            | Command::Blast(_)
     )
 }
 
@@ -4682,6 +4728,19 @@ mod tests {
             from: None,
             depth: 10,
             branching: 4,
+            min_confidence: None,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_blast() {
+        use crate::cli::BlastArgs;
+        let cmd = Command::Blast(BlastArgs {
+            symbol: "processPayment".into(),
+            direction: None,
+            depth: 3,
+            include_tests: false,
             min_confidence: None,
         });
         assert!(is_query_command(&cmd));
