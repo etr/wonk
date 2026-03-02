@@ -444,6 +444,122 @@ pub fn category_header(cat: ResultCategory) -> &'static str {
 // Full pipeline
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Reciprocal Rank Fusion (RRF)
+// ---------------------------------------------------------------------------
+
+/// Tracks how a result entered the fused list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedSource {
+    /// Result appeared only in the structural (grep) list.
+    Structural,
+    /// Result appeared only in the semantic (embedding) list.
+    Semantic,
+    /// Result appeared in both lists.
+    Both,
+}
+
+impl std::fmt::Display for FusedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            FusedSource::Structural => "structural",
+            FusedSource::Semantic => "semantic",
+            FusedSource::Both => "both",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// A result produced by Reciprocal Rank Fusion of structural and semantic lists.
+#[derive(Debug, Clone)]
+pub struct FusedResult {
+    /// File path (relative to repo root).
+    pub file: String,
+    /// 1-based line number.
+    pub line: u64,
+    /// 1-based column.
+    pub col: u64,
+    /// Display content for this result.
+    pub content: String,
+    /// RRF score (higher = better).
+    pub rrf_score: f32,
+    /// Which list(s) this result came from.
+    pub source: FusedSource,
+    /// Optional annotation (e.g. "[semantic: 0.85]").
+    pub annotation: Option<String>,
+}
+
+/// Merge structural and semantic result lists using Reciprocal Rank Fusion.
+///
+/// Each document is identified by `(file, line)`. For each list the document
+/// appears in, it receives a score of `1 / (k + rank)` where rank is 1-indexed.
+/// Scores are summed across lists. The output is sorted by descending RRF
+/// score.
+///
+/// When a document appears in both lists, the structural content is used (it
+/// has the actual source line, while semantic results only have a symbol name).
+pub fn fuse_rrf(
+    structural: &[SearchResult],
+    semantic: &[crate::types::SemanticResult],
+    k: f32,
+) -> Vec<FusedResult> {
+    // Document key -> (accumulated score, FusedResult-in-progress)
+    let mut docs: HashMap<(String, u64), FusedResult> = HashMap::new();
+
+    // Score structural results (1-indexed ranks)
+    for (i, r) in structural.iter().enumerate() {
+        let rank = (i + 1) as f32;
+        let score = 1.0 / (k + rank);
+        let key = (r.file.to_string_lossy().into_owned(), r.line);
+
+        docs.entry(key)
+            .and_modify(|d| {
+                d.rrf_score += score;
+                d.source = FusedSource::Both;
+            })
+            .or_insert_with(|| FusedResult {
+                file: r.file.to_string_lossy().into_owned(),
+                line: r.line,
+                col: r.col,
+                content: r.content.clone(),
+                rrf_score: score,
+                source: FusedSource::Structural,
+                annotation: None,
+            });
+    }
+
+    // Score semantic results (1-indexed ranks)
+    for (i, sr) in semantic.iter().enumerate() {
+        let rank = (i + 1) as f32;
+        let score = 1.0 / (k + rank);
+        let key = (sr.file.clone(), sr.line as u64);
+
+        docs.entry(key)
+            .and_modify(|d| {
+                d.rrf_score += score;
+                d.source = FusedSource::Both;
+                // Keep structural content when available (it has actual source)
+            })
+            .or_insert_with(|| FusedResult {
+                file: sr.file.clone(),
+                line: sr.line as u64,
+                col: 1,
+                content: format!("{} ({})", sr.symbol_name, sr.symbol_kind),
+                rrf_score: score,
+                source: FusedSource::Semantic,
+                annotation: Some(format!("[semantic: {:.2}]", sr.similarity_score)),
+            });
+    }
+
+    let mut results: Vec<FusedResult> = docs.into_values().collect();
+    results.sort_unstable_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results
+}
+
 /// Full ranking pipeline: classify -> sort -> dedup -> group.
 pub fn rank_and_dedup(
     results: &[SearchResult],
@@ -965,5 +1081,159 @@ mod tests {
         assert!(!groups.is_empty());
         // First group should be Import (tier 2)
         assert_eq!(groups[0].0, ResultCategory::Import);
+    }
+
+    // -----------------------------------------------------------------------
+    // FusedResult / FusedSource type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fused_source_display() {
+        assert_eq!(FusedSource::Structural.to_string(), "structural");
+        assert_eq!(FusedSource::Semantic.to_string(), "semantic");
+        assert_eq!(FusedSource::Both.to_string(), "both");
+    }
+
+    #[test]
+    fn fused_result_construction() {
+        let fr = FusedResult {
+            file: "src/lib.rs".to_string(),
+            line: 42,
+            col: 1,
+            content: "fn foo() {}".to_string(),
+            rrf_score: 0.016,
+            source: FusedSource::Structural,
+            annotation: None,
+        };
+        assert_eq!(fr.file, "src/lib.rs");
+        assert_eq!(fr.line, 42);
+        assert!((fr.rrf_score - 0.016).abs() < 1e-6);
+        assert_eq!(fr.source, FusedSource::Structural);
+    }
+
+    // -----------------------------------------------------------------------
+    // fuse_rrf tests
+    // -----------------------------------------------------------------------
+
+    use crate::types::{SemanticResult, SymbolKind};
+
+    fn make_semantic(file: &str, line: usize, name: &str, score: f32) -> SemanticResult {
+        SemanticResult {
+            symbol_id: 0,
+            file: file.to_string(),
+            line,
+            symbol_name: name.to_string(),
+            symbol_kind: SymbolKind::Function,
+            similarity_score: score,
+        }
+    }
+
+    #[test]
+    fn fuse_rrf_empty_inputs() {
+        let fused = fuse_rrf(&[], &[], 60.0);
+        assert!(fused.is_empty());
+    }
+
+    #[test]
+    fn fuse_rrf_structural_only() {
+        let structural = vec![
+            make_result("src/a.rs", 10, "fn foo()"),
+            make_result("src/b.rs", 20, "fn bar()"),
+        ];
+        let fused = fuse_rrf(&structural, &[], 60.0);
+        assert_eq!(fused.len(), 2);
+        // rank-1 structural: 1/(60+1), rank-2: 1/(60+2)
+        assert!((fused[0].rrf_score - 1.0 / 61.0).abs() < 1e-6);
+        assert!((fused[1].rrf_score - 1.0 / 62.0).abs() < 1e-6);
+        assert_eq!(fused[0].source, FusedSource::Structural);
+        assert_eq!(fused[1].source, FusedSource::Structural);
+        assert_eq!(fused[0].file, "src/a.rs");
+    }
+
+    #[test]
+    fn fuse_rrf_semantic_only() {
+        let semantic = vec![
+            make_semantic("src/x.rs", 5, "process", 0.95),
+            make_semantic("src/y.rs", 15, "handle", 0.80),
+        ];
+        let fused = fuse_rrf(&[], &semantic, 60.0);
+        assert_eq!(fused.len(), 2);
+        assert!((fused[0].rrf_score - 1.0 / 61.0).abs() < 1e-6);
+        assert!((fused[1].rrf_score - 1.0 / 62.0).abs() < 1e-6);
+        assert_eq!(fused[0].source, FusedSource::Semantic);
+        assert_eq!(fused[1].source, FusedSource::Semantic);
+        // Annotation should include semantic score
+        assert!(fused[0].annotation.as_ref().unwrap().contains("semantic"));
+    }
+
+    #[test]
+    fn fuse_rrf_both_lists_document_in_both() {
+        // Same (file, line) appears in both lists
+        let structural = vec![make_result("src/a.rs", 10, "fn foo()")];
+        let semantic = vec![make_semantic("src/a.rs", 10, "foo", 0.9)];
+        let fused = fuse_rrf(&structural, &semantic, 60.0);
+        assert_eq!(fused.len(), 1);
+        // Score should be sum: 1/(60+1) + 1/(60+1) = 2/(61)
+        let expected = 2.0 / 61.0;
+        assert!((fused[0].rrf_score - expected).abs() < 1e-6);
+        assert_eq!(fused[0].source, FusedSource::Both);
+        // Structural content is preferred for Both
+        assert_eq!(fused[0].content, "fn foo()");
+    }
+
+    #[test]
+    fn fuse_rrf_semantic_outranks_structural() {
+        // Semantic rank-1 result should outrank structural rank-3 result
+        // when the semantic result has a higher combined RRF score.
+        let structural = vec![
+            make_result("src/a.rs", 1, "line1"),
+            make_result("src/b.rs", 2, "line2"),
+            make_result("src/c.rs", 3, "line3"),
+        ];
+        let semantic = vec![make_semantic("src/x.rs", 5, "top_semantic", 0.99)];
+
+        let fused = fuse_rrf(&structural, &semantic, 60.0);
+        // Structural rank-1: 1/61 = 0.01639
+        // Semantic rank-1: 1/61 = 0.01639  (same score as structural rank-1)
+        // Structural rank-3: 1/63 = 0.01587
+        // So semantic rank-1 should appear before structural rank-3
+        let x_pos = fused.iter().position(|f| f.file == "src/x.rs").unwrap();
+        let c_pos = fused.iter().position(|f| f.file == "src/c.rs").unwrap();
+        assert!(
+            x_pos < c_pos,
+            "semantic rank-1 (pos {}) should appear before structural rank-3 (pos {})",
+            x_pos,
+            c_pos
+        );
+    }
+
+    #[test]
+    fn fuse_rrf_sorted_descending() {
+        let structural = vec![
+            make_result("src/a.rs", 1, "first"),
+            make_result("src/b.rs", 2, "second"),
+        ];
+        let semantic = vec![
+            make_semantic("src/c.rs", 3, "third", 0.9),
+            make_semantic("src/d.rs", 4, "fourth", 0.8),
+        ];
+        let fused = fuse_rrf(&structural, &semantic, 60.0);
+        // Verify descending order
+        for w in fused.windows(2) {
+            assert!(
+                w[0].rrf_score >= w[1].rrf_score,
+                "results should be sorted descending: {} >= {}",
+                w[0].rrf_score,
+                w[1].rrf_score
+            );
+        }
+    }
+
+    #[test]
+    fn fuse_rrf_custom_k() {
+        let structural = vec![make_result("src/a.rs", 1, "fn foo()")];
+        let fused = fuse_rrf(&structural, &[], 10.0);
+        // With k=10, rank-1: 1/(10+1) = 1/11
+        assert!((fused[0].rrf_score - 1.0 / 11.0).abs() < 1e-6);
     }
 }
