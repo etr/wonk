@@ -37,7 +37,7 @@
 | M17 | Call Graph Commands | 2 | Complete |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Complete |
 | M19 | Edge Confidence & Inheritance Infrastructure | 3 | In Progress |
-| M20 | Hybrid Search Fusion (RRF) | 1 | Not Started |
+| M20 | Hybrid Search Fusion (RRF) | 1 | In Progress |
 | M21 | Execution Flow Detection (`wonk flows`) | 1 | Not Started |
 | M22 | Blast Radius Analysis (`wonk blast`) | 1 | Not Started |
 | M23 | Scoped Change Detection (`wonk changes`) | 2 | Not Started |
@@ -2791,14 +2791,14 @@ Ensure full index builds (`wonk init`/`wonk update`) and daemon incremental re-i
 Implement `fuse_rrf()` in `ranker.rs` that merges structural and semantic result lists using the RRF formula, and wire it into the search pipeline replacing the existing blending logic.
 
 **Action Items:**
-- [ ] Add `fuse_rrf(structural: &[RankedResult], semantic: &[SemanticResult], k: f32) -> Vec<FusedResult>` to `ranker.rs` (~40 lines) (PRD-RRF-REQ-001)
-- [ ] Implement RRF formula: `score(d) = Sum 1/(K + rank_i(d))` across all result lists (PRD-RRF-REQ-001)
-- [ ] Default K=60 (PRD-RRF-REQ-002)
-- [ ] Add `rrf_k` to `[search]` section in config.toml schema; use configured value when present (PRD-RRF-REQ-003)
-- [ ] Define `FusedResult` with: result data, rrf_score, source tracking (Structural, Semantic, or Both)
-- [ ] Sort output by descending RRF score (PRD-RRF-REQ-004)
-- [ ] Replace existing `blended_search()` call in `router.rs` with `fuse_rrf()` call
-- [ ] Apply existing budget/ranking post-processing after fusion
+- [x] Add `fuse_rrf(structural: &[RankedResult], semantic: &[SemanticResult], k: f32) -> Vec<FusedResult>` to `ranker.rs` (~40 lines) (PRD-RRF-REQ-001)
+- [x] Implement RRF formula: `score(d) = Sum 1/(K + rank_i(d))` across all result lists (PRD-RRF-REQ-001)
+- [x] Default K=60 (PRD-RRF-REQ-002)
+- [x] Add `rrf_k` to `[search]` section in config.toml schema; use configured value when present (PRD-RRF-REQ-003)
+- [x] Define `FusedResult` with: result data, rrf_score, source tracking (Structural, Semantic, or Both)
+- [x] Sort output by descending RRF score (PRD-RRF-REQ-004)
+- [x] Replace existing `blended_search()` call in `router.rs` with `fuse_rrf()` call
+- [x] Apply existing budget/ranking post-processing after fusion
 
 **Dependencies:**
 - Blocked by: None
@@ -2816,7 +2816,7 @@ Implement `fuse_rrf()` in `ranker.rs` that merges structural and semantic result
 **Related Requirements:** PRD-RRF-REQ-001 through PRD-RRF-REQ-004
 **Related Decisions:** DR-027
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
