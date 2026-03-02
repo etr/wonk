@@ -362,7 +362,7 @@ fn gather_children(conn: &Connection, symbol_id: i64) -> Result<Vec<ContextChild
         WHERE te.parent_id = ?1 \
         ORDER BY s.file, s.line";
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params![symbol_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
