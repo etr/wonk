@@ -25,6 +25,7 @@ pub struct Config {
     pub output: OutputConfig,
     pub ignore: IgnoreConfig,
     pub llm: LlmConfig,
+    pub search: SearchConfig,
 }
 
 /// Daemon-related settings.
@@ -68,6 +69,17 @@ pub struct LlmConfig {
     pub generate_url: String,
 }
 
+/// Search-related settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchConfig {
+    /// Reciprocal Rank Fusion constant K.
+    ///
+    /// Controls how much weight is given to rank position when fusing
+    /// structural and semantic result lists. Higher values produce more
+    /// even blending. Default: 60.0 (standard RRF constant).
+    pub rrf_k: f32,
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -105,6 +117,12 @@ impl Default for LlmConfig {
     }
 }
 
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self { rrf_k: 60.0 }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Option-based overlay types (for partial deserialization)
 // ---------------------------------------------------------------------------
@@ -120,6 +138,7 @@ struct ConfigOverlay {
     output: Option<OutputOverlay>,
     ignore: Option<IgnoreOverlay>,
     llm: Option<LlmOverlay>,
+    search: Option<SearchOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -153,6 +172,12 @@ struct IgnoreOverlay {
 struct LlmOverlay {
     model: Option<String>,
     generate_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct SearchOverlay {
+    rrf_k: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +221,11 @@ impl Config {
             if let Some(v) = llm.generate_url {
                 self.llm.generate_url = v;
             }
+        }
+        if let Some(s) = overlay.search
+            && let Some(v) = s.rrf_k
+        {
+            self.search.rrf_k = v;
         }
     }
 }
@@ -710,5 +740,50 @@ model = "llama3.2:1b"
         assert_eq!(config.llm.model, "llama3.2:1b");
         // generate_url from global should survive.
         assert_eq!(config.llm.generate_url, "http://global:11434/api/generate");
+    }
+
+    // -- Search config tests --------------------------------------------------
+
+    #[test]
+    fn search_rrf_k_default_is_60() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert!((config.search.rrf_k - 60.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_rrf_k_override_from_global() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[search]
+rrf_k = 40.0
+"#,
+        );
+
+        let config = env.load().unwrap();
+        assert!((config.search.rrf_k - 40.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_rrf_k_repo_overrides_global() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[search]
+rrf_k = 40.0
+"#,
+        );
+
+        let repo = env.create_repo();
+        env.write_repo_config(
+            r#"
+[search]
+rrf_k = 80.0
+"#,
+        );
+
+        let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
+        assert!((config.search.rrf_k - 80.0).abs() < f32::EPSILON);
     }
 }

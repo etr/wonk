@@ -5,7 +5,6 @@
 //! is unavailable or returns no results, falls back to grep-based heuristic
 //! search patterns that cover all 11 supported languages.
 
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -150,60 +149,69 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let blend_semantic = args.semantic;
 
             let mut truncated = 0usize;
-            match mode {
-                SearchMode::Smart(_) => {
-                    // Ranked mode: classify, sort, dedup, and group with headers.
-                    use crate::ranker;
 
-                    let groups = ranker::rank_and_dedup(&results, conn.as_ref(), &args.pattern);
+            if blend_semantic {
+                // RRF fusion mode: fetch semantic results, fuse with structural,
+                // output interleaved by descending RRF score.
+                use crate::ranker;
 
-                    for (category, items) in &groups {
-                        if !suppress {
-                            output::print_category_header(ranker::category_header(*category));
-                        }
-                        for item in items {
-                            let mut out = SearchOutput::from_search_result(
-                                &item.result.file,
-                                item.result.line,
-                                item.result.col,
-                                &item.result.content,
-                            );
-                            out.annotation = item.annotation.clone();
-                            if blend_semantic {
-                                out.source = Some("structural".to_string());
+                let rrf_k = config.search.rrf_k;
+                let semantic_results =
+                    fetch_semantic_results(&args.pattern, conn.as_ref(), suppress)?;
+
+                let fused = ranker::fuse_rrf(&results, &semantic_results, rrf_k);
+
+                for fr in &fused {
+                    let out = SearchOutput {
+                        file: fr.file.clone(),
+                        line: fr.line,
+                        col: fr.col,
+                        content: fr.content.clone(),
+                        annotation: fr.annotation.clone(),
+                        source: Some(fr.source.to_string()),
+                    };
+                    if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
+                        truncated += 1;
+                    }
+                }
+            } else {
+                match mode {
+                    SearchMode::Smart(_) => {
+                        // Ranked mode: classify, sort, dedup, and group with headers.
+                        use crate::ranker;
+
+                        let groups = ranker::rank_and_dedup(&results, conn.as_ref(), &args.pattern);
+
+                        for (category, items) in &groups {
+                            if !suppress {
+                                output::print_category_header(ranker::category_header(*category));
                             }
+                            for item in items {
+                                let mut out = SearchOutput::from_search_result(
+                                    &item.result.file,
+                                    item.result.line,
+                                    item.result.col,
+                                    &item.result.content,
+                                );
+                                out.annotation = item.annotation.clone();
+                                if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
+                                    truncated += 1;
+                                }
+                            }
+                        }
+                    }
+                    SearchMode::Plain => {
+                        // Plain text mode: output directly without ranking/dedup.
+                        for r in &results {
+                            let out = SearchOutput::from_search_result(
+                                &r.file, r.line, r.col, &r.content,
+                            );
                             if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
                                 truncated += 1;
                             }
                         }
                     }
                 }
-                SearchMode::Plain => {
-                    // Plain text mode: output directly without ranking/dedup.
-                    for r in &results {
-                        let mut out =
-                            SearchOutput::from_search_result(&r.file, r.line, r.col, &r.content);
-                        if blend_semantic {
-                            out.source = Some("structural".to_string());
-                        }
-                        if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
-                            truncated += 1;
-                        }
-                    }
-                }
-            }
-
-            // Blend semantic results when --semantic is active.
-            if blend_semantic {
-                let structural_keys = collect_structural_keys(&results);
-                let semantic_truncated = blend_semantic_results(
-                    &args.pattern,
-                    conn.as_ref(),
-                    &structural_keys,
-                    suppress,
-                    &mut fmt,
-                )?;
-                truncated += semantic_truncated;
             }
 
             emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
@@ -1279,50 +1287,20 @@ fn is_query_command(cmd: &Command) -> bool {
 // Semantic blending helpers
 // ---------------------------------------------------------------------------
 
-/// Collect `(file, line)` keys from structural search results for dedup.
-fn collect_structural_keys(results: &[search::SearchResult]) -> HashSet<(String, u64)> {
-    results
-        .iter()
-        .map(|r| (r.file.to_string_lossy().into_owned(), r.line))
-        .collect()
-}
-
-/// Convert a `SemanticResult` into a `SearchOutput` for blended display.
+/// Fetch semantic search results without formatting them.
 ///
-/// Sets `annotation` to `[semantic: X.XX]` and `source` to `"semantic"`.
-/// The `content` field is set to `"symbol_name (symbol_kind)"` since semantic
-/// results come from the symbol index rather than grep matches.
-fn semantic_to_search_output(sr: &crate::types::SemanticResult) -> SearchOutput {
-    SearchOutput {
-        file: sr.file.clone(),
-        line: sr.line as u64,
-        col: 0,
-        content: format!("{} ({})", sr.symbol_name, sr.symbol_kind),
-        annotation: Some(format!("[semantic: {:.2}]", sr.similarity_score)),
-        source: Some("semantic".to_string()),
-    }
-}
-
-/// Run semantic search and blend results into the formatter output.
-///
-/// Returns the count of truncated (budget-skipped) semantic results.
-///
-/// Graceful degradation:
-/// - No DB connection: hint + return 0
-/// - No embeddings: hint + return 0
-/// - Ollama unreachable: hint + return 0
-fn blend_semantic_results<W: io::Write>(
+/// Returns the resolved semantic results, or an empty Vec on graceful
+/// degradation (no DB, no embeddings, Ollama unreachable).
+fn fetch_semantic_results(
     pattern: &str,
     conn: Option<&Connection>,
-    structural_keys: &HashSet<(String, u64)>,
     suppress: bool,
-    fmt: &mut Formatter<W>,
-) -> Result<usize> {
+) -> Result<Vec<crate::types::SemanticResult>> {
     let conn = match conn {
         Some(c) => c,
         None => {
             output::print_hint("semantic blending skipped: no index available", suppress);
-            return Ok(0);
+            return Ok(Vec::new());
         }
     };
 
@@ -1333,14 +1311,14 @@ fn blend_semantic_results<W: io::Write>(
                 "semantic blending skipped: no embeddings available (run `wonk init` with Ollama running)",
                 suppress,
             );
-            return Ok(0);
+            return Ok(Vec::new());
         }
         Err(_) => {
             output::print_hint(
                 "semantic blending skipped: failed to load embeddings",
                 suppress,
             );
-            return Ok(0);
+            return Ok(Vec::new());
         }
     };
 
@@ -1349,7 +1327,7 @@ fn blend_semantic_results<W: io::Write>(
         Ok(v) => v,
         Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
             output::print_hint("semantic blending skipped: Ollama is unreachable", suppress);
-            return Ok(0);
+            return Ok(Vec::new());
         }
         Err(e) => return Err(e.into()),
     };
@@ -1357,26 +1335,8 @@ fn blend_semantic_results<W: io::Write>(
 
     let scored = crate::semantic::semantic_search(&query_vec, &all_embeddings, 20);
     let resolved = crate::semantic::resolve_results(conn, &scored)?;
-    let deduped = crate::semantic::dedup_semantic(&resolved, structural_keys);
 
-    if deduped.is_empty() {
-        return Ok(0);
-    }
-
-    // Print category header for semantic section.
-    if !suppress {
-        output::print_category_header("-- semantic --");
-    }
-
-    let mut truncated = 0usize;
-    for sr in &deduped {
-        let out = semantic_to_search_output(sr);
-        if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
-            truncated += 1;
-        }
-    }
-
-    Ok(truncated)
+    Ok(resolved)
 }
 
 /// Emit a budget summary if any results were truncated.
@@ -4552,85 +4512,26 @@ mod tests {
         assert!(output.contains("unreachable"));
     }
 
-    // -- Semantic blending helpers ------------------------------------------
+    // -- Semantic fetch + RRF helpers -----------------------------------------
 
     #[test]
-    fn test_collect_structural_keys_from_search_results() {
-        let results = vec![
-            search::SearchResult {
-                file: PathBuf::from("src/lib.rs"),
-                line: 10,
-                col: 1,
-                content: "fn foo() {}".to_string(),
-            },
-            search::SearchResult {
-                file: PathBuf::from("src/main.rs"),
-                line: 20,
-                col: 5,
-                content: "fn bar() {}".to_string(),
-            },
-        ];
-        let keys = collect_structural_keys(&results);
-        assert_eq!(keys.len(), 2);
-        assert!(keys.contains(&("src/lib.rs".to_string(), 10u64)));
-        assert!(keys.contains(&("src/main.rs".to_string(), 20u64)));
+    fn test_fetch_semantic_no_conn_returns_empty() {
+        let result = fetch_semantic_results("test", None, true);
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_collect_structural_keys_empty() {
-        let results: Vec<search::SearchResult> = vec![];
-        let keys = collect_structural_keys(&results);
-        assert!(keys.is_empty());
-    }
-
-    #[test]
-    fn test_semantic_to_search_output_annotation_and_source() {
-        use crate::types::{SemanticResult, SymbolKind};
-        let sr = SemanticResult {
-            symbol_id: 1,
-            file: "src/auth.rs".to_string(),
-            line: 42,
-            symbol_name: "verifyToken".to_string(),
-            symbol_kind: SymbolKind::Function,
-            similarity_score: 0.8765,
-        };
-        let out = semantic_to_search_output(&sr);
-        assert_eq!(out.file, "src/auth.rs");
-        assert_eq!(out.line, 42);
-        assert_eq!(out.annotation.as_deref(), Some("[semantic: 0.88]"));
-        assert_eq!(out.source.as_deref(), Some("semantic"));
-        // content should contain symbol name and kind
-        assert!(out.content.contains("verifyToken"));
-        assert!(out.content.contains("function"));
-    }
-
-    #[test]
-    fn test_blend_semantic_no_conn_returns_zero() {
-        let structural_keys = HashSet::new();
-        let mut buf = Vec::new();
-        let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
-        let result = blend_semantic_results("test", None, &structural_keys, true, &mut fmt);
-        assert_eq!(result.unwrap(), 0);
-        // No output written (hint is suppressed).
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn test_blend_semantic_no_embeddings_returns_zero() {
+    fn test_fetch_semantic_no_embeddings_returns_empty() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("index.db");
         let conn = db::open(&db_path).unwrap();
 
-        let structural_keys = HashSet::new();
-        let mut buf = Vec::new();
-        let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
-        let result = blend_semantic_results("test", Some(&conn), &structural_keys, true, &mut fmt);
-        assert_eq!(result.unwrap(), 0);
-        assert!(buf.is_empty());
+        let result = fetch_semantic_results("test", Some(&conn), true);
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_blend_semantic_with_embeddings_does_not_panic() {
+    fn test_fetch_semantic_with_embeddings_does_not_panic() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("index.db");
         let conn = db::open(&db_path).unwrap();
@@ -4652,15 +4553,11 @@ mod tests {
         )
         .unwrap();
 
-        let structural_keys = HashSet::new();
-        let mut buf = Vec::new();
-        let mut fmt = Formatter::new(&mut buf, OutputFormat::Grep, false);
         // Should succeed regardless of whether Ollama is running:
-        // - If unreachable: graceful degradation, returns 0
+        // - If unreachable: graceful degradation, returns empty Vec
         // - If reachable: may produce results, still returns Ok
-        let result =
-            blend_semantic_results("test_query", Some(&conn), &structural_keys, true, &mut fmt);
-        assert!(result.is_ok(), "blend_semantic_results should not error");
+        let result = fetch_semantic_results("test_query", Some(&conn), true);
+        assert!(result.is_ok(), "fetch_semantic_results should not error");
     }
 
     // -- Impact query command test -------------------------------------------
