@@ -89,6 +89,9 @@ pub enum Command {
 
     /// Detect entry points and trace execution flows
     Flows(FlowsArgs),
+
+    /// Analyze blast radius of a symbol change
+    Blast(BlastArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -354,6 +357,28 @@ pub struct FlowsArgs {
     pub branching: usize,
 
     /// Minimum confidence threshold (0.0-1.0) to filter callee edges
+    #[arg(long)]
+    pub min_confidence: Option<f64>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct BlastArgs {
+    /// Symbol name to analyze blast radius for
+    pub symbol: String,
+
+    /// Traversal direction: upstream (default) or downstream
+    #[arg(long)]
+    pub direction: Option<String>,
+
+    /// Maximum traversal depth (default: 3, max: 10)
+    #[arg(long, default_value_t = 3)]
+    pub depth: usize,
+
+    /// Include test files in results
+    #[arg(long)]
+    pub include_tests: bool,
+
+    /// Minimum confidence threshold (0.0-1.0) to filter edges
     #[arg(long)]
     pub min_confidence: Option<f64>,
 }
@@ -1007,6 +1032,109 @@ mod tests {
         match cli.command {
             Command::Flows(_) => {}
             _ => panic!("expected Command::Flows"),
+        }
+    }
+
+    // -- Blast tests ----------------------------------------------------------
+
+    #[test]
+    fn parse_blast_basic() {
+        let cli = Cli::try_parse_from(["wonk", "blast", "processPayment"]).unwrap();
+        match cli.command {
+            Command::Blast(args) => {
+                assert_eq!(args.symbol, "processPayment");
+                assert!(args.direction.is_none());
+                assert_eq!(args.depth, 3);
+                assert!(!args.include_tests);
+                assert!(args.min_confidence.is_none());
+            }
+            _ => panic!("expected Command::Blast"),
+        }
+    }
+
+    #[test]
+    fn parse_blast_with_direction() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "blast",
+            "--direction",
+            "downstream",
+            "processPayment",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Blast(args) => {
+                assert_eq!(args.direction.as_deref(), Some("downstream"));
+            }
+            _ => panic!("expected Command::Blast"),
+        }
+    }
+
+    #[test]
+    fn parse_blast_with_depth() {
+        let cli = Cli::try_parse_from(["wonk", "blast", "--depth", "5", "processPayment"]).unwrap();
+        match cli.command {
+            Command::Blast(args) => {
+                assert_eq!(args.depth, 5);
+            }
+            _ => panic!("expected Command::Blast"),
+        }
+    }
+
+    #[test]
+    fn parse_blast_with_include_tests() {
+        let cli =
+            Cli::try_parse_from(["wonk", "blast", "--include-tests", "processPayment"]).unwrap();
+        match cli.command {
+            Command::Blast(args) => {
+                assert!(args.include_tests);
+            }
+            _ => panic!("expected Command::Blast"),
+        }
+    }
+
+    #[test]
+    fn parse_blast_with_min_confidence() {
+        let cli =
+            Cli::try_parse_from(["wonk", "blast", "--min-confidence", "0.8", "processPayment"])
+                .unwrap();
+        match cli.command {
+            Command::Blast(args) => {
+                assert_eq!(args.min_confidence, Some(0.8));
+            }
+            _ => panic!("expected Command::Blast"),
+        }
+    }
+
+    #[test]
+    fn parse_blast_requires_symbol() {
+        let result = Cli::try_parse_from(["wonk", "blast"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_blast_with_global_format() {
+        let cli =
+            Cli::try_parse_from(["wonk", "--format", "json", "blast", "processPayment"]).unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Blast(args) => {
+                assert_eq!(args.symbol, "processPayment");
+            }
+            _ => panic!("expected Command::Blast"),
+        }
+    }
+
+    #[test]
+    fn parse_blast_with_global_budget() {
+        let cli =
+            Cli::try_parse_from(["wonk", "--budget", "500", "blast", "processPayment"]).unwrap();
+        assert_eq!(cli.budget, Some(500));
+        match cli.command {
+            Command::Blast(args) => {
+                assert_eq!(args.symbol, "processPayment");
+            }
+            _ => panic!("expected Command::Blast"),
         }
     }
 }

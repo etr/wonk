@@ -401,6 +401,68 @@ impl From<&crate::types::ExecutionFlow> for FlowOutput {
     }
 }
 
+/// A symbol affected by blast radius analysis, for output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlastAffectedOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    pub depth: usize,
+    pub confidence: f64,
+}
+
+/// A severity tier in blast radius output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlastTierOutput {
+    pub severity: String,
+    pub symbols: Vec<BlastAffectedOutput>,
+}
+
+/// Complete blast radius analysis output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlastOutput {
+    pub target: String,
+    pub direction: String,
+    pub risk_level: String,
+    pub total_affected: usize,
+    pub tiers: Vec<BlastTierOutput>,
+    pub affected_files: Vec<String>,
+}
+
+impl From<&crate::types::BlastAnalysis> for BlastOutput {
+    fn from(analysis: &crate::types::BlastAnalysis) -> Self {
+        let tiers = analysis
+            .tiers
+            .iter()
+            .map(|t| BlastTierOutput {
+                severity: t.severity.to_string(),
+                symbols: t
+                    .symbols
+                    .iter()
+                    .map(|s| BlastAffectedOutput {
+                        name: s.name.clone(),
+                        kind: s.kind.to_string(),
+                        file: s.file.clone(),
+                        line: s.line,
+                        depth: s.depth,
+                        confidence: s.confidence,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Self {
+            target: analysis.target.clone(),
+            direction: analysis.direction.to_string(),
+            risk_level: analysis.risk_level.to_string(),
+            total_affected: analysis.total_affected,
+            tiers,
+            affected_files: analysis.affected_files.clone(),
+        }
+    }
+}
+
 /// Truncation metadata emitted as a final JSON line when `--budget` truncates
 /// output. In grep mode the summary goes to stderr instead.
 #[derive(Debug, Clone, Serialize)]
@@ -1201,6 +1263,56 @@ impl<W: Write> Formatter<W> {
                     hop.symbol_name, hop.symbol_kind, hop.file, hop.line
                 )?;
             }
+            Ok(())
+        }
+    }
+
+    /// Format a blast radius analysis result.
+    pub fn format_blast(&mut self, out: &BlastOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_blast(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_blast(fmt, &out))
+    }
+
+    /// Shared render logic for blast radius output.
+    fn render_blast<W2: Write>(fmt: &mut Formatter<W2>, out: &BlastOutput) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            // Header with risk level.
+            writeln!(
+                fmt.writer,
+                "Blast radius for `{}` ({}, risk: {})",
+                out.target, out.direction, out.risk_level
+            )?;
+            writeln!(fmt.writer, "Total affected: {}", out.total_affected)?;
+            writeln!(fmt.writer)?;
+
+            // Per-tier output.
+            for tier in &out.tiers {
+                writeln!(fmt.writer, "[{}]", tier.severity)?;
+                for sym in &tier.symbols {
+                    writeln!(
+                        fmt.writer,
+                        "  {}:{}\t{} ({})",
+                        sym.file, sym.line, sym.name, sym.kind
+                    )?;
+                }
+                writeln!(fmt.writer)?;
+            }
+
+            // Affected files summary.
+            if !out.affected_files.is_empty() {
+                writeln!(fmt.writer, "Affected files ({}):", out.affected_files.len())?;
+                for file in &out.affected_files {
+                    writeln!(fmt.writer, "  {file}")?;
+                }
+            }
+
             Ok(())
         }
     }
@@ -3231,5 +3343,103 @@ mod tests {
         assert_eq!(v["entry_point"]["name"], "main");
         assert_eq!(v["step_count"], 2);
         assert_eq!(v["steps"].as_array().unwrap().len(), 2);
+    }
+
+    // -- BlastOutput ---------------------------------------------------------
+
+    fn make_blast_output() -> BlastOutput {
+        BlastOutput {
+            target: "processPayment".into(),
+            direction: "upstream".into(),
+            risk_level: "MEDIUM".into(),
+            total_affected: 5,
+            tiers: vec![
+                BlastTierOutput {
+                    severity: "WILL BREAK".into(),
+                    symbols: vec![BlastAffectedOutput {
+                        name: "handleCheckout".into(),
+                        kind: "function".into(),
+                        file: "src/checkout.rs".into(),
+                        line: 10,
+                        depth: 1,
+                        confidence: 0.85,
+                    }],
+                },
+                BlastTierOutput {
+                    severity: "LIKELY AFFECTED".into(),
+                    symbols: vec![BlastAffectedOutput {
+                        name: "processOrder".into(),
+                        kind: "function".into(),
+                        file: "src/orders.rs".into(),
+                        line: 20,
+                        depth: 2,
+                        confidence: 0.85,
+                    }],
+                },
+            ],
+            affected_files: vec!["src/checkout.rs".into(), "src/orders.rs".into()],
+        }
+    }
+
+    #[test]
+    fn blast_grep_format() {
+        let out = make_blast_output();
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_blast(&out));
+        assert!(rendered.contains("Blast radius for `processPayment`"));
+        assert!(rendered.contains("upstream"));
+        assert!(rendered.contains("risk: MEDIUM"));
+        assert!(rendered.contains("Total affected: 5"));
+        assert!(rendered.contains("[WILL BREAK]"));
+        assert!(rendered.contains("handleCheckout"));
+        assert!(rendered.contains("[LIKELY AFFECTED]"));
+        assert!(rendered.contains("processOrder"));
+        assert!(rendered.contains("Affected files (2):"));
+        assert!(rendered.contains("src/checkout.rs"));
+    }
+
+    #[test]
+    fn blast_json_format() {
+        let out = make_blast_output();
+        let rendered = render(OutputFormat::Json, |fmt| fmt.format_blast(&out));
+        let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
+        assert_eq!(v["target"], "processPayment");
+        assert_eq!(v["direction"], "upstream");
+        assert_eq!(v["risk_level"], "MEDIUM");
+        assert_eq!(v["total_affected"], 5);
+        assert_eq!(v["tiers"].as_array().unwrap().len(), 2);
+        assert_eq!(v["tiers"][0]["severity"], "WILL BREAK");
+        assert_eq!(v["tiers"][0]["symbols"][0]["name"], "handleCheckout");
+        assert_eq!(v["affected_files"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn blast_from_analysis() {
+        use crate::types::*;
+        let analysis = BlastAnalysis {
+            target: "foo".into(),
+            direction: BlastDirection::Upstream,
+            risk_level: BlastRiskLevel::Low,
+            total_affected: 1,
+            tiers: vec![BlastTier {
+                severity: BlastSeverity::WillBreak,
+                symbols: vec![BlastAffectedSymbol {
+                    name: "bar".into(),
+                    kind: SymbolKind::Function,
+                    file: "a.rs".into(),
+                    line: 5,
+                    depth: 1,
+                    confidence: 0.85,
+                }],
+            }],
+            affected_files: vec!["a.rs".into()],
+        };
+        let out = BlastOutput::from(&analysis);
+        assert_eq!(out.target, "foo");
+        assert_eq!(out.direction, "upstream");
+        assert_eq!(out.risk_level, "LOW");
+        assert_eq!(out.total_affected, 1);
+        assert_eq!(out.tiers.len(), 1);
+        assert_eq!(out.tiers[0].severity, "WILL BREAK");
+        assert_eq!(out.tiers[0].symbols[0].name, "bar");
     }
 }

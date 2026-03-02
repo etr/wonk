@@ -702,6 +702,50 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     }
                 }),
             },
+            Tool {
+                name: "wonk_blast",
+                description: "Analyze the blast radius of a symbol change. Shows all affected symbols grouped by severity tier (WILL BREAK, LIKELY AFFECTED, MAY NEED TESTING) with a risk level assessment. Supports upstream (callers) and downstream (callees) traversal with inheritance integration.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol": {
+                            "type": "string",
+                            "description": "Symbol name to analyze blast radius for"
+                        },
+                        "direction": {
+                            "type": "string",
+                            "enum": ["upstream", "downstream"],
+                            "description": "Traversal direction (default: upstream)",
+                            "default": "upstream"
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "Maximum traversal depth (default: 3, max: 10)",
+                            "default": 3
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include test files in results (default: false)",
+                            "default": false
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Minimum edge confidence (0.0-1.0) to include"
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Limit output to approximately N tokens"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["symbol"]
+                }),
+            },
         ]
     })
 }
@@ -765,6 +809,7 @@ impl McpServer {
             "wonk_callpath" => self.tool_callpath(call.arguments),
             "wonk_summary" => self.tool_summary(call.arguments),
             "wonk_flows" => self.tool_flows(call.arguments),
+            "wonk_blast" => self.tool_blast(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1362,6 +1407,63 @@ impl McpServer {
         format_result(&out, format)
     }
 
+    fn tool_blast(&self, args: Value) -> CallToolResult {
+        let symbol = match require_str(&args, "symbol") {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        if !crate::callgraph::has_caller_id_data(conn) {
+            return CallToolResult::error(
+                "index lacks call graph data; run wonk_init to re-index".into(),
+            );
+        }
+
+        let format = extract_format(&args);
+
+        let depth_raw = args
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(crate::blast::DEFAULT_DEPTH as u64) as usize;
+        let (depth, _clamped) = crate::blast::clamp_depth(depth_raw);
+
+        let direction_str = args
+            .get("direction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("upstream");
+        let direction = match direction_str.parse::<crate::types::BlastDirection>() {
+            Ok(d) => d,
+            Err(e) => return CallToolResult::error(e),
+        };
+
+        let include_tests = args
+            .get("include_tests")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
+
+        let options = crate::blast::BlastOptions {
+            depth,
+            direction,
+            include_tests,
+            min_confidence,
+        };
+
+        match crate::blast::analyze_blast(conn, &symbol, &options) {
+            Ok(ref analysis) => {
+                let out = crate::output::BlastOutput::from(analysis);
+                format_result(&out, format)
+            }
+            Err(e) => CallToolResult::error(format!("blast analysis failed: {e}")),
+        }
+    }
+
     fn tool_flows(&self, args: Value) -> CallToolResult {
         let conn = match self.router.conn() {
             Some(c) => c,
@@ -1589,7 +1691,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
     }
 
     #[test]
@@ -1805,7 +1907,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
     }
 
     #[test]
@@ -2084,5 +2186,62 @@ mod tests {
         let result = server.handle_tools_call(&params);
         // List mode: should return a result (possibly empty list).
         assert!(result.get("content").is_some() || result.get("isError").is_some());
+    }
+
+    // -- wonk_blast tests -----------------------------------------------------
+
+    #[test]
+    fn tool_blast_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_blast").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("symbol"), "missing 'symbol' property");
+        assert!(
+            props.contains_key("direction"),
+            "missing 'direction' property"
+        );
+        assert!(props.contains_key("depth"), "missing 'depth' property");
+        assert!(
+            props.contains_key("include_tests"),
+            "missing 'include_tests' property"
+        );
+        assert!(
+            props.contains_key("min_confidence"),
+            "missing 'min_confidence' property"
+        );
+        assert!(props.contains_key("format"), "missing 'format' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("symbol")));
+    }
+
+    #[test]
+    fn tool_blast_dispatches_correctly() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_blast",
+            "arguments": {"symbol": "nonexistent_symbol_xyz"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("no index")
+                || text.contains("[]")
+                || text.contains("call graph")
+                || text.contains("blast")
+                || text.contains("total_affected"),
+            "expected index/callgraph error or blast result, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_blast_missing_symbol() {
+        let server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_blast",
+            "arguments": {}
+        });
+        let result = server.handle_tools_call(&params);
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        assert!(is_error, "should error on missing symbol");
     }
 }
