@@ -2924,7 +2924,7 @@ Implement `blast.rs` module with depth-annotated BFS, severity tiers, risk level
 **Related Requirements:** PRD-BLAST-REQ-001 through PRD-BLAST-REQ-010, PRD-HRTG-REQ-003, PRD-CONF-REQ-005
 **Related Decisions:** DR-024
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
