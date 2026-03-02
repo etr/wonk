@@ -127,11 +127,7 @@ fn resolve_symbols(
     let kind_filter = options.kind.as_deref().unwrap_or("");
 
     // Build file filter: escape LIKE metacharacters and use ESCAPE clause.
-    let file_filter = options
-        .file
-        .as_deref()
-        .map(escape_like)
-        .unwrap_or_default();
+    let file_filter = options.file.as_deref().map(escape_like).unwrap_or_default();
 
     let sql = "\
         SELECT id, name, kind, file, line, end_line, signature \

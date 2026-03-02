@@ -56,7 +56,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `blast.rs` | Blast radius analysis — depth-annotated BFS from a target symbol, severity tiers (WILL BREAK / LIKELY AFFECTED / MAY NEED TESTING), risk level assessment, inheritance integration via type_edges, test file exclusion |
 | `callgraph.rs` | Call graph traversal — BFS callers/callees expansion and callpath shortest-path finder via caller_id JOIN, cycle detection via visited HashSet, depth cap enforcement |
 | `flows.rs` | Entry point detection and flow tracing — SQL anti-join for functions/methods with no indexed callers, forward BFS callee expansion with depth/branching/min-confidence controls |
-| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 18 query tools for AI coding assistants |
+| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 19 query tools for AI coding assistants; multi-repo support via optional `repo` parameter and lazy-loaded connections |
 | `budget.rs` | Token budget tracking (~4 chars/token heuristic) |
 
 ### Key Design Decisions
