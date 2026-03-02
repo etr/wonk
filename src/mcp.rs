@@ -269,6 +269,23 @@ fn validate_path(path: &Path, repo_root: &Path) -> Result<PathBuf, CallToolResul
     }
 }
 
+/// Embed a query and run semantic search, returning resolved results.
+/// Returns an empty vec on any failure (graceful degradation).
+fn fetch_semantic_for_mcp(query: &str, conn: &Connection) -> Vec<crate::types::SemanticResult> {
+    let all_embeddings = match crate::embedding::load_all_embeddings(conn) {
+        Ok(e) if !e.is_empty() => e,
+        _ => return Vec::new(),
+    };
+    let client = crate::embedding::OllamaClient::new();
+    let mut query_vec = match client.embed_single(query) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    crate::embedding::normalize(&mut query_vec);
+    let scored = crate::semantic::semantic_search(&query_vec, &all_embeddings, 20);
+    crate::semantic::resolve_results(conn, &scored).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -310,6 +327,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
+                        },
+                        "semantic": {
+                            "type": "boolean",
+                            "description": "Blend structural results with semantic (embedding-based) results via RRF fusion",
+                            "default": false
                         },
                         "format": {
                             "type": "string",
@@ -832,12 +854,108 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     "required": ["name"]
                 }),
             },
+            Tool {
+                name: "wonk_ask",
+                description: "Pure semantic search — natural language query matched against code symbol embeddings via cosine similarity. Requires embeddings (run wonk_init with Ollama). Optionally scope results to symbols reachable from/to a file via the dependency graph.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Natural language query to search for semantically similar code symbols"
+                        },
+                        "from": {
+                            "type": "string",
+                            "description": "Restrict results to symbols reachable from this file (dependency scoping)"
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "Restrict results to symbols that reach this file (reverse dependency scoping)"
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Limit output to approximately N tokens"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            Tool {
+                name: "wonk_cluster",
+                description: "Cluster code symbols by semantic similarity using K-means on embeddings. Auto-selects optimal K via silhouette scoring. Returns clusters with representative members closest to each centroid.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Scope clustering to symbols under this path prefix (relative to repo root)"
+                        },
+                        "top": {
+                            "type": "integer",
+                            "description": "Number of representative members to show per cluster (default: 5)",
+                            "default": 5
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            Tool {
+                name: "wonk_impact",
+                description: "Analyze semantic impact of changed symbols in a file. Re-parses the file against the indexed version, detects added/modified/removed symbols, and finds other symbols likely impacted via embedding similarity. Use --since with a git ref for multi-file analysis.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "File path (relative to repo root) to analyze for changed symbols"
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "Git ref (commit, tag, branch) — analyze all files changed since this ref"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["file"]
+                }),
+            },
+            Tool {
+                name: "wonk_update",
+                description: "Rebuild the structural index and embeddings for the current repository. Same as wonk_init but always uses the existing index location. Use after significant code changes to refresh the index.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    }
+                }),
+            },
         ];
 
         // Inject optional `repo` parameter into all existing tools except wonk_init
-        // (init always operates on the working directory repo).
+        // and wonk_update (both always operate on the working directory repo).
         for tool in &mut tools {
-            if tool.name == "wonk_init" {
+            if tool.name == "wonk_init" || tool.name == "wonk_update" {
                 continue;
             }
             if let Some(props) = tool.input_schema.get_mut("properties")
@@ -1102,6 +1220,10 @@ impl McpServer {
             "wonk_changes" => self.tool_changes(call.arguments),
             "wonk_context" => self.tool_context(call.arguments),
             "wonk_repos" => self.tool_repos(call.arguments),
+            "wonk_ask" => self.tool_ask(call.arguments),
+            "wonk_cluster" => self.tool_cluster(call.arguments),
+            "wonk_impact" => self.tool_impact(call.arguments),
+            "wonk_update" => self.tool_update(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1128,6 +1250,10 @@ impl McpServer {
             .get("budget")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        let semantic = args
+            .get("semantic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let format = extract_format(&args);
 
         let (ranker_conn, repo_root) = match self.resolve_repo(&args) {
@@ -1151,6 +1277,39 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("search failed: {e}")),
         };
+
+        // When semantic blending is requested, fuse structural + embedding results via RRF.
+        if semantic {
+            let semantic_results = ranker_conn
+                .map(|c| fetch_semantic_for_mcp(&query, c))
+                .unwrap_or_default();
+            let fused = ranker::fuse_rrf(&results, &semantic_results, 60.0);
+
+            let mut budget = budget_limit.map(TokenBudget::new);
+            let mut outputs: Vec<SearchOutput> = Vec::new();
+            for item in &fused {
+                let mut out = SearchOutput::from_search_result(
+                    Path::new(&item.file),
+                    item.line,
+                    item.col,
+                    &item.content,
+                );
+                out.annotation = item.annotation.clone();
+
+                if let Some(ref mut b) = budget {
+                    let estimate = (out.file.len() + out.content.len() + 20) / 4;
+                    if b.remaining() < estimate {
+                        continue;
+                    }
+                    let serialized = serde_json::to_string(&out).unwrap_or_default();
+                    if !b.try_consume(&serialized) {
+                        continue;
+                    }
+                }
+                outputs.push(out);
+            }
+            return format_result(&outputs, format);
+        }
 
         let groups = ranker::rank_and_dedup(&results, ranker_conn, &query);
 
@@ -2006,6 +2165,330 @@ impl McpServer {
 
         format_result(&repos, format)
     }
+
+    fn tool_ask(&mut self, args: Value) -> CallToolResult {
+        let query = match require_str(&args, "query") {
+            Ok(q) => q,
+            Err(e) => return e,
+        };
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let format = extract_format(&args);
+
+        let (conn, _repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+
+        let from = args.get("from").and_then(|v| v.as_str());
+        let to = args.get("to").and_then(|v| v.as_str());
+
+        // Compute dependency-scoped file set for --from/--to filtering.
+        let reachable_files = match crate::semantic::compute_reachable_files(conn, from, to) {
+            Ok(r) => r,
+            Err(e) => {
+                return CallToolResult::error(format!("reachability computation failed: {e}"));
+            }
+        };
+
+        // Load embeddings — scoped to reachable files when from/to is specified.
+        let embeddings = match &reachable_files {
+            Some(files) => match crate::embedding::load_embeddings_for_files(conn, files) {
+                Ok(e) => e,
+                Err(e) => return CallToolResult::error(format!("failed to load embeddings: {e}")),
+            },
+            None => match crate::embedding::load_all_embeddings(conn) {
+                Ok(e) => e,
+                Err(e) => return CallToolResult::error(format!("failed to load embeddings: {e}")),
+            },
+        };
+
+        if embeddings.is_empty() {
+            return CallToolResult::error(
+                "no embeddings available; run wonk_init with Ollama running to build embeddings"
+                    .into(),
+            );
+        }
+
+        let client = crate::embedding::OllamaClient::new();
+        let mut query_vec = match client.embed_single(&query) {
+            Ok(v) => v,
+            Err(e) => return CallToolResult::error(format!("embedding query failed: {e}")),
+        };
+        crate::embedding::normalize(&mut query_vec);
+
+        let scored = crate::semantic::semantic_search(&query_vec, &embeddings, 50);
+        let results = match crate::semantic::resolve_results(conn, &scored) {
+            Ok(r) => r,
+            Err(e) => return CallToolResult::error(format!("result resolution failed: {e}")),
+        };
+
+        let outputs: Vec<crate::output::SemanticOutput> = results
+            .iter()
+            .map(|sr| crate::output::SemanticOutput {
+                file: sr.file.clone(),
+                line: sr.line,
+                symbol_name: sr.symbol_name.clone(),
+                symbol_kind: sr.symbol_kind.to_string(),
+                similarity_score: sr.similarity_score,
+                symbol_id: sr.symbol_id,
+            })
+            .collect();
+
+        collect_with_budget(outputs, budget_limit, format)
+    }
+
+    fn tool_cluster(&mut self, args: Value) -> CallToolResult {
+        let path = match require_str(&args, "path") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+        let format = extract_format(&args);
+
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+
+        if let Err(e) = validate_path(Path::new(&path), &repo_root) {
+            return e;
+        }
+
+        // Normalize path: strip leading "./", normalize "." to empty.
+        let prefix = path.strip_prefix("./").unwrap_or(&path);
+        let prefix = if prefix == "." { "" } else { prefix };
+
+        let embeddings = match crate::embedding::load_embeddings_for_path_prefix(conn, prefix) {
+            Ok(e) => e,
+            Err(e) => return CallToolResult::error(format!("failed to load embeddings: {e}")),
+        };
+
+        if embeddings.is_empty() {
+            return CallToolResult::error(
+                "no embeddings found for this path; run wonk_init with Ollama running to build embeddings".into(),
+            );
+        }
+
+        let mut clusters =
+            crate::cluster::cluster_embeddings(&embeddings, crate::cluster::ABSOLUTE_MAX_K);
+        if let Err(e) = crate::cluster::resolve_cluster_members(conn, &mut clusters) {
+            return CallToolResult::error(format!("cluster resolution failed: {e}"));
+        }
+
+        let outputs: Vec<crate::output::ClusterOutput> = clusters
+            .iter()
+            .map(|cluster| crate::output::ClusterOutput {
+                cluster_id: cluster.cluster_id,
+                total_members: cluster.members.len(),
+                representatives: cluster
+                    .members
+                    .iter()
+                    .take(top)
+                    .map(|m| crate::output::ClusterMemberOutput {
+                        file: m.file.clone(),
+                        line: m.line,
+                        symbol_name: m.symbol_name.clone(),
+                        symbol_kind: m.symbol_kind.to_string(),
+                        distance_to_centroid: m.distance_to_centroid,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        format_result(&outputs, format)
+    }
+
+    fn tool_impact(&mut self, args: Value) -> CallToolResult {
+        let file = match require_str(&args, "file") {
+            Ok(f) => f,
+            Err(e) => return e,
+        };
+        let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
+        let format = extract_format(&args);
+
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+
+        // Determine files to analyze.
+        let files: Vec<String> = if let Some(ref since_ref) = since {
+            match crate::impact::detect_changed_files_since(since_ref, &repo_root) {
+                Ok(f) => f,
+                Err(e) => {
+                    return CallToolResult::error(format!("failed to list changed files: {e}"));
+                }
+            }
+        } else {
+            // Resolve relative path against repo root.
+            if let Err(e) = validate_path(Path::new(&file), &repo_root) {
+                return e;
+            }
+            vec![file]
+        };
+
+        if files.is_empty() {
+            return CallToolResult::success("no changed files found".into());
+        }
+
+        // Load all embeddings once.
+        let all_embeddings = match crate::embedding::load_all_embeddings(conn) {
+            Ok(e) if !e.is_empty() => e,
+            Ok(_) => {
+                return CallToolResult::error(
+                    "no embeddings found; run wonk_init with Ollama running to build embeddings"
+                        .into(),
+                );
+            }
+            Err(e) => return CallToolResult::error(format!("failed to load embeddings: {e}")),
+        };
+
+        let client = crate::embedding::OllamaClient::new();
+
+        let mut all_results = Vec::new();
+        for f in &files {
+            match crate::impact::analyze_impact(conn, f, &repo_root, &client, &all_embeddings) {
+                Ok(results) => all_results.extend(results),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if msg.contains("unsupported language") {
+                        continue;
+                    }
+                    return CallToolResult::error(format!("impact analysis failed: {e}"));
+                }
+            }
+        }
+
+        // Re-sort after merging results across multiple files.
+        all_results.sort_by(|a, b| {
+            b.similarity_score
+                .partial_cmp(&a.similarity_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if all_results.is_empty() {
+            return CallToolResult::success("no impact detected".into());
+        }
+
+        // Group by changed symbol.
+        let changed_key = |r: &crate::types::ImpactResult| {
+            format!(
+                "{}:{}:{}:{}",
+                r.changed_symbol.file,
+                r.changed_symbol.line,
+                r.changed_symbol.name,
+                r.changed_symbol.kind
+            )
+        };
+
+        let to_symbol_output = |s: &crate::types::SymbolRef| crate::output::ImpactSymbolOutput {
+            name: s.name.clone(),
+            kind: s.kind.to_string(),
+            file: s.file.clone(),
+            line: s.line,
+        };
+
+        let to_entry_output = |r: &crate::types::ImpactResult| crate::output::ImpactEntryOutput {
+            file: r.impacted_symbol.file.clone(),
+            line: r.impacted_symbol.line,
+            symbol_name: r.impacted_symbol.name.clone(),
+            symbol_kind: r.impacted_symbol.kind.to_string(),
+            similarity_score: r.similarity_score,
+        };
+
+        let mut groups: Vec<(
+            String,
+            crate::output::ImpactSymbolOutput,
+            Vec<crate::output::ImpactEntryOutput>,
+        )> = Vec::new();
+
+        for r in &all_results {
+            let key = changed_key(r);
+            if groups.last().is_some_and(|(k, _, _)| k == &key) {
+                groups.last_mut().unwrap().2.push(to_entry_output(r));
+            } else {
+                groups.push((
+                    key,
+                    to_symbol_output(&r.changed_symbol),
+                    vec![to_entry_output(r)],
+                ));
+            }
+        }
+
+        let outputs: Vec<crate::output::ImpactOutput> = groups
+            .into_iter()
+            .map(|(_, changed, impacted)| crate::output::ImpactOutput {
+                changed_symbol: changed,
+                impacted,
+            })
+            .collect();
+
+        format_result(&outputs, format)
+    }
+
+    fn tool_update(&mut self, args: Value) -> CallToolResult {
+        let format = extract_format(&args);
+
+        let stats = match pipeline::rebuild_index_with_progress(
+            self.router.repo_root(),
+            false,
+            &Progress::silent(),
+        ) {
+            Ok(s) => s,
+            Err(e) => return CallToolResult::error(format!("index rebuild failed: {e}")),
+        };
+
+        // Build embeddings after structural index.
+        let index_path = match db::index_path_for(self.router.repo_root(), false) {
+            Ok(p) => p,
+            Err(_) => {
+                let result = serde_json::json!({
+                    "file_count": stats.file_count,
+                    "symbol_count": stats.symbol_count,
+                    "reference_count": stats.ref_count,
+                    "elapsed_ms": stats.elapsed.as_millis(),
+                    "embedding_count": 0,
+                    "embedding_skipped": true
+                });
+                return format_result(&result, format);
+            }
+        };
+
+        let emb_stats = db::open(&index_path)
+            .ok()
+            .and_then(|conn| {
+                let client = crate::embedding::OllamaClient::new();
+                pipeline::build_embeddings(
+                    &conn,
+                    self.router.repo_root(),
+                    &client,
+                    crate::progress::ProgressMode::Silent,
+                )
+                .ok()
+            })
+            .unwrap_or(pipeline::EmbeddingBuildStats {
+                embedded_count: 0,
+                total_symbols: 0,
+                skipped: true,
+                elapsed: std::time::Duration::ZERO,
+            });
+
+        // Refresh the router's connection to pick up the new index.
+        self.router.refresh_connection();
+
+        let result = serde_json::json!({
+            "file_count": stats.file_count,
+            "symbol_count": stats.symbol_count,
+            "reference_count": stats.ref_count,
+            "elapsed_ms": stats.elapsed.as_millis(),
+            "embedding_count": emb_stats.embedded_count,
+            "embedding_skipped": emb_stats.skipped
+        });
+        format_result(&result, format)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2136,9 +2619,11 @@ fn write_response(stdout: &mut impl Write, resp: &Response) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Create a test server with no index.  Uses a non-existent path so the
+    /// router cannot accidentally discover the real repo's index.
     fn test_server() -> McpServer {
         McpServer {
-            router: QueryRouter::new(None, false),
+            router: QueryRouter::new(Some("/nonexistent/test/repo".into()), false),
             registry: RepoRegistry::new(Vec::new()),
         }
     }
@@ -2169,7 +2654,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 23);
     }
 
     #[test]
@@ -2382,11 +2867,11 @@ mod tests {
     // -- Callers/Callees MCP tests -------------------------------------------
 
     #[test]
-    fn tools_list_returns_nineteen_tools() {
+    fn tools_list_returns_twenty_three_tools() {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 23);
     }
 
     #[test]
@@ -2960,8 +3445,8 @@ mod tests {
     fn all_tools_have_repo_param() {
         let tools = tool_definitions();
         for tool in tools.iter() {
-            // wonk_repos lists all repos; wonk_init always targets working directory.
-            if tool.name == "wonk_repos" || tool.name == "wonk_init" {
+            // wonk_repos lists all repos; wonk_init/wonk_update always target working directory.
+            if tool.name == "wonk_repos" || tool.name == "wonk_init" || tool.name == "wonk_update" {
                 continue;
             }
             let props = tool.input_schema["properties"].as_object().unwrap();
@@ -2984,7 +3469,7 @@ mod tests {
     fn repo_param_is_not_required() {
         let tools = tool_definitions();
         for tool in tools.iter() {
-            if tool.name == "wonk_repos" || tool.name == "wonk_init" {
+            if tool.name == "wonk_repos" || tool.name == "wonk_init" || tool.name == "wonk_update" {
                 continue;
             }
             if let Some(required) = tool.input_schema.get("required") {
@@ -3268,6 +3753,168 @@ mod tests {
         assert!(
             text.contains("unknown repo"),
             "error should mention unknown repo"
+        );
+    }
+
+    // -- wonk_search semantic param ------------------------------------------
+
+    #[test]
+    fn tool_search_has_semantic_param() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_search").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("semantic"),
+            "wonk_search missing 'semantic' property"
+        );
+    }
+
+    // -- wonk_ask tests -------------------------------------------------------
+
+    #[test]
+    fn tool_ask_definition_exists() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_ask");
+        assert!(tool.is_some(), "wonk_ask tool should exist");
+    }
+
+    #[test]
+    fn tool_ask_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_ask").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("query"), "missing 'query' property");
+        assert!(props.contains_key("from"), "missing 'from' property");
+        assert!(props.contains_key("to"), "missing 'to' property");
+        assert!(props.contains_key("budget"), "missing 'budget' property");
+        assert!(props.contains_key("format"), "missing 'format' property");
+        assert!(props.contains_key("repo"), "missing 'repo' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("query")));
+    }
+
+    #[test]
+    fn tool_ask_dispatches_correctly() {
+        let mut server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_ask",
+            "arguments": {"query": "parse function"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        // Should get an error about missing index/embeddings, not "unknown tool".
+        assert!(
+            !text.contains("unknown tool"),
+            "wonk_ask should dispatch correctly, got: {text}"
+        );
+    }
+
+    // -- wonk_cluster tests ---------------------------------------------------
+
+    #[test]
+    fn tool_cluster_definition_exists() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_cluster");
+        assert!(tool.is_some(), "wonk_cluster tool should exist");
+    }
+
+    #[test]
+    fn tool_cluster_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_cluster").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("path"), "missing 'path' property");
+        assert!(props.contains_key("top"), "missing 'top' property");
+        assert!(props.contains_key("format"), "missing 'format' property");
+        assert!(props.contains_key("repo"), "missing 'repo' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("path")));
+    }
+
+    #[test]
+    fn tool_cluster_dispatches_correctly() {
+        let mut server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_cluster",
+            "arguments": {"path": "src/"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("unknown tool"),
+            "wonk_cluster should dispatch correctly, got: {text}"
+        );
+    }
+
+    // -- wonk_impact tests ----------------------------------------------------
+
+    #[test]
+    fn tool_impact_definition_exists() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_impact");
+        assert!(tool.is_some(), "wonk_impact tool should exist");
+    }
+
+    #[test]
+    fn tool_impact_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_impact").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("file"), "missing 'file' property");
+        assert!(props.contains_key("since"), "missing 'since' property");
+        assert!(props.contains_key("format"), "missing 'format' property");
+        assert!(props.contains_key("repo"), "missing 'repo' property");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("file")));
+    }
+
+    #[test]
+    fn tool_impact_dispatches_correctly() {
+        let mut server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_impact",
+            "arguments": {"file": "src/main.rs"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("unknown tool"),
+            "wonk_impact should dispatch correctly, got: {text}"
+        );
+    }
+
+    // -- wonk_update tests ----------------------------------------------------
+
+    #[test]
+    fn tool_update_definition_exists() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_update");
+        assert!(tool.is_some(), "wonk_update tool should exist");
+    }
+
+    #[test]
+    fn tool_update_excluded_from_repo_injection() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_update").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(
+            !props.contains_key("repo"),
+            "wonk_update should not have 'repo' property"
+        );
+    }
+
+    #[test]
+    fn tool_update_dispatches_correctly() {
+        let mut server = test_server();
+        let params = serde_json::json!({
+            "name": "wonk_update",
+            "arguments": {}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("unknown tool"),
+            "wonk_update should dispatch correctly, got: {text}"
         );
     }
 }

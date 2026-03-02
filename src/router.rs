@@ -2099,6 +2099,15 @@ impl QueryRouter {
         &self.repo_root
     }
 
+    /// Re-open the database connection for the current repo root.
+    /// Used after rebuilding the index to pick up the new data.
+    pub fn refresh_connection(&mut self) {
+        self.conn = db::index_path_for(&self.repo_root, false)
+            .ok()
+            .filter(|p| p.exists())
+            .and_then(|p| db::open_existing(&p).ok());
+    }
+
     // -- Symbol queries -----------------------------------------------------
 
     /// Look up symbols by name.
