@@ -746,6 +746,45 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     "required": ["symbol"]
                 }),
             },
+            Tool {
+                name: "wonk_changes",
+                description: "Detect changed symbols in working tree. Optionally chain blast radius analysis and execution flow detection for each changed symbol. Supports scoping to unstaged, staged, all uncommitted, or compare-to-ref changes.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["unstaged", "staged", "all", "compare"],
+                            "description": "Change scope (default: unstaged)",
+                            "default": "unstaged"
+                        },
+                        "base": {
+                            "type": "string",
+                            "description": "Base git ref for compare scope (required when scope=compare)"
+                        },
+                        "blast": {
+                            "type": "boolean",
+                            "description": "Include blast radius per changed symbol (default: false)",
+                            "default": false
+                        },
+                        "flows": {
+                            "type": "boolean",
+                            "description": "Identify affected execution flows (default: false)",
+                            "default": false
+                        },
+                        "min_confidence": {
+                            "type": "number",
+                            "description": "Minimum edge confidence (0.0-1.0) for blast/flow analysis"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    }
+                }),
+            },
         ]
     })
 }
@@ -810,6 +849,7 @@ impl McpServer {
             "wonk_summary" => self.tool_summary(call.arguments),
             "wonk_flows" => self.tool_flows(call.arguments),
             "wonk_blast" => self.tool_blast(call.arguments),
+            "wonk_changes" => self.tool_changes(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1535,6 +1575,159 @@ impl McpServer {
             }
         }
     }
+
+    fn tool_changes(&self, args: Value) -> CallToolResult {
+        let conn = match self.router.conn() {
+            Some(c) => c,
+            None => return CallToolResult::error("no index available; run wonk_init first".into()),
+        };
+
+        let repo_root = self.router.repo_root().to_path_buf();
+
+        let format = extract_format(&args);
+
+        // Parse scope.
+        let scope_str = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unstaged");
+        let scope = match scope_str {
+            "unstaged" => crate::types::ChangeScope::Unstaged,
+            "staged" => crate::types::ChangeScope::Staged,
+            "all" => crate::types::ChangeScope::All,
+            "compare" => {
+                let base = match args.get("base").and_then(|v| v.as_str()) {
+                    Some(b) => b.to_string(),
+                    None => {
+                        return CallToolResult::error(
+                            "'base' is required when scope=compare".into(),
+                        );
+                    }
+                };
+                crate::types::ChangeScope::Compare(base)
+            }
+            other => {
+                return CallToolResult::error(format!(
+                    "unknown scope: {other} (expected: unstaged, staged, all, compare)"
+                ));
+            }
+        };
+
+        let blast = args.get("blast").and_then(|v| v.as_bool()).unwrap_or(false);
+        let flows = args.get("flows").and_then(|v| v.as_bool()).unwrap_or(false);
+        let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
+
+        // Detect changes.
+        let analysis = match crate::impact::detect_changes(conn, &scope, &repo_root) {
+            Ok(a) => a,
+            Err(e) => return CallToolResult::error(format!("change detection failed: {e}")),
+        };
+
+        // Build output.
+        let mut combined_risk: Option<crate::types::BlastRiskLevel> = None;
+        let mut changed_outputs: Vec<crate::output::ChangedSymbolOutput> = Vec::new();
+
+        for cs in &analysis.changed_symbols {
+            let blast_out = if blast && cs.change_type != crate::types::ChangeType::Removed {
+                let blast_opts = crate::blast::BlastOptions {
+                    depth: crate::blast::DEFAULT_DEPTH,
+                    direction: crate::types::BlastDirection::Upstream,
+                    include_tests: false,
+                    min_confidence,
+                };
+                match crate::blast::analyze_blast(conn, &cs.name, &blast_opts) {
+                    Ok(ref result) => {
+                        combined_risk = Some(match combined_risk {
+                            Some(current) => std::cmp::max(current, result.risk_level),
+                            None => result.risk_level,
+                        });
+                        Some(crate::output::BlastOutput::from(result))
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            changed_outputs.push(crate::output::ChangedSymbolOutput {
+                name: cs.name.clone(),
+                kind: cs.kind.to_string(),
+                file: cs.file.clone(),
+                line: cs.line,
+                change_type: cs.change_type.to_string(),
+                blast_radius: blast_out,
+            });
+        }
+
+        // Affected flows.
+        let affected_flows = if flows {
+            let flow_opts = crate::flows::FlowOptions {
+                depth: crate::flows::DEFAULT_DEPTH,
+                branching: crate::flows::DEFAULT_BRANCHING,
+                min_confidence,
+                from_file: None,
+            };
+
+            let changed_names: std::collections::HashSet<String> = analysis
+                .changed_symbols
+                .iter()
+                .map(|cs| cs.name.clone())
+                .collect();
+
+            let mut matched_flows = Vec::new();
+            if let Ok(entries) = crate::flows::detect_entry_points(conn, &flow_opts) {
+                for entry in &entries {
+                    if let Ok(Some(flow)) = crate::flows::trace_flow(conn, &entry.name, &flow_opts)
+                    {
+                        let matched: Vec<String> = flow
+                            .steps
+                            .iter()
+                            .filter(|step| changed_names.contains(&step.name))
+                            .map(|step| step.name.clone())
+                            .collect();
+
+                        if !matched.is_empty() {
+                            let steps: Vec<crate::output::FlowStepOutput> = flow
+                                .steps
+                                .iter()
+                                .map(crate::output::FlowStepOutput::from)
+                                .collect();
+                            matched_flows.push(crate::output::AffectedFlowOutput {
+                                entry_point: crate::output::FlowStepOutput::from(&flow.entry_point),
+                                step_count: steps.len(),
+                                steps,
+                                matched_symbols: matched,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if matched_flows.is_empty() {
+                None
+            } else {
+                Some(matched_flows)
+            }
+        } else {
+            None
+        };
+
+        let scope_display = match &scope {
+            crate::types::ChangeScope::Unstaged => "unstaged".to_string(),
+            crate::types::ChangeScope::Staged => "staged".to_string(),
+            crate::types::ChangeScope::All => "all".to_string(),
+            crate::types::ChangeScope::Compare(r) => format!("compare({r})"),
+        };
+
+        let changes_out = crate::output::ChangesOutput {
+            scope: scope_display,
+            changed_symbols: changed_outputs,
+            combined_risk_level: combined_risk.map(|r| r.to_string()),
+            affected_flows,
+        };
+
+        format_result(&changes_out, format)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,7 +1884,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
     }
 
     #[test]
@@ -1907,7 +2100,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
     }
 
     #[test]
@@ -2243,5 +2436,30 @@ mod tests {
         let result = server.handle_tools_call(&params);
         let is_error = result["isError"].as_bool().unwrap_or(false);
         assert!(is_error, "should error on missing symbol");
+    }
+
+    // -- wonk_changes tests (TASK-072) ----------------------------------------
+
+    #[test]
+    fn tool_changes_definition_exists() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_changes");
+        assert!(tool.is_some(), "wonk_changes tool should exist");
+    }
+
+    #[test]
+    fn tool_changes_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_changes").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("scope"), "missing 'scope' property");
+        assert!(props.contains_key("base"), "missing 'base' property");
+        assert!(props.contains_key("blast"), "missing 'blast' property");
+        assert!(props.contains_key("flows"), "missing 'flows' property");
+        assert!(
+            props.contains_key("min_confidence"),
+            "missing 'min_confidence' property"
+        );
+        assert!(props.contains_key("format"), "missing 'format' property");
     }
 }

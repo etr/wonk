@@ -541,7 +541,7 @@ impl fmt::Display for BlastSeverity {
 }
 
 /// Overall risk level based on total affected symbol count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BlastRiskLevel {
     /// 0-3 affected symbols.
     Low,
@@ -1315,5 +1315,14 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    // -- BlastRiskLevel ordering tests (TASK-072) ----------------------------
+
+    #[test]
+    fn blast_risk_level_ordering() {
+        assert!(BlastRiskLevel::Low < BlastRiskLevel::Medium);
+        assert!(BlastRiskLevel::Medium < BlastRiskLevel::High);
+        assert!(BlastRiskLevel::High < BlastRiskLevel::Critical);
     }
 }

@@ -17,9 +17,10 @@ use crate::errors::DbError;
 #[cfg(test)]
 use crate::errors::SearchError;
 use crate::output::{
-    self, BlastOutput, BudgetStatus, CallPathHopOutput, CalleeOutput, CallerOutput, FlowOutput,
-    FlowStepOutput, Formatter, LsSymbolEntry, OutputFormat, RefOutput, SearchOutput,
-    SemanticOutput, ShowOutput, SignatureOutput, SummaryOutput, SymbolOutput,
+    self, AffectedFlowOutput, BlastOutput, BudgetStatus, CallPathHopOutput, CalleeOutput,
+    CallerOutput, ChangedSymbolOutput, ChangesOutput, FlowOutput, FlowStepOutput, Formatter,
+    LsSymbolEntry, OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput,
+    SignatureOutput, SummaryOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -1303,7 +1304,167 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let out = BlastOutput::from(&result);
             fmt.format_blast(&out)?;
         }
+        Command::Changes(args) => {
+            dispatch_changes(args, &mut fmt, suppress)?;
+        }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `wonk changes` dispatch (TASK-072)
+// ---------------------------------------------------------------------------
+
+fn dispatch_changes<W: io::Write>(
+    args: crate::cli::ChangesArgs,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+) -> Result<()> {
+    use crate::types::{BlastRiskLevel, ChangeScope, ChangeType};
+
+    // 1. Resolve repo root and open connection.
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
+
+    let conn = db::find_existing_index(&repo_root)
+        .and_then(|path| db::open(&path).ok())
+        .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
+
+    // 2. Parse scope string to ChangeScope enum.
+    let scope = match args.scope.as_str() {
+        "unstaged" => ChangeScope::Unstaged,
+        "staged" => ChangeScope::Staged,
+        "all" => ChangeScope::All,
+        "compare" => {
+            let base = args
+                .base
+                .ok_or_else(|| anyhow::anyhow!("--base is required when --scope=compare"))?;
+            ChangeScope::Compare(base)
+        }
+        other => anyhow::bail!("unknown scope: {other} (expected: unstaged, staged, all, compare)"),
+    };
+
+    // 3. Detect changes.
+    let analysis = crate::impact::detect_changes(&conn, &scope, &repo_root)?;
+
+    if analysis.changed_symbols.is_empty() {
+        output::print_hint("no changed symbols detected", suppress);
+    }
+
+    // 4. Build ChangedSymbolOutput vec, optionally with blast radius.
+    let mut combined_risk: Option<BlastRiskLevel> = None;
+    let mut changed_outputs: Vec<ChangedSymbolOutput> = Vec::new();
+
+    for cs in &analysis.changed_symbols {
+        let blast_out = if args.blast && cs.change_type != ChangeType::Removed {
+            let blast_opts = crate::blast::BlastOptions {
+                depth: crate::blast::DEFAULT_DEPTH,
+                direction: crate::types::BlastDirection::Upstream,
+                include_tests: false,
+                min_confidence: args.min_confidence,
+            };
+            match crate::blast::analyze_blast(&conn, &cs.name, &blast_opts) {
+                Ok(ref result) => {
+                    // Track combined risk level (take the max).
+                    combined_risk = Some(match combined_risk {
+                        Some(current) => std::cmp::max(current, result.risk_level),
+                        None => result.risk_level,
+                    });
+                    Some(BlastOutput::from(result))
+                }
+                Err(e) => {
+                    eprintln!("wonk: warning: blast analysis failed for {}: {e}", cs.name);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        changed_outputs.push(ChangedSymbolOutput {
+            name: cs.name.clone(),
+            kind: cs.kind.to_string(),
+            file: cs.file.clone(),
+            line: cs.line,
+            change_type: cs.change_type.to_string(),
+            blast_radius: blast_out,
+        });
+    }
+
+    // 5. If --flows: detect affected execution flows.
+    let affected_flows = if args.flows {
+        let flow_opts = crate::flows::FlowOptions {
+            depth: crate::flows::DEFAULT_DEPTH,
+            branching: crate::flows::DEFAULT_BRANCHING,
+            min_confidence: args.min_confidence,
+            from_file: None,
+        };
+
+        // Collect changed symbol names for matching.
+        let changed_names: std::collections::HashSet<String> = analysis
+            .changed_symbols
+            .iter()
+            .map(|cs| cs.name.clone())
+            .collect();
+
+        // Detect entry points and trace each flow.
+        let entries = crate::flows::detect_entry_points(&conn, &flow_opts)?;
+        let mut matched_flows: Vec<AffectedFlowOutput> = Vec::new();
+
+        for entry in &entries {
+            if let Some(flow) = crate::flows::trace_flow(&conn, &entry.name, &flow_opts)? {
+                // Check if any step matches a changed symbol.
+                let matched: Vec<String> = flow
+                    .steps
+                    .iter()
+                    .filter(|step| changed_names.contains(&step.name))
+                    .map(|step| step.name.clone())
+                    .collect();
+
+                if !matched.is_empty() {
+                    let steps: Vec<output::FlowStepOutput> = flow
+                        .steps
+                        .iter()
+                        .map(output::FlowStepOutput::from)
+                        .collect();
+                    matched_flows.push(AffectedFlowOutput {
+                        entry_point: output::FlowStepOutput::from(&flow.entry_point),
+                        step_count: steps.len(),
+                        steps,
+                        matched_symbols: matched,
+                    });
+                }
+            }
+        }
+
+        if matched_flows.is_empty() {
+            None
+        } else {
+            Some(matched_flows)
+        }
+    } else {
+        None
+    };
+
+    // 6. Build ChangesOutput.
+    let scope_str = match &scope {
+        ChangeScope::Unstaged => "unstaged".to_string(),
+        ChangeScope::Staged => "staged".to_string(),
+        ChangeScope::All => "all".to_string(),
+        ChangeScope::Compare(r) => format!("compare({r})"),
+    };
+
+    let changes_out = ChangesOutput {
+        scope: scope_str,
+        changed_symbols: changed_outputs,
+        combined_risk_level: combined_risk.map(|r| r.to_string()),
+        affected_flows,
+    };
+
+    // 7. Format and emit.
+    fmt.format_changes(&changes_out)?;
     Ok(())
 }
 
@@ -1381,6 +1542,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Summary(_)
             | Command::Flows(_)
             | Command::Blast(_)
+            | Command::Changes(_)
     )
 }
 
@@ -4737,6 +4899,21 @@ mod tests {
             direction: None,
             depth: 3,
             include_tests: false,
+            min_confidence: None,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    // -- Changes tests (TASK-072) --------------------------------------------
+
+    #[test]
+    fn test_is_query_command_changes() {
+        use crate::cli::ChangesArgs;
+        let cmd = Command::Changes(ChangesArgs {
+            scope: "unstaged".into(),
+            base: None,
+            blast: false,
+            flows: false,
             min_confidence: None,
         });
         assert!(is_query_command(&cmd));

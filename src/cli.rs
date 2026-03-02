@@ -92,6 +92,9 @@ pub enum Command {
 
     /// Analyze blast radius of a symbol change
     Blast(BlastArgs),
+
+    /// Detect changed symbols and optionally chain blast/flow analysis
+    Changes(ChangesArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -379,6 +382,29 @@ pub struct BlastArgs {
     pub include_tests: bool,
 
     /// Minimum confidence threshold (0.0-1.0) to filter edges
+    #[arg(long)]
+    pub min_confidence: Option<f64>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ChangesArgs {
+    /// Change scope: unstaged (default), staged, all, or compare
+    #[arg(long, default_value = "unstaged")]
+    pub scope: String,
+
+    /// Base git ref for compare scope (required when --scope=compare)
+    #[arg(long)]
+    pub base: Option<String>,
+
+    /// Include blast radius analysis for each changed symbol
+    #[arg(long)]
+    pub blast: bool,
+
+    /// Identify execution flows affected by changed symbols
+    #[arg(long)]
+    pub flows: bool,
+
+    /// Minimum confidence threshold (0.0-1.0) for blast/flow edges
     #[arg(long)]
     pub min_confidence: Option<f64>,
 }
@@ -1135,6 +1161,105 @@ mod tests {
                 assert_eq!(args.symbol, "processPayment");
             }
             _ => panic!("expected Command::Blast"),
+        }
+    }
+
+    // -- Changes tests (TASK-072) ---------------------------------------------
+
+    #[test]
+    fn parse_changes_default() {
+        let cli = Cli::try_parse_from(["wonk", "changes"]).unwrap();
+        match cli.command {
+            Command::Changes(args) => {
+                assert_eq!(args.scope, "unstaged");
+                assert!(args.base.is_none());
+                assert!(!args.blast);
+                assert!(!args.flows);
+                assert!(args.min_confidence.is_none());
+            }
+            _ => panic!("expected Command::Changes"),
+        }
+    }
+
+    #[test]
+    fn parse_changes_scope_staged() {
+        let cli = Cli::try_parse_from(["wonk", "changes", "--scope", "staged"]).unwrap();
+        match cli.command {
+            Command::Changes(args) => {
+                assert_eq!(args.scope, "staged");
+            }
+            _ => panic!("expected Command::Changes"),
+        }
+    }
+
+    #[test]
+    fn parse_changes_scope_all() {
+        let cli = Cli::try_parse_from(["wonk", "changes", "--scope", "all"]).unwrap();
+        match cli.command {
+            Command::Changes(args) => {
+                assert_eq!(args.scope, "all");
+            }
+            _ => panic!("expected Command::Changes"),
+        }
+    }
+
+    #[test]
+    fn parse_changes_scope_compare_with_base() {
+        let cli = Cli::try_parse_from(["wonk", "changes", "--scope", "compare", "--base", "main"])
+            .unwrap();
+        match cli.command {
+            Command::Changes(args) => {
+                assert_eq!(args.scope, "compare");
+                assert_eq!(args.base.as_deref(), Some("main"));
+            }
+            _ => panic!("expected Command::Changes"),
+        }
+    }
+
+    #[test]
+    fn parse_changes_blast_flag() {
+        let cli = Cli::try_parse_from(["wonk", "changes", "--blast"]).unwrap();
+        match cli.command {
+            Command::Changes(args) => {
+                assert!(args.blast);
+                assert!(!args.flows);
+            }
+            _ => panic!("expected Command::Changes"),
+        }
+    }
+
+    #[test]
+    fn parse_changes_flows_flag() {
+        let cli = Cli::try_parse_from(["wonk", "changes", "--flows"]).unwrap();
+        match cli.command {
+            Command::Changes(args) => {
+                assert!(!args.blast);
+                assert!(args.flows);
+            }
+            _ => panic!("expected Command::Changes"),
+        }
+    }
+
+    #[test]
+    fn parse_changes_blast_and_flows() {
+        let cli = Cli::try_parse_from(["wonk", "changes", "--blast", "--flows"]).unwrap();
+        match cli.command {
+            Command::Changes(args) => {
+                assert!(args.blast);
+                assert!(args.flows);
+            }
+            _ => panic!("expected Command::Changes"),
+        }
+    }
+
+    #[test]
+    fn parse_changes_min_confidence() {
+        let cli = Cli::try_parse_from(["wonk", "changes", "--min-confidence", "0.8"]).unwrap();
+        match cli.command {
+            Command::Changes(args) => {
+                assert_eq!(args.min_confidence, Some(0.8));
+            }
+            _ => panic!("expected Command::Changes"),
         }
     }
 }
