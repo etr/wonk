@@ -37,7 +37,7 @@
 | M17 | Call Graph Commands | 2 | Complete |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Complete |
 | M19 | Edge Confidence & Inheritance Infrastructure | 3 | In Progress |
-| M20 | Hybrid Search Fusion (RRF) | 1 | In Progress |
+| M20 | Hybrid Search Fusion (RRF) | 1 | Complete |
 | M21 | Execution Flow Detection (`wonk flows`) | 1 | Not Started |
 | M22 | Blast Radius Analysis (`wonk blast`) | 1 | Not Started |
 | M23 | Scoped Change Detection (`wonk changes`) | 2 | Not Started |
@@ -2816,7 +2816,7 @@ Implement `fuse_rrf()` in `ranker.rs` that merges structural and semantic result
 **Related Requirements:** PRD-RRF-REQ-001 through PRD-RRF-REQ-004
 **Related Decisions:** DR-027
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
