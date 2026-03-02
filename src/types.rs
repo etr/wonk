@@ -457,6 +457,30 @@ pub struct RawTypeEdge {
     pub relationship: String,
 }
 
+/// A single step in an execution flow, representing a symbol at a given BFS depth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowStep {
+    /// The symbol name (e.g. function or method name).
+    pub name: String,
+    /// What kind of symbol this is.
+    pub kind: SymbolKind,
+    /// Path of the source file.
+    pub file: String,
+    /// 1-based line number where the symbol starts.
+    pub line: usize,
+    /// BFS depth at which this step was discovered (0 = entry point).
+    pub depth: usize,
+}
+
+/// An execution flow traced from an entry point via BFS callee expansion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionFlow {
+    /// The entry point of this flow.
+    pub entry_point: FlowStep,
+    /// All steps in the flow (including the entry point).
+    pub steps: Vec<FlowStep>,
+}
+
 /// A single hop in a call path between two symbols, returned by `wonk callpath`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallPathHop {
@@ -866,6 +890,83 @@ mod tests {
             child_name: "Cat".into(),
             parent_name: "Animal".into(),
             relationship: "extends".into(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // -- FlowStep tests -------------------------------------------------------
+
+    #[test]
+    fn flow_step_creation() {
+        let step = FlowStep {
+            name: "main".into(),
+            kind: SymbolKind::Function,
+            file: "src/main.rs".into(),
+            line: 1,
+            depth: 0,
+        };
+        assert_eq!(step.name, "main");
+        assert_eq!(step.kind, SymbolKind::Function);
+        assert_eq!(step.file, "src/main.rs");
+        assert_eq!(step.line, 1);
+        assert_eq!(step.depth, 0);
+    }
+
+    #[test]
+    fn flow_step_equality_by_value() {
+        let a = FlowStep {
+            name: "dispatch".into(),
+            kind: SymbolKind::Function,
+            file: "src/router.rs".into(),
+            line: 50,
+            depth: 1,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // -- ExecutionFlow tests ---------------------------------------------------
+
+    #[test]
+    fn execution_flow_creation() {
+        let entry = FlowStep {
+            name: "main".into(),
+            kind: SymbolKind::Function,
+            file: "src/main.rs".into(),
+            line: 1,
+            depth: 0,
+        };
+        let steps = vec![
+            entry.clone(),
+            FlowStep {
+                name: "dispatch".into(),
+                kind: SymbolKind::Function,
+                file: "src/router.rs".into(),
+                line: 50,
+                depth: 1,
+            },
+        ];
+        let flow = ExecutionFlow {
+            entry_point: entry.clone(),
+            steps: steps.clone(),
+        };
+        assert_eq!(flow.entry_point, entry);
+        assert_eq!(flow.steps.len(), 2);
+    }
+
+    #[test]
+    fn execution_flow_equality_by_value() {
+        let entry = FlowStep {
+            name: "main".into(),
+            kind: SymbolKind::Function,
+            file: "src/main.rs".into(),
+            line: 1,
+            depth: 0,
+        };
+        let a = ExecutionFlow {
+            entry_point: entry.clone(),
+            steps: vec![entry.clone()],
         };
         let b = a.clone();
         assert_eq!(a, b);
