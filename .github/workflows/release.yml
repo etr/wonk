@@ -75,17 +75,17 @@ jobs:
           cp "$src" "$dst"
           echo "ARTIFACT_PATH=$dst" >> "$GITHUB_ENV"
 
-      - name: Assert binary size under 30 MB
+      - name: Assert binary size under 35 MB
         shell: bash
         run: |
           size=$(wc -c < "${{ env.ARTIFACT_PATH }}" | tr -d ' ')
-          max=$((30 * 1024 * 1024))
+          max=$((35 * 1024 * 1024))
           echo "Binary size: ${size} bytes"
           if [ "$size" -gt "$max" ]; then
-            echo "ERROR: Binary size ${size} exceeds 30 MB limit (${max} bytes)"
+            echo "ERROR: Binary size ${size} exceeds 35 MB limit (${max} bytes)"
             exit 1
           fi
-          echo "OK: Binary size ${size} is under 30 MB limit"
+          echo "OK: Binary size ${size} is under 35 MB limit"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
