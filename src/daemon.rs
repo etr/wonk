@@ -474,8 +474,14 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
         .context("spawning embedding worker thread")?;
 
     // --- File watcher event loop ---
-    // Set up debounced file watching (500ms window) and run the event loop.
-    let (_watcher, rx) = FileWatcher::new(repo_root, 500).context("starting file watcher")?;
+    // Build ignore rules from .gitignore, .wonkignore, and config patterns.
+    let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
+    let ignore_matcher = Arc::new(watcher::IgnoreMatcher::build(
+        repo_root,
+        &config.ignore.patterns,
+    ));
+    let (_watcher, rx) =
+        FileWatcher::new(repo_root, 500, ignore_matcher).context("starting file watcher")?;
 
     let repo_root_buf = repo_root.to_path_buf();
     watcher::run_event_loop(&rx, &shutdown, |events| {

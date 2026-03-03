@@ -2,8 +2,9 @@
 //!
 //! Wraps `notify-debouncer-mini` to produce debounced filesystem events and
 //! feeds them into a `crossbeam-channel`.  The daemon event loop receives
-//! events from the channel, filters them through gitignore / default
-//! exclusion rules, classifies each event as Created / Modified / Deleted,
+//! events from the channel, filters them through default exclusion rules,
+//! `.gitignore` / `.wonkignore` / config ignore patterns (via
+//! [`IgnoreMatcher`]), classifies each event as Created / Modified / Deleted,
 //! and dispatches to a caller-supplied handler.
 
 use std::path::{Path, PathBuf};
@@ -134,6 +135,152 @@ pub fn should_process(path: &Path, repo_root: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// IgnoreMatcher — compiled gitignore / wonkignore / config ignore rules
+// ---------------------------------------------------------------------------
+
+/// Compiled ignore rules from `.gitignore`, `.wonkignore`, and config
+/// `[ignore].patterns`.  Used by [`FileWatcher`] to filter out events for
+/// files that should not be indexed.
+///
+/// Each directory that contains a `.gitignore` or `.wonkignore` gets its own
+/// [`ignore::gitignore::Gitignore`] matcher, scoped to that directory.  When
+/// checking a path, matchers are tested from deepest to shallowest; the first
+/// match (ignore or whitelist) wins.
+pub struct IgnoreMatcher {
+    /// Per-directory matchers, sorted by path depth (shallowest first).
+    /// Each entry is `(directory_path, matcher)`.
+    matchers: Vec<(PathBuf, ignore::gitignore::Gitignore)>,
+}
+
+impl IgnoreMatcher {
+    /// Build an `IgnoreMatcher` by discovering all `.gitignore` and
+    /// `.wonkignore` files under `repo_root`, plus `.git/info/exclude`
+    /// and any extra patterns from the config.
+    pub fn build(repo_root: &Path, config_patterns: &[String]) -> Self {
+        let mut matchers: Vec<(PathBuf, ignore::gitignore::Gitignore)> = Vec::new();
+
+        // Recursively discover directories with ignore files.
+        Self::collect_matchers(repo_root, repo_root, config_patterns, &mut matchers);
+
+        // Sort by path length so shallowest directories come first.
+        matchers.sort_by_key(|(dir, _)| dir.as_os_str().len());
+
+        Self { matchers }
+    }
+
+    /// Create an empty matcher that ignores nothing.
+    pub fn empty() -> Self {
+        Self {
+            matchers: Vec::new(),
+        }
+    }
+
+    /// Return `true` if the given path should be ignored.
+    ///
+    /// `path` should be absolute (the same form as paths produced by the file
+    /// watcher).  `is_dir` indicates whether the path is a directory.
+    ///
+    /// Matchers are checked from deepest directory to shallowest.  The first
+    /// match wins: an `Ignore` match returns `true`, a `Whitelist` (negation)
+    /// match returns `false`.
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        // Iterate from deepest to shallowest.
+        for (dir, matcher) in self.matchers.iter().rev() {
+            if !path.starts_with(dir) {
+                continue;
+            }
+            match matcher.matched(path, is_dir) {
+                ignore::Match::Ignore(_) => return true,
+                ignore::Match::Whitelist(_) => return false,
+                ignore::Match::None => continue,
+            }
+        }
+        false
+    }
+
+    /// Recursively discover `.gitignore` and `.wonkignore` files and build
+    /// per-directory matchers.
+    fn collect_matchers(
+        repo_root: &Path,
+        dir: &Path,
+        config_patterns: &[String],
+        out: &mut Vec<(PathBuf, ignore::gitignore::Gitignore)>,
+    ) {
+        let gitignore_path = dir.join(".gitignore");
+        let wonkignore_path = dir.join(".wonkignore");
+        let has_gitignore = gitignore_path.is_file();
+        let has_wonkignore = wonkignore_path.is_file();
+
+        // At the repo root, also include .git/info/exclude and config patterns.
+        let is_root = dir == repo_root;
+        let exclude_path = repo_root.join(".git/info/exclude");
+        let has_exclude = is_root && exclude_path.is_file();
+        let has_config = is_root && !config_patterns.is_empty();
+
+        if has_gitignore || has_wonkignore || has_exclude || has_config {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+
+            if has_exclude {
+                builder.add(&exclude_path);
+            }
+            if has_gitignore {
+                builder.add(&gitignore_path);
+            }
+            if has_wonkignore {
+                builder.add(&wonkignore_path);
+            }
+            if has_config {
+                for pattern in config_patterns {
+                    builder.add_line(None, pattern).ok();
+                }
+            }
+
+            if let Ok(matcher) = builder.build()
+                && !matcher.is_empty()
+            {
+                out.push((dir.to_path_buf(), matcher));
+            }
+        }
+
+        // Recurse into subdirectories.
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            // Skip .git directory.
+            if name == ".git" {
+                continue;
+            }
+            // Skip default exclusion directories.
+            if DEFAULT_EXCLUSIONS.iter().any(|exc| *exc == name) {
+                continue;
+            }
+            // Skip hidden directories (unless allowlisted).
+            if name.starts_with('.') && !HIDDEN_ALLOWLIST.iter().any(|a| *a == name) {
+                continue;
+            }
+            // Skip worktree boundaries (non-root dirs containing .git).
+            if path.join(".git").exists() {
+                continue;
+            }
+
+            Self::collect_matchers(repo_root, &path, config_patterns, out);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FileWatcher
 // ---------------------------------------------------------------------------
 
@@ -148,10 +295,18 @@ impl FileWatcher {
     /// Create a new file watcher for `repo_root` with the given debounce
     /// window in milliseconds.
     ///
+    /// `ignore_matcher` provides compiled `.gitignore` / `.wonkignore` /
+    /// config ignore rules.  Events for paths that fail either the
+    /// [`should_process`] fast-path filter or the `ignore_matcher` are
+    /// silently dropped before being sent.
+    ///
     /// Returns the watcher (which must be kept alive) and a receiver for
-    /// batches of classified `FileEvent`s.  Events for paths that fail the
-    /// `should_process` filter are silently dropped before being sent.
-    pub fn new(repo_root: &Path, debounce_ms: u64) -> Result<(Self, Receiver<Vec<FileEvent>>)> {
+    /// batches of classified `FileEvent`s.
+    pub fn new(
+        repo_root: &Path,
+        debounce_ms: u64,
+        ignore_matcher: Arc<IgnoreMatcher>,
+    ) -> Result<(Self, Receiver<Vec<FileEvent>>)> {
         let (tx, rx): (Sender<Vec<FileEvent>>, Receiver<Vec<FileEvent>>) =
             crossbeam_channel::unbounded();
 
@@ -167,11 +322,15 @@ impl FileWatcher {
                             // Make the path relative to repo root for filtering,
                             // but keep the absolute path in the event.
                             let rel = ev.path.strip_prefix(&repo_root_buf).unwrap_or(&ev.path);
-                            if should_process(rel, &repo_root_buf) {
-                                Some(classify_event(ev))
-                            } else {
-                                None
+                            if !should_process(rel, &repo_root_buf) {
+                                return None;
                             }
+                            // Check gitignore / wonkignore / config patterns.
+                            let is_dir = ev.path.is_dir();
+                            if ignore_matcher.is_ignored(&ev.path, is_dir) {
+                                return None;
+                            }
+                            Some(classify_event(ev))
                         })
                         .collect();
 
@@ -619,7 +778,8 @@ mod tests {
     fn test_file_watcher_creates_and_receives_events() {
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
-        let (watcher, rx) = FileWatcher::new(dir.path(), 300).unwrap();
+        let matcher = Arc::new(IgnoreMatcher::empty());
+        let (watcher, rx) = FileWatcher::new(dir.path(), 300, matcher).unwrap();
 
         // Create a file inside the watched directory.
         let file_path = dir.path().join("test_file.rs");
@@ -655,7 +815,8 @@ mod tests {
         fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
 
-        let (watcher, rx) = FileWatcher::new(dir.path(), 300).unwrap();
+        let matcher = Arc::new(IgnoreMatcher::empty());
+        let (watcher, rx) = FileWatcher::new(dir.path(), 300, matcher).unwrap();
 
         // Write to an excluded directory.
         fs::write(
@@ -714,7 +875,8 @@ mod tests {
         fs::create_dir_all(dir.path().join("libs/nested/.git")).unwrap();
         fs::create_dir_all(dir.path().join("libs/nested/src")).unwrap();
 
-        let (watcher, rx) = FileWatcher::new(dir.path(), 300).unwrap();
+        let matcher = Arc::new(IgnoreMatcher::empty());
+        let (watcher, rx) = FileWatcher::new(dir.path(), 300, matcher).unwrap();
 
         // Write to a file inside the nested worktree boundary.
         fs::write(
@@ -757,6 +919,174 @@ mod tests {
         assert!(
             !has_nested,
             "should NOT receive events for files inside nested worktree boundary, got: {all_events:?}"
+        );
+
+        drop(watcher);
+    }
+
+    // ---- IgnoreMatcher unit tests ----
+
+    #[test]
+    fn test_ignore_matcher_empty_ignores_nothing() {
+        let m = IgnoreMatcher::empty();
+        assert!(!m.is_ignored(Path::new("src/main.rs"), false));
+        assert!(!m.is_ignored(Path::new("build.log"), false));
+    }
+
+    #[test]
+    fn test_ignore_matcher_gitignore_patterns() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.log\nbuild/\n").unwrap();
+
+        let m = IgnoreMatcher::build(dir.path(), &[]);
+
+        assert!(m.is_ignored(&dir.path().join("app.log"), false));
+        assert!(m.is_ignored(&dir.path().join("build"), true));
+        assert!(!m.is_ignored(&dir.path().join("src/main.rs"), false));
+    }
+
+    #[test]
+    fn test_ignore_matcher_wonkignore_patterns() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".wonkignore"), "*.generated.ts\n").unwrap();
+
+        let m = IgnoreMatcher::build(dir.path(), &[]);
+
+        assert!(m.is_ignored(&dir.path().join("api.generated.ts"), false));
+        assert!(!m.is_ignored(&dir.path().join("api.ts"), false));
+    }
+
+    #[test]
+    fn test_ignore_matcher_config_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let patterns = vec!["*.tmp".to_string(), "scratch/".to_string()];
+        let m = IgnoreMatcher::build(dir.path(), &patterns);
+
+        assert!(m.is_ignored(&dir.path().join("notes.tmp"), false));
+        assert!(m.is_ignored(&dir.path().join("scratch"), true));
+        assert!(!m.is_ignored(&dir.path().join("src/lib.rs"), false));
+    }
+
+    #[test]
+    fn test_ignore_matcher_subdirectory_scoping() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Root .gitignore ignores nothing extra.
+        fs::write(dir.path().join(".gitignore"), "").unwrap();
+
+        // src/.gitignore ignores *.tmp — should only apply under src/.
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/.gitignore"), "*.tmp\n").unwrap();
+
+        let m = IgnoreMatcher::build(dir.path(), &[]);
+
+        // *.tmp under src/ is ignored.
+        assert!(m.is_ignored(&dir.path().join("src/scratch.tmp"), false));
+        // *.tmp at root is NOT ignored (pattern scoped to src/).
+        assert!(!m.is_ignored(&dir.path().join("root.tmp"), false));
+    }
+
+    #[test]
+    fn test_ignore_matcher_negation_pattern() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.log\n!important.log\n").unwrap();
+
+        let m = IgnoreMatcher::build(dir.path(), &[]);
+
+        assert!(m.is_ignored(&dir.path().join("debug.log"), false));
+        assert!(
+            !m.is_ignored(&dir.path().join("important.log"), false),
+            "negation pattern should un-ignore important.log"
+        );
+    }
+
+    #[test]
+    fn test_ignore_matcher_combined_sources() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+
+        // .gitignore ignores *.log
+        fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        // .wonkignore ignores *.bak
+        fs::write(dir.path().join(".wonkignore"), "*.bak\n").unwrap();
+        // Config ignores *.tmp
+        let patterns = vec!["*.tmp".to_string()];
+
+        let m = IgnoreMatcher::build(dir.path(), &patterns);
+
+        assert!(m.is_ignored(&dir.path().join("app.log"), false));
+        assert!(m.is_ignored(&dir.path().join("data.bak"), false));
+        assert!(m.is_ignored(&dir.path().join("scratch.tmp"), false));
+        assert!(!m.is_ignored(&dir.path().join("main.rs"), false));
+    }
+
+    #[test]
+    fn test_ignore_matcher_git_info_exclude() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        fs::write(dir.path().join(".git/info/exclude"), "*.secret\n").unwrap();
+
+        let m = IgnoreMatcher::build(dir.path(), &[]);
+
+        assert!(m.is_ignored(&dir.path().join("passwords.secret"), false));
+        assert!(!m.is_ignored(&dir.path().join("config.toml"), false));
+    }
+
+    // ---- Integration: FileWatcher with IgnoreMatcher ----
+
+    #[test]
+    fn test_file_watcher_respects_gitignore_via_ignore_matcher() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Set up .gitignore that ignores *.log files.
+        fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+
+        let matcher = Arc::new(IgnoreMatcher::build(dir.path(), &[]));
+        let (watcher, rx) = FileWatcher::new(dir.path(), 300, matcher).unwrap();
+
+        // Write a .log file (should be ignored).
+        fs::write(dir.path().join("debug.log"), "some log data").unwrap();
+
+        // Write a .rs file (should come through).
+        std::thread::sleep(Duration::from_millis(50));
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Collect events.
+        let mut all_events = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(batch) => all_events.extend(batch),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !all_events.is_empty() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let has_rs = all_events
+            .iter()
+            .any(|e| e.path().to_string_lossy().contains("main.rs"));
+        let has_log = all_events
+            .iter()
+            .any(|e| e.path().to_string_lossy().contains(".log"));
+
+        assert!(
+            has_rs,
+            "should receive event for src/main.rs, got: {all_events:?}"
+        );
+        assert!(
+            !has_log,
+            "should NOT receive events for .log files, got: {all_events:?}"
         );
 
         drop(watcher);

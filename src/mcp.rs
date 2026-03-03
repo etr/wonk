@@ -2995,14 +2995,25 @@ mod tests {
 
     #[test]
     fn tool_summary_dispatches_correctly() {
-        let mut server = test_server();
+        use tempfile::TempDir;
+
+        // Use a real temp dir so path validation (canonicalize) succeeds,
+        // but there is no index so we expect a "no index" error.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let mut server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+            registry: RepoRegistry::new(Vec::new()),
+        };
         let params = serde_json::json!({
             "name": "wonk_summary",
             "arguments": {"path": "src/"}
         });
         let result = server.handle_tools_call(&params);
         let text = result["content"][0]["text"].as_str().unwrap_or("");
-        // test_server has no index, so we expect a "no index" error
         assert!(
             text.contains("no index"),
             "expected 'no index' error, got: {text}"

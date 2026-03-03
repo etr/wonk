@@ -109,8 +109,11 @@ pub fn build_index_with_progress(
     // 2. Open (or create) the database.
     let conn = db::open(&index_path)?;
 
-    // 3. Walk files.
-    let paths = Walker::new(repo_root).collect_paths();
+    // 3. Walk files (respecting config ignore patterns).
+    let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
+    let paths = Walker::new(repo_root)
+        .with_ignore_patterns(&config.ignore.patterns)
+        .collect_paths();
 
     // Set total for progress reporting.
     progress.set_total(paths.len());
