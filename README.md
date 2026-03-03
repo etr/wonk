@@ -70,9 +70,64 @@ cargo build --release
 # Binary is at target/release/wonk
 ```
 
+## Optional dependencies
+
+Wonk's core features -- structural search, symbol lookup, call graph analysis,
+and change detection -- work out of the box with zero external dependencies.
+Advanced semantic and LLM features require Ollama; git-based change detection
+requires git.
+
+### Ollama
+
+[Ollama](https://ollama.ai/) provides local embedding generation and LLM text
+generation. Install it and pull the two models wonk uses:
+
+```sh
+# Install Ollama (see https://ollama.ai for other methods)
+curl -fsSL https://ollama.ai/install.sh | sh
+
+# Pull the embedding model (required for semantic search)
+ollama pull nomic-embed-text
+
+# Pull the text generation model (required for AI-generated summaries)
+ollama pull llama3.2:3b
+```
+
+| Model | Used by |
+|-------|---------|
+| `nomic-embed-text` | `wonk ask`, `wonk search --semantic`, `wonk cluster`, `wonk init` (embedding build) |
+| `llama3.2:3b` | `wonk summary --semantic` |
+
+Embeddings are built automatically on first semantic query or explicitly via
+`wonk init`. The background daemon keeps them up to date as files change.
+
+To point at a remote Ollama instance or swap models, add to your
+`~/.wonk/config.toml` (or `<repo>/.wonk/config.toml`):
+
+```toml
+[llm]
+model = "llama3.2:3b"
+generate_url = "http://your-server:11434/api/generate"
+```
+
+The embedding client uses `http://localhost:11434` by default. No separate
+configuration is needed when Ollama runs locally.
+
+### Git
+
+Git is only required for commit-relative change detection:
+
+- `wonk impact --since <commit>`
+- `wonk changes --scope compare --base <ref>`
+
+Git is most likely already installed on your system. If not, see
+[git-scm.com](https://git-scm.com/).
+
 ## Commands
 
-### `wonk search <pattern>`
+### Search
+
+#### `wonk search <pattern>`
 
 Full-text search across indexed files.
 
@@ -80,6 +135,7 @@ Full-text search across indexed files.
 wonk search "handleRequest"
 wonk search --regex "handle\w+Request"
 wonk search -i "config"
+wonk search --semantic "render"
 wonk search "render" -- src/components/
 ```
 
@@ -89,158 +145,10 @@ wonk search "render" -- src/components/
 | `-i`, `--ignore-case` | Case-insensitive search |
 | `--raw` | Skip ranking, deduplication, and category headers |
 | `--smart` | Force smart ranking even if pattern does not match known symbols |
-| `--semantic` | Blend structural results with embedding-based semantic results |
+| `--semantic` | Blend structural results with embedding-based semantic results (RRF fusion) |
 | `-- <paths>` | Restrict search to specific paths |
 
-### `wonk sym <name>`
-
-Look up symbol definitions (functions, classes, variables, etc.).
-
-```
-wonk sym "UserService"
-wonk sym --kind function "process"
-wonk sym --exact "Config"
-```
-
-| Flag | Description |
-|------|-------------|
-| `--kind <kind>` | Filter by symbol kind (e.g. `function`, `class`, `variable`) |
-| `--exact` | Require exact match on symbol name |
-
-### `wonk ref <name>`
-
-Find references to a symbol across the codebase.
-
-```
-wonk ref "handleRequest"
-wonk ref "validate" -- src/
-```
-
-| Flag | Description |
-|------|-------------|
-| `-- <paths>` | Restrict search to specific paths |
-
-### `wonk sig <name>`
-
-Show function and method signatures.
-
-```
-wonk sig "process"
-```
-
-Output:
-
-```
-src/engine.rs:15:  fn process(input: &str) -> Result<()>
-```
-
-### `wonk ls [path]`
-
-List indexed files. Defaults to the repository root.
-
-```
-wonk ls
-wonk ls src/components
-wonk ls --tree
-```
-
-| Flag | Description |
-|------|-------------|
-| `--tree` | Show files with symbol structure (functions, classes, methods) |
-
-### `wonk deps <file>`
-
-Show files that a given file depends on (imports/requires).
-
-```
-wonk deps src/main.rs
-```
-
-Output:
-
-```
-src/main.rs -> src/lib.rs
-src/main.rs -> src/config.rs
-```
-
-### `wonk rdeps <file>`
-
-Show reverse dependencies -- files that depend on a given file.
-
-```
-wonk rdeps src/config.rs
-```
-
-### `wonk init`
-
-Manually initialize indexing for the current repository. This is optional --
-any query command (`search`, `sym`, `ref`, `sig`, `ls`, `deps`, `rdeps`)
-automatically builds the index on first use. Use `init` when you want to
-pre-build the index or choose `--local` mode.
-
-```
-wonk init
-wonk init --local
-```
-
-| Flag | Description |
-|------|-------------|
-| `--local` | Use a project-specific index instead of the shared index |
-
-### `wonk update`
-
-Re-index the current repository.
-
-```
-wonk update
-```
-
-### `wonk status`
-
-Show indexing status for the current repository.
-
-```
-wonk status
-```
-
-### `wonk daemon <start|stop|status|list>`
-
-Manage the background daemon.
-
-```
-wonk daemon start
-wonk daemon stop
-wonk daemon stop --all
-wonk daemon status
-wonk daemon list
-```
-
-| Flag | Description |
-|------|-------------|
-| `--all` | Stop all running daemons (with `stop`) |
-
-### `wonk repos <list|clean>`
-
-Manage tracked repositories.
-
-```
-wonk repos list
-wonk repos clean    # Remove stale repositories from the index
-```
-
-### `wonk mcp serve`
-
-Start an MCP (Model Context Protocol) server over stdio. This lets AI coding
-assistants like Claude Code use wonk as a tool provider.
-
-```
-wonk mcp serve
-```
-
-The server communicates via JSON-RPC 2.0 over NDJSON on stdin/stdout. It
-auto-indexes the repository on first startup if no index exists.
-
-### `wonk ask <query>`
+#### `wonk ask <query>`
 
 Semantic search: find symbols related to a natural language query.
 Requires Ollama running locally with `nomic-embed-text`.
@@ -256,7 +164,275 @@ wonk ask --to src/db.rs "query builder"
 | `--from <file>` | Restrict to symbols reachable from this file |
 | `--to <file>` | Restrict to symbols that can reach this file |
 
-### `wonk cluster <path>`
+### Symbol lookup
+
+#### `wonk sym <name>`
+
+Look up symbol definitions (functions, classes, variables, etc.).
+
+```
+wonk sym "UserService"
+wonk sym --kind function "process"
+wonk sym --exact "Config"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--kind <kind>` | Filter by symbol kind (e.g. `function`, `class`, `variable`) |
+| `--exact` | Require exact match on symbol name |
+
+#### `wonk ref <name>`
+
+Find references to a symbol across the codebase.
+
+```
+wonk ref "handleRequest"
+wonk ref "validate" -- src/
+```
+
+| Flag | Description |
+|------|-------------|
+| `-- <paths>` | Restrict search to specific paths |
+
+#### `wonk sig <name>`
+
+Show function and method signatures.
+
+```
+wonk sig "process"
+```
+
+Output:
+
+```
+src/engine.rs:15:  fn process(input: &str) -> Result<()>
+```
+
+#### `wonk show <name>`
+
+Show the full source body of a symbol. For container types (class, struct,
+enum, trait, interface), use `--shallow` to get the container signature plus
+child signatures without bodies.
+
+```
+wonk show "processPayment"
+wonk show --file src/billing.ts "processPayment"
+wonk show --kind function "handle"
+wonk show --shallow "MyClass"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--file <path>` | Restrict results to a specific file |
+| `--kind <kind>` | Filter by symbol kind (e.g. `function`, `class`) |
+| `--exact` | Require exact match on symbol name |
+| `--shallow` | Show container signature + child signatures without bodies |
+
+### Code structure
+
+#### `wonk ls [path]`
+
+List indexed files. Defaults to the repository root.
+
+```
+wonk ls
+wonk ls src/components
+wonk ls --tree
+```
+
+| Flag | Description |
+|------|-------------|
+| `--tree` | Show files with symbol structure (functions, classes, methods) |
+
+#### `wonk deps <file>`
+
+Show files that a given file depends on (imports/requires).
+
+```
+wonk deps src/main.rs
+```
+
+Output:
+
+```
+src/main.rs -> src/lib.rs
+src/main.rs -> src/config.rs
+```
+
+#### `wonk rdeps <file>`
+
+Show reverse dependencies -- files that depend on a given file.
+
+```
+wonk rdeps src/config.rs
+```
+
+#### `wonk summary <path>`
+
+Show a structural summary of a file or directory: file count, line count,
+symbol counts by kind, language breakdown, and dependency count.
+
+```
+wonk summary src/
+wonk summary --detail light src/auth/
+wonk summary --recursive src/
+wonk summary --semantic src/lib.rs
+```
+
+| Flag | Description |
+|------|-------------|
+| `--detail <level>` | Detail level: `rich` (default), `light`, or `symbols` |
+| `--depth <N>` | Recursion depth for child summaries (0 = target only) |
+| `--recursive` | Show full recursive hierarchy (unlimited depth) |
+| `--semantic` | Include AI-generated description (requires Ollama) |
+
+### Call graph
+
+Wonk tracks caller/callee relationships by analyzing which symbols appear
+within other symbols' bodies. This call graph powers the `callers`, `callees`,
+`callpath`, `flows`, `blast`, `changes`, and `context` commands.
+
+#### `wonk callers <name>`
+
+Find all callers of a symbol (functions whose bodies reference it).
+
+```
+wonk callers "dispatch"
+wonk callers --depth 3 "dispatch"
+wonk callers --min-confidence 0.8 "dispatch"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--depth <N>` | Transitive expansion depth (default: 1 = direct callers only, max: 10) |
+| `--min-confidence <F>` | Minimum edge confidence threshold (0.0-1.0) |
+
+#### `wonk callees <name>`
+
+Find all callees of a symbol (symbols referenced within its body).
+
+```
+wonk callees "main"
+wonk callees --depth 2 "main"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--depth <N>` | Transitive expansion depth (default: 1 = direct callees only, max: 10) |
+| `--min-confidence <F>` | Minimum edge confidence threshold (0.0-1.0) |
+
+#### `wonk callpath <from> <to>`
+
+Find the shortest call chain between two symbols via BFS traversal.
+
+```
+wonk callpath "main" "dispatch"
+wonk callpath --min-confidence 0.7 "handleRequest" "writeDB"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--min-confidence <F>` | Minimum edge confidence threshold (0.0-1.0) |
+
+### Program analysis
+
+#### `wonk flows [entry]`
+
+Detect entry points (functions/methods with no callers) and trace execution
+flows via BFS callee expansion. Without an entry parameter, lists all detected
+entry points. With an entry parameter, traces the full execution flow from that
+function.
+
+```
+wonk flows                      # list all entry points
+wonk flows "main"               # trace flow from main
+wonk flows --from src/api.ts    # entry points in a specific file
+wonk flows --depth 5 --branching 2 "handleRequest"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--from <file>` | Restrict entry point detection to symbols in this file |
+| `--depth <N>` | Maximum BFS traversal depth (default: 10, max: 20) |
+| `--branching <N>` | Maximum callees to follow per symbol (default: 4) |
+| `--min-confidence <F>` | Minimum edge confidence threshold (0.0-1.0) |
+
+#### `wonk blast <symbol>`
+
+Analyze the blast radius of a symbol change. Shows all affected symbols grouped
+by severity tier (WILL BREAK, LIKELY AFFECTED, MAY NEED TESTING) with a risk
+level assessment. Integrates inheritance edges (extends/implements).
+
+```
+wonk blast "processPayment"
+wonk blast --direction downstream "validateInput"
+wonk blast --depth 5 --include-tests "UserService"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--direction <dir>` | Traversal direction: `upstream` (default) or `downstream` |
+| `--depth <N>` | Maximum traversal depth (default: 3, max: 10) |
+| `--include-tests` | Include test files in results |
+| `--min-confidence <F>` | Minimum edge confidence threshold (0.0-1.0) |
+
+#### `wonk changes`
+
+Detect changed symbols in the working tree. Optionally chain blast radius
+analysis and execution flow detection for each changed symbol.
+
+```
+wonk changes                              # unstaged changes
+wonk changes --scope staged               # staged changes
+wonk changes --scope all                  # all uncommitted changes
+wonk changes --scope compare --base main  # compare to a ref
+wonk changes --blast --flows              # chain blast + flow analysis
+```
+
+| Flag | Description |
+|------|-------------|
+| `--scope <scope>` | Change scope: `unstaged` (default), `staged`, `all`, or `compare` |
+| `--base <ref>` | Base git ref for compare scope |
+| `--blast` | Include blast radius analysis for each changed symbol |
+| `--flows` | Identify execution flows affected by changed symbols |
+| `--min-confidence <F>` | Minimum edge confidence for blast/flow edges (0.0-1.0) |
+
+#### `wonk context <name>`
+
+Aggregate full context for a symbol: definition, categorized incoming
+references (callers, importers, type users), outgoing references (callees,
+imports), flow participation, and children (extending/implementing types).
+
+```
+wonk context "processPayment"
+wonk context --file src/billing.ts "processPayment"
+wonk context --kind class "StripeClient"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--file <path>` | Restrict to symbols in this file |
+| `--kind <kind>` | Filter by symbol kind (e.g. `function`, `class`) |
+| `--min-confidence <F>` | Minimum edge confidence threshold (0.0-1.0) |
+
+### Change impact
+
+#### `wonk impact <file>`
+
+Analyze symbol changes and find semantically impacted downstream code.
+
+```
+wonk impact src/lib.rs
+wonk impact --since HEAD~5
+```
+
+| Flag | Description |
+|------|-------------|
+| `--since <commit>` | Analyze all files changed since this commit |
+
+### Semantic
+
+#### `wonk cluster <path>`
 
 Cluster symbols by semantic similarity within a directory.
 Uses K-Means with automatic K selection via silhouette scoring.
@@ -270,18 +446,75 @@ wonk cluster --top 3 src/components/
 |------|-------------|
 | `--top <N>` | Representative symbols per cluster (default: 5) |
 
-### `wonk impact <file>`
+### Index management
 
-Analyze symbol changes and find semantically impacted downstream code.
+#### `wonk init`
+
+Manually initialize indexing for the current repository. This is optional --
+any query command automatically builds the index on first use.
 
 ```
-wonk impact src/lib.rs
-wonk impact --since HEAD~5
+wonk init
+wonk init --local
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--since <commit>` | Analyze all files changed since this commit |
+| `--local` | Use a project-specific index instead of the shared index |
+
+#### `wonk update`
+
+Re-index the current repository.
+
+```
+wonk update
+```
+
+#### `wonk status`
+
+Show indexing status for the current repository.
+
+```
+wonk status
+```
+
+#### `wonk repos <list|clean>`
+
+Manage tracked repositories.
+
+```
+wonk repos list
+wonk repos clean    # Remove stale repositories from the index
+```
+
+### Daemon
+
+#### `wonk daemon <start|stop|status|list>`
+
+Manage the background daemon.
+
+```
+wonk daemon start
+wonk daemon stop
+wonk daemon stop --all
+wonk daemon status
+wonk daemon list
+```
+
+| Flag | Description |
+|------|-------------|
+| `--all` | Stop all running daemons (with `stop`) |
+
+### Integration
+
+#### `wonk mcp serve`
+
+Start an MCP (Model Context Protocol) server over stdio. This lets AI coding
+assistants like Claude Code use wonk as a tool provider.
+
+```
+wonk mcp serve
+```
 
 ## Global flags
 
@@ -342,9 +575,29 @@ exact text patterns.
 - **Dependency scoping**: Use `--from <file>` and `--to <file>` to restrict
   semantic results to symbols reachable from or leading to a specific file,
   using the indexed dependency graph
+- **Hybrid fusion**: `wonk search --semantic` blends structural and semantic
+  result lists using Reciprocal Rank Fusion (RRF). The fusion constant K
+  is configurable via `[search] rrf_k` (default: 60.0); higher values produce
+  more even blending
 
 Use `wonk ask` for pure semantic search, or `wonk search --semantic` to blend
 structural and semantic results.
+
+## Edge confidence
+
+Wonk assigns a confidence score to each caller/callee edge based on how the
+relationship was resolved:
+
+| Confidence | Resolution method |
+|------------|-------------------|
+| >= 0.9 | Import-resolved: the callee was imported in the caller's file |
+| >= 0.8 | Same-file: both symbols are defined in the same file |
+| <= 0.5 | Fuzzy: name matched but no import or co-location evidence |
+
+Use `--min-confidence <F>` on any graph command (`callers`, `callees`,
+`callpath`, `flows`, `blast`, `changes`, `context`) to filter out low-confidence
+edges. For example, `--min-confidence 0.8` keeps only import-resolved and
+same-file edges.
 
 ## Supported languages
 
@@ -389,6 +642,13 @@ color = "auto"                # "auto", "always", or "never"
 
 [ignore]
 patterns = []                 # Glob patterns to exclude from indexing
+
+[llm]
+model = "llama3.2:3b"                              # Ollama model for text generation
+generate_url = "http://localhost:11434/api/generate" # Ollama generate endpoint
+
+[search]
+rrf_k = 60.0                  # Reciprocal Rank Fusion constant K
 ```
 
 ### Sections
@@ -418,6 +678,19 @@ patterns = []                 # Glob patterns to exclude from indexing
 | Key | Default | Description |
 |-----|---------|-------------|
 | `patterns` | `[]` | Glob patterns to exclude from walks and indexing |
+
+**`[llm]`**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `model` | `"llama3.2:3b"` | Ollama model name for text generation (`wonk summary --semantic`) |
+| `generate_url` | `"http://localhost:11434/api/generate"` | Full URL for the Ollama generate endpoint |
+
+**`[search]`**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `rrf_k` | `60.0` | Reciprocal Rank Fusion constant K for `--semantic` blending |
 
 ## Background daemon
 
@@ -513,7 +786,7 @@ coding assistants can use it as a tool provider. To configure it in your
 }
 ```
 
-The server exposes 9 tools over stdio (JSON-RPC 2.0):
+The server exposes 23 tools over stdio (JSON-RPC 2.0):
 
 | Tool | Description |
 |------|-------------|
@@ -521,14 +794,32 @@ The server exposes 9 tools over stdio (JSON-RPC 2.0):
 | `wonk_sym` | Look up symbol definitions by name, kind, or exact match |
 | `wonk_ref` | Find references to a symbol |
 | `wonk_sig` | Show function/method signatures |
+| `wonk_show` | Show full source body of a symbol (with shallow mode for containers) |
 | `wonk_ls` | List files and symbols in a path |
 | `wonk_deps` | Show file dependencies (imports) |
 | `wonk_rdeps` | Show reverse dependencies |
-| `wonk_status` | Check index status (file/symbol/reference/embedding counts) |
+| `wonk_callers` | Find callers of a symbol with transitive expansion |
+| `wonk_callees` | Find callees of a symbol with transitive expansion |
+| `wonk_callpath` | Find shortest call chain between two symbols |
+| `wonk_summary` | Structural/semantic summary of a file or directory |
+| `wonk_flows` | Detect entry points and trace execution flows |
+| `wonk_blast` | Blast radius analysis with severity tiers and risk levels |
+| `wonk_changes` | Detect changed symbols with optional blast/flow chaining |
+| `wonk_context` | Aggregate full context for a symbol (definition + callers + callees + flows) |
+| `wonk_ask` | Pure semantic search via embedding similarity |
+| `wonk_cluster` | Cluster symbols by semantic similarity (K-Means) |
+| `wonk_impact` | Analyze semantic impact of changed symbols |
 | `wonk_init` | Initialize or rebuild the index (supports Ollama embedding build) |
+| `wonk_update` | Rebuild the index for the current repository |
+| `wonk_status` | Check index status (file/symbol/reference/embedding counts) |
+| `wonk_repos` | List all indexed repositories (multi-repo mode only) |
 
 All file paths are validated against the repository boundary. The index is
 built automatically on first use if it does not already exist.
+
+**Multi-repo support:** When multiple repositories are indexed, all tools
+accept an optional `repo` parameter to target a specific repository. Use
+`wonk_repos` to list available repositories.
 
 ### Claude Code plugin
 
