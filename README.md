@@ -33,6 +33,42 @@ cd your-project
 wonk search "handleRequest"
 ```
 
+### Claude Code plugin
+
+The [wonk plugin](https://github.com/etr/wonk-plugin) integrates wonk into
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) as a native
+tool provider. It bundles the MCP server, an agent skill that teaches Claude
+when to prefer wonk over grep/glob, and a session hook that keeps the index
+fresh.
+
+Install via the [Groundwork Marketplace](https://github.com/etr/groundwork-marketplace):
+
+```sh
+claude plugin marketplace add https://github.com/etr/groundwork-marketplace
+claude plugin install wonk
+```
+
+#### Direct Installation
+
+```bash
+claude plugin install https://github.com/etr/groundwork
+```
+
+#### Manual Installation
+
+```bash
+cd ~/.claude/plugins
+git clone https://github.com/etr/wonk-plugin.git
+```
+
+#### Update via Marketplace
+
+```bash
+claude plugin marketplace update groundwork-marketplace
+
+claude plugin update groundwork
+```
+
 ## Installation
 
 ### curl (Linux / macOS)
@@ -820,27 +856,6 @@ built automatically on first use if it does not already exist.
 **Multi-repo support:** When multiple repositories are indexed, all tools
 accept an optional `repo` parameter to target a specific repository. Use
 `wonk_repos` to list available repositories.
-
-### Claude Code plugin
-
-The [wonk plugin](https://github.com/etr/wonk-plugin) integrates wonk into
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) as a native
-tool provider. It bundles the MCP server, an agent skill that teaches Claude
-when to prefer wonk over grep/glob, and a session hook that keeps the index
-fresh.
-
-Install via the [Groundwork Marketplace](https://github.com/etr/groundwork-marketplace):
-
-```sh
-claude plugin marketplace add https://github.com/etr/groundwork-marketplace
-claude plugin add wonk
-```
-
-Or directly from GitHub:
-
-```sh
-claude plugin add https://github.com/etr/wonk-plugin
-```
 
 ## License
 
