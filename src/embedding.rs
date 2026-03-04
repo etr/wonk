@@ -224,6 +224,21 @@ fn extract_error_detail(status: u16, body: &str) -> String {
     format!("HTTP {status}")
 }
 
+/// Check whether an [`EmbeddingError`] indicates that the input exceeded
+/// the model's context length.
+///
+/// Matches both Ollama's server-side message ("context length") and wonk's
+/// own pre-flight check ("input text too long").
+pub(crate) fn is_context_length_error(err: &EmbeddingError) -> bool {
+    match err {
+        EmbeddingError::OllamaError(msg) => {
+            let m = msg.to_lowercase();
+            m.contains("context length") || m.contains("input text too long")
+        }
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chunking helpers
 // ---------------------------------------------------------------------------
@@ -1130,6 +1145,38 @@ mod tests {
             result.unwrap_err(),
             EmbeddingError::OllamaUnreachable
         ));
+    }
+
+    // -- is_context_length_error tests ----------------------------------------
+
+    #[test]
+    fn context_length_error_matches_server_message() {
+        let err =
+            EmbeddingError::OllamaError("the input length exceeds the context length".to_string());
+        assert!(is_context_length_error(&err));
+    }
+
+    #[test]
+    fn context_length_error_matches_client_preflight() {
+        let err =
+            EmbeddingError::OllamaError("input text too long (40000 bytes, max 32768)".to_string());
+        assert!(is_context_length_error(&err));
+    }
+
+    #[test]
+    fn context_length_error_rejects_unrelated_ollama_error() {
+        let err = EmbeddingError::OllamaError("model not found".to_string());
+        assert!(!is_context_length_error(&err));
+    }
+
+    #[test]
+    fn context_length_error_rejects_unreachable() {
+        assert!(!is_context_length_error(&EmbeddingError::OllamaUnreachable));
+    }
+
+    #[test]
+    fn context_length_error_rejects_invalid_response() {
+        assert!(!is_context_length_error(&EmbeddingError::InvalidResponse));
     }
 
     // -- embed_single tests ---------------------------------------------------

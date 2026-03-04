@@ -819,6 +819,55 @@ fn handle_embed_interruption(msg: &str, policy: EmbedErrorPolicy, silent: bool) 
     }
 }
 
+/// Retry a failed batch by embedding each text individually.
+///
+/// When a batch fails with a context-length error, this function retries each
+/// text one by one.  Texts that embed successfully are stored normally; texts
+/// that hit the context-length limit again are skipped with a log message.
+/// Returns `(embedded_count, should_break)`.
+fn embed_batch_individually(
+    conn: &Connection,
+    batch: &[(i64, String, String)],
+    client: &OllamaClient,
+    policy: EmbedErrorPolicy,
+    silent: bool,
+) -> Result<(usize, bool)> {
+    let mut count = 0usize;
+    for (sym_id, file, text) in batch {
+        match client.embed_single(text) {
+            Ok(vec) => {
+                embedding::store_embeddings_batch(
+                    conn,
+                    &[(*sym_id, file.as_str(), text.as_str(), vec.as_slice())],
+                )?;
+                count += 1;
+            }
+            Err(ref e) if embedding::is_context_length_error(e) => {
+                if !silent {
+                    eprintln!("Skipping oversized symbol (id={sym_id}, file={file})");
+                }
+            }
+            Err(EmbeddingError::OllamaUnreachable) => {
+                handle_embed_interruption(
+                    "Ollama became unreachable during individual retry",
+                    policy,
+                    silent,
+                )?;
+                return Ok((count, true));
+            }
+            Err(e) => {
+                handle_embed_interruption(
+                    &format!("Embedding error during individual retry: {e}"),
+                    policy,
+                    silent,
+                )?;
+                return Ok((count, true));
+            }
+        }
+    }
+    Ok((count, false))
+}
+
 /// Shared batch-embed loop.
 ///
 /// Iterates over `chunks` in groups of [`EMBEDDING_BATCH_SIZE`], embeds each
@@ -849,6 +898,20 @@ fn embed_chunks(
                 );
                 handle_embed_interruption(&msg, policy, silent)?;
                 break;
+            }
+            Err(ref e) if embedding::is_context_length_error(e) => {
+                // A chunk in the batch exceeds context length — retry individually.
+                if !silent {
+                    eprintln!("Batch context-length error; retrying individually...");
+                }
+                let (fallback_count, should_break) =
+                    embed_batch_individually(conn, batch, client, policy, silent)?;
+                embedded += fallback_count;
+                if should_break {
+                    break;
+                }
+                render_embedding_progress(progress_mode, embedded, total);
+                continue;
             }
             Err(e) => {
                 let msg =
