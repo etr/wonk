@@ -109,6 +109,9 @@ pub fn build_index_with_progress(
     // 2. Open (or create) the database.
     let conn = db::open(&index_path)?;
 
+    // 2b. Clear any existing data so fresh build is idempotent.
+    drop_all_data(&conn)?;
+
     // 3. Walk files (respecting config ignore patterns).
     let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
     let paths = Walker::new(repo_root)
