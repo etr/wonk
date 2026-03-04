@@ -1818,7 +1818,7 @@ pub fn print_error(msg: &str) {
 ///   prints `hint: <suggestion>` to stderr.
 /// * Returns the appropriate process exit code.
 pub fn format_error(err: &crate::errors::WonkError, suppress: bool) -> i32 {
-    print_error(&format!("{err}"));
+    print_error(&format!("{err:#}"));
     if let Some(hint) = err.hint() {
         print_hint(hint, suppress);
     }

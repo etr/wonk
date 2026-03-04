@@ -61,9 +61,6 @@ CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_references_name ON "references"(name);
 CREATE INDEX IF NOT EXISTS idx_references_file ON "references"(file);
-CREATE INDEX IF NOT EXISTS idx_references_caller ON "references"(caller_id);
-CREATE INDEX IF NOT EXISTS idx_references_name_confidence ON "references"(name, confidence);
-CREATE INDEX IF NOT EXISTS idx_references_caller_confidence ON "references"(caller_id, confidence);
 
 -- File-level import tracking for dependency graph
 CREATE TABLE IF NOT EXISTS file_imports (
@@ -188,6 +185,9 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
 fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)
         .context("creating base tables and indexes")?;
+    // Column migrations must run before any SQL that references these columns.
+    ensure_caller_id_column(conn)?;
+    ensure_confidence_column(conn)?;
     conn.execute_batch(TYPE_EDGES_SQL)
         .context("creating type_edges table")?;
     conn.execute_batch(EMBEDDINGS_SQL)
@@ -198,8 +198,6 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating FTS5 virtual table")?;
     conn.execute_batch(TRIGGERS_SQL)
         .context("creating FTS5 sync triggers")?;
-    ensure_caller_id_column(conn)?;
-    ensure_confidence_column(conn)?;
     Ok(())
 }
 
@@ -278,14 +276,13 @@ pub fn ensure_caller_id_column(conn: &Connection) -> Result<()> {
             "ALTER TABLE \"references\" ADD COLUMN caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL;",
         )
         .context("adding caller_id column to references table")?;
-
-        // New databases already have this index via SCHEMA_SQL; only needed
-        // for the ALTER TABLE migration path.
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_references_caller ON \"references\"(caller_id);",
-        )
-        .context("creating caller_id index")?;
     }
+
+    // Always run CREATE INDEX IF NOT EXISTS for idempotent migration.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_references_caller ON \"references\"(caller_id);",
+    )
+    .context("creating caller_id index")?;
 
     Ok(())
 }
@@ -1731,6 +1728,84 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(tables.len(), 1);
+    }
+
+    #[test]
+    fn test_open_migrates_legacy_db_without_caller_id_or_confidence() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // Create a legacy database without caller_id or confidence columns.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS symbols (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    file TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    end_line INTEGER,
+                    scope TEXT,
+                    signature TEXT,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS "references" (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    file TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    context TEXT
+                );
+                CREATE TABLE IF NOT EXISTS files (
+                    path TEXT PRIMARY KEY,
+                    language TEXT,
+                    hash TEXT NOT NULL,
+                    last_indexed INTEGER NOT NULL,
+                    line_count INTEGER,
+                    symbols_count INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+                CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
+                CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
+                CREATE INDEX IF NOT EXISTS idx_references_name ON "references"(name);
+                CREATE INDEX IF NOT EXISTS idx_references_file ON "references"(file);
+                "#,
+            )
+            .unwrap();
+        }
+
+        // open() should succeed and migrate the schema.
+        let conn = open(&db_path).unwrap();
+
+        // Verify both columns exist.
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(\"references\")")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(columns.contains(&"caller_id".to_string()));
+        assert!(columns.contains(&"confidence".to_string()));
+
+        // Verify all three indexes exist.
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_references_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(indexes.contains(&"idx_references_caller".to_string()));
+        assert!(indexes.contains(&"idx_references_name_confidence".to_string()));
+        assert!(indexes.contains(&"idx_references_caller_confidence".to_string()));
     }
 
     #[test]
