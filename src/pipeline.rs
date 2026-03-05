@@ -245,7 +245,9 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
         .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
         .unwrap_or(0) as usize;
     let symbol_count = conn
-        .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get::<_, i64>(0))
+        .query_row("SELECT COUNT(*) FROM symbols", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap_or(0) as usize;
     let ref_count = conn
         .query_row("SELECT COUNT(*) FROM \"references\"", [], |row| {

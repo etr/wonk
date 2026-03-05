@@ -406,8 +406,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             if needs_full_rebuild {
                 let progress = Progress::new("Indexing", "Indexed", progress_mode);
-                let stats =
-                    pipeline::build_index_with_progress(&repo_root, args.local, &progress)?;
+                let stats = pipeline::build_index_with_progress(&repo_root, args.local, &progress)?;
                 progress.finish(&stats);
 
                 // Full embedding build.
@@ -439,12 +438,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 let index_path = db::index_path_for(&repo_root, args.local)?;
                 let conn = db::open(&index_path)?;
                 let client = crate::embedding::OllamaClient::new();
-                match pipeline::build_missing_embeddings(
-                    &conn,
-                    &repo_root,
-                    &client,
-                    progress_mode,
-                ) {
+                match pipeline::build_missing_embeddings(&conn, &repo_root, &client, progress_mode)
+                {
                     Ok(emb_stats) => {
                         if !suppress && emb_stats.embedded_count > 0 {
                             eprintln!(
@@ -477,8 +472,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             if needs_full_rebuild {
                 let progress = Progress::new("Re-indexing", "Re-indexed", progress_mode);
-                let stats =
-                    pipeline::rebuild_index_with_progress(&repo_root, false, &progress)?;
+                let stats = pipeline::rebuild_index_with_progress(&repo_root, false, &progress)?;
                 progress.finish(&stats);
 
                 // Full embedding rebuild.
@@ -510,12 +504,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 let index_path = db::index_path_for(&repo_root, false)?;
                 let conn = db::open(&index_path)?;
                 let client = crate::embedding::OllamaClient::new();
-                match pipeline::build_missing_embeddings(
-                    &conn,
-                    &repo_root,
-                    &client,
-                    progress_mode,
-                ) {
+                match pipeline::build_missing_embeddings(&conn, &repo_root, &client, progress_mode)
+                {
                     Ok(emb_stats) => {
                         if !suppress && emb_stats.embedded_count > 0 {
                             eprintln!(

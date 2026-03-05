@@ -2436,10 +2436,7 @@ impl McpServer {
 
     fn tool_update(&mut self, args: Value) -> CallToolResult {
         let format = extract_format(&args);
-        let force = args
-            .get("force")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let repo_root = self.router.repo_root().to_path_buf();
 
@@ -2453,14 +2450,12 @@ impl McpServer {
                 != Some(env!("CARGO_PKG_VERSION"));
 
         let (stats, emb_stats) = if needs_full_rebuild {
-            let stats = match pipeline::rebuild_index_with_progress(
-                &repo_root,
-                false,
-                &Progress::silent(),
-            ) {
-                Ok(s) => s,
-                Err(e) => return CallToolResult::error(format!("index rebuild failed: {e}")),
-            };
+            let stats =
+                match pipeline::rebuild_index_with_progress(&repo_root, false, &Progress::silent())
+                {
+                    Ok(s) => s,
+                    Err(e) => return CallToolResult::error(format!("index rebuild failed: {e}")),
+                };
 
             let emb_stats = db::index_path_for(&repo_root, false)
                 .ok()
@@ -2486,9 +2481,7 @@ impl McpServer {
         } else {
             let stats = match pipeline::incremental_update(&repo_root, false) {
                 Ok(s) => s,
-                Err(e) => {
-                    return CallToolResult::error(format!("incremental update failed: {e}"))
-                }
+                Err(e) => return CallToolResult::error(format!("incremental update failed: {e}")),
             };
 
             let emb_stats = db::index_path_for(&repo_root, false)
