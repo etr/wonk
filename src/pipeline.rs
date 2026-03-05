@@ -184,6 +184,97 @@ pub fn rebuild_index_with_progress(
     build_index_with_progress(repo_root, local, progress)
 }
 
+/// Incrementally update the index: re-index changed files and remove deleted ones.
+///
+/// Walks the filesystem, compares with the indexed files table, removes
+/// entries for deleted files, and calls [`reindex_file`] for each on-disk
+/// file (which skips unchanged files via xxhash comparison).
+///
+/// Returns [`IndexStats`] reflecting what is now in the database.
+pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
+    let start = Instant::now();
+
+    let index_path = db::index_path_for(repo_root, local)?;
+    let conn = db::open(&index_path)?;
+
+    // Walk current files on disk.
+    let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
+    let on_disk: HashSet<String> = Walker::new(repo_root)
+        .with_ignore_patterns(&config.ignore.patterns)
+        .collect_paths()
+        .into_iter()
+        .filter_map(|p| {
+            p.strip_prefix(repo_root)
+                .ok()
+                .map(|r| r.to_string_lossy().into_owned())
+        })
+        .collect();
+
+    // Query indexed paths.
+    let mut stmt = conn.prepare("SELECT path FROM files")?;
+    let indexed: HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Remove files no longer on disk.
+    for rel in &indexed {
+        if !on_disk.contains(rel) {
+            let abs = repo_root.join(rel);
+            remove_file(&conn, &abs, repo_root)?;
+        }
+    }
+
+    // Re-index files on disk (reindex_file skips unchanged via hash).
+    for rel in &on_disk {
+        let abs = repo_root.join(rel);
+        let _ = reindex_file(&conn, &abs, repo_root);
+    }
+
+    // Collect languages and rewrite meta.json.
+    let mut lang_stmt = conn.prepare("SELECT DISTINCT language FROM files")?;
+    let mut languages: Vec<String> = lang_stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    languages.sort();
+    db::write_meta(&index_path, repo_root, &languages)?;
+
+    // Gather final stats from DB.
+    let file_count = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0) as usize;
+    let symbol_count = conn
+        .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get::<_, i64>(0))
+        .unwrap_or(0) as usize;
+    let ref_count = conn
+        .query_row("SELECT COUNT(*) FROM \"references\"", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize;
+    let caller_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM \"references\" WHERE caller_id IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    let type_edge_count = conn
+        .query_row("SELECT COUNT(*) FROM type_edges", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize;
+
+    Ok(IndexStats {
+        file_count,
+        symbol_count,
+        ref_count,
+        caller_count,
+        type_edge_count,
+        elapsed: start.elapsed(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // ProcessResult
 // ---------------------------------------------------------------------------

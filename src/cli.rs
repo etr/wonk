@@ -49,7 +49,7 @@ pub enum Command {
     Init(InitArgs),
 
     /// Update the index for the current repository
-    Update,
+    Update(UpdateArgs),
 
     /// Show indexing status for the current repository
     Status,
@@ -188,6 +188,13 @@ pub struct InitArgs {
     /// Use a local (project-specific) index instead of the shared index
     #[arg(long)]
     pub local: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct UpdateArgs {
+    /// Force a full rebuild even if the index appears current
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug)]

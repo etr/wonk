@@ -937,7 +937,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_update",
-                description: "Rebuild the structural index and embeddings for the current repository. Same as wonk_init but always uses the existing index location. Use after significant code changes to refresh the index.",
+                description: "Update the structural index and embeddings for the current repository. Performs an incremental update (fast) when the index is current, or a full rebuild when the binary version has changed. Use the force parameter to force a full rebuild.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -946,6 +946,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "enum": ["json", "toon"],
                             "description": "Output format (default: json)",
                             "default": "json"
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "Force a full rebuild even if the index appears current",
+                            "default": false
                         }
                     }
                 }),
@@ -2431,50 +2436,83 @@ impl McpServer {
 
     fn tool_update(&mut self, args: Value) -> CallToolResult {
         let format = extract_format(&args);
+        let force = args
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        let stats = match pipeline::rebuild_index_with_progress(
-            self.router.repo_root(),
-            false,
-            &Progress::silent(),
-        ) {
-            Ok(s) => s,
-            Err(e) => return CallToolResult::error(format!("index rebuild failed: {e}")),
-        };
+        let repo_root = self.router.repo_root().to_path_buf();
 
-        // Build embeddings after structural index.
-        let index_path = match db::index_path_for(self.router.repo_root(), false) {
-            Ok(p) => p,
-            Err(_) => {
-                let result = serde_json::json!({
-                    "file_count": stats.file_count,
-                    "symbol_count": stats.symbol_count,
-                    "reference_count": stats.ref_count,
-                    "elapsed_ms": stats.elapsed.as_millis(),
-                    "embedding_count": 0,
-                    "embedding_skipped": true
-                });
-                return format_result(&result, format);
-            }
-        };
-
-        let emb_stats = db::open(&index_path)
-            .ok()
-            .and_then(|conn| {
-                let client = crate::embedding::OllamaClient::new();
-                pipeline::build_embeddings(
-                    &conn,
-                    self.router.repo_root(),
-                    &client,
-                    crate::progress::ProgressMode::Silent,
-                )
+        // Decide whether we need a full rebuild or can do incremental.
+        let needs_full_rebuild = force
+            || db::find_existing_index(&repo_root).is_none()
+            || db::read_meta(&db::find_existing_index(&repo_root).unwrap_or_default())
                 .ok()
-            })
-            .unwrap_or(pipeline::EmbeddingBuildStats {
-                embedded_count: 0,
-                total_symbols: 0,
-                skipped: true,
-                elapsed: std::time::Duration::ZERO,
-            });
+                .and_then(|m| m.wonk_version)
+                .as_deref()
+                != Some(env!("CARGO_PKG_VERSION"));
+
+        let (stats, emb_stats) = if needs_full_rebuild {
+            let stats = match pipeline::rebuild_index_with_progress(
+                &repo_root,
+                false,
+                &Progress::silent(),
+            ) {
+                Ok(s) => s,
+                Err(e) => return CallToolResult::error(format!("index rebuild failed: {e}")),
+            };
+
+            let emb_stats = db::index_path_for(&repo_root, false)
+                .ok()
+                .and_then(|p| db::open(&p).ok())
+                .and_then(|conn| {
+                    let client = crate::embedding::OllamaClient::new();
+                    pipeline::build_embeddings(
+                        &conn,
+                        &repo_root,
+                        &client,
+                        crate::progress::ProgressMode::Silent,
+                    )
+                    .ok()
+                })
+                .unwrap_or(pipeline::EmbeddingBuildStats {
+                    embedded_count: 0,
+                    total_symbols: 0,
+                    skipped: true,
+                    elapsed: std::time::Duration::ZERO,
+                });
+
+            (stats, emb_stats)
+        } else {
+            let stats = match pipeline::incremental_update(&repo_root, false) {
+                Ok(s) => s,
+                Err(e) => {
+                    return CallToolResult::error(format!("incremental update failed: {e}"))
+                }
+            };
+
+            let emb_stats = db::index_path_for(&repo_root, false)
+                .ok()
+                .and_then(|p| db::open(&p).ok())
+                .and_then(|conn| {
+                    let client = crate::embedding::OllamaClient::new();
+                    pipeline::build_missing_embeddings(
+                        &conn,
+                        &repo_root,
+                        &client,
+                        crate::progress::ProgressMode::Silent,
+                    )
+                    .ok()
+                })
+                .unwrap_or(pipeline::EmbeddingBuildStats {
+                    embedded_count: 0,
+                    total_symbols: 0,
+                    skipped: true,
+                    elapsed: std::time::Duration::ZERO,
+                });
+
+            (stats, emb_stats)
+        };
 
         // Refresh the router's connection to pick up the new index.
         self.router.refresh_connection();

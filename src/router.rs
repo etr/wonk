@@ -411,25 +411,76 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
         }
-        Command::Update => {
+        Command::Update(args) => {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
             let progress_mode = progress::detect_mode(suppress);
-            let progress = Progress::new("Re-indexing", "Re-indexed", progress_mode);
-            let stats = pipeline::rebuild_index_with_progress(&repo_root, false, &progress)?;
-            progress.finish(&stats);
 
-            // Rebuild embeddings after structural re-index.
-            let index_path = db::index_path_for(&repo_root, false)?;
-            let conn = db::open(&index_path)?;
-            let client = crate::embedding::OllamaClient::new();
-            let emb_stats = pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
-            if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
-                eprintln!(
-                    "Embedded {} symbols in {:.1}s",
-                    emb_stats.embedded_count,
-                    emb_stats.elapsed.as_secs_f64(),
-                );
+            // Decide whether we need a full rebuild or can do incremental.
+            let needs_full_rebuild = args.force
+                || db::find_existing_index(&repo_root).is_none()
+                || db::read_meta(
+                    &db::find_existing_index(&repo_root).unwrap_or_default(),
+                )
+                .ok()
+                .and_then(|m| m.wonk_version)
+                .as_deref()
+                    != Some(env!("CARGO_PKG_VERSION"));
+
+            if needs_full_rebuild {
+                let progress = Progress::new("Re-indexing", "Re-indexed", progress_mode);
+                let stats =
+                    pipeline::rebuild_index_with_progress(&repo_root, false, &progress)?;
+                progress.finish(&stats);
+
+                // Full embedding rebuild.
+                let index_path = db::index_path_for(&repo_root, false)?;
+                let conn = db::open(&index_path)?;
+                let client = crate::embedding::OllamaClient::new();
+                let emb_stats =
+                    pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
+                if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
+                    eprintln!(
+                        "Embedded {} symbols in {:.1}s",
+                        emb_stats.embedded_count,
+                        emb_stats.elapsed.as_secs_f64(),
+                    );
+                }
+            } else {
+                // Incremental structural update.
+                let stats = pipeline::incremental_update(&repo_root, false)?;
+                if !suppress {
+                    eprintln!(
+                        "Updated index ({} files, {} symbols) in {:.1}s",
+                        stats.file_count,
+                        stats.symbol_count,
+                        stats.elapsed.as_secs_f64(),
+                    );
+                }
+
+                // Incremental embedding update (graceful skip if Ollama unavailable).
+                let index_path = db::index_path_for(&repo_root, false)?;
+                let conn = db::open(&index_path)?;
+                let client = crate::embedding::OllamaClient::new();
+                match pipeline::build_missing_embeddings(
+                    &conn,
+                    &repo_root,
+                    &client,
+                    progress_mode,
+                ) {
+                    Ok(emb_stats) => {
+                        if !suppress && emb_stats.embedded_count > 0 {
+                            eprintln!(
+                                "Embedded {} symbols in {:.1}s",
+                                emb_stats.embedded_count,
+                                emb_stats.elapsed.as_secs_f64(),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        // Ollama unavailable — skip silently for incremental update.
+                    }
+                }
             }
         }
         Command::Ask(args) => {
@@ -2661,7 +2712,7 @@ pub fn build_tree_entries(symbols: &[Symbol]) -> Vec<LsSymbolEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{DepsArgs, InitArgs, SearchArgs, SymArgs};
+    use crate::cli::{DepsArgs, InitArgs, SearchArgs, SymArgs, UpdateArgs};
     use std::fs;
     use tempfile::TempDir;
 
@@ -4741,7 +4792,9 @@ mod tests {
 
     #[test]
     fn test_is_query_command_not_update() {
-        assert!(!is_query_command(&Command::Update));
+        assert!(!is_query_command(&Command::Update(UpdateArgs {
+            force: false,
+        })));
     }
 
     #[test]

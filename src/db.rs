@@ -382,6 +382,8 @@ pub struct Meta {
     pub repo_path: String,
     pub created: u64,
     pub languages: Vec<String>,
+    #[serde(default)]
+    pub wonk_version: Option<String>,
 }
 
 /// Write `meta.json` next to the given `index_db_path`.
@@ -400,6 +402,7 @@ pub fn write_meta(index_db_path: &Path, repo_path: &Path, languages: &[String]) 
         repo_path: repo_path.to_string_lossy().into_owned(),
         created: now,
         languages: languages.to_vec(),
+        wonk_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
 
     let json = serde_json::to_string_pretty(&meta).context("serializing meta.json")?;
