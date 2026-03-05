@@ -3,20 +3,22 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/etr/wonk/main/install.sh | sh
+#   curl -fsSL ... | sh -s -- --install-dir ~/.local/bin
+#   curl -fsSL ... | sh -s -- --install-dir ~/.local/bin --version 0.3.0
+#
+# Options (via CLI arguments — preferred for piped installs):
+#   --install-dir  - Installation directory (default: /usr/local/bin)
+#   --version      - Version to install (default: latest)
 #
 # Options (via environment variables):
-#   WONK_VERSION   - Version to install (default: latest)
-#   WONK_INSTALL   - Installation directory (default: /usr/local/bin)
+#   WONK_INSTALL   - Installation directory (overridden by --install-dir)
+#   WONK_VERSION   - Version to install (overridden by --version)
 #   GITHUB_REPO    - GitHub repository (default: etr/wonk)
-#
-# Example:
-#   WONK_VERSION=0.2.0 WONK_INSTALL=$HOME/.local/bin curl -fsSL ... | sh
 
 set -eu
 
 BINARY_NAME="wonk"
 GITHUB_REPO="${GITHUB_REPO:-etr/wonk}"
-INSTALL_DIR="${WONK_INSTALL:-/usr/local/bin}"
 
 # --- Logging helpers ---
 
@@ -106,6 +108,18 @@ trap cleanup EXIT
 main() {
   local os arch target version download_url
 
+  # Default install directory (env var, then fallback)
+  INSTALL_DIR="${WONK_INSTALL:-/usr/local/bin}"
+
+  # Parse arguments (override env vars)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --install-dir) INSTALL_DIR="$2"; shift 2 ;;
+      --version) WONK_VERSION="$2"; shift 2 ;;
+      *) err "Unknown argument: $1" ;;
+    esac
+  done
+
   os=$(detect_os)
   arch=$(detect_arch)
   target=$(get_target "$os" "$arch")
@@ -157,4 +171,4 @@ main() {
   fi
 }
 
-main
+main "$@"
