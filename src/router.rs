@@ -394,21 +394,70 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
             let progress_mode = progress::detect_mode(suppress);
-            let progress = Progress::new("Indexing", "Indexed", progress_mode);
-            let stats = pipeline::build_index_with_progress(&repo_root, args.local, &progress)?;
-            progress.finish(&stats);
 
-            // Build embeddings after structural index.
+            // Check if we can do an incremental update instead of a full rebuild.
             let index_path = db::index_path_for(&repo_root, args.local)?;
-            let conn = db::open(&index_path)?;
-            let client = crate::embedding::OllamaClient::new();
-            let emb_stats = pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
-            if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
-                eprintln!(
-                    "Embedded {} symbols in {:.1}s",
-                    emb_stats.embedded_count,
-                    emb_stats.elapsed.as_secs_f64(),
-                );
+            let needs_full_rebuild = !index_path.exists()
+                || db::read_meta(&index_path)
+                    .ok()
+                    .and_then(|m| m.wonk_version)
+                    .as_deref()
+                    != Some(env!("CARGO_PKG_VERSION"));
+
+            if needs_full_rebuild {
+                let progress = Progress::new("Indexing", "Indexed", progress_mode);
+                let stats =
+                    pipeline::build_index_with_progress(&repo_root, args.local, &progress)?;
+                progress.finish(&stats);
+
+                // Full embedding build.
+                let index_path = db::index_path_for(&repo_root, args.local)?;
+                let conn = db::open(&index_path)?;
+                let client = crate::embedding::OllamaClient::new();
+                let emb_stats =
+                    pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
+                if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
+                    eprintln!(
+                        "Embedded {} symbols in {:.1}s",
+                        emb_stats.embedded_count,
+                        emb_stats.elapsed.as_secs_f64(),
+                    );
+                }
+            } else {
+                // Incremental structural update.
+                let stats = pipeline::incremental_update(&repo_root, args.local)?;
+                if !suppress {
+                    eprintln!(
+                        "Updated index ({} files, {} symbols) in {:.1}s",
+                        stats.file_count,
+                        stats.symbol_count,
+                        stats.elapsed.as_secs_f64(),
+                    );
+                }
+
+                // Incremental embedding update.
+                let index_path = db::index_path_for(&repo_root, args.local)?;
+                let conn = db::open(&index_path)?;
+                let client = crate::embedding::OllamaClient::new();
+                match pipeline::build_missing_embeddings(
+                    &conn,
+                    &repo_root,
+                    &client,
+                    progress_mode,
+                ) {
+                    Ok(emb_stats) => {
+                        if !suppress && emb_stats.embedded_count > 0 {
+                            eprintln!(
+                                "Embedded {} symbols in {:.1}s",
+                                emb_stats.embedded_count,
+                                emb_stats.elapsed.as_secs_f64(),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        // Ollama unavailable — skip silently for incremental update.
+                    }
+                }
             }
         }
         Command::Update(args) => {
@@ -417,14 +466,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let progress_mode = progress::detect_mode(suppress);
 
             // Decide whether we need a full rebuild or can do incremental.
+            let index_path = db::index_path_for(&repo_root, false)?;
             let needs_full_rebuild = args.force
-                || db::find_existing_index(&repo_root).is_none()
-                || db::read_meta(
-                    &db::find_existing_index(&repo_root).unwrap_or_default(),
-                )
-                .ok()
-                .and_then(|m| m.wonk_version)
-                .as_deref()
+                || !index_path.exists()
+                || db::read_meta(&index_path)
+                    .ok()
+                    .and_then(|m| m.wonk_version)
+                    .as_deref()
                     != Some(env!("CARGO_PKG_VERSION"));
 
             if needs_full_rebuild {
