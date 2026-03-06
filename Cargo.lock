@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "wonk"
-version = "4.1.1"
+version = "4.2.1"
 dependencies = [
  "anyhow",
  "bytemuck",

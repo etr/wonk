@@ -229,6 +229,29 @@ fn symbol_to_output(sym: &Symbol) -> SymbolOutput {
     }
 }
 
+/// Enrich a reference context line with ±1 surrounding lines from the source file.
+/// Falls back to the original context if the file can't be read.
+fn enrich_context(repo_root: &Path, file: &str, line: usize, original: &str) -> String {
+    if line == 0 {
+        return original.to_string();
+    }
+    let path = repo_root.join(file);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return original.to_string(),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let idx = line.saturating_sub(1); // 1-based to 0-based
+    let start = idx.saturating_sub(1);
+    let end = (idx + 2).min(lines.len()); // exclusive, ±1 line
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{}: {}", start + i + 1, l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Validate that a path is within the repo root, returning a `CallToolResult::error`
 /// if the path escapes the repository boundary.
 fn validate_path(path: &Path, repo_root: &Path) -> Result<PathBuf, CallToolResult> {
@@ -301,7 +324,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
         let mut tools = vec![
             Tool {
                 name: "wonk_search",
-                description: "Full-text search across the codebase with structural ranking. Results are classified (definition > call site > import > other > comment > test) and deduplicated.",
+                description: "Search the codebase with structural ranking. Results are classified and deduplicated.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -345,7 +368,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_sym",
-                description: "Look up symbol definitions (functions, classes, structs, etc.) by name.",
+                description: "Look up symbol definitions by name.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -374,7 +397,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_ref",
-                description: "Find references (usages) of a symbol across the codebase.",
+                description: "Find references of a symbol across the codebase.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -386,6 +409,10 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Restrict search to these file paths"
+                        },
+                        "budget": {
+                            "type": "integer",
+                            "description": "Limit output to approximately N tokens"
                         },
                         "format": {
                             "type": "string",
@@ -399,7 +426,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_sig",
-                description: "Show function/method signatures by name.",
+                description: "Show function/method signatures.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -419,7 +446,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_ls",
-                description: "List symbols defined in a file or directory.",
+                description: "List symbols in a file or directory.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -444,7 +471,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_deps",
-                description: "Show dependencies of a file (files it imports/uses).",
+                description: "Show files imported/used by a file.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -464,7 +491,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_rdeps",
-                description: "Show reverse dependencies (files that depend on a given file).",
+                description: "Show files that depend on a given file.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -484,7 +511,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_status",
-                description: "Show index status: whether an index exists, file count, symbol count, reference count, embedding count, stale embedding count, and Ollama reachability.",
+                description: "Show index status: file/symbol/reference/embedding counts and Ollama reachability.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -499,7 +526,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_init",
-                description: "Initialize or rebuild the structural index and embeddings for the current repository. Embedding generation requires Ollama; if unavailable, only the structural index is built.",
+                description: "Initialize or rebuild the index and embeddings for the current repository.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -519,7 +546,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_show",
-                description: "Show full source body of a symbol. For container types (class, struct, enum, trait, interface), use shallow=true to get the container signature plus child signatures without bodies.",
+                description: "Show source body of a symbol. Use shallow=true for containers to get signatures only.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -561,7 +588,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_callers",
-                description: "Find all callers of a symbol (functions whose bodies reference it). Supports transitive expansion via depth parameter.",
+                description: "Find callers of a symbol. Use depth for transitive expansion.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -594,7 +621,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_callees",
-                description: "Find all callees of a symbol (symbols referenced within its body). Supports transitive expansion via depth parameter.",
+                description: "Find callees of a symbol. Use depth for transitive expansion.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -627,7 +654,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_callpath",
-                description: "Find a call chain between two symbols via BFS traversal. Returns the shortest path from the source symbol to the target symbol.",
+                description: "Find the shortest call chain between two symbols.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -655,7 +682,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_summary",
-                description: "Show a structural summary of a file or directory: file count, line count, symbol counts by kind, language breakdown, and dependency count.",
+                description: "Show a structural summary of a file or directory.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -700,7 +727,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_flows",
-                description: "Detect entry points (functions/methods with no callers) and trace execution flows via BFS callee expansion. Without an entry parameter, lists all detected entry points. With an entry parameter, traces the full execution flow from that function.",
+                description: "Detect entry points and trace execution flows. Omit entry to list all entry points.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -741,7 +768,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_blast",
-                description: "Analyze the blast radius of a symbol change. Shows all affected symbols grouped by severity tier (WILL BREAK, LIKELY AFFECTED, MAY NEED TESTING) with a risk level assessment. Supports upstream (callers) and downstream (callees) traversal with inheritance integration.",
+                description: "Analyze blast radius of changing a symbol. Groups affected symbols by severity tier.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -785,7 +812,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_changes",
-                description: "Detect changed symbols in working tree. Optionally chain blast radius analysis and execution flow detection for each changed symbol. Supports scoping to unstaged, staged, all uncommitted, or compare-to-ref changes.",
+                description: "Detect changed symbols in working tree with optional blast radius and flow analysis.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -824,7 +851,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_context",
-                description: "Aggregate full context for a symbol: definition, categorized incoming references (callers, importers, type users), outgoing references (callees, imports), flow participation, and children (extending/implementing types). Returns one context block per matching symbol.",
+                description: "Aggregate full context for a symbol: definition, callers, importers, callees, imports, and children.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -856,7 +883,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_ask",
-                description: "Pure semantic search — natural language query matched against code symbol embeddings via cosine similarity. Requires embeddings (run wonk_init with Ollama). Optionally scope results to symbols reachable from/to a file via the dependency graph.",
+                description: "Semantic search via embeddings. Requires Ollama. Use from/to for dependency scoping.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -888,7 +915,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_cluster",
-                description: "Cluster code symbols by semantic similarity using K-means on embeddings. Auto-selects optimal K via silhouette scoring. Returns clusters with representative members closest to each centroid.",
+                description: "Cluster symbols by semantic similarity using K-means on embeddings.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -913,7 +940,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_impact",
-                description: "Analyze semantic impact of changed symbols in a file. Re-parses the file against the indexed version, detects added/modified/removed symbols, and finds other symbols likely impacted via embedding similarity. Use --since with a git ref for multi-file analysis.",
+                description: "Analyze semantic impact of changed symbols. Use since for multi-file analysis.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -937,7 +964,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_update",
-                description: "Update the structural index and embeddings for the current repository. Performs an incremental update (fast) when the index is current, or a full rebuild when the binary version has changed. Use the force parameter to force a full rebuild.",
+                description: "Update the index and embeddings. Use force for a full rebuild.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -973,7 +1000,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
         // Add the wonk_repos tool (does not get repo param — it lists all repos).
         tools.push(Tool {
             name: "wonk_repos",
-            description: "List all indexed repositories available for querying. Returns name, path, file count, symbol count, and last indexed time for each repo.",
+            description: "List all indexed repositories available for querying.",
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1254,7 +1281,8 @@ impl McpServer {
         let budget_limit: Option<usize> = args
             .get("budget")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+            .map(|v| v as usize)
+            .or(Some(2000));
         let semantic = args
             .get("semantic")
             .and_then(|v| v.as_bool())
@@ -1375,9 +1403,14 @@ impl McpServer {
             Ok(n) => n,
             Err(e) => return e,
         };
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .or(Some(2000));
         let format = extract_format(&args);
 
-        let (conn, _) = match self.resolve_repo(&args) {
+        let (conn, repo_root) = match self.resolve_repo(&args) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -1388,19 +1421,22 @@ impl McpServer {
 
         let outputs: Vec<RefOutput> = results
             .iter()
-            .map(|r| RefOutput {
-                name: r.name.clone(),
-                kind: r.kind.to_string(),
-                file: r.file.clone(),
-                line: r.line,
-                col: r.col,
-                context: r.context.clone(),
-                caller_name: r.caller_name.clone(),
-                confidence: r.confidence,
+            .map(|r| {
+                let context = enrich_context(&repo_root, &r.file, r.line, &r.context);
+                RefOutput {
+                    name: r.name.clone(),
+                    kind: r.kind.to_string(),
+                    file: r.file.clone(),
+                    line: r.line,
+                    col: r.col,
+                    context,
+                    caller_name: r.caller_name.clone(),
+                    confidence: r.confidence,
+                }
             })
             .collect();
 
-        format_result(&outputs, format)
+        collect_with_budget(outputs, budget_limit, format)
     }
 
     fn tool_sig(&mut self, args: Value) -> CallToolResult {
@@ -1685,7 +1721,8 @@ impl McpServer {
         let budget_limit: Option<usize> = args
             .get("budget")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+            .map(|v| v as usize)
+            .or(Some(2000));
         let format = extract_format(args);
 
         let (conn, _) = self.resolve_repo(args)?;
