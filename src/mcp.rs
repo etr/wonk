@@ -214,6 +214,52 @@ fn clamp_confidence(c: f64) -> f64 {
     }
 }
 
+/// Generate diagnostic hints when a show query returns 0 results.
+fn empty_show_hints(
+    conn: &Connection,
+    name: &str,
+    file_filter: Option<&str>,
+    kind_filter: Option<&str>,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+
+    // Fuzzy match: find symbols whose name contains the query substring.
+    let like_pattern = format!("%{}%", name.replace('%', "\\%").replace('_', "\\_"));
+    let mut near: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT name FROM symbols WHERE name LIKE ?1 ESCAPE '\\' ORDER BY length(name) LIMIT 5",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![like_pattern], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+
+    // Remove the exact name if it appears (it matched by LIKE but returned 0 with filters).
+    near.retain(|n| n != name);
+
+    if !near.is_empty() {
+        hints.push(format!(
+            "No exact match for '{}'. Similar symbols: {}",
+            name,
+            near.join(", ")
+        ));
+    } else {
+        hints.push(format!("No symbol matching '{}' found in the index.", name));
+    }
+
+    if file_filter.is_some() {
+        hints.push("Try without the file filter for broader results.".into());
+    }
+    if kind_filter.is_some() {
+        hints.push("Try without the kind filter for broader results.".into());
+    }
+    hints.push("Use wonk_search for text-based search if the symbol name is uncertain.".into());
+    hints
+}
+
 /// Convert a `Symbol` to the serializable `SymbolOutput`.
 fn symbol_to_output(sym: &Symbol) -> SymbolOutput {
     SymbolOutput {
@@ -324,7 +370,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
         let mut tools = vec![
             Tool {
                 name: "wonk_search",
-                description: "Search the codebase with structural ranking. Results are classified and deduplicated.",
+                description: "Search the codebase. Start here for broad queries. Returns ranked, deduplicated results with definitions above imports.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -368,7 +414,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_sym",
-                description: "Look up symbol definitions by name.",
+                description: "Find symbol definitions. Returns name, kind, file, line, and signature.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -397,7 +443,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_ref",
-                description: "Find references of a symbol across the codebase.",
+                description: "Find references (call sites and imports) of a symbol. Includes surrounding context lines.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -426,7 +472,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_sig",
-                description: "Show function/method signatures.",
+                description: "Quick: show only function/method signatures (no bodies). Fastest way to check a function's type.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -546,7 +592,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_show",
-                description: "Show source body of a symbol. Use shallow=true for containers to get signatures only.",
+                description: "Read source body of symbols. Accepts comma-separated names (e.g. 'main,parse,validate') for batch lookup. If truncated, use the Read tool with the file:line from results.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -588,7 +634,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_callers",
-                description: "Find callers of a symbol. Use depth for transitive expansion.",
+                description: "Who calls this symbol? depth=1 for direct callers, depth=2+ for transitive.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -621,7 +667,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_callees",
-                description: "Find callees of a symbol. Use depth for transitive expansion.",
+                description: "What does this symbol call? depth=1 for direct callees, depth=2+ for transitive.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -654,7 +700,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_callpath",
-                description: "Find the shortest call chain between two symbols.",
+                description: "Trace how symbol A reaches symbol B. Use for 'how does X call Y' questions — returns the call chain (e.g. main → parse → validate).",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -727,7 +773,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_flows",
-                description: "Detect entry points and trace execution flows. Omit entry to list all entry points.",
+                description: "Trace execution from an entry point through callees. Use for 'how does this flow work' questions. Omit entry to list all detected entry points.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -851,7 +897,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_context",
-                description: "Aggregate full context for a symbol: definition, callers, importers, callees, imports, and children.",
+                description: "Get everything about a symbol in ONE call: definition, callers, callees, imports, and children. Replaces chaining wonk_sym + wonk_callers + wonk_callees + wonk_ref.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1274,7 +1320,7 @@ impl McpServer {
             .get("case_insensitive")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let mut paths: Vec<String> = args
+        let paths: Vec<String> = args
             .get("paths")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
@@ -1282,7 +1328,7 @@ impl McpServer {
             .get("budget")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
-            .or(Some(2000));
+            .or(Some(4000));
         let semantic = args
             .get("semantic")
             .and_then(|v| v.as_bool())
@@ -1294,19 +1340,41 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        // Validate user-supplied paths against the repo boundary.
+        // Resolve user-supplied paths: accept relative paths and partial fragments.
+        let mut resolved_paths: Vec<String> = Vec::new();
         for p in &paths {
-            if validate_path(Path::new(p), &repo_root).is_err() {
-                return CallToolResult::error(format!("path outside repository: {p}"));
+            let as_path = Path::new(p);
+            if as_path.is_absolute() {
+                return CallToolResult::error(format!("absolute paths are not allowed: {p}"));
+            }
+            let joined = repo_root.join(as_path);
+            if joined.exists() {
+                resolved_paths.push(joined.to_string_lossy().into_owned());
+            } else {
+                // Fuzzy: try as a substring match against repo root children.
+                let mut found = false;
+                if let Ok(entries) = std::fs::read_dir(&repo_root) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if name.contains(p.as_str()) && entry.path().is_dir() {
+                            resolved_paths.push(entry.path().to_string_lossy().into_owned());
+                            found = true;
+                        }
+                    }
+                }
+                if !found {
+                    // Fall through: use repo root join as-is (grep will simply find nothing).
+                    resolved_paths.push(joined.to_string_lossy().into_owned());
+                }
             }
         }
 
         // Default to repo root when no paths specified.
-        if paths.is_empty() {
-            paths.push(repo_root.to_string_lossy().into_owned());
+        if resolved_paths.is_empty() {
+            resolved_paths.push(repo_root.to_string_lossy().into_owned());
         }
 
-        let results = match search::text_search(&query, regex, case_insensitive, &paths) {
+        let results = match search::text_search(&query, regex, case_insensitive, &resolved_paths) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("search failed: {e}")),
         };
@@ -1348,6 +1416,7 @@ impl McpServer {
 
         let mut budget = budget_limit.map(TokenBudget::new);
         let mut outputs: Vec<SearchOutput> = Vec::new();
+        let mut truncated = 0usize;
 
         for (_category, items) in &groups {
             for item in items {
@@ -1362,10 +1431,12 @@ impl McpServer {
                 if let Some(ref mut b) = budget {
                     let estimate = (out.file.len() + out.content.len() + 20) / 4;
                     if b.remaining() < estimate {
+                        truncated += 1;
                         continue;
                     }
                     let serialized = serde_json::to_string(&out).unwrap_or_default();
                     if !b.try_consume(&serialized) {
+                        truncated += 1;
                         continue;
                     }
                 }
@@ -1373,7 +1444,16 @@ impl McpServer {
             }
         }
 
-        format_result(&outputs, format)
+        if truncated > 0 {
+            let wrapper = serde_json::json!({
+                "results": outputs,
+                "truncated": truncated,
+                "hint": "Increase budget to see more results.",
+            });
+            format_result(&wrapper, format)
+        } else {
+            format_result(&outputs, format)
+        }
     }
 
     fn tool_sym(&mut self, args: Value) -> CallToolResult {
@@ -1390,6 +1470,14 @@ impl McpServer {
             Err(e) => return e,
         };
         match crate::router::query_symbols_db(conn, &name, kind, exact) {
+            Ok(r) if r.is_empty() => {
+                let hints = empty_show_hints(conn, &name, None, kind);
+                let wrapper = serde_json::json!({
+                    "results": Vec::<String>::new(),
+                    "hints": hints,
+                });
+                format_result(&wrapper, format)
+            }
             Ok(r) => {
                 let outputs: Vec<SymbolOutput> = r.iter().map(symbol_to_output).collect();
                 format_result(&outputs, format)
@@ -1659,7 +1747,8 @@ impl McpServer {
         let budget_limit: Option<usize> = args
             .get("budget")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+            .map(|v| v as usize)
+            .or(Some(4000));
         let format = extract_format(&args);
 
         let (conn, repo_root) = match self.resolve_repo(&args) {
@@ -1668,23 +1757,43 @@ impl McpServer {
         };
 
         let options = crate::show::ShowOptions {
-            file,
-            kind,
+            file: file.clone(),
+            kind: kind.clone(),
             exact,
             suppress: true,
             shallow,
         };
 
-        let results = match crate::show::show_symbol(conn, &name, &repo_root, &options) {
-            Ok(r) => r,
-            Err(e) => return CallToolResult::error(format!("show query failed: {e}")),
-        };
+        // Support comma-separated names for batch lookup (e.g. "main,parse,validate").
+        let names: Vec<&str> = name
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut all_results = Vec::new();
+        for n in &names {
+            match crate::show::show_symbol(conn, n, &repo_root, &options) {
+                Ok(r) => all_results.extend(r),
+                Err(e) => return CallToolResult::error(format!("show query failed: {e}")),
+            }
+        }
+
+        // Empty result diagnostics (Fix 11).
+        if all_results.is_empty() {
+            let hints = empty_show_hints(conn, &name, file.as_deref(), kind.as_deref());
+            let wrapper = serde_json::json!({
+                "results": Vec::<String>::new(),
+                "hints": hints,
+            });
+            return format_result(&wrapper, format);
+        }
 
         let mut budget = budget_limit.map(TokenBudget::new);
         let mut outputs: Vec<ShowOutput> = Vec::new();
         let mut truncated = 0usize;
 
-        for sr in &results {
+        for sr in &all_results {
             let out = ShowOutput::from(sr);
 
             if let Some(ref mut b) = budget {
@@ -1698,11 +1807,18 @@ impl McpServer {
         }
 
         if truncated > 0 {
-            // Append truncation metadata as a wrapper.
+            let hint = if let Some(first) = outputs.first() {
+                format!(
+                    "Increase budget or use Read({}, {}, 80) for full file content.",
+                    first.file, first.line,
+                )
+            } else {
+                "Increase budget to see results, or use Read tool for full file content.".into()
+            };
             let wrapper = serde_json::json!({
                 "results": outputs,
                 "truncated": truncated,
-                "budget_limit": budget_limit,
+                "hint": hint,
             });
             format_result(&wrapper, format)
         } else {
@@ -2588,7 +2704,7 @@ fn collect_with_budget<T: serde::Serialize>(
             let wrapper = serde_json::json!({
                 "results": kept,
                 "truncated": truncated,
-                "budget_limit": budget_limit,
+                "hint": "Increase budget to see more results.",
             });
             return format_result(&wrapper, format);
         }
@@ -2900,7 +3016,10 @@ mod tests {
         // With a tiny budget, the response should be a wrapper with truncation metadata.
         if parsed.get("truncated").is_some() {
             assert!(parsed["truncated"].as_u64().unwrap() > 0);
-            assert!(parsed["budget_limit"].as_u64().unwrap() == 1);
+            assert!(
+                parsed.get("hint").is_some(),
+                "truncated response should have a hint"
+            );
         } else {
             // If only one result fits, it's returned as a plain array — that's fine too.
             let arr = parsed.as_array().unwrap();
