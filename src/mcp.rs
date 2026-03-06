@@ -728,7 +728,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_summary",
-                description: "Show a structural summary of a file or directory.",
+                description: "Show a structural summary of a file or directory. With detail=rich and depth>=1, includes top-level symbol signatures per file and inter-file import edges — use this for architecture overview questions.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

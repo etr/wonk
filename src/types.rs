@@ -440,6 +440,25 @@ pub struct SummaryResult {
     pub children: Vec<SummaryResult>,
     /// Optional natural language description (populated by `--semantic`, TASK-064).
     pub description: Option<String>,
+    /// Top-level symbols for file entries (populated when detail=Rich).
+    pub symbols: Vec<SummarySymbol>,
+    /// Intra-directory import edges (populated for directory entries when detail=Rich).
+    pub import_edges: Vec<ImportEdge>,
+}
+
+/// A top-level symbol included in a summary result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarySymbol {
+    pub name: String,
+    pub kind: String,
+    pub signature: String,
+}
+
+/// An intra-directory import edge (from file → to file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportEdge {
+    pub from: String,
+    pub to: String,
 }
 
 /// A raw (name-based) type hierarchy edge extracted from a syntax tree.
@@ -1097,6 +1116,8 @@ mod tests {
             },
             children: vec![],
             description: None,
+            symbols: vec![],
+            import_edges: vec![],
         };
         assert_eq!(sr.path, "src/");
         assert_eq!(sr.path_type, SummaryPathType::Directory);
@@ -1121,6 +1142,8 @@ mod tests {
             },
             children: vec![],
             description: None,
+            symbols: vec![],
+            import_edges: vec![],
         };
         let parent = SummaryResult {
             path: "src/".into(),
@@ -1135,6 +1158,8 @@ mod tests {
             },
             children: vec![child],
             description: None,
+            symbols: vec![],
+            import_edges: vec![],
         };
         assert_eq!(parent.children.len(), 1);
         assert_eq!(parent.children[0].path, "src/lib.rs");

@@ -274,6 +274,25 @@ pub struct SummaryOutput {
     pub children: Vec<SummaryOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<SummarySymbolOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub import_edges: Vec<ImportEdgeOutput>,
+}
+
+/// A top-level symbol in a summary output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummarySymbolOutput {
+    pub name: String,
+    pub kind: String,
+    pub signature: String,
+}
+
+/// An intra-directory import edge in a summary output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportEdgeOutput {
+    pub from: String,
+    pub to: String,
 }
 
 impl SummaryOutput {
@@ -327,6 +346,25 @@ impl SummaryOutput {
 
         let children = sr.children.iter().map(SummaryOutput::from_result).collect();
 
+        let symbols = sr
+            .symbols
+            .iter()
+            .map(|s| SummarySymbolOutput {
+                name: s.name.clone(),
+                kind: s.kind.clone(),
+                signature: s.signature.clone(),
+            })
+            .collect();
+
+        let import_edges = sr
+            .import_edges
+            .iter()
+            .map(|e| ImportEdgeOutput {
+                from: e.from.clone(),
+                to: e.to.clone(),
+            })
+            .collect();
+
         Self {
             path: sr.path.clone(),
             path_type: sr.path_type.to_string(),
@@ -334,6 +372,8 @@ impl SummaryOutput {
             metrics,
             children,
             description: sr.description.clone(),
+            symbols,
+            import_edges,
         }
     }
 }
@@ -1382,6 +1422,26 @@ impl<W: Write> Formatter<W> {
             }
             if let Some(ref desc) = out.description {
                 writeln!(fmt.writer, "{prefix}  Description: {desc}")?;
+            }
+            if !out.symbols.is_empty() {
+                writeln!(fmt.writer, "{prefix}  Symbols:")?;
+                for s in &out.symbols {
+                    if s.signature.is_empty() {
+                        writeln!(fmt.writer, "{prefix}    {} {}", s.kind, s.name)?;
+                    } else {
+                        writeln!(
+                            fmt.writer,
+                            "{prefix}    {} {} — {}",
+                            s.kind, s.name, s.signature
+                        )?;
+                    }
+                }
+            }
+            if !out.import_edges.is_empty() {
+                writeln!(fmt.writer, "{prefix}  Imports:")?;
+                for e in &out.import_edges {
+                    writeln!(fmt.writer, "{prefix}    {} → {}", e.from, e.to)?;
+                }
             }
 
             // Render children recursively.
@@ -3549,6 +3609,8 @@ mod tests {
             },
             children: vec![],
             description: None,
+            symbols: vec![],
+            import_edges: vec![],
         }
     }
 
@@ -3613,6 +3675,8 @@ mod tests {
             },
             children: vec![],
             description: None,
+            symbols: vec![],
+            import_edges: vec![],
         };
 
         let out = SummaryOutput::from_result(&sr);
@@ -3641,6 +3705,8 @@ mod tests {
             },
             children: vec![],
             description: None,
+            symbols: vec![],
+            import_edges: vec![],
         };
 
         let out = SummaryOutput::from_result(&sr);
@@ -3668,6 +3734,8 @@ mod tests {
             },
             children: vec![],
             description: None,
+            symbols: vec![],
+            import_edges: vec![],
         };
 
         let out = SummaryOutput::from_result(&sr);
@@ -3693,6 +3761,8 @@ mod tests {
             },
             children: vec![],
             description: None,
+            symbols: vec![],
+            import_edges: vec![],
         };
         let mut out = make_summary_output();
         out.children = vec![child];

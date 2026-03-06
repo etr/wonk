@@ -8,7 +8,9 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::config::LlmConfig;
-use crate::types::{DetailLevel, SummaryMetrics, SummaryPathType, SummaryResult};
+use crate::types::{
+    DetailLevel, ImportEdge, SummaryMetrics, SummaryPathType, SummaryResult, SummarySymbol,
+};
 
 /// Maximum recursion depth to prevent unbounded resource consumption.
 const MAX_RECURSIVE_DEPTH: usize = 20;
@@ -66,12 +68,18 @@ pub fn summarize_path(
 
     let metrics = query_metrics(conn, &like_pattern, &exact_path, path_type)?;
 
+    // Pre-fetch subtree data when we need children or rich directory details.
+    let need_subtree = path_type == SummaryPathType::Directory
+        && (should_recurse(options.depth, 0) || options.detail == DetailLevel::Rich);
+    let subtree_data = if need_subtree {
+        Some(SubtreeData::load(conn, &like_pattern)?)
+    } else {
+        None
+    };
+
     // Recurse into children if depth allows.
     let children = if should_recurse(options.depth, 0) && path_type == SummaryPathType::Directory {
-        // Pre-fetch all subtree data in exactly 4 SQL queries, then build
-        // the entire child tree in-memory with zero additional SQL.
-        let subtree_data = SubtreeData::load(conn, &like_pattern)?;
-        build_children_from_data(&subtree_data, &exact_path, options, 1)?
+        build_children_from_data(subtree_data.as_ref().unwrap(), &exact_path, options, 1)?
     } else {
         vec![]
     };
@@ -91,6 +99,24 @@ pub fn summarize_path(
         None
     };
 
+    // For Rich detail on directories, compute intra-directory import edges.
+    let import_edges = if options.detail == DetailLevel::Rich {
+        if let Some(ref data) = subtree_data {
+            data.import_edges_for_dir(&exact_path)
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    // For Rich detail on files, include top-level symbols.
+    let symbols = if options.detail == DetailLevel::Rich && path_type == SummaryPathType::File {
+        symbols_for_file(conn, &normalized)?
+    } else {
+        vec![]
+    };
+
     Ok(SummaryResult {
         path: normalized,
         path_type,
@@ -98,6 +124,8 @@ pub fn summarize_path(
         metrics,
         children,
         description,
+        symbols,
+        import_edges,
     })
 }
 
@@ -228,8 +256,8 @@ struct SubtreeData {
     paths: Vec<String>,
     /// (path, language, line_count) for every file in the subtree.
     file_rows: Vec<(String, String, usize)>,
-    /// (file, kind) for every symbol in the subtree.
-    symbol_rows: Vec<(String, String)>,
+    /// (file, kind, name, signature, scope) for every symbol in the subtree.
+    symbol_rows: Vec<(String, String, String, String, Option<String>)>,
     /// (source_file, import_path) for every import in the subtree.
     import_rows: Vec<(String, String)>,
 }
@@ -260,11 +288,19 @@ impl SubtreeData {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut sym_stmt =
-            conn.prepare_cached("SELECT file, kind FROM symbols WHERE file LIKE ?1 ESCAPE '\\'")?;
-        let symbol_rows: Vec<(String, String)> = sym_stmt
+        let mut sym_stmt = conn.prepare_cached(
+            "SELECT file, kind, name, COALESCE(signature, ''), scope \
+             FROM symbols WHERE file LIKE ?1 ESCAPE '\\'",
+        )?;
+        let symbol_rows: Vec<(String, String, String, String, Option<String>)> = sym_stmt
             .query_map(rusqlite::params![like_pattern], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -303,7 +339,7 @@ impl SubtreeData {
         }
 
         let mut sym_map: BTreeMap<String, usize> = BTreeMap::new();
-        for (file, kind) in &self.symbol_rows {
+        for (file, kind, _, _, _) in &self.symbol_rows {
             if (is_file && file == prefix) || (!is_file && file.starts_with(prefix)) {
                 *sym_map.entry(kind.clone()).or_default() += 1;
             }
@@ -324,6 +360,91 @@ impl SubtreeData {
             dependency_count: dep_set.len(),
         }
     }
+
+    /// Return top-level symbols for a specific file. Capped at 50.
+    fn symbols_for_file(&self, file: &str) -> Vec<SummarySymbol> {
+        self.symbol_rows
+            .iter()
+            .filter(|(f, _, _, _, scope)| f == file && scope.is_none())
+            .take(50)
+            .map(|(_, kind, name, sig, _)| SummarySymbol {
+                name: name.clone(),
+                kind: kind.clone(),
+                signature: sig.clone(),
+            })
+            .collect()
+    }
+
+    /// Return intra-directory import edges for files under `prefix`.
+    ///
+    /// For each import row where source starts with prefix, stem-match the
+    /// import_path against files within the prefix directory.
+    fn import_edges_for_dir(&self, prefix: &str) -> Vec<ImportEdge> {
+        use std::collections::{HashMap, HashSet};
+        use std::path::Path;
+
+        // Build a stem → path lookup for files in this directory.
+        let mut stem_map: HashMap<String, Vec<&str>> = HashMap::new();
+        for path in &self.paths {
+            if path.starts_with(prefix)
+                && let Some(stem) = Path::new(path.as_str())
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+            {
+                stem_map
+                    .entry(stem.to_string())
+                    .or_default()
+                    .push(path.as_str());
+            }
+        }
+
+        let mut seen = HashSet::new();
+        let mut edges = Vec::new();
+
+        for (source_file, import_path) in &self.import_rows {
+            if !source_file.starts_with(prefix) {
+                continue;
+            }
+            // Extract stem from import path (e.g. "./bar" → "bar", "../utils" → "utils").
+            let import_stem = Path::new(import_path.as_str())
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(import_path.as_str());
+
+            if let Some(targets) = stem_map.get(import_stem) {
+                for &target in targets {
+                    if target != source_file.as_str()
+                        && seen.insert((source_file.clone(), target.to_string()))
+                    {
+                        edges.push(ImportEdge {
+                            from: source_file.clone(),
+                            to: target.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        edges
+    }
+}
+
+/// Query top-level symbols for a single file directly from the DB.
+/// Used when summarizing a file at the top level (no SubtreeData loaded).
+fn symbols_for_file(conn: &Connection, file: &str) -> Result<Vec<SummarySymbol>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT kind, name, COALESCE(signature, '') FROM symbols \
+         WHERE file = ?1 AND scope IS NULL LIMIT 50",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![file], |row| {
+            Ok(SummarySymbol {
+                kind: row.get::<_, String>(0)?,
+                name: row.get::<_, String>(1)?,
+                signature: row.get::<_, String>(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Find the subslice of sorted paths that start with the given prefix,
@@ -374,6 +495,18 @@ fn build_children_from_data(
             vec![]
         };
 
+        // For Rich detail: file children get top-level symbols,
+        // directory children get intra-directory import edges.
+        let (symbols, import_edges) = if options.detail == DetailLevel::Rich {
+            if is_file {
+                (data.symbols_for_file(child_path), vec![])
+            } else {
+                (vec![], data.import_edges_for_dir(child_path))
+            }
+        } else {
+            (vec![], vec![])
+        };
+
         results.push(SummaryResult {
             path: child_path.clone(),
             path_type: *child_type,
@@ -381,6 +514,8 @@ fn build_children_from_data(
             metrics,
             children: grandchildren,
             description: None,
+            symbols,
+            import_edges,
         });
     }
 
@@ -765,5 +900,129 @@ mod tests {
                 child.path
             );
         }
+    }
+
+    #[test]
+    fn summary_rich_depth1_includes_file_symbols() {
+        let source = "fn alpha() {}\nfn beta(x: i32) -> bool { true }\n";
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", source)]);
+
+        let opts = SummaryOptions {
+            depth: Some(1),
+            detail: DetailLevel::Rich,
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", &opts).unwrap();
+
+        let file_child = result
+            .children
+            .iter()
+            .find(|c| c.path == "src/lib.rs")
+            .expect("should find src/lib.rs child");
+        assert!(
+            !file_child.symbols.is_empty(),
+            "file child should have symbols"
+        );
+        let names: Vec<&str> = file_child.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "should contain alpha");
+        assert!(names.contains(&"beta"), "should contain beta");
+        // All should be functions.
+        for s in &file_child.symbols {
+            assert_eq!(s.kind, "function");
+        }
+    }
+
+    #[test]
+    fn summary_light_depth1_no_symbols() {
+        let source = "fn alpha() {}\nfn beta() {}\n";
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", source)]);
+
+        let opts = SummaryOptions {
+            depth: Some(1),
+            detail: DetailLevel::Light,
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", &opts).unwrap();
+
+        for child in &result.children {
+            assert!(
+                child.symbols.is_empty(),
+                "Light detail should not include symbols for {}",
+                child.path
+            );
+        }
+    }
+
+    #[test]
+    fn summary_rich_depth1_includes_import_edges() {
+        let app_js = "import { foo } from './bar';\nfunction main() {}\n";
+        let bar_js = "export function foo() {}\n";
+        let (_dir, conn) = make_indexed_repo(&[("src/app.js", app_js), ("src/bar.js", bar_js)]);
+
+        let opts = SummaryOptions {
+            depth: Some(1),
+            detail: DetailLevel::Rich,
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", &opts).unwrap();
+
+        // Top-level directory should have import edges.
+        assert!(!result.import_edges.is_empty(), "should have import edges");
+        let edge = result
+            .import_edges
+            .iter()
+            .find(|e| e.from == "src/app.js" && e.to == "src/bar.js");
+        assert!(edge.is_some(), "should have edge from app.js to bar.js");
+    }
+
+    #[test]
+    fn summary_symbols_are_toplevel_only() {
+        // Python: top-level function + class with a method inside.
+        let source =
+            "def top_func():\n    pass\n\nclass MyClass:\n    def method(self):\n        pass\n";
+        let (_dir, conn) = make_indexed_repo(&[("src/mod.py", source)]);
+
+        let opts = SummaryOptions {
+            depth: Some(1),
+            detail: DetailLevel::Rich,
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", &opts).unwrap();
+
+        let file_child = result
+            .children
+            .iter()
+            .find(|c| c.path == "src/mod.py")
+            .expect("should find src/mod.py");
+        let names: Vec<&str> = file_child.symbols.iter().map(|s| s.name.as_str()).collect();
+        // top_func and MyClass are top-level; method is scoped inside MyClass.
+        assert!(names.contains(&"top_func"), "should contain top_func");
+        assert!(names.contains(&"MyClass"), "should contain MyClass");
+        assert!(
+            !names.contains(&"method"),
+            "should NOT contain scoped method"
+        );
+    }
+
+    #[test]
+    fn summary_file_toplevel_has_symbols() {
+        // Summarizing a file directly (not as a child) should also include symbols.
+        let source = "fn hello() {}\nfn world() {}\n";
+        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", source)]);
+
+        let opts = SummaryOptions {
+            depth: Some(0),
+            detail: DetailLevel::Rich,
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src/lib.rs", &opts).unwrap();
+
+        assert!(
+            !result.symbols.is_empty(),
+            "file summary should have symbols"
+        );
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"hello"));
+        assert!(names.contains(&"world"));
     }
 }
