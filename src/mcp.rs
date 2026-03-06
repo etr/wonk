@@ -492,7 +492,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_ls",
-                description: "List symbols in a file or directory.",
+                description: "List symbols in a file or directory. For architecture overview of a directory, prefer wonk_summary with depth>=1.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -728,7 +728,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_summary",
-                description: "Show a structural summary of a file or directory. With detail=rich and depth>=1, includes top-level symbol signatures per file and inter-file import edges — use this for architecture overview questions.",
+                description: "Architecture overview: structural summary of a file or directory. START HERE for 'what modules exist', 'how is this organized', or 'explain this crate/package'. With detail=rich and depth>=1, returns per-file symbol signatures and import edges in a single call.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1575,10 +1575,16 @@ impl McpServer {
                 .collect_paths()
                 .into_iter()
                 .filter(|p| p.is_file())
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| {
+                    p.strip_prefix(&repo_root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .collect()
         } else {
-            vec![path_buf.to_string_lossy().into_owned()]
+            let rel = path_buf.strip_prefix(&repo_root).unwrap_or(&path_buf);
+            vec![rel.to_string_lossy().into_owned()]
         };
         let mut all_symbols = Vec::new();
         for file in &files {
