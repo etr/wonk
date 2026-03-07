@@ -100,6 +100,8 @@ struct InitializeResult {
     capabilities: ServerCapabilities,
     #[serde(rename = "serverInfo")]
     server_info: ServerInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,7 +372,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
         let mut tools = vec![
             Tool {
                 name: "wonk_search",
-                description: "Search the codebase. Start here for broad queries. Returns ranked, deduplicated results with definitions above imports.",
+                description: "Ranked code search — returns definitions first, deduplicates re-exports. Replaces Grep for broad pattern matching. Use wonk_sym instead if you know the exact symbol name.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -414,7 +416,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_sym",
-                description: "Find symbol definitions. Returns name, kind, file, line, and signature.",
+                description: "Find symbol definitions by name. Returns kind, file, line, and signature. Faster and more precise than Grep for 'where is X defined' questions.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -443,7 +445,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_ref",
-                description: "Find references (call sites and imports) of a symbol. Includes surrounding context lines.",
+                description: "Find all references (call sites and imports) of a symbol with surrounding context. More precise than Grep for 'who uses X' questions.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -492,7 +494,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_deps",
-                description: "Show files imported/used by a file.",
+                description: "Show files imported/used by a file. Use for 'what does this file depend on' questions.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -567,7 +569,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_show",
-                description: "Read source body of symbols. Accepts comma-separated names (e.g. 'main,parse,validate') for batch lookup. If truncated, use the Read tool with the file:line from results.",
+                description: "Read source bodies of named symbols. Accepts comma-separated names for batch lookup (e.g. 'main,parse,validate'). More targeted than Read — finds the symbol across files without needing the file path. If output is truncated, use Read with the file:line from results.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -703,7 +705,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_summary",
-                description: "Architecture overview and symbol listing. START HERE for 'what modules exist', 'how is this organized', or 'explain this crate/package'. With detail=rich and depth>=1, returns per-file symbols (with line/col/scope) and import edges. Use tree=true for scope-grouped hierarchy (replaces wonk_ls).",
+                description: "Architecture overview — returns file list, symbol definitions, and import edges for a path. Works on both files and directories. For 'what modules exist' or 'explain this crate': pass the directory path with depth=1 to get all files and their symbols in a single call (more efficient than calling per-file). Replaces Glob+Read for understanding module structure.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1239,6 +1241,17 @@ impl McpServer {
                 name: "wonk",
                 version: env!("CARGO_PKG_VERSION"),
             },
+            instructions: Some(
+                "wonk provides structure-aware code analysis via a pre-built index. \
+                 Prefer wonk tools over Glob/Read/Grep for code exploration — they return \
+                 ranked, deduplicated results in fewer calls.\n\
+                 - Architecture/module questions: wonk_summary with directory path + depth=1 \
+                   (returns all files, symbols, and import edges in one call — do NOT call per-file)\n\
+                 - Find a symbol definition: wonk_sym\n\
+                 - Read symbol source code: wonk_show (batch: comma-separated names)\n\
+                 - Find references/call sites: wonk_ref\n\
+                 - Text search: wonk_search (ranked, definitions first)",
+            ),
         })
         .expect("serialize InitializeResult")
     }
