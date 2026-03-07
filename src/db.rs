@@ -188,6 +188,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     // Column migrations must run before any SQL that references these columns.
     ensure_caller_id_column(conn)?;
     ensure_confidence_column(conn)?;
+    ensure_doc_comment_column(conn)?;
     conn.execute_batch(TYPE_EDGES_SQL)
         .context("creating type_edges table")?;
     conn.execute_batch(EMBEDDINGS_SQL)
@@ -257,6 +258,25 @@ pub fn ensure_confidence_column(conn: &Connection) -> Result<()> {
 pub fn ensure_type_edges_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(TYPE_EDGES_SQL)
         .context("creating type_edges table (migration)")?;
+    Ok(())
+}
+
+/// Ensure the `doc_comment` column exists on the `symbols` table.
+///
+/// Handles schema migration for indexes created before doc comment
+/// extraction was added.
+pub fn ensure_doc_comment_column(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("PRAGMA table_info(symbols)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "doc_comment");
+
+    if !has_column {
+        conn.execute_batch("ALTER TABLE symbols ADD COLUMN doc_comment TEXT;")
+            .context("adding doc_comment column to symbols table")?;
+    }
+
     Ok(())
 }
 

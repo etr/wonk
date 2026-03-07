@@ -705,19 +705,13 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_summary",
-                description: "Architecture overview — returns file list, symbol definitions, and import edges for a path. Works on both files and directories. For 'what modules exist' or 'explain this crate': pass the directory path with depth=1 to get all files and their symbols in a single call (more efficient than calling per-file). Replaces Glob+Read for understanding module structure.",
+                description: "Architecture overview — returns file list, symbol definitions with doc comments, and import edges for a path. Compact top-level types + functions. For 'what modules exist' or 'explain this crate': pass the directory path with depth=1.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "Path to summarize (file or directory, relative to repo root)"
-                        },
-                        "detail": {
-                            "type": "string",
-                            "enum": ["rich", "light", "symbols"],
-                            "description": "Detail level: rich (all metrics), light (file count, symbol count, languages), symbols (symbol counts by kind only)",
-                            "default": "rich"
                         },
                         "depth": {
                             "type": "integer",
@@ -727,16 +721,6 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "recursive": {
                             "type": "boolean",
                             "description": "Show full recursive hierarchy (unlimited depth)",
-                            "default": false
-                        },
-                        "semantic": {
-                            "type": "boolean",
-                            "description": "Include AI-generated description via Ollama LLM (requires Ollama running)",
-                            "default": false
-                        },
-                        "tree": {
-                            "type": "boolean",
-                            "description": "Show all symbols (including scoped) in tree hierarchy; with detail=rich returns scope-grouped symbols",
                             "default": false
                         },
                         "budget": {
@@ -1944,14 +1928,8 @@ impl McpServer {
             return e;
         }
 
-        let detail_str = args
-            .get("detail")
-            .and_then(|v| v.as_str())
-            .unwrap_or("rich");
-        let detail = match detail_str.parse::<crate::types::DetailLevel>() {
-            Ok(d) => d,
-            Err(e) => return CallToolResult::error(e),
-        };
+        // MCP always uses outline — rich is only available via CLI.
+        let detail = crate::types::DetailLevel::Outline;
 
         let recursive = args
             .get("recursive")
@@ -1962,29 +1940,14 @@ impl McpServer {
 
         let format = extract_format(&args);
 
-        let semantic_flag = args
-            .get("semantic")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let semantic = if semantic_flag {
-            let config = crate::config::Config::load(Some(&repo_root)).unwrap_or_default();
-            if let Err(e) = crate::db::ensure_summaries_table(conn) {
-                return CallToolResult::error(format!("failed to create summaries table: {e}"));
-            }
-            Some(config.llm)
-        } else {
-            None
-        };
-
-        let tree = args.get("tree").and_then(|v| v.as_bool()).unwrap_or(false);
+        if let Err(e) = crate::db::ensure_summaries_table(conn) {
+            return CallToolResult::error(format!("failed to create summaries table: {e}"));
+        }
 
         let options = crate::summary::SummaryOptions {
             detail,
             depth,
             suppress: true,
-            semantic,
-            tree,
         };
 
         let result = match crate::summary::summarize_path(conn, &path, &options) {
@@ -3125,15 +3088,10 @@ mod tests {
         let tool = tools.iter().find(|t| t.name == "wonk_summary").unwrap();
         let props = tool.input_schema["properties"].as_object().unwrap();
         assert!(props.contains_key("path"), "missing 'path' property");
-        assert!(props.contains_key("detail"), "missing 'detail' property");
         assert!(props.contains_key("depth"), "missing 'depth' property");
         assert!(
             props.contains_key("recursive"),
             "missing 'recursive' property"
-        );
-        assert!(
-            props.contains_key("semantic"),
-            "missing 'semantic' property"
         );
         assert!(props.contains_key("budget"), "missing 'budget' property");
         assert!(props.contains_key("format"), "missing 'format' property");
@@ -3187,19 +3145,19 @@ mod tests {
         };
         let params = serde_json::json!({
             "name": "wonk_summary",
-            "arguments": {"path": "src/", "detail": "rich", "format": "json"}
+            "arguments": {"path": "src/", "format": "json"}
         });
         let result = server.handle_tools_call(&params);
         let text = result["content"][0]["text"].as_str().unwrap_or("");
         let v: Value = serde_json::from_str(text).expect("should be valid JSON");
         assert_eq!(v["path"], "src");
         assert_eq!(v["type"], "directory");
-        assert_eq!(v["detail_level"], "rich");
+        assert_eq!(v["detail_level"], "outline");
         assert!(v["metrics"]["file_count"].as_u64().unwrap() > 0);
     }
 
     #[test]
-    fn tool_summary_light_detail() {
+    fn tool_summary_outline_detail() {
         use crate::pipeline;
         use tempfile::TempDir;
 
@@ -3217,15 +3175,15 @@ mod tests {
         };
         let params = serde_json::json!({
             "name": "wonk_summary",
-            "arguments": {"path": "src/", "detail": "light", "format": "json"}
+            "arguments": {"path": "src/", "detail": "outline", "format": "json"}
         });
         let result = server.handle_tools_call(&params);
         let text = result["content"][0]["text"].as_str().unwrap_or("");
         let v: Value = serde_json::from_str(text).expect("should be valid JSON");
-        assert_eq!(v["detail_level"], "light");
+        assert_eq!(v["detail_level"], "outline");
         assert!(v["metrics"]["file_count"].is_number());
-        // line_count and dependency_count should be absent in light mode
-        assert!(v["metrics"].get("line_count").is_none());
+        // symbol_counts and dependency_count should be absent in outline mode
+        assert!(v["metrics"].get("symbol_counts").is_none());
         assert!(v["metrics"].get("dependency_count").is_none());
     }
 

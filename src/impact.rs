@@ -68,6 +68,7 @@ fn query_indexed_symbols(conn: &Connection, file: &str) -> Result<Vec<Symbol>> {
             scope: row.get(6)?,
             signature: row.get(7)?,
             language: row.get(8)?,
+            doc_comment: None,
         })
     })?;
 
@@ -1676,6 +1677,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             scope: None,
             signature: "fn foo()".into(),
             language: "Rust".into(),
+            doc_comment: None,
         }];
 
         // Hunk is on lines 1-5, symbol is on lines 10-15
@@ -1699,6 +1701,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             scope: None,
             signature: "fn bar()".into(),
             language: "Rust".into(),
+            doc_comment: None,
         }];
 
         // Hunk covers lines 6-8, inside symbol 5-10
@@ -1721,6 +1724,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             scope: None,
             signature: "fn baz()".into(),
             language: "Rust".into(),
+            doc_comment: None,
         }];
 
         // Hunk starts before symbol, ends inside it
@@ -1742,6 +1746,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             scope: None,
             signature: "const VAL: i32 = 42".into(),
             language: "Rust".into(),
+            doc_comment: None,
         }];
 
         // Hunk covers line 3
@@ -1764,6 +1769,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                 scope: None,
                 signature: "fn alpha()".into(),
                 language: "Rust".into(),
+                doc_comment: None,
             },
             Symbol {
                 name: "beta".into(),
@@ -1775,6 +1781,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                 scope: None,
                 signature: "fn beta()".into(),
                 language: "Rust".into(),
+                doc_comment: None,
             },
             Symbol {
                 name: "gamma".into(),
@@ -1786,6 +1793,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                 scope: None,
                 signature: "fn gamma()".into(),
                 language: "Rust".into(),
+                doc_comment: None,
             },
         ];
 
@@ -1811,6 +1819,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             scope: None,
             signature: "fn foo()".into(),
             language: "Rust".into(),
+            doc_comment: None,
         }];
 
         // Two hunks both overlap the same symbol

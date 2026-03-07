@@ -193,6 +193,71 @@ pub fn build_prompt(
 }
 
 // ---------------------------------------------------------------------------
+// Directory overview prompt (for directories with children)
+// ---------------------------------------------------------------------------
+
+/// Build a prompt for an LLM to generate a directory overview from children.
+pub fn build_directory_overview_prompt(
+    path: &str,
+    children: &[crate::types::SummaryResult],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut prompt = String::with_capacity(2048);
+
+    writeln!(
+        prompt,
+        "Summarize the following code directory: `{}`\n",
+        sanitize(path)
+    )
+    .unwrap();
+
+    prompt.push_str("Files:\n");
+    for child in children {
+        let kind = if child.path_type == crate::types::SummaryPathType::Directory {
+            "dir"
+        } else {
+            "file"
+        };
+        writeln!(
+            prompt,
+            "- {} ({}, {} lines)",
+            sanitize(&child.path),
+            kind,
+            child.metrics.line_count
+        )
+        .unwrap();
+
+        // Key symbols (max 10 per file)
+        for sym in child.symbols.iter().take(10) {
+            writeln!(prompt, "    {} {}", sym.kind, sanitize(&sym.name)).unwrap();
+        }
+    }
+
+    if children.iter().any(|c| !c.import_edges.is_empty()) {
+        prompt.push_str("\nImport relationships:\n");
+        for child in children {
+            for edge in &child.import_edges {
+                writeln!(
+                    prompt,
+                    "- {} -> {}",
+                    sanitize(&edge.from),
+                    sanitize(&edge.to)
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    prompt.push_str(
+        "\nSummarize the modules in this directory and explain how they relate. \
+         Write a concise 2-4 sentence overview.",
+    );
+
+    prompt
+}
+
+// ---------------------------------------------------------------------------
 // Ollama /api/generate client
 // ---------------------------------------------------------------------------
 

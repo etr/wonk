@@ -23,11 +23,13 @@ pub struct SummaryOptions {
     pub depth: Option<usize>,
     /// Whether to suppress stderr hints.
     pub suppress: bool,
-    /// LLM config for `--semantic` descriptions.
-    /// `None` means structural only; `Some` triggers LLM generation.
-    pub semantic: Option<LlmConfig>,
-    /// When true, include all symbols (including scoped) for tree display.
-    pub tree: bool,
+}
+
+impl SummaryOptions {
+    /// Rich detail always uses tree mode (all symbols including scoped).
+    fn wants_tree(&self) -> bool {
+        self.detail == DetailLevel::Rich
+    }
 }
 
 /// Escape SQLite LIKE metacharacters (`%` and `_`) in a string.
@@ -70,9 +72,11 @@ pub fn summarize_path(
 
     let metrics = query_metrics(conn, &like_pattern, &exact_path, path_type)?;
 
-    // Pre-fetch subtree data when we need children or rich directory details.
+    // Pre-fetch subtree data when we need children or symbols for directory entries.
     let need_subtree = path_type == SummaryPathType::Directory
-        && (should_recurse(options.depth, 0) || options.detail == DetailLevel::Rich);
+        && (should_recurse(options.depth, 0)
+            || options.detail == DetailLevel::Rich
+            || options.detail == DetailLevel::Outline);
     let subtree_data = if need_subtree {
         Some(SubtreeData::load(conn, &like_pattern)?)
     } else {
@@ -86,37 +90,40 @@ pub fn summarize_path(
         vec![]
     };
 
-    // Generate LLM description (top-level only, not per-child).
-    let description = if let Some(ref llm_config) = options.semantic {
+    // For Rich or Outline detail on directories, compute intra-directory import edges.
+    let import_edges =
+        if options.detail == DetailLevel::Rich || options.detail == DetailLevel::Outline {
+            if let Some(ref data) = subtree_data {
+                data.import_edges_for_dir(&exact_path)
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+    // For Rich or Outline detail on files, include symbols.
+    let symbols = if (options.detail == DetailLevel::Rich || options.detail == DetailLevel::Outline)
+        && path_type == SummaryPathType::File
+    {
+        symbols_for_file(conn, &normalized, options)?
+    } else {
+        vec![]
+    };
+
+    // Auto-load LLM config and generate description (top-level only).
+    let description = {
+        let config = crate::config::Config::load(None).unwrap_or_default();
         generate_description(
             conn,
             &normalized,
             &like_pattern,
             path_type,
             &metrics,
-            llm_config,
+            &config.llm,
             options.suppress,
+            &children,
         )
-    } else {
-        None
-    };
-
-    // For Rich detail on directories, compute intra-directory import edges.
-    let import_edges = if options.detail == DetailLevel::Rich {
-        if let Some(ref data) = subtree_data {
-            data.import_edges_for_dir(&exact_path)
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
-    };
-
-    // For Rich detail on files, include symbols.
-    let symbols = if options.detail == DetailLevel::Rich && path_type == SummaryPathType::File {
-        symbols_for_file(conn, &normalized, options.tree)?
-    } else {
-        vec![]
     };
 
     Ok(SummaryResult {
@@ -250,7 +257,7 @@ fn should_recurse(max_depth: Option<usize>, current_depth: usize) -> bool {
     }
 }
 
-/// (file, kind, name, signature, line, col, end_line, scope) per symbol.
+/// (file, kind, name, signature, line, col, end_line, scope, doc_comment) per symbol.
 type SymbolRow = (
     String,
     String,
@@ -259,6 +266,7 @@ type SymbolRow = (
     usize,
     usize,
     Option<usize>,
+    Option<String>,
     Option<String>,
 );
 
@@ -270,7 +278,7 @@ struct SubtreeData {
     paths: Vec<String>,
     /// (path, language, line_count) for every file in the subtree.
     file_rows: Vec<(String, String, usize)>,
-    /// (file, kind, name, signature, line, col, end_line, scope) for every symbol in the subtree.
+    /// (file, kind, name, signature, line, col, end_line, scope, doc_comment) for every symbol in the subtree.
     symbol_rows: Vec<SymbolRow>,
     /// (source_file, import_path) for every import in the subtree.
     import_rows: Vec<(String, String)>,
@@ -303,7 +311,7 @@ impl SubtreeData {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut sym_stmt = conn.prepare_cached(
-            "SELECT file, kind, name, COALESCE(signature, ''), line, col, end_line, scope \
+            "SELECT file, kind, name, COALESCE(signature, ''), line, col, end_line, scope, doc_comment \
              FROM symbols WHERE file LIKE ?1 ESCAPE '\\'",
         )?;
         let symbol_rows: Vec<SymbolRow> = sym_stmt
@@ -317,6 +325,7 @@ impl SubtreeData {
                     row.get::<_, i64>(5)? as usize,
                     row.get::<_, Option<i64>>(6)?.map(|v| v as usize),
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -356,7 +365,7 @@ impl SubtreeData {
         }
 
         let mut sym_map: BTreeMap<String, usize> = BTreeMap::new();
-        for (file, kind, _, _, _, _, _, _) in &self.symbol_rows {
+        for (file, kind, _, _, _, _, _, _, _) in &self.symbol_rows {
             if (is_file && file == prefix) || (!is_file && file.starts_with(prefix)) {
                 *sym_map.entry(kind.clone()).or_default() += 1;
             }
@@ -379,16 +388,16 @@ impl SubtreeData {
     }
 
     /// Return symbols for a specific file.
-    /// When `tree` is false, returns only top-level symbols (scope IS NULL), capped at 50.
-    /// When `tree` is true, returns ALL symbols (no scope filter or cap).
-    fn symbols_for_file(&self, file: &str, tree: bool) -> Vec<SummarySymbol> {
+    /// - Rich (tree=true): ALL symbols (no filter or cap).
+    /// - Outline (tree=false): top-level types + functions only (no methods, scope IS NULL), capped at 50.
+    fn symbols_for_file(&self, file: &str, options: &SummaryOptions) -> Vec<SummarySymbol> {
         let iter = self
             .symbol_rows
             .iter()
-            .filter(|(f, _, _, _, _, _, _, _)| f == file);
-        if tree {
+            .filter(|(f, _, _, _, _, _, _, _, _)| f == file);
+        if options.wants_tree() {
             iter.map(
-                |(_, kind, name, sig, line, col, end_line, scope)| SummarySymbol {
+                |(_, kind, name, sig, line, col, end_line, scope, doc)| SummarySymbol {
                     name: name.clone(),
                     kind: kind.clone(),
                     signature: sig.clone(),
@@ -396,14 +405,15 @@ impl SubtreeData {
                     col: *col,
                     end_line: *end_line,
                     scope: scope.clone(),
+                    doc_comment: doc.clone(),
                 },
             )
             .collect()
         } else {
-            iter.filter(|(_, _, _, _, _, _, _, scope)| scope.is_none())
+            iter.filter(|(_, kind, _, _, _, _, _, scope, _)| scope.is_none() && kind != "method")
                 .take(50)
                 .map(
-                    |(_, kind, name, sig, line, col, end_line, _)| SummarySymbol {
+                    |(_, kind, name, sig, line, col, end_line, _, doc)| SummarySymbol {
                         name: name.clone(),
                         kind: kind.clone(),
                         signature: sig.clone(),
@@ -411,6 +421,7 @@ impl SubtreeData {
                         col: *col,
                         end_line: *end_line,
                         scope: None,
+                        doc_comment: doc.clone(),
                     },
                 )
                 .collect()
@@ -472,15 +483,19 @@ impl SubtreeData {
 
 /// Query symbols for a single file directly from the DB.
 /// Used when summarizing a file at the top level (no SubtreeData loaded).
-/// When `tree` is false, returns only top-level symbols (scope IS NULL), capped at 50.
-/// When `tree` is true, returns ALL symbols (no scope filter or cap).
-fn symbols_for_file(conn: &Connection, file: &str, tree: bool) -> Result<Vec<SummarySymbol>> {
-    let sql = if tree {
-        "SELECT kind, name, COALESCE(signature, ''), line, col, end_line, scope \
+/// - Rich: ALL symbols (tree mode, no filter or cap).
+/// - Outline: top-level types + functions only (no methods, scope IS NULL, kind != 'method'), capped at 50.
+fn symbols_for_file(
+    conn: &Connection,
+    file: &str,
+    options: &SummaryOptions,
+) -> Result<Vec<SummarySymbol>> {
+    let sql = if options.wants_tree() {
+        "SELECT kind, name, COALESCE(signature, ''), line, col, end_line, scope, doc_comment \
          FROM symbols WHERE file = ?1"
     } else {
-        "SELECT kind, name, COALESCE(signature, ''), line, col, end_line, scope \
-         FROM symbols WHERE file = ?1 AND scope IS NULL LIMIT 50"
+        "SELECT kind, name, COALESCE(signature, ''), line, col, end_line, scope, doc_comment \
+         FROM symbols WHERE file = ?1 AND scope IS NULL AND kind != 'method' LIMIT 50"
     };
     let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt
@@ -493,6 +508,7 @@ fn symbols_for_file(conn: &Connection, file: &str, tree: bool) -> Result<Vec<Sum
                 col: row.get::<_, i64>(4)? as usize,
                 end_line: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
                 scope: row.get::<_, Option<String>>(6)?,
+                doc_comment: row.get::<_, Option<String>>(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -547,17 +563,18 @@ fn build_children_from_data(
             vec![]
         };
 
-        // For Rich detail: file children get symbols,
+        // For Rich or Outline detail: file children get symbols,
         // directory children get intra-directory import edges.
-        let (symbols, import_edges) = if options.detail == DetailLevel::Rich {
-            if is_file {
-                (data.symbols_for_file(child_path, options.tree), vec![])
+        let (symbols, import_edges) =
+            if options.detail == DetailLevel::Rich || options.detail == DetailLevel::Outline {
+                if is_file {
+                    (data.symbols_for_file(child_path, options), vec![])
+                } else {
+                    (vec![], data.import_edges_for_dir(child_path))
+                }
             } else {
-                (vec![], data.import_edges_for_dir(child_path))
-            }
-        } else {
-            (vec![], vec![])
-        };
+                (vec![], vec![])
+            };
 
         results.push(SummaryResult {
             path: child_path.clone(),
@@ -578,6 +595,7 @@ fn build_children_from_data(
 ///
 /// Returns `Some(description)` on success or cache hit, `None` if Ollama is
 /// unreachable (with a stderr warning), or `None` on other errors.
+#[allow(clippy::too_many_arguments)]
 fn generate_description(
     conn: &Connection,
     path: &str,
@@ -586,6 +604,7 @@ fn generate_description(
     metrics: &SummaryMetrics,
     config: &LlmConfig,
     suppress: bool,
+    children: &[SummaryResult],
 ) -> Option<String> {
     use crate::errors::LlmError;
     use crate::llm;
@@ -606,11 +625,15 @@ fn generate_description(
     }
 
     // 3. Build prompt.
-    let prompt = match llm::build_prompt(conn, path, like_pattern, path_type, metrics) {
-        Ok(p) => p,
-        Err(e) => {
-            output::print_hint(&format!("failed to build prompt: {e}"), suppress);
-            return None;
+    let prompt = if path_type == SummaryPathType::Directory && !children.is_empty() {
+        llm::build_directory_overview_prompt(path, children)
+    } else {
+        match llm::build_prompt(conn, path, like_pattern, path_type, metrics) {
+            Ok(p) => p,
+            Err(e) => {
+                output::print_hint(&format!("failed to build prompt: {e}"), suppress);
+                return None;
+            }
         }
     };
 
@@ -677,8 +700,6 @@ mod tests {
             detail: DetailLevel::Rich,
             depth: Some(0),
             suppress: true,
-            semantic: None,
-            tree: false,
         }
     }
 
@@ -829,7 +850,7 @@ mod tests {
     fn summary_detail_level_propagated() {
         let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
 
-        for level in [DetailLevel::Rich, DetailLevel::Light, DetailLevel::Symbols] {
+        for level in [DetailLevel::Outline, DetailLevel::Rich] {
             let opts = SummaryOptions {
                 detail: level,
                 ..default_options()
@@ -873,38 +894,21 @@ mod tests {
     // -- Semantic (--semantic) tests -------------------------------------------
 
     #[test]
-    fn summary_without_semantic_has_no_description() {
-        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
-
-        let opts = SummaryOptions {
-            semantic: None,
-            ..default_options()
-        };
-        let result = summarize_path(&conn, "src", &opts).unwrap();
-        assert!(result.description.is_none());
-    }
-
-    #[test]
-    fn summary_semantic_ollama_unreachable_returns_none_description() {
-        // When Ollama is down, description should be None (graceful degradation).
+    fn summary_auto_llm_graceful_degradation() {
+        // LLM description is auto-attempted. When Ollama is unreachable,
+        // description should be None (graceful degradation). When running,
+        // it may produce a description. Either way, no panic.
         let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
         crate::db::ensure_summaries_table(&conn).unwrap();
 
-        let config = crate::config::LlmConfig {
-            model: "llama3.2:3b".to_string(),
-            generate_url: "http://127.0.0.1:19999/api/generate".to_string(),
-        };
-        let opts = SummaryOptions {
-            semantic: Some(config),
-            ..default_options()
-        };
+        let opts = default_options();
         let result = summarize_path(&conn, "src", &opts).unwrap();
-        // Should succeed, but description is None since Ollama is unreachable.
-        assert!(result.description.is_none());
+        // Should succeed regardless of whether Ollama is running.
+        assert_eq!(result.path, "src");
     }
 
     #[test]
-    fn summary_semantic_cached_description_returned() {
+    fn summary_cached_description_returned() {
         let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", "fn hello() {}\n")]);
         crate::db::ensure_summaries_table(&conn).unwrap();
 
@@ -913,34 +917,22 @@ mod tests {
             crate::llm::compute_content_hash(&conn, "src/%", SummaryPathType::Directory).unwrap();
         crate::llm::store_cache(&conn, "src", &hash, "Cached description.").unwrap();
 
-        let config = crate::config::LlmConfig {
-            model: "llama3.2:3b".to_string(),
-            generate_url: "http://127.0.0.1:19999/api/generate".to_string(),
-        };
-        let opts = SummaryOptions {
-            semantic: Some(config),
-            ..default_options()
-        };
+        let opts = default_options();
         let result = summarize_path(&conn, "src", &opts).unwrap();
         assert_eq!(result.description, Some("Cached description.".to_string()));
     }
 
     #[test]
-    fn summary_semantic_only_at_top_level() {
-        // Children should NOT get LLM descriptions even when semantic is enabled.
+    fn summary_description_only_at_top_level() {
+        // Children should NOT get LLM descriptions.
         let (_dir, conn) = make_indexed_repo(&[
             ("src/a.rs", "fn alpha() {}\n"),
             ("src/sub/b.rs", "fn beta() {}\n"),
         ]);
         crate::db::ensure_summaries_table(&conn).unwrap();
 
-        let config = crate::config::LlmConfig {
-            model: "llama3.2:3b".to_string(),
-            generate_url: "http://127.0.0.1:19999/api/generate".to_string(),
-        };
         let opts = SummaryOptions {
             depth: Some(1),
-            semantic: Some(config),
             ..default_options()
         };
         let result = summarize_path(&conn, "src", &opts).unwrap();
@@ -986,24 +978,50 @@ mod tests {
     }
 
     #[test]
-    fn summary_light_depth1_no_symbols() {
-        let source = "fn alpha() {}\nfn beta() {}\n";
-        let (_dir, conn) = make_indexed_repo(&[("src/lib.rs", source)]);
+    fn summary_outline_excludes_methods() {
+        // Python: top-level function + class with a method inside.
+        let source =
+            "def top_func():\n    pass\n\nclass MyClass:\n    def method(self):\n        pass\n";
+        let (_dir, conn) = make_indexed_repo(&[("src/mod.py", source)]);
 
         let opts = SummaryOptions {
             depth: Some(1),
-            detail: DetailLevel::Light,
+            detail: DetailLevel::Outline,
             ..default_options()
         };
         let result = summarize_path(&conn, "src", &opts).unwrap();
 
-        for child in &result.children {
-            assert!(
-                child.symbols.is_empty(),
-                "Light detail should not include symbols for {}",
-                child.path
-            );
-        }
+        let file_child = result
+            .children
+            .iter()
+            .find(|c| c.path == "src/mod.py")
+            .expect("should find src/mod.py");
+        let names: Vec<&str> = file_child.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"top_func"), "should contain top_func");
+        assert!(names.contains(&"MyClass"), "should contain MyClass");
+        assert!(
+            !names.contains(&"method"),
+            "outline should NOT contain methods"
+        );
+    }
+
+    #[test]
+    fn summary_outline_includes_import_edges() {
+        let app_js = "import { foo } from './bar';\nfunction main() {}\n";
+        let bar_js = "export function foo() {}\n";
+        let (_dir, conn) = make_indexed_repo(&[("src/app.js", app_js), ("src/bar.js", bar_js)]);
+
+        let opts = SummaryOptions {
+            depth: Some(1),
+            detail: DetailLevel::Outline,
+            ..default_options()
+        };
+        let result = summarize_path(&conn, "src", &opts).unwrap();
+
+        assert!(
+            !result.import_edges.is_empty(),
+            "outline should have import edges"
+        );
     }
 
     #[test]
@@ -1029,8 +1047,9 @@ mod tests {
     }
 
     #[test]
-    fn summary_symbols_are_toplevel_only() {
+    fn summary_rich_includes_all_symbols_tree() {
         // Python: top-level function + class with a method inside.
+        // Rich mode now always uses tree — should include ALL symbols.
         let source =
             "def top_func():\n    pass\n\nclass MyClass:\n    def method(self):\n        pass\n";
         let (_dir, conn) = make_indexed_repo(&[("src/mod.py", source)]);
@@ -1048,12 +1067,11 @@ mod tests {
             .find(|c| c.path == "src/mod.py")
             .expect("should find src/mod.py");
         let names: Vec<&str> = file_child.symbols.iter().map(|s| s.name.as_str()).collect();
-        // top_func and MyClass are top-level; method is scoped inside MyClass.
         assert!(names.contains(&"top_func"), "should contain top_func");
         assert!(names.contains(&"MyClass"), "should contain MyClass");
         assert!(
-            !names.contains(&"method"),
-            "should NOT contain scoped method"
+            names.contains(&"method"),
+            "rich mode should include scoped methods"
         );
     }
 

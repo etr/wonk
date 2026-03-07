@@ -277,6 +277,8 @@ pub struct SummarySymbolOutput {
     pub end_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_comment: Option<String>,
     /// Nesting depth for tree display (0 = top-level). Skipped in serialization.
     #[serde(skip)]
     pub indent: usize,
@@ -315,26 +317,19 @@ impl SummaryOutput {
             .collect();
 
         let metrics = match sr.detail_level {
+            DetailLevel::Outline => SummaryMetricsOutput {
+                file_count: Some(m.file_count),
+                line_count: Some(m.line_count),
+                symbol_counts: None,
+                languages: Some(languages_out),
+                dependency_count: None,
+            },
             DetailLevel::Rich => SummaryMetricsOutput {
                 file_count: Some(m.file_count),
                 line_count: Some(m.line_count),
                 symbol_counts: Some(symbol_counts_out),
                 languages: Some(languages_out),
                 dependency_count: Some(m.dependency_count),
-            },
-            DetailLevel::Light => SummaryMetricsOutput {
-                file_count: Some(m.file_count),
-                line_count: None,
-                symbol_counts: Some(symbol_counts_out),
-                languages: Some(languages_out),
-                dependency_count: None,
-            },
-            DetailLevel::Symbols => SummaryMetricsOutput {
-                file_count: None,
-                line_count: None,
-                symbol_counts: Some(symbol_counts_out),
-                languages: None,
-                dependency_count: None,
             },
         };
 
@@ -363,6 +358,7 @@ impl SummaryOutput {
                         col: s.col,
                         end_line: s.end_line,
                         scope: s.scope.clone(),
+                        doc_comment: s.doc_comment.clone(),
                         indent,
                     }
                 })
@@ -3591,13 +3587,13 @@ mod tests {
     }
 
     #[test]
-    fn summary_output_from_result_light() {
+    fn summary_output_from_result_outline() {
         use crate::types::{DetailLevel, SummaryMetrics, SummaryPathType, SummaryResult};
 
         let sr = SummaryResult {
             path: "src/".into(),
             path_type: SummaryPathType::Directory,
-            detail_level: DetailLevel::Light,
+            detail_level: DetailLevel::Outline,
             metrics: SummaryMetrics {
                 file_count: 5,
                 line_count: 200,
@@ -3613,39 +3609,10 @@ mod tests {
 
         let out = SummaryOutput::from_result(&sr);
         assert_eq!(out.metrics.file_count, Some(5));
-        assert!(out.metrics.line_count.is_none());
+        assert_eq!(out.metrics.line_count, Some(200));
         assert!(out.metrics.dependency_count.is_none());
-        assert!(out.metrics.symbol_counts.is_some());
+        assert!(out.metrics.symbol_counts.is_none());
         assert!(out.metrics.languages.is_some());
-    }
-
-    #[test]
-    fn summary_output_from_result_symbols() {
-        use crate::types::{DetailLevel, SummaryMetrics, SummaryPathType, SummaryResult};
-
-        let sr = SummaryResult {
-            path: "src/".into(),
-            path_type: SummaryPathType::Directory,
-            detail_level: DetailLevel::Symbols,
-            metrics: SummaryMetrics {
-                file_count: 5,
-                line_count: 200,
-                symbol_counts: vec![("function".into(), 10)],
-                language_breakdown: vec![("Rust".into(), 5)],
-                dependency_count: 3,
-            },
-            children: vec![],
-            description: None,
-            symbols: vec![],
-            import_edges: vec![],
-        };
-
-        let out = SummaryOutput::from_result(&sr);
-        assert!(out.metrics.file_count.is_none());
-        assert!(out.metrics.line_count.is_none());
-        assert!(out.metrics.dependency_count.is_none());
-        assert!(out.metrics.symbol_counts.is_some());
-        assert!(out.metrics.languages.is_none());
     }
 
     #[test]

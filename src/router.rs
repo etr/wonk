@@ -1271,19 +1271,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 Some(args.depth)
             };
 
-            let semantic = if args.semantic {
-                crate::db::ensure_summaries_table(&conn)?;
-                Some(config.llm.clone())
-            } else {
-                None
-            };
+            crate::db::ensure_summaries_table(&conn)?;
 
             let options = crate::summary::SummaryOptions {
                 detail,
                 depth,
                 suppress,
-                semantic,
-                tree: args.tree,
             };
 
             let result = crate::summary::summarize_path(&conn, &args.path, &options)?;
@@ -2168,6 +2161,7 @@ impl QueryRouter {
                     scope: None,
                     signature: r.content.clone(),
                     language: String::new(),
+                    doc_comment: None,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -2265,6 +2259,7 @@ impl QueryRouter {
                     scope: None,
                     signature: r.content.clone(),
                     language: String::new(),
+                    doc_comment: None,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -2312,6 +2307,7 @@ impl QueryRouter {
                     scope: None,
                     signature: r.content.clone(),
                     language: String::new(),
+                    doc_comment: None,
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -2571,6 +2567,7 @@ fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
         scope: row.get(6)?,
         signature: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
         language: row.get(8)?,
+        doc_comment: None,
     })
 }
 

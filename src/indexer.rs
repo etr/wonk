@@ -272,6 +272,181 @@ fn make_symbol(
         scope: scope.map(|s| s.to_string()),
         signature: first_line(node, src),
         language: lang.name().to_string(),
+        doc_comment: extract_doc_comment(node, src, lang),
+    }
+}
+
+/// Maximum length for extracted doc comments.
+const MAX_DOC_COMMENT_LEN: usize = 200;
+
+/// Extract a doc comment for the given symbol node.
+fn extract_doc_comment(node: Node, src: &[u8], lang: Lang) -> Option<String> {
+    match lang {
+        Lang::Python => extract_python_docstring(node, src),
+        _ => extract_preceding_comment(node, src, lang),
+    }
+}
+
+/// Extract a Python docstring: first `expression_statement > string` in the `body` field.
+fn extract_python_docstring(node: Node, src: &[u8]) -> Option<String> {
+    let body = node.child_by_field_name("body")?;
+    let first_stmt = body.named_child(0)?;
+    if first_stmt.kind() != "expression_statement" {
+        return None;
+    }
+    let string_node = first_stmt.named_child(0)?;
+    if string_node.kind() != "string" {
+        return None;
+    }
+    let text = node_text(string_node, src);
+    // Strip quotes: """...""", '''...''', "...", '...'
+    let stripped = text
+        .strip_prefix("\"\"\"")
+        .and_then(|s| s.strip_suffix("\"\"\""))
+        .or_else(|| text.strip_prefix("'''").and_then(|s| s.strip_suffix("'''")))
+        .or_else(|| text.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .or_else(|| text.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(text);
+    let cleaned = strip_doc_prefix(stripped, Lang::Python);
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(truncate_doc(&cleaned))
+}
+
+/// Extract a doc comment from preceding sibling comment nodes.
+fn extract_preceding_comment(node: Node, src: &[u8], lang: Lang) -> Option<String> {
+    let mut current = node.prev_named_sibling()?;
+
+    // Skip attribute/decorator nodes
+    while let "attribute_item" | "decorator" | "annotation" | "attribute" | "attribute_list" =
+        current.kind()
+    {
+        current = current.prev_named_sibling()?;
+    }
+
+    // Check if the node is a comment
+    let is_comment = matches!(current.kind(), "line_comment" | "block_comment" | "comment");
+    if !is_comment {
+        return None;
+    }
+
+    let text = node_text(current, src);
+
+    // Check for doc comment prefix based on language
+    let is_doc = match lang {
+        Lang::Rust => text.starts_with("///") || text.starts_with("/**"),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => text.starts_with("/**"),
+        Lang::Go => text.starts_with("//"),
+        Lang::Java | Lang::CSharp => text.starts_with("/**") || text.starts_with("///"),
+        Lang::C | Lang::Cpp => text.starts_with("/**") || text.starts_with("///"),
+        Lang::Ruby => text.starts_with("#"),
+        Lang::Php => text.starts_with("/**"),
+        Lang::Python => false, // handled by docstring extractor
+    };
+
+    if !is_doc {
+        return None;
+    }
+
+    // For multi-line comments, also collect adjacent preceding comment siblings
+    let mut lines = vec![text.to_string()];
+    let mut prev = current.prev_named_sibling();
+    while let Some(p) = prev {
+        if !matches!(p.kind(), "line_comment" | "comment") {
+            break;
+        }
+        let pt = node_text(p, src);
+        // Must have the same doc prefix style
+        let same_style = match lang {
+            Lang::Rust => pt.starts_with("///"),
+            Lang::Go => pt.starts_with("//"),
+            Lang::Ruby => pt.starts_with("#"),
+            _ => false,
+        };
+        if !same_style {
+            break;
+        }
+        // Must be on the immediately preceding line
+        if current.start_position().row != p.end_position().row + 1 {
+            break;
+        }
+        lines.push(pt.to_string());
+        current = p;
+        prev = p.prev_named_sibling();
+    }
+
+    lines.reverse();
+    let joined = lines.join("\n");
+    let cleaned = strip_doc_prefix(&joined, lang);
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(truncate_doc(&cleaned))
+}
+
+/// Strip language-specific doc comment prefixes and normalize whitespace.
+fn strip_doc_prefix(text: &str, lang: Lang) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let cleaned: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim();
+            match lang {
+                Lang::Rust => trimmed
+                    .strip_prefix("///")
+                    .or_else(|| trimmed.strip_prefix("/**"))
+                    .or_else(|| trimmed.strip_prefix("* "))
+                    .or_else(|| trimmed.strip_prefix("*"))
+                    .or_else(|| trimmed.strip_suffix("*/"))
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string(),
+                Lang::TypeScript
+                | Lang::Tsx
+                | Lang::JavaScript
+                | Lang::Java
+                | Lang::CSharp
+                | Lang::C
+                | Lang::Cpp
+                | Lang::Php => trimmed
+                    .strip_prefix("/**")
+                    .or_else(|| trimmed.strip_prefix("///"))
+                    .or_else(|| trimmed.strip_prefix("* "))
+                    .or_else(|| trimmed.strip_prefix("*"))
+                    .or_else(|| trimmed.strip_suffix("*/"))
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string(),
+                Lang::Go => trimmed
+                    .strip_prefix("//")
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string(),
+                Lang::Ruby => trimmed
+                    .strip_prefix('#')
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string(),
+                Lang::Python => trimmed.to_string(),
+            }
+        })
+        .filter(|s| !s.is_empty() && s != "/")
+        .collect();
+    cleaned.join(" ")
+}
+
+/// Truncate doc comment to MAX_DOC_COMMENT_LEN chars at a word boundary.
+fn truncate_doc(s: &str) -> String {
+    if s.len() <= MAX_DOC_COMMENT_LEN {
+        return s.to_string();
+    }
+    // Find last space before the limit
+    let truncated = &s[..MAX_DOC_COMMENT_LEN];
+    if let Some(pos) = truncated.rfind(' ') {
+        format!("{}...", &s[..pos])
+    } else {
+        format!("{}...", truncated)
     }
 }
 
@@ -4552,6 +4727,7 @@ mod tests {
             scope: None,
             signature: "fn helper()".into(),
             language: "Rust".into(),
+            doc_comment: None,
         }];
         let imports: Vec<String> = vec![];
         let score = compute_confidence(&r, &symbols, &imports);
@@ -4587,6 +4763,7 @@ mod tests {
                 scope: Some("MyClass".into()),
                 signature: "fn run(&self)".into(),
                 language: "Rust".into(),
+                doc_comment: None,
             },
             Symbol {
                 name: "do_work".into(),
@@ -4598,6 +4775,7 @@ mod tests {
                 scope: Some("MyClass".into()),
                 signature: "fn do_work(&self)".into(),
                 language: "Rust".into(),
+                doc_comment: None,
             },
         ];
         let imports: Vec<String> = vec![];
@@ -4633,6 +4811,7 @@ mod tests {
             scope: None,
             signature: "fn unrelated()".into(),
             language: "Rust".into(),
+            doc_comment: None,
         }];
         let imports: Vec<String> = vec![];
         let score = compute_confidence(&r, &symbols, &imports);
@@ -4667,6 +4846,7 @@ mod tests {
                 scope: Some("MyClass".into()),
                 signature: "fn run(&self)".into(),
                 language: "Rust".into(),
+                doc_comment: None,
             },
             // helper is in scope "MyClass" but different file
             Symbol {
@@ -4679,6 +4859,7 @@ mod tests {
                 scope: Some("MyClass".into()),
                 signature: "fn helper(&self)".into(),
                 language: "Rust".into(),
+                doc_comment: None,
             },
         ];
         let imports: Vec<String> = vec![];

@@ -321,8 +321,8 @@ pub struct SummaryArgs {
     /// Path to summarize (file or directory)
     pub path: String,
 
-    /// Detail level: rich (default), light, or symbols
-    #[arg(long, default_value = "rich")]
+    /// Detail level: outline (default) or rich (all symbols in tree)
+    #[arg(long, default_value = "outline")]
     pub detail: String,
 
     /// Recursion depth for child summaries (0 = target only)
@@ -332,14 +332,6 @@ pub struct SummaryArgs {
     /// Show full recursive hierarchy (unlimited depth)
     #[arg(long, conflicts_with = "depth")]
     pub recursive: bool,
-
-    /// Include AI-generated description (requires embeddings)
-    #[arg(long)]
-    pub semantic: bool,
-
-    /// Show symbols in a tree structure grouped by scope
-    #[arg(long)]
-    pub tree: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -891,10 +883,9 @@ mod tests {
         match cli.command {
             Command::Summary(args) => {
                 assert_eq!(args.path, "src/");
-                assert_eq!(args.detail, "rich");
+                assert_eq!(args.detail, "outline");
                 assert_eq!(args.depth, 0);
                 assert!(!args.recursive);
-                assert!(!args.semantic);
             }
             _ => panic!("expected Command::Summary"),
         }
@@ -902,10 +893,10 @@ mod tests {
 
     #[test]
     fn parse_summary_with_detail() {
-        let cli = Cli::try_parse_from(["wonk", "summary", "--detail", "light", "src/"]).unwrap();
+        let cli = Cli::try_parse_from(["wonk", "summary", "--detail", "rich", "src/"]).unwrap();
         match cli.command {
             Command::Summary(args) => {
-                assert_eq!(args.detail, "light");
+                assert_eq!(args.detail, "rich");
             }
             _ => panic!("expected Command::Summary"),
         }
@@ -939,17 +930,6 @@ mod tests {
         let result =
             Cli::try_parse_from(["wonk", "summary", "--recursive", "--depth", "2", "src/"]);
         assert!(result.is_err(), "--recursive and --depth should conflict");
-    }
-
-    #[test]
-    fn parse_summary_semantic_flag() {
-        let cli = Cli::try_parse_from(["wonk", "summary", "--semantic", "src/"]).unwrap();
-        match cli.command {
-            Command::Summary(args) => {
-                assert!(args.semantic);
-            }
-            _ => panic!("expected Command::Summary"),
-        }
     }
 
     #[test]

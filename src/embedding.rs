@@ -408,6 +408,7 @@ fn map_symbol_row(row: &rusqlite::Row) -> rusqlite::Result<SymbolRow> {
             scope,
             signature,
             language,
+            doc_comment: None,
         },
     })
 }
@@ -1295,6 +1296,7 @@ mod tests {
             scope: scope.map(|s| s.to_string()),
             signature: format!("fn {name}()"),
             language: "Rust".to_string(),
+            doc_comment: None,
         }
     }
 

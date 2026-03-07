@@ -95,6 +95,8 @@ pub struct Symbol {
     pub signature: String,
     /// Language name (e.g. "Rust", "Python").
     pub language: String,
+    /// Doc comment extracted from source (first 200 chars).
+    pub doc_comment: Option<String>,
 }
 
 /// The kind of a reference (usage site, not a definition).
@@ -359,20 +361,17 @@ pub struct CalleeResult {
 /// Detail level for `wonk summary` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailLevel {
-    /// All metrics: file count, line count, symbol counts, language breakdown, dependency count.
+    /// Compact: top-level types + functions + doc comments + import edges. No methods.
+    Outline,
+    /// All metrics and ALL symbols in tree hierarchy (including scoped methods).
     Rich,
-    /// Lightweight: file count, symbol count, languages only.
-    Light,
-    /// Symbol counts by kind only.
-    Symbols,
 }
 
 impl fmt::Display for DetailLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
+            DetailLevel::Outline => "outline",
             DetailLevel::Rich => "rich",
-            DetailLevel::Light => "light",
-            DetailLevel::Symbols => "symbols",
         };
         write!(f, "{s}")
     }
@@ -383,11 +382,10 @@ impl FromStr for DetailLevel {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "outline" | "light" | "symbols" => Ok(DetailLevel::Outline),
             "rich" => Ok(DetailLevel::Rich),
-            "light" => Ok(DetailLevel::Light),
-            "symbols" => Ok(DetailLevel::Symbols),
             other => Err(format!(
-                "unknown detail level: {other} (expected: rich, light, symbols)"
+                "unknown detail level: {other} (expected: outline, rich)"
             )),
         }
     }
@@ -456,6 +454,7 @@ pub struct SummarySymbol {
     pub col: usize,
     pub end_line: Option<usize>,
     pub scope: Option<String>,
+    pub doc_comment: Option<String>,
 }
 
 /// An intra-directory import edge (from file → to file).
@@ -1065,13 +1064,21 @@ mod tests {
     #[test]
     fn detail_level_display_round_trip() {
         for (level, expected) in [
+            (DetailLevel::Outline, "outline"),
             (DetailLevel::Rich, "rich"),
-            (DetailLevel::Light, "light"),
-            (DetailLevel::Symbols, "symbols"),
         ] {
             assert_eq!(level.to_string(), expected);
             assert_eq!(DetailLevel::from_str(expected).unwrap(), level);
         }
+        // Backward compat aliases
+        assert_eq!(
+            DetailLevel::from_str("light").unwrap(),
+            DetailLevel::Outline
+        );
+        assert_eq!(
+            DetailLevel::from_str("symbols").unwrap(),
+            DetailLevel::Outline
+        );
     }
 
     #[test]

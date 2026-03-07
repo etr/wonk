@@ -545,8 +545,8 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     let mut caller_map: HashMap<&str, i64> = HashMap::new();
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language, doc_comment) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for sym in &result.symbols {
             stmt.execute(rusqlite::params![
@@ -559,6 +559,7 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
                 sym.scope,
                 sym.signature,
                 sym.language,
+                sym.doc_comment,
             ])?;
             caller_map.insert(&sym.name, tx.last_insert_rowid());
         }
@@ -729,8 +730,8 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
     let mut file_caller_maps: HashMap<&str, HashMap<&str, i64>> = HashMap::new();
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language, doc_comment) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for r in results {
             let file_map = file_caller_maps.entry(&r.rel_path).or_default();
@@ -745,6 +746,7 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
                     sym.scope,
                     sym.signature,
                     sym.language,
+                    sym.doc_comment,
                 ])?;
                 file_map.insert(&sym.name, tx.last_insert_rowid());
                 total_syms += 1;
