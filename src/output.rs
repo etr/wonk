@@ -188,6 +188,8 @@ pub struct ShowOutput {
     pub end_line: Option<usize>,
     pub source: String,
     pub language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_shallow: Option<bool>,
 }
 
 impl From<&ShowResult> for ShowOutput {
@@ -200,6 +202,7 @@ impl From<&ShowResult> for ShowOutput {
             end_line: sr.end_line,
             source: sr.source.clone(),
             language: sr.language.clone(),
+            auto_shallow: None,
         }
     }
 }
@@ -3193,6 +3196,7 @@ mod tests {
             end_line: Some(12),
             source: "function processPayment() {\n  return true;\n}".into(),
             language: "TypeScript".into(),
+            auto_shallow: None,
         };
         let rendered = render(OutputFormat::Grep, |fmt| fmt.format_show(&out));
         assert!(rendered.contains("  10| function processPayment()"));
@@ -3210,6 +3214,7 @@ mod tests {
             end_line: Some(5),
             source: "fn foo() {}".into(),
             language: "Rust".into(),
+            auto_shallow: None,
         };
         let rendered = render_color(|fmt| fmt.format_show(&out));
         assert!(
@@ -3228,6 +3233,7 @@ mod tests {
             end_line: Some(8),
             source: "fn foo() {\n  42\n}".into(),
             language: "Rust".into(),
+            auto_shallow: None,
         };
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_show(&out));
         let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
@@ -3250,6 +3256,7 @@ mod tests {
             end_line: None,
             source: "const MAX: usize = 1024;".into(),
             language: "Rust".into(),
+            auto_shallow: None,
         };
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_show(&out));
         assert!(!rendered.contains("end_line"));
@@ -3265,6 +3272,7 @@ mod tests {
             end_line: None,
             source: "const MAX: usize = 1024;".into(),
             language: "Rust".into(),
+            auto_shallow: None,
         };
         let rendered = render(OutputFormat::Grep, |fmt| fmt.format_show(&out));
         assert_eq!(rendered, "   3| const MAX: usize = 1024;\n");

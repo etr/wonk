@@ -569,7 +569,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_show",
-                description: "Read source bodies of named symbols. Accepts comma-separated names for batch lookup (e.g. 'main,parse,validate'). More targeted than Read — finds the symbol across files without needing the file path. If output is truncated, use Read with the file:line from results.",
+                description: "Read source bodies of named symbols. Accepts comma-separated names for batch lookup (e.g. 'main,parse,validate'). More targeted than Read — finds the symbol across files without needing the file path. Large containers auto-fallback to shallow mode when they exceed the budget.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1741,6 +1741,31 @@ impl McpServer {
             if let Some(ref mut b) = budget {
                 let serialized = serde_json::to_string(&out).unwrap_or_default();
                 if !b.try_consume(&serialized) {
+                    // Auto-fallback: retry container types in shallow mode
+                    if !shallow && sr.kind.is_container() {
+                        let shallow_opts = crate::show::ShowOptions {
+                            file: Some(sr.file.clone()),
+                            kind: Some(sr.kind.to_string()),
+                            exact: true,
+                            suppress: true,
+                            shallow: true,
+                        };
+                        if let Ok(shallow_results) =
+                            crate::show::show_symbol(conn, &sr.name, &repo_root, &shallow_opts)
+                            && let Some(shallow_sr) = shallow_results
+                                .iter()
+                                .find(|s| s.file == sr.file && s.line == sr.line)
+                        {
+                            let mut shallow_out = ShowOutput::from(shallow_sr);
+                            shallow_out.auto_shallow = Some(true);
+                            let shallow_ser =
+                                serde_json::to_string(&shallow_out).unwrap_or_default();
+                            if b.try_consume(&shallow_ser) {
+                                outputs.push(shallow_out);
+                                continue;
+                            }
+                        }
+                    }
                     truncated += 1;
                     continue;
                 }
@@ -1749,13 +1774,10 @@ impl McpServer {
         }
 
         if truncated > 0 {
-            let hint = if let Some(first) = outputs.first() {
-                format!(
-                    "Increase budget or use Read({}, {}, 80) for full file content.",
-                    first.file, first.line,
-                )
+            let hint = if outputs.is_empty() {
+                "Increase budget or use shallow:true to see results.".into()
             } else {
-                "Increase budget to see results, or use Read tool for full file content.".into()
+                "Increase budget or use shallow:true to see truncated results.".to_string()
             };
             let wrapper = serde_json::json!({
                 "results": outputs,
