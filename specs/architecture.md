@@ -109,7 +109,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 │  type_edges [V4]                                              │
 ├─────────────────────────────────────────────────────────────┤
 │              MCP Server (JSON-RPC 2.0 stdio)                  │
-│  19 tools, multi-repo support via lazy connections    [V4]    │
+│  18 tools, multi-repo support via lazy connections    [V4]    │
 ├─────────────────────────────────────────────────────────────┤
 │                   Background Daemon                           │
 │  notify + crossbeam-channel + rayon                           │
@@ -211,7 +211,6 @@ Key technology choices: Rust for single static binary distribution and native Tr
   | `wonk sym` | SQLite symbols table | grep with heuristic patterns |
   | `wonk ref` | SQLite references table | grep for name occurrences |
   | `wonk deps` | SQLite import data | grep for import/require statements |
-  | `wonk ls` | SQLite symbols by file | Tree-sitter on-demand parse |
   | `wonk sig` | SQLite symbols table | grep with heuristic patterns |
   | `wonk rdeps` | SQLite import data | grep for import/require statements |
   | `wonk ask` [V2] | Semantic engine (embeddings) | Error if Ollama unavailable |
@@ -224,7 +223,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - Fallback is triggered when primary returns no results
 - Error types from `thiserror` enable matching on `NoIndex` vs `QueryFailed` vs `NoEmbeddings` (V2)
 
-**Related Requirements:** PRD-FBK-REQ-001 through PRD-FBK-REQ-005, PRD-SIG-REQ-001, PRD-LST-REQ-001, PRD-LST-REQ-002, PRD-DEP-REQ-001, PRD-DEP-REQ-002, PRD-SEM-REQ-001, PRD-SEM-REQ-002, PRD-SEM-REQ-012
+**Related Requirements:** PRD-FBK-REQ-001 through PRD-FBK-REQ-005, PRD-SIG-REQ-001, PRD-DEP-REQ-001, PRD-DEP-REQ-002, PRD-SEM-REQ-001, PRD-SEM-REQ-002, PRD-SEM-REQ-012
 
 ### 4.3 Smart Search Ranker
 
@@ -485,9 +484,10 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Semantic + recursion interaction (PRD-SUM-REQ-009, PRD-SUM-REQ-006):** When both `--semantic` and `--depth N` (or `--recursive`) are specified, the LLM description is generated only for the top-level target path, not for each child. Generating per-child descriptions would be prohibitively slow (1-5s per Ollama call).
 - **Configuration (DR-018):** `[llm]` section in config.toml with `model` key (default: `"llama3.2:3b"`). Additional keys: `generate_url` (default: `"http://localhost:11434/api/generate"`).
 - **Auto-init (PRD-SUM-REQ-016):** Consistent with PRD-AUT behavior — builds index on first use.
-- **MCP exposure (PRD-SUM-REQ-018):** `wonk_summary` tool with parameters: path (required), detail (optional: rich|light|symbols), depth (optional integer), recursive (optional boolean), semantic (optional boolean), format (json|toon).
+- **MCP exposure (PRD-SUM-REQ-018):** `wonk_summary` tool with parameters: path (required), detail (optional: rich|light|symbols), depth (optional integer), recursive (optional boolean), semantic (optional boolean), tree (optional boolean), format (json|toon).
+- **Symbol listing (PRD-SUM-REQ-019/020):** `wonk ls` merged into `wonk summary`. With `--detail rich`, symbols include line/col/end_line/scope. With `--tree`, symbols are displayed in scope-grouped hierarchy.
 
-**Related Requirements:** PRD-SUM-REQ-001 through PRD-SUM-REQ-018
+**Related Requirements:** PRD-SUM-REQ-001 through PRD-SUM-REQ-020
 
 ### 4.14 Call Graph [V3]
 
@@ -524,20 +524,19 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - Consumes: All query backends (Query Router, Semantic Search, Clustering Engine, Impact Analyzer, Source Display, Code Summary Engine, Call Graph, Flow Detection [V4], Blast Radius [V4], Scoped Change Detection [V4], Unified Symbol Context [V4])
 
 **Key Design Notes:**
-- **Tool manifest (19 tools):**
+- **Tool manifest (18 tools):**
   | Tool | Backend | Added |
   |------|---------|-------|
   | `wonk_search` | Text Search + Smart Search Ranker (+ RRF [V4]) | V1 |
   | `wonk_sym` | Structural Index | V1 |
   | `wonk_ref` | Structural Index | V1 |
   | `wonk_sig` | Structural Index | V1 |
-  | `wonk_ls` | Structural Index | V1 |
   | `wonk_deps` | Structural Index | V1 |
   | `wonk_rdeps` | Structural Index | V1 |
   | `wonk_init` | Pipeline | V1 |
   | `wonk_status` | SQLite Database | V1 |
   | `wonk_show` | Source Display | V3 |
-  | `wonk_summary` | Code Summary Engine | V3 |
+  | `wonk_summary` | Code Summary Engine (includes symbol listing + tree) | V3 |
   | `wonk_callers` | Call Graph | V3 |
   | `wonk_callees` | Call Graph | V3 |
   | `wonk_callpath` | Call Graph | V3 |
@@ -1812,7 +1811,7 @@ GitHub Actions workflow:
 
 **Consequences:**
 - `mcp.rs` gains 5 new tool handler functions routing to `show.rs`, `summary.rs`, and `callgraph.rs`
-- Tool count increases from 9 to 14
+- Tool count increases from 9 to 14 (later: `wonk_ls` merged into `wonk_summary`, reducing count by 1)
 - No changes to existing tool contracts
 - MCP clients (Claude Code, Aider, etc.) discover new tools automatically via `tools/list`
 

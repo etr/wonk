@@ -114,21 +114,6 @@ pub struct FileEntry {
     pub path: String,
 }
 
-/// A symbol entry for `ls --tree` results, with an indent level for nesting.
-#[derive(Debug, Clone, Serialize)]
-pub struct LsSymbolEntry {
-    pub name: String,
-    pub kind: String,
-    pub file: String,
-    pub line: usize,
-    /// Nesting depth (0 = top-level). Skipped in JSON output.
-    #[serde(skip)]
-    pub indent: usize,
-    /// Parent scope name (e.g. class name for a method). Skipped when `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
-}
-
 /// A dependency edge for `deps` / `rdeps` results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepOutput {
@@ -280,12 +265,21 @@ pub struct SummaryOutput {
     pub import_edges: Vec<ImportEdgeOutput>,
 }
 
-/// A top-level symbol in a summary output.
+/// A symbol in a summary output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummarySymbolOutput {
     pub name: String,
     pub kind: String,
     pub signature: String,
+    pub line: usize,
+    pub col: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Nesting depth for tree display (0 = top-level). Skipped in serialization.
+    #[serde(skip)]
+    pub indent: usize,
 }
 
 /// An intra-directory import edge in a summary output.
@@ -346,15 +340,34 @@ impl SummaryOutput {
 
         let children = sr.children.iter().map(SummaryOutput::from_result).collect();
 
-        let symbols = sr
-            .symbols
-            .iter()
-            .map(|s| SummarySymbolOutput {
-                name: s.name.clone(),
-                kind: s.kind.clone(),
-                signature: s.signature.clone(),
-            })
-            .collect();
+        let symbols = {
+            // Build a set of top-level symbol names for scope-based indent computation.
+            let parent_names: std::collections::HashSet<&str> = sr
+                .symbols
+                .iter()
+                .filter(|s| s.scope.is_none())
+                .map(|s| s.name.as_str())
+                .collect();
+            sr.symbols
+                .iter()
+                .map(|s| {
+                    let indent = match &s.scope {
+                        Some(scope) if parent_names.contains(scope.as_str()) => 1,
+                        _ => 0,
+                    };
+                    SummarySymbolOutput {
+                        name: s.name.clone(),
+                        kind: s.kind.clone(),
+                        signature: s.signature.clone(),
+                        line: s.line,
+                        col: s.col,
+                        end_line: s.end_line,
+                        scope: s.scope.clone(),
+                        indent,
+                    }
+                })
+                .collect()
+        };
 
         let import_edges = sr
             .import_edges
@@ -1045,37 +1058,6 @@ impl<W: Write> Formatter<W> {
             fmt.write_line_no(sig.line)?;
             fmt.write_sep()?;
             writeln!(fmt.writer, "  {}", sig.signature)
-        }
-    }
-
-    /// Format a single ls-symbol entry (used by `wonk ls --tree`).
-    ///
-    /// Grep format: `file:line:  [indent]kind name`
-    /// JSON: all fields except `indent`.
-    pub fn format_ls_symbol(&mut self, entry: &LsSymbolEntry) -> std::io::Result<BudgetStatus> {
-        if !self.has_budget() {
-            Self::render_ls_symbol(self, entry)?;
-            return Ok(BudgetStatus::Written);
-        }
-        let entry = entry.clone();
-        self.budgeted_write(move |fmt| Self::render_ls_symbol(fmt, &entry))
-    }
-
-    /// Shared render logic for an ls-symbol entry.
-    fn render_ls_symbol<W2: Write>(
-        fmt: &mut Formatter<W2>,
-        entry: &LsSymbolEntry,
-    ) -> std::io::Result<()> {
-        if fmt.format.is_structured() {
-            let line = Self::serialize_structured(fmt.format, entry)?;
-            writeln!(fmt.writer, "{line}")
-        } else {
-            let padding = "  ".repeat(entry.indent + 1);
-            fmt.write_file(&entry.file)?;
-            fmt.write_sep()?;
-            fmt.write_line_no(entry.line)?;
-            fmt.write_sep()?;
-            writeln!(fmt.writer, "{}{} {}", padding, entry.kind, entry.name)
         }
     }
 
@@ -2364,86 +2346,6 @@ mod tests {
         let err = WonkError::Db(DbError::NoIndex);
         let code = super::format_error(&err, true);
         assert_eq!(code, 1);
-    }
-
-    // -- LsSymbolEntry -------------------------------------------------------
-
-    #[test]
-    fn ls_symbol_grep_format_flat() {
-        let entry = LsSymbolEntry {
-            name: "main".into(),
-            kind: "function".into(),
-            file: "src/main.rs".into(),
-            line: 1,
-            indent: 0,
-            scope: None,
-        };
-        let out = render(OutputFormat::Grep, |fmt| fmt.format_ls_symbol(&entry));
-        assert_eq!(out, "src/main.rs:1:  function main\n");
-    }
-
-    #[test]
-    fn ls_symbol_grep_format_indented() {
-        let entry = LsSymbolEntry {
-            name: "process".into(),
-            kind: "method".into(),
-            file: "src/lib.rs".into(),
-            line: 15,
-            indent: 1,
-            scope: Some("Worker".into()),
-        };
-        let out = render(OutputFormat::Grep, |fmt| fmt.format_ls_symbol(&entry));
-        assert_eq!(out, "src/lib.rs:15:    method process\n");
-    }
-
-    #[test]
-    fn ls_symbol_grep_format_deeply_nested() {
-        let entry = LsSymbolEntry {
-            name: "inner".into(),
-            kind: "function".into(),
-            file: "src/lib.rs".into(),
-            line: 30,
-            indent: 2,
-            scope: Some("Outer".into()),
-        };
-        let out = render(OutputFormat::Grep, |fmt| fmt.format_ls_symbol(&entry));
-        assert_eq!(out, "src/lib.rs:30:      function inner\n");
-    }
-
-    #[test]
-    fn ls_symbol_json_format_includes_all_fields() {
-        let entry = LsSymbolEntry {
-            name: "process".into(),
-            kind: "method".into(),
-            file: "src/lib.rs".into(),
-            line: 15,
-            indent: 1,
-            scope: Some("Worker".into()),
-        };
-        let out = render(OutputFormat::Json, |fmt| fmt.format_ls_symbol(&entry));
-        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-        assert_eq!(v["name"], "process");
-        assert_eq!(v["kind"], "method");
-        assert_eq!(v["file"], "src/lib.rs");
-        assert_eq!(v["line"], 15);
-        assert_eq!(v["scope"], "Worker");
-    }
-
-    #[test]
-    fn ls_symbol_json_format_skips_indent() {
-        let entry = LsSymbolEntry {
-            name: "main".into(),
-            kind: "function".into(),
-            file: "src/main.rs".into(),
-            line: 1,
-            indent: 2,
-            scope: None,
-        };
-        let out = render(OutputFormat::Json, |fmt| fmt.format_ls_symbol(&entry));
-        // indent should NOT appear in JSON
-        assert!(!out.contains("indent"));
-        // scope should be omitted when None
-        assert!(!out.contains("scope"));
     }
 
     // -- Color output tests -------------------------------------------------

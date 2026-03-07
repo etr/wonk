@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::cli::{Cli, Command, ContextArgs, DaemonCommand, LsArgs, McpCommand, ReposCommand};
+use crate::cli::{Cli, Command, ContextArgs, DaemonCommand, McpCommand, ReposCommand};
 use crate::db;
 use crate::errors::DbError;
 #[cfg(test)]
@@ -19,8 +19,8 @@ use crate::errors::SearchError;
 use crate::output::{
     self, AffectedFlowOutput, BlastOutput, BudgetStatus, CallPathHopOutput, CalleeOutput,
     CallerOutput, ChangedSymbolOutput, ChangesOutput, FlowOutput, FlowStepOutput, Formatter,
-    LsSymbolEntry, OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput,
-    SignatureOutput, SummaryOutput, SymbolOutput,
+    OutputFormat, RefOutput, SearchOutput, SemanticOutput, ShowOutput, SignatureOutput,
+    SummaryOutput, SymbolOutput,
 };
 use crate::pipeline;
 use crate::progress::{self, Progress};
@@ -322,10 +322,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
-        }
-        Command::Ls(args) => {
-            let truncated = dispatch_ls(args, suppress, &mut fmt)?;
             emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Deps(args) => {
@@ -1287,6 +1283,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 depth,
                 suppress,
                 semantic,
+                tree: args.tree,
             };
 
             let result = crate::summary::summarize_path(&conn, &args.path, &options)?;
@@ -1680,7 +1677,6 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Sym(_)
             | Command::Ref(_)
             | Command::Sig(_)
-            | Command::Ls(_)
             | Command::Deps(_)
             | Command::Rdeps(_)
             | Command::Ask(_)
@@ -1916,82 +1912,6 @@ fn dispatch_daemon_list<W: io::Write>(
         }
     }
     Ok(())
-}
-
-/// Handle `wonk ls <path>` dispatch.
-///
-/// Lists symbols in a single file or recursively for a directory.
-/// When `--tree` is set, groups symbols by scope hierarchy (e.g. methods
-/// under their parent class).
-/// Returns the number of results truncated by budget (0 if no budget active).
-fn dispatch_ls<W: io::Write>(
-    args: LsArgs,
-    suppress: bool,
-    fmt: &mut Formatter<W>,
-) -> Result<usize> {
-    let path = PathBuf::from(&args.path);
-    let repo_root =
-        db::find_repo_root(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))).ok();
-    let router = QueryRouter::new(repo_root, false);
-
-    if !router.has_index() {
-        output::print_hint(
-            "no index found; falling back to grep (run `wonk init` for faster results)",
-            suppress,
-        );
-    }
-
-    // Collect file paths: single file or recursive directory walk.
-    let files: Vec<String> = if path.is_dir() {
-        let walker = crate::walker::Walker::new(&path);
-        walker
-            .collect_paths()
-            .into_iter()
-            .filter(|p| p.is_file())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect()
-    } else {
-        vec![args.path.clone()]
-    };
-
-    let mut all_symbols = Vec::new();
-    for file in &files {
-        let symbols = router.query_symbols_in_file(file, args.tree)?;
-        all_symbols.extend(symbols);
-    }
-
-    if all_symbols.is_empty() {
-        output::print_hint("no symbols found", suppress);
-    }
-
-    let mut truncated = 0usize;
-    if args.tree {
-        let entries = build_tree_entries(&all_symbols);
-        for entry in &entries {
-            if fmt.format_ls_symbol(entry)? == BudgetStatus::Skipped {
-                truncated += 1;
-            }
-        }
-    } else {
-        for sym in &all_symbols {
-            let out = SymbolOutput {
-                name: sym.name.clone(),
-                kind: sym.kind.to_string(),
-                file: sym.file.clone(),
-                line: sym.line,
-                col: sym.col,
-                end_line: sym.end_line,
-                scope: sym.scope.clone(),
-                signature: sym.signature.clone(),
-                language: sym.language.clone(),
-            };
-            if fmt.format_symbol(&out)? == BudgetStatus::Skipped {
-                truncated += 1;
-            }
-        }
-    }
-
-    Ok(truncated)
 }
 
 // ---------------------------------------------------------------------------
@@ -2703,43 +2623,6 @@ fn extract_symbol_name(content: &str) -> String {
         .unwrap_or("unknown")
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Tree-view helpers
-// ---------------------------------------------------------------------------
-
-/// Convert a flat list of symbols into `LsSymbolEntry` items with indent
-/// levels derived from the `scope` field.
-///
-/// Symbols whose `scope` matches the `name` of an earlier symbol in the
-/// list are indented one level deeper. Symbols with no scope (or a scope
-/// that doesn't match any known parent) are placed at the top level.
-pub fn build_tree_entries(symbols: &[Symbol]) -> Vec<LsSymbolEntry> {
-    // Build a set of known top-level symbol names for scope matching.
-    let parent_names: std::collections::HashSet<&str> = symbols
-        .iter()
-        .filter(|s| s.scope.is_none())
-        .map(|s| s.name.as_str())
-        .collect();
-
-    symbols
-        .iter()
-        .map(|sym| {
-            let indent = match &sym.scope {
-                Some(scope) if parent_names.contains(scope.as_str()) => 1,
-                _ => 0,
-            };
-            LsSymbolEntry {
-                name: sym.name.clone(),
-                kind: sym.kind.to_string(),
-                file: sym.file.clone(),
-                line: sym.line,
-                indent,
-                scope: sym.scope.clone(),
-            }
-        })
         .collect()
 }
 
@@ -4415,342 +4298,6 @@ mod tests {
         assert_eq!(results[1].file, "src/main.rs");
     }
 
-    // -- build_tree_entries tests -------------------------------------------
-
-    #[test]
-    fn test_build_tree_entries_empty() {
-        let symbols: Vec<Symbol> = vec![];
-        let entries = build_tree_entries(&symbols);
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn test_build_tree_entries_flat_no_scopes() {
-        let symbols = vec![
-            Symbol {
-                name: "main".into(),
-                kind: SymbolKind::Function,
-                file: "src/main.rs".into(),
-                line: 1,
-                col: 0,
-                end_line: Some(10),
-                scope: None,
-                signature: "fn main()".into(),
-                language: "rust".into(),
-            },
-            Symbol {
-                name: "helper".into(),
-                kind: SymbolKind::Function,
-                file: "src/main.rs".into(),
-                line: 12,
-                col: 0,
-                end_line: Some(20),
-                scope: None,
-                signature: "fn helper()".into(),
-                language: "rust".into(),
-            },
-        ];
-        let entries = build_tree_entries(&symbols);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "main");
-        assert_eq!(entries[0].indent, 0);
-        assert!(entries[0].scope.is_none());
-        assert_eq!(entries[1].name, "helper");
-        assert_eq!(entries[1].indent, 0);
-    }
-
-    #[test]
-    fn test_build_tree_entries_class_with_methods() {
-        let symbols = vec![
-            Symbol {
-                name: "Worker".into(),
-                kind: SymbolKind::Class,
-                file: "src/lib.py".into(),
-                line: 1,
-                col: 0,
-                end_line: Some(30),
-                scope: None,
-                signature: "class Worker:".into(),
-                language: "python".into(),
-            },
-            Symbol {
-                name: "process".into(),
-                kind: SymbolKind::Method,
-                file: "src/lib.py".into(),
-                line: 5,
-                col: 4,
-                end_line: Some(15),
-                scope: Some("Worker".into()),
-                signature: "def process(self):".into(),
-                language: "python".into(),
-            },
-            Symbol {
-                name: "cleanup".into(),
-                kind: SymbolKind::Method,
-                file: "src/lib.py".into(),
-                line: 17,
-                col: 4,
-                end_line: Some(25),
-                scope: Some("Worker".into()),
-                signature: "def cleanup(self):".into(),
-                language: "python".into(),
-            },
-            Symbol {
-                name: "standalone".into(),
-                kind: SymbolKind::Function,
-                file: "src/lib.py".into(),
-                line: 32,
-                col: 0,
-                end_line: Some(40),
-                scope: None,
-                signature: "def standalone():".into(),
-                language: "python".into(),
-            },
-        ];
-        let entries = build_tree_entries(&symbols);
-        assert_eq!(entries.len(), 4);
-
-        // Worker is top-level
-        assert_eq!(entries[0].name, "Worker");
-        assert_eq!(entries[0].indent, 0);
-        assert!(entries[0].scope.is_none());
-
-        // process is nested under Worker
-        assert_eq!(entries[1].name, "process");
-        assert_eq!(entries[1].indent, 1);
-        assert_eq!(entries[1].scope, Some("Worker".into()));
-
-        // cleanup is nested under Worker
-        assert_eq!(entries[2].name, "cleanup");
-        assert_eq!(entries[2].indent, 1);
-        assert_eq!(entries[2].scope, Some("Worker".into()));
-
-        // standalone is top-level
-        assert_eq!(entries[3].name, "standalone");
-        assert_eq!(entries[3].indent, 0);
-        assert!(entries[3].scope.is_none());
-    }
-
-    #[test]
-    fn test_build_tree_entries_preserves_file_info() {
-        let symbols = vec![
-            Symbol {
-                name: "MyStruct".into(),
-                kind: SymbolKind::Struct,
-                file: "src/types.rs".into(),
-                line: 5,
-                col: 0,
-                end_line: Some(20),
-                scope: None,
-                signature: "struct MyStruct".into(),
-                language: "rust".into(),
-            },
-            Symbol {
-                name: "new".into(),
-                kind: SymbolKind::Method,
-                file: "src/types.rs".into(),
-                line: 10,
-                col: 4,
-                end_line: Some(15),
-                scope: Some("MyStruct".into()),
-                signature: "fn new() -> Self".into(),
-                language: "rust".into(),
-            },
-        ];
-        let entries = build_tree_entries(&symbols);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].file, "src/types.rs");
-        assert_eq!(entries[0].line, 5);
-        assert_eq!(entries[0].kind, "struct");
-        assert_eq!(entries[1].file, "src/types.rs");
-        assert_eq!(entries[1].line, 10);
-        assert_eq!(entries[1].kind, "method");
-    }
-
-    // -- Ls dispatch integration tests ----------------------------------------
-
-    /// Helper: run ls query through QueryRouter and format results.
-    fn run_ls_query(router: &QueryRouter, path: &str, tree: bool, format: OutputFormat) -> String {
-        let results = router.query_symbols_in_file(path, tree).unwrap();
-        let mut buf = Vec::new();
-        {
-            let mut fmt = Formatter::new(&mut buf, format, false);
-            if tree {
-                let entries = build_tree_entries(&results);
-                for entry in &entries {
-                    fmt.format_ls_symbol(entry).unwrap();
-                }
-            } else {
-                for sym in &results {
-                    let out = SymbolOutput {
-                        name: sym.name.clone(),
-                        kind: sym.kind.to_string(),
-                        file: sym.file.clone(),
-                        line: sym.line,
-                        col: sym.col,
-                        end_line: sym.end_line,
-                        scope: sym.scope.clone(),
-                        signature: sym.signature.clone(),
-                        language: sym.language.clone(),
-                    };
-                    fmt.format_symbol(&out).unwrap();
-                }
-            }
-        }
-        String::from_utf8(buf).unwrap()
-    }
-
-    #[test]
-    fn test_ls_flat_from_db() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("index.db");
-        let conn = db::open(&db_path).unwrap();
-
-        conn.execute(
-            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params!["main", "function", "src/main.rs", 1, 0, "rust", "fn main()"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                "helper",
-                "function",
-                "src/main.rs",
-                10,
-                0,
-                "rust",
-                "fn helper()"
-            ],
-        )
-        .unwrap();
-
-        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_ls_query(&router, "src/main.rs", false, OutputFormat::Grep);
-        let lines: Vec<&str> = output.trim().lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(output.contains("fn main()"));
-        assert!(output.contains("fn helper()"));
-    }
-
-    #[test]
-    fn test_ls_tree_from_db() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("index.db");
-        let conn = db::open(&db_path).unwrap();
-
-        conn.execute(
-            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                "Worker",
-                "class",
-                "src/lib.py",
-                1,
-                0,
-                "python",
-                "class Worker:"
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO symbols (name, kind, file, line, col, scope, language, signature) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                "process",
-                "method",
-                "src/lib.py",
-                5,
-                4,
-                "Worker",
-                "python",
-                "def process(self):"
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                "standalone",
-                "function",
-                "src/lib.py",
-                20,
-                0,
-                "python",
-                "def standalone():"
-            ],
-        )
-        .unwrap();
-
-        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_ls_query(&router, "src/lib.py", true, OutputFormat::Grep);
-        let lines: Vec<&str> = output.trim().lines().collect();
-        assert_eq!(lines.len(), 3);
-
-        // Worker at top level (2 spaces indent)
-        assert!(lines[0].contains("  class Worker"));
-        // process indented (4 spaces indent)
-        assert!(lines[1].contains("    method process"));
-        // standalone at top level
-        assert!(lines[2].contains("  function standalone"));
-    }
-
-    #[test]
-    fn test_ls_tree_json_from_db() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("index.db");
-        let conn = db::open(&db_path).unwrap();
-
-        conn.execute(
-            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                "Worker",
-                "class",
-                "src/lib.py",
-                1,
-                0,
-                "python",
-                "class Worker:"
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO symbols (name, kind, file, line, col, scope, language, signature) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                "process",
-                "method",
-                "src/lib.py",
-                5,
-                4,
-                "Worker",
-                "python",
-                "def process(self):"
-            ],
-        )
-        .unwrap();
-
-        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
-        let output = run_ls_query(&router, "src/lib.py", true, OutputFormat::Json);
-        let lines: Vec<&str> = output.trim().lines().collect();
-        assert_eq!(lines.len(), 2);
-
-        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(v0["name"], "Worker");
-        assert_eq!(v0["kind"], "class");
-        // indent should NOT be in JSON
-        assert!(v0.get("indent").is_none());
-
-        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(v1["name"], "process");
-        assert_eq!(v1["kind"], "method");
-        assert_eq!(v1["scope"], "Worker");
-    }
-
     #[test]
     fn test_ref_context_lines_included() {
         let dir = TempDir::new().unwrap();
@@ -4801,15 +4348,6 @@ mod tests {
             name: "foo".into(),
             kind: None,
             exact: false,
-        });
-        assert!(is_query_command(&cmd));
-    }
-
-    #[test]
-    fn test_is_query_command_ls() {
-        let cmd = Command::Ls(LsArgs {
-            path: ".".into(),
-            tree: false,
         });
         assert!(is_query_command(&cmd));
     }

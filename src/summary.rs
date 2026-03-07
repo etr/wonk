@@ -26,6 +26,8 @@ pub struct SummaryOptions {
     /// LLM config for `--semantic` descriptions.
     /// `None` means structural only; `Some` triggers LLM generation.
     pub semantic: Option<LlmConfig>,
+    /// When true, include all symbols (including scoped) for tree display.
+    pub tree: bool,
 }
 
 /// Escape SQLite LIKE metacharacters (`%` and `_`) in a string.
@@ -110,9 +112,9 @@ pub fn summarize_path(
         vec![]
     };
 
-    // For Rich detail on files, include top-level symbols.
+    // For Rich detail on files, include symbols.
     let symbols = if options.detail == DetailLevel::Rich && path_type == SummaryPathType::File {
-        symbols_for_file(conn, &normalized)?
+        symbols_for_file(conn, &normalized, options.tree)?
     } else {
         vec![]
     };
@@ -248,6 +250,18 @@ fn should_recurse(max_depth: Option<usize>, current_depth: usize) -> bool {
     }
 }
 
+/// (file, kind, name, signature, line, col, end_line, scope) per symbol.
+type SymbolRow = (
+    String,
+    String,
+    String,
+    String,
+    usize,
+    usize,
+    Option<usize>,
+    Option<String>,
+);
+
 /// Pre-fetched subtree data for fully in-memory metric aggregation.
 /// Loaded once with 4 SQL queries; all recursive child building uses this
 /// data with zero additional SQL.
@@ -256,8 +270,8 @@ struct SubtreeData {
     paths: Vec<String>,
     /// (path, language, line_count) for every file in the subtree.
     file_rows: Vec<(String, String, usize)>,
-    /// (file, kind, name, signature, scope) for every symbol in the subtree.
-    symbol_rows: Vec<(String, String, String, String, Option<String>)>,
+    /// (file, kind, name, signature, line, col, end_line, scope) for every symbol in the subtree.
+    symbol_rows: Vec<SymbolRow>,
     /// (source_file, import_path) for every import in the subtree.
     import_rows: Vec<(String, String)>,
 }
@@ -289,17 +303,20 @@ impl SubtreeData {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut sym_stmt = conn.prepare_cached(
-            "SELECT file, kind, name, COALESCE(signature, ''), scope \
+            "SELECT file, kind, name, COALESCE(signature, ''), line, col, end_line, scope \
              FROM symbols WHERE file LIKE ?1 ESCAPE '\\'",
         )?;
-        let symbol_rows: Vec<(String, String, String, String, Option<String>)> = sym_stmt
+        let symbol_rows: Vec<SymbolRow> = sym_stmt
             .query_map(rusqlite::params![like_pattern], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, i64>(5)? as usize,
+                    row.get::<_, Option<i64>>(6)?.map(|v| v as usize),
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -339,7 +356,7 @@ impl SubtreeData {
         }
 
         let mut sym_map: BTreeMap<String, usize> = BTreeMap::new();
-        for (file, kind, _, _, _) in &self.symbol_rows {
+        for (file, kind, _, _, _, _, _, _) in &self.symbol_rows {
             if (is_file && file == prefix) || (!is_file && file.starts_with(prefix)) {
                 *sym_map.entry(kind.clone()).or_default() += 1;
             }
@@ -361,18 +378,43 @@ impl SubtreeData {
         }
     }
 
-    /// Return top-level symbols for a specific file. Capped at 50.
-    fn symbols_for_file(&self, file: &str) -> Vec<SummarySymbol> {
-        self.symbol_rows
+    /// Return symbols for a specific file.
+    /// When `tree` is false, returns only top-level symbols (scope IS NULL), capped at 50.
+    /// When `tree` is true, returns ALL symbols (no scope filter or cap).
+    fn symbols_for_file(&self, file: &str, tree: bool) -> Vec<SummarySymbol> {
+        let iter = self
+            .symbol_rows
             .iter()
-            .filter(|(f, _, _, _, scope)| f == file && scope.is_none())
-            .take(50)
-            .map(|(_, kind, name, sig, _)| SummarySymbol {
-                name: name.clone(),
-                kind: kind.clone(),
-                signature: sig.clone(),
-            })
+            .filter(|(f, _, _, _, _, _, _, _)| f == file);
+        if tree {
+            iter.map(
+                |(_, kind, name, sig, line, col, end_line, scope)| SummarySymbol {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    signature: sig.clone(),
+                    line: *line,
+                    col: *col,
+                    end_line: *end_line,
+                    scope: scope.clone(),
+                },
+            )
             .collect()
+        } else {
+            iter.filter(|(_, _, _, _, _, _, _, scope)| scope.is_none())
+                .take(50)
+                .map(
+                    |(_, kind, name, sig, line, col, end_line, _)| SummarySymbol {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        signature: sig.clone(),
+                        line: *line,
+                        col: *col,
+                        end_line: *end_line,
+                        scope: None,
+                    },
+                )
+                .collect()
+        }
     }
 
     /// Return intra-directory import edges for files under `prefix`.
@@ -428,19 +470,29 @@ impl SubtreeData {
     }
 }
 
-/// Query top-level symbols for a single file directly from the DB.
+/// Query symbols for a single file directly from the DB.
 /// Used when summarizing a file at the top level (no SubtreeData loaded).
-fn symbols_for_file(conn: &Connection, file: &str) -> Result<Vec<SummarySymbol>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT kind, name, COALESCE(signature, '') FROM symbols \
-         WHERE file = ?1 AND scope IS NULL LIMIT 50",
-    )?;
+/// When `tree` is false, returns only top-level symbols (scope IS NULL), capped at 50.
+/// When `tree` is true, returns ALL symbols (no scope filter or cap).
+fn symbols_for_file(conn: &Connection, file: &str, tree: bool) -> Result<Vec<SummarySymbol>> {
+    let sql = if tree {
+        "SELECT kind, name, COALESCE(signature, ''), line, col, end_line, scope \
+         FROM symbols WHERE file = ?1"
+    } else {
+        "SELECT kind, name, COALESCE(signature, ''), line, col, end_line, scope \
+         FROM symbols WHERE file = ?1 AND scope IS NULL LIMIT 50"
+    };
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt
         .query_map(rusqlite::params![file], |row| {
             Ok(SummarySymbol {
                 kind: row.get::<_, String>(0)?,
                 name: row.get::<_, String>(1)?,
                 signature: row.get::<_, String>(2)?,
+                line: row.get::<_, i64>(3)? as usize,
+                col: row.get::<_, i64>(4)? as usize,
+                end_line: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+                scope: row.get::<_, Option<String>>(6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -495,11 +547,11 @@ fn build_children_from_data(
             vec![]
         };
 
-        // For Rich detail: file children get top-level symbols,
+        // For Rich detail: file children get symbols,
         // directory children get intra-directory import edges.
         let (symbols, import_edges) = if options.detail == DetailLevel::Rich {
             if is_file {
-                (data.symbols_for_file(child_path), vec![])
+                (data.symbols_for_file(child_path, options.tree), vec![])
             } else {
                 (vec![], data.import_edges_for_dir(child_path))
             }
@@ -626,6 +678,7 @@ mod tests {
             depth: Some(0),
             suppress: true,
             semantic: None,
+            tree: false,
         }
     }
 

@@ -491,31 +491,6 @@ fn tool_definitions() -> &'static Vec<Tool> {
                 }),
             },
             Tool {
-                name: "wonk_ls",
-                description: "List symbols in a file or directory. For architecture overview of a directory, prefer wonk_summary with depth>=1.",
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File or directory path (defaults to repo root)",
-                            "default": "."
-                        },
-                        "tree": {
-                            "type": "boolean",
-                            "description": "Show symbols in a tree structure grouped by scope",
-                            "default": false
-                        },
-                        "format": {
-                            "type": "string",
-                            "enum": ["json", "toon"],
-                            "description": "Output format (default: json)",
-                            "default": "json"
-                        }
-                    }
-                }),
-            },
-            Tool {
                 name: "wonk_deps",
                 description: "Show files imported/used by a file.",
                 input_schema: serde_json::json!({
@@ -728,7 +703,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_summary",
-                description: "Architecture overview: structural summary of a file or directory. START HERE for 'what modules exist', 'how is this organized', or 'explain this crate/package'. With detail=rich and depth>=1, returns per-file symbol signatures and import edges in a single call.",
+                description: "Architecture overview and symbol listing. START HERE for 'what modules exist', 'how is this organized', or 'explain this crate/package'. With detail=rich and depth>=1, returns per-file symbols (with line/col/scope) and import edges. Use tree=true for scope-grouped hierarchy (replaces wonk_ls).",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -755,6 +730,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "semantic": {
                             "type": "boolean",
                             "description": "Include AI-generated description via Ollama LLM (requires Ollama running)",
+                            "default": false
+                        },
+                        "tree": {
+                            "type": "boolean",
+                            "description": "Show all symbols (including scoped) in tree hierarchy; with detail=rich returns scope-grouped symbols",
                             "default": false
                         },
                         "budget": {
@@ -1283,7 +1263,6 @@ impl McpServer {
             "wonk_sym" => self.tool_sym(call.arguments),
             "wonk_ref" => self.tool_ref(call.arguments),
             "wonk_sig" => self.tool_sig(call.arguments),
-            "wonk_ls" => self.tool_ls(call.arguments),
             "wonk_deps" => self.tool_deps(call.arguments),
             "wonk_rdeps" => self.tool_rdeps(call.arguments),
             "wonk_status" => self.tool_status(call.arguments),
@@ -1554,46 +1533,6 @@ impl McpServer {
             })
             .collect();
 
-        format_result(&outputs, format)
-    }
-
-    fn tool_ls(&mut self, args: Value) -> CallToolResult {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let format = extract_format(&args);
-
-        let (conn, repo_root) = match self.resolve_repo(&args) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
-        let path_buf = match validate_path(Path::new(path), &repo_root) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let files: Vec<String> = if path_buf.is_dir() {
-            let walker = crate::walker::Walker::new(&path_buf);
-            walker
-                .collect_paths()
-                .into_iter()
-                .filter(|p| p.is_file())
-                .map(|p| {
-                    p.strip_prefix(&repo_root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect()
-        } else {
-            let rel = path_buf.strip_prefix(&repo_root).unwrap_or(&path_buf);
-            vec![rel.to_string_lossy().into_owned()]
-        };
-        let mut all_symbols = Vec::new();
-        for file in &files {
-            match crate::router::query_symbols_in_file_db(conn, file) {
-                Ok(syms) => all_symbols.extend(syms),
-                Err(e) => return CallToolResult::error(format!("symbol listing failed: {e}")),
-            }
-        }
-        let outputs: Vec<SymbolOutput> = all_symbols.iter().map(symbol_to_output).collect();
         format_result(&outputs, format)
     }
 
@@ -2025,11 +1964,14 @@ impl McpServer {
             None
         };
 
+        let tree = args.get("tree").and_then(|v| v.as_bool()).unwrap_or(false);
+
         let options = crate::summary::SummaryOptions {
             detail,
             depth,
             suppress: true,
             semantic,
+            tree,
         };
 
         let result = match crate::summary::summarize_path(conn, &path, &options) {
@@ -2844,7 +2786,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 22);
     }
 
     #[test]
@@ -3064,7 +3006,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 22);
     }
 
     #[test]

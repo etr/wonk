@@ -551,8 +551,8 @@ Implement `wonk status`, `wonk repos list`, and `wonk repos clean` commands.
 
 ## Milestone 3: Structural Queries
 
-**Goal:** `wonk sym`, `wonk ref`, `wonk sig`, `wonk ls` return results from the index with grep-based fallback.
-**Exit Criteria:** All four query commands return correct results. Fallback to grep works when index has no results.
+**Goal:** `wonk sym`, `wonk ref`, `wonk sig` return results from the index with grep-based fallback. (`wonk ls` was later absorbed into `wonk summary`.)
+**Exit Criteria:** All query commands return correct results. Fallback to grep works when index has no results.
 
 ### TASK-012: Query router with fallback logic
 
@@ -696,11 +696,13 @@ Implement `wonk sig <name>` that displays just the signature lines for matching 
 
 ---
 
-### TASK-016: Symbol listing command (wonk ls)
+### TASK-016: Symbol listing command (wonk ls) — ABSORBED
 
 **Milestone:** M3 - Structural Queries
 **Component:** Query Router, CLI
 **Estimate:** M
+
+**Note:** This task's functionality was absorbed into `wonk summary` (with `--detail rich` and `--tree`). The `wonk ls` subcommand has been removed.
 
 **Goal:**
 Implement `wonk ls <path>` with flat and tree views, including on-demand Tree-sitter fallback.

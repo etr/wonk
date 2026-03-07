@@ -46,7 +46,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `output.rs` | Dual format: grep-compatible (stdout+stderr) or NDJSON (stdout) |
 | `embedding.rs` | Ollama API client, symbol chunking engine, and vector storage — sync HTTP client for embedding generation, context-rich text chunk formatting for `nomic-embed-text`, BLOB storage/retrieval with bytemuck zero-copy deserialization |
 | `show.rs` | Source body retrieval — queries symbol index by name with optional file/kind/exact filters, reads source file lines line..end_line per match, falls back to signature when end_line is absent; shallow mode for containers shows signature + child signatures without bodies |
-| `summary.rs` | Structural summary engine — queries SQLite to aggregate file count, line count, symbol counts by kind, language breakdown, and dependency count for a path; supports three detail levels (rich/light/symbols) and recursive depth traversal |
+| `summary.rs` | Structural summary engine — queries SQLite to aggregate file count, line count, symbol counts by kind, language breakdown, and dependency count for a path; supports three detail levels (rich/light/symbols), recursive depth traversal, symbol listing with location metadata, and `--tree` scope-grouped display (absorbed former `wonk ls`) |
 | `llm.rs` | LLM description generation and caching — content hash computation from (symbol.id, file.hash) pairs, prompt construction from structural metrics, Ollama `/api/generate` sync client, SQLite cache get/store for `wonk summary --semantic` |
 | `impact.rs` | Symbol change detection — Tree-sitter re-parse vs. indexed symbols for Added/Modified/Removed; git CLI wrapper for `--since` file listing; scoped change detection via `ChangeScope` enum and `detect_changes()` with git diff hunk-to-symbol mapping |
 | `daemon.rs` | Background file watcher — double-fork daemonization, PID file, SIGTERM handler, embedding worker thread, daemon status table |
@@ -56,7 +56,7 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `blast.rs` | Blast radius analysis — depth-annotated BFS from a target symbol, severity tiers (WILL BREAK / LIKELY AFFECTED / MAY NEED TESTING), risk level assessment, inheritance integration via type_edges, test file exclusion |
 | `callgraph.rs` | Call graph traversal — BFS callers/callees expansion and callpath shortest-path finder via caller_id JOIN, cycle detection via visited HashSet, depth cap enforcement |
 | `flows.rs` | Entry point detection and flow tracing — SQL anti-join for functions/methods with no indexed callers, forward BFS callee expansion with depth/branching/min-confidence controls |
-| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 19 query tools for AI coding assistants; multi-repo support via optional `repo` parameter and lazy-loaded connections |
+| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 18 query tools for AI coding assistants; multi-repo support via optional `repo` parameter and lazy-loaded connections |
 | `budget.rs` | Token budget tracking (~4 chars/token heuristic) |
 
 ### Key Design Decisions

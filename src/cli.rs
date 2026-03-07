@@ -36,9 +36,6 @@ pub enum Command {
     /// Show function/method signatures
     Sig(SigArgs),
 
-    /// List files in the index
-    Ls(LsArgs),
-
     /// Show dependencies of a file
     Deps(DepsArgs),
 
@@ -158,17 +155,6 @@ pub struct RefArgs {
 pub struct SigArgs {
     /// Function or method name
     pub name: String,
-}
-
-#[derive(clap::Args, Debug)]
-pub struct LsArgs {
-    /// Path to list (defaults to repository root)
-    #[arg(default_value = ".")]
-    pub path: String,
-
-    /// Show files in a tree structure
-    #[arg(long)]
-    pub tree: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -350,6 +336,10 @@ pub struct SummaryArgs {
     /// Include AI-generated description (requires embeddings)
     #[arg(long)]
     pub semantic: bool,
+
+    /// Show symbols in a tree structure grouped by scope
+    #[arg(long)]
+    pub tree: bool,
 }
 
 #[derive(clap::Args, Debug)]

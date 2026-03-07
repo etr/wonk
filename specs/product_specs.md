@@ -178,20 +178,16 @@ Users need to view function/method signatures without opening files.
 
 ---
 
-### 3.6 Symbol Listing (PRD-LST)
+### 3.6 Symbol Listing (PRD-LST) — DEPRECATED
 
-**Problem / outcome**
-Users need to see all symbols defined in a file or directory for navigation.
+Absorbed into PRD-SUM. The `wonk summary` command with `--detail rich` now provides
+full symbol listing (with line, col, end_line, scope, signature) and `--tree` support,
+superseding the former `wonk ls` subcommand.
 
-**In scope**
-- Flat and tree-view listing of symbols per file/directory
-
-**Out of scope**
-- LLM-generated directory summaries (V2)
-
-**EARS Requirements**
-- `PRD-LST-REQ-001` When the user runs `wonk ls <path>` then the system shall list all symbols defined in the specified file or directory.
-- `PRD-LST-REQ-002` When the user provides `--tree` then the system shall display symbols with nesting hierarchy.
+Original requirements PRD-LST-REQ-001 and PRD-LST-REQ-002 are now satisfied by:
+- PRD-SUM-REQ-001/002 (symbol listing via rich detail)
+- PRD-SUM-REQ-019 (tree display via --tree flag)
+- PRD-SUM-REQ-020 (per-symbol location metadata)
 
 **Acceptance criteria**
 - Lists all symbols in a file
@@ -340,7 +336,7 @@ The tool must always return useful results even when the index is incomplete or 
 - `PRD-FBK-REQ-001` If `wonk sym` finds no results in the index then the system shall fall back to grep-based search with heuristic patterns for definitions.
 - `PRD-FBK-REQ-002` If `wonk ref` finds no results in the index then the system shall fall back to grep-based search for name occurrences.
 - `PRD-FBK-REQ-003` If `wonk deps` finds no import data in the index then the system shall fall back to grep-based search for import/require statements.
-- `PRD-FBK-REQ-004` If `wonk ls` finds no symbols in the index for a file then the system shall perform an on-demand Tree-sitter parse.
+- `PRD-FBK-REQ-004` ~~If `wonk ls` finds no symbols in the index for a file then the system shall perform an on-demand Tree-sitter parse.~~ (Deprecated: `wonk ls` merged into `wonk summary`)
 - `PRD-FBK-REQ-005` If a file's language is not supported by Tree-sitter then the system shall still include it in text search results.
 
 **Acceptance criteria**
@@ -642,11 +638,13 @@ LLM coding agents need two tool calls to see a symbol's source code: one to look
 ### 3.21 Code Summary (PRD-SUM)
 
 **Problem / outcome**
-LLM coding agents and developers need a quick structural and semantic overview of files and directories — what's in them, how complex they are, and what they do — without manually reading every file. The existing `wonk ls` shows individual symbols but provides no aggregate metrics or natural-language descriptions.
+LLM coding agents and developers need a quick structural and semantic overview of files and directories — what's in them, how complex they are, and what they do — without manually reading every file. This command also serves as the symbol listing tool (formerly `wonk ls`).
 
 **In scope**
-- New `wonk summary <path>` subcommand
+- `wonk summary <path>` subcommand (also replaces `wonk ls`)
 - Three detail levels for structural metrics: rich (default), light, symbols-only
+- Per-symbol location metadata (line, col, end_line, scope) in rich detail
+- `--tree` flag for scope-grouped symbol display
 - Configurable recursion depth (`--depth N`) for hierarchical summaries
 - LLM-generated natural-language descriptions via `--semantic` flag (Ollama `/api/generate`)
 - LLM generation model configuration in `[llm]` section of existing layered config.toml
@@ -677,7 +675,9 @@ LLM coding agents and developers need a quick structural and semantic overview o
 - `PRD-SUM-REQ-015` If no `[llm].model` is configured when `--semantic` is requested then the system shall use `llama3.2:3b` as the default generation model. If the model is not available in Ollama then the system shall display an error instructing the user to pull the model or configure an alternative in `config.toml`.
 - `PRD-SUM-REQ-016` When `wonk summary` is invoked without an existing index then the system shall auto-initialize the index consistent with PRD-AUT behavior.
 - `PRD-SUM-REQ-017` When output format is JSON or TOON then the system shall include structured fields: path, type (file|directory), detail_level, metrics (object), children (array, if recursive), description (string, if `--semantic`).
-- `PRD-SUM-REQ-018` The system shall expose `wonk_summary` as an MCP tool with parameters: path (required), detail (optional: rich|light|symbols), depth (optional integer), recursive (optional boolean), semantic (optional boolean), format (json|toon).
+- `PRD-SUM-REQ-018` The system shall expose `wonk_summary` as an MCP tool with parameters: path (required), detail (optional: rich|light|symbols), depth (optional integer), recursive (optional boolean), semantic (optional boolean), tree (optional boolean), format (json|toon).
+- `PRD-SUM-REQ-019` When `--tree` is provided with `--detail rich` then the system shall display symbols with scope-based nesting hierarchy (methods indented under classes).
+- `PRD-SUM-REQ-020` When `--detail rich` is used then each symbol in the output shall include `line`, `col`, `end_line`, and `scope` fields in addition to `name`, `kind`, and `signature`.
 
 **Acceptance criteria**
 - `wonk summary src/` displays file count, line count, symbol counts by kind, language breakdown, dependency count
@@ -1011,7 +1011,7 @@ When an LLM agent works across related repositories, it must start a separate MC
 | Symbol Lookup | PRD-SYM-REQ-001 to 004 | 4 |
 | Reference Finding | PRD-REF-REQ-001 to 003 | 3 |
 | Signature Display | PRD-SIG-REQ-001 | 1 |
-| Symbol Listing | PRD-LST-REQ-001 to 002 | 2 |
+| Symbol Listing (deprecated) | PRD-LST — absorbed into PRD-SUM | 0 |
 | Dependency Graph | PRD-DEP-REQ-001 to 002 | 2 |
 | Index Build | PRD-IDX-REQ-001 to 015 | 15 |
 | Background Daemon | PRD-DMN-REQ-001 to 015 | 15 |
@@ -1026,7 +1026,7 @@ When an LLM agent works across related repositories, it must start a separate MC
 | Semantic Clustering | PRD-SCLST-REQ-001 to 003 | 3 |
 | Semantic Change Impact | PRD-SIMP-REQ-001 to 004 | 4 |
 | Source Display | PRD-SHOW-REQ-001 to 013 | 13 |
-| Code Summary | PRD-SUM-REQ-001 to 018 | 18 |
+| Code Summary | PRD-SUM-REQ-001 to 020 | 20 |
 | Call Graph Analysis | PRD-CGR-REQ-001 to 014 | 14 |
 | Execution Flow Detection | PRD-FLOW-REQ-001 to 010 | 10 |
 | Blast Radius Impact Analysis | PRD-BLAST-REQ-001 to 010 | 10 |

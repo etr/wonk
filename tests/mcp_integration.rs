@@ -113,14 +113,14 @@ fn mcp_server_initialize_and_list_tools() {
     assert_eq!(list_resp["id"], 2);
     assert!(list_resp["error"].is_null());
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 23);
+    assert_eq!(tools.len(), 22);
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(tool_names.contains(&"wonk_search"));
     assert!(tool_names.contains(&"wonk_sym"));
     assert!(tool_names.contains(&"wonk_ref"));
     assert!(tool_names.contains(&"wonk_sig"));
-    assert!(tool_names.contains(&"wonk_ls"));
+    // wonk_ls was merged into wonk_summary
     assert!(tool_names.contains(&"wonk_deps"));
     assert!(tool_names.contains(&"wonk_show"));
     assert!(tool_names.contains(&"wonk_rdeps"));

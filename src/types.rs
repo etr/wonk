@@ -452,6 +452,10 @@ pub struct SummarySymbol {
     pub name: String,
     pub kind: String,
     pub signature: String,
+    pub line: usize,
+    pub col: usize,
+    pub end_line: Option<usize>,
+    pub scope: Option<String>,
 }
 
 /// An intra-directory import edge (from file → to file).
