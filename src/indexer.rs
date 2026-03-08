@@ -175,7 +175,10 @@ fn is_container(kind: &str, lang: Lang) -> bool {
         ),
         Lang::Python => matches!(kind, "class_definition"),
         Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
-            matches!(kind, "class_declaration" | "class")
+            matches!(
+                kind,
+                "class_declaration" | "class" | "interface_declaration"
+            )
         }
         Lang::Java => matches!(
             kind,
@@ -842,6 +845,17 @@ fn extract_typescript(
                 lang,
                 scope,
             ))
+        }
+        // Interface/class member signatures — extracted so shallow mode can
+        // query child signatures via `scope`.
+        "method_signature" | "property_signature" => {
+            let name = field_text(node, "name", src)?;
+            let sk = if kind == "method_signature" {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Variable
+            };
+            Some(make_symbol(name, sk, node, src, file, lang, scope))
         }
         _ => extract_js_common(node, kind, src, file, lang, scope),
     }
@@ -3629,6 +3643,20 @@ mod tests {
         let method = find_sym(&syms, "getName");
         assert_eq!(method.kind, SymbolKind::Method);
         assert_eq!(method.scope.as_deref(), Some("MyService"));
+    }
+
+    #[test]
+    fn ts_interface_members_scoped() {
+        let src = "interface FastifyReply {\n  send(data: any): void;\n  status: number;\n}";
+        let syms = extract_from(Lang::TypeScript, src);
+        let iface = find_sym(&syms, "FastifyReply");
+        assert_eq!(iface.kind, SymbolKind::Interface);
+        let method = find_sym(&syms, "send");
+        assert_eq!(method.kind, SymbolKind::Method);
+        assert_eq!(method.scope.as_deref(), Some("FastifyReply"));
+        let prop = find_sym(&syms, "status");
+        assert_eq!(prop.kind, SymbolKind::Variable);
+        assert_eq!(prop.scope.as_deref(), Some("FastifyReply"));
     }
 
     // ---------- TSX symbol extraction ----------

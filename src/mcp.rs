@@ -340,23 +340,6 @@ fn validate_path(path: &Path, repo_root: &Path) -> Result<PathBuf, CallToolResul
     }
 }
 
-/// Embed a query and run semantic search, returning resolved results.
-/// Returns an empty vec on any failure (graceful degradation).
-fn fetch_semantic_for_mcp(query: &str, conn: &Connection) -> Vec<crate::types::SemanticResult> {
-    let all_embeddings = match crate::embedding::load_all_embeddings(conn) {
-        Ok(e) if !e.is_empty() => e,
-        _ => return Vec::new(),
-    };
-    let client = crate::embedding::OllamaClient::new();
-    let mut query_vec = match client.embed_single(query) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    crate::embedding::normalize(&mut query_vec);
-    let scored = crate::semantic::semantic_search(&query_vec, &all_embeddings, 20);
-    crate::semantic::resolve_results(conn, &scored).unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -372,13 +355,13 @@ fn tool_definitions() -> &'static Vec<Tool> {
         let mut tools = vec![
             Tool {
                 name: "wonk_search",
-                description: "Ranked code search — returns definitions first, deduplicates re-exports. Replaces Grep for broad pattern matching. Use wonk_sym instead if you know the exact symbol name.",
+                description: "Keyword/regex code search (ripgrep) — returns definitions first, deduplicates re-exports. Use single keywords or regex patterns like 'handleError|onError'. Do NOT use natural language sentences — use wonk_ask for semantic queries instead.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search pattern (literal text or regex if regex=true)"
+                            "description": "Search pattern — literal keyword or regex (if regex=true). NOT natural language."
                         },
                         "regex": {
                             "type": "boolean",
@@ -398,11 +381,6 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
-                        },
-                        "semantic": {
-                            "type": "boolean",
-                            "description": "Blend structural results with semantic (embedding-based) results via RRF fusion",
-                            "default": false
                         },
                         "format": {
                             "type": "string",
@@ -445,7 +423,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_ref",
-                description: "Find all references (call sites and imports) of a symbol with surrounding context. More precise than Grep for 'who uses X' questions.",
+                description: "Find all references (call sites and imports) of a symbol. Use output='files' when you only need file names, not per-reference details.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -461,6 +439,12 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
+                        },
+                        "output": {
+                            "type": "string",
+                            "enum": ["full", "files"],
+                            "description": "Use 'files' for just unique file paths (like grep --files-with-matches). Default: full.",
+                            "default": "full"
                         },
                         "format": {
                             "type": "string",
@@ -569,7 +553,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_show",
-                description: "Read source bodies of named symbols. Accepts comma-separated names for batch lookup (e.g. 'main,parse,validate'). More targeted than Read — finds the symbol across files without needing the file path. Large containers auto-fallback to shallow mode when they exceed the budget.",
+                description: "Read source bodies of named symbols. Accepts comma-separated names for batch lookup (e.g. 'main,parse,validate'). More targeted than Read — finds the symbol across files without needing the file path. Large containers auto-fallback to shallow mode when they exceed the budget. Returns complete symbol source code — you do not need to Read the same file afterward.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1234,7 +1218,8 @@ impl McpServer {
                  - Find a symbol definition: wonk_sym\n\
                  - Read symbol source code: wonk_show (batch: comma-separated names)\n\
                  - Find references/call sites: wonk_ref\n\
-                 - Text search: wonk_search (ranked, definitions first)",
+                 - Text search: wonk_search (keyword/regex, ranked, definitions first)\n\
+                 - Semantic / natural-language search: wonk_ask (requires embeddings)",
             ),
         })
         .expect("serialize InitializeResult")
@@ -1305,10 +1290,6 @@ impl McpServer {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .or(Some(4000));
-        let semantic = args
-            .get("semantic")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let format = extract_format(&args);
 
         let (ranker_conn, repo_root) = match self.resolve_repo(&args) {
@@ -1355,39 +1336,6 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("search failed: {e}")),
         };
 
-        // When semantic blending is requested, fuse structural + embedding results via RRF.
-        if semantic {
-            let semantic_results = ranker_conn
-                .map(|c| fetch_semantic_for_mcp(&query, c))
-                .unwrap_or_default();
-            let fused = ranker::fuse_rrf(&results, &semantic_results, 60.0);
-
-            let mut budget = budget_limit.map(TokenBudget::new);
-            let mut outputs: Vec<SearchOutput> = Vec::new();
-            for item in &fused {
-                let mut out = SearchOutput::from_search_result(
-                    Path::new(&item.file),
-                    item.line,
-                    item.col,
-                    &item.content,
-                );
-                out.annotation = item.annotation.clone();
-
-                if let Some(ref mut b) = budget {
-                    let estimate = (out.file.len() + out.content.len() + 20) / 4;
-                    if b.remaining() < estimate {
-                        continue;
-                    }
-                    let serialized = serde_json::to_string(&out).unwrap_or_default();
-                    if !b.try_consume(&serialized) {
-                        continue;
-                    }
-                }
-                outputs.push(out);
-            }
-            return format_result(&outputs, format);
-        }
-
         let groups = ranker::rank_and_dedup(&results, ranker_conn, &query);
 
         let mut budget = budget_limit.map(TokenBudget::new);
@@ -1421,10 +1369,12 @@ impl McpServer {
         }
 
         if truncated > 0 {
+            let shown = outputs.len();
+            let total = shown + truncated;
             let wrapper = serde_json::json!({
                 "results": outputs,
                 "truncated": truncated,
-                "hint": "Increase budget to see more results.",
+                "hint": format!("Showing {shown} of {total} matches. Results are sorted by relevance."),
             });
             format_result(&wrapper, format)
         } else {
@@ -1454,7 +1404,14 @@ impl McpServer {
                 });
                 format_result(&wrapper, format)
             }
-            Ok(r) => {
+            Ok(mut r) => {
+                // Deprioritize .d.ts files — push them to the end so
+                // actual source definitions appear first within budget.
+                r.sort_by(|a, b| {
+                    let a_dts = a.file.ends_with(".d.ts");
+                    let b_dts = b.file.ends_with(".d.ts");
+                    a_dts.cmp(&b_dts)
+                });
                 let outputs: Vec<SymbolOutput> = r.iter().map(symbol_to_output).collect();
                 format_result(&outputs, format)
             }
@@ -1473,6 +1430,10 @@ impl McpServer {
             .map(|v| v as usize)
             .or(Some(2000));
         let format = extract_format(&args);
+        let output_mode = args
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("full");
 
         let (conn, repo_root) = match self.resolve_repo(&args) {
             Ok(r) => r,
@@ -1482,6 +1443,14 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("reference query failed: {e}")),
         };
+
+        // Files-only mode: return just unique file paths.
+        if output_mode == "files" {
+            let mut files: Vec<String> = results.iter().map(|r| r.file.clone()).collect();
+            files.sort();
+            files.dedup();
+            return format_result(&files, format);
+        }
 
         let outputs: Vec<RefOutput> = results
             .iter()
@@ -1774,15 +1743,12 @@ impl McpServer {
         }
 
         if truncated > 0 {
-            let hint = if outputs.is_empty() {
-                "Increase budget or use shallow:true to see results.".into()
-            } else {
-                "Increase budget or use shallow:true to see truncated results.".to_string()
-            };
+            let shown = outputs.len();
+            let total = shown + truncated;
             let wrapper = serde_json::json!({
                 "results": outputs,
                 "truncated": truncated,
-                "hint": hint,
+                "hint": format!("Showing {shown} of {total} matching symbols. Results are sorted by relevance."),
             });
             format_result(&wrapper, format)
         } else {
@@ -2281,7 +2247,7 @@ impl McpServer {
             .map(|v| v as usize);
         let format = extract_format(&args);
 
-        let (conn, _repo_root) = match self.resolve_repo(&args) {
+        let (conn, repo_root) = match self.resolve_repo(&args) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -2324,12 +2290,63 @@ impl McpServer {
         crate::embedding::normalize(&mut query_vec);
 
         let scored = crate::semantic::semantic_search(&query_vec, &embeddings, 50);
-        let results = match crate::semantic::resolve_results(conn, &scored) {
+        let semantic_results = match crate::semantic::resolve_results(conn, &scored) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("result resolution failed: {e}")),
         };
 
-        let outputs: Vec<crate::output::SemanticOutput> = results
+        // Run structural search with same query for RRF blending.
+        // Keyword queries like "handleError" get both structural + semantic fused;
+        // NL queries like "error handling in route handlers" gracefully degrade to
+        // pure semantic (ripgrep returns nothing for natural language).
+        let repo_path = repo_root.to_string_lossy().into_owned();
+        let structural_results =
+            search::text_search(&query, false, true, &[repo_path]).unwrap_or_default();
+
+        if !structural_results.is_empty() {
+            let fused = ranker::fuse_rrf(&structural_results, &semantic_results, 60.0);
+
+            let mut budget = budget_limit.map(TokenBudget::new);
+            let mut outputs: Vec<SearchOutput> = Vec::new();
+            let mut truncated = 0usize;
+            for item in &fused {
+                let mut out = SearchOutput::from_search_result(
+                    Path::new(&item.file),
+                    item.line,
+                    item.col,
+                    &item.content,
+                );
+                out.annotation = item.annotation.clone();
+
+                if let Some(ref mut b) = budget {
+                    let estimate = (out.file.len() + out.content.len() + 20) / 4;
+                    if b.remaining() < estimate {
+                        truncated += 1;
+                        continue;
+                    }
+                    let serialized = serde_json::to_string(&out).unwrap_or_default();
+                    if !b.try_consume(&serialized) {
+                        truncated += 1;
+                        continue;
+                    }
+                }
+                outputs.push(out);
+            }
+            if truncated > 0 {
+                let shown = outputs.len();
+                let total = shown + truncated;
+                let wrapper = serde_json::json!({
+                    "results": outputs,
+                    "truncated": truncated,
+                    "hint": format!("Showing {shown} of {total} matches. Results are sorted by relevance."),
+                });
+                return format_result(&wrapper, format);
+            }
+            return format_result(&outputs, format);
+        }
+
+        // Pure semantic results (NL queries won't match ripgrep).
+        let outputs: Vec<crate::output::SemanticOutput> = semantic_results
             .iter()
             .map(|sr| crate::output::SemanticOutput {
                 file: sr.file.clone(),
@@ -2647,10 +2664,12 @@ fn collect_with_budget<T: serde::Serialize>(
         }
 
         if truncated > 0 {
+            let shown = kept.len();
+            let total = shown + truncated;
             let wrapper = serde_json::json!({
                 "results": kept,
                 "truncated": truncated,
-                "hint": "Increase budget to see more results.",
+                "hint": format!("Showing {shown} of {total} matches. Results are sorted by relevance."),
             });
             return format_result(&wrapper, format);
         }
@@ -2962,9 +2981,10 @@ mod tests {
         // With a tiny budget, the response should be a wrapper with truncation metadata.
         if parsed.get("truncated").is_some() {
             assert!(parsed["truncated"].as_u64().unwrap() > 0);
+            let hint = parsed["hint"].as_str().expect("truncated response should have a hint");
             assert!(
-                parsed.get("hint").is_some(),
-                "truncated response should have a hint"
+                hint.contains("Showing") && hint.contains("sorted by relevance"),
+                "hint should use soft wording, got: {hint}"
             );
         } else {
             // If only one result fits, it's returned as a plain array — that's fine too.
@@ -3895,16 +3915,29 @@ mod tests {
         );
     }
 
-    // -- wonk_search semantic param ------------------------------------------
+    // -- wonk_search no longer has semantic param ------------------------------
 
     #[test]
-    fn tool_search_has_semantic_param() {
+    fn tool_search_no_semantic_param() {
         let tools = tool_definitions();
         let tool = tools.iter().find(|t| t.name == "wonk_search").unwrap();
         let props = tool.input_schema["properties"].as_object().unwrap();
         assert!(
-            props.contains_key("semantic"),
-            "wonk_search missing 'semantic' property"
+            !props.contains_key("semantic"),
+            "wonk_search should not have 'semantic' property (moved to wonk_ask)"
+        );
+    }
+
+    // -- wonk_ref output=files ------------------------------------------------
+
+    #[test]
+    fn tool_ref_has_output_param() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_ref").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("output"),
+            "wonk_ref missing 'output' property"
         );
     }
 
