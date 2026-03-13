@@ -109,11 +109,22 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Search(args) => {
+            // Auto-detect regex metacharacters and enable regex mode.
+            let regex = if !args.regex && search::looks_like_regex(&args.pattern) {
+                output::print_hint(
+                    "pattern looks like regex; auto-enabled --regex",
+                    suppress,
+                );
+                true
+            } else {
+                args.regex
+            };
+
             // Set up match highlighting for search results.
-            fmt.set_highlight(&args.pattern, args.regex, args.ignore_case);
+            fmt.set_highlight(&args.pattern, regex, args.ignore_case);
 
             let results =
-                search::text_search(&args.pattern, args.regex, args.ignore_case, &args.paths)?;
+                search::text_search(&args.pattern, regex, args.ignore_case, &args.paths)?;
 
             if results.is_empty() {
                 output::print_hint(
@@ -231,7 +242,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
 
             let kind_str = args.kind.as_deref();
-            let results = router.query_symbols(&args.name, kind_str, args.exact)?;
+            let file_str = args.file.as_deref();
+            let results = router.query_symbols_with_file(&args.name, kind_str, file_str, args.exact)?;
 
             if results.is_empty() {
                 output::print_hint(
@@ -271,11 +283,41 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             let results = router.query_references(&args.name, &args.paths)?;
 
-            if results.is_empty() {
+            // Also query subclasses/implementors from type_edges.
+            let subclass_results = router
+                .conn()
+                .and_then(|conn| query_subclasses_db(conn, &args.name).ok())
+                .unwrap_or_default();
+
+            if results.is_empty() && subclass_results.is_empty() {
                 output::print_hint("no references found", suppress);
             }
 
             let mut truncated = 0usize;
+
+            // Show subclasses first if present.
+            if !subclass_results.is_empty() && !suppress {
+                output::print_category_header("-- subclasses --");
+            }
+            for sym in &subclass_results {
+                let out = RefOutput {
+                    name: sym.name.clone(),
+                    kind: "subclass".to_string(),
+                    file: sym.file.clone(),
+                    line: sym.line,
+                    col: sym.col,
+                    context: sym.signature.clone(),
+                    caller_name: None,
+                    confidence: 1.0,
+                };
+                if fmt.format_reference(&out)? == BudgetStatus::Skipped {
+                    truncated += 1;
+                }
+            }
+
+            if !subclass_results.is_empty() && !results.is_empty() && !suppress {
+                output::print_category_header("-- references --");
+            }
             for r in &results {
                 let out = RefOutput {
                     name: r.name.clone(),
@@ -1113,15 +1155,19 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     }
                 };
 
+            // Support qualified paths: `Foo::bar` → name="bar", file hint="Foo".
+            let (show_name, file_hint) = split_qualified_name(&args.name);
+            let file = args.file.or(file_hint);
+
             let options = crate::show::ShowOptions {
-                file: args.file,
+                file,
                 kind: args.kind,
                 exact: args.exact,
                 suppress,
                 shallow: args.shallow,
             };
 
-            let results = crate::show::show_symbol(&conn, &args.name, &repo_root, &options)?;
+            let results = crate::show::show_symbol(&conn, show_name, &repo_root, &options)?;
 
             if results.is_empty() {
                 output::print_hint(
@@ -1663,6 +1709,46 @@ fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection
 
 /// Returns `true` for commands that query the index and should trigger
 /// auto-initialization when no index exists.
+/// Returns true if a file path looks like a test, benchmark, spec, or mock file.
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/test")
+        || lower.contains("/tests/")
+        || lower.contains("/bench")
+        || lower.contains("/benches/")
+        || lower.contains("/spec/")
+        || lower.contains("/specs/")
+        || lower.contains("_test.")
+        || lower.contains(".test.")
+        || lower.contains("_spec.")
+        || lower.contains(".spec.")
+        || lower.contains("/mock")
+        || lower.contains("/examples/")
+        || lower.starts_with("test")
+        || lower.starts_with("bench")
+        || lower.starts_with("examples/")
+}
+
+/// Split a qualified name like `tokio::spawn` or `std::collections::HashMap`
+/// into (bare_name, optional_file_hint).
+///
+/// The last `::` segment becomes the name; earlier segments are joined with `/`
+/// to form a file path hint.  If the name contains no `::`, returns it as-is.
+fn split_qualified_name(name: &str) -> (&str, Option<String>) {
+    if let Some(pos) = name.rfind("::") {
+        let prefix = &name[..pos];
+        let bare = &name[pos + 2..];
+        if bare.is_empty() {
+            return (name, None);
+        }
+        // Convert `tokio::runtime` → `tokio/runtime` as a file path hint.
+        let hint = prefix.replace("::", "/");
+        (bare, Some(hint))
+    } else {
+        (name, None)
+    }
+}
+
 fn is_query_command(cmd: &Command) -> bool {
     matches!(
         cmd,
@@ -2126,9 +2212,19 @@ impl QueryRouter {
         kind: Option<&str>,
         exact: bool,
     ) -> Result<Vec<Symbol>, DbError> {
+        self.query_symbols_with_file(name, kind, None, exact)
+    }
+
+    pub fn query_symbols_with_file(
+        &self,
+        name: &str,
+        kind: Option<&str>,
+        file: Option<&str>,
+        exact: bool,
+    ) -> Result<Vec<Symbol>, DbError> {
         // Try SQLite first.
         if let Some(conn) = &self.conn {
-            let results = query_symbols_db(conn, name, kind, exact)?;
+            let results = query_symbols_db_with_file(conn, name, kind, file, exact)?;
             if !results.is_empty() {
                 return Ok(results);
             }
@@ -2403,44 +2499,55 @@ pub fn query_symbols_db(
     kind: Option<&str>,
     exact: bool,
 ) -> Result<Vec<Symbol>, DbError> {
+    query_symbols_db_with_file(conn, name, kind, None, exact)
+}
+
+pub fn query_symbols_db_with_file(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    file: Option<&str>,
+    exact: bool,
+) -> Result<Vec<Symbol>, DbError> {
     let mut sql = String::from(
-        "SELECT name, kind, file, line, col, end_line, scope, signature, language FROM symbols",
+        "SELECT name, kind, file, line, col, end_line, scope, signature, language FROM symbols WHERE ",
     );
-    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if exact {
-        conditions.push("name = ?1".to_string());
+        sql.push_str("name = ?");
+        params.push(Box::new(name.to_string()));
     } else {
-        conditions.push("name LIKE ?1".to_string());
+        sql.push_str("name LIKE ?");
+        params.push(Box::new(format!("%{}%", name)));
     }
 
-    if kind.is_some() {
-        conditions.push("kind = ?2".to_string());
+    if let Some(k) = kind {
+        sql.push_str(" AND kind = ?");
+        params.push(Box::new(k.to_string()));
     }
 
-    if !conditions.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&conditions.join(" AND "));
+    if let Some(f) = file {
+        sql.push_str(" AND file LIKE ?");
+        params.push(Box::new(format!("%{}%", f)));
     }
 
-    let name_param = if exact {
-        name.to_string()
-    } else {
-        format!("%{}%", name)
-    };
-
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(param_refs), row_to_symbol)?;
 
-    let rows = if let Some(k) = kind {
-        stmt.query_map(rusqlite::params![name_param, k], row_to_symbol)?
-    } else {
-        stmt.query_map(rusqlite::params![name_param], row_to_symbol)?
-    };
-
-    let mut results = Vec::new();
+    let mut results: Vec<Symbol> = Vec::new();
     for row in rows {
         results.push(row?);
     }
+
+    // Deprioritize test/bench/spec files: sort them after production code.
+    results.sort_by(|a, b| {
+        let a_test = is_test_path(&a.file);
+        let b_test = is_test_path(&b.file);
+        a_test.cmp(&b_test)
+    });
+
     Ok(results)
 }
 
@@ -2467,6 +2574,25 @@ pub fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Referenc
             confidence: row.get::<_, Option<f64>>(6)?.unwrap_or(0.5),
         })
     })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Query subclasses/implementors of a symbol via the type_edges table.
+pub fn query_subclasses_db(conn: &Connection, name: &str) -> Result<Vec<Symbol>, DbError> {
+    let sql = "SELECT s.name, s.kind, s.file, s.line, s.col, s.end_line, s.scope, s.signature, s.language \
+               FROM type_edges te \
+               JOIN symbols parent ON te.parent_id = parent.id \
+               JOIN symbols s ON te.child_id = s.id \
+               WHERE parent.name LIKE ?1 \
+               ORDER BY s.file, s.line";
+    let name_param = format!("%{}%", name);
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![name_param], row_to_symbol)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -4344,6 +4470,7 @@ mod tests {
         let cmd = Command::Sym(SymArgs {
             name: "foo".into(),
             kind: None,
+            file: None,
             exact: false,
         });
         assert!(is_query_command(&cmd));

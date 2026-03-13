@@ -524,10 +524,10 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - Consumes: All query backends (Query Router, Semantic Search, Clustering Engine, Impact Analyzer, Source Display, Code Summary Engine, Call Graph, Flow Detection [V4], Blast Radius [V4], Scoped Change Detection [V4], Unified Symbol Context [V4])
 
 **Key Design Notes:**
-- **Tool manifest (18 tools):**
+- **Tool manifest (22 tools):**
   | Tool | Backend | Added |
   |------|---------|-------|
-  | `wonk_search` | Text Search + Smart Search Ranker (+ RRF [V4]) | V1 |
+  | `wonk_search` | Text Search + Smart Search Ranker | V1 |
   | `wonk_sym` | Structural Index | V1 |
   | `wonk_ref` | Structural Index | V1 |
   | `wonk_sig` | Structural Index | V1 |
@@ -544,6 +544,10 @@ Key technology choices: Rust for single static binary distribution and native Tr
   | `wonk_blast` | Blast Radius | V4 |
   | `wonk_changes` | Scoped Change Detection | V4 |
   | `wonk_context` | Unified Symbol Context | V4 |
+  | `wonk_ask` | Semantic Engine + RRF fusion (structural + semantic) | V2 |
+  | `wonk_cluster` | K-Means Clustering | V2 |
+  | `wonk_impact` | Change Impact Analysis | V2 |
+  | `wonk_update` | Pipeline (incremental) | V2 |
   | `wonk_repos` | Multi-Repo Registry | V4 |
 - **Routing:** Each tool handler delegates to its backend component using the same code paths as the CLI subcommands. MCP tools and CLI commands produce identical results.
 - **Parameter mapping:** MCP tool parameters map 1:1 to CLI flags. See sections 4.12, 4.13, 4.14 for parameter specifications per tool. See sections 4.16 through 4.23 for V4 tool parameters.

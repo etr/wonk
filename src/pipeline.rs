@@ -343,16 +343,24 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
         }
     };
 
+    // Pre-process Rust source to expand cfg_*! macros so tree-sitter can
+    // see the items they wrap.
+    let parse_source = if lang == indexer::Lang::Rust {
+        indexer::preprocess_rust_macros(&content)
+    } else {
+        content.clone()
+    };
+
     // Parse with tree-sitter.
     let mut parser = indexer::get_parser(lang);
     let tree = parser
-        .parse(content.as_bytes(), None)
+        .parse(parse_source.as_bytes(), None)
         .context("tree-sitter parse failed")?;
 
-    let symbols = indexer::extract_symbols(&tree, &content, &rel_path, lang);
-    let mut refs = indexer::extract_references(&tree, &content, &rel_path, lang);
-    let file_imports = indexer::extract_imports(&tree, &content, &rel_path, lang);
-    let type_edges = indexer::extract_type_edges(&tree, &content, &rel_path, lang);
+    let symbols = indexer::extract_symbols(&tree, &parse_source, &rel_path, lang);
+    let mut refs = indexer::extract_references(&tree, &parse_source, &rel_path, lang);
+    let file_imports = indexer::extract_imports(&tree, &parse_source, &rel_path, lang);
+    let type_edges = indexer::extract_type_edges(&tree, &parse_source, &rel_path, lang);
 
     // Compute confidence for each reference.
     for r in &mut refs {
@@ -649,9 +657,16 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
     // Compute content hash.
     let hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(content.as_bytes()));
 
+    // Pre-process Rust source to expand cfg_*! macros.
+    let parse_source = if lang == indexer::Lang::Rust {
+        indexer::preprocess_rust_macros(&content)
+    } else {
+        content.clone()
+    };
+
     // Parse with tree-sitter.
     let mut parser = indexer::get_parser(lang);
-    let tree = parser.parse(content.as_bytes(), None)?;
+    let tree = parser.parse(parse_source.as_bytes(), None)?;
 
     // Relative path for storage.
     let rel_path = path
@@ -661,16 +676,16 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
         .into_owned();
 
     // Extract symbols.
-    let symbols = indexer::extract_symbols(&tree, &content, &rel_path, lang);
+    let symbols = indexer::extract_symbols(&tree, &parse_source, &rel_path, lang);
 
     // Extract references.
-    let mut refs = indexer::extract_references(&tree, &content, &rel_path, lang);
+    let mut refs = indexer::extract_references(&tree, &parse_source, &rel_path, lang);
 
     // Extract imports for dependency graph.
-    let file_imports = indexer::extract_imports(&tree, &content, &rel_path, lang);
+    let file_imports = indexer::extract_imports(&tree, &parse_source, &rel_path, lang);
 
     // Extract type hierarchy edges (extends/implements).
-    let type_edges = indexer::extract_type_edges(&tree, &content, &rel_path, lang);
+    let type_edges = indexer::extract_type_edges(&tree, &parse_source, &rel_path, lang);
 
     // Compute confidence for each reference.
     for r in &mut refs {

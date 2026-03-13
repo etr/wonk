@@ -112,6 +112,77 @@ pub fn parse_file(path: &Path) -> Option<(Tree, Lang)> {
 }
 
 // ---------------------------------------------------------------------------
+// Rust macro pre-expansion
+// ---------------------------------------------------------------------------
+
+/// Pre-process Rust source to strip `cfg_*!` macro wrappers so that tree-sitter
+/// can parse the inner items normally.
+///
+/// Replaces the macro invocation line and its matching closing brace with blank
+/// lines so that all original line numbers are preserved.
+pub fn preprocess_rust_macros(source: &str) -> String {
+    let mut lines: Vec<String> = source.lines().map(String::from).collect();
+    // Preserve trailing newline if original had one.
+    let trailing_newline = source.ends_with('\n');
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        // Match `cfg_*! {` patterns — the macro name starts with `cfg_`.
+        if is_cfg_macro_line(trimmed) {
+            // Find the matching closing brace by counting depth.
+            if let Some(close_idx) = find_matching_brace(&lines, i) {
+                // Blank out the macro invocation line(s).
+                lines[i] = String::new();
+                // Blank out the closing brace line.
+                lines[close_idx] = String::new();
+            }
+        }
+        i += 1;
+    }
+
+    let mut result = lines.join("\n");
+    if trailing_newline {
+        result.push('\n');
+    }
+    result
+}
+
+/// Returns true if a trimmed line looks like a `cfg_*! {` macro invocation.
+fn is_cfg_macro_line(trimmed: &str) -> bool {
+    // Match patterns: `cfg_FOO! {`, `cfg_FOO!{`
+    // The line must start with `cfg_`, contain `!`, and end with `{`.
+    if !trimmed.starts_with("cfg_") {
+        return false;
+    }
+    // Find the `!` after the macro name.
+    if let Some(bang_pos) = trimmed.find('!') {
+        let after_bang = trimmed[bang_pos + 1..].trim();
+        // The rest after `!` should be `{` possibly with whitespace.
+        return after_bang == "{";
+    }
+    false
+}
+
+/// Find the line index of the matching `}` for a brace opened on `start_line`.
+fn find_matching_brace(lines: &[String], start_line: usize) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (i, line) in lines.iter().enumerate().skip(start_line) {
+        for ch in line.chars() {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Symbol extraction
 // ---------------------------------------------------------------------------
 
@@ -5129,5 +5200,73 @@ mod tests {
         assert_eq!(edges[0].child_name, "Worker");
         assert_eq!(edges[0].parent_name, "Runnable");
         assert_eq!(edges[0].relationship, "implements");
+    }
+
+    // ---------- preprocess_rust_macros tests ----------
+
+    #[test]
+    fn preprocess_strips_cfg_macro_wrapper() {
+        let src = "use std::future::Future;\n\ncfg_rt! {\n    pub fn spawn() {}\n}\n";
+        let processed = preprocess_rust_macros(src);
+        assert!(
+            !processed.contains("cfg_rt!"),
+            "macro wrapper should be stripped"
+        );
+        assert!(
+            processed.contains("pub fn spawn() {}"),
+            "inner content should be preserved"
+        );
+    }
+
+    #[test]
+    fn preprocess_preserves_line_numbers() {
+        let src = "line1\nline2\ncfg_rt! {\n    pub fn spawn() {}\n}\nline6\n";
+        let processed = preprocess_rust_macros(src);
+        let lines: Vec<&str> = processed.lines().collect();
+        assert_eq!(lines.len(), 6, "line count should be preserved");
+        assert_eq!(lines[0], "line1");
+        assert_eq!(lines[1], "line2");
+        assert_eq!(lines[2], "", "macro line should be blanked");
+        assert!(lines[3].contains("pub fn spawn"), "inner content on line 4");
+        assert_eq!(lines[4], "", "closing brace should be blanked");
+        assert_eq!(lines[5], "line6");
+    }
+
+    #[test]
+    fn preprocess_handles_nested_braces() {
+        let src = "cfg_rt! {\n    fn foo() {\n        if true { bar(); }\n    }\n}\n";
+        let processed = preprocess_rust_macros(src);
+        assert!(
+            !processed.contains("cfg_rt!"),
+            "macro wrapper should be stripped"
+        );
+        assert!(
+            processed.contains("fn foo()"),
+            "inner function should be preserved"
+        );
+        assert!(
+            processed.contains("bar()"),
+            "nested content should be preserved"
+        );
+    }
+
+    #[test]
+    fn preprocess_no_op_without_macros() {
+        let src = "fn main() {}\n";
+        let processed = preprocess_rust_macros(src);
+        assert_eq!(processed, src);
+    }
+
+    #[test]
+    fn preprocess_expands_symbols_inside_cfg_macros() {
+        let src = "cfg_rt! {\n    pub fn spawn<F>(future: F) -> JoinHandle<F::Output>\n    where\n        F: Future + Send + 'static,\n    {\n        spawn_inner(future)\n    }\n}\n";
+        let processed = preprocess_rust_macros(src);
+        let mut parser = get_parser(Lang::Rust);
+        let tree = parser.parse(processed.as_bytes(), None).unwrap();
+        let symbols = extract_symbols(&tree, &processed, "test.rs", Lang::Rust);
+        assert!(
+            symbols.iter().any(|s| s.name == "spawn"),
+            "spawn should be extracted after macro expansion: {symbols:?}"
+        );
     }
 }

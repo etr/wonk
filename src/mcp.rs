@@ -406,6 +406,10 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "string",
                             "description": "Filter by symbol kind (function, method, class, struct, interface, enum, trait, type_alias, constant, variable, module)"
                         },
+                        "file": {
+                            "type": "string",
+                            "description": "Restrict results to a specific file path (substring match)"
+                        },
                         "exact": {
                             "type": "boolean",
                             "description": "Require exact name match",
@@ -1276,7 +1280,8 @@ impl McpServer {
             Ok(q) => q,
             Err(e) => return e,
         };
-        let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
+        let explicit_regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
+        let regex = explicit_regex || search::looks_like_regex(&query);
         let case_insensitive = args
             .get("case_insensitive")
             .and_then(|v| v.as_bool())
@@ -1388,6 +1393,7 @@ impl McpServer {
             Err(e) => return e,
         };
         let kind = args.get("kind").and_then(|v| v.as_str());
+        let file = args.get("file").and_then(|v| v.as_str());
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
 
@@ -1395,7 +1401,7 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        match crate::router::query_symbols_db(conn, &name, kind, exact) {
+        match crate::router::query_symbols_db_with_file(conn, &name, kind, file, exact) {
             Ok(r) if r.is_empty() => {
                 let hints = empty_show_hints(conn, &name, None, kind);
                 let wrapper = serde_json::json!({
@@ -1444,30 +1450,49 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("reference query failed: {e}")),
         };
 
+        // Also query subclasses/implementors from type_edges.
+        let subclass_results = crate::router::query_subclasses_db(conn, &name)
+            .unwrap_or_default();
+
         // Files-only mode: return just unique file paths.
         if output_mode == "files" {
             let mut files: Vec<String> = results.iter().map(|r| r.file.clone()).collect();
+            files.extend(subclass_results.iter().map(|s| s.file.clone()));
             files.sort();
             files.dedup();
             return format_result(&files, format);
         }
 
-        let outputs: Vec<RefOutput> = results
-            .iter()
-            .map(|r| {
-                let context = enrich_context(&repo_root, &r.file, r.line, &r.context);
-                RefOutput {
-                    name: r.name.clone(),
-                    kind: r.kind.to_string(),
-                    file: r.file.clone(),
-                    line: r.line,
-                    col: r.col,
-                    context,
-                    caller_name: r.caller_name.clone(),
-                    confidence: r.confidence,
-                }
-            })
-            .collect();
+        let mut outputs: Vec<RefOutput> = Vec::new();
+
+        // Subclasses first.
+        for sym in &subclass_results {
+            outputs.push(RefOutput {
+                name: sym.name.clone(),
+                kind: "subclass".to_string(),
+                file: sym.file.clone(),
+                line: sym.line,
+                col: sym.col,
+                context: sym.signature.clone(),
+                caller_name: None,
+                confidence: 1.0,
+            });
+        }
+
+        // Then regular references.
+        for r in &results {
+            let context = enrich_context(&repo_root, &r.file, r.line, &r.context);
+            outputs.push(RefOutput {
+                name: r.name.clone(),
+                kind: r.kind.to_string(),
+                file: r.file.clone(),
+                line: r.line,
+                col: r.col,
+                context,
+                caller_name: r.caller_name.clone(),
+                confidence: r.confidence,
+            });
+        }
 
         collect_with_budget(outputs, budget_limit, format)
     }
@@ -1644,13 +1669,30 @@ impl McpServer {
     }
 
     fn tool_show(&mut self, args: Value) -> CallToolResult {
-        let name = match require_str(&args, "name") {
+        let raw_name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
         };
         let kind = args.get("kind").and_then(|v| v.as_str()).map(String::from);
-        let file = args.get("file").and_then(|v| v.as_str()).map(String::from);
+        let explicit_file = args.get("file").and_then(|v| v.as_str()).map(String::from);
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Support qualified paths: `tokio::spawn` → name="spawn", file hint="tokio".
+        let (name, file) = if raw_name.contains("::") && explicit_file.is_none() {
+            if let Some(pos) = raw_name.rfind("::") {
+                let prefix = &raw_name[..pos];
+                let bare = &raw_name[pos + 2..];
+                if bare.is_empty() {
+                    (raw_name.clone(), explicit_file)
+                } else {
+                    (bare.to_string(), Some(prefix.replace("::", "/")))
+                }
+            } else {
+                (raw_name, explicit_file)
+            }
+        } else {
+            (raw_name, explicit_file)
+        };
         let shallow = args
             .get("shallow")
             .and_then(|v| v.as_bool())

@@ -156,6 +156,33 @@ impl<'a> Sink for CollectSink<'a> {
     }
 }
 
+/// Returns `true` if the pattern contains sequences that are almost certainly
+/// intended as regex metacharacters (e.g. `\w`, `\d`, `[A-Z]`).
+///
+/// Used to auto-enable regex mode and hint the user when they forget `--regex`.
+pub fn looks_like_regex(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    // Check for common regex escape sequences: \w \W \d \D \s \S \b \B
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'\\' {
+            let next = bytes[i + 1];
+            if matches!(
+                next,
+                b'w' | b'W' | b'd' | b'D' | b's' | b'S' | b'b' | b'B'
+            ) {
+                return true;
+            }
+        }
+    }
+    // Check for character classes [...]
+    if let Some(open) = pattern.find('[')
+        && pattern[open + 1..].contains(']')
+    {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +486,27 @@ mod tests {
             .map(|p| p.to_path_buf())
             .unwrap_or(absolute.clone());
         assert_eq!(normalized, absolute);
+    }
+
+    #[test]
+    fn looks_like_regex_detects_backslash_escapes() {
+        assert!(looks_like_regex(r"class \w+"));
+        assert!(looks_like_regex(r"\d+"));
+        assert!(looks_like_regex(r"fn\s+main"));
+        assert!(looks_like_regex(r"\bword\b"));
+    }
+
+    #[test]
+    fn looks_like_regex_detects_character_classes() {
+        assert!(looks_like_regex("class [A-Z]"));
+        assert!(looks_like_regex("[0-9]+"));
+    }
+
+    #[test]
+    fn looks_like_regex_ignores_plain_text() {
+        assert!(!looks_like_regex("BaseTransport"));
+        assert!(!looks_like_regex("pub fn spawn"));
+        assert!(!looks_like_regex("config.json"));
+        assert!(!looks_like_regex("hello world"));
     }
 }

@@ -150,6 +150,7 @@ Users need to find all usages of a symbol name across the codebase.
 - `PRD-REF-REQ-001` When the user runs `wonk ref <name>` then the system shall return all indexed references matching the name.
 - `PRD-REF-REQ-002` When the user provides a path after `--` then the system shall restrict results to files within that path.
 - `PRD-REF-REQ-003` When returning reference results then each result shall include file path, line number, and the full source line.
+- `PRD-REF-REQ-004` Where `output=files` is provided then the system shall return only unique file paths containing references, without per-reference line details.
 
 **Acceptance criteria**
 - References are found by name matching
@@ -1009,7 +1010,7 @@ When an LLM agent works across related repositories, it must start a separate MC
 | Text Search | PRD-SRCH-REQ-001 to 005 | 5 |
 | Smart Search | PRD-SSRCH-REQ-001 to 006 | 6 |
 | Symbol Lookup | PRD-SYM-REQ-001 to 004 | 4 |
-| Reference Finding | PRD-REF-REQ-001 to 003 | 3 |
+| Reference Finding | PRD-REF-REQ-001 to 004 | 4 |
 | Signature Display | PRD-SIG-REQ-001 | 1 |
 | Symbol Listing (deprecated) | PRD-LST — absorbed into PRD-SUM | 0 |
 | Dependency Graph | PRD-DEP-REQ-001 to 002 | 2 |

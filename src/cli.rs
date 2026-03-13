@@ -136,6 +136,10 @@ pub struct SymArgs {
     #[arg(long)]
     pub kind: Option<String>,
 
+    /// Restrict results to a specific file path (substring match)
+    #[arg(long)]
+    pub file: Option<String>,
+
     /// Require an exact match on the symbol name
     #[arg(long)]
     pub exact: bool,
