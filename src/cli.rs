@@ -95,6 +95,9 @@ pub enum Command {
 
     /// Aggregate full context for a symbol: definition, callers, callees, importers, flows, children
     Context(ContextArgs),
+
+    /// Ask a question about the codebase and get an LLM-generated answer
+    Delegate(DelegateArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -433,6 +436,16 @@ pub struct McpArgs {
 pub enum McpCommand {
     /// Start the MCP server (stdio transport)
     Serve,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct DelegateArgs {
+    /// The question to ask about the codebase
+    pub question: String,
+
+    /// Restrict context to symbols under this path prefix
+    #[arg(long)]
+    pub scope: Option<String>,
 }
 
 pub fn parse() -> Cli {
@@ -1353,6 +1366,59 @@ mod tests {
                 assert_eq!(args.name, "processPayment");
             }
             _ => panic!("expected Command::Context"),
+        }
+    }
+
+    // -- Delegate tests -------------------------------------------------------
+
+    #[test]
+    fn parse_delegate_basic() {
+        let cli = Cli::try_parse_from(["wonk", "delegate", "How does auth work?"]).unwrap();
+        match cli.command {
+            Command::Delegate(args) => {
+                assert_eq!(args.question, "How does auth work?");
+                assert!(args.scope.is_none());
+            }
+            _ => panic!("expected Command::Delegate"),
+        }
+    }
+
+    #[test]
+    fn parse_delegate_with_scope() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "delegate",
+            "--scope",
+            "src/auth/",
+            "How does auth work?",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Delegate(args) => {
+                assert_eq!(args.question, "How does auth work?");
+                assert_eq!(args.scope.as_deref(), Some("src/auth/"));
+            }
+            _ => panic!("expected Command::Delegate"),
+        }
+    }
+
+    #[test]
+    fn parse_delegate_requires_question() {
+        let result = Cli::try_parse_from(["wonk", "delegate"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_delegate_with_global_format() {
+        let cli =
+            Cli::try_parse_from(["wonk", "--format", "json", "delegate", "What does this do?"])
+                .unwrap();
+        assert_eq!(cli.format, Some(OutputFormat::Json));
+        match cli.command {
+            Command::Delegate(args) => {
+                assert_eq!(args.question, "What does this do?");
+            }
+            _ => panic!("expected Command::Delegate"),
         }
     }
 }

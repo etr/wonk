@@ -166,10 +166,7 @@ pub fn looks_like_regex(pattern: &str) -> bool {
     for i in 0..bytes.len().saturating_sub(1) {
         if bytes[i] == b'\\' {
             let next = bytes[i + 1];
-            if matches!(
-                next,
-                b'w' | b'W' | b'd' | b'D' | b's' | b'S' | b'b' | b'B'
-            ) {
+            if matches!(next, b'w' | b'W' | b'd' | b'D' | b's' | b'S' | b'b' | b'B') {
                 return true;
             }
         }

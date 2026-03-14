@@ -8,6 +8,7 @@ pub mod config;
 pub mod context;
 pub mod daemon;
 pub mod db;
+pub mod delegate;
 pub mod embedding;
 pub mod errors;
 pub mod flows;

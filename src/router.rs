@@ -111,10 +111,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Search(args) => {
             // Auto-detect regex metacharacters and enable regex mode.
             let regex = if !args.regex && search::looks_like_regex(&args.pattern) {
-                output::print_hint(
-                    "pattern looks like regex; auto-enabled --regex",
-                    suppress,
-                );
+                output::print_hint("pattern looks like regex; auto-enabled --regex", suppress);
                 true
             } else {
                 args.regex
@@ -123,8 +120,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // Set up match highlighting for search results.
             fmt.set_highlight(&args.pattern, regex, args.ignore_case);
 
-            let results =
-                search::text_search(&args.pattern, regex, args.ignore_case, &args.paths)?;
+            let results = search::text_search(&args.pattern, regex, args.ignore_case, &args.paths)?;
 
             if results.is_empty() {
                 output::print_hint(
@@ -243,7 +239,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
             let kind_str = args.kind.as_deref();
             let file_str = args.file.as_deref();
-            let results = router.query_symbols_with_file(&args.name, kind_str, file_str, args.exact)?;
+            let results =
+                router.query_symbols_with_file(&args.name, kind_str, file_str, args.exact)?;
 
             if results.is_empty() {
                 output::print_hint(
@@ -1435,6 +1432,81 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Context(args) => {
             dispatch_context(args, &mut fmt, suppress)?;
         }
+        Command::Delegate(args) => {
+            let repo_root = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| db::find_repo_root(&cwd).ok());
+
+            let conn = repo_root
+                .as_ref()
+                .and_then(|root| db::find_existing_index(root))
+                .and_then(|path| db::open(&path).ok());
+
+            let conn = match conn {
+                Some(c) => c,
+                None => {
+                    output::print_hint(
+                        "no index found; run `wonk init` to build the index",
+                        suppress,
+                    );
+                    return Ok(());
+                }
+            };
+
+            let repo = match repo_root.as_deref() {
+                Some(r) => r,
+                None => {
+                    output::print_error("no repository root found");
+                    return Ok(());
+                }
+            };
+
+            let result = crate::delegate::delegate(
+                &conn,
+                repo,
+                &config.llm,
+                &args.question,
+                args.scope.as_deref(),
+            );
+
+            match result {
+                Ok(dr) => {
+                    if format.is_structured() {
+                        let out = serde_json::json!({
+                            "answer": dr.answer,
+                            "context_symbols": dr.context_symbols.iter().map(|cs| {
+                                serde_json::json!({
+                                    "name": cs.name,
+                                    "kind": cs.kind,
+                                    "file": cs.file,
+                                    "line": cs.line,
+                                    "similarity": cs.similarity,
+                                })
+                            }).collect::<Vec<_>>(),
+                        });
+                        let json = serde_json::to_string_pretty(&out).unwrap_or_default();
+                        writeln!(fmt.writer_mut(), "{json}")?;
+                    } else {
+                        writeln!(fmt.writer_mut(), "{}", dr.answer)?;
+                        if !dr.context_symbols.is_empty() {
+                            eprintln!();
+                            eprintln!("Context ({} symbols):", dr.context_symbols.len());
+                            for cs in &dr.context_symbols {
+                                eprintln!("  {} ({}) in {}:{}", cs.name, cs.kind, cs.file, cs.line);
+                            }
+                        }
+                    }
+                }
+                Err(crate::errors::LlmError::OllamaUnreachable) => {
+                    output::print_error(
+                        "cannot connect to Ollama; ensure it is running: `ollama serve`",
+                    );
+                }
+                Err(e) => {
+                    output::print_error(&format!("delegate failed: {e}"));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1769,6 +1841,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Blast(_)
             | Command::Changes(_)
             | Command::Context(_)
+            | Command::Delegate(_)
     )
 }
 
@@ -4753,6 +4826,16 @@ mod tests {
             file: None,
             kind: None,
             min_confidence: None,
+        });
+        assert!(is_query_command(&cmd));
+    }
+
+    #[test]
+    fn test_is_query_command_delegate() {
+        use crate::cli::DelegateArgs;
+        let cmd = Command::Delegate(DelegateArgs {
+            question: "How does auth work?".into(),
+            scope: None,
         });
         assert!(is_query_command(&cmd));
     }

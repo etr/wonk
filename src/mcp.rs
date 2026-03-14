@@ -982,6 +982,30 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     }
                 }),
             },
+            Tool {
+                name: "wonk_delegate",
+                description: "Ask a natural-language question about the codebase. Uses semantic search to gather relevant code context, then delegates to a local LLM (Ollama) for a grounded answer. Requires Ollama.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "Natural language question about the codebase"
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Restrict context to symbols under this path prefix (e.g. 'src/auth/')"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "toon"],
+                            "description": "Output format (default: json)",
+                            "default": "json"
+                        }
+                    },
+                    "required": ["question"]
+                }),
+            },
         ];
 
         // Inject optional `repo` parameter into all existing tools except wonk_init
@@ -1267,6 +1291,7 @@ impl McpServer {
             "wonk_cluster" => self.tool_cluster(call.arguments),
             "wonk_impact" => self.tool_impact(call.arguments),
             "wonk_update" => self.tool_update(call.arguments),
+            "wonk_delegate" => self.tool_delegate(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1451,8 +1476,7 @@ impl McpServer {
         };
 
         // Also query subclasses/implementors from type_edges.
-        let subclass_results = crate::router::query_subclasses_db(conn, &name)
-            .unwrap_or_default();
+        let subclass_results = crate::router::query_subclasses_db(conn, &name).unwrap_or_default();
 
         // Files-only mode: return just unique file paths.
         if output_mode == "files" {
@@ -2678,6 +2702,43 @@ impl McpServer {
         });
         format_result(&result, format)
     }
+
+    fn tool_delegate(&mut self, args: Value) -> CallToolResult {
+        let question = match require_str(&args, "question") {
+            Ok(q) => q,
+            Err(e) => return e,
+        };
+        let scope = args.get("scope").and_then(|v| v.as_str());
+        let format = extract_format(&args);
+
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+
+        let config = crate::config::Config::load(Some(&repo_root)).unwrap_or_default();
+
+        let result = crate::delegate::delegate(conn, &repo_root, &config.llm, &question, scope);
+
+        match result {
+            Ok(dr) => {
+                let out = serde_json::json!({
+                    "answer": dr.answer,
+                    "context_symbols": dr.context_symbols.iter().map(|cs| {
+                        serde_json::json!({
+                            "name": cs.name,
+                            "kind": cs.kind,
+                            "file": cs.file,
+                            "line": cs.line,
+                            "similarity": cs.similarity,
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                format_result(&out, format)
+            }
+            Err(e) => CallToolResult::error(format!("delegate failed: {e}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2845,7 +2906,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
     }
 
     #[test]
@@ -3023,7 +3084,9 @@ mod tests {
         // With a tiny budget, the response should be a wrapper with truncation metadata.
         if parsed.get("truncated").is_some() {
             assert!(parsed["truncated"].as_u64().unwrap() > 0);
-            let hint = parsed["hint"].as_str().expect("truncated response should have a hint");
+            let hint = parsed["hint"]
+                .as_str()
+                .expect("truncated response should have a hint");
             assert!(
                 hint.contains("Showing") && hint.contains("sorted by relevance"),
                 "hint should use soft wording, got: {hint}"
@@ -3066,7 +3129,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
     }
 
     #[test]
