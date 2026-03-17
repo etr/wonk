@@ -1823,14 +1823,11 @@ impl McpServer {
                 != Some(env!("CARGO_PKG_VERSION"));
 
         if needs_full_rebuild {
-            let stats = match pipeline::build_index_with_progress(
-                &repo_root,
-                local,
-                &Progress::silent(),
-            ) {
-                Ok(s) => s,
-                Err(e) => return CallToolResult::error(format!("index build failed: {e}")),
-            };
+            let stats =
+                match pipeline::build_index_with_progress(&repo_root, local, &Progress::silent()) {
+                    Ok(s) => s,
+                    Err(e) => return CallToolResult::error(format!("index build failed: {e}")),
+                };
 
             // Full embedding build.
             let emb_stats = db::open(&index_path)
