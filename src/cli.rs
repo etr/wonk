@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use clap::{Parser, Subcommand};
 
 use crate::output::OutputFormat;
@@ -17,6 +19,14 @@ pub struct Cli {
     /// Limit output to approximately N tokens (higher-ranked results preserved)
     #[arg(long, global = true)]
     pub budget: Option<usize>,
+
+    /// Page number for paginated output (1-indexed, requires --budget)
+    #[arg(long, global = true)]
+    pub page: Option<usize>,
+
+    /// Include results from test, doc, example, and benchmark files (excluded by default)
+    #[arg(long, global = true)]
+    pub include_tests: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -122,6 +132,10 @@ pub struct SearchArgs {
     #[arg(long, conflicts_with = "raw")]
     pub semantic: bool,
 
+    /// Restrict search to files matching this path (substring match)
+    #[arg(short = 'f', long)]
+    pub file: Option<String>,
+
     /// Restrict search to these paths (use -- before paths)
     #[arg(last = true)]
     pub paths: Vec<String>,
@@ -137,18 +151,30 @@ pub struct SymArgs {
     pub kind: Option<String>,
 
     /// Restrict results to a specific file path (substring match)
-    #[arg(long)]
+    #[arg(short = 'f', long)]
     pub file: Option<String>,
 
     /// Require an exact match on the symbol name
     #[arg(long)]
     pub exact: bool,
+
+    /// Limit the number of results returned
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 #[derive(clap::Args, Debug)]
 pub struct RefArgs {
     /// Symbol name to find references for
     pub name: String,
+
+    /// Output mode: full (default) or files (unique file paths only)
+    #[arg(long, default_value = "full")]
+    pub output: String,
+
+    /// Restrict search to files matching this path (substring match)
+    #[arg(short = 'f', long)]
+    pub file: Option<String>,
 
     /// Restrict search to these paths (use -- before paths)
     #[arg(last = true)]
@@ -185,6 +211,10 @@ pub struct UpdateArgs {
     /// Force a full rebuild even if the index appears current
     #[arg(long)]
     pub force: bool,
+
+    /// Skip embedding generation (useful for quick structural-only updates)
+    #[arg(long)]
+    pub skip_embed: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -259,11 +289,12 @@ pub struct ImpactArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ShowArgs {
-    /// Symbol name to look up
-    pub name: String,
+    /// Symbol name to look up (optional when --file is provided)
+    pub name: Option<String>,
 
-    /// Restrict results to a specific file path
-    #[arg(long)]
+    /// Restrict results to a specific file path (or directory prefix).
+    /// When provided without a name, shows all top-level symbols in the file/directory.
+    #[arg(short = 'f', long)]
     pub file: Option<String>,
 
     /// Filter by symbol kind (e.g. function, class, variable)
@@ -278,12 +309,24 @@ pub struct ShowArgs {
     /// mode: signature + child signatures without bodies
     #[arg(long)]
     pub shallow: bool,
+
+    /// Restrict results to these file paths (use -- before paths)
+    #[arg(last = true)]
+    pub paths: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
 pub struct CallersArgs {
     /// Symbol name to find callers for
     pub name: String,
+
+    /// Disambiguate which symbol `name` refers to (file substring filter)
+    #[arg(long)]
+    pub reference_file: Option<String>,
+
+    /// Filter caller results to those in files matching this substring
+    #[arg(long)]
+    pub callers_file: Option<String>,
 
     /// Transitive expansion depth (default: 1 = direct callers only, max: 10)
     #[arg(long, default_value_t = 1)]
@@ -298,6 +341,14 @@ pub struct CallersArgs {
 pub struct CalleesArgs {
     /// Symbol name to find callees for
     pub name: String,
+
+    /// Disambiguate which symbol `name` refers to (file substring filter)
+    #[arg(long)]
+    pub reference_file: Option<String>,
+
+    /// Filter callee results to those in files matching this substring
+    #[arg(long)]
+    pub callees_file: Option<String>,
 
     /// Transitive expansion depth (default: 1 = direct callees only, max: 10)
     #[arg(long, default_value_t = 1)]
@@ -314,6 +365,14 @@ pub struct CallpathArgs {
     pub from: String,
     /// Target symbol name
     pub to: String,
+
+    /// Disambiguate which `from` symbol (file substring filter)
+    #[arg(long)]
+    pub reference_file: Option<String>,
+
+    /// Disambiguate which `to` symbol (file substring filter)
+    #[arg(long)]
+    pub destination_file: Option<String>,
 
     /// Minimum confidence threshold (0.0-1.0) to filter edges
     #[arg(long)]
@@ -436,7 +495,15 @@ pub enum McpCommand {
 }
 
 pub fn parse() -> Cli {
-    Cli::parse()
+    let mut cli = Cli::parse();
+
+    // Auto-budget: when stdout is piped (not a TTY) and no explicit --budget
+    // was given, apply a default to keep output bounded.
+    if cli.budget.is_none() && !std::io::stdout().is_terminal() {
+        cli.budget = Some(2000);
+    }
+
+    cli
 }
 
 #[cfg(test)]
@@ -604,7 +671,7 @@ mod tests {
         let cli = Cli::try_parse_from(["wonk", "show", "processPayment"]).unwrap();
         match cli.command {
             Command::Show(args) => {
-                assert_eq!(args.name, "processPayment");
+                assert_eq!(args.name.as_deref(), Some("processPayment"));
                 assert!(args.file.is_none());
                 assert!(args.kind.is_none());
                 assert!(!args.exact);
@@ -620,7 +687,7 @@ mod tests {
                 .unwrap();
         match cli.command {
             Command::Show(args) => {
-                assert_eq!(args.name, "processPayment");
+                assert_eq!(args.name.as_deref(), Some("processPayment"));
                 assert_eq!(args.file.as_deref(), Some("src/billing.ts"));
             }
             _ => panic!("expected Command::Show"),
@@ -655,7 +722,7 @@ mod tests {
         let cli = Cli::try_parse_from(["wonk", "show", "--shallow", "MyClass"]).unwrap();
         match cli.command {
             Command::Show(args) => {
-                assert_eq!(args.name, "MyClass");
+                assert_eq!(args.name.as_deref(), Some("MyClass"));
                 assert!(args.shallow);
             }
             _ => panic!("expected Command::Show"),
@@ -674,9 +741,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_show_requires_name() {
-        let result = Cli::try_parse_from(["wonk", "show"]);
-        assert!(result.is_err());
+    fn parse_show_file_only_mode() {
+        let cli = Cli::try_parse_from(["wonk", "show", "--file", "src/auth/"]).unwrap();
+        match cli.command {
+            Command::Show(args) => {
+                assert!(args.name.is_none());
+                assert_eq!(args.file.as_deref(), Some("src/auth/"));
+            }
+            _ => panic!("expected Command::Show"),
+        }
     }
 
     #[test]
@@ -686,7 +759,7 @@ mod tests {
         assert_eq!(cli.format, Some(OutputFormat::Json));
         match cli.command {
             Command::Show(args) => {
-                assert_eq!(args.name, "processPayment");
+                assert_eq!(args.name.as_deref(), Some("processPayment"));
             }
             _ => panic!("expected Command::Show"),
         }
@@ -877,6 +950,124 @@ mod tests {
     fn parse_callpath_requires_both_args() {
         let result = Cli::try_parse_from(["wonk", "callpath", "foo"]);
         assert!(result.is_err(), "callpath requires both from and to");
+    }
+
+    #[test]
+    fn parse_callers_with_reference_file() {
+        let cli = Cli::try_parse_from(["wonk", "callers", "--reference-file", "driver.rs", "poll"])
+            .unwrap();
+        match cli.command {
+            Command::Callers(args) => {
+                assert_eq!(args.name, "poll");
+                assert_eq!(args.reference_file, Some("driver.rs".to_string()));
+                assert_eq!(args.callers_file, None);
+            }
+            _ => panic!("expected Command::Callers"),
+        }
+    }
+
+    #[test]
+    fn parse_callers_with_both_files() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "callers",
+            "--reference-file",
+            "driver.rs",
+            "--callers-file",
+            "main.rs",
+            "poll",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Callers(args) => {
+                assert_eq!(args.name, "poll");
+                assert_eq!(args.reference_file, Some("driver.rs".to_string()));
+                assert_eq!(args.callers_file, Some("main.rs".to_string()));
+            }
+            _ => panic!("expected Command::Callers"),
+        }
+    }
+
+    #[test]
+    fn parse_callees_with_reference_file() {
+        let cli = Cli::try_parse_from(["wonk", "callees", "--reference-file", "_client.py", "get"])
+            .unwrap();
+        match cli.command {
+            Command::Callees(args) => {
+                assert_eq!(args.name, "get");
+                assert_eq!(args.reference_file, Some("_client.py".to_string()));
+                assert_eq!(args.callees_file, None);
+            }
+            _ => panic!("expected Command::Callees"),
+        }
+    }
+
+    #[test]
+    fn parse_callees_with_both_files() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "callees",
+            "--reference-file",
+            "_client.py",
+            "--callees-file",
+            "models.py",
+            "get",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Callees(args) => {
+                assert_eq!(args.name, "get");
+                assert_eq!(args.reference_file, Some("_client.py".to_string()));
+                assert_eq!(args.callees_file, Some("models.py".to_string()));
+            }
+            _ => panic!("expected Command::Callees"),
+        }
+    }
+
+    #[test]
+    fn parse_callpath_with_reference_file() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "callpath",
+            "--reference-file",
+            "_client.py",
+            "get",
+            "_send",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Callpath(args) => {
+                assert_eq!(args.from, "get");
+                assert_eq!(args.to, "_send");
+                assert_eq!(args.reference_file, Some("_client.py".to_string()));
+                assert_eq!(args.destination_file, None);
+            }
+            _ => panic!("expected Command::Callpath"),
+        }
+    }
+
+    #[test]
+    fn parse_callpath_with_both_files() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "callpath",
+            "--reference-file",
+            "_client.py",
+            "--destination-file",
+            "transport.py",
+            "get",
+            "_send",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Callpath(args) => {
+                assert_eq!(args.from, "get");
+                assert_eq!(args.to, "_send");
+                assert_eq!(args.reference_file, Some("_client.py".to_string()));
+                assert_eq!(args.destination_file, Some("transport.py".to_string()));
+            }
+            _ => panic!("expected Command::Callpath"),
+        }
     }
 
     // -- Summary tests --------------------------------------------------------

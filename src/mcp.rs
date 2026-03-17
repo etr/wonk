@@ -178,6 +178,13 @@ impl CallToolResult {
 
 /// Extract a required string parameter from JSON args, returning a
 /// `CallToolResult::error` on missing.
+/// Extract the `include_tests` boolean flag (defaults to false).
+fn extract_include_tests(args: &Value) -> bool {
+    args.get("include_tests")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn require_str(args: &Value, key: &str) -> Result<String, CallToolResult> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -373,6 +380,10 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "description": "Case-insensitive search",
                             "default": false
                         },
+                        "file": {
+                            "type": "string",
+                            "description": "Restrict search to files matching this path (substring match). Alternative to paths for single-file filtering."
+                        },
                         "paths": {
                             "type": "array",
                             "items": { "type": "string" },
@@ -382,11 +393,21 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
                         },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number (1-indexed). Each page contains one budget-worth of tokens.",
+                            "default": 1
+                        },
                         "format": {
                             "type": "string",
                             "enum": ["json", "toon"],
                             "description": "Output format (default: json)",
                             "default": "json"
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include results from test/doc/example files (excluded by default)",
+                            "default": false
                         }
                     },
                     "required": ["query"]
@@ -415,11 +436,20 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "description": "Require exact name match",
                             "default": false
                         },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return"
+                        },
                         "format": {
                             "type": "string",
                             "enum": ["json", "toon"],
                             "description": "Output format (default: json)",
                             "default": "json"
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include results from test/doc/example files (excluded by default)",
+                            "default": false
                         }
                     },
                     "required": ["name"]
@@ -435,6 +465,10 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "string",
                             "description": "Symbol name to find references for"
                         },
+                        "file": {
+                            "type": "string",
+                            "description": "Restrict results to files matching this path (substring match). Alternative to paths for single-file filtering."
+                        },
                         "paths": {
                             "type": "array",
                             "items": { "type": "string" },
@@ -443,6 +477,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
+                        },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number (1-indexed). Each page contains one budget-worth of tokens. You don't need to read all pages — read only the minimum necessary.",
+                            "default": 1
                         },
                         "output": {
                             "type": "string",
@@ -455,6 +494,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "enum": ["json", "toon"],
                             "description": "Output format (default: json)",
                             "default": "json"
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include results from test/doc/example files (excluded by default)",
+                            "default": false
                         }
                     },
                     "required": ["name"]
@@ -557,13 +601,13 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_show",
-                description: "Read source bodies of named symbols. Accepts comma-separated names for batch lookup (e.g. 'main,parse,validate'). More targeted than Read — finds the symbol across files without needing the file path. Large containers auto-fallback to shallow mode when they exceed the budget. Returns complete symbol source code — you do not need to Read the same file afterward.",
+                description: "Read source bodies of named symbols. Accepts comma-separated names for batch lookup (e.g. 'main,parse,validate') and qualified paths (e.g. 'Client.get', 'Foo::bar'). When only `file` is provided (no `name`), returns all top-level symbols in that file or directory — one call for the complete module picture. Large results are auto-truncated to 80 lines per symbol. Large containers auto-fallback to shallow mode when they exceed the budget. Returns complete symbol source code — you do not need to Read the same file afterward.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "Symbol name to look up"
+                            "description": "Symbol name to look up. Supports qualified paths (Foo::bar or Client.get) and comma-separated batch (foo,bar,baz). Optional when `file` is provided."
                         },
                         "kind": {
                             "type": "string",
@@ -571,7 +615,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         },
                         "file": {
                             "type": "string",
-                            "description": "Restrict results to a specific file path (substring match)"
+                            "description": "File path or directory prefix. When provided without `name`, returns all top-level symbols in that path. Use trailing '/' for directories (e.g. 'src/auth/')."
                         },
                         "exact": {
                             "type": "boolean",
@@ -587,25 +631,43 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
                         },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number (1-indexed). Each page contains one budget-worth of tokens. You don't need to read all pages — read only the minimum necessary.",
+                            "default": 1
+                        },
                         "format": {
                             "type": "string",
                             "enum": ["json", "toon"],
                             "description": "Output format (default: json)",
                             "default": "json"
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include results from test/doc/example files (excluded by default)",
+                            "default": false
                         }
                     },
-                    "required": ["name"]
+                    "required": []
                 }),
             },
             Tool {
                 name: "wonk_callers",
-                description: "Who calls this symbol? depth=1 for direct callers, depth=2+ for transitive.",
+                description: "Who calls this symbol? depth=1 for direct callers, depth=2+ for transitive. Use reference_file to disambiguate which target symbol, callers_file to filter returned callers by file.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
                             "description": "Symbol name to find callers for"
+                        },
+                        "reference_file": {
+                            "type": "string",
+                            "description": "Disambiguate which symbol `name` refers to (file substring, e.g. 'driver.rs')"
+                        },
+                        "callers_file": {
+                            "type": "string",
+                            "description": "Filter returned callers to those defined in files matching this substring"
                         },
                         "depth": {
                             "type": "integer",
@@ -620,11 +682,21 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
                         },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number (1-indexed). Each page contains one budget-worth of tokens.",
+                            "default": 1
+                        },
                         "format": {
                             "type": "string",
                             "enum": ["json", "toon"],
                             "description": "Output format (default: json)",
                             "default": "json"
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include results from test/doc/example files (excluded by default)",
+                            "default": false
                         }
                     },
                     "required": ["name"]
@@ -632,13 +704,21 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_callees",
-                description: "What does this symbol call? depth=1 for direct callees, depth=2+ for transitive.",
+                description: "What does this symbol call? depth=1 for direct callees, depth=2+ for transitive. Use reference_file to disambiguate which source symbol, callees_file to filter returned callees by file.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
                             "description": "Symbol name to find callees for"
+                        },
+                        "reference_file": {
+                            "type": "string",
+                            "description": "Disambiguate which symbol `name` refers to (file substring, e.g. '_client.py')"
+                        },
+                        "callees_file": {
+                            "type": "string",
+                            "description": "Filter returned callees to those defined in files matching this substring"
                         },
                         "depth": {
                             "type": "integer",
@@ -653,11 +733,21 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
                         },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number (1-indexed). Each page contains one budget-worth of tokens.",
+                            "default": 1
+                        },
                         "format": {
                             "type": "string",
                             "enum": ["json", "toon"],
                             "description": "Output format (default: json)",
                             "default": "json"
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include results from test/doc/example files (excluded by default)",
+                            "default": false
                         }
                     },
                     "required": ["name"]
@@ -665,7 +755,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_callpath",
-                description: "Trace how symbol A reaches symbol B. Use for 'how does X call Y' questions — returns the call chain (e.g. main → parse → validate).",
+                description: "Trace how symbol A reaches symbol B. Use for 'how does X call Y' questions — returns the call chain (e.g. main → parse → validate). Use reference_file/destination_file to disambiguate common names.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -676,6 +766,14 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "to": {
                             "type": "string",
                             "description": "Target symbol name (end of call chain)"
+                        },
+                        "reference_file": {
+                            "type": "string",
+                            "description": "Disambiguate which `from` symbol (file substring, e.g. '_client.py')"
+                        },
+                        "destination_file": {
+                            "type": "string",
+                            "description": "Disambiguate which `to` symbol (file substring, e.g. 'transport.py')"
                         },
                         "min_confidence": {
                             "type": "number",
@@ -715,6 +813,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
                         },
+                        "page": {
+                            "type": "integer",
+                            "description": "Page number (1-indexed). Each page contains one budget-worth of tokens.",
+                            "default": 1
+                        },
                         "format": {
                             "type": "string",
                             "enum": ["json", "toon"],
@@ -727,7 +830,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_flows",
-                description: "Trace execution from an entry point through callees. Use for 'how does this flow work' questions. Omit entry to list all detected entry points.",
+                description: "Trace execution from an entry point through callees. Use for 'how does this flow work' questions. Omit entry to list detected entry points; when from is set and exactly one entry point is found, auto-traces it.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -876,6 +979,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "enum": ["json", "toon"],
                             "description": "Output format (default: json)",
                             "default": "json"
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include results from test/doc/example files (excluded by default)",
+                            "default": false
                         }
                     },
                     "required": ["name"]
@@ -1217,13 +1325,16 @@ impl McpServer {
                 "wonk provides structure-aware code analysis via a pre-built index. \
                  Prefer wonk tools over Glob/Read/Grep for code exploration — they return \
                  ranked, deduplicated results in fewer calls.\n\
-                 - Architecture/module questions: wonk_summary with directory path + depth=1 \
-                   (returns all files, symbols, and import edges in one call — do NOT call per-file)\n\
-                 - Find a symbol definition: wonk_sym\n\
-                 - Read symbol source code: wonk_show (batch: comma-separated names)\n\
-                 - Find references/call sites: wonk_ref\n\
+                 Pick ONE recipe per question, execute 1-2 calls, answer:\n\
+                 - Source/definition: wonk_show (batch: name='X,Y,Z', qualified: name='Class.method' or 'Mod::Type')\n\
+                 - Everything about X: wonk_context (def+callers+callees in ONE call)\n\
+                 - List class methods: wonk_show with batch qualified paths (name='X.get,X.post,X.send') \
+                   or wonk_show(file='path/to/x.py', shallow=true). Do NOT use wonk_context to list methods.\n\
+                 - Trace flow / callees: wonk_callees(name='X', depth=3) — qualified: name='Class.get'\n\
+                 - Architecture: wonk_summary(path='dir/', depth=1, budget=8000) — use budget=8000\n\
+                 - References: wonk_ref (output='files' for just file paths)\n\
                  - Text search: wonk_search (keyword/regex, ranked, definitions first)\n\
-                 - Semantic / natural-language search: wonk_ask (requires embeddings)",
+                 - Pagination: use page=N to read more results; read only the minimum necessary",
             ),
         })
         .expect("serialize InitializeResult")
@@ -1286,15 +1397,23 @@ impl McpServer {
             .get("case_insensitive")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let paths: Vec<String> = args
+        let mut paths: Vec<String> = args
             .get("paths")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        // Merge `file` param into paths list.
+        if let Some(file) = args.get("file").and_then(|v| v.as_str()) {
+            paths.insert(0, file.to_string());
+        }
         let budget_limit: Option<usize> = args
             .get("budget")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .or(Some(4000));
+        let page: Option<usize> = args
+            .get("page")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
         let format = extract_format(&args);
 
         let (ranker_conn, repo_root) = match self.resolve_repo(&args) {
@@ -1336,14 +1455,27 @@ impl McpServer {
             resolved_paths.push(repo_root.to_string_lossy().into_owned());
         }
 
-        let results = match search::text_search(&query, regex, case_insensitive, &resolved_paths) {
-            Ok(r) => r,
-            Err(e) => return CallToolResult::error(format!("search failed: {e}")),
-        };
+        let include_tests = extract_include_tests(&args);
+
+        let mut results =
+            match search::text_search(&query, regex, case_insensitive, &resolved_paths) {
+                Ok(r) => r,
+                Err(e) => return CallToolResult::error(format!("search failed: {e}")),
+            };
+
+        if !include_tests {
+            results.retain(|r| !ranker::is_test_file(&r.file));
+        }
 
         let groups = ranker::rank_and_dedup(&results, ranker_conn, &query);
 
-        let mut budget = budget_limit.map(TokenBudget::new);
+        let mut budget = budget_limit.map(|limit| {
+            if let Some(p) = page {
+                TokenBudget::new_with_skip(limit, p.saturating_sub(1) * limit)
+            } else {
+                TokenBudget::new(limit)
+            }
+        });
         let mut outputs: Vec<SearchOutput> = Vec::new();
         let mut truncated = 0usize;
 
@@ -1373,13 +1505,24 @@ impl McpServer {
             }
         }
 
-        if truncated > 0 {
+        if truncated > 0 || page.is_some_and(|p| p > 1) {
             let shown = outputs.len();
             let total = shown + truncated;
+            let current_page = page.unwrap_or(1);
+            let has_more = truncated > 0;
+            let hint = if has_more {
+                format!(
+                    "Page {current_page}. Showing {shown} of {total} matches. Use page={} for more.",
+                    current_page + 1
+                )
+            } else {
+                format!("Page {current_page}. Showing {shown} of {total} matches. No more pages.")
+            };
             let wrapper = serde_json::json!({
                 "results": outputs,
-                "truncated": truncated,
-                "hint": format!("Showing {shown} of {total} matches. Results are sorted by relevance."),
+                "page": current_page,
+                "has_more": has_more,
+                "hint": hint,
             });
             format_result(&wrapper, format)
         } else {
@@ -1388,22 +1531,39 @@ impl McpServer {
     }
 
     fn tool_sym(&mut self, args: Value) -> CallToolResult {
-        let name = match require_str(&args, "name") {
+        let raw_name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
         };
         let kind = args.get("kind").and_then(|v| v.as_str());
-        let file = args.get("file").and_then(|v| v.as_str());
+        let explicit_file = args.get("file").and_then(|v| v.as_str());
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
         let format = extract_format(&args);
+
+        // Support qualified paths: `Client.get` → name="get", scope="Client".
+        let split = crate::router::split_qualified_name(&raw_name);
+        let file = explicit_file.map(String::from).or(split.file_hint);
+        let scope = split.scope_hint;
 
         let (conn, _) = match self.resolve_repo(&args) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        match crate::router::query_symbols_db_with_file(conn, &name, kind, file, exact) {
+        let include_tests = extract_include_tests(&args);
+        match crate::router::query_symbols_db_with_filters(
+            conn,
+            split.name,
+            kind,
+            file.as_deref(),
+            scope.as_deref(),
+            exact,
+        ) {
             Ok(r) if r.is_empty() => {
-                let hints = empty_show_hints(conn, &name, None, kind);
+                let hints = empty_show_hints(conn, &raw_name, None, kind);
                 let wrapper = serde_json::json!({
                     "results": Vec::<String>::new(),
                     "hints": hints,
@@ -1411,6 +1571,9 @@ impl McpServer {
                 format_result(&wrapper, format)
             }
             Ok(mut r) => {
+                if !include_tests {
+                    r.retain(|s| !crate::ranker::is_test_file(std::path::Path::new(&s.file)));
+                }
                 // Deprioritize .d.ts files — push them to the end so
                 // actual source definitions appear first within budget.
                 r.sort_by(|a, b| {
@@ -1418,6 +1581,10 @@ impl McpServer {
                     let b_dts = b.file.ends_with(".d.ts");
                     a_dts.cmp(&b_dts)
                 });
+                // Apply limit after sorting.
+                if let Some(limit) = limit {
+                    r.truncate(limit);
+                }
                 let outputs: Vec<SymbolOutput> = r.iter().map(symbol_to_output).collect();
                 format_result(&outputs, format)
             }
@@ -1430,11 +1597,28 @@ impl McpServer {
             Ok(n) => n,
             Err(e) => return e,
         };
+        let mut paths: Vec<String> = args
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Merge `file` param into paths list.
+        if let Some(file) = args.get("file").and_then(|v| v.as_str()) {
+            paths.insert(0, file.to_string());
+        }
         let budget_limit: Option<usize> = args
             .get("budget")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .or(Some(2000));
+        let page: Option<usize> = args
+            .get("page")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
         let format = extract_format(&args);
         let output_mode = args
             .get("output")
@@ -1445,14 +1629,26 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let results = match crate::router::query_references_db(conn, &name) {
+        let mut results = match crate::router::query_references_db(conn, &name) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("reference query failed: {e}")),
         };
+        if !paths.is_empty() {
+            results.retain(|r| paths.iter().any(|p| r.file.starts_with(p)));
+        }
 
         // Also query subclasses/implementors from type_edges.
-        let subclass_results = crate::router::query_subclasses_db(conn, &name)
-            .unwrap_or_default();
+        let mut subclass_results =
+            crate::router::query_subclasses_db(conn, &name).unwrap_or_default();
+        if !paths.is_empty() {
+            subclass_results.retain(|s| paths.iter().any(|p| s.file.starts_with(p)));
+        }
+        let include_tests = extract_include_tests(&args);
+        if !include_tests {
+            results.retain(|r| !crate::ranker::is_test_file(std::path::Path::new(&r.file)));
+            subclass_results
+                .retain(|s| !crate::ranker::is_test_file(std::path::Path::new(&s.file)));
+        }
 
         // Files-only mode: return just unique file paths.
         if output_mode == "files" {
@@ -1494,7 +1690,7 @@ impl McpServer {
             });
         }
 
-        collect_with_budget(outputs, budget_limit, format)
+        collect_with_budget_and_page(outputs, budget_limit, page, format)
     }
 
     fn tool_sig(&mut self, args: Value) -> CallToolResult {
@@ -1612,87 +1808,110 @@ impl McpServer {
     fn tool_init(&mut self, args: Value) -> CallToolResult {
         let local = args.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
+        let repo_root = self.router.repo_root().to_path_buf();
 
-        let stats = match pipeline::build_index_with_progress(
-            self.router.repo_root(),
-            local,
-            &Progress::silent(),
-        ) {
-            Ok(s) => s,
-            Err(e) => return CallToolResult::error(format!("index build failed: {e}")),
-        };
-
-        // Build embeddings after structural index.
-        let index_path = match db::index_path_for(self.router.repo_root(), local) {
+        // Check if we can do an incremental update instead of a full rebuild.
+        let index_path = match db::index_path_for(&repo_root, local) {
             Ok(p) => p,
-            Err(_) => {
-                let result = serde_json::json!({
-                    "file_count": stats.file_count,
-                    "symbol_count": stats.symbol_count,
-                    "reference_count": stats.ref_count,
-                    "elapsed_ms": stats.elapsed.as_millis(),
-                    "embedding_count": 0,
-                    "embedding_skipped": true
-                });
-                return format_result(&result, format);
-            }
+            Err(e) => return CallToolResult::error(format!("index path error: {e}")),
         };
-
-        let emb_stats = db::open(&index_path)
-            .ok()
-            .and_then(|conn| {
-                let client = crate::embedding::OllamaClient::new();
-                pipeline::build_embeddings(
-                    &conn,
-                    self.router.repo_root(),
-                    &client,
-                    crate::progress::ProgressMode::Silent,
-                )
+        let needs_full_rebuild = !index_path.exists()
+            || db::read_meta(&index_path)
                 .ok()
-            })
-            .unwrap_or(pipeline::EmbeddingBuildStats {
-                embedded_count: 0,
-                total_symbols: 0,
-                skipped: true,
-                elapsed: std::time::Duration::ZERO,
-            });
+                .and_then(|m| m.wonk_version)
+                .as_deref()
+                != Some(env!("CARGO_PKG_VERSION"));
 
-        let result = serde_json::json!({
-            "file_count": stats.file_count,
-            "symbol_count": stats.symbol_count,
-            "reference_count": stats.ref_count,
-            "elapsed_ms": stats.elapsed.as_millis(),
-            "embedding_count": emb_stats.embedded_count,
-            "embedding_skipped": emb_stats.skipped
-        });
-        format_result(&result, format)
+        if needs_full_rebuild {
+            let stats = match pipeline::build_index_with_progress(
+                &repo_root,
+                local,
+                &Progress::silent(),
+            ) {
+                Ok(s) => s,
+                Err(e) => return CallToolResult::error(format!("index build failed: {e}")),
+            };
+
+            // Full embedding build.
+            let emb_stats = db::open(&index_path)
+                .ok()
+                .and_then(|conn| {
+                    let client = crate::embedding::OllamaClient::new();
+                    pipeline::build_embeddings(
+                        &conn,
+                        &repo_root,
+                        &client,
+                        crate::progress::ProgressMode::Silent,
+                    )
+                    .ok()
+                })
+                .unwrap_or(pipeline::EmbeddingBuildStats {
+                    embedded_count: 0,
+                    total_symbols: 0,
+                    skipped: true,
+                    elapsed: std::time::Duration::ZERO,
+                });
+
+            let result = serde_json::json!({
+                "file_count": stats.file_count,
+                "symbol_count": stats.symbol_count,
+                "reference_count": stats.ref_count,
+                "elapsed_ms": stats.elapsed.as_millis(),
+                "embedding_count": emb_stats.embedded_count,
+                "embedding_skipped": emb_stats.skipped
+            });
+            format_result(&result, format)
+        } else {
+            // Incremental structural update.
+            let stats = match pipeline::incremental_update(&repo_root, local) {
+                Ok(s) => s,
+                Err(e) => return CallToolResult::error(format!("incremental update failed: {e}")),
+            };
+
+            // Incremental embedding update.
+            let emb_stats = db::open(&index_path)
+                .ok()
+                .and_then(|conn| {
+                    let client = crate::embedding::OllamaClient::new();
+                    pipeline::build_missing_embeddings(
+                        &conn,
+                        &repo_root,
+                        &client,
+                        crate::progress::ProgressMode::Silent,
+                    )
+                    .ok()
+                })
+                .unwrap_or(pipeline::EmbeddingBuildStats {
+                    embedded_count: 0,
+                    total_symbols: 0,
+                    skipped: true,
+                    elapsed: std::time::Duration::ZERO,
+                });
+
+            let result = serde_json::json!({
+                "file_count": stats.file_count,
+                "symbol_count": stats.symbol_count,
+                "reference_count": stats.ref_count,
+                "elapsed_ms": stats.elapsed.as_millis(),
+                "incremental": true,
+                "embedding_count": emb_stats.embedded_count,
+                "embedding_skipped": emb_stats.skipped
+            });
+            format_result(&result, format)
+        }
     }
 
     fn tool_show(&mut self, args: Value) -> CallToolResult {
-        let raw_name = match require_str(&args, "name") {
-            Ok(n) => n,
-            Err(e) => return e,
-        };
+        let raw_name = args.get("name").and_then(|v| v.as_str()).map(String::from);
         let kind = args.get("kind").and_then(|v| v.as_str()).map(String::from);
         let explicit_file = args.get("file").and_then(|v| v.as_str()).map(String::from);
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        // Support qualified paths: `tokio::spawn` → name="spawn", file hint="tokio".
-        let (name, file) = if raw_name.contains("::") && explicit_file.is_none() {
-            if let Some(pos) = raw_name.rfind("::") {
-                let prefix = &raw_name[..pos];
-                let bare = &raw_name[pos + 2..];
-                if bare.is_empty() {
-                    (raw_name.clone(), explicit_file)
-                } else {
-                    (bare.to_string(), Some(prefix.replace("::", "/")))
-                }
-            } else {
-                (raw_name, explicit_file)
-            }
-        } else {
-            (raw_name, explicit_file)
-        };
+        // Require at least name or file.
+        if raw_name.is_none() && explicit_file.is_none() {
+            return CallToolResult::error("either 'name' or 'file' is required".into());
+        }
+
         let shallow = args
             .get("shallow")
             .and_then(|v| v.as_bool())
@@ -1709,45 +1928,139 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        let options = crate::show::ShowOptions {
-            file: file.clone(),
-            kind: kind.clone(),
-            exact,
-            suppress: true,
-            shallow,
-        };
-
-        // Support comma-separated names for batch lookup (e.g. "main,parse,validate").
-        let names: Vec<&str> = name
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-
         let mut all_results = Vec::new();
-        for n in &names {
-            match crate::show::show_symbol(conn, n, &repo_root, &options) {
-                Ok(r) => all_results.extend(r),
+
+        let page: Option<usize> = args
+            .get("page")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        if let Some(raw_name) = raw_name {
+            // Auto-detect file paths passed as name: redirect to file-only mode.
+            if explicit_file.is_none() && crate::router::looks_like_file_path(&raw_name) {
+                let options = crate::show::ShowOptions {
+                    file: None,
+                    kind: kind.clone(),
+                    exact: false,
+                    suppress: true,
+                    shallow: true,
+                    scope: None,
+                    signatures_only: true, // auto-file-path: compact output
+                };
+                match crate::show::show_file(conn, &raw_name, &repo_root, &options) {
+                    Ok(r) => all_results = r,
+                    Err(e) => return CallToolResult::error(format!("show query failed: {e}")),
+                }
+            } else {
+                // Support comma-separated names for batch lookup (e.g. "main,parse,validate").
+                let names: Vec<&str> = raw_name
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                for n in &names {
+                    // Support qualified paths with scope: `Client.get` → name="get", scope="Client".
+                    let split = crate::router::split_qualified_name(n);
+                    let file = explicit_file.clone().or(split.file_hint);
+
+                    let options = crate::show::ShowOptions {
+                        file: file.clone(),
+                        kind: kind.clone(),
+                        exact,
+                        suppress: true,
+                        shallow,
+                        scope: split.scope_hint,
+                        signatures_only: false,
+                    };
+
+                    match crate::show::show_symbol(conn, split.name, &repo_root, &options) {
+                        Ok(r) => all_results.extend(r),
+                        Err(e) => return CallToolResult::error(format!("show query failed: {e}")),
+                    }
+                }
+            } // close auto-detect file path else
+
+            // Empty result diagnostics (Fix 11).
+            if all_results.is_empty() {
+                let hints =
+                    empty_show_hints(conn, &raw_name, explicit_file.as_deref(), kind.as_deref());
+                let wrapper = serde_json::json!({
+                    "results": Vec::<String>::new(),
+                    "hints": hints,
+                });
+                return format_result(&wrapper, format);
+            }
+        } else {
+            // File-only mode: show all top-level symbols in file/directory.
+            let file_pattern = explicit_file.as_ref().unwrap();
+            let options = crate::show::ShowOptions {
+                file: None,
+                kind: kind.clone(),
+                exact: false,
+                suppress: true,
+                shallow,
+                scope: None,
+                signatures_only: false,
+            };
+            match crate::show::show_file(conn, file_pattern, &repo_root, &options) {
+                Ok(r) => all_results = r,
                 Err(e) => return CallToolResult::error(format!("show query failed: {e}")),
+            }
+
+            if all_results.is_empty() {
+                let wrapper = serde_json::json!({
+                    "results": Vec::<String>::new(),
+                    "hints": [format!("no symbols found in '{file_pattern}'")],
+                });
+                return format_result(&wrapper, format);
             }
         }
 
-        // Empty result diagnostics (Fix 11).
-        if all_results.is_empty() {
-            let hints = empty_show_hints(conn, &name, file.as_deref(), kind.as_deref());
-            let wrapper = serde_json::json!({
-                "results": Vec::<String>::new(),
-                "hints": hints,
-            });
-            return format_result(&wrapper, format);
+        let include_tests = extract_include_tests(&args);
+        if !include_tests {
+            all_results.retain(|r| !crate::ranker::is_test_file(std::path::Path::new(&r.file)));
         }
 
-        let mut budget = budget_limit.map(TokenBudget::new);
+        let mut budget = budget_limit.map(|limit| {
+            if let Some(p) = page {
+                TokenBudget::new_with_skip(limit, p.saturating_sub(1) * limit)
+            } else {
+                TokenBudget::new(limit)
+            }
+        });
         let mut outputs: Vec<ShowOutput> = Vec::new();
         let mut truncated = 0usize;
 
+        // When no exact match exists in implementation files, hint that the
+        // symbol may be dynamically assigned and suggest wonk_search.
+        let no_exact_hint = if let Some(ref raw) =
+            args.get("name").and_then(|v| v.as_str()).map(String::from)
+        {
+            let has_impl_exact = all_results
+                .iter()
+                .any(|r| r.name == *raw && !r.file.ends_with(".d.ts") && !r.file.ends_with(".h"));
+            if !has_impl_exact && !exact {
+                Some(format!(
+                    "No implementation of '{}' found — results are substring or type-only matches. \
+                     If '{}' is dynamically assigned, try wonk_search(query=\"{}\").",
+                    raw, raw, raw
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         for sr in &all_results {
-            let out = ShowOutput::from(sr);
+            // Phase A: unconditional per-result cap at MAX_SOURCE_LINES.
+            let mut out = ShowOutput::from(sr);
+            if budget.is_some()
+                && let Some(t) = out.truncated(ShowOutput::MAX_SOURCE_LINES)
+            {
+                out = t;
+            }
 
             if let Some(ref mut b) = budget {
                 let serialized = serde_json::to_string(&out).unwrap_or_default();
@@ -1760,6 +2073,8 @@ impl McpServer {
                             exact: true,
                             suppress: true,
                             shallow: true,
+                            scope: None,
+                            signatures_only: false,
                         };
                         if let Ok(shallow_results) =
                             crate::show::show_symbol(conn, &sr.name, &repo_root, &shallow_opts)
@@ -1777,6 +2092,24 @@ impl McpServer {
                             }
                         }
                     }
+                    // Phase B: adaptive truncation to fit remaining budget.
+                    let remaining_chars = b.remaining() * 4;
+                    let source_lines: Vec<&str> = sr.source.lines().collect();
+                    if !source_lines.is_empty() {
+                        let avg_chars = sr.source.len() / source_lines.len();
+                        if avg_chars > 0 {
+                            let max_lines = (remaining_chars / avg_chars)
+                                .clamp(ShowOutput::MIN_SOURCE_LINES, ShowOutput::MAX_SOURCE_LINES);
+                            let fresh_out = ShowOutput::from(sr);
+                            if let Some(t) = fresh_out.truncated(max_lines) {
+                                let t_ser = serde_json::to_string(&t).unwrap_or_default();
+                                if b.try_consume(&t_ser) {
+                                    outputs.push(t);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     truncated += 1;
                     continue;
                 }
@@ -1784,13 +2117,40 @@ impl McpServer {
             outputs.push(out);
         }
 
-        if truncated > 0 {
+        if truncated > 0 || page.is_some_and(|p| p > 1) || no_exact_hint.is_some() {
             let shown = outputs.len();
             let total = shown + truncated;
+            let current_page = page.unwrap_or(1);
+            let has_more = truncated > 0;
+            let mut hint = if has_more {
+                format!(
+                    "Page {current_page}. Showing {shown} of {total} matching symbols. Use page={} for more.",
+                    current_page + 1
+                )
+            } else if page.is_some() {
+                format!(
+                    "Page {current_page}. Showing {shown} of {total} matching symbols. No more pages."
+                )
+            } else {
+                String::new()
+            };
+            if let Some(ref no_exact) = no_exact_hint {
+                if !hint.is_empty() {
+                    hint.push(' ');
+                }
+                hint.push_str(no_exact);
+            }
             let wrapper = serde_json::json!({
                 "results": outputs,
-                "truncated": truncated,
-                "hint": format!("Showing {shown} of {total} matching symbols. Results are sorted by relevance."),
+                "page": current_page,
+                "has_more": has_more,
+                "hint": hint,
+            });
+            format_result(&wrapper, format)
+        } else if let Some(ref no_exact) = no_exact_hint {
+            let wrapper = serde_json::json!({
+                "results": outputs,
+                "hint": no_exact,
             });
             format_result(&wrapper, format)
         } else {
@@ -1825,24 +2185,58 @@ impl McpServer {
     }
 
     fn tool_callers(&mut self, args: Value) -> CallToolResult {
-        let name = match require_str(&args, "name") {
+        let raw_name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
         };
+        let explicit_ref_file = args
+            .get("reference_file")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let callers_file = args
+            .get("callers_file")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let (conn, depth, budget_limit, format) = match self.callgraph_setup(&args) {
             Ok(setup) => setup,
             Err(e) => return e,
         };
+        let page: Option<usize> = args
+            .get("page")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        // Support qualified paths: `Client.get` → name="get", scope="Client".
+        let split = crate::router::split_qualified_name(&raw_name);
+        let scope_file = split.scope_hint.as_deref().and_then(|scope| {
+            let sql = "SELECT file FROM symbols WHERE name = ?1 AND scope = ?2 LIMIT 1";
+            conn.query_row(sql, rusqlite::params![split.name, scope], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+        });
+        let reference_file = explicit_ref_file.or(split.file_hint).or(scope_file);
 
         let min_confidence: Option<f64> = args
             .get("min_confidence")
             .and_then(|v| v.as_f64())
             .map(clamp_confidence);
 
-        let results = match crate::callgraph::callers(conn, &name, depth, min_confidence) {
+        let mut results = match crate::callgraph::callers(
+            conn,
+            split.name,
+            depth,
+            min_confidence,
+            reference_file.as_deref(),
+            callers_file.as_deref(),
+        ) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("callers query failed: {e}")),
         };
+        let include_tests = extract_include_tests(&args);
+        if !include_tests {
+            results.retain(|r| !crate::ranker::is_test_file(std::path::Path::new(&r.file)));
+        }
 
         let outputs: Vec<CallerOutput> = results
             .iter()
@@ -1858,28 +2252,62 @@ impl McpServer {
             })
             .collect();
 
-        collect_with_budget(outputs, budget_limit, format)
+        collect_with_budget_and_page(outputs, budget_limit, page, format)
     }
 
     fn tool_callees(&mut self, args: Value) -> CallToolResult {
-        let name = match require_str(&args, "name") {
+        let raw_name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
         };
+        let explicit_ref_file = args
+            .get("reference_file")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let callees_file = args
+            .get("callees_file")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let (conn, depth, budget_limit, format) = match self.callgraph_setup(&args) {
             Ok(setup) => setup,
             Err(e) => return e,
         };
+        let page: Option<usize> = args
+            .get("page")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        // Support qualified paths: `Client.get` → name="get", scope="Client".
+        let split = crate::router::split_qualified_name(&raw_name);
+        let scope_file = split.scope_hint.as_deref().and_then(|scope| {
+            let sql = "SELECT file FROM symbols WHERE name = ?1 AND scope = ?2 LIMIT 1";
+            conn.query_row(sql, rusqlite::params![split.name, scope], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+        });
+        let reference_file = explicit_ref_file.or(split.file_hint).or(scope_file);
 
         let min_confidence: Option<f64> = args
             .get("min_confidence")
             .and_then(|v| v.as_f64())
             .map(clamp_confidence);
 
-        let results = match crate::callgraph::callees(conn, &name, depth, min_confidence) {
+        let mut results = match crate::callgraph::callees(
+            conn,
+            split.name,
+            depth,
+            min_confidence,
+            reference_file.as_deref(),
+            callees_file.as_deref(),
+        ) {
             Ok(r) => r,
             Err(e) => return CallToolResult::error(format!("callees query failed: {e}")),
         };
+        let include_tests = extract_include_tests(&args);
+        if !include_tests {
+            results.retain(|r| !crate::ranker::is_test_file(std::path::Path::new(&r.file)));
+        }
 
         let outputs: Vec<CalleeOutput> = results
             .iter()
@@ -1894,7 +2322,7 @@ impl McpServer {
             })
             .collect();
 
-        collect_with_budget(outputs, budget_limit, format)
+        collect_with_budget_and_page(outputs, budget_limit, page, format)
     }
 
     fn tool_callpath(&mut self, args: Value) -> CallToolResult {
@@ -1906,6 +2334,14 @@ impl McpServer {
             Ok(n) => n,
             Err(e) => return e,
         };
+        let reference_file = args
+            .get("reference_file")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let destination_file = args
+            .get("destination_file")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let format = extract_format(&args);
 
         let (conn, _) = match self.resolve_repo(&args) {
@@ -1924,7 +2360,14 @@ impl McpServer {
             .and_then(|v| v.as_f64())
             .map(clamp_confidence);
 
-        match crate::callgraph::callpath(conn, &from, &to, min_confidence) {
+        match crate::callgraph::callpath(
+            conn,
+            &from,
+            &to,
+            min_confidence,
+            reference_file.as_deref(),
+            destination_file.as_deref(),
+        ) {
             Ok(Some(hops)) => {
                 let outputs: Vec<CallPathHopOutput> = hops
                     .iter()
@@ -2023,10 +2466,7 @@ impl McpServer {
             Err(e) => return CallToolResult::error(e),
         };
 
-        let include_tests = args
-            .get("include_tests")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let include_tests = extract_include_tests(&args);
 
         let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
 
@@ -2106,6 +2546,25 @@ impl McpServer {
         } else {
             // List mode: detect entry points.
             match crate::flows::detect_entry_points(conn, &options) {
+                Ok(entries) if entries.len() == 1 && options.from_file.is_some() => {
+                    // Auto-trace: single entry point found with file filter — trace it
+                    // automatically instead of returning just the entry point name.
+                    match crate::flows::trace_flow(conn, &entries[0].name, &options) {
+                        Ok(Some(ref flow)) => {
+                            let out = crate::output::FlowOutput::from(flow);
+                            format_result(&out, format)
+                        }
+                        Ok(None) => {
+                            // Fall back to listing the entry point if flow too short.
+                            let outputs: Vec<crate::output::FlowStepOutput> = entries
+                                .iter()
+                                .map(crate::output::FlowStepOutput::from)
+                                .collect();
+                            collect_with_budget(outputs, budget_limit, format)
+                        }
+                        Err(e) => CallToolResult::error(format!("flows query failed: {e}")),
+                    }
+                }
                 Ok(entries) => {
                     let outputs: Vec<crate::output::FlowStepOutput> = entries
                         .iter()
@@ -2179,7 +2638,7 @@ impl McpServer {
     }
 
     fn tool_context(&mut self, args: Value) -> CallToolResult {
-        let name = match require_str(&args, "name") {
+        let raw_name = match require_str(&args, "name") {
             Ok(n) => n,
             Err(e) => return e,
         };
@@ -2197,7 +2656,10 @@ impl McpServer {
 
         let format = extract_format(&args);
 
-        let file = args.get("file").and_then(|v| v.as_str()).map(String::from);
+        // Support qualified paths: `Client.get` → name="get", scope="Client".
+        let split = crate::router::split_qualified_name(&raw_name);
+        let explicit_file = args.get("file").and_then(|v| v.as_str()).map(String::from);
+        let file = explicit_file.or(split.file_hint);
         let kind = args.get("kind").and_then(|v| v.as_str()).map(String::from);
         let min_confidence = args.get("min_confidence").and_then(|v| v.as_f64());
 
@@ -2205,10 +2667,16 @@ impl McpServer {
             file,
             kind,
             min_confidence,
+            scope: split.scope_hint,
         };
 
-        match crate::context::symbol_context(conn, &name, &options) {
-            Ok(contexts) => {
+        let include_tests = extract_include_tests(&args);
+        match crate::context::symbol_context(conn, split.name, &options) {
+            Ok(mut contexts) => {
+                if !include_tests {
+                    contexts
+                        .retain(|c| !crate::ranker::is_test_file(std::path::Path::new(&c.file)));
+                }
                 let outputs: Vec<crate::output::SymbolContextOutput> = contexts
                     .iter()
                     .map(crate::output::SymbolContextOutput::from)
@@ -2684,15 +3152,25 @@ impl McpServer {
 // Budget collection helper
 // ---------------------------------------------------------------------------
 
-/// Collect serializable outputs, applying optional token budget, and format the
-/// final `CallToolResult`. Shared by tool_callers and tool_callees.
+/// Collect serializable outputs, applying optional token budget and pagination,
+/// and format the final `CallToolResult`. Shared by tool_callers, tool_callees, etc.
 fn collect_with_budget<T: serde::Serialize>(
     outputs: Vec<T>,
     budget_limit: Option<usize>,
     format: OutputFormat,
 ) -> CallToolResult {
+    collect_with_budget_and_page(outputs, budget_limit, None, format)
+}
+
+fn collect_with_budget_and_page<T: serde::Serialize>(
+    outputs: Vec<T>,
+    budget_limit: Option<usize>,
+    page: Option<usize>,
+    format: OutputFormat,
+) -> CallToolResult {
     if let Some(limit) = budget_limit {
-        let mut budget = TokenBudget::new(limit);
+        let skip = page.unwrap_or(1).saturating_sub(1) * limit;
+        let mut budget = TokenBudget::new_with_skip(limit, skip);
         let mut kept: Vec<&T> = Vec::new();
         let mut truncated = 0usize;
 
@@ -2701,17 +3179,31 @@ fn collect_with_budget<T: serde::Serialize>(
             if budget.try_consume(&serialized) {
                 kept.push(out);
             } else {
-                truncated += 1;
+                // Only count as truncated if we've already passed the skip phase.
+                if budget.skip_remaining() == 0 {
+                    truncated += 1;
+                }
             }
         }
 
-        if truncated > 0 {
+        if truncated > 0 || page.is_some_and(|p| p > 1) {
             let shown = kept.len();
-            let total = shown + truncated;
+            let total = outputs.len();
+            let current_page = page.unwrap_or(1);
+            let has_more = truncated > 0;
+            let hint = if has_more {
+                format!(
+                    "Page {current_page}. Showing {shown} of {total} matches. Use page={} for more.",
+                    current_page + 1
+                )
+            } else {
+                format!("Page {current_page}. Showing {shown} of {total} matches. No more pages.")
+            };
             let wrapper = serde_json::json!({
                 "results": kept,
-                "truncated": truncated,
-                "hint": format!("Showing {shown} of {total} matches. Results are sorted by relevance."),
+                "page": current_page,
+                "has_more": has_more,
+                "hint": hint,
             });
             return format_result(&wrapper, format);
         }
@@ -2967,8 +3459,12 @@ mod tests {
         assert!(props.contains_key("shallow"), "missing 'shallow' property");
         assert!(props.contains_key("budget"), "missing 'budget' property");
         assert!(props.contains_key("format"), "missing 'format' property");
+        // name is no longer required — file-only mode is supported.
         let required = show_tool.input_schema["required"].as_array().unwrap();
-        assert!(required.contains(&serde_json::json!("name")));
+        assert!(
+            required.is_empty(),
+            "required should be empty, got: {required:?}"
+        );
     }
 
     #[test]
@@ -3021,12 +3517,13 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap_or_default();
 
         // With a tiny budget, the response should be a wrapper with truncation metadata.
-        if parsed.get("truncated").is_some() {
-            assert!(parsed["truncated"].as_u64().unwrap() > 0);
-            let hint = parsed["hint"].as_str().expect("truncated response should have a hint");
+        if parsed.get("has_more").is_some() {
+            let hint = parsed["hint"]
+                .as_str()
+                .expect("truncated response should have a hint");
             assert!(
-                hint.contains("Showing") && hint.contains("sorted by relevance"),
-                "hint should use soft wording, got: {hint}"
+                hint.contains("Showing") || hint.contains("Page"),
+                "hint should describe pagination, got: {hint}"
             );
         } else {
             // If only one result fits, it's returned as a plain array — that's fine too.
@@ -3075,6 +3572,14 @@ mod tests {
         let tool = tools.iter().find(|t| t.name == "wonk_callers").unwrap();
         let props = tool.input_schema["properties"].as_object().unwrap();
         assert!(props.contains_key("name"), "missing 'name' property");
+        assert!(
+            props.contains_key("reference_file"),
+            "missing 'reference_file' property"
+        );
+        assert!(
+            props.contains_key("callers_file"),
+            "missing 'callers_file' property"
+        );
         assert!(props.contains_key("depth"), "missing 'depth' property");
         assert!(props.contains_key("format"), "missing 'format' property");
         assert!(
@@ -3091,6 +3596,14 @@ mod tests {
         let tool = tools.iter().find(|t| t.name == "wonk_callees").unwrap();
         let props = tool.input_schema["properties"].as_object().unwrap();
         assert!(props.contains_key("name"), "missing 'name' property");
+        assert!(
+            props.contains_key("reference_file"),
+            "missing 'reference_file' property"
+        );
+        assert!(
+            props.contains_key("callees_file"),
+            "missing 'callees_file' property"
+        );
         assert!(props.contains_key("depth"), "missing 'depth' property");
         assert!(props.contains_key("format"), "missing 'format' property");
         assert!(
@@ -3139,6 +3652,14 @@ mod tests {
         let props = tool.input_schema["properties"].as_object().unwrap();
         assert!(props.contains_key("from"), "missing 'from' property");
         assert!(props.contains_key("to"), "missing 'to' property");
+        assert!(
+            props.contains_key("reference_file"),
+            "missing 'reference_file' property"
+        );
+        assert!(
+            props.contains_key("destination_file"),
+            "missing 'destination_file' property"
+        );
         assert!(props.contains_key("format"), "missing 'format' property");
         assert!(
             props.contains_key("min_confidence"),

@@ -82,10 +82,22 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         crate::color::resolve_color(&config.output.color)
     };
 
-    let mut fmt = Formatter::new(stdout, format, color);
+    // When stdout is piped (not a terminal), group output by file (one line
+    // per file) so `| grep "path/"` filters correctly and `| head -N` limits
+    // by file count.  Auto-budget is applied in cli::parse().
+    let is_piped = !std::io::IsTerminal::is_terminal(&stdout);
     let budget_limit = cli.budget;
+    let page = cli.page;
+    let include_tests = cli.include_tests;
+
+    let mut fmt = Formatter::new(stdout, format, color);
+    fmt.set_single_line(is_piped);
     if let Some(limit) = budget_limit {
-        fmt.set_budget(limit);
+        if let Some(p) = page {
+            fmt.set_budget_with_page(limit, p);
+        } else {
+            fmt.set_budget(limit);
+        }
     }
 
     // Auto-init: if this is a query command and no index exists, build one.
@@ -110,11 +122,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Search(args) => {
             // Auto-detect regex metacharacters and enable regex mode.
-            let regex = if !args.regex && search::looks_like_regex(&args.pattern) {
-                output::print_hint(
-                    "pattern looks like regex; auto-enabled --regex",
-                    suppress,
-                );
+            let auto_regex = !args.regex && search::looks_like_regex(&args.pattern);
+            let mut regex = if auto_regex {
+                output::print_hint("pattern looks like regex; auto-enabled --regex", suppress);
                 true
             } else {
                 args.regex
@@ -123,8 +133,32 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // Set up match highlighting for search results.
             fmt.set_highlight(&args.pattern, regex, args.ignore_case);
 
-            let results =
-                search::text_search(&args.pattern, regex, args.ignore_case, &args.paths)?;
+            // Merge --file into paths list.
+            let mut paths = args.paths;
+            if let Some(f) = args.file {
+                paths.insert(0, f);
+            }
+
+            let mut results = search::text_search(&args.pattern, regex, args.ignore_case, &paths);
+
+            // When auto-regex detected the pattern but it fails to compile as
+            // regex (e.g. unmatched parens), fall back to literal search.
+            if auto_regex && results.is_err() {
+                output::print_hint(
+                    "regex compilation failed; falling back to literal search",
+                    suppress,
+                );
+                regex = false;
+                fmt.set_highlight(&args.pattern, regex, args.ignore_case);
+                results = search::text_search(&args.pattern, regex, args.ignore_case, &paths);
+            }
+
+            let mut results = results?;
+
+            // Exclude test/doc/example files unless --include-tests.
+            if !include_tests {
+                results.retain(|r| !crate::ranker::is_test_file(&r.file));
+            }
 
             if results.is_empty() {
                 output::print_hint(
@@ -226,7 +260,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
 
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Sym(args) => {
             let repo_root =
@@ -241,15 +275,38 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
 
+            // Support qualified paths: `Client.get` → name="get", scope="Client".
+            let split = split_qualified_name(&args.name);
             let kind_str = args.kind.as_deref();
-            let file_str = args.file.as_deref();
-            let results = router.query_symbols_with_file(&args.name, kind_str, file_str, args.exact)?;
+            let file_str = args.file.as_deref().or(split.file_hint.as_deref());
+            let mut results =
+                if let (Some(conn), Some(scope)) = (router.conn(), split.scope_hint.as_deref()) {
+                    query_symbols_db_with_filters(
+                        conn,
+                        split.name,
+                        kind_str,
+                        file_str,
+                        Some(scope),
+                        args.exact,
+                    )?
+                } else {
+                    router.query_symbols_with_file(split.name, kind_str, file_str, args.exact)?
+                };
+
+            if !include_tests {
+                results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
+            }
 
             if results.is_empty() {
                 output::print_hint(
                     "no symbols found; try a broader query or omit --exact",
                     suppress,
                 );
+            }
+
+            // Apply --limit after deduplication/sorting.
+            if let Some(limit) = args.limit {
+                results.truncate(limit);
             }
 
             let mut truncated = 0usize;
@@ -269,7 +326,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Ref(args) => {
             let router = QueryRouter::new(None, false);
@@ -281,59 +338,81 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
 
-            let results = router.query_references(&args.name, &args.paths)?;
+            // Merge --file into paths list.
+            let mut paths = args.paths;
+            if let Some(f) = args.file {
+                paths.insert(0, f);
+            }
+
+            let mut results = router.query_references(&args.name, &paths)?;
 
             // Also query subclasses/implementors from type_edges.
-            let subclass_results = router
+            let mut subclass_results = router
                 .conn()
                 .and_then(|conn| query_subclasses_db(conn, &args.name).ok())
                 .unwrap_or_default();
+
+            if !include_tests {
+                results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
+                subclass_results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
+            }
 
             if results.is_empty() && subclass_results.is_empty() {
                 output::print_hint("no references found", suppress);
             }
 
-            let mut truncated = 0usize;
-
-            // Show subclasses first if present.
-            if !subclass_results.is_empty() && !suppress {
-                output::print_category_header("-- subclasses --");
-            }
-            for sym in &subclass_results {
-                let out = RefOutput {
-                    name: sym.name.clone(),
-                    kind: "subclass".to_string(),
-                    file: sym.file.clone(),
-                    line: sym.line,
-                    col: sym.col,
-                    context: sym.signature.clone(),
-                    caller_name: None,
-                    confidence: 1.0,
-                };
-                if fmt.format_reference(&out)? == BudgetStatus::Skipped {
-                    truncated += 1;
+            // Files-only mode: return just unique file paths.
+            if args.output == "files" {
+                let mut files: Vec<String> = results.iter().map(|r| r.file.clone()).collect();
+                files.extend(subclass_results.iter().map(|s| s.file.clone()));
+                files.sort();
+                files.dedup();
+                for f in &files {
+                    writeln!(fmt.writer_mut(), "{f}")?;
                 }
-            }
+            } else {
+                let mut truncated = 0usize;
 
-            if !subclass_results.is_empty() && !results.is_empty() && !suppress {
-                output::print_category_header("-- references --");
-            }
-            for r in &results {
-                let out = RefOutput {
-                    name: r.name.clone(),
-                    kind: r.kind.to_string(),
-                    file: r.file.clone(),
-                    line: r.line,
-                    col: r.col,
-                    context: r.context.clone(),
-                    caller_name: r.caller_name.clone(),
-                    confidence: r.confidence,
-                };
-                if fmt.format_reference(&out)? == BudgetStatus::Skipped {
-                    truncated += 1;
+                // Show subclasses first if present.
+                if !subclass_results.is_empty() && !suppress {
+                    output::print_category_header("-- subclasses --");
                 }
+                for sym in &subclass_results {
+                    let out = RefOutput {
+                        name: sym.name.clone(),
+                        kind: "subclass".to_string(),
+                        file: sym.file.clone(),
+                        line: sym.line,
+                        col: sym.col,
+                        context: sym.signature.clone(),
+                        caller_name: None,
+                        confidence: 1.0,
+                    };
+                    if fmt.format_reference(&out)? == BudgetStatus::Skipped {
+                        truncated += 1;
+                    }
+                }
+
+                if !subclass_results.is_empty() && !results.is_empty() && !suppress {
+                    output::print_category_header("-- references --");
+                }
+                for r in &results {
+                    let out = RefOutput {
+                        name: r.name.clone(),
+                        kind: r.kind.to_string(),
+                        file: r.file.clone(),
+                        line: r.line,
+                        col: r.col,
+                        context: r.context.clone(),
+                        caller_name: r.caller_name.clone(),
+                        confidence: r.confidence,
+                    };
+                    if fmt.format_reference(&out)? == BudgetStatus::Skipped {
+                        truncated += 1;
+                    }
+                }
+                emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
         }
         Command::Sig(args) => {
             let router = QueryRouter::new(None, false);
@@ -364,7 +443,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Deps(args) => {
             let repo_root =
@@ -395,7 +474,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Rdeps(args) => {
             let repo_root =
@@ -426,7 +505,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     truncated += 1;
                 }
             }
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Init(args) => {
             let repo_root = std::env::current_dir()?;
@@ -513,18 +592,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 let stats = pipeline::rebuild_index_with_progress(&repo_root, false, &progress)?;
                 progress.finish(&stats);
 
-                // Full embedding rebuild.
-                let index_path = db::index_path_for(&repo_root, false)?;
-                let conn = db::open(&index_path)?;
-                let client = crate::embedding::OllamaClient::new();
-                let emb_stats =
-                    pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
-                if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
-                    eprintln!(
-                        "Embedded {} symbols in {:.1}s",
-                        emb_stats.embedded_count,
-                        emb_stats.elapsed.as_secs_f64(),
-                    );
+                if !args.skip_embed {
+                    // Full embedding rebuild.
+                    let index_path = db::index_path_for(&repo_root, false)?;
+                    let conn = db::open(&index_path)?;
+                    let client = crate::embedding::OllamaClient::new();
+                    let emb_stats =
+                        pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
+                    if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
+                        eprintln!(
+                            "Embedded {} symbols in {:.1}s",
+                            emb_stats.embedded_count,
+                            emb_stats.elapsed.as_secs_f64(),
+                        );
+                    }
                 }
             } else {
                 // Incremental structural update.
@@ -538,23 +619,29 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     );
                 }
 
-                // Incremental embedding update (graceful skip if Ollama unavailable).
-                let index_path = db::index_path_for(&repo_root, false)?;
-                let conn = db::open(&index_path)?;
-                let client = crate::embedding::OllamaClient::new();
-                match pipeline::build_missing_embeddings(&conn, &repo_root, &client, progress_mode)
-                {
-                    Ok(emb_stats) => {
-                        if !suppress && emb_stats.embedded_count > 0 {
-                            eprintln!(
-                                "Embedded {} symbols in {:.1}s",
-                                emb_stats.embedded_count,
-                                emb_stats.elapsed.as_secs_f64(),
-                            );
+                if !args.skip_embed {
+                    // Incremental embedding update (graceful skip if Ollama unavailable).
+                    let index_path = db::index_path_for(&repo_root, false)?;
+                    let conn = db::open(&index_path)?;
+                    let client = crate::embedding::OllamaClient::new();
+                    match pipeline::build_missing_embeddings(
+                        &conn,
+                        &repo_root,
+                        &client,
+                        progress_mode,
+                    ) {
+                        Ok(emb_stats) => {
+                            if !suppress && emb_stats.embedded_count > 0 {
+                                eprintln!(
+                                    "Embedded {} symbols in {:.1}s",
+                                    emb_stats.embedded_count,
+                                    emb_stats.elapsed.as_secs_f64(),
+                                );
+                            }
                         }
-                    }
-                    Err(_) => {
-                        // Ollama unavailable — skip silently for incremental update.
+                        Err(_) => {
+                            // Ollama unavailable — skip silently for incremental update.
+                        }
                     }
                 }
             }
@@ -702,7 +789,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
 
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Status => {
             let conn = std::env::current_dir()
@@ -946,7 +1033,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
 
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Impact(args) => {
             let repo_root = match std::env::current_dir()
@@ -1132,7 +1219,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
 
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Show(args) => {
             let repo_root = match std::env::current_dir()
@@ -1155,41 +1242,210 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     }
                 };
 
-            // Support qualified paths: `Foo::bar` → name="bar", file hint="Foo".
-            let (show_name, file_hint) = split_qualified_name(&args.name);
-            let file = args.file.or(file_hint);
+            // Merge --file and -- paths into a combined file filter list.
+            let mut file_filters: Vec<String> = args.paths;
+            if let Some(f) = args.file.clone() {
+                file_filters.insert(0, f);
+            }
 
-            let options = crate::show::ShowOptions {
-                file,
-                kind: args.kind,
-                exact: args.exact,
-                suppress,
-                shallow: args.shallow,
-            };
+            let mut all_results = Vec::new();
 
-            let results = crate::show::show_symbol(&conn, show_name, &repo_root, &options)?;
+            if let Some(ref name) = args.name {
+                // Auto-detect file paths passed as name: if the name contains
+                // '/' or ends with a code file extension, treat it as --file.
+                if file_filters.is_empty() && looks_like_file_path(name) {
+                    // Auto-shallow: showing all symbols in a file can be very
+                    // verbose, so default to shallow mode (signatures only)
+                    // unless the user explicitly chose non-shallow.
+                    let auto_shallow = !args.shallow;
+                    if auto_shallow {
+                        output::print_hint(
+                            &format!(
+                                "'{name}' looks like a file path; treating as --file {name} --shallow"
+                            ),
+                            suppress,
+                        );
+                    } else {
+                        output::print_hint(
+                            &format!("'{name}' looks like a file path; treating as --file {name}"),
+                            suppress,
+                        );
+                    }
+                    let options = crate::show::ShowOptions {
+                        file: None,
+                        kind: args.kind.clone(),
+                        exact: false,
+                        suppress,
+                        shallow: true,
+                        scope: None,
+                        signatures_only: true, // auto-file-path: compact output
+                    };
+                    all_results.extend(crate::show::show_file(&conn, name, &repo_root, &options)?);
+                } else {
+                    // Support comma-separated names for batch lookup (e.g. "main,parse,validate").
+                    let names: Vec<&str> = name
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect();
 
-            if results.is_empty() {
+                    // When paths are specified, query per file filter and merge.
+                    let file_list = if file_filters.is_empty() {
+                        vec![None]
+                    } else {
+                        file_filters.iter().map(|f| Some(f.clone())).collect()
+                    };
+
+                    for n in &names {
+                        // Support qualified paths: `Foo::bar` → name="bar", file hint="Foo".
+                        let split = split_qualified_name(n);
+
+                        for ff in &file_list {
+                            let file = ff.clone().or(split.file_hint.clone());
+
+                            let options = crate::show::ShowOptions {
+                                file,
+                                kind: args.kind.clone(),
+                                exact: args.exact,
+                                suppress,
+                                shallow: args.shallow,
+                                scope: split.scope_hint.clone(),
+                                signatures_only: false,
+                            };
+
+                            all_results.extend(crate::show::show_symbol(
+                                &conn, split.name, &repo_root, &options,
+                            )?);
+                        }
+                    }
+                } // close auto-detect else
+            } else if !file_filters.is_empty() {
+                // File-only mode: show all top-level symbols in file(s)/directory.
+                for file_pattern in &file_filters {
+                    let options = crate::show::ShowOptions {
+                        file: None,
+                        kind: args.kind.clone(),
+                        exact: false,
+                        suppress,
+                        shallow: args.shallow,
+                        scope: None,
+                        signatures_only: false,
+                    };
+                    all_results.extend(crate::show::show_file(
+                        &conn,
+                        file_pattern,
+                        &repo_root,
+                        &options,
+                    )?);
+                }
+            } else {
+                output::print_error("show requires a symbol name or --file");
+                return Ok(());
+            }
+
+            if !include_tests {
+                all_results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
+            }
+
+            if all_results.is_empty() {
                 output::print_hint(
                     "no symbols found; try a broader query or omit --exact",
                     suppress,
                 );
+            } else if let Some(ref name) = args.name {
+                // When no exact match exists in implementation files, hint
+                // that the symbol may be dynamically assigned. Type
+                // declarations (.d.ts, .h) don't count as implementations.
+                let has_impl_exact = all_results.iter().any(|r| {
+                    r.name == *name && !r.file.ends_with(".d.ts") && !r.file.ends_with(".h")
+                });
+                if !has_impl_exact && !args.exact {
+                    output::print_hint(
+                        &format!(
+                            "no implementation of '{}' found — results are substring or type-only matches. \
+                             If '{}' is dynamically assigned, try: wonk search \"{}\"",
+                            name, name, name,
+                        ),
+                        suppress,
+                    );
+                }
             }
 
             let mut truncated = 0usize;
-            for sr in &results {
-                let out = ShowOutput::from(sr);
+            let user_shallow = args.shallow;
+            for sr in &all_results {
+                // Auto-shallow: when a container's body exceeds MAX_SOURCE_LINES
+                // and --shallow wasn't explicitly set, retry in shallow mode to
+                // show signature + child signatures instead of a truncated body.
+                if !user_shallow
+                    && sr.kind.is_container()
+                    && sr.source.lines().count() > ShowOutput::MAX_SOURCE_LINES
+                {
+                    let shallow_opts = crate::show::ShowOptions {
+                        file: Some(sr.file.clone()),
+                        kind: Some(sr.kind.to_string()),
+                        exact: true,
+                        suppress,
+                        shallow: true,
+                        scope: None,
+                        signatures_only: false,
+                    };
+                    if let Ok(shallow_results) =
+                        crate::show::show_symbol(&conn, &sr.name, &repo_root, &shallow_opts)
+                        && let Some(shallow_sr) = shallow_results
+                            .iter()
+                            .find(|s| s.file == sr.file && s.line == sr.line)
+                    {
+                        let mut shallow_out = ShowOutput::from(shallow_sr);
+                        shallow_out.auto_shallow = Some(true);
+                        if !format.is_structured() {
+                            output::print_show_header(&sr.file, sr.line, sr.end_line, suppress);
+                        }
+                        if fmt.format_show(&shallow_out)? == BudgetStatus::Skipped {
+                            truncated += 1;
+                        }
+                        continue;
+                    }
+                }
+
+                let mut out = ShowOutput::from(sr);
+
+                // Per-result truncation when budget is active.
+                if budget_limit.is_some()
+                    && let Some(t) = out.truncated(ShowOutput::MAX_SOURCE_LINES)
+                {
+                    out = t;
+                }
 
                 if !format.is_structured() {
                     output::print_show_header(&sr.file, sr.line, sr.end_line, suppress);
                 }
 
                 if fmt.format_show(&out)? == BudgetStatus::Skipped {
+                    // Adaptive truncation: try to fit within remaining budget.
+                    if let Some(remaining_chars) = fmt.remaining_budget_chars() {
+                        let source_lines: Vec<&str> = sr.source.lines().collect();
+                        if !source_lines.is_empty() {
+                            let avg_chars = sr.source.len() / source_lines.len();
+                            if avg_chars > 0 {
+                                let max_lines = (remaining_chars / avg_chars).clamp(
+                                    ShowOutput::MIN_SOURCE_LINES,
+                                    ShowOutput::MAX_SOURCE_LINES,
+                                );
+                                let fresh_out = ShowOutput::from(sr);
+                                if let Some(t) = fresh_out.truncated(max_lines)
+                                    && fmt.format_show(&t)? == BudgetStatus::Written
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     truncated += 1;
                 }
             }
 
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Callers(args) => {
             let (conn, depth) = match callgraph_setup(args.depth, suppress) {
@@ -1197,7 +1453,27 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 None => return Ok(()),
             };
 
-            let results = crate::callgraph::callers(&conn, &args.name, depth, args.min_confidence)?;
+            // Support qualified paths: `Client.get` → name="get", file hint from scope.
+            let split = split_qualified_name(&args.name);
+            let scope_file = resolve_file_for_scope(&conn, split.name, split.scope_hint.as_deref());
+            let reference_file = args
+                .reference_file
+                .clone()
+                .or(split.file_hint)
+                .or(scope_file);
+
+            let mut results = crate::callgraph::callers(
+                &conn,
+                split.name,
+                depth,
+                args.min_confidence,
+                reference_file.as_deref(),
+                args.callers_file.as_deref(),
+            )?;
+
+            if !include_tests {
+                results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
+            }
 
             if results.is_empty() {
                 output::print_hint("no callers found", suppress);
@@ -1221,7 +1497,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
 
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Callees(args) => {
             let (conn, depth) = match callgraph_setup(args.depth, suppress) {
@@ -1229,7 +1505,27 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 None => return Ok(()),
             };
 
-            let results = crate::callgraph::callees(&conn, &args.name, depth, args.min_confidence)?;
+            // Support qualified paths: `Client.get` → name="get", file hint from scope.
+            let split = split_qualified_name(&args.name);
+            let scope_file = resolve_file_for_scope(&conn, split.name, split.scope_hint.as_deref());
+            let reference_file = args
+                .reference_file
+                .clone()
+                .or(split.file_hint)
+                .or(scope_file);
+
+            let mut results = crate::callgraph::callees(
+                &conn,
+                split.name,
+                depth,
+                args.min_confidence,
+                reference_file.as_deref(),
+                args.callees_file.as_deref(),
+            )?;
+
+            if !include_tests {
+                results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
+            }
 
             if results.is_empty() {
                 output::print_hint("no callees found", suppress);
@@ -1252,7 +1548,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
 
-            emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+            emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Callpath(args) => {
             let conn = match callgraph_conn(suppress) {
@@ -1260,8 +1556,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 None => return Ok(()),
             };
 
-            let path =
-                crate::callgraph::callpath(&conn, &args.from, &args.to, args.min_confidence)?;
+            let path = crate::callgraph::callpath(
+                &conn,
+                &args.from,
+                &args.to,
+                args.min_confidence,
+                args.reference_file.as_deref(),
+                args.destination_file.as_deref(),
+            )?;
 
             match path {
                 Some(hops) => {
@@ -1373,19 +1675,33 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 // List mode: detect all entry points.
                 let entries = crate::flows::detect_entry_points(&conn, &options)?;
 
-                if entries.is_empty() {
-                    output::print_hint("no entry points detected", suppress);
-                }
-
-                let mut truncated = 0usize;
-                for entry in &entries {
-                    let out = FlowStepOutput::from(entry);
-                    if fmt.format_flow_entry(&out)? == BudgetStatus::Skipped {
-                        truncated += 1;
+                // Auto-trace: when file filter is set and exactly one entry point
+                // is found, automatically trace it instead of listing.
+                if entries.len() == 1 && args.from.is_some() {
+                    match crate::flows::trace_flow(&conn, &entries[0].name, &options)? {
+                        Some(ref flow) => {
+                            let out = FlowOutput::from(flow);
+                            fmt.format_flow(&out)?;
+                        }
+                        None => {
+                            // Fall back to listing the entry point.
+                            let out = FlowStepOutput::from(&entries[0]);
+                            fmt.format_flow_entry(&out)?;
+                        }
                     }
-                }
+                } else if entries.is_empty() {
+                    output::print_hint("no entry points detected", suppress);
+                } else {
+                    let mut truncated = 0usize;
+                    for entry in &entries {
+                        let out = FlowStepOutput::from(entry);
+                        if fmt.format_flow_entry(&out)? == BudgetStatus::Skipped {
+                            truncated += 1;
+                        }
+                    }
 
-                emit_budget_summary(&mut fmt, truncated, budget_limit, format)?;
+                    emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
+                }
             }
         }
         Command::Blast(args) => {
@@ -1416,7 +1732,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let options = crate::blast::BlastOptions {
                 depth,
                 direction,
-                include_tests: args.include_tests,
+                include_tests: include_tests || args.include_tests,
                 min_confidence: args.min_confidence,
             };
 
@@ -1433,9 +1749,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             dispatch_changes(args, &mut fmt, suppress)?;
         }
         Command::Context(args) => {
-            dispatch_context(args, &mut fmt, suppress)?;
+            dispatch_context(args, &mut fmt, suppress, include_tests)?;
         }
     }
+
+    // In single-line (piped) mode, emit a final newline so the output is
+    // a complete line for the shell to capture.
+    if is_piped {
+        writeln!(fmt.writer_mut())?;
+    }
+
     Ok(())
 }
 
@@ -1504,19 +1827,29 @@ fn dispatch_context<W: io::Write>(
     args: ContextArgs,
     fmt: &mut Formatter<W>,
     suppress: bool,
+    include_tests: bool,
 ) -> Result<()> {
     let conn = match callgraph_conn(suppress) {
         Some(c) => c,
         None => return Ok(()),
     };
 
+    // Support qualified paths: `Client.get` → name="get", scope="Client".
+    let split = split_qualified_name(&args.name);
+    let file = args.file.or(split.file_hint);
+
     let options = crate::context::ContextOptions {
-        file: args.file,
+        file,
         kind: args.kind,
         min_confidence: args.min_confidence,
+        scope: split.scope_hint,
     };
 
-    let contexts = crate::context::symbol_context(&conn, &args.name, &options)?;
+    let mut contexts = crate::context::symbol_context(&conn, split.name, &options)?;
+
+    if !include_tests {
+        contexts.retain(|c| !crate::ranker::is_test_file(Path::new(&c.file)));
+    }
 
     if contexts.is_empty() {
         output::print_hint("no matching symbols found", suppress);
@@ -1707,6 +2040,33 @@ fn callgraph_setup(requested_depth: usize, suppress: bool) -> Option<(Connection
     Some((conn, depth))
 }
 
+/// Returns `true` if the string looks like a file path rather than a symbol name.
+/// Detects paths containing `/` or ending with common code file extensions.
+pub fn looks_like_file_path(s: &str) -> bool {
+    if s.contains('/') {
+        return true;
+    }
+    let lower = s.to_lowercase();
+    [
+        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".c", ".h", ".cpp", ".cc",
+        ".hpp", ".rb", ".php", ".cs",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+/// Resolve a file path for a scoped symbol (e.g. `Client.get` → find the file
+/// containing `get` with `scope = 'Client'`). Returns the file as a string
+/// hint suitable for `reference_file` filtering.
+fn resolve_file_for_scope(conn: &Connection, name: &str, scope: Option<&str>) -> Option<String> {
+    let scope = scope?;
+    let sql = "SELECT file FROM symbols WHERE name = ?1 AND scope = ?2 LIMIT 1";
+    conn.query_row(sql, rusqlite::params![name, scope], |row| {
+        row.get::<_, String>(0)
+    })
+    .ok()
+}
+
 /// Returns `true` for commands that query the index and should trigger
 /// auto-initialization when no index exists.
 /// Returns true if a file path looks like a test, benchmark, spec, or mock file.
@@ -1729,24 +2089,152 @@ fn is_test_path(path: &str) -> bool {
         || lower.starts_with("examples/")
 }
 
-/// Split a qualified name like `tokio::spawn` or `std::collections::HashMap`
-/// into (bare_name, optional_file_hint).
+/// Parsed result from a qualified name like `Foo::bar`, `Client.get`, or
+/// `module::Class.method`.
+pub struct QualifiedSplit<'a> {
+    /// The bare symbol name (last segment).
+    pub name: &'a str,
+    /// File path hint from `::` segments (e.g. `tokio/runtime`).
+    pub file_hint: Option<String>,
+    /// Scope hint from `.` segments (e.g. `Client` for `Client.get`).
+    pub scope_hint: Option<String>,
+}
+
+/// Split a qualified name into bare name, optional file hint, and optional
+/// scope hint.
 ///
-/// The last `::` segment becomes the name; earlier segments are joined with `/`
-/// to form a file path hint.  If the name contains no `::`, returns it as-is.
-fn split_qualified_name(name: &str) -> (&str, Option<String>) {
+/// `::` separators produce file_hint (Rust module paths).
+/// `.` separators produce scope_hint (class/scope, Python/JS-style).
+/// Mixed paths like `module::Class.method` produce both.
+///
+/// Examples:
+///   `tokio::runtime::Handle` → name `Handle`, file_hint `tokio/runtime`
+///   `Client.get`             → name `get`, scope_hint `Client`
+///   `foo.bar.baz`            → name `baz`, scope_hint `bar`
+///   `module::Class.method`   → name `method`, file_hint `module`, scope_hint `Class`
+pub fn split_qualified_name(name: &str) -> QualifiedSplit<'_> {
+    // Try `::` first (Rust-style qualified paths).
     if let Some(pos) = name.rfind("::") {
         let prefix = &name[..pos];
         let bare = &name[pos + 2..];
         if bare.is_empty() {
-            return (name, None);
+            return QualifiedSplit {
+                name,
+                file_hint: None,
+                scope_hint: None,
+            };
         }
-        // Convert `tokio::runtime` → `tokio/runtime` as a file path hint.
-        let hint = prefix.replace("::", "/");
-        (bare, Some(hint))
-    } else {
-        (name, None)
+        let hint = camel_to_snake_hint(prefix);
+        // Check if the bare part contains a dot (mixed: `module::Class.method`).
+        if let Some(dot_pos) = bare.rfind('.') {
+            let scope = &bare[..dot_pos];
+            let method = &bare[dot_pos + 1..];
+            if method.is_empty() {
+                return QualifiedSplit {
+                    name: bare,
+                    file_hint: Some(hint),
+                    scope_hint: None,
+                };
+            }
+            return QualifiedSplit {
+                name: method,
+                file_hint: Some(hint),
+                scope_hint: Some(scope.to_string()),
+            };
+        }
+        return QualifiedSplit {
+            name: bare,
+            file_hint: Some(hint),
+            scope_hint: None,
+        };
     }
+    // Try `.` next (Python/JS-style qualified paths like `Client.get`).
+    if let Some(pos) = name.rfind('.') {
+        let prefix = &name[..pos];
+        let bare = &name[pos + 1..];
+        if bare.is_empty() {
+            return QualifiedSplit {
+                name,
+                file_hint: None,
+                scope_hint: None,
+            };
+        }
+        // The immediate parent is the scope hint. If there are multiple dots,
+        // the immediate parent (last segment of prefix) is scope_hint.
+        let scope_hint = if let Some(last_dot) = prefix.rfind('.') {
+            prefix[last_dot + 1..].to_string()
+        } else {
+            prefix.to_string()
+        };
+        // For single-segment dot paths like `Client.get`, check if the prefix
+        // looks like a class name (starts with uppercase) → scope_hint only.
+        // For multi-segment like `foo.bar.baz`, the prefix before scope is file_hint.
+        let file_hint = if prefix.contains('.') {
+            // Multi-segment: everything before the last dot could be file hint.
+            prefix
+                .rfind('.')
+                .map(|last_dot| prefix[..last_dot].replace('.', "/"))
+        } else if prefix.chars().next().is_some_and(|c| c.is_uppercase()) {
+            // Single uppercase prefix like `Client` → scope only, no file hint.
+            None
+        } else {
+            // Single lowercase prefix like `foo` → ambiguous, treat as file hint
+            // for backward compat (but also set scope).
+            Some(prefix.to_string())
+        };
+        return QualifiedSplit {
+            name: bare,
+            file_hint,
+            scope_hint: Some(scope_hint),
+        };
+    }
+    QualifiedSplit {
+        name,
+        file_hint: None,
+        scope_hint: None,
+    }
+}
+
+/// Convert a qualified path prefix into a file hint.
+///
+/// If the prefix looks like a CamelCase type name (starts uppercase, no `/`),
+/// convert it to snake_case so `ScheduledIo` → `scheduled_io`.
+/// Otherwise replace `::` with `/` as before.
+fn camel_to_snake_hint(prefix: &str) -> String {
+    let segments: Vec<&str> = prefix.split("::").collect();
+    segments
+        .iter()
+        .map(|seg| {
+            if seg.chars().next().is_some_and(|c| c.is_uppercase()) && !seg.contains('/') {
+                camel_to_snake(seg)
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Convert a CamelCase string to snake_case.
+fn camel_to_snake(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 {
+                // Don't insert underscore between consecutive uppercase letters
+                // unless the next char is lowercase (e.g. "IO" stays "io", "IOHandler" → "io_handler").
+                let prev_upper = s.chars().nth(i - 1).is_some_and(|c| c.is_uppercase());
+                let next_lower = s.chars().nth(i + 1).is_some_and(|c| c.is_lowercase());
+                if !prev_upper || next_lower {
+                    result.push('_');
+                }
+            }
+            result.push(ch.to_lowercase().next().unwrap());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 fn is_query_command(cmd: &Command) -> bool {
@@ -1832,25 +2320,33 @@ fn fetch_semantic_results(
 ///
 /// In grep mode, prints the summary to stderr. In structured mode (JSON/TOON),
 /// emits a truncation metadata line to the formatter.
-fn emit_budget_summary<W: io::Write>(
+fn emit_budget_summary_with_page<W: io::Write>(
     fmt: &mut Formatter<W>,
     truncated: usize,
     budget_limit: Option<usize>,
     format: OutputFormat,
+    page: Option<usize>,
 ) -> Result<()> {
-    if truncated == 0 {
+    if truncated == 0 && page.is_none() {
         return Ok(());
     }
     if let Some(limit) = budget_limit {
+        let has_more = truncated > 0;
         if format.is_structured() {
             let meta = output::TruncationMeta {
                 truncated_count: truncated,
                 budget_tokens: limit,
                 used_tokens: fmt.budget_used(),
+                page,
+                has_more,
             };
             fmt.format_truncation_meta(&meta)?;
-        } else {
-            output::print_budget_summary(truncated, limit);
+        } else if has_more {
+            if let Some(p) = page {
+                output::print_budget_summary_with_page(truncated, limit, p);
+            } else {
+                output::print_budget_summary(truncated, limit);
+            }
         }
     }
     Ok(())
@@ -2279,8 +2775,11 @@ impl QueryRouter {
     ) -> Result<Vec<Reference>, DbError> {
         // Try SQLite first.
         if let Some(conn) = &self.conn {
-            let results = query_references_db(conn, name)?;
+            let mut results = query_references_db(conn, name)?;
             if !results.is_empty() {
+                if !paths.is_empty() {
+                    results.retain(|r| paths.iter().any(|p| r.file.starts_with(p)));
+                }
                 return Ok(results);
             }
         }
@@ -2509,6 +3008,17 @@ pub fn query_symbols_db_with_file(
     file: Option<&str>,
     exact: bool,
 ) -> Result<Vec<Symbol>, DbError> {
+    query_symbols_db_with_filters(conn, name, kind, file, None, exact)
+}
+
+pub fn query_symbols_db_with_filters(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    file: Option<&str>,
+    scope: Option<&str>,
+    exact: bool,
+) -> Result<Vec<Symbol>, DbError> {
     let mut sql = String::from(
         "SELECT name, kind, file, line, col, end_line, scope, signature, language FROM symbols WHERE ",
     );
@@ -2530,6 +3040,11 @@ pub fn query_symbols_db_with_file(
     if let Some(f) = file {
         sql.push_str(" AND file LIKE ?");
         params.push(Box::new(format!("%{}%", f)));
+    }
+
+    if let Some(s) = scope {
+        sql.push_str(" AND scope = ?");
+        params.push(Box::new(s.to_string()));
     }
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -3100,6 +3615,65 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "my_func");
         assert_eq!(results[0].context, "let x = my_func();");
+    }
+
+    #[test]
+    fn test_router_query_references_db_path_filtering() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = db::open(&db_path).unwrap();
+
+        // Insert references in different directories.
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["Widget", "src/ui/button.rs", 10, 4, "use Widget;"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "Widget",
+                "src/core/layout.rs",
+                20,
+                4,
+                "let w = Widget::new();"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, context) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["Widget", "tests/widget_test.rs", 5, 4, "Widget::default()"],
+        )
+        .unwrap();
+
+        let router = QueryRouter::with_conn(conn, dir.path().to_path_buf());
+
+        // No path filter — returns all.
+        let all = router.query_references("Widget", &[]).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Filter to src/ui/ — returns only button.rs.
+        let filtered = router
+            .query_references("Widget", &["src/ui/".to_string()])
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].file, "src/ui/button.rs");
+
+        // Filter to src/ — returns both src/ files.
+        let src_only = router
+            .query_references("Widget", &["src/".to_string()])
+            .unwrap();
+        assert_eq!(src_only.len(), 2);
+        assert!(src_only.iter().all(|r| r.file.starts_with("src/")));
+
+        // Multiple path prefixes.
+        let multi = router
+            .query_references("Widget", &["src/ui/".to_string(), "tests/".to_string()])
+            .unwrap();
+        assert_eq!(multi.len(), 2);
     }
 
     #[test]
@@ -4460,6 +5034,7 @@ mod tests {
             raw: false,
             smart: false,
             semantic: false,
+            file: None,
             paths: vec![],
         });
         assert!(is_query_command(&cmd));
@@ -4472,6 +5047,7 @@ mod tests {
             kind: None,
             file: None,
             exact: false,
+            limit: None,
         });
         assert!(is_query_command(&cmd));
     }
@@ -4494,6 +5070,7 @@ mod tests {
     fn test_is_query_command_not_update() {
         assert!(!is_query_command(&Command::Update(UpdateArgs {
             force: false,
+            skip_embed: false,
         })));
     }
 
@@ -4674,6 +5251,8 @@ mod tests {
         use crate::cli::CallersArgs;
         let cmd = Command::Callers(CallersArgs {
             name: "dispatch".into(),
+            reference_file: None,
+            callers_file: None,
             depth: 1,
             min_confidence: None,
         });
@@ -4685,6 +5264,8 @@ mod tests {
         use crate::cli::CalleesArgs;
         let cmd = Command::Callees(CalleesArgs {
             name: "main".into(),
+            reference_file: None,
+            callees_file: None,
             depth: 1,
             min_confidence: None,
         });
@@ -4697,6 +5278,8 @@ mod tests {
         let cmd = Command::Callpath(CallpathArgs {
             from: "main".into(),
             to: "dispatch".into(),
+            reference_file: None,
+            destination_file: None,
             min_confidence: None,
         });
         assert!(is_query_command(&cmd));
@@ -4755,5 +5338,84 @@ mod tests {
             min_confidence: None,
         });
         assert!(is_query_command(&cmd));
+    }
+
+    // -- split_qualified_name tests -------------------------------------------
+
+    #[test]
+    fn test_split_qualified_rust_style() {
+        let split = split_qualified_name("tokio::runtime::Handle");
+        assert_eq!(split.name, "Handle");
+        assert_eq!(split.file_hint.as_deref(), Some("tokio/runtime"));
+        assert!(split.scope_hint.is_none());
+    }
+
+    #[test]
+    fn test_split_qualified_rust_single_prefix() {
+        let split = split_qualified_name("ScheduledIo::wake");
+        assert_eq!(split.name, "wake");
+        assert_eq!(split.file_hint.as_deref(), Some("scheduled_io"));
+        assert!(split.scope_hint.is_none());
+    }
+
+    #[test]
+    fn test_split_qualified_dot_style() {
+        let split = split_qualified_name("Client.get");
+        assert_eq!(split.name, "get");
+        assert!(
+            split.file_hint.is_none(),
+            "uppercase prefix → scope only, no file hint"
+        );
+        assert_eq!(split.scope_hint.as_deref(), Some("Client"));
+    }
+
+    #[test]
+    fn test_split_qualified_dot_nested() {
+        let split = split_qualified_name("foo.bar.baz");
+        assert_eq!(split.name, "baz");
+        assert_eq!(split.file_hint.as_deref(), Some("foo"));
+        assert_eq!(split.scope_hint.as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn test_split_qualified_no_separator() {
+        let split = split_qualified_name("dispatch");
+        assert_eq!(split.name, "dispatch");
+        assert!(split.file_hint.is_none());
+        assert!(split.scope_hint.is_none());
+    }
+
+    #[test]
+    fn test_split_qualified_trailing_colons() {
+        let split = split_qualified_name("Foo::");
+        assert_eq!(split.name, "Foo::");
+        assert!(split.file_hint.is_none());
+        assert!(split.scope_hint.is_none());
+    }
+
+    #[test]
+    fn test_split_qualified_trailing_dot() {
+        let split = split_qualified_name("Foo.");
+        assert_eq!(split.name, "Foo.");
+        assert!(split.file_hint.is_none());
+        assert!(split.scope_hint.is_none());
+    }
+
+    #[test]
+    fn test_split_qualified_colons_preferred_over_dots() {
+        // `::` takes priority even when dots are present.
+        let split = split_qualified_name("std.io::Write");
+        assert_eq!(split.name, "Write");
+        assert_eq!(split.file_hint.as_deref(), Some("std.io"));
+        assert!(split.scope_hint.is_none());
+    }
+
+    #[test]
+    fn test_split_qualified_mixed_colons_and_dot() {
+        // `module::Class.method` → name=method, file_hint=module, scope_hint=Class
+        let split = split_qualified_name("module::Class.method");
+        assert_eq!(split.name, "method");
+        assert_eq!(split.file_hint.as_deref(), Some("module"));
+        assert_eq!(split.scope_hint.as_deref(), Some("Class"));
     }
 }

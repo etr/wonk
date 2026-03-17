@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS "references" (
     col INTEGER NOT NULL,
     context TEXT,
     caller_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
-    confidence REAL DEFAULT 0.5
+    confidence REAL DEFAULT 0.5,
+    target_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS daemon_status (
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
+CREATE INDEX IF NOT EXISTS idx_symbols_scope ON symbols(scope);
 CREATE INDEX IF NOT EXISTS idx_references_name ON "references"(name);
 CREATE INDEX IF NOT EXISTS idx_references_file ON "references"(file);
 
@@ -189,6 +191,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     ensure_caller_id_column(conn)?;
     ensure_confidence_column(conn)?;
     ensure_doc_comment_column(conn)?;
+    ensure_target_id_column(conn)?;
     conn.execute_batch(TYPE_EDGES_SQL)
         .context("creating type_edges table")?;
     conn.execute_batch(EMBEDDINGS_SQL)
@@ -303,6 +306,32 @@ pub fn ensure_caller_id_column(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_references_caller ON \"references\"(caller_id);",
     )
     .context("creating caller_id index")?;
+
+    Ok(())
+}
+
+/// Ensure the `target_id` column exists on the `references` table.
+///
+/// Handles schema migration for indexes built before target resolution was
+/// added. Uses `PRAGMA table_info` to check before altering.
+pub fn ensure_target_id_column(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("PRAGMA table_info(\"references\")")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "target_id");
+
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE \"references\" ADD COLUMN target_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL;",
+        )
+        .context("adding target_id column to references table")?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_references_target_id ON \"references\"(target_id);",
+    )
+    .context("creating target_id index")?;
 
     Ok(())
 }
@@ -1805,7 +1834,7 @@ mod tests {
         // open() should succeed and migrate the schema.
         let conn = open(&db_path).unwrap();
 
-        // Verify both columns exist.
+        // Verify all migrated columns exist.
         let columns: Vec<String> = conn
             .prepare("PRAGMA table_info(\"references\")")
             .unwrap()
@@ -1815,8 +1844,9 @@ mod tests {
             .collect();
         assert!(columns.contains(&"caller_id".to_string()));
         assert!(columns.contains(&"confidence".to_string()));
+        assert!(columns.contains(&"target_id".to_string()));
 
-        // Verify all three indexes exist.
+        // Verify all indexes exist.
         let indexes: Vec<String> = conn
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_references_%'",
@@ -1829,6 +1859,7 @@ mod tests {
         assert!(indexes.contains(&"idx_references_caller".to_string()));
         assert!(indexes.contains(&"idx_references_name_confidence".to_string()));
         assert!(indexes.contains(&"idx_references_caller_confidence".to_string()));
+        assert!(indexes.contains(&"idx_references_target_id".to_string()));
     }
 
     #[test]

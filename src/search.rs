@@ -162,13 +162,13 @@ impl<'a> Sink for CollectSink<'a> {
 /// Used to auto-enable regex mode and hint the user when they forget `--regex`.
 pub fn looks_like_regex(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
-    // Check for common regex escape sequences: \w \W \d \D \s \S \b \B
+    // Check for common regex escape sequences: \w \W \d \D \s \S \b \B \.
     for i in 0..bytes.len().saturating_sub(1) {
         if bytes[i] == b'\\' {
             let next = bytes[i + 1];
             if matches!(
                 next,
-                b'w' | b'W' | b'd' | b'D' | b's' | b'S' | b'b' | b'B'
+                b'w' | b'W' | b'd' | b'D' | b's' | b'S' | b'b' | b'B' | b'.'
             ) {
                 return true;
             }
@@ -179,6 +179,12 @@ pub fn looks_like_regex(pattern: &str) -> bool {
         && pattern[open + 1..].contains(']')
     {
         return true;
+    }
+    // Check for unescaped | (regex alternation), not at edges
+    for i in 1..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'|' && bytes[i - 1] != b'\\' {
+            return true;
+        }
     }
     false
 }
@@ -508,5 +514,25 @@ mod tests {
         assert!(!looks_like_regex("pub fn spawn"));
         assert!(!looks_like_regex("config.json"));
         assert!(!looks_like_regex("hello world"));
+    }
+
+    #[test]
+    fn looks_like_regex_detects_alternation() {
+        assert!(looks_like_regex("foo|bar"));
+        assert!(looks_like_regex("fastify.register|this.register"));
+        assert!(looks_like_regex("a|b|c"));
+    }
+
+    #[test]
+    fn looks_like_regex_detects_escaped_dot() {
+        assert!(looks_like_regex(r"fastify\.register"));
+        assert!(looks_like_regex(r"a\.b"));
+    }
+
+    #[test]
+    fn looks_like_regex_ignores_edge_pipe() {
+        // Pipe at start or end is not alternation
+        assert!(!looks_like_regex("|foo"));
+        assert!(!looks_like_regex("foo|"));
     }
 }

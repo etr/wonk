@@ -23,6 +23,8 @@ pub struct ContextOptions {
     pub kind: Option<String>,
     /// Minimum confidence threshold for edge filtering.
     pub min_confidence: Option<f64>,
+    /// Restrict to symbols with this scope (e.g. class name for methods).
+    pub scope: Option<String>,
 }
 
 /// Sanitize a user-provided confidence threshold to a valid [0.0, 1.0] range.
@@ -128,6 +130,7 @@ fn resolve_symbols(
 
     // Build file filter: escape LIKE metacharacters and use ESCAPE clause.
     let file_filter = options.file.as_deref().map(escape_like).unwrap_or_default();
+    let scope_filter = options.scope.as_deref().unwrap_or("");
 
     let sql = "\
         SELECT id, name, kind, file, line, end_line, signature \
@@ -135,20 +138,24 @@ fn resolve_symbols(
         WHERE name = ?1 \
         AND (?2 = '' OR file LIKE '%' || ?2 ESCAPE '\\') \
         AND (?3 = '' OR kind = ?3) \
+        AND (?4 = '' OR scope = ?4) \
         ORDER BY file, line";
 
     let mut stmt = conn.prepare_cached(sql)?;
-    let rows = stmt.query_map(rusqlite::params![name, file_filter, kind_filter], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, Option<i64>>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![name, file_filter, kind_filter, scope_filter],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        },
+    )?;
 
     let mut symbols = Vec::new();
     for row in rows {

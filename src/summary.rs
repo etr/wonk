@@ -57,37 +57,67 @@ pub fn summarize_path(
 
     // Build LIKE pattern and exact path for queries.
     // Files use exact match only; directories use `prefix/%` LIKE pattern.
+    // Special case: "." (repo root) uses "%" to match all files since paths
+    // in the DB don't have a "./" prefix.
     let (like_pattern, exact_path) = match path_type {
         SummaryPathType::File => (normalized.clone(), normalized.clone()),
         SummaryPathType::Directory => {
-            let prefix = if normalized.ends_with('/') {
-                normalized.clone()
+            if normalized == "." {
+                ("%".to_string(), String::new())
             } else {
-                format!("{normalized}/")
-            };
-            let safe_prefix = escape_like(&prefix);
-            (format!("{safe_prefix}%"), prefix)
+                let prefix = if normalized.ends_with('/') {
+                    normalized.clone()
+                } else {
+                    format!("{normalized}/")
+                };
+                let safe_prefix = escape_like(&prefix);
+                (format!("{safe_prefix}%"), prefix)
+            }
         }
     };
 
     let metrics = query_metrics(conn, &like_pattern, &exact_path, path_type)?;
 
-    // Pre-fetch subtree data when we need children or symbols for directory entries.
-    let need_subtree = path_type == SummaryPathType::Directory
-        && (should_recurse(options.depth, 0)
-            || options.detail == DetailLevel::Rich
-            || options.detail == DetailLevel::Outline);
-    let subtree_data = if need_subtree {
-        Some(SubtreeData::load(conn, &like_pattern)?)
+    // For repo root ".", delegate child building to per-directory summarize_path
+    // calls instead of loading the entire index into memory (which is too slow
+    // for large repos with thousands of symbols).
+    let (subtree_data, children) = if normalized == "."
+        && path_type == SummaryPathType::Directory
+        && should_recurse(options.depth, 0)
+    {
+        let child_dirs = root_child_directories(conn)?;
+        let mut children = Vec::new();
+        let child_opts = SummaryOptions {
+            depth: options.depth.map(|d| d.saturating_sub(1)),
+            ..*options
+        };
+        for dir in child_dirs {
+            match summarize_path(conn, &dir, &child_opts) {
+                Ok(child) => children.push(child),
+                Err(_) => continue,
+            }
+        }
+        (None, children)
     } else {
-        None
-    };
+        // Pre-fetch subtree data when we need children or symbols for directory entries.
+        let need_subtree = path_type == SummaryPathType::Directory
+            && (should_recurse(options.depth, 0)
+                || options.detail == DetailLevel::Rich
+                || options.detail == DetailLevel::Outline);
+        let subtree_data = if need_subtree {
+            Some(SubtreeData::load(conn, &like_pattern)?)
+        } else {
+            None
+        };
 
-    // Recurse into children if depth allows.
-    let children = if should_recurse(options.depth, 0) && path_type == SummaryPathType::Directory {
-        build_children_from_data(subtree_data.as_ref().unwrap(), &exact_path, options, 1)?
-    } else {
-        vec![]
+        // Recurse into children if depth allows.
+        let children =
+            if should_recurse(options.depth, 0) && path_type == SummaryPathType::Directory {
+                build_children_from_data(subtree_data.as_ref().unwrap(), &exact_path, options, 1)?
+            } else {
+                vec![]
+            };
+        (subtree_data, children)
     };
 
     // For Rich or Outline detail on directories, compute intra-directory import edges.
@@ -112,7 +142,12 @@ pub fn summarize_path(
     };
 
     // Auto-load LLM config and generate description (top-level only).
-    let description = {
+    // Skip for repo root "." and for very large directories (>200 files) —
+    // the LLM prompt would be too large and the Ollama call too slow.
+    let file_count = metrics.file_count;
+    let description = if normalized == "." || file_count > 200 {
+        None
+    } else {
         let config = crate::config::Config::load(None).unwrap_or_default();
         generate_description(
             conn,
@@ -136,6 +171,37 @@ pub fn summarize_path(
         symbols,
         import_edges,
     })
+}
+
+/// Get unique top-level directory names from indexed file paths.
+/// Used for the root "." summary to avoid loading the entire index.
+fn root_child_directories(conn: &Connection) -> Result<Vec<String>> {
+    let sql = "SELECT DISTINCT \
+               CASE WHEN instr(path, '/') > 0 THEN substr(path, 1, instr(path, '/') - 1) \
+               ELSE path END AS top_dir \
+               FROM files ORDER BY top_dir";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    // Deduplicate and filter: only return entries that look like directories
+    // (have files under them with a '/' separator).
+    let mut dirs: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for name in rows {
+        if seen.insert(name.clone()) {
+            // Check if this is actually a directory (has files under it)
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE ?1 || '/%'",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )?;
+            if count > 0 {
+                dirs.push(name);
+            }
+        }
+    }
+    Ok(dirs)
 }
 
 /// Normalize a user-supplied path for DB queries.
@@ -550,6 +616,14 @@ fn build_children_from_data(
         } else if seen.insert(path.clone()) {
             child_entries.push((path.clone(), SummaryPathType::File));
         }
+    }
+
+    // Auto-collapse: when a directory's only immediate child is a single
+    // subdirectory (e.g. `crate/` → `crate/src/`), skip the intermediate
+    // level and show the grandchildren directly. This avoids sparse output
+    // that shows only metrics without symbols.
+    if child_entries.len() == 1 && child_entries[0].1 == SummaryPathType::Directory {
+        return build_children_from_data(data, &child_entries[0].0, options, current_depth);
     }
 
     let mut results = Vec::with_capacity(child_entries.len());

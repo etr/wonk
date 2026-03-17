@@ -573,17 +573,19 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         }
     }
 
-    // Insert new references, resolving caller_name to caller_id.
+    // Insert new references, resolving caller_name to caller_id and target_id.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO \"references\" (name, file, line, col, context, caller_id, confidence) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO \"references\" (name, file, line, col, context, caller_id, confidence, target_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         for reference in &result.refs {
             let caller_id = reference
                 .caller_name
                 .as_deref()
                 .and_then(|name| caller_map.get(name).copied());
+            // Same-file target resolution: if the referenced name is defined in this file, use its ID.
+            let target_id = caller_map.get(reference.name.as_str()).copied();
             stmt.execute(rusqlite::params![
                 reference.name,
                 reference.file,
@@ -592,9 +594,20 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
                 reference.context,
                 caller_id,
                 reference.confidence,
+                target_id,
             ])?;
         }
     }
+
+    // Cross-file target_id resolution: for refs where the target wasn't in the same file,
+    // resolve if there's exactly one symbol with that name.
+    tx.execute(
+        "UPDATE \"references\" SET target_id = ( \
+             SELECT s.id FROM symbols s WHERE s.name = \"references\".name \
+         ) WHERE file = ?1 AND target_id IS NULL \
+         AND (SELECT COUNT(*) FROM symbols s WHERE s.name = \"references\".name) = 1",
+        rusqlite::params![result.rel_path],
+    )?;
 
     // Insert new imports.
     {
@@ -769,11 +782,11 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
         }
     }
 
-    // Insert references, resolving caller_name to caller_id.
+    // Insert references, resolving caller_name to caller_id and target_id.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO \"references\" (name, file, line, col, context, caller_id, confidence) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO \"references\" (name, file, line, col, context, caller_id, confidence, target_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         for r in results {
             let file_map = file_caller_maps.get(r.rel_path.as_str());
@@ -785,6 +798,8 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
                 if caller_id.is_some() {
                     caller_count += 1;
                 }
+                // Same-file target resolution.
+                let target_id = file_map.and_then(|m| m.get(reference.name.as_str()).copied());
                 stmt.execute(rusqlite::params![
                     reference.name,
                     reference.file,
@@ -793,11 +808,22 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
                     reference.context,
                     caller_id,
                     reference.confidence,
+                    target_id,
                 ])?;
                 total_refs += 1;
             }
         }
     }
+
+    // Cross-file target_id resolution: for refs where the target wasn't in the same file,
+    // resolve if there's exactly one symbol with that name.
+    tx.execute(
+        "UPDATE \"references\" SET target_id = ( \
+             SELECT s.id FROM symbols s WHERE s.name = \"references\".name \
+         ) WHERE target_id IS NULL \
+         AND (SELECT COUNT(*) FROM symbols s WHERE s.name = \"references\".name) = 1",
+        [],
+    )?;
 
     // Insert file imports.
     {

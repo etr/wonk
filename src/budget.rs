@@ -17,16 +17,32 @@ pub fn estimate_tokens_from_len(byte_len: usize) -> usize {
     byte_len.div_ceil(4)
 }
 
-/// Tracks cumulative token consumption against a fixed limit.
+/// Tracks cumulative token consumption against a fixed limit, with optional
+/// skip support for pagination (page N skips `(N-1) * limit` tokens).
 pub struct TokenBudget {
     limit: usize,
     used: usize,
+    skip: usize,
 }
 
 impl TokenBudget {
     /// Create a new budget with the given token limit.
     pub fn new(limit: usize) -> Self {
-        Self { limit, used: 0 }
+        Self {
+            limit,
+            used: 0,
+            skip: 0,
+        }
+    }
+
+    /// Create a new budget that skips `skip` tokens before emitting.
+    /// Used for pagination: `skip = (page - 1) * limit`.
+    pub fn new_with_skip(limit: usize, skip: usize) -> Self {
+        Self {
+            limit,
+            used: 0,
+            skip,
+        }
     }
 
     /// How many tokens remain before the budget is exhausted.
@@ -44,11 +60,26 @@ impl TokenBudget {
         self.limit
     }
 
+    /// How many tokens still need to be skipped.
+    pub fn skip_remaining(&self) -> usize {
+        self.skip
+    }
+
     /// Try to consume tokens for `text`. Returns `true` if the text fits
     /// within the remaining budget (and records the consumption), or `false`
     /// if it would exceed the budget (leaving the budget unchanged).
+    ///
+    /// When skip > 0, deducts from skip and returns `false` (skipped).
     pub fn try_consume(&mut self, text: &str) -> bool {
         let tokens = estimate_tokens(text);
+        if self.skip > 0 {
+            if tokens <= self.skip {
+                self.skip -= tokens;
+            } else {
+                self.skip = 0;
+            }
+            return false;
+        }
         if tokens + self.used <= self.limit {
             self.used += tokens;
             true
@@ -63,6 +94,14 @@ impl TokenBudget {
     /// raw byte buffers.
     pub fn try_consume_bytes(&mut self, byte_len: usize) -> bool {
         let tokens = estimate_tokens_from_len(byte_len);
+        if self.skip > 0 {
+            if tokens <= self.skip {
+                self.skip -= tokens;
+            } else {
+                self.skip = 0;
+            }
+            return false;
+        }
         if tokens + self.used <= self.limit {
             self.used += tokens;
             true

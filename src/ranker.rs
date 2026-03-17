@@ -238,7 +238,17 @@ pub fn is_test_file(path: &Path) -> bool {
     // Directory-based heuristics: check path components
     for component in path.components() {
         let s = component.as_os_str().to_string_lossy();
-        if s == "test" || s == "tests" || s == "__tests__" {
+        if s == "test"
+            || s == "tests"
+            || s == "__tests__"
+            || s == "docs"
+            || s == "doc"
+            || s == "examples"
+            || s == "example"
+            || s == "fixtures"
+            || s == "benchmarks"
+            || s == "bench"
+        {
             return true;
         }
     }

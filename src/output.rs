@@ -190,6 +190,49 @@ pub struct ShowOutput {
     pub language: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_shallow: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_at_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<usize>,
+}
+
+impl ShowOutput {
+    /// Maximum source lines per result before truncation.
+    pub const MAX_SOURCE_LINES: usize = 80;
+    /// Minimum useful source lines — below this, skip rather than truncate.
+    pub const MIN_SOURCE_LINES: usize = 20;
+
+    /// Truncate this result's source to at most `max_lines` lines.
+    ///
+    /// Returns `None` if the source already fits within `max_lines`.
+    /// Returns `None` if truncating would leave fewer than `MIN_SOURCE_LINES`.
+    pub fn truncated(&self, max_lines: usize) -> Option<Self> {
+        let lines: Vec<&str> = self.source.lines().collect();
+        let total = lines.len();
+        if total <= max_lines {
+            return None;
+        }
+        if max_lines < Self::MIN_SOURCE_LINES {
+            return None;
+        }
+        let remaining = total - max_lines;
+        let mut truncated_source: String = lines[..max_lines].join("\n");
+        truncated_source.push_str(&format!(
+            "\n// ... {remaining} more lines (truncated — use --page 2 for continuation)",
+        ));
+        Some(Self {
+            name: self.name.clone(),
+            kind: self.kind.clone(),
+            file: self.file.clone(),
+            line: self.line,
+            end_line: self.end_line,
+            source: truncated_source,
+            language: self.language.clone(),
+            auto_shallow: self.auto_shallow,
+            truncated_at_line: Some(self.line + max_lines - 1),
+            total_lines: Some(total),
+        })
+    }
 }
 
 impl From<&ShowResult> for ShowOutput {
@@ -203,6 +246,8 @@ impl From<&ShowResult> for ShowOutput {
             source: sr.source.clone(),
             language: sr.language.clone(),
             auto_shallow: None,
+            truncated_at_line: None,
+            total_lines: None,
         }
     }
 }
@@ -733,6 +778,10 @@ pub struct TruncationMeta {
     pub truncated_count: usize,
     pub budget_tokens: usize,
     pub used_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_more: bool,
 }
 
 /// Indicates whether a format call actually wrote data or was skipped due to
@@ -780,6 +829,13 @@ pub struct Formatter<W: Write> {
     color: bool,
     highlight: Option<HighlightPattern>,
     budget: Option<TokenBudget>,
+    /// When true, collapse newlines within each file group so that piped output
+    /// emits one line per file. Results from the same file are joined with
+    /// ` ; ` and results from different files get separate lines.
+    single_line: bool,
+    /// Tracks the file path from the previous `emit()` call so that same-file
+    /// results can be joined on one line in single-line mode.
+    last_emit_file: Option<String>,
 }
 
 impl<W: Write> Formatter<W> {
@@ -795,6 +851,48 @@ impl<W: Write> Formatter<W> {
             color,
             highlight: None,
             budget: None,
+            single_line: false,
+            last_emit_file: None,
+        }
+    }
+
+    /// Enable single-line mode: piped output emits one line per file group.
+    /// Results from the same file are joined with ` ; `, results from
+    /// different files get separate lines.
+    pub fn set_single_line(&mut self, enabled: bool) {
+        self.single_line = enabled;
+    }
+
+    /// Write data to the underlying writer. In single-line mode, collapses
+    /// internal newlines to ` ; ` and groups results by file path (one line
+    /// per file).
+    fn emit(&mut self, data: &[u8]) -> std::io::Result<()> {
+        if self.single_line {
+            let s = String::from_utf8_lossy(data);
+            let collapsed = s
+                .lines()
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ; ");
+            if collapsed.is_empty() {
+                return Ok(());
+            }
+            // Extract file path from leading "file:line:" pattern.
+            let current_file = collapsed.split(':').next().map(|f| f.trim().to_string());
+            let same_file = match (&current_file, &self.last_emit_file) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if same_file {
+                self.writer.write_all(b" ; ")?;
+            } else if self.last_emit_file.is_some() {
+                self.writer.write_all(b"\n")?;
+            }
+            self.writer.write_all(collapsed.as_bytes())?;
+            self.last_emit_file = current_file;
+            Ok(())
+        } else {
+            self.writer.write_all(data)
         }
     }
 
@@ -822,6 +920,13 @@ impl<W: Write> Formatter<W> {
     /// result fits within the remaining budget before writing it.
     pub fn set_budget(&mut self, limit: usize) {
         self.budget = Some(TokenBudget::new(limit));
+    }
+
+    /// Set a token budget with page skip. Skips `(page - 1) * limit` tokens
+    /// before emitting results.
+    pub fn set_budget_with_page(&mut self, limit: usize, page: usize) {
+        let skip = page.saturating_sub(1) * limit;
+        self.budget = Some(TokenBudget::new_with_skip(limit, skip));
     }
 
     /// Borrow the underlying writer for direct output (e.g. table headers).
@@ -857,6 +962,12 @@ impl<W: Write> Formatter<W> {
         self.budget.is_some()
     }
 
+    /// Approximate remaining budget in characters (tokens × 4).
+    /// Returns `None` when no budget is set.
+    pub fn remaining_budget_chars(&self) -> Option<usize> {
+        self.budget.as_ref().map(|b| b.remaining() * 4)
+    }
+
     /// Render a formatting closure to a temporary buffer, check the budget,
     /// and write to the real writer only if the budget allows.
     ///
@@ -877,6 +988,8 @@ impl<W: Write> Formatter<W> {
                 color: self.color,
                 highlight: None,
                 budget: None,
+                single_line: false, // render normally; collapsing happens in emit()
+                last_emit_file: None,
             };
             // Transfer highlight pattern temporarily.
             std::mem::swap(&mut tmp.highlight, &mut self.highlight);
@@ -887,7 +1000,7 @@ impl<W: Write> Formatter<W> {
 
         let status = self.check_budget_bytes(&buf);
         if status == BudgetStatus::Written {
-            self.writer.write_all(&buf)?;
+            self.emit(&buf)?;
         }
         Ok(status)
     }
@@ -1343,14 +1456,135 @@ impl<W: Write> Formatter<W> {
         self.budgeted_write(move |fmt| Self::render_callpath(fmt, &hops))
     }
 
-    /// Format a summary result.
+    /// Format a summary result with progressive budget rendering.
+    ///
+    /// When a budget is active, renders the root node header as one block,
+    /// then each child as a separate budgeted block. This ensures the
+    /// top-level summary is always visible, with children truncated at
+    /// budget boundaries rather than the all-or-nothing behavior.
     pub fn format_summary(&mut self, out: &SummaryOutput) -> std::io::Result<BudgetStatus> {
         if !self.has_budget() {
             Self::render_summary(self, out, 0)?;
             return Ok(BudgetStatus::Written);
         }
-        let out = out.clone();
-        self.budgeted_write(move |fmt| Self::render_summary(fmt, &out, 0))
+
+        // Progressive rendering: root node header first, then each child separately.
+        let root_node = out.clone();
+        let status =
+            self.budgeted_write(move |fmt| Self::render_summary_node(fmt, &root_node, 0))?;
+        if status == BudgetStatus::Skipped {
+            return Ok(BudgetStatus::Skipped);
+        }
+
+        // Render each child as a separate budgeted block.
+        let mut truncated_children = 0usize;
+        for child in &out.children {
+            let child = child.clone();
+            let child_status =
+                self.budgeted_write(move |fmt| Self::render_summary(fmt, &child, 1))?;
+            if child_status == BudgetStatus::Skipped {
+                truncated_children += 1;
+            }
+        }
+
+        // Note: truncated_children is available to the caller via the meta.
+        if truncated_children > 0 {
+            let total_children = out.children.len();
+            let shown = total_children - truncated_children;
+            let msg = format!(
+                "-- {shown} of {total_children} children shown (budget reached, {} omitted) --\n",
+                truncated_children
+            );
+            // Write directly — this is diagnostic, not budgeted.
+            self.emit(msg.as_bytes())?;
+        }
+
+        Ok(BudgetStatus::Written)
+    }
+
+    /// Render just the current node's metrics/symbols (no children).
+    fn render_summary_node<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &SummaryOutput,
+        indent: usize,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            // For structured output, emit the full node (including children).
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            Self::render_summary_grep_node(fmt, out, indent)
+        }
+    }
+
+    /// Render grep-format metrics for a single summary node (no children).
+    fn render_summary_grep_node<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &SummaryOutput,
+        indent: usize,
+    ) -> std::io::Result<()> {
+        let prefix = "  ".repeat(indent);
+
+        writeln!(
+            fmt.writer,
+            "{prefix}Summary: {} ({})",
+            out.path, out.path_type
+        )?;
+
+        let m = &out.metrics;
+
+        if let Some(fc) = m.file_count {
+            writeln!(fmt.writer, "{prefix}  Files: {fc}")?;
+        }
+        if let Some(lc) = m.line_count {
+            writeln!(fmt.writer, "{prefix}  Lines: {lc}")?;
+        }
+        if let Some(ref syms) = m.symbol_counts
+            && !syms.is_empty()
+        {
+            let parts: Vec<String> = syms
+                .iter()
+                .map(|s| format!("{}: {}", s.kind, s.count))
+                .collect();
+            writeln!(fmt.writer, "{prefix}  Symbols: {}", parts.join(", "))?;
+        }
+        if let Some(ref langs) = m.languages
+            && !langs.is_empty()
+        {
+            let parts: Vec<String> = langs
+                .iter()
+                .map(|l| format!("{}: {}", l.language, l.count))
+                .collect();
+            writeln!(fmt.writer, "{prefix}  Languages: {}", parts.join(", "))?;
+        }
+        if let Some(dc) = m.dependency_count {
+            writeln!(fmt.writer, "{prefix}  Dependencies: {dc}")?;
+        }
+        if let Some(ref desc) = out.description {
+            writeln!(fmt.writer, "{prefix}  Description: {desc}")?;
+        }
+        if !out.symbols.is_empty() {
+            writeln!(fmt.writer, "{prefix}  Symbols:")?;
+            for s in &out.symbols {
+                if s.signature.is_empty() {
+                    writeln!(fmt.writer, "{prefix}    {} {}", s.kind, s.name)?;
+                } else {
+                    writeln!(
+                        fmt.writer,
+                        "{prefix}    {} {} — {}",
+                        s.kind, s.name, s.signature
+                    )?;
+                }
+            }
+        }
+        if !out.import_edges.is_empty() {
+            writeln!(fmt.writer, "{prefix}  Imports:")?;
+            for e in &out.import_edges {
+                writeln!(fmt.writer, "{prefix}    {} → {}", e.from, e.to)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Shared render logic for a summary result (recursive with indent level).
@@ -1363,67 +1597,7 @@ impl<W: Write> Formatter<W> {
             let line = Self::serialize_structured(fmt.format, out)?;
             writeln!(fmt.writer, "{line}")
         } else {
-            let prefix = "  ".repeat(indent);
-
-            // Path header.
-            writeln!(
-                fmt.writer,
-                "{prefix}Summary: {} ({})",
-                out.path, out.path_type
-            )?;
-
-            let m = &out.metrics;
-
-            if let Some(fc) = m.file_count {
-                writeln!(fmt.writer, "{prefix}  Files: {fc}")?;
-            }
-            if let Some(lc) = m.line_count {
-                writeln!(fmt.writer, "{prefix}  Lines: {lc}")?;
-            }
-            if let Some(ref syms) = m.symbol_counts
-                && !syms.is_empty()
-            {
-                let parts: Vec<String> = syms
-                    .iter()
-                    .map(|s| format!("{}: {}", s.kind, s.count))
-                    .collect();
-                writeln!(fmt.writer, "{prefix}  Symbols: {}", parts.join(", "))?;
-            }
-            if let Some(ref langs) = m.languages
-                && !langs.is_empty()
-            {
-                let parts: Vec<String> = langs
-                    .iter()
-                    .map(|l| format!("{}: {}", l.language, l.count))
-                    .collect();
-                writeln!(fmt.writer, "{prefix}  Languages: {}", parts.join(", "))?;
-            }
-            if let Some(dc) = m.dependency_count {
-                writeln!(fmt.writer, "{prefix}  Dependencies: {dc}")?;
-            }
-            if let Some(ref desc) = out.description {
-                writeln!(fmt.writer, "{prefix}  Description: {desc}")?;
-            }
-            if !out.symbols.is_empty() {
-                writeln!(fmt.writer, "{prefix}  Symbols:")?;
-                for s in &out.symbols {
-                    if s.signature.is_empty() {
-                        writeln!(fmt.writer, "{prefix}    {} {}", s.kind, s.name)?;
-                    } else {
-                        writeln!(
-                            fmt.writer,
-                            "{prefix}    {} {} — {}",
-                            s.kind, s.name, s.signature
-                        )?;
-                    }
-                }
-            }
-            if !out.import_edges.is_empty() {
-                writeln!(fmt.writer, "{prefix}  Imports:")?;
-                for e in &out.import_edges {
-                    writeln!(fmt.writer, "{prefix}    {} → {}", e.from, e.to)?;
-                }
-            }
+            Self::render_summary_grep_node(fmt, out, indent)?;
 
             // Render children recursively.
             for child in &out.children {
@@ -1805,8 +1979,19 @@ fn write_highlighted<W: Write>(writer: &mut W, content: &str, re: &Regex) -> std
 // ---------------------------------------------------------------------------
 
 /// Print a hint message to stderr (suppressed when `suppress` is true).
+///
+/// When suppressed and stdout is a TTY, writes a comment line to stdout so
+/// that callers using `2>/dev/null` still see feedback. When stdout is piped
+/// (not a TTY), hints are suppressed entirely to avoid confusing LLM agents
+/// that parse stdout as structured results.
 pub fn print_hint(msg: &str, suppress: bool) {
-    if !suppress {
+    use std::io::IsTerminal;
+    if suppress {
+        // In piped mode, suppress entirely — agents parse stdout as results.
+        if std::io::stdout().is_terminal() {
+            println!("# {msg}");
+        }
+    } else {
         eprintln!("hint: {msg}");
     }
 }
@@ -1816,6 +2001,14 @@ pub fn print_hint(msg: &str, suppress: bool) {
 /// Format: `-- {truncated} more results truncated (budget: {budget} tokens) --`
 pub fn print_budget_summary(truncated: usize, budget: usize) {
     eprintln!("-- {truncated} more results truncated (budget: {budget} tokens) --");
+}
+
+/// Print a budget truncation summary with page info to stderr (grep mode).
+pub fn print_budget_summary_with_page(truncated: usize, budget: usize, page: usize) {
+    eprintln!(
+        "-- page {page}: {truncated} more results available (use --page {} --budget {budget}) --",
+        page + 1
+    );
 }
 
 /// Format the search mode indicator message.
@@ -1843,8 +2036,13 @@ pub fn print_mode_indicator(symbol_count: u64, suppress: bool) {
 /// Print a category header to stderr.
 ///
 /// Headers go to stderr so they don't break grep-compatible stdout parsing.
+/// When stdout is piped (not a TTY), headers are suppressed entirely to avoid
+/// confusing LLM agents that discard stderr with `2>/dev/null`.
 pub fn print_category_header(header: &str) {
-    eprintln!("{header}");
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        eprintln!("{header}");
+    }
 }
 
 /// Print an error message to stderr.
@@ -2586,6 +2784,8 @@ mod tests {
             truncated_count: 42,
             budget_tokens: 500,
             used_tokens: 498,
+            page: None,
+            has_more: true,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_truncation_meta(&meta));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -2600,6 +2800,8 @@ mod tests {
             truncated_count: 10,
             budget_tokens: 100,
             used_tokens: 95,
+            page: None,
+            has_more: true,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"truncated_count\":10"));
@@ -2679,6 +2881,8 @@ mod tests {
                     truncated_count: truncated,
                     budget_tokens: 25,
                     used_tokens: fmt.budget_used(),
+                    page: None,
+                    has_more: true,
                 };
                 fmt.format_truncation_meta(&meta).unwrap();
             }
@@ -3197,6 +3401,8 @@ mod tests {
             source: "function processPayment() {\n  return true;\n}".into(),
             language: "TypeScript".into(),
             auto_shallow: None,
+            truncated_at_line: None,
+            total_lines: None,
         };
         let rendered = render(OutputFormat::Grep, |fmt| fmt.format_show(&out));
         assert!(rendered.contains("  10| function processPayment()"));
@@ -3215,6 +3421,8 @@ mod tests {
             source: "fn foo() {}".into(),
             language: "Rust".into(),
             auto_shallow: None,
+            truncated_at_line: None,
+            total_lines: None,
         };
         let rendered = render_color(|fmt| fmt.format_show(&out));
         assert!(
@@ -3234,6 +3442,8 @@ mod tests {
             source: "fn foo() {\n  42\n}".into(),
             language: "Rust".into(),
             auto_shallow: None,
+            truncated_at_line: None,
+            total_lines: None,
         };
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_show(&out));
         let v: serde_json::Value = serde_json::from_str(rendered.trim()).unwrap();
@@ -3257,6 +3467,8 @@ mod tests {
             source: "const MAX: usize = 1024;".into(),
             language: "Rust".into(),
             auto_shallow: None,
+            truncated_at_line: None,
+            total_lines: None,
         };
         let rendered = render(OutputFormat::Json, |fmt| fmt.format_show(&out));
         assert!(!rendered.contains("end_line"));
@@ -3273,9 +3485,71 @@ mod tests {
             source: "const MAX: usize = 1024;".into(),
             language: "Rust".into(),
             auto_shallow: None,
+            truncated_at_line: None,
+            total_lines: None,
         };
         let rendered = render(OutputFormat::Grep, |fmt| fmt.format_show(&out));
         assert_eq!(rendered, "   3| const MAX: usize = 1024;\n");
+    }
+
+    // -- ShowOutput truncation ------------------------------------------------
+
+    fn make_show_output(num_lines: usize) -> ShowOutput {
+        let source = (0..num_lines)
+            .map(|i| format!("    line {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ShowOutput {
+            name: "big_fn".into(),
+            kind: "function".into(),
+            file: "src/big.rs".into(),
+            line: 10,
+            end_line: Some(10 + num_lines - 1),
+            source,
+            language: "Rust".into(),
+            auto_shallow: None,
+            truncated_at_line: None,
+            total_lines: None,
+        }
+    }
+
+    #[test]
+    fn truncated_returns_none_when_fits() {
+        let out = make_show_output(50);
+        assert!(out.truncated(80).is_none());
+    }
+
+    #[test]
+    fn truncated_returns_none_below_min() {
+        let out = make_show_output(100);
+        assert!(out.truncated(10).is_none());
+    }
+
+    #[test]
+    fn truncated_caps_at_max_lines() {
+        let out = make_show_output(200);
+        let t = out.truncated(80).expect("should truncate");
+        assert_eq!(t.truncated_at_line, Some(89)); // line 10 + 80 - 1
+        assert_eq!(t.total_lines, Some(200));
+        assert_eq!(t.source.lines().count(), 81); // 80 lines + marker
+        assert!(t.source.contains("// ... 120 more lines (truncated"));
+    }
+
+    #[test]
+    fn truncated_json_skips_fields_when_none() {
+        let out = make_show_output(10);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains("truncated_at_line"));
+        assert!(!json.contains("total_lines"));
+    }
+
+    #[test]
+    fn truncated_json_includes_fields_when_set() {
+        let out = make_show_output(200);
+        let t = out.truncated(80).unwrap();
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"truncated_at_line\":89"));
+        assert!(json.contains("\"total_lines\":200"));
     }
 
     // -- CallerOutput --------------------------------------------------------

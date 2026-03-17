@@ -26,6 +26,61 @@ pub struct ShowOptions {
     pub suppress: bool,
     /// Show container types in shallow mode (signature + child signatures only).
     pub shallow: bool,
+    /// Restrict results to symbols with this scope (e.g. class name for methods).
+    pub scope: Option<String>,
+    /// Show only signatures for all symbols (no source bodies).
+    pub signatures_only: bool,
+}
+
+/// Query all top-level symbols in a file (or directory prefix) and read their
+/// source bodies from disk.
+///
+/// When `file_pattern` ends with `/`, it matches all files under that
+/// directory. Otherwise it matches the exact file path.
+pub fn show_file(
+    conn: &Connection,
+    file_pattern: &str,
+    repo_root: &Path,
+    options: &ShowOptions,
+) -> Result<Vec<ShowResult>> {
+    let like_pattern = if file_pattern.ends_with('/') {
+        format!("{}%", escape_like(file_pattern))
+    } else {
+        escape_like(file_pattern)
+    };
+
+    let mut sql = String::from(
+        "SELECT name, kind, file, line, end_line, signature, language \
+         FROM symbols WHERE file LIKE ?1 ESCAPE '\\' AND scope IS NULL",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(like_pattern)];
+
+    if let Some(ref kind_str) = options.kind {
+        SymbolKind::from_str(kind_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        sql.push_str(" AND kind = ?");
+        params.push(Box::new(kind_str.clone()));
+    }
+
+    sql.push_str(" ORDER BY file, line");
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<_> = stmt
+        .query_map(rusqlite::params_from_iter(param_refs), |row| {
+            let kind_str: String = row.get(1)?;
+            Ok((
+                row.get::<_, String>(0)?, // name
+                kind_str,
+                row.get::<_, String>(2)?,      // file
+                row.get::<_, i64>(3)?,         // line
+                row.get::<_, Option<i64>>(4)?, // end_line
+                row.get::<_, String>(5)?,      // signature
+                row.get::<_, String>(6)?,      // language
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    collect_show_results(conn, rows, repo_root, options)
 }
 
 /// Query the index for symbols matching `name` and read their source bodies
@@ -63,15 +118,20 @@ pub fn show_symbol(
     }
 
     if let Some(ref file_filter) = options.file {
-        sql.push_str(" AND file LIKE ? ESCAPE '\\'");
+        sql.push_str(" AND LOWER(file) LIKE LOWER(?) ESCAPE '\\'");
         params.push(Box::new(format!("%{}%", escape_like(file_filter))));
+    }
+
+    if let Some(ref scope_filter) = options.scope {
+        sql.push_str(" AND scope = ?");
+        params.push(Box::new(scope_filter.clone()));
     }
 
     sql.push_str(" ORDER BY file, line");
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<_> = stmt
+    let mut rows: Vec<_> = stmt
         .query_map(rusqlite::params_from_iter(param_refs), |row| {
             let kind_str: String = row.get(1)?;
             Ok((
@@ -86,7 +146,37 @@ pub fn show_symbol(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Cache file contents to avoid N+1 I/O when multiple symbols share a file.
+    // Prioritize exact name matches over substring matches, and deprioritize
+    // test files, so the most relevant result appears first within budget.
+    if !options.exact {
+        let query_name = name.to_string();
+        rows.sort_by(|a, b| {
+            let a_exact = a.0.eq_ignore_ascii_case(&query_name);
+            let b_exact = b.0.eq_ignore_ascii_case(&query_name);
+            let a_test = is_test_path(&a.2);
+            let b_test = is_test_path(&b.2);
+            b_exact.cmp(&a_exact).then(a_test.cmp(&b_test))
+        });
+    }
+
+    collect_show_results(conn, rows, repo_root, options)
+}
+
+/// Returns `true` for test/bench/spec file paths.
+fn is_test_path(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.contains("test") || p.contains("spec") || p.contains("bench") || p.contains("example")
+}
+
+/// Shared logic: given queried rows, read source bodies and build `ShowResult`s.
+type SymbolRow = (String, String, String, i64, Option<i64>, String, String);
+
+fn collect_show_results(
+    conn: &Connection,
+    rows: Vec<SymbolRow>,
+    repo_root: &Path,
+    options: &ShowOptions,
+) -> Result<Vec<ShowResult>> {
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
     let canonical_root = repo_root
         .canonicalize()
@@ -94,7 +184,6 @@ pub fn show_symbol(
 
     let mut results = Vec::new();
 
-    // Prepare child-signature statement once outside the loop to avoid N+1 prepare calls.
     let mut child_stmt = if options.shallow {
         Some(conn.prepare(
             "SELECT signature FROM symbols WHERE scope = ?1 AND file = ?2 ORDER BY line",
@@ -108,16 +197,35 @@ pub fn show_symbol(
         let line = line as usize;
         let end_line = end_line.map(|v| v as usize);
 
-        // Shallow mode for container types: show container signature + child signatures.
+        if options.signatures_only {
+            let short_sig = signature.lines().next().unwrap_or(&signature).to_string();
+            results.push(ShowResult {
+                name: sym_name,
+                kind,
+                file,
+                line,
+                end_line,
+                source: short_sig,
+                language,
+            });
+            continue;
+        }
+
         if options.shallow && kind.is_container() {
             let child_sigs =
                 query_child_signatures_with_stmt(child_stmt.as_mut().unwrap(), &sym_name, &file)?;
+            // Use only the first line of the container signature (the
+            // class/struct declaration) — Python signatures can include
+            // the entire docstring + __init__ body which defeats shallow mode.
+            let short_sig = signature.lines().next().unwrap_or(&signature).to_string();
             let source = if child_sigs.is_empty() {
-                signature.clone()
+                short_sig
             } else {
-                let mut parts = vec![signature.clone()];
+                let mut parts = vec![short_sig];
                 for sig in &child_sigs {
-                    parts.push(format!("    {sig}"));
+                    // Use only the first line of each child signature too.
+                    let first_line = sig.lines().next().unwrap_or(sig);
+                    parts.push(format!("    {first_line}"));
                 }
                 parts.join("\n")
             };
@@ -133,12 +241,10 @@ pub fn show_symbol(
             continue;
         }
 
-        // Read source body from disk.
         let source = if let Some(end) = end_line {
             let suppress = options.suppress;
             let content = file_cache.entry(file.clone()).or_insert_with(|| {
                 let abs_path = repo_root.join(&file);
-                // Validate resolved path stays within repo root (CWE-22).
                 match abs_path.canonicalize() {
                     Ok(canonical) if canonical.starts_with(&canonical_root) => {
                         std::fs::read_to_string(&canonical).ok()
@@ -161,7 +267,6 @@ pub fn show_symbol(
                 None => continue,
             }
         } else {
-            // No end_line: fall back to signature.
             signature
         };
 
@@ -245,6 +350,8 @@ mod tests {
             exact: false,
             suppress: true,
             shallow: false,
+            scope: None,
+            signatures_only: false,
         }
     }
 
@@ -488,5 +595,77 @@ mod tests {
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"alpha"));
         assert!(names.contains(&"beta"));
+    }
+
+    #[test]
+    fn show_file_returns_top_level_symbols() {
+        let source = "fn alpha() {\n    1\n}\nfn beta() {\n    2\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let results = show_file(&conn, "src/lib.rs", dir.path(), &default_options()).unwrap();
+
+        assert_eq!(results.len(), 2);
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+    }
+
+    #[test]
+    fn show_file_directory_prefix() {
+        let source = "fn alpha() {\n    1\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let results = show_file(&conn, "src/", dir.path(), &default_options()).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "alpha");
+    }
+
+    #[test]
+    fn show_file_excludes_scoped_symbols() {
+        // Methods (scope != NULL) should be excluded from file-only mode.
+        let source = "struct Foo {}\nimpl Foo {\n    fn bar(&self) {\n        42\n    }\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let results = show_file(&conn, "src/lib.rs", dir.path(), &default_options()).unwrap();
+
+        // Only the struct should appear, not the method.
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"Foo"), "should contain top-level Foo");
+        assert!(!names.contains(&"bar"), "should exclude scoped method bar");
+    }
+
+    #[test]
+    fn show_file_respects_shallow_mode() {
+        let source = "struct Foo {\n    x: i32,\n}\n\nimpl Foo {\n    fn bar(&self) -> i32 {\n        self.x\n    }\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let opts = ShowOptions {
+            shallow: true,
+            ..default_options()
+        };
+        let results = show_file(&conn, "src/lib.rs", dir.path(), &opts).unwrap();
+
+        let foo = results
+            .iter()
+            .find(|r| r.name == "Foo")
+            .expect("should find Foo");
+        assert!(
+            foo.source.contains("bar"),
+            "shallow should include child signatures"
+        );
+        assert!(
+            !foo.source.contains("self.x"),
+            "shallow should not include method bodies"
+        );
+    }
+
+    #[test]
+    fn show_file_no_match_returns_empty() {
+        let source = "fn alpha() { }\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let results = show_file(&conn, "nonexistent.rs", dir.path(), &default_options()).unwrap();
+        assert!(results.is_empty());
     }
 }
