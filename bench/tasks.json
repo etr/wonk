@@ -1,0 +1,282 @@
+[
+  {
+    "id": "rg_find_search_worker",
+    "repo": "ripgrep",
+    "prompt": "Find the definition of the `search_parallel` function and show its signature.",
+    "category": "symbol_location",
+    "expected_facts": [
+      "search_parallel search.rs",
+      "SearchWorker",
+      "Result",
+      "pub"
+    ]
+  },
+  {
+    "id": "rg_callers_of_sink_matched",
+    "repo": "ripgrep",
+    "prompt": "Find all functions that call `sink_matched`. List each caller's name and file.",
+    "category": "reference_tracing",
+    "expected_facts": [
+      "sink_matched",
+      "core.rs",
+      "glue.rs"
+    ]
+  },
+  {
+    "id": "rg_regex_module_arch",
+    "repo": "ripgrep",
+    "prompt": "Summarize the modules in the `crates/regex/` directory and explain how they relate.",
+    "category": "architecture",
+    "expected_facts": [
+      "lib.rs",
+      "RegexMatcher",
+      "Matcher trait"
+    ]
+  },
+  {
+    "id": "rg_matcher_impl",
+    "repo": "ripgrep",
+    "prompt": "Explain how the Matcher trait is implemented and which types implement it.",
+    "category": "multi_step",
+    "expected_facts": [
+      "Matcher trait",
+      "RegexMatcher",
+      "find_at"
+    ]
+  },
+  {
+    "id": "rg_flag_parsing",
+    "repo": "ripgrep",
+    "prompt": "How does ripgrep parse CLI flags? Trace the flow from main() to argument parsing.",
+    "category": "architecture",
+    "expected_facts": [
+      "main.rs",
+      "Args",
+      "lexopt"
+    ]
+  },
+  {
+    "id": "tokio_find_spawn",
+    "repo": "tokio",
+    "prompt": "Find the definition of the `spawn` function in the tokio runtime and show its full signature.",
+    "category": "symbol_location",
+    "expected_facts": [
+      "spawn",
+      "Future",
+      "JoinHandle",
+      "pub"
+    ]
+  },
+  {
+    "id": "tokio_task_wakers",
+    "repo": "tokio",
+    "prompt": "What functions reference `Waker` in the task module? List them.",
+    "category": "reference_tracing",
+    "expected_facts": [
+      "wake_by_ref",
+      "Waker",
+      "harness"
+    ]
+  },
+  {
+    "id": "tokio_runtime_arch",
+    "repo": "tokio",
+    "prompt": "Summarize the architecture of tokio's runtime module. What are the key components?",
+    "category": "architecture",
+    "expected_facts": [
+      "scheduler",
+      "Handle",
+      "Runtime"
+    ]
+  },
+  {
+    "id": "tokio_io_driver",
+    "repo": "tokio",
+    "prompt": "Explain how the I/O driver polls for events. Trace from the driver struct to poll.",
+    "category": "multi_step",
+    "expected_facts": [
+      "Driver",
+      "mio",
+      "poll"
+    ]
+  },
+  {
+    "id": "tokio_join_handle",
+    "repo": "tokio",
+    "prompt": "What methods does JoinHandle provide? List them with their signatures.",
+    "category": "structural",
+    "expected_facts": [
+      "abort",
+      "is_finished",
+      "JoinHandle Future"
+    ]
+  },
+  {
+    "id": "httpx_find_client",
+    "repo": "httpx",
+    "prompt": "Find the definition of the Client class and list its key methods.",
+    "category": "symbol_location",
+    "expected_facts": [
+      "Client _client.py",
+      "get",
+      "post",
+      "request"
+    ]
+  },
+  {
+    "id": "httpx_transport_refs",
+    "repo": "httpx",
+    "prompt": "What classes reference BaseTransport? List each with its file.",
+    "category": "reference_tracing",
+    "expected_facts": [
+      "HTTPTransport",
+      "AsyncBaseTransport",
+      "_transports"
+    ]
+  },
+  {
+    "id": "httpx_request_flow",
+    "repo": "httpx",
+    "prompt": "Trace how an HTTP request flows from Client.get() to the transport layer.",
+    "category": "architecture",
+    "expected_facts": [
+      "request",
+      "_send",
+      "Response"
+    ]
+  },
+  {
+    "id": "httpx_redirect_handling",
+    "repo": "httpx",
+    "prompt": "How does httpx handle HTTP redirects? Trace the redirect following logic.",
+    "category": "multi_step",
+    "expected_facts": [
+      "follow_redirects",
+      "status code",
+      "max_redirects"
+    ]
+  },
+  {
+    "id": "httpx_response_methods",
+    "repo": "httpx",
+    "prompt": "What methods and properties does the Response class provide? List them.",
+    "category": "structural",
+    "expected_facts": [
+      "json",
+      "status_code",
+      "text",
+      "Response _models.py"
+    ]
+  },
+  {
+    "id": "pydantic_find_basemodel",
+    "repo": "pydantic",
+    "prompt": "Find the definition of BaseModel and show its metaclass or model configuration.",
+    "category": "symbol_location",
+    "expected_facts": [
+      "BaseModel main.py",
+      "ConfigDict",
+      "metaclass"
+    ]
+  },
+  {
+    "id": "pydantic_validator_refs",
+    "repo": "pydantic",
+    "prompt": "What modules import or reference field_validator? List the files.",
+    "category": "reference_tracing",
+    "expected_facts": [
+      "field_validator",
+      "functional_validators",
+      "decorators"
+    ]
+  },
+  {
+    "id": "pydantic_validation_arch",
+    "repo": "pydantic",
+    "prompt": "How does Pydantic's validation pipeline work? What are the key components?",
+    "category": "architecture",
+    "expected_facts": [
+      "pydantic-core",
+      "validators",
+      "CoreSchema"
+    ]
+  },
+  {
+    "id": "pydantic_field_serialization",
+    "repo": "pydantic",
+    "prompt": "How does field serialization work when calling model_dump()? Trace the flow.",
+    "category": "multi_step",
+    "expected_facts": [
+      "model_dump",
+      "serializ",
+      "field"
+    ]
+  },
+  {
+    "id": "pydantic_config_options",
+    "repo": "pydantic",
+    "prompt": "What configuration options does ConfigDict provide? List them.",
+    "category": "structural",
+    "expected_facts": [
+      "ConfigDict",
+      "strict",
+      "json_schema_extra"
+    ]
+  },
+  {
+    "id": "fastify_find_register",
+    "repo": "fastify",
+    "prompt": "Find the definition of the register function and explain how plugins are loaded.",
+    "category": "symbol_location",
+    "expected_facts": [
+      "register",
+      "avvio",
+      "plugin"
+    ]
+  },
+  {
+    "id": "fastify_hook_refs",
+    "repo": "fastify",
+    "prompt": "What functions reference onRequest hook? List each with its file.",
+    "category": "reference_tracing",
+    "expected_facts": [
+      "onRequest",
+      "hook",
+      "route"
+    ]
+  },
+  {
+    "id": "fastify_request_flow",
+    "repo": "fastify",
+    "prompt": "Trace how an HTTP request flows through Fastify from server to route handler.",
+    "category": "architecture",
+    "expected_facts": [
+      "find-my-way",
+      "hook",
+      "reply"
+    ]
+  },
+  {
+    "id": "fastify_error_handling",
+    "repo": "fastify",
+    "prompt": "How does Fastify handle errors in route handlers? Trace the error propagation path.",
+    "category": "multi_step",
+    "expected_facts": [
+      "setErrorHandler",
+      "error",
+      "reply"
+    ]
+  },
+  {
+    "id": "fastify_reply_methods",
+    "repo": "fastify",
+    "prompt": "What methods does the Reply object provide? List them with brief descriptions.",
+    "category": "structural",
+    "expected_facts": [
+      "send",
+      "status",
+      "header",
+      "Reply reply.js"
+    ]
+  }
+]

@@ -2,3 +2,4 @@
 .worktrees
 bench/repos/
 bench/results/
+__pycache__/

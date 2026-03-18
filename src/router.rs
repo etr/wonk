@@ -3071,11 +3071,10 @@ pub fn query_references_db(conn: &Connection, name: &str) -> Result<Vec<Referenc
     let sql = "SELECT r.name, r.file, r.line, r.col, r.context, s.name, r.confidence \
                FROM \"references\" r \
                LEFT JOIN symbols s ON r.caller_id = s.id \
-               WHERE r.name LIKE ?1";
-    let name_param = format!("%{}%", name);
+               WHERE r.name = ?1";
     let mut stmt = conn.prepare_cached(sql)?;
 
-    let rows = stmt.query_map(rusqlite::params![name_param], |row| {
+    let rows = stmt.query_map(rusqlite::params![name], |row| {
         let line: i64 = row.get(2)?;
         let col: i64 = row.get(3)?;
         Ok(Reference {

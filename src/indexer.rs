@@ -703,14 +703,27 @@ fn extract_python(
             None
         }
         "assignment" => {
-            // Module-level variable: `FOO = 42`
-            if scope.is_none() {
-                // Only capture simple name = value at module level
-                if let Some(left) = node.child_by_field_name("left")
-                    && left.kind() == "identifier"
-                {
-                    let name = node_text(left, src);
-                    // Heuristic: ALL_CAPS = constant, otherwise variable
+            if let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "identifier"
+            {
+                let name = node_text(left, src);
+                if scope.is_some() {
+                    // Class-level field: `title: str | None` or `value: int = 42`
+                    // Only index annotated assignments (those with a type field)
+                    // so plain `FOO = 'bar'` inside classes stays unindexed.
+                    if node.child_by_field_name("type").is_some() {
+                        return Some(make_symbol(
+                            name,
+                            SymbolKind::Variable,
+                            node,
+                            src,
+                            file,
+                            Lang::Python,
+                            scope,
+                        ));
+                    }
+                } else {
+                    // Module-level variable: `FOO = 42`
                     let is_const = name.chars().all(|c| c.is_uppercase() || c == '_');
                     let sk = if is_const {
                         SymbolKind::Constant
@@ -1805,9 +1818,7 @@ fn walk_refs(
     }
 
     // Check for import references
-    if let Some(r) = match_import_ref(node, kind, src, file, lang, source_lines) {
-        refs.push(r);
-    }
+    refs.extend(match_import_ref(node, kind, src, file, lang, source_lines));
 
     // Recurse into children
     for i in 0..node.child_count() {
@@ -2531,122 +2542,185 @@ fn match_import_ref(
     file: &str,
     lang: Lang,
     source_lines: &[&str],
-) -> Option<Reference> {
+) -> Vec<Reference> {
     match lang {
         Lang::Rust => {
             if kind != "use_declaration" {
-                return None;
+                return vec![];
             }
-            let arg = node.child_by_field_name("argument")?;
+            let Some(arg) = node.child_by_field_name("argument") else {
+                return vec![];
+            };
             let name = node_text(arg, src).to_string();
-            Some(make_ref(
+            vec![make_ref(
                 &name,
                 ReferenceKind::Import,
                 node,
                 file,
                 source_lines,
-            ))
+            )]
         }
         Lang::Python => match kind {
-            "import_statement" | "import_from_statement" => {
-                let name = node_text(node, src).trim().to_string();
-                Some(make_ref(
-                    &name,
-                    ReferenceKind::Import,
-                    node,
-                    file,
-                    source_lines,
-                ))
+            "import_from_statement" => {
+                // Extract each imported name individually.
+                // AST: import_from_statement { module_name: dotted_name, dotted_name, ... }
+                let module_child = node.child_by_field_name("module_name");
+                let mut result = Vec::new();
+                for i in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(i as u32) else {
+                        continue;
+                    };
+                    // Skip the module_name field child
+                    if let Some(ref mc) = module_child
+                        && child.id() == mc.id()
+                    {
+                        continue;
+                    }
+                    // Remaining named children are the imported names
+                    // (dotted_name nodes, or aliased_import nodes)
+                    let text = if child.kind() == "aliased_import" {
+                        // `from foo import bar as baz` — store the original name "bar"
+                        child
+                            .child_by_field_name("name")
+                            .map(|n| node_text(n, src).trim().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        node_text(child, src).trim().to_string()
+                    };
+                    if !text.is_empty() {
+                        result.push(make_ref(
+                            &text,
+                            ReferenceKind::Import,
+                            node,
+                            file,
+                            source_lines,
+                        ));
+                    }
+                }
+                result
             }
-            _ => None,
+            "import_statement" => {
+                // `import os` or `import os.path` — extract the module name
+                let mut result = Vec::new();
+                for i in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(i as u32) else {
+                        continue;
+                    };
+                    let text = if child.kind() == "aliased_import" {
+                        child
+                            .child_by_field_name("name")
+                            .map(|n| node_text(n, src).trim().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        node_text(child, src).trim().to_string()
+                    };
+                    if !text.is_empty() {
+                        result.push(make_ref(
+                            &text,
+                            ReferenceKind::Import,
+                            node,
+                            file,
+                            source_lines,
+                        ));
+                    }
+                }
+                result
+            }
+            _ => vec![],
         },
         Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
             if kind != "import_statement" {
-                return None;
+                return vec![];
             }
             let name = node_text(node, src).trim().to_string();
-            Some(make_ref(
+            vec![make_ref(
                 &name,
                 ReferenceKind::Import,
                 node,
                 file,
                 source_lines,
-            ))
+            )]
         }
         Lang::Go => {
             if kind != "import_spec" {
-                return None;
+                return vec![];
             }
-            let path = node.child_by_field_name("path")?;
+            let Some(path) = node.child_by_field_name("path") else {
+                return vec![];
+            };
             let name = node_text(path, src).trim_matches('"').to_string();
-            Some(make_ref(
+            vec![make_ref(
                 &name,
                 ReferenceKind::Import,
                 node,
                 file,
                 source_lines,
-            ))
+            )]
         }
         Lang::Java => {
             if kind != "import_declaration" {
-                return None;
+                return vec![];
             }
             // The text minus the "import " prefix and ";" suffix
             let text = node_text(node, src).trim().to_string();
-            Some(make_ref(
+            vec![make_ref(
                 &text,
                 ReferenceKind::Import,
                 node,
                 file,
                 source_lines,
-            ))
+            )]
         }
         Lang::C | Lang::Cpp => {
             if kind != "preproc_include" {
-                return None;
+                return vec![];
             }
-            let path = node.child_by_field_name("path")?;
+            let Some(path) = node.child_by_field_name("path") else {
+                return vec![];
+            };
             let name = node_text(path, src)
                 .trim_matches(|c| c == '"' || c == '<' || c == '>')
                 .to_string();
-            Some(make_ref(
+            vec![make_ref(
                 &name,
                 ReferenceKind::Import,
                 node,
                 file,
                 source_lines,
-            ))
+            )]
         }
-        Lang::Ruby => {
-            match kind {
-                "call" | "method_call" => {
-                    // require 'foo' or require_relative 'foo'
-                    let method = node
-                        .child_by_field_name("method")
-                        .map(|n| node_text(n, src))
-                        .unwrap_or("");
-                    if !matches!(method, "require" | "require_relative") {
-                        return None;
-                    }
-                    let args = node.child_by_field_name("arguments")?;
-                    let arg = args.named_child(0u32)?;
-                    let name = node_text(arg, src)
-                        .trim_matches(|c| c == '\'' || c == '"')
-                        .to_string();
-                    Some(make_ref(
-                        &name,
-                        ReferenceKind::Import,
-                        node,
-                        file,
-                        source_lines,
-                    ))
+        Lang::Ruby => match kind {
+            "call" | "method_call" => {
+                // require 'foo' or require_relative 'foo'
+                let method = node
+                    .child_by_field_name("method")
+                    .map(|n| node_text(n, src))
+                    .unwrap_or("");
+                if !matches!(method, "require" | "require_relative") {
+                    return vec![];
                 }
-                _ => None,
+                let Some(args) = node.child_by_field_name("arguments") else {
+                    return vec![];
+                };
+                let Some(arg) = args.named_child(0u32) else {
+                    return vec![];
+                };
+                let name = node_text(arg, src)
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_string();
+                vec![make_ref(
+                    &name,
+                    ReferenceKind::Import,
+                    node,
+                    file,
+                    source_lines,
+                )]
             }
-        }
+            _ => vec![],
+        },
         Lang::Php => {
             match kind {
-                "named_label_statement" => None,
+                "named_label_statement" => vec![],
                 _ => {
                     // PHP: include, require, include_once, require_once
                     if !matches!(
@@ -2656,32 +2730,32 @@ fn match_import_ref(
                             | "require_expression"
                             | "require_once_expression"
                     ) {
-                        return None;
+                        return vec![];
                     }
                     // The argument is a string literal child
                     let text = node_text(node, src).trim().to_string();
-                    Some(make_ref(
+                    vec![make_ref(
                         &text,
                         ReferenceKind::Import,
                         node,
                         file,
                         source_lines,
-                    ))
+                    )]
                 }
             }
         }
         Lang::CSharp => {
             if kind != "using_directive" {
-                return None;
+                return vec![];
             }
             let text = node_text(node, src).trim().to_string();
-            Some(make_ref(
+            vec![make_ref(
                 &text,
                 ReferenceKind::Import,
                 node,
                 file,
                 source_lines,
-            ))
+            )]
         }
     }
 }
@@ -3642,6 +3716,30 @@ mod tests {
         assert_eq!(var.kind, SymbolKind::Variable);
     }
 
+    #[test]
+    fn python_class_annotated_fields() {
+        let src = "class ConfigDict:\n    title: str\n    name: str | None\n    value: int = 42\n    FOO = 'bar'\n";
+        let syms = extract_from(Lang::Python, src);
+        let cls = find_sym(&syms, "ConfigDict");
+        assert_eq!(cls.kind, SymbolKind::Class);
+
+        // Annotated fields should be indexed as Variable with scope
+        let title = find_sym(&syms, "title");
+        assert_eq!(title.kind, SymbolKind::Variable);
+        assert_eq!(title.scope.as_deref(), Some("ConfigDict"));
+
+        let name = find_sym(&syms, "name");
+        assert_eq!(name.kind, SymbolKind::Variable);
+        assert_eq!(name.scope.as_deref(), Some("ConfigDict"));
+
+        let value = find_sym(&syms, "value");
+        assert_eq!(value.kind, SymbolKind::Variable);
+        assert_eq!(value.scope.as_deref(), Some("ConfigDict"));
+
+        // Plain assignment without type annotation should NOT be indexed
+        assert!(syms.iter().all(|s| s.name != "FOO"));
+    }
+
     // ---------- JavaScript symbol extraction ----------
 
     #[test]
@@ -4059,16 +4157,43 @@ mod tests {
     fn python_import_reference() {
         let src = "import os\nfrom pathlib import Path\n";
         let refs = refs_from(Lang::Python, src);
+        assert!(has_ref(&refs, "os", ReferenceKind::Import));
+        assert!(has_ref(&refs, "Path", ReferenceKind::Import));
+        // Must NOT store the full statement text
+        assert!(
+            !has_ref(&refs, "from pathlib import Path", ReferenceKind::Import),
+            "import ref should store individual name, not full statement"
+        );
+    }
+
+    #[test]
+    fn python_import_from_multiple_names() {
+        let src = "from foo import bar, baz\n";
+        let refs = refs_from(Lang::Python, src);
         let import_refs: Vec<_> = refs
             .iter()
             .filter(|r| r.kind == ReferenceKind::Import)
             .collect();
-        assert!(
-            import_refs.len() >= 2,
-            "expected at least 2 import refs, got {}: {:?}",
+        assert_eq!(
+            import_refs.len(),
+            2,
+            "expected 2 import refs for 'from foo import bar, baz', got {}: {:?}",
             import_refs.len(),
             import_refs
         );
+        assert!(has_ref(&refs, "bar", ReferenceKind::Import));
+        assert!(has_ref(&refs, "baz", ReferenceKind::Import));
+        // Must NOT contain the module name or full statement
+        assert!(!has_ref(&refs, "foo", ReferenceKind::Import));
+    }
+
+    #[test]
+    fn python_import_aliased() {
+        let src = "from typing import List as L\nimport numpy as np\n";
+        let refs = refs_from(Lang::Python, src);
+        // Should store the original name, not the alias
+        assert!(has_ref(&refs, "List", ReferenceKind::Import));
+        assert!(has_ref(&refs, "numpy", ReferenceKind::Import));
     }
 
     // ---------- JavaScript reference extraction ----------

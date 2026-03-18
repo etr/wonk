@@ -668,4 +668,36 @@ mod tests {
         let results = show_file(&conn, "nonexistent.rs", dir.path(), &default_options()).unwrap();
         assert!(results.is_empty());
     }
+
+    #[test]
+    fn shallow_python_class_shows_annotated_fields() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("config.py"),
+            "class ConfigDict:\n    title: str\n    name: str | None\n    value: int = 42\n    def method(self):\n        pass\n",
+        )
+        .unwrap();
+        pipeline::build_index(root, true).unwrap();
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+
+        let opts = ShowOptions {
+            shallow: true,
+            exact: true,
+            ..default_options()
+        };
+        let results = show_symbol(&conn, "ConfigDict", root, &opts).unwrap();
+        assert_eq!(results.len(), 1);
+        let src = &results[0].source;
+        assert!(src.contains("title"), "shallow should list field title");
+        assert!(src.contains("name"), "shallow should list field name");
+        assert!(src.contains("value"), "shallow should list field value");
+        assert!(src.contains("method"), "shallow should list method");
+        assert!(
+            !src.contains("pass"),
+            "shallow should NOT include method body"
+        );
+    }
 }

@@ -82,17 +82,19 @@ Wonk pre-indexes your codebase with Tree-sitter so it understands code structure
 
 ## Benchmarks
 
-25 queries across 5 repos (ripgrep, tokio, Flask, Django, Express):
+25 code-understanding tasks across 5 real-world repos (ripgrep, tokio, httpx, pydantic, fastify), 5 runs each, median reported. Measures Claude Code token consumption with vs without wonk.
 
-| Comparison | Avg token reduction |
-|------------|---------------------|
-| wonk toon vs rg --json | **60%** |
-| wonk json vs rg --json | **57%** |
-| wonk grep vs plain rg  | **3%** (grep format is already compact) |
+| Category | Baseline (avg) | Wonk (avg) | Reduction | Quality (B→W) |
+|----------|---------------:|-----------:|----------:|--------------:|
+| symbol_location | 100k | 61k | 33% | 0.85→0.85 |
+| reference_tracing | 96k | 57k | 28% | 0.92→0.88 |
+| architecture | 162k | 101k | 29% | 0.90→0.96 |
+| multi_step | 143k | 104k | 23% | 0.93→0.93 |
+| structural | 130k | 69k | 46% | 0.95→0.88 |
 
-Definitions found in 92% of queries. Average of 73 re-export dedup annotations per query.
+**Overall:** 37.4% total reduction (median per-task 29.7%, best 68.5%). Quality maintained at 0.90 vs 0.91 baseline.
 
-Full results: [`bench/results/report.md`](bench/results/report.md)
+Full results: [`bench/results/agent_report.md`](bench/results/agent_report.md)
 
 ## Installation
 
