@@ -94,8 +94,6 @@ Wonk pre-indexes your codebase with Tree-sitter so it understands code structure
 
 **Overall:** 37.4% total reduction (median per-task 29.7%, best 68.5%). Quality maintained at 0.90 vs 0.91 baseline.
 
-Full results: [`bench/results/agent_report.md`](bench/results/agent_report.md)
-
 ## Installation
 
 ### curl (Linux / macOS)
