@@ -2,6 +2,14 @@
 name = "wonk"
 version = "4.13.0"
 edition = "2024"
+description = "Structure-aware code search CLI for LLM coding agents"
+license = "MIT"
+repository = "https://github.com/etr/wonk"
+homepage = "https://github.com/etr/wonk"
+readme = "README.md"
+keywords = ["code-search", "tree-sitter", "llm", "coding-agent", "indexer"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["bench/", "specs/", "homebrew/", "docs/", ".github/"]
 
 [lib]
 name = "wonk"
