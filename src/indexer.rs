@@ -196,42 +196,41 @@ pub fn extract_symbols(tree: &Tree, source: &str, file: &str, lang: Lang) -> Vec
     let mut symbols = Vec::new();
     let root = tree.root_node();
 
-    walk_node(root, src, file, lang, None, &mut symbols);
+    walk_node(root, src, file, lang, &mut symbols);
     symbols
 }
 
 /// Recursively walk a node and its children, collecting symbols.
-fn walk_node(
-    node: Node,
-    src: &[u8],
-    file: &str,
-    lang: Lang,
-    scope: Option<&str>,
-    symbols: &mut Vec<Symbol>,
-) {
-    let kind = node.kind();
+///
+/// Implemented with an explicit stack (iterative DFS) so very deep C/C++ trees
+/// cannot overflow the thread stack.
+fn walk_node(root: Node, src: &[u8], file: &str, lang: Lang, symbols: &mut Vec<Symbol>) {
+    let mut stack = vec![(root, None::<String>)];
+    while let Some((node, scope)) = stack.pop() {
+        let kind = node.kind();
 
-    // Attempt to extract a symbol from this node.
-    if let Some(sym) = match_node(node, kind, src, file, lang, scope) {
-        let new_scope = sym.name.clone();
-        symbols.push(sym);
+        // Attempt to extract a symbol from this node.
+        if let Some(sym) = match_node(node, kind, src, file, lang, scope.as_deref()) {
+            let new_scope = sym.name.clone();
+            symbols.push(sym);
 
-        // For container nodes (class, struct, impl, trait, module, etc.),
-        // recurse with updated scope.
-        if is_container(kind, lang) {
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    walk_node(child, src, file, lang, Some(&new_scope), symbols);
+            // For container nodes (class, struct, impl, trait, module, etc.),
+            // continue with updated scope.
+            if is_container(kind, lang) {
+                for i in (0..node.child_count()).rev() {
+                    if let Some(child) = node.child(i as u32) {
+                        stack.push((child, Some(new_scope.clone())));
+                    }
                 }
+                continue; // already queued children
             }
-            return; // already recursed children
         }
-    }
 
-    // Default: recurse into children with same scope.
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            walk_node(child, src, file, lang, scope, symbols);
+        // Default: descend into children with same scope.
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push((child, scope.clone()));
+            }
         }
     }
 }
@@ -350,7 +349,7 @@ fn make_symbol(
     }
 }
 
-/// Maximum length for extracted doc comments.
+/// Maximum length in Unicode scalar values for extracted doc comments.
 const MAX_DOC_COMMENT_LEN: usize = 200;
 
 /// Extract a doc comment for the given symbol node.
@@ -512,15 +511,16 @@ fn strip_doc_prefix(text: &str, lang: Lang) -> String {
 
 /// Truncate doc comment to MAX_DOC_COMMENT_LEN chars at a word boundary.
 fn truncate_doc(s: &str) -> String {
-    if s.len() <= MAX_DOC_COMMENT_LEN {
+    let max = MAX_DOC_COMMENT_LEN;
+    let mut chars = s.chars();
+    let prefix: String = chars.by_ref().take(max).collect();
+    if chars.next().is_none() {
         return s.to_string();
     }
-    // Find last space before the limit
-    let truncated = &s[..MAX_DOC_COMMENT_LEN];
-    if let Some(pos) = truncated.rfind(' ') {
-        format!("{}...", &s[..pos])
+    if let Some(pos) = prefix.rfind(' ') {
+        format!("{}...", prefix[..pos].trim_end())
     } else {
-        format!("{}...", truncated)
+        format!("{}...", prefix)
     }
 }
 
@@ -1796,34 +1796,39 @@ pub fn extract_references(tree: &Tree, source: &str, file: &str, lang: Lang) -> 
 }
 
 /// Recursively walk a node tree collecting references.
+///
+/// Implemented with an explicit stack so deep trees cannot overflow the stack.
 fn walk_refs(
-    node: Node,
+    root: Node,
     src: &[u8],
     file: &str,
     lang: Lang,
     source_lines: &[&str],
     refs: &mut Vec<Reference>,
 ) {
-    let kind = node.kind();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
 
-    // Check for call expressions
-    if let Some(mut r) = match_call_ref(node, kind, src, file, lang, source_lines) {
-        r.caller_name = find_enclosing_function(node, src, lang);
-        refs.push(r);
-    }
+        // Check for call expressions
+        if let Some(mut r) = match_call_ref(node, kind, src, file, lang, source_lines) {
+            r.caller_name = find_enclosing_function(node, src, lang);
+            refs.push(r);
+        }
 
-    // Check for type references
-    if let Some(r) = match_type_ref(node, kind, src, file, lang, source_lines) {
-        refs.push(r);
-    }
+        // Check for type references
+        if let Some(r) = match_type_ref(node, kind, src, file, lang, source_lines) {
+            refs.push(r);
+        }
 
-    // Check for import references
-    refs.extend(match_import_ref(node, kind, src, file, lang, source_lines));
+        // Check for import references
+        refs.extend(match_import_ref(node, kind, src, file, lang, source_lines));
 
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            walk_refs(child, src, file, lang, source_lines, refs);
+        // Recurse into children
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push(child);
+            }
         }
     }
 }
@@ -2781,231 +2786,237 @@ pub fn extract_imports(tree: &Tree, source: &str, file: &str, lang: Lang) -> Fil
 }
 
 /// Recursively walk the tree collecting import paths and export names.
+///
+/// Implemented with an explicit stack so deep trees cannot overflow the stack.
 fn walk_imports(
-    node: Node,
+    root: Node,
     src: &[u8],
     lang: Lang,
     imports: &mut Vec<String>,
     exports: &mut Vec<String>,
 ) {
-    let kind = node.kind();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
 
-    match lang {
-        Lang::Rust => {
-            if kind == "use_declaration"
-                && let Some(arg) = node.child_by_field_name("argument")
-            {
-                imports.push(node_text(arg, src).to_string());
-            }
-            // Rust pub items are exports (simplified: just look for `pub` visibility)
-            if kind == "visibility_modifier"
-                && node_text(node, src).starts_with("pub")
-                && let Some(parent) = node.parent()
-            {
-                let export_name = match parent.kind() {
-                    "function_item" | "struct_item" | "enum_item" | "trait_item" | "type_item"
-                    | "const_item" | "static_item" | "mod_item" => {
-                        field_text(parent, "name", src).map(|s| s.to_string())
-                    }
-                    _ => None,
-                };
-                if let Some(name) = export_name {
-                    exports.push(name);
-                }
-            }
-        }
-        Lang::Python => {
-            match kind {
-                "import_statement" => {
-                    // import foo, bar
-                    for i in 0..node.named_child_count() {
-                        if let Some(child) = node.named_child(i as u32)
-                            && (child.kind() == "dotted_name" || child.kind() == "aliased_import")
-                        {
-                            let name_node = if child.kind() == "aliased_import" {
-                                child.child_by_field_name("name")
-                            } else {
-                                Some(child)
-                            };
-                            if let Some(n) = name_node {
-                                imports.push(node_text(n, src).to_string());
-                            }
-                        }
-                    }
-                }
-                "import_from_statement" => {
-                    if let Some(module) = node.child_by_field_name("module_name") {
-                        imports.push(node_text(module, src).to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
-            if kind == "import_statement"
-                && let Some(source_node) = node.child_by_field_name("source")
-            {
-                let path = node_text(source_node, src)
-                    .trim_matches(|c| c == '\'' || c == '"')
-                    .to_string();
-                imports.push(path);
-            }
-            // Export statements
-            if kind == "export_statement" {
-                // `export function foo() {}` or `export { foo, bar }`
-                // Try to get the declaration's name
-                if let Some(decl) = node.child_by_field_name("declaration")
-                    && let Some(name) = field_text(decl, "name", src)
+        match lang {
+            Lang::Rust => {
+                if kind == "use_declaration"
+                    && let Some(arg) = node.child_by_field_name("argument")
                 {
-                    exports.push(name.to_string());
+                    imports.push(node_text(arg, src).to_string());
                 }
-                // `export { foo, bar }` - look for export_clause
-                for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32)
-                        && child.kind() == "export_clause"
-                    {
-                        for j in 0..child.named_child_count() {
-                            if let Some(spec) = child.named_child(j as u32)
-                                && spec.kind() == "export_specifier"
-                                && let Some(name) = spec.child_by_field_name("name")
+                // Rust pub items are exports (simplified: just look for `pub` visibility)
+                if kind == "visibility_modifier"
+                    && node_text(node, src).starts_with("pub")
+                    && let Some(parent) = node.parent()
+                {
+                    let export_name = match parent.kind() {
+                        "function_item" | "struct_item" | "enum_item" | "trait_item"
+                        | "type_item" | "const_item" | "static_item" | "mod_item" => {
+                            field_text(parent, "name", src).map(|s| s.to_string())
+                        }
+                        _ => None,
+                    };
+                    if let Some(name) = export_name {
+                        exports.push(name);
+                    }
+                }
+            }
+            Lang::Python => {
+                match kind {
+                    "import_statement" => {
+                        // import foo, bar
+                        for i in 0..node.named_child_count() {
+                            if let Some(child) = node.named_child(i as u32)
+                                && (child.kind() == "dotted_name"
+                                    || child.kind() == "aliased_import")
                             {
-                                exports.push(node_text(name, src).to_string());
+                                let name_node = if child.kind() == "aliased_import" {
+                                    child.child_by_field_name("name")
+                                } else {
+                                    Some(child)
+                                };
+                                if let Some(n) = name_node {
+                                    imports.push(node_text(n, src).to_string());
+                                }
                             }
                         }
                     }
-                }
-                // `export default` - add "default"
-                let text = node_text(node, src);
-                if text.contains("export default") {
-                    exports.push("default".to_string());
-                }
-            }
-        }
-        Lang::Go => {
-            if kind == "import_spec"
-                && let Some(path) = node.child_by_field_name("path")
-            {
-                imports.push(node_text(path, src).trim_matches('"').to_string());
-            }
-            // Go exports: capitalized top-level names (handled by convention,
-            // we capture them for completeness)
-            if matches!(
-                kind,
-                "function_declaration"
-                    | "type_declaration"
-                    | "const_declaration"
-                    | "var_declaration"
-            ) && let Some(name) = field_text(node, "name", src)
-                && name.starts_with(|c: char| c.is_uppercase())
-            {
-                exports.push(name.to_string());
-            }
-        }
-        Lang::Java => {
-            if kind == "import_declaration" {
-                // Extract the imported path (skip "import " and ";")
-                for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32)
-                        && child.kind() == "scoped_identifier"
-                    {
-                        imports.push(node_text(child, src).to_string());
+                    "import_from_statement" => {
+                        if let Some(module) = node.child_by_field_name("module_name") {
+                            imports.push(node_text(module, src).to_string());
+                        }
                     }
+                    _ => {}
                 }
             }
-        }
-        Lang::C | Lang::Cpp => {
-            if kind == "preproc_include"
-                && let Some(path) = node.child_by_field_name("path")
-            {
-                let text = node_text(path, src)
-                    .trim_matches(|c| c == '"' || c == '<' || c == '>')
-                    .to_string();
-                imports.push(text);
-            }
-        }
-        Lang::Ruby => {
-            if matches!(kind, "call" | "method_call") {
-                let method = node
-                    .child_by_field_name("method")
-                    .map(|n| node_text(n, src))
-                    .unwrap_or("");
-                if matches!(method, "require" | "require_relative")
-                    && let Some(args) = node.child_by_field_name("arguments")
-                    && let Some(arg) = args.named_child(0u32)
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+                if kind == "import_statement"
+                    && let Some(source_node) = node.child_by_field_name("source")
                 {
-                    let path = node_text(arg, src)
+                    let path = node_text(source_node, src)
                         .trim_matches(|c| c == '\'' || c == '"')
                         .to_string();
                     imports.push(path);
                 }
-            }
-        }
-        Lang::Php => {
-            if matches!(
-                kind,
-                "include_expression"
-                    | "include_once_expression"
-                    | "require_expression"
-                    | "require_once_expression"
-            ) {
-                // Get the string argument
-                for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32)
-                        && child.kind() == "string"
+                // Export statements
+                if kind == "export_statement" {
+                    // `export function foo() {}` or `export { foo, bar }`
+                    // Try to get the declaration's name
+                    if let Some(decl) = node.child_by_field_name("declaration")
+                        && let Some(name) = field_text(decl, "name", src)
                     {
-                        let path = node_text(child, src)
+                        exports.push(name.to_string());
+                    }
+                    // `export { foo, bar }` - look for export_clause
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i as u32)
+                            && child.kind() == "export_clause"
+                        {
+                            for j in 0..child.named_child_count() {
+                                if let Some(spec) = child.named_child(j as u32)
+                                    && spec.kind() == "export_specifier"
+                                    && let Some(name) = spec.child_by_field_name("name")
+                                {
+                                    exports.push(node_text(name, src).to_string());
+                                }
+                            }
+                        }
+                    }
+                    // `export default` - add "default"
+                    let text = node_text(node, src);
+                    if text.contains("export default") {
+                        exports.push("default".to_string());
+                    }
+                }
+            }
+            Lang::Go => {
+                if kind == "import_spec"
+                    && let Some(path) = node.child_by_field_name("path")
+                {
+                    imports.push(node_text(path, src).trim_matches('"').to_string());
+                }
+                // Go exports: capitalized top-level names (handled by convention,
+                // we capture them for completeness)
+                if matches!(
+                    kind,
+                    "function_declaration"
+                        | "type_declaration"
+                        | "const_declaration"
+                        | "var_declaration"
+                ) && let Some(name) = field_text(node, "name", src)
+                    && name.starts_with(|c: char| c.is_uppercase())
+                {
+                    exports.push(name.to_string());
+                }
+            }
+            Lang::Java => {
+                if kind == "import_declaration" {
+                    // Extract the imported path (skip "import " and ";")
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i as u32)
+                            && child.kind() == "scoped_identifier"
+                        {
+                            imports.push(node_text(child, src).to_string());
+                        }
+                    }
+                }
+            }
+            Lang::C | Lang::Cpp => {
+                if kind == "preproc_include"
+                    && let Some(path) = node.child_by_field_name("path")
+                {
+                    let text = node_text(path, src)
+                        .trim_matches(|c| c == '"' || c == '<' || c == '>')
+                        .to_string();
+                    imports.push(text);
+                }
+            }
+            Lang::Ruby => {
+                if matches!(kind, "call" | "method_call") {
+                    let method = node
+                        .child_by_field_name("method")
+                        .map(|n| node_text(n, src))
+                        .unwrap_or("");
+                    if matches!(method, "require" | "require_relative")
+                        && let Some(args) = node.child_by_field_name("arguments")
+                        && let Some(arg) = args.named_child(0u32)
+                    {
+                        let path = node_text(arg, src)
                             .trim_matches(|c| c == '\'' || c == '"')
                             .to_string();
                         imports.push(path);
                     }
                 }
             }
-            // PHP namespace use statements
-            if kind == "namespace_use_declaration" {
-                for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32)
-                        && child.kind() == "namespace_use_clause"
+            Lang::Php => {
+                if matches!(
+                    kind,
+                    "include_expression"
+                        | "include_once_expression"
+                        | "require_expression"
+                        | "require_once_expression"
+                ) {
+                    // Get the string argument
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i as u32)
+                            && child.kind() == "string"
+                        {
+                            let path = node_text(child, src)
+                                .trim_matches(|c| c == '\'' || c == '"')
+                                .to_string();
+                            imports.push(path);
+                        }
+                    }
+                }
+                // PHP namespace use statements
+                if kind == "namespace_use_declaration" {
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i as u32)
+                            && child.kind() == "namespace_use_clause"
+                        {
+                            imports.push(node_text(child, src).to_string());
+                        }
+                    }
+                }
+            }
+            Lang::CSharp => {
+                if kind == "using_directive" {
+                    // `using System.Collections.Generic;` → extract the namespace
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i as u32)
+                            && matches!(child.kind(), "qualified_name" | "identifier")
+                        {
+                            imports.push(node_text(child, src).to_string());
+                        }
+                    }
+                }
+                // C# public types at namespace level are effectively exports
+                if matches!(
+                    kind,
+                    "class_declaration"
+                        | "struct_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "delegate_declaration"
+                        | "record_declaration"
+                ) {
+                    let text = node_text(node, src);
+                    if text.contains("public")
+                        && let Some(name) = field_text(node, "name", src)
                     {
-                        imports.push(node_text(child, src).to_string());
+                        exports.push(name.to_string());
                     }
                 }
             }
         }
-        Lang::CSharp => {
-            if kind == "using_directive" {
-                // `using System.Collections.Generic;` → extract the namespace
-                for i in 0..node.named_child_count() {
-                    if let Some(child) = node.named_child(i as u32)
-                        && matches!(child.kind(), "qualified_name" | "identifier")
-                    {
-                        imports.push(node_text(child, src).to_string());
-                    }
-                }
-            }
-            // C# public types at namespace level are effectively exports
-            if matches!(
-                kind,
-                "class_declaration"
-                    | "struct_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "delegate_declaration"
-                    | "record_declaration"
-            ) {
-                let text = node_text(node, src);
-                if text.contains("public")
-                    && let Some(name) = field_text(node, "name", src)
-                {
-                    exports.push(name.to_string());
-                }
-            }
-        }
-    }
 
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            walk_imports(child, src, lang, imports, exports);
+        // Recurse into children
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push(child);
+            }
         }
     }
 }
@@ -3033,183 +3044,190 @@ pub fn extract_type_edges(tree: &Tree, source: &str, _file: &str, lang: Lang) ->
 }
 
 /// Recursively walk the tree collecting type hierarchy edges.
-fn walk_type_edges(node: Node, src: &[u8], lang: Lang, edges: &mut Vec<RawTypeEdge>) {
-    let kind = node.kind();
+///
+/// Implemented with an explicit stack so deep trees cannot overflow the stack.
+fn walk_type_edges(root: Node, src: &[u8], lang: Lang, edges: &mut Vec<RawTypeEdge>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
 
-    match lang {
-        Lang::TypeScript | Lang::Tsx => {
-            if kind == "class_declaration"
-                && let Some(class_name) = field_text(node, "name", src)
-            {
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32)
-                        && child.kind() == "class_heritage"
-                    {
-                        extract_ts_heritage(child, src, class_name, edges);
+        match lang {
+            Lang::TypeScript | Lang::Tsx => {
+                if kind == "class_declaration"
+                    && let Some(class_name) = field_text(node, "name", src)
+                {
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i as u32)
+                            && child.kind() == "class_heritage"
+                        {
+                            extract_ts_heritage(child, src, class_name, edges);
+                        }
                     }
                 }
             }
-        }
-        Lang::JavaScript => {
-            if (kind == "class_declaration" || kind == "class")
-                && let Some(class_name) = field_text(node, "name", src)
-            {
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32)
-                        && child.kind() == "class_heritage"
-                    {
-                        // In JS, class_heritage children: extends keyword, then identifier.
-                        for j in 0..child.child_count() {
-                            if let Some(gchild) = child.child(j as u32)
-                                && gchild.kind() == "identifier"
-                            {
-                                let parent = node_text(gchild, src);
-                                if !parent.is_empty() {
-                                    edges.push(RawTypeEdge {
-                                        child_name: class_name.to_string(),
-                                        parent_name: parent.to_string(),
-                                        relationship: "extends".to_string(),
-                                    });
+            Lang::JavaScript => {
+                if (kind == "class_declaration" || kind == "class")
+                    && let Some(class_name) = field_text(node, "name", src)
+                {
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i as u32)
+                            && child.kind() == "class_heritage"
+                        {
+                            // In JS, class_heritage children: extends keyword, then identifier.
+                            for j in 0..child.child_count() {
+                                if let Some(gchild) = child.child(j as u32)
+                                    && gchild.kind() == "identifier"
+                                {
+                                    let parent = node_text(gchild, src);
+                                    if !parent.is_empty() {
+                                        edges.push(RawTypeEdge {
+                                            child_name: class_name.to_string(),
+                                            parent_name: parent.to_string(),
+                                            relationship: "extends".to_string(),
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-        Lang::Python => {
-            if kind == "class_definition"
-                && let Some(class_name) = field_text(node, "name", src)
-                && let Some(superclasses) = node.child_by_field_name("superclasses")
-            {
-                for i in 0..superclasses.named_child_count() {
-                    if let Some(arg) = superclasses.named_child(i as u32) {
-                        // Skip keyword_argument (e.g., metaclass=ABCMeta).
-                        if arg.kind() == "keyword_argument" {
-                            continue;
-                        }
-                        let parent = node_text(arg, src);
-                        if !parent.is_empty() {
-                            edges.push(RawTypeEdge {
-                                child_name: class_name.to_string(),
-                                parent_name: parent.to_string(),
-                                relationship: "extends".to_string(),
-                            });
+            Lang::Python => {
+                if kind == "class_definition"
+                    && let Some(class_name) = field_text(node, "name", src)
+                    && let Some(superclasses) = node.child_by_field_name("superclasses")
+                {
+                    for i in 0..superclasses.named_child_count() {
+                        if let Some(arg) = superclasses.named_child(i as u32) {
+                            // Skip keyword_argument (e.g., metaclass=ABCMeta).
+                            if arg.kind() == "keyword_argument" {
+                                continue;
+                            }
+                            let parent = node_text(arg, src);
+                            if !parent.is_empty() {
+                                edges.push(RawTypeEdge {
+                                    child_name: class_name.to_string(),
+                                    parent_name: parent.to_string(),
+                                    relationship: "extends".to_string(),
+                                });
+                            }
                         }
                     }
                 }
             }
-        }
-        Lang::Java => {
-            if (kind == "class_declaration" || kind == "interface_declaration")
-                && let Some(class_name) = field_text(node, "name", src)
-            {
-                let is_interface = kind == "interface_declaration";
+            Lang::Java => {
+                if (kind == "class_declaration" || kind == "interface_declaration")
+                    && let Some(class_name) = field_text(node, "name", src)
+                {
+                    let is_interface = kind == "interface_declaration";
 
-                // extends: superclass field for classes.
-                if !is_interface && let Some(superclass) = node.child_by_field_name("superclass") {
-                    extract_java_type_list(superclass, src, class_name, "extends", edges);
-                }
+                    // extends: superclass field for classes.
+                    if !is_interface
+                        && let Some(superclass) = node.child_by_field_name("superclass")
+                    {
+                        extract_java_type_list(superclass, src, class_name, "extends", edges);
+                    }
 
-                // implements for classes, extends for interfaces.
-                if let Some(interfaces) = node.child_by_field_name("interfaces") {
-                    let rel = if is_interface {
-                        "extends"
-                    } else {
-                        "implements"
-                    };
-                    extract_java_type_list(interfaces, src, class_name, rel, edges);
-                }
-            }
-        }
-        Lang::CSharp => {
-            if matches!(
-                kind,
-                "class_declaration" | "struct_declaration" | "interface_declaration"
-            ) && let Some(class_name) = field_text(node, "name", src)
-            {
-                let is_interface = kind == "interface_declaration";
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32)
-                        && child.kind() == "base_list"
-                    {
-                        extract_csharp_base_list(child, src, class_name, is_interface, edges);
+                    // implements for classes, extends for interfaces.
+                    if let Some(interfaces) = node.child_by_field_name("interfaces") {
+                        let rel = if is_interface {
+                            "extends"
+                        } else {
+                            "implements"
+                        };
+                        extract_java_type_list(interfaces, src, class_name, rel, edges);
                     }
                 }
             }
-        }
-        Lang::Cpp => {
-            if (kind == "class_specifier" || kind == "struct_specifier")
-                && let Some(class_name) = field_text(node, "name", src)
-            {
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32)
-                        && child.kind() == "base_class_clause"
-                    {
-                        extract_cpp_bases(child, src, class_name, edges);
-                    }
-                }
-            }
-        }
-        Lang::Ruby => {
-            if kind == "class"
-                && let Some(class_name) = field_text(node, "name", src)
-                && let Some(superclass) = node.child_by_field_name("superclass")
-            {
-                for i in 0..superclass.child_count() {
-                    if let Some(child) = superclass.child(i as u32)
-                        && (child.kind() == "constant" || child.kind() == "scope_resolution")
-                    {
-                        let parent = node_text(child, src);
-                        if !parent.is_empty() {
-                            edges.push(RawTypeEdge {
-                                child_name: class_name.to_string(),
-                                parent_name: parent.to_string(),
-                                relationship: "extends".to_string(),
-                            });
+            Lang::CSharp => {
+                if matches!(
+                    kind,
+                    "class_declaration" | "struct_declaration" | "interface_declaration"
+                ) && let Some(class_name) = field_text(node, "name", src)
+                {
+                    let is_interface = kind == "interface_declaration";
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i as u32)
+                            && child.kind() == "base_list"
+                        {
+                            extract_csharp_base_list(child, src, class_name, is_interface, edges);
                         }
                     }
                 }
             }
-        }
-        Lang::Rust => {
-            if kind == "impl_item"
-                && let Some(trait_node) = node.child_by_field_name("trait")
-                && let Some(type_node) = node.child_by_field_name("type")
-            {
-                let trait_name = extract_type_name(trait_node, src);
-                let type_name = extract_type_name(type_node, src);
-                if !trait_name.is_empty() && !type_name.is_empty() {
-                    edges.push(RawTypeEdge {
-                        child_name: type_name,
-                        parent_name: trait_name,
-                        relationship: "implements".to_string(),
-                    });
-                }
-            }
-        }
-        Lang::Php => {
-            if kind == "class_declaration"
-                && let Some(class_name) = field_text(node, "name", src)
-            {
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        if child.kind() == "base_clause" {
-                            extract_php_clause(child, src, class_name, "extends", edges);
-                        } else if child.kind() == "class_interface_clause" {
-                            extract_php_clause(child, src, class_name, "implements", edges);
+            Lang::Cpp => {
+                if (kind == "class_specifier" || kind == "struct_specifier")
+                    && let Some(class_name) = field_text(node, "name", src)
+                {
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i as u32)
+                            && child.kind() == "base_class_clause"
+                        {
+                            extract_cpp_bases(child, src, class_name, edges);
                         }
                     }
                 }
             }
+            Lang::Ruby => {
+                if kind == "class"
+                    && let Some(class_name) = field_text(node, "name", src)
+                    && let Some(superclass) = node.child_by_field_name("superclass")
+                {
+                    for i in 0..superclass.child_count() {
+                        if let Some(child) = superclass.child(i as u32)
+                            && (child.kind() == "constant" || child.kind() == "scope_resolution")
+                        {
+                            let parent = node_text(child, src);
+                            if !parent.is_empty() {
+                                edges.push(RawTypeEdge {
+                                    child_name: class_name.to_string(),
+                                    parent_name: parent.to_string(),
+                                    relationship: "extends".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Lang::Rust => {
+                if kind == "impl_item"
+                    && let Some(trait_node) = node.child_by_field_name("trait")
+                    && let Some(type_node) = node.child_by_field_name("type")
+                {
+                    let trait_name = extract_type_name(trait_node, src);
+                    let type_name = extract_type_name(type_node, src);
+                    if !trait_name.is_empty() && !type_name.is_empty() {
+                        edges.push(RawTypeEdge {
+                            child_name: type_name,
+                            parent_name: trait_name,
+                            relationship: "implements".to_string(),
+                        });
+                    }
+                }
+            }
+            Lang::Php => {
+                if kind == "class_declaration"
+                    && let Some(class_name) = field_text(node, "name", src)
+                {
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i as u32) {
+                            if child.kind() == "base_clause" {
+                                extract_php_clause(child, src, class_name, "extends", edges);
+                            } else if child.kind() == "class_interface_clause" {
+                                extract_php_clause(child, src, class_name, "implements", edges);
+                            }
+                        }
+                    }
+                }
+            }
+            Lang::C | Lang::Go => {} // handled by early return above
         }
-        Lang::C | Lang::Go => {} // handled by early return above
-    }
 
-    // Recurse into children.
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            walk_type_edges(child, src, lang, edges);
+        // Recurse into children.
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push(child);
+            }
         }
     }
 }
@@ -3474,6 +3492,50 @@ mod tests {
     #[test]
     fn detect_no_extension_returns_none() {
         assert_eq!(detect_language(Path::new("Dockerfile")), None);
+    }
+
+    // ---------- truncate_doc (UTF-8 / char limit) ----------
+
+    #[test]
+    fn truncate_doc_short_unchanged() {
+        assert_eq!(truncate_doc("hello"), "hello");
+    }
+
+    #[test]
+    fn truncate_doc_exactly_max_chars_unchanged() {
+        let s = "x".repeat(MAX_DOC_COMMENT_LEN);
+        assert_eq!(truncate_doc(&s), s);
+    }
+
+    #[test]
+    fn truncate_doc_long_no_space_takes_first_max_chars() {
+        let s = "x".repeat(MAX_DOC_COMMENT_LEN + 50);
+        assert_eq!(
+            truncate_doc(&s),
+            format!("{}...", "x".repeat(MAX_DOC_COMMENT_LEN))
+        );
+    }
+
+    #[test]
+    fn truncate_doc_long_truncates_at_last_space() {
+        let prefix = "word ".repeat(50);
+        let s = format!("{prefix}{}", "y".repeat(MAX_DOC_COMMENT_LEN));
+        let out = truncate_doc(&s);
+        assert!(out.ends_with("..."));
+        assert!(out.len() < s.len());
+        assert!(out.contains("word"));
+    }
+
+    /// Regression: byte index 200 is not always a UTF-8 boundary (e.g. U+00A0 after ASCII).
+    #[test]
+    fn truncate_doc_nbsp_after_ascii_does_not_panic() {
+        let head = "a".repeat(199);
+        let tail = " tail ".repeat(40);
+        let s = format!("{head}\u{00a0}{tail}");
+        assert!(s.len() > MAX_DOC_COMMENT_LEN);
+        let out = truncate_doc(&s);
+        assert!(out.ends_with("..."));
+        assert!(out.chars().count() <= MAX_DOC_COMMENT_LEN + 4);
     }
 
     // ---------- get_parser / grammar loading tests ----------
