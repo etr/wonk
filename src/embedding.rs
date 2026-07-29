@@ -29,6 +29,9 @@ pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 /// Default embedding model.
 pub const DEFAULT_MODEL: &str = "nomic-embed-text";
 
+/// Dimension produced by the legacy `nomic-embed-text` Ollama provider.
+pub const OLLAMA_DIM: usize = 768;
+
 /// User-facing error message when Ollama is required but unreachable.
 pub const OLLAMA_REQUIRED_MSG: &str = "Ollama is required for semantic search. \
     Start Ollama with 'ollama serve' and ensure nomic-embed-text is available.";
@@ -54,20 +57,72 @@ pub(crate) struct EmbedResponse {
 // Client
 // ---------------------------------------------------------------------------
 
+/// Embedding implementation selected for an invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingProviderKind {
+    #[default]
+    Bundled,
+    Ollama,
+}
+
+/// Provider-neutral embedding generation contract.
+pub trait EmbeddingProvider: Send + Sync {
+    fn name(&self) -> &str;
+    fn dim(&self) -> usize;
+    fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
+
+    fn embed_single(&self, chunk: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let mut results = self.embed_batch(&[chunk.to_string()])?;
+        results.pop().ok_or(EmbeddingError::InvalidResponse)
+    }
+
+    /// Whether the provider is currently available.
+    ///
+    /// In-process providers use the default. Network providers override this
+    /// so background and index-building workflows can retain graceful skips.
+    fn is_healthy(&self) -> bool {
+        true
+    }
+}
+
+/// Resolve invocation precedence: explicit override, then configured value.
+pub fn resolve_provider_kind(
+    invocation: Option<EmbeddingProviderKind>,
+    configured: EmbeddingProviderKind,
+) -> EmbeddingProviderKind {
+    invocation.unwrap_or(configured)
+}
+
+/// Construct the selected provider.
+///
+/// The bundled implementation is supplied by TASK-076. Keeping the error
+/// explicit here prevents silently falling back into Ollama's vector space.
+pub fn create_provider(
+    kind: EmbeddingProviderKind,
+) -> Result<Box<dyn EmbeddingProvider>, EmbeddingError> {
+    match kind {
+        EmbeddingProviderKind::Ollama => Ok(Box::new(OllamaProvider::new())),
+        EmbeddingProviderKind::Bundled => Err(EmbeddingError::ProviderUnavailable(
+            "bundled provider is not available in this build".to_string(),
+        )),
+    }
+}
+
 /// Synchronous HTTP client for Ollama's embedding API.
-pub struct OllamaClient {
+pub struct OllamaProvider {
     agent: Agent,
     pub(crate) base_url: String,
     pub(crate) model: String,
 }
 
-impl Default for OllamaClient {
+impl Default for OllamaProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl OllamaClient {
+impl OllamaProvider {
     /// Create a client pointing at the default Ollama URL (`localhost:11434`).
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL)
@@ -120,11 +175,7 @@ impl OllamaClient {
         }
     }
 
-    /// Generate embeddings for a batch of texts.
-    ///
-    /// Returns one `Vec<f32>` per input string.  An empty input slice
-    /// short-circuits to an empty result without contacting the server.
-    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    fn embed_batch_impl(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -176,12 +227,32 @@ impl OllamaClient {
         Ok(embed_resp.embeddings)
     }
 
-    /// Generate an embedding for a single text.
-    ///
-    /// Convenience wrapper around [`embed_batch`](Self::embed_batch).
+    /// Generate embeddings for a batch of texts.
+    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.embed_batch_impl(texts)
+    }
+
+    /// Generate an embedding for one text.
     pub fn embed_single(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        let mut results = self.embed_batch(&[text.to_string()])?;
-        results.pop().ok_or(EmbeddingError::InvalidResponse)
+        EmbeddingProvider::embed_single(self, text)
+    }
+}
+
+impl EmbeddingProvider for OllamaProvider {
+    fn name(&self) -> &str {
+        "ollama"
+    }
+
+    fn dim(&self) -> usize {
+        OLLAMA_DIM
+    }
+
+    fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.embed_batch_impl(chunks)
+    }
+
+    fn is_healthy(&self) -> bool {
+        OllamaProvider::is_healthy(self)
     }
 }
 
@@ -202,7 +273,9 @@ fn classify_error(err: ureq::Error) -> EmbeddingError {
         ureq::Error::Io(ref io_err)
             if matches!(
                 io_err.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::PermissionDenied
             ) =>
         {
             EmbeddingError::OllamaUnreachable
@@ -435,14 +508,31 @@ fn query_symbol_rows(conn: &Connection, sql: &str) -> Result<Vec<SymbolRow>, Emb
 ///
 /// Returns symbols whose `id` is not in the `embeddings` table with `stale = 0`.
 /// This includes symbols with no embedding and symbols whose embedding is stale.
-fn query_unembedded_symbols(conn: &Connection) -> Result<Vec<SymbolRow>, EmbeddingError> {
-    query_symbol_rows(
-        conn,
-        "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
-         FROM symbols
-         WHERE id NOT IN (SELECT symbol_id FROM embeddings WHERE NOT stale)
-         ORDER BY file, line",
-    )
+fn query_unembedded_symbols(
+    conn: &Connection,
+    provider: &dyn EmbeddingProvider,
+) -> Result<Vec<SymbolRow>, EmbeddingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, kind, file, line, col, end_line, scope, signature, language
+             FROM symbols
+             WHERE id NOT IN (
+                 SELECT symbol_id FROM embeddings
+                 WHERE NOT stale AND provider = ?1 AND dim = ?2
+             )
+             ORDER BY file, line",
+        )
+        .map_err(|_| EmbeddingError::ChunkingFailed)?;
+
+    let rows = stmt
+        .query_map(
+            rusqlite::params![provider.name(), provider.dim() as i64],
+            map_symbol_row,
+        )
+        .map_err(|_| EmbeddingError::ChunkingFailed)?
+        .filter_map(|row| row.ok())
+        .collect();
+    Ok(rows)
 }
 
 /// Query symbols for specific files, returning (id, Symbol) pairs.
@@ -590,11 +680,13 @@ pub fn normalize(vec: &mut [f32]) {
 /// so re-embedding the same symbol overwrites the previous vector.
 pub fn store_embedding(
     conn: &Connection,
+    provider: &dyn EmbeddingProvider,
     symbol_id: i64,
     file: &str,
     chunk_text: &str,
     vector: &[f32],
 ) -> Result<(), EmbeddingError> {
+    validate_vector_dimension(provider, vector)?;
     let mut normalized = vector.to_vec();
     normalize(&mut normalized);
 
@@ -605,9 +697,18 @@ pub fn store_embedding(
         .as_secs() as i64;
 
     conn.execute(
-        "INSERT OR REPLACE INTO embeddings (symbol_id, file, chunk_text, vector, stale, created_at)
-         VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-        rusqlite::params![symbol_id, file, chunk_text, bytes, now],
+        "INSERT OR REPLACE INTO embeddings
+            (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+        rusqlite::params![
+            symbol_id,
+            file,
+            chunk_text,
+            bytes,
+            now,
+            provider.name(),
+            provider.dim() as i64
+        ],
     )
     .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
@@ -621,8 +722,13 @@ pub fn store_embedding(
 /// insert fails, all are rolled back.
 pub fn store_embeddings_batch(
     conn: &Connection,
+    provider: &dyn EmbeddingProvider,
     embeddings: &[(i64, &str, &str, &[f32])],
 ) -> Result<(), EmbeddingError> {
+    for &(_, _, _, vector) in embeddings {
+        validate_vector_dimension(provider, vector)?;
+    }
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -635,8 +741,9 @@ pub fn store_embeddings_batch(
     {
         let mut stmt = tx
             .prepare(
-                "INSERT OR REPLACE INTO embeddings (symbol_id, file, chunk_text, vector, stale, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                "INSERT OR REPLACE INTO embeddings
+                    (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
             )
             .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
@@ -646,8 +753,16 @@ pub fn store_embeddings_batch(
             scratch.extend_from_slice(vector);
             normalize(&mut scratch);
             let bytes: &[u8] = bytemuck::cast_slice(&scratch);
-            stmt.execute(rusqlite::params![symbol_id, file, chunk_text, bytes, now])
-                .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+            stmt.execute(rusqlite::params![
+                symbol_id,
+                file,
+                chunk_text,
+                bytes,
+                now,
+                provider.name(),
+                provider.dim() as i64
+            ])
+            .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
         }
     }
 
@@ -656,36 +771,107 @@ pub fn store_embeddings_batch(
     Ok(())
 }
 
+fn validate_vector_dimension(
+    provider: &dyn EmbeddingProvider,
+    vector: &[f32],
+) -> Result<(), EmbeddingError> {
+    if vector.len() != provider.dim() {
+        return Err(EmbeddingError::VectorDimension {
+            provider: provider.name().to_string(),
+            expected: provider.dim(),
+            actual: vector.len(),
+        });
+    }
+    Ok(())
+}
+
+fn decode_vector(
+    blob: &[u8],
+    provider: &dyn EmbeddingProvider,
+) -> Result<Vec<f32>, EmbeddingError> {
+    let floats: &[f32] = bytemuck::try_cast_slice(blob)
+        .map_err(|e| EmbeddingError::StorageFailed(format!("BLOB cast failed: {e}")))?;
+    if floats.len() != provider.dim() {
+        return Err(vector_space_mismatch(
+            provider,
+            provider.name().to_string(),
+            floats.len() as i64,
+        ));
+    }
+    Ok(floats.to_vec())
+}
+
+fn vector_space_mismatch(
+    provider: &dyn EmbeddingProvider,
+    stored_provider: String,
+    stored_dim: i64,
+) -> EmbeddingError {
+    EmbeddingError::VectorSpaceMismatch {
+        active_provider: provider.name().to_string(),
+        active_dim: provider.dim(),
+        stored_provider,
+        stored_dim: stored_dim.max(0) as usize,
+    }
+}
+
 /// Load all embedding vectors from the database.
 ///
 /// Returns `(symbol_id, vector)` pairs.  Uses `bytemuck::try_cast_slice`
 /// to validate BLOB alignment, then copies the floats into an owned `Vec<f32>`.
 /// (The intermediate `Vec<u8>` is a rusqlite API constraint — SQLite BLOBs
 /// must be copied out of the page cache regardless.)
-pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
+pub fn load_all_embeddings(
+    conn: &Connection,
+    provider: &dyn EmbeddingProvider,
+) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
     let mut stmt = conn
-        .prepare("SELECT symbol_id, vector FROM embeddings")
+        .prepare(
+            "SELECT symbol_id, vector FROM embeddings
+             WHERE provider = ?1 AND dim = ?2",
+        )
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM embeddings WHERE provider = ?1 AND dim = ?2",
+            rusqlite::params![provider.name(), provider.dim() as i64],
+            |r| r.get(0),
+        )
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
     let count = count as usize;
 
     let rows = stmt
-        .query_map([], |row| {
-            let symbol_id: i64 = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            Ok((symbol_id, blob))
-        })
+        .query_map(
+            rusqlite::params![provider.name(), provider.dim() as i64],
+            |row| {
+                let symbol_id: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((symbol_id, blob))
+            },
+        )
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let mut results = Vec::with_capacity(count);
     for r in rows {
         let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-        let floats: &[f32] = bytemuck::try_cast_slice(&blob)
-            .map_err(|e| EmbeddingError::StorageFailed(format!("BLOB cast failed: {e}")))?;
-        results.push((symbol_id, floats.to_vec()));
+        results.push((symbol_id, decode_vector(&blob, provider)?));
+    }
+
+    if results.is_empty() {
+        let incompatible = conn.query_row(
+            "SELECT provider, dim FROM embeddings
+             WHERE provider != ?1 OR dim != ?2
+             LIMIT 1",
+            rusqlite::params![provider.name(), provider.dim() as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        );
+        match incompatible {
+            Ok((stored_provider, stored_dim)) => {
+                return Err(vector_space_mismatch(provider, stored_provider, stored_dim));
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(EmbeddingError::StorageFailed(error.to_string())),
+        }
     }
 
     Ok(results)
@@ -704,6 +890,7 @@ pub fn load_all_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>, Em
 pub fn load_embeddings_for_path_prefix(
     conn: &Connection,
     prefix: &str,
+    provider: &dyn EmbeddingProvider,
 ) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
     // Escape GLOB metacharacters (*, ?, [) in user-supplied prefix so only the
     // trailing `*` acts as a wildcard.
@@ -713,32 +900,54 @@ pub fn load_embeddings_for_path_prefix(
         .replace('?', "[?]");
     let pattern = format!("{escaped}*");
     let mut stmt = conn
-        .prepare("SELECT symbol_id, vector FROM embeddings WHERE file GLOB ?1 AND NOT stale")
+        .prepare(
+            "SELECT symbol_id, vector FROM embeddings
+             WHERE file GLOB ?1 AND NOT stale AND provider = ?2 AND dim = ?3",
+        )
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM embeddings WHERE file GLOB ?1 AND NOT stale",
-            [&pattern],
+            "SELECT COUNT(*) FROM embeddings
+             WHERE file GLOB ?1 AND NOT stale AND provider = ?2 AND dim = ?3",
+            rusqlite::params![pattern, provider.name(), provider.dim() as i64],
             |r| r.get(0),
         )
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
     let count = count as usize;
 
     let rows = stmt
-        .query_map([&pattern], |row| {
-            let symbol_id: i64 = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            Ok((symbol_id, blob))
-        })
+        .query_map(
+            rusqlite::params![pattern, provider.name(), provider.dim() as i64],
+            |row| {
+                let symbol_id: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((symbol_id, blob))
+            },
+        )
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let mut results = Vec::with_capacity(count);
     for r in rows {
         let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-        let floats: &[f32] = bytemuck::try_cast_slice(&blob)
-            .map_err(|e| EmbeddingError::StorageFailed(format!("BLOB cast failed: {e}")))?;
-        results.push((symbol_id, floats.to_vec()));
+        results.push((symbol_id, decode_vector(&blob, provider)?));
+    }
+
+    if results.is_empty() {
+        let incompatible = conn.query_row(
+            "SELECT provider, dim FROM embeddings
+             WHERE file GLOB ?1 AND NOT stale AND (provider != ?2 OR dim != ?3)
+             LIMIT 1",
+            rusqlite::params![pattern, provider.name(), provider.dim() as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        );
+        match incompatible {
+            Ok((stored_provider, stored_dim)) => {
+                return Err(vector_space_mismatch(provider, stored_provider, stored_dim));
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(EmbeddingError::StorageFailed(error.to_string())),
+        }
     }
 
     Ok(results)
@@ -751,6 +960,7 @@ pub fn load_embeddings_for_path_prefix(
 pub fn load_embeddings_for_files(
     conn: &Connection,
     files: &HashSet<String>,
+    provider: &dyn EmbeddingProvider,
 ) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
     if files.is_empty() {
         return Ok(Vec::new());
@@ -758,9 +968,14 @@ pub fn load_embeddings_for_files(
 
     // Build a parameterized IN clause: (?1, ?2, ..., ?N)
     let placeholders: Vec<String> = (1..=files.len()).map(|i| format!("?{i}")).collect();
+    let provider_param = files.len() + 1;
+    let dim_param = files.len() + 2;
     let sql = format!(
-        "SELECT symbol_id, vector FROM embeddings WHERE file IN ({})",
-        placeholders.join(", ")
+        "SELECT symbol_id, vector FROM embeddings
+         WHERE file IN ({}) AND provider = ?{} AND dim = ?{}",
+        placeholders.join(", "),
+        provider_param,
+        dim_param,
     );
 
     let mut stmt = conn
@@ -768,14 +983,21 @@ pub fn load_embeddings_for_files(
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let file_params: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-    let params: Vec<&dyn rusqlite::types::ToSql> = file_params
+    let mut params: Vec<&dyn rusqlite::types::ToSql> = file_params
         .iter()
         .map(|s| s as &dyn rusqlite::types::ToSql)
         .collect();
+    let provider_name = provider.name();
+    let provider_dim = provider.dim() as i64;
+    params.push(&provider_name);
+    params.push(&provider_dim);
 
     let count_sql = format!(
-        "SELECT COUNT(*) FROM embeddings WHERE file IN ({})",
-        placeholders.join(", ")
+        "SELECT COUNT(*) FROM embeddings
+         WHERE file IN ({}) AND provider = ?{} AND dim = ?{}",
+        placeholders.join(", "),
+        provider_param,
+        dim_param,
     );
     let count: i64 = conn
         .query_row(&count_sql, params.as_slice(), |r| r.get(0))
@@ -793,9 +1015,28 @@ pub fn load_embeddings_for_files(
     let mut results = Vec::with_capacity(count);
     for r in rows {
         let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-        let floats: &[f32] = bytemuck::try_cast_slice(&blob)
-            .map_err(|e| EmbeddingError::StorageFailed(format!("BLOB cast failed: {e}")))?;
-        results.push((symbol_id, floats.to_vec()));
+        results.push((symbol_id, decode_vector(&blob, provider)?));
+    }
+
+    if results.is_empty() {
+        let mismatch_sql = format!(
+            "SELECT provider, dim FROM embeddings
+             WHERE file IN ({}) AND (provider != ?{} OR dim != ?{})
+             LIMIT 1",
+            placeholders.join(", "),
+            provider_param,
+            dim_param,
+        );
+        let incompatible = conn.query_row(&mismatch_sql, params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        });
+        match incompatible {
+            Ok((stored_provider, stored_dim)) => {
+                return Err(vector_space_mismatch(provider, stored_provider, stored_dim));
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => return Err(EmbeddingError::StorageFailed(error.to_string())),
+        }
     }
 
     Ok(results)
@@ -826,15 +1067,19 @@ pub fn mark_embeddings_stale(conn: &Connection, file: &str) -> Result<(), Embedd
 /// `total_symbols` is the count of rows in the `symbols` table.
 /// `fresh_embedding_count` is the count of non-stale embeddings.
 /// When `total_symbols == fresh_embedding_count`, all symbols are embedded.
-pub fn embedding_completeness(conn: &Connection) -> Result<(usize, usize), EmbeddingError> {
+pub fn embedding_completeness(
+    conn: &Connection,
+    provider: &dyn EmbeddingProvider,
+) -> Result<(usize, usize), EmbeddingError> {
     let total_symbols: i64 = conn
         .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
 
     let fresh_embeddings: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM embeddings WHERE NOT stale",
-            [],
+            "SELECT COUNT(*) FROM embeddings
+             WHERE NOT stale AND provider = ?1 AND dim = ?2",
+            rusqlite::params![provider.name(), provider.dim() as i64],
             |row| row.get(0),
         )
         .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
@@ -996,8 +1241,9 @@ pub fn chunk_all_symbols(
 pub fn chunk_missing_symbols(
     conn: &Connection,
     repo_root: &Path,
+    provider: &dyn EmbeddingProvider,
 ) -> Result<Vec<(i64, String, String)>, EmbeddingError> {
-    let rows = query_unembedded_symbols(conn)?;
+    let rows = query_unembedded_symbols(conn, provider)?;
     let all_imports = query_all_file_imports(conn)?;
     Ok(chunk_symbol_rows(&rows, &all_imports, repo_root))
 }
@@ -1024,22 +1270,179 @@ pub fn chunk_symbols_for_files(
 mod tests {
     use super::*;
 
+    struct TinyProvider;
+    struct OneDimProvider;
+
+    impl EmbeddingProvider for TinyProvider {
+        fn name(&self) -> &str {
+            "tiny"
+        }
+
+        fn dim(&self) -> usize {
+            2
+        }
+
+        fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(chunks.iter().map(|_| vec![3.0, 4.0]).collect())
+        }
+    }
+
+    impl EmbeddingProvider for OneDimProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn dim(&self) -> usize {
+            1
+        }
+
+        fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(chunks.iter().map(|_| vec![1.0]).collect())
+        }
+    }
+
+    fn insert_test_symbol(conn: &Connection, name: &str, file: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language)
+             VALUES (?1, 'function', ?2, 1, 0, 'rust')",
+            rusqlite::params![name, file],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn provider_trait_dispatches_and_supplies_single_helper() {
+        let provider: &dyn EmbeddingProvider = &TinyProvider;
+        assert_eq!(provider.name(), "tiny");
+        assert_eq!(provider.dim(), 2);
+        assert_eq!(provider.embed_single("query").unwrap(), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn ollama_provider_declares_legacy_vector_space() {
+        let provider = OllamaProvider::new();
+        assert_eq!(provider.name(), "ollama");
+        assert_eq!(provider.dim(), OLLAMA_DIM);
+        assert_eq!(provider.dim(), 768);
+    }
+
+    #[test]
+    fn invocation_provider_override_wins_over_configuration() {
+        assert_eq!(
+            resolve_provider_kind(
+                Some(EmbeddingProviderKind::Ollama),
+                EmbeddingProviderKind::Bundled,
+            ),
+            EmbeddingProviderKind::Ollama
+        );
+        assert_eq!(
+            resolve_provider_kind(None, EmbeddingProviderKind::Ollama),
+            EmbeddingProviderKind::Ollama
+        );
+    }
+
+    #[test]
+    fn provider_metadata_round_trips_and_wrong_dimension_is_rejected() {
+        let conn = setup_test_db_with_embeddings();
+        let symbol_id = insert_test_symbol(&conn, "tiny", "tiny.rs");
+
+        let mismatch = store_embedding(&conn, &TinyProvider, symbol_id, "tiny.rs", "chunk", &[1.0])
+            .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            EmbeddingError::VectorDimension {
+                expected: 2,
+                actual: 1,
+                ..
+            }
+        ));
+
+        store_embedding(
+            &conn,
+            &TinyProvider,
+            symbol_id,
+            "tiny.rs",
+            "chunk",
+            &[3.0, 4.0],
+        )
+        .unwrap();
+
+        let metadata: (String, i64) = conn
+            .query_row(
+                "SELECT provider, dim FROM embeddings WHERE symbol_id = ?1",
+                [symbol_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata, ("tiny".to_string(), 2));
+        assert_eq!(
+            load_all_embeddings(&conn, &TinyProvider).unwrap(),
+            vec![(symbol_id, vec![0.6, 0.8])]
+        );
+    }
+
+    #[test]
+    fn incompatible_space_fails_with_reembed_instruction() {
+        let conn = setup_test_db_with_embeddings();
+        let symbol_id = insert_test_symbol(&conn, "legacy", "legacy.rs");
+        conn.execute(
+            "INSERT INTO embeddings
+                (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+             VALUES (?1, 'legacy.rs', 'chunk', ?2, 0, 0, 'ollama', 768)",
+            rusqlite::params![symbol_id, bytemuck::cast_slice(&[1.0_f32, 0.0])],
+        )
+        .unwrap();
+
+        let error = load_all_embeddings(&conn, &TinyProvider).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("active tiny/2"));
+        assert!(message.contains("stored ollama/768"));
+        assert!(message.contains("wonk update --force --provider tiny"));
+    }
+
+    #[test]
+    fn compatible_partition_is_loaded_without_mixing_other_spaces() {
+        let conn = setup_test_db_with_embeddings();
+        let tiny_id = insert_test_symbol(&conn, "tiny", "tiny.rs");
+        let ollama_id = insert_test_symbol(&conn, "legacy", "legacy.rs");
+        store_embedding(
+            &conn,
+            &TinyProvider,
+            tiny_id,
+            "tiny.rs",
+            "chunk",
+            &[1.0, 0.0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings
+                (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+             VALUES (?1, 'legacy.rs', 'chunk', ?2, 0, 0, 'ollama', 768)",
+            rusqlite::params![ollama_id, bytemuck::cast_slice(&[0.0_f32, 1.0])],
+        )
+        .unwrap();
+
+        let loaded = load_all_embeddings(&conn, &TinyProvider).unwrap();
+        assert_eq!(loaded, vec![(tiny_id, vec![1.0, 0.0])]);
+    }
+
     #[test]
     fn default_client_uses_localhost() {
-        let client = OllamaClient::new();
+        let client = OllamaProvider::new();
         assert_eq!(client.base_url, DEFAULT_BASE_URL);
         assert_eq!(client.model, DEFAULT_MODEL);
     }
 
     #[test]
     fn with_base_url_trims_trailing_slash() {
-        let client = OllamaClient::with_base_url("http://example.com:11434/");
+        let client = OllamaProvider::with_base_url("http://example.com:11434/");
         assert_eq!(client.base_url, "http://example.com:11434");
     }
 
     #[test]
     fn with_base_url_preserves_clean_url() {
-        let client = OllamaClient::with_base_url("http://example.com:11434");
+        let client = OllamaProvider::with_base_url("http://example.com:11434");
         assert_eq!(client.base_url, "http://example.com:11434");
     }
 
@@ -1048,7 +1451,7 @@ mod tests {
     #[test]
     fn health_check_returns_false_when_unreachable() {
         // Port 19999 should have nothing listening.
-        let client = OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = OllamaProvider::with_base_url("http://127.0.0.1:19999");
         assert!(!client.is_healthy());
     }
 
@@ -1113,7 +1516,7 @@ mod tests {
 
     #[test]
     fn embed_batch_empty_returns_empty_vec() {
-        let client = OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let result = client.embed_batch(&[]);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
@@ -1121,7 +1524,7 @@ mod tests {
 
     #[test]
     fn embed_batch_rejects_oversized_input() {
-        let client = OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let oversized = "x".repeat(32_769);
         let texts = vec![oversized];
         let result = client.embed_batch(&texts);
@@ -1138,14 +1541,15 @@ mod tests {
 
     #[test]
     fn embed_batch_unreachable_returns_error() {
-        let client = OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let texts = vec!["hello".to_string()];
         let result = client.embed_batch(&texts);
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            EmbeddingError::OllamaUnreachable
-        ));
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, EmbeddingError::OllamaUnreachable),
+            "unexpected error: {error:?}"
+        );
     }
 
     // -- is_context_length_error tests ----------------------------------------
@@ -1184,13 +1588,14 @@ mod tests {
 
     #[test]
     fn embed_single_unreachable_returns_error() {
-        let client = OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let result = client.embed_single("hello");
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            EmbeddingError::OllamaUnreachable
-        ));
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, EmbeddingError::OllamaUnreachable),
+            "unexpected error: {error:?}"
+        );
     }
 
     // -- Serde round-trip tests -----------------------------------------------
@@ -1706,6 +2111,8 @@ mod tests {
                 vector BLOB NOT NULL,
                 stale INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'ollama',
+                dim INTEGER NOT NULL DEFAULT 768,
                 UNIQUE(symbol_id)
             );
             CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file);",
@@ -1730,9 +2137,9 @@ mod tests {
         );
 
         let vector = vec![3.0_f32, 4.0]; // will be normalized to [0.6, 0.8]
-        store_embedding(&conn, sym_id, "a.rs", "fn foo() {}", &vector).unwrap();
+        store_embedding(&conn, &TinyProvider, sym_id, "a.rs", "fn foo() {}", &vector).unwrap();
 
-        let loaded = load_all_embeddings(&conn).unwrap();
+        let loaded = load_all_embeddings(&conn, &TinyProvider).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, sym_id);
         // Check it was L2-normalized
@@ -1758,12 +2165,12 @@ mod tests {
         );
 
         let v1 = vec![1.0_f32, 0.0];
-        store_embedding(&conn, sym_id, "a.rs", "v1", &v1).unwrap();
+        store_embedding(&conn, &TinyProvider, sym_id, "a.rs", "v1", &v1).unwrap();
 
         let v2 = vec![0.0_f32, 1.0];
-        store_embedding(&conn, sym_id, "a.rs", "v2", &v2).unwrap();
+        store_embedding(&conn, &TinyProvider, sym_id, "a.rs", "v2", &v2).unwrap();
 
-        let loaded = load_all_embeddings(&conn).unwrap();
+        let loaded = load_all_embeddings(&conn, &TinyProvider).unwrap();
         assert_eq!(loaded.len(), 1);
         // Should have the second vector
         assert!((loaded[0].1[0] - 0.0).abs() < 1e-6);
@@ -1800,9 +2207,9 @@ mod tests {
         let v2 = vec![0.0_f32, 1.0];
         let batch: Vec<(i64, &str, &str, &[f32])> =
             vec![(id1, "a.rs", "fn a()", &v1), (id2, "b.rs", "fn b()", &v2)];
-        store_embeddings_batch(&conn, &batch).unwrap();
+        store_embeddings_batch(&conn, &TinyProvider, &batch).unwrap();
 
-        let loaded = load_all_embeddings(&conn).unwrap();
+        let loaded = load_all_embeddings(&conn, &TinyProvider).unwrap();
         assert_eq!(loaded.len(), 2);
     }
 
@@ -1826,18 +2233,18 @@ mod tests {
         let v2 = vec![0.0_f32, 1.0];
         let batch: Vec<(i64, &str, &str, &[f32])> =
             vec![(id1, "a.rs", "fn a()", &v1), (999, "z.rs", "bogus", &v2)];
-        let result = store_embeddings_batch(&conn, &batch);
+        let result = store_embeddings_batch(&conn, &TinyProvider, &batch);
         assert!(result.is_err());
 
         // Atomic: nothing should have been inserted.
-        let loaded = load_all_embeddings(&conn).unwrap();
+        let loaded = load_all_embeddings(&conn, &TinyProvider).unwrap();
         assert!(loaded.is_empty());
     }
 
     #[test]
     fn load_all_embeddings_empty_db() {
         let conn = setup_test_db_with_embeddings();
-        let loaded = load_all_embeddings(&conn).unwrap();
+        let loaded = load_all_embeddings(&conn, &TinyProvider).unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -1867,12 +2274,12 @@ mod tests {
             "Rust",
         );
 
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
 
         delete_embeddings_for_file(&conn, "a.rs").unwrap();
 
-        let loaded = load_all_embeddings(&conn).unwrap();
+        let loaded = load_all_embeddings(&conn, &TinyProvider).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, id2);
     }
@@ -1910,8 +2317,8 @@ mod tests {
             "Rust",
         );
 
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
 
         mark_embeddings_stale(&conn, "a.rs").unwrap();
 
@@ -1965,9 +2372,9 @@ mod tests {
             "Rust",
         );
 
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        store_embedding(&conn, id2, "a.rs", "fn b()", &[0.0, 1.0]).unwrap();
-        store_embedding(&conn, id3, "b.rs", "fn c()", &[0.7, 0.7]).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id2, "a.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id3, "b.rs", "fn c()", &[0.7, 0.7]).unwrap();
 
         mark_embeddings_stale(&conn, "a.rs").unwrap();
 
@@ -1990,7 +2397,7 @@ mod tests {
     #[test]
     fn embedding_completeness_no_symbols_no_embeddings() {
         let conn = setup_test_db_with_embeddings();
-        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        let (sym_count, emb_count) = embedding_completeness(&conn, &TinyProvider).unwrap();
         assert_eq!(sym_count, 0);
         assert_eq!(emb_count, 0);
     }
@@ -2020,7 +2427,7 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        let (sym_count, emb_count) = embedding_completeness(&conn, &TinyProvider).unwrap();
         assert_eq!(sym_count, 2);
         assert_eq!(emb_count, 0);
     }
@@ -2050,8 +2457,8 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        let (sym_count, emb_count) = embedding_completeness(&conn, &TinyProvider).unwrap();
         assert_eq!(sym_count, 2);
         assert_eq!(emb_count, 1);
     }
@@ -2081,9 +2488,9 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
-        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        let (sym_count, emb_count) = embedding_completeness(&conn, &TinyProvider).unwrap();
         assert_eq!(sym_count, 2);
         assert_eq!(emb_count, 2);
     }
@@ -2113,11 +2520,11 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
         // Mark one as stale -- should not count as fresh
         mark_embeddings_stale(&conn, "a.rs").unwrap();
-        let (sym_count, emb_count) = embedding_completeness(&conn).unwrap();
+        let (sym_count, emb_count) = embedding_completeness(&conn, &TinyProvider).unwrap();
         assert_eq!(sym_count, 2);
         assert_eq!(emb_count, 1);
     }
@@ -2149,7 +2556,7 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        let rows = query_unembedded_symbols(&conn).unwrap();
+        let rows = query_unembedded_symbols(&conn, &TinyProvider).unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -2178,8 +2585,8 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        let rows = query_unembedded_symbols(&conn).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        let rows = query_unembedded_symbols(&conn, &TinyProvider).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol.name, "b");
     }
@@ -2209,9 +2616,9 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
-        let rows = query_unembedded_symbols(&conn).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        let rows = query_unembedded_symbols(&conn, &TinyProvider).unwrap();
         assert!(rows.is_empty());
     }
 
@@ -2240,11 +2647,11 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
         // Mark id1's embedding as stale -- it needs re-embedding
         mark_embeddings_stale(&conn, "a.rs").unwrap();
-        let rows = query_unembedded_symbols(&conn).unwrap();
+        let rows = query_unembedded_symbols(&conn, &TinyProvider).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol.name, "a");
     }
@@ -2282,7 +2689,7 @@ mod tests {
             "Rust",
         );
 
-        let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        let chunks = chunk_missing_symbols(&conn, root, &TinyProvider).unwrap();
         assert_eq!(chunks.len(), 2);
     }
 
@@ -2316,9 +2723,9 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
 
-        let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        let chunks = chunk_missing_symbols(&conn, root, &TinyProvider).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].1, "b.rs");
     }
@@ -2341,9 +2748,9 @@ mod tests {
             "fn a()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
 
-        let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        let chunks = chunk_missing_symbols(&conn, root, &TinyProvider).unwrap();
         assert!(chunks.is_empty());
     }
 
@@ -2377,11 +2784,11 @@ mod tests {
             "fn b()",
             "Rust",
         );
-        store_embedding(&conn, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
-        store_embedding(&conn, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id1, "a.rs", "fn a()", &[1.0, 0.0]).unwrap();
+        store_embedding(&conn, &TinyProvider, id2, "b.rs", "fn b()", &[0.0, 1.0]).unwrap();
         mark_embeddings_stale(&conn, "a.rs").unwrap();
 
-        let chunks = chunk_missing_symbols(&conn, root).unwrap();
+        let chunks = chunk_missing_symbols(&conn, root, &TinyProvider).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].1, "a.rs");
     }
@@ -2518,6 +2925,7 @@ mod tests {
                 symbol_id INTEGER NOT NULL REFERENCES symbols(id),
                 file TEXT NOT NULL, chunk_text TEXT NOT NULL, vector BLOB NOT NULL,
                 stale INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'test', dim INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(symbol_id)
             );
             CREATE INDEX idx_embeddings_file ON embeddings(file);",
@@ -2557,7 +2965,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let results = load_embeddings_for_files(&conn, &files).unwrap();
+        let results = load_embeddings_for_files(&conn, &files, &OneDimProvider).unwrap();
 
         assert_eq!(results.len(), 2);
         let ids: HashSet<i64> = results.iter().map(|(id, _)| *id).collect();
@@ -2573,7 +2981,7 @@ mod tests {
         insert_symbol_and_embedding(&conn, 1, "src/a.ts", &vec_a);
 
         let files: HashSet<String> = HashSet::new();
-        let results = load_embeddings_for_files(&conn, &files).unwrap();
+        let results = load_embeddings_for_files(&conn, &files, &OneDimProvider).unwrap();
         assert!(results.is_empty());
     }
 
@@ -2610,7 +3018,7 @@ mod tests {
         insert_symbol_and_embedding(&conn, 2, "src/auth/session.ts", &vec_b);
         insert_symbol_and_embedding(&conn, 3, "src/db/connection.ts", &vec_c);
 
-        let results = load_embeddings_for_path_prefix(&conn, "src/auth/").unwrap();
+        let results = load_embeddings_for_path_prefix(&conn, "src/auth/", &OneDimProvider).unwrap();
         assert_eq!(results.len(), 2);
         let ids: HashSet<i64> = results.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&1));
@@ -2624,7 +3032,7 @@ mod tests {
         let vec_a: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
         insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
 
-        let results = load_embeddings_for_path_prefix(&conn, "lib/").unwrap();
+        let results = load_embeddings_for_path_prefix(&conn, "lib/", &OneDimProvider).unwrap();
         assert!(results.is_empty());
     }
 
@@ -2637,7 +3045,7 @@ mod tests {
         insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
         insert_symbol_and_embedding(&conn, 2, "src/auth/session.ts", &vec_b);
 
-        let results = load_embeddings_for_path_prefix(&conn, "src/").unwrap();
+        let results = load_embeddings_for_path_prefix(&conn, "src/", &OneDimProvider).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -2650,7 +3058,7 @@ mod tests {
         insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
         insert_symbol_and_embedding_stale(&conn, 2, "src/auth/session.ts", &vec_b);
 
-        let results = load_embeddings_for_path_prefix(&conn, "src/auth/").unwrap();
+        let results = load_embeddings_for_path_prefix(&conn, "src/auth/", &OneDimProvider).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
     }
@@ -2664,7 +3072,7 @@ mod tests {
         insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vec_a);
         insert_symbol_and_embedding(&conn, 2, "lib/utils.ts", &vec_b);
 
-        let results = load_embeddings_for_path_prefix(&conn, "").unwrap();
+        let results = load_embeddings_for_path_prefix(&conn, "", &OneDimProvider).unwrap();
         assert_eq!(results.len(), 2);
     }
 }

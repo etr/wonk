@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::embedding::EmbeddingProviderKind;
+
 // ---------------------------------------------------------------------------
 // Public config types (fully resolved, no Options)
 // ---------------------------------------------------------------------------
@@ -26,6 +28,7 @@ pub struct Config {
     pub ignore: IgnoreConfig,
     pub llm: LlmConfig,
     pub search: SearchConfig,
+    pub embedding: EmbeddingConfig,
 }
 
 /// Daemon-related settings.
@@ -78,6 +81,12 @@ pub struct SearchConfig {
     /// structural and semantic result lists. Higher values produce more
     /// even blending. Default: 60.0 (standard RRF constant).
     pub rrf_k: f32,
+}
+
+/// Embedding provider selection.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EmbeddingConfig {
+    pub provider: EmbeddingProviderKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +148,7 @@ struct ConfigOverlay {
     ignore: Option<IgnoreOverlay>,
     llm: Option<LlmOverlay>,
     search: Option<SearchOverlay>,
+    embedding: Option<EmbeddingOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -178,6 +188,12 @@ struct LlmOverlay {
 #[serde(default)]
 struct SearchOverlay {
     rrf_k: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct EmbeddingOverlay {
+    provider: Option<EmbeddingProviderKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +242,11 @@ impl Config {
             && let Some(v) = s.rrf_k
         {
             self.search.rrf_k = v;
+        }
+        if let Some(embedding) = overlay.embedding
+            && let Some(provider) = embedding.provider
+        {
+            self.embedding.provider = provider;
         }
     }
 }
@@ -367,12 +388,62 @@ mod tests {
         // No config files written.
         let config = env.load().unwrap();
         assert_eq!(config, Config::default());
+        assert_eq!(
+            config.embedding.provider,
+            crate::embedding::EmbeddingProviderKind::Bundled
+        );
         assert_eq!(config.daemon.debounce_ms, 500);
         assert_eq!(config.index.max_file_size_kb, 1024);
         assert!(config.index.additional_extensions.is_empty());
         assert_eq!(config.output.default_format, "grep");
         assert_eq!(config.output.color, "auto");
         assert!(config.ignore.patterns.is_empty());
+    }
+
+    #[test]
+    fn embedding_provider_follows_global_then_repo_precedence() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[embedding]
+provider = "ollama"
+"#,
+        );
+        let repo = env.create_repo();
+        env.write_repo_config(
+            r#"
+[embedding]
+provider = "bundled"
+"#,
+        );
+
+        let global =
+            Config::load_with_global_dir(Some(&env.global_path), None).expect("global config");
+        assert_eq!(
+            global.embedding.provider,
+            crate::embedding::EmbeddingProviderKind::Ollama
+        );
+
+        let resolved =
+            Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).expect("repo config");
+        assert_eq!(
+            resolved.embedding.provider,
+            crate::embedding::EmbeddingProviderKind::Bundled
+        );
+    }
+
+    #[test]
+    fn invalid_embedding_provider_is_rejected() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[embedding]
+provider = "remote"
+"#,
+        );
+
+        let error = env.load().unwrap_err().to_string();
+        assert!(error.contains("failed to parse config file"));
     }
 
     #[test]

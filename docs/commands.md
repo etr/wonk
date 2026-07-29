@@ -38,7 +38,8 @@ wonk search "render" -- src/components/
 ### `wonk ask <query>`
 
 Semantic search: find symbols related to a natural language query.
-Requires Ollama running locally with `nomic-embed-text`.
+Uses the configured embedding provider. The bundled provider is the default;
+Ollama with `nomic-embed-text` is an opt-in quality tier.
 
 ```
 wonk ask "error handling logic"
@@ -343,11 +344,13 @@ any query command automatically builds the index on first use.
 ```
 wonk init
 wonk init --local
+wonk init --provider ollama
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--local` | Use a project-specific index instead of the shared index |
+| `--provider <bundled|ollama>` | Override the configured embedding provider for this build |
 
 ### `wonk update`
 
@@ -355,7 +358,14 @@ Re-index the current repository.
 
 ```
 wonk update
+wonk update --force --provider ollama
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--force` | Force a full structural and embedding rebuild |
+| `--skip-embed` | Update only the structural index |
+| `--provider <bundled|ollama>` | Override the configured embedding provider for this build |
 
 ### `wonk status`
 
@@ -442,13 +452,19 @@ to force smart mode even when the pattern does not match known symbols.
 
 ## Semantic search
 
-Wonk supports embedding-based semantic search via [Ollama](https://ollama.ai/)
-with the `nomic-embed-text` model. This lets you search by meaning rather than
-exact text patterns.
+Wonk supports embedding-based semantic search with a bundled in-process
+provider by default. You can opt into [Ollama](https://ollama.ai/) with the
+`nomic-embed-text` model for a higher-quality tier. Both let you search by
+meaning rather than exact text patterns.
 
-- **Setup**: Install Ollama and pull `nomic-embed-text` (`ollama pull nomic-embed-text`)
+- **Default setup**: No external embedding service is required
+- **Ollama tier**: Set `[embedding] provider = "ollama"` and pull
+  `nomic-embed-text` (`ollama pull nomic-embed-text`)
 - **Embedding build**: Embeddings are built on first semantic query or explicitly via `wonk init`
 - **Freshness**: The background daemon keeps embeddings up to date as files change
+- **Vector-space safety**: Provider and dimension are stored with every vector;
+  a mismatch stops the query and prints the exact `wonk update --force
+  --provider ...` command needed to rebuild
 - **Dependency scoping**: Use `--from <file>` and `--to <file>` to restrict
   semantic results to symbols reachable from or leading to a specific file,
   using the indexed dependency graph

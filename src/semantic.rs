@@ -924,6 +924,25 @@ mod tests {
     // Integration: compute_reachable_files + load_embeddings_for_files
     // -----------------------------------------------------------------------
 
+    struct OneDimProvider;
+
+    impl crate::embedding::EmbeddingProvider for OneDimProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn dim(&self) -> usize {
+            1
+        }
+
+        fn embed_batch(
+            &self,
+            chunks: &[String],
+        ) -> Result<Vec<Vec<f32>>, crate::errors::EmbeddingError> {
+            Ok(chunks.iter().map(|_| vec![1.0]).collect())
+        }
+    }
+
     fn setup_full_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -943,6 +962,7 @@ mod tests {
                 id INTEGER PRIMARY KEY, symbol_id INTEGER NOT NULL REFERENCES symbols(id),
                 file TEXT NOT NULL, chunk_text TEXT NOT NULL, vector BLOB NOT NULL,
                 stale INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'test', dim INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(symbol_id)
             );
             CREATE INDEX idx_embeddings_file ON embeddings(file);",
@@ -987,7 +1007,9 @@ mod tests {
         let reachable = compute_reachable_files(&conn, Some("src/a.ts"), None)
             .unwrap()
             .unwrap();
-        let embeddings = crate::embedding::load_embeddings_for_files(&conn, &reachable).unwrap();
+        let embeddings =
+            crate::embedding::load_embeddings_for_files(&conn, &reachable, &OneDimProvider)
+                .unwrap();
 
         assert_eq!(embeddings.len(), 3);
         let ids: HashSet<i64> = embeddings.iter().map(|(id, _)| *id).collect();
@@ -1017,7 +1039,9 @@ mod tests {
         let reachable = compute_reachable_files(&conn, None, Some("src/b.ts"))
             .unwrap()
             .unwrap();
-        let embeddings = crate::embedding::load_embeddings_for_files(&conn, &reachable).unwrap();
+        let embeddings =
+            crate::embedding::load_embeddings_for_files(&conn, &reachable, &OneDimProvider)
+                .unwrap();
 
         assert_eq!(embeddings.len(), 3);
         let ids: HashSet<i64> = embeddings.iter().map(|(id, _)| *id).collect();

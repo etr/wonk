@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 
 use crate::db;
-use crate::embedding::{self, OllamaClient};
+use crate::embedding::{self, EmbeddingProvider};
 use crate::errors::EmbeddingError;
 use crate::indexer;
 use crate::progress::{Progress, ProgressMode};
@@ -964,16 +964,23 @@ fn handle_embed_interruption(msg: &str, policy: EmbedErrorPolicy, silent: bool) 
 fn embed_batch_individually(
     conn: &Connection,
     batch: &[(i64, String, String)],
-    client: &OllamaClient,
+    provider: &dyn EmbeddingProvider,
     policy: EmbedErrorPolicy,
     silent: bool,
+    replacement: EmbeddingReplacement<'_>,
+    replacement_pending: &mut bool,
 ) -> Result<(usize, bool)> {
     let mut count = 0usize;
     for (sym_id, file, text) in batch {
-        match client.embed_single(text) {
+        match provider.embed_single(text) {
             Ok(vec) => {
+                if *replacement_pending {
+                    replacement.prepare(conn)?;
+                    *replacement_pending = false;
+                }
                 embedding::store_embeddings_batch(
                     conn,
+                    provider,
                     &[(*sym_id, file.as_str(), text.as_str(), vec.as_slice())],
                 )?;
                 count += 1;
@@ -1007,18 +1014,20 @@ fn embed_batch_individually(
 /// Shared batch-embed loop.
 ///
 /// Iterates over `chunks` in groups of [`EMBEDDING_BATCH_SIZE`], embeds each
-/// batch via `client`, and stores the resulting vectors.  Returns the number
+/// batch via `provider`, and stores the resulting vectors. Returns the number
 /// of successfully embedded symbols.
 fn embed_chunks(
     conn: &Connection,
     chunks: &[(i64, String, String)],
-    client: &OllamaClient,
+    provider: &dyn EmbeddingProvider,
     progress_mode: ProgressMode,
     policy: EmbedErrorPolicy,
+    replacement: EmbeddingReplacement<'_>,
 ) -> Result<usize> {
     let total = chunks.len();
     let silent = progress_mode == ProgressMode::Silent;
     let mut embedded = 0usize;
+    let mut replacement_pending = true;
 
     for batch_start in (0..total).step_by(EMBEDDING_BATCH_SIZE) {
         let batch_end = (batch_start + EMBEDDING_BATCH_SIZE).min(total);
@@ -1026,7 +1035,7 @@ fn embed_chunks(
 
         let texts: Vec<String> = batch.iter().map(|(_, _, text)| text.clone()).collect();
 
-        let vectors = match client.embed_batch(&texts) {
+        let vectors = match provider.embed_batch(&texts) {
             Ok(v) => v,
             Err(EmbeddingError::OllamaUnreachable) => {
                 let msg = format!(
@@ -1040,8 +1049,15 @@ fn embed_chunks(
                 if !silent {
                     eprintln!("Batch context-length error; retrying individually...");
                 }
-                let (fallback_count, should_break) =
-                    embed_batch_individually(conn, batch, client, policy, silent)?;
+                let (fallback_count, should_break) = embed_batch_individually(
+                    conn,
+                    batch,
+                    provider,
+                    policy,
+                    silent,
+                    replacement,
+                    &mut replacement_pending,
+                )?;
                 embedded += fallback_count;
                 if should_break {
                     break;
@@ -1077,7 +1093,12 @@ fn embed_chunks(
             })
             .collect();
 
-        embedding::store_embeddings_batch(conn, &store_batch).context("storing embedding batch")?;
+        if replacement_pending {
+            replacement.prepare(conn)?;
+            replacement_pending = false;
+        }
+        embedding::store_embeddings_batch(conn, provider, &store_batch)
+            .context("storing embedding batch")?;
 
         embedded += store_batch.len();
 
@@ -1092,6 +1113,37 @@ fn embed_chunks(
     Ok(embedded)
 }
 
+#[derive(Clone, Copy)]
+enum EmbeddingReplacement<'a> {
+    Incremental,
+    All,
+    Files(&'a [String]),
+}
+
+impl EmbeddingReplacement<'_> {
+    fn prepare(self, conn: &Connection) -> Result<()> {
+        match self {
+            Self::Incremental => Ok(()),
+            Self::All => {
+                conn.execute("DELETE FROM embeddings", [])
+                    .context("clearing old embeddings")?;
+                Ok(())
+            }
+            Self::Files(files) => {
+                let tx = conn
+                    .unchecked_transaction()
+                    .context("starting delete-embeddings transaction")?;
+                for file in files {
+                    embedding::delete_embeddings_for_file(&tx, file)
+                        .context("deleting embeddings for changed file")?;
+                }
+                tx.commit()
+                    .context("committing delete-embeddings transaction")
+            }
+        }
+    }
+}
+
 /// Build embeddings for all indexed symbols.
 ///
 /// Checks Ollama health first; if unreachable, returns with `skipped = true`.
@@ -1101,13 +1153,13 @@ fn embed_chunks(
 pub fn build_embeddings(
     conn: &Connection,
     repo_root: &Path,
-    client: &OllamaClient,
+    provider: &dyn EmbeddingProvider,
     progress_mode: ProgressMode,
 ) -> Result<EmbeddingBuildStats> {
     let start = Instant::now();
 
     // Health check.
-    if !client.is_healthy() {
+    if !provider.is_healthy() {
         if progress_mode != ProgressMode::Silent {
             eprintln!(
                 "Ollama not available — skipping embedding generation. \
@@ -1137,22 +1189,19 @@ pub fn build_embeddings(
 
     let total = chunks.len();
 
-    // Delete existing embeddings for a clean rebuild.
-    conn.execute("DELETE FROM embeddings", [])
-        .context("clearing old embeddings")?;
-
     let embedded = embed_chunks(
         conn,
         &chunks,
-        client,
+        provider,
         progress_mode,
         EmbedErrorPolicy::SkipPartial,
+        EmbeddingReplacement::All,
     )?;
 
     Ok(EmbeddingBuildStats {
         embedded_count: embedded,
         total_symbols: total,
-        skipped: false,
+        skipped: embedded == 0,
         elapsed: start.elapsed(),
     })
 }
@@ -1165,13 +1214,13 @@ pub fn build_embeddings(
 pub fn build_missing_embeddings(
     conn: &Connection,
     repo_root: &Path,
-    client: &OllamaClient,
+    provider: &dyn EmbeddingProvider,
     progress_mode: ProgressMode,
 ) -> Result<EmbeddingBuildStats> {
     let start = Instant::now();
 
     // Generate chunks only for un-embedded / stale symbols.
-    let chunks = embedding::chunk_missing_symbols(conn, repo_root)
+    let chunks = embedding::chunk_missing_symbols(conn, repo_root, provider)
         .context("chunking missing symbols for embedding")?;
 
     if chunks.is_empty() {
@@ -1188,16 +1237,17 @@ pub fn build_missing_embeddings(
     // Health check — bail before starting the expensive batch-embed loop.
     // Unlike build_embeddings we return Err because the caller (wonk ask)
     // requires Ollama.
-    if !client.is_healthy() {
+    if !provider.is_healthy() {
         anyhow::bail!("{}", embedding::OLLAMA_REQUIRED_MSG);
     }
 
     let embedded = embed_chunks(
         conn,
         &chunks,
-        client,
+        provider,
         progress_mode,
         EmbedErrorPolicy::FailFast,
+        EmbeddingReplacement::Incremental,
     )?;
 
     Ok(EmbeddingBuildStats {
@@ -1238,13 +1288,13 @@ pub fn reembed_changed_files(
     conn: &Connection,
     repo_root: &Path,
     changed_files: &[String],
-    client: &OllamaClient,
+    provider: &dyn EmbeddingProvider,
 ) -> Result<usize> {
     if changed_files.is_empty() {
         return Ok(0);
     }
 
-    if !client.is_healthy() {
+    if !provider.is_healthy() {
         // Ollama unreachable: mark embeddings stale for each file in a single transaction.
         let tx = conn
             .unchecked_transaction()
@@ -1256,22 +1306,12 @@ pub fn reembed_changed_files(
         return Ok(0);
     }
 
-    // Delete old embeddings for changed files in a single transaction.
-    let tx = conn
-        .unchecked_transaction()
-        .context("starting delete-embeddings transaction")?;
-    for file in changed_files {
-        embedding::delete_embeddings_for_file(&tx, file)
-            .context("deleting embeddings for changed file")?;
-    }
-    tx.commit()
-        .context("committing delete-embeddings transaction")?;
-
     // Generate chunks for the changed files.
     let chunks = embedding::chunk_symbols_for_files(conn, repo_root, changed_files)
         .context("chunking symbols for changed files")?;
 
     if chunks.is_empty() {
+        EmbeddingReplacement::Files(changed_files).prepare(conn)?;
         return Ok(0);
     }
 
@@ -1279,9 +1319,10 @@ pub fn reembed_changed_files(
     let embedded = embed_chunks(
         conn,
         &chunks,
-        client,
+        provider,
         ProgressMode::Silent,
         EmbedErrorPolicy::SkipPartial,
+        EmbeddingReplacement::Files(changed_files),
     )?;
 
     Ok(embedded)
@@ -1310,6 +1351,52 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    struct TwoDimProvider;
+    struct FailingProvider;
+    struct OldTwoDimProvider;
+
+    impl embedding::EmbeddingProvider for TwoDimProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn dim(&self) -> usize {
+            2
+        }
+
+        fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(chunks.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    impl embedding::EmbeddingProvider for FailingProvider {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        fn dim(&self) -> usize {
+            2
+        }
+
+        fn embed_batch(&self, _chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Err(EmbeddingError::OllamaUnreachable)
+        }
+    }
+
+    impl embedding::EmbeddingProvider for OldTwoDimProvider {
+        fn name(&self) -> &str {
+            "old-test"
+        }
+
+        fn dim(&self) -> usize {
+            2
+        }
+
+        fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(chunks.iter().map(|_| vec![0.0, 1.0]).collect())
+        }
+    }
 
     /// Create a minimal test repo with source files.
     fn make_test_repo() -> TempDir {
@@ -2367,12 +2454,90 @@ class Component {
         let conn = db::open_existing(&index_path).unwrap();
 
         // Use a dead port to simulate Ollama unreachable.
-        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = crate::embedding::OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let progress_mode = crate::progress::ProgressMode::Silent;
 
         let emb_stats = build_embeddings(&conn, root, &client, progress_mode).unwrap();
         assert!(emb_stats.skipped, "should skip when Ollama is unreachable");
         assert_eq!(emb_stats.embedded_count, 0);
+    }
+
+    #[test]
+    fn test_first_batch_failure_preserves_existing_embeddings() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+        let symbol_id: i64 = conn
+            .query_row("SELECT id FROM symbols LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        embedding::store_embedding(
+            &conn,
+            &TwoDimProvider,
+            symbol_id,
+            "existing.rs",
+            "old chunk",
+            &[1.0, 0.0],
+        )
+        .unwrap();
+
+        let stats = build_embeddings(
+            &conn,
+            root,
+            &FailingProvider,
+            crate::progress::ProgressMode::Silent,
+        )
+        .unwrap();
+
+        assert!(stats.skipped);
+        let stored: (String, String) = conn
+            .query_row(
+                "SELECT provider, chunk_text FROM embeddings WHERE symbol_id = ?1",
+                [symbol_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("test".to_string(), "old chunk".to_string()));
+    }
+
+    #[test]
+    fn test_provider_switch_reembeds_and_propagates_metadata() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+        let symbol_id: i64 = conn
+            .query_row("SELECT id FROM symbols LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        embedding::store_embedding(
+            &conn,
+            &OldTwoDimProvider,
+            symbol_id,
+            "existing.rs",
+            "old chunk",
+            &[0.0, 1.0],
+        )
+        .unwrap();
+
+        let stats = build_missing_embeddings(
+            &conn,
+            root,
+            &TwoDimProvider,
+            crate::progress::ProgressMode::Silent,
+        )
+        .unwrap();
+        assert!(stats.embedded_count > 0);
+
+        let incompatible: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE provider != 'test' OR dim != 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(incompatible, 0);
     }
 
     #[test]
@@ -2388,7 +2553,15 @@ class Component {
         let sym_id: i64 = conn
             .query_row("SELECT id FROM symbols LIMIT 1", [], |row| row.get(0))
             .unwrap();
-        crate::embedding::store_embedding(&conn, sym_id, "test.rs", "chunk", &[1.0, 0.0]).unwrap();
+        crate::embedding::store_embedding(
+            &conn,
+            &TwoDimProvider,
+            sym_id,
+            "test.rs",
+            "chunk",
+            &[1.0, 0.0],
+        )
+        .unwrap();
 
         let (total, _) = crate::embedding::embedding_stats(&conn).unwrap();
         assert_eq!(total, 1, "should have 1 embedding before drop");
@@ -2416,7 +2589,7 @@ class Component {
         let conn = db::open_existing(&index_path).unwrap();
 
         // Use a dead port to simulate Ollama unreachable.
-        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = crate::embedding::OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let progress_mode = crate::progress::ProgressMode::Silent;
 
         let result = build_missing_embeddings(&conn, root, &client, progress_mode);
@@ -2440,7 +2613,7 @@ class Component {
         let index_path = db::local_index_path(root);
         let conn = db::open_existing(&index_path).unwrap();
 
-        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = crate::embedding::OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let progress_mode = crate::progress::ProgressMode::Silent;
 
         let result = build_missing_embeddings(&conn, root, &client, progress_mode);
@@ -2472,14 +2645,22 @@ class Component {
                 |row| row.get(0),
             )
             .unwrap();
-        embedding::store_embedding(&conn, sym_id, "src/main.rs", "chunk", &[1.0, 0.0]).unwrap();
+        embedding::store_embedding(
+            &conn,
+            &TwoDimProvider,
+            sym_id,
+            "src/main.rs",
+            "chunk",
+            &[1.0, 0.0],
+        )
+        .unwrap();
 
         // Verify embedding is fresh (not stale).
         let (_, stale_before) = embedding::embedding_stats(&conn).unwrap();
         assert_eq!(stale_before, 0, "embedding should be fresh initially");
 
         // Use dead port to simulate Ollama unreachable.
-        let client = embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = embedding::OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let files = vec!["src/main.rs".to_string()];
 
         let count = reembed_changed_files(&conn, root, &files, &client).unwrap();
@@ -2499,7 +2680,7 @@ class Component {
         let index_path = db::local_index_path(root);
         let conn = db::open_existing(&index_path).unwrap();
 
-        let client = embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = embedding::OllamaProvider::with_base_url("http://127.0.0.1:19999");
         let files: Vec<String> = vec![];
 
         let count = reembed_changed_files(&conn, root, &files, &client).unwrap();
@@ -2516,7 +2697,7 @@ class Component {
         let conn = db::open_existing(&index_path).unwrap();
 
         // Use dead port; the function should mark stale rather than error.
-        let client = embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = embedding::OllamaProvider::with_base_url("http://127.0.0.1:19999");
         // File that was deleted from disk but still referenced.
         let files = vec!["nonexistent.rs".to_string()];
 

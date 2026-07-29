@@ -63,7 +63,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     let repo_root_for_config = std::env::current_dir()
         .ok()
         .and_then(|cwd| db::find_repo_root(&cwd).ok());
-    let config = crate::config::Config::load(repo_root_for_config.as_deref()).unwrap_or_default();
+    let config = crate::config::Config::load(repo_root_for_config.as_deref())?;
 
     // Resolve format: CLI flag > config default_format > grep.
     let format = cli.format.unwrap_or_else(|| {
@@ -201,9 +201,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 // output interleaved by descending RRF score.
                 use crate::ranker;
 
+                let provider = crate::embedding::create_provider(config.embedding.provider)?;
                 let rrf_k = config.search.rrf_k;
-                let semantic_results =
-                    fetch_semantic_results(&args.pattern, conn.as_ref(), suppress)?;
+                let semantic_results = fetch_semantic_results(
+                    &args.pattern,
+                    conn.as_ref(),
+                    provider.as_ref(),
+                    suppress,
+                )?;
 
                 let fused = ranker::fuse_rrf(&results, &semantic_results, rrf_k);
 
@@ -511,6 +516,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
             let progress_mode = progress::detect_mode(suppress);
+            let provider = crate::embedding::create_provider(
+                crate::embedding::resolve_provider_kind(args.provider, config.embedding.provider),
+            )?;
 
             // Check if we can do an incremental update instead of a full rebuild.
             let index_path = db::index_path_for(&repo_root, args.local)?;
@@ -529,9 +537,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 // Full embedding build.
                 let index_path = db::index_path_for(&repo_root, args.local)?;
                 let conn = db::open(&index_path)?;
-                let client = crate::embedding::OllamaClient::new();
-                let emb_stats =
-                    pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
+                let emb_stats = pipeline::build_embeddings(
+                    &conn,
+                    &repo_root,
+                    provider.as_ref(),
+                    progress_mode,
+                )?;
                 if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
                     eprintln!(
                         "Embedded {} symbols in {:.1}s",
@@ -554,9 +565,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 // Incremental embedding update.
                 let index_path = db::index_path_for(&repo_root, args.local)?;
                 let conn = db::open(&index_path)?;
-                let client = crate::embedding::OllamaClient::new();
-                match pipeline::build_missing_embeddings(&conn, &repo_root, &client, progress_mode)
-                {
+                match pipeline::build_missing_embeddings(
+                    &conn,
+                    &repo_root,
+                    provider.as_ref(),
+                    progress_mode,
+                ) {
                     Ok(emb_stats) => {
                         if !suppress && emb_stats.embedded_count > 0 {
                             eprintln!(
@@ -576,6 +590,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let repo_root = std::env::current_dir()?;
             let repo_root = db::find_repo_root(&repo_root)?;
             let progress_mode = progress::detect_mode(suppress);
+            let provider = crate::embedding::create_provider(
+                crate::embedding::resolve_provider_kind(args.provider, config.embedding.provider),
+            )?;
 
             // Decide whether we need a full rebuild or can do incremental.
             let index_path = db::index_path_for(&repo_root, false)?;
@@ -596,9 +613,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     // Full embedding rebuild.
                     let index_path = db::index_path_for(&repo_root, false)?;
                     let conn = db::open(&index_path)?;
-                    let client = crate::embedding::OllamaClient::new();
-                    let emb_stats =
-                        pipeline::build_embeddings(&conn, &repo_root, &client, progress_mode)?;
+                    let emb_stats = pipeline::build_embeddings(
+                        &conn,
+                        &repo_root,
+                        provider.as_ref(),
+                        progress_mode,
+                    )?;
                     if !suppress && !emb_stats.skipped && emb_stats.embedded_count > 0 {
                         eprintln!(
                             "Embedded {} symbols in {:.1}s",
@@ -623,11 +643,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     // Incremental embedding update (graceful skip if Ollama unavailable).
                     let index_path = db::index_path_for(&repo_root, false)?;
                     let conn = db::open(&index_path)?;
-                    let client = crate::embedding::OllamaClient::new();
                     match pipeline::build_missing_embeddings(
                         &conn,
                         &repo_root,
-                        &client,
+                        provider.as_ref(),
                         progress_mode,
                     ) {
                         Ok(emb_stats) => {
@@ -648,6 +667,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Ask(args) => {
             let ollama_error_msg = crate::embedding::OLLAMA_REQUIRED_MSG;
+            let provider = crate::embedding::create_provider(config.embedding.provider)?;
 
             // Discover repo root (needed for embedding build).
             let repo_root = std::env::current_dir()
@@ -699,9 +719,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             )?;
 
             // Check embedding completeness and build if needed.
-            let (symbol_count, embedding_count) = crate::embedding::embedding_completeness(&conn)?;
-
-            let client = crate::embedding::OllamaClient::new();
+            let (symbol_count, embedding_count) =
+                crate::embedding::embedding_completeness(&conn, provider.as_ref())?;
 
             if symbol_count > 0 && embedding_count < symbol_count {
                 let progress_mode = progress::detect_mode(suppress);
@@ -712,7 +731,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         return Ok(());
                     }
                 };
-                match pipeline::build_missing_embeddings(&conn, repo, &client, progress_mode) {
+                match pipeline::build_missing_embeddings(
+                    &conn,
+                    repo,
+                    provider.as_ref(),
+                    progress_mode,
+                ) {
                     Ok(stats) => {
                         if !suppress && stats.embedded_count > 0 {
                             eprintln!(
@@ -732,18 +756,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // Load embeddings — scoped to reachable files when --from/--to
             // is specified, otherwise load all.
             let embeddings = match &reachable_files {
-                Some(files) => crate::embedding::load_embeddings_for_files(&conn, files)?,
-                None => crate::embedding::load_all_embeddings(&conn)?,
+                Some(files) => {
+                    crate::embedding::load_embeddings_for_files(&conn, files, provider.as_ref())?
+                }
+                None => crate::embedding::load_all_embeddings(&conn, provider.as_ref())?,
             };
             if embeddings.is_empty() {
                 output::print_hint(
-                    "no embeddings available; run `wonk init` with Ollama running to build embeddings",
+                    "no embeddings available; run `wonk init` to build embeddings",
                     suppress,
                 );
                 return Ok(());
             }
 
-            let mut query_vec = match client.embed_single(&args.query) {
+            let mut query_vec = match provider.embed_single(&args.query) {
                 Ok(v) => v,
                 Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
                     output::print_error(ollama_error_msg);
@@ -958,6 +984,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             McpCommand::Serve => crate::mcp::serve()?,
         },
         Command::Cluster(args) => {
+            let provider = crate::embedding::create_provider(config.embedding.provider)?;
             let conn = std::env::current_dir()
                 .ok()
                 .and_then(|cwd| db::find_repo_root(&cwd).ok())
@@ -979,11 +1006,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let prefix = args.path.strip_prefix("./").unwrap_or(&args.path);
             let prefix = if prefix == "." { "" } else { prefix };
 
-            let embeddings = crate::embedding::load_embeddings_for_path_prefix(&conn, prefix)?;
+            let embeddings = crate::embedding::load_embeddings_for_path_prefix(
+                &conn,
+                prefix,
+                provider.as_ref(),
+            )?;
 
             if embeddings.is_empty() {
                 output::print_hint(
-                    "no embeddings found for this path; run `wonk init` with Ollama running to build embeddings",
+                    "no embeddings found for this path; run `wonk init` to build embeddings",
                     suppress,
                 );
                 return Ok(());
@@ -1036,6 +1067,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Impact(args) => {
+            let provider = crate::embedding::create_provider(config.embedding.provider)?;
             let repo_root = match std::env::current_dir()
                 .ok()
                 .and_then(|cwd| db::find_repo_root(&cwd).ok())
@@ -1090,16 +1122,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
 
             // Load all embeddings once (shared across files for --since).
-            let all_embeddings = crate::embedding::load_all_embeddings(&conn)?;
+            let all_embeddings = crate::embedding::load_all_embeddings(&conn, provider.as_ref())?;
             if all_embeddings.is_empty() {
                 output::print_error(
-                    "no embeddings found in the index; \
-                     run `wonk init` with Ollama running to build embeddings",
+                    "no embeddings found in the index; run `wonk init` to build embeddings",
                 );
                 return Ok(());
             }
-
-            let client = crate::embedding::OllamaClient::new();
 
             // Aggregate results across all files.
             let mut all_results = Vec::new();
@@ -1108,7 +1137,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     &conn,
                     file,
                     &repo_root,
-                    &client,
+                    provider.as_ref(),
                     &all_embeddings,
                 ) {
                     Ok(results) => all_results.extend(results),
@@ -1427,8 +1456,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         let source_lines: Vec<&str> = sr.source.lines().collect();
                         if !source_lines.is_empty() {
                             let avg_chars = sr.source.len() / source_lines.len();
-                            if avg_chars > 0 {
-                                let max_lines = (remaining_chars / avg_chars).clamp(
+                            if let Some(line_budget) = remaining_chars.checked_div(avg_chars) {
+                                let max_lines = line_budget.clamp(
                                     ShowOutput::MIN_SOURCE_LINES,
                                     ShowOutput::MAX_SOURCE_LINES,
                                 );
@@ -2271,6 +2300,7 @@ fn is_query_command(cmd: &Command) -> bool {
 fn fetch_semantic_results(
     pattern: &str,
     conn: Option<&Connection>,
+    provider: &dyn crate::embedding::EmbeddingProvider,
     suppress: bool,
 ) -> Result<Vec<crate::types::SemanticResult>> {
     let conn = match conn {
@@ -2281,14 +2311,17 @@ fn fetch_semantic_results(
         }
     };
 
-    let all_embeddings = match crate::embedding::load_all_embeddings(conn) {
+    let all_embeddings = match crate::embedding::load_all_embeddings(conn, provider) {
         Ok(e) if !e.is_empty() => e,
         Ok(_) => {
             output::print_hint(
-                "semantic blending skipped: no embeddings available (run `wonk init` with Ollama running)",
+                "semantic blending skipped: no embeddings available (run `wonk init`)",
                 suppress,
             );
             return Ok(Vec::new());
+        }
+        Err(error @ crate::errors::EmbeddingError::VectorSpaceMismatch { .. }) => {
+            return Err(error.into());
         }
         Err(_) => {
             output::print_hint(
@@ -2299,8 +2332,7 @@ fn fetch_semantic_results(
         }
     };
 
-    let client = crate::embedding::OllamaClient::new();
-    let mut query_vec = match client.embed_single(pattern) {
+    let mut query_vec = match provider.embed_single(pattern) {
         Ok(v) => v,
         Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
             output::print_hint("semantic blending skipped: Ollama is unreachable", suppress);
@@ -2405,7 +2437,7 @@ pub fn format_status_info(info: &StatusInfo) -> String {
 /// Uses a quick 500ms timeout for the Ollama health check so that
 /// `wonk status` doesn't block for 2 seconds when Ollama is unreachable.
 pub fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
-    let client = crate::embedding::OllamaClient::new();
+    let client = crate::embedding::OllamaProvider::new();
     let ollama_reachable = client.is_healthy_quick();
 
     let Some(conn) = conn else {
@@ -5061,7 +5093,10 @@ mod tests {
 
     #[test]
     fn test_is_query_command_not_init() {
-        let cmd = Command::Init(InitArgs { local: false });
+        let cmd = Command::Init(InitArgs {
+            local: false,
+            provider: None,
+        });
         assert!(!is_query_command(&cmd));
     }
 
@@ -5070,6 +5105,7 @@ mod tests {
         assert!(!is_query_command(&Command::Update(UpdateArgs {
             force: false,
             skip_embed: false,
+            provider: None,
         })));
     }
 
@@ -5179,7 +5215,8 @@ mod tests {
 
     #[test]
     fn test_fetch_semantic_no_conn_returns_empty() {
-        let result = fetch_semantic_results("test", None, true);
+        let provider = crate::embedding::OllamaProvider::new();
+        let result = fetch_semantic_results("test", None, &provider, true);
         assert!(result.unwrap().is_empty());
     }
 
@@ -5189,7 +5226,8 @@ mod tests {
         let db_path = dir.path().join("index.db");
         let conn = db::open(&db_path).unwrap();
 
-        let result = fetch_semantic_results("test", Some(&conn), true);
+        let provider = crate::embedding::OllamaProvider::new();
+        let result = fetch_semantic_results("test", Some(&conn), &provider, true);
         assert!(result.unwrap().is_empty());
     }
 
@@ -5219,7 +5257,8 @@ mod tests {
         // Should succeed regardless of whether Ollama is running:
         // - If unreachable: graceful degradation, returns empty Vec
         // - If reachable: may produce results, still returns Ok
-        let result = fetch_semantic_results("test_query", Some(&conn), true);
+        let provider = crate::embedding::OllamaProvider::new();
+        let result = fetch_semantic_results("test_query", Some(&conn), &provider, true);
         assert!(result.is_ok(), "fetch_semantic_results should not error");
     }
 

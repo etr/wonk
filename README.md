@@ -80,13 +80,13 @@ Wonk pre-indexes your codebase with Tree-sitter so it understands code structure
 |------|-------------|
 | `wonk search <pattern>` | Full-text search ranked by code structure. Definitions first, tests last, re-exports collapsed. Add `--semantic` for hybrid RRF fusion. |
 | `wonk sym` / `sig` / `show` / `ref` | Direct symbol lookup. Find definitions, view signatures, read full source, or trace references — no regex needed. |
-| `wonk ask <query>` | Semantic search via Ollama embeddings. Natural-language queries over code meaning. Requires Ollama + nomic-embed-text. |
+| `wonk ask <query>` | Semantic search over code meaning. Uses the bundled provider by default; Ollama is an opt-in quality tier. |
 
 ## Features at a glance
 
 **Search**
 - Smart ranking: definitions first, tests last, re-exports deduplicated
-- Semantic search via Ollama embeddings (`wonk ask`)
+- Semantic search via bundled or Ollama embeddings (`wonk ask`)
 - Hybrid RRF fusion blends structural + semantic results (`--semantic`)
 
 **Code intelligence**
@@ -149,7 +149,7 @@ wonk sym "UserService"            # find symbol definitions
 wonk callers "dispatch"           # who calls this?
 wonk blast "processPayment"       # what breaks if this changes?
 wonk changes --blast --flows      # changed symbols + impact analysis
-wonk ask "error handling logic"   # semantic search (requires Ollama)
+wonk ask "error handling logic"   # semantic search
 ```
 
 Indexing happens automatically on first use.
@@ -252,7 +252,7 @@ Full flag reference: [`docs/commands.md`](docs/commands.md)
 | Structural ranking | Definitions first, tests last | No ranking | N/A |
 | Deduplication | Re-export collapsing | None | N/A |
 | Call graph | Callers, callees, callpath, blast radius | No | LSP only (running server) |
-| Semantic search | Embedding similarity (Ollama) | No | No |
+| Semantic search | Embedding similarity (bundled or Ollama) | No | No |
 | Token budget | `--budget N` caps output | No | No |
 | Setup | Single binary, auto-indexes | Single binary | Language server per language |
 | MCP server | 22 tools built-in | No | Via adapter |
@@ -285,7 +285,7 @@ TypeScript (TSX), JavaScript (JSX), Python, Rust, Go, Java, C, C++, Ruby, PHP, C
 
 Wonk's core features work out of the box with zero external dependencies. Advanced features require:
 
-- **[Ollama](https://ollama.ai/)** -- for semantic search and AI-generated summaries. Pull `nomic-embed-text` (embeddings) and `llama3.2:3b` (summaries).
+- **[Ollama](https://ollama.ai/)** -- optional higher-quality embedding tier and required for AI-generated summaries. Pull `nomic-embed-text` (embeddings) and `llama3.2:3b` (summaries).
 - **git** -- only needed for `wonk impact --since` and `wonk changes --scope compare`. Most likely already installed.
 
 ## Configuration

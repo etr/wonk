@@ -204,6 +204,10 @@ pub struct InitArgs {
     /// Use a local (project-specific) index instead of the shared index
     #[arg(long)]
     pub local: bool,
+
+    /// Embedding provider for this index build
+    #[arg(long, value_enum)]
+    pub provider: Option<crate::embedding::EmbeddingProviderKind>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -215,6 +219,10 @@ pub struct UpdateArgs {
     /// Skip embedding generation (useful for quick structural-only updates)
     #[arg(long)]
     pub skip_embed: bool,
+
+    /// Embedding provider for this index build
+    #[arg(long, value_enum)]
+    pub provider: Option<crate::embedding::EmbeddingProviderKind>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1545,5 +1553,38 @@ mod tests {
             }
             _ => panic!("expected Command::Context"),
         }
+    }
+
+    #[test]
+    fn parse_init_provider_override() {
+        let cli = Cli::try_parse_from(["wonk", "init", "--provider", "ollama"]).unwrap();
+        match cli.command {
+            Command::Init(args) => {
+                assert_eq!(
+                    args.provider,
+                    Some(crate::embedding::EmbeddingProviderKind::Ollama)
+                );
+            }
+            _ => panic!("expected Command::Init"),
+        }
+    }
+
+    #[test]
+    fn parse_update_provider_override() {
+        let cli = Cli::try_parse_from(["wonk", "update", "--provider", "bundled"]).unwrap();
+        match cli.command {
+            Command::Update(args) => {
+                assert_eq!(
+                    args.provider,
+                    Some(crate::embedding::EmbeddingProviderKind::Bundled)
+                );
+            }
+            _ => panic!("expected Command::Update"),
+        }
+    }
+
+    #[test]
+    fn invalid_provider_override_is_rejected() {
+        assert!(Cli::try_parse_from(["wonk", "init", "--provider", "remote"]).is_err());
     }
 }
