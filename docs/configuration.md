@@ -34,7 +34,7 @@ generate_url = "http://localhost:11434/api/generate" # Ollama generate endpoint
 rrf_k = 60.0                  # Reciprocal Rank Fusion constant K
 
 [embedding]
-provider = "bundled"          # "bundled" (default) or "ollama"
+provider = "ollama"           # Available provider; "bundled" is deferred to TASK-076
 ```
 
 ## Sections
@@ -82,11 +82,12 @@ provider = "bundled"          # "bundled" (default) or "ollama"
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `provider` | `"bundled"` | Embedding provider: `"bundled"` for the in-process model or `"ollama"` for `nomic-embed-text` |
+| `provider` | `"bundled"` | Embedding provider: use `"ollama"` for `nomic-embed-text`; `"bundled"` is the deferred default and is unavailable until TASK-076 |
 
 Provider selection follows the normal configuration precedence: per-repo
 configuration overrides global configuration, which overrides the built-in
-default. `wonk init --provider <provider>` and
+default. Until TASK-076 implements the bundled provider, configure `ollama`.
+`wonk init --provider <provider>` and
 `wonk update --provider <provider>` override configuration for that invocation.
 
 Embeddings from different providers or dimensions are kept in separate vector

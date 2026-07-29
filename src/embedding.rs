@@ -2985,6 +2985,26 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[test]
+    fn test_load_embeddings_for_files_rejects_mismatched_vector_space() {
+        let conn = setup_db_with_embeddings();
+        let vector: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_and_embedding(&conn, 1, "src/a.ts", &vector);
+        conn.execute(
+            "UPDATE embeddings SET provider = 'ollama', dim = 768 WHERE symbol_id = 1",
+            [],
+        )
+        .unwrap();
+
+        let files = ["src/a.ts".to_string()].into_iter().collect();
+        let error = load_embeddings_for_files(&conn, &files, &OneDimProvider).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("active test/1"));
+        assert!(message.contains("stored ollama/768"));
+        assert!(message.contains("wonk update --force --provider test"));
+    }
+
     // -- load_embeddings_for_path_prefix tests --------------------------------
 
     fn insert_symbol_and_embedding_stale(
@@ -3034,6 +3054,26 @@ mod tests {
 
         let results = load_embeddings_for_path_prefix(&conn, "lib/", &OneDimProvider).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_load_embeddings_for_path_prefix_rejects_mismatched_vector_space() {
+        let conn = setup_db_with_embeddings();
+        let vector: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &vector);
+        conn.execute(
+            "UPDATE embeddings SET provider = 'ollama', dim = 768 WHERE symbol_id = 1",
+            [],
+        )
+        .unwrap();
+
+        let error =
+            load_embeddings_for_path_prefix(&conn, "src/auth/", &OneDimProvider).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("active test/1"));
+        assert!(message.contains("stored ollama/768"));
+        assert!(message.contains("wonk update --force --provider test"));
     }
 
     #[test]

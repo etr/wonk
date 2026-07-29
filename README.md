@@ -80,13 +80,13 @@ Wonk pre-indexes your codebase with Tree-sitter so it understands code structure
 |------|-------------|
 | `wonk search <pattern>` | Full-text search ranked by code structure. Definitions first, tests last, re-exports collapsed. Add `--semantic` for hybrid RRF fusion. |
 | `wonk sym` / `sig` / `show` / `ref` | Direct symbol lookup. Find definitions, view signatures, read full source, or trace references — no regex needed. |
-| `wonk ask <query>` | Semantic search over code meaning. Uses the bundled provider by default; Ollama is an opt-in quality tier. |
+| `wonk ask <query>` | Semantic search over code meaning. Use the available Ollama provider; the bundled default is deferred to TASK-076. |
 
 ## Features at a glance
 
 **Search**
 - Smart ranking: definitions first, tests last, re-exports deduplicated
-- Semantic search via bundled or Ollama embeddings (`wonk ask`)
+- Semantic search via Ollama embeddings (`wonk ask`); bundled embeddings arrive in TASK-076
 - Hybrid RRF fusion blends structural + semantic results (`--semantic`)
 
 **Code intelligence**

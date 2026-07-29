@@ -4704,6 +4704,50 @@ mod tests {
     }
 
     #[test]
+    fn embedding_provider_for_uses_repo_configuration_and_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_root = dir.path();
+        std::fs::create_dir_all(repo_root.join(".wonk")).unwrap();
+        std::fs::write(
+            repo_root.join(".wonk/config.toml"),
+            "[embedding]\nprovider = 'ollama'\n",
+        )
+        .unwrap();
+
+        let configured = embedding_provider_for(repo_root, None).unwrap();
+        assert_eq!(configured.name(), "ollama");
+        assert_eq!(configured.dim(), 768);
+
+        std::fs::write(
+            repo_root.join(".wonk/config.toml"),
+            "[embedding]\nprovider = 'bundled'\n",
+        )
+        .unwrap();
+        let overridden = embedding_provider_for(repo_root, Some("ollama")).unwrap();
+        assert_eq!(overridden.name(), "ollama");
+        assert_eq!(overridden.dim(), 768);
+    }
+
+    #[test]
+    fn embedding_provider_for_rejects_invalid_mcp_provider() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut server = McpServer {
+            router: QueryRouter::new(Some(dir.path().to_path_buf()), false),
+            registry: RepoRegistry::new(Vec::new()),
+        };
+        let result = server.handle_tools_call(&serde_json::json!({
+            "name": "wonk_init",
+            "arguments": {"provider": "remote"}
+        }));
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"][0]["text"],
+            "invalid embedding provider: remote"
+        );
+    }
+
+    #[test]
     fn tool_update_dispatches_correctly() {
         let mut server = test_server();
         let params = serde_json::json!({

@@ -3208,13 +3208,13 @@ Extend `mcp.rs` to discover all indexed repositories at startup, lazy-load conne
 Introduce an `EmbeddingProvider` trait in `embedding.rs`, refactor the existing Ollama client to implement it, and wire config-driven provider selection with a per-invocation override.
 
 **Action Items:**
-- [ ] Define `trait EmbeddingProvider { fn name(&self) -> &str; fn dim(&self) -> usize; fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>>; }` (PRD-EMB-REQ-001)
-- [ ] Refactor the existing V2 Ollama client into `OllamaProvider` implementing the trait — behavior must be unchanged (PRD-EMB-REQ-003)
-- [ ] Add `embedding.provider` config key with values `bundled` (default) and `ollama` (PRD-EMB-REQ-004)
-- [ ] Add per-invocation `--provider` override on index-building commands (PRD-EMB-REQ-004)
-- [ ] Add `provider TEXT DEFAULT 'ollama'` and `dim INTEGER DEFAULT 768` columns to `embeddings` via ALTER TABLE (PRD-EMB-REQ-006)
-- [ ] Record provider and dimension on every embedding write (PRD-EMB-REQ-006)
-- [ ] Filter similarity queries by active provider; fail fast with a re-embed instruction on mismatch (PRD-EMB-REQ-005)
+- [x] Define `trait EmbeddingProvider { fn name(&self) -> &str; fn dim(&self) -> usize; fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>>; }` (PRD-EMB-REQ-001)
+- [x] Refactor the existing V2 Ollama client into `OllamaProvider` implementing the trait — behavior must be unchanged (PRD-EMB-REQ-003)
+- [x] Add `embedding.provider` config key with values `bundled` (default) and `ollama` (PRD-EMB-REQ-004)
+- [x] Add per-invocation `--provider` override on index-building commands (PRD-EMB-REQ-004)
+- [x] Add `provider TEXT DEFAULT 'ollama'` and `dim INTEGER DEFAULT 768` columns to `embeddings` via ALTER TABLE (PRD-EMB-REQ-006)
+- [x] Record provider and dimension on every embedding write (PRD-EMB-REQ-006)
+- [x] Filter similarity queries by active provider; fail fast with a re-embed instruction on mismatch (PRD-EMB-REQ-005)
 
 **Dependencies:**
 - Blocked by: None
@@ -3230,7 +3230,7 @@ Introduce an `EmbeddingProvider` trait in `embedding.rs`, refactor the existing 
 **Related Requirements:** PRD-EMB-REQ-001, PRD-EMB-REQ-003, PRD-EMB-REQ-004, PRD-EMB-REQ-005, PRD-EMB-REQ-006
 **Related Decisions:** DR-032
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
