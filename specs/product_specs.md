@@ -1,7 +1,7 @@
 # EARS-based Product Requirements
 
 **Doc status:** Draft 0.1
-**Last updated:** 2026-02-11
+**Last updated:** 2026-07-29
 **Owner:** TBD
 **Audience:** Exec, Eng, Design, Data, QA, Sec
 
@@ -31,7 +31,7 @@
   - Time to first result (warm index) < 100ms
   - Precision of `wonk sym` (correct definitions returned) > 90%
   - Recall of `wonk ref` (usages found vs grep baseline) > 80%
-- **Release strategy:** V1 is CLI-only. Editor integrations, LSP backends, and cross-language call graphs are deferred to V2. V2 semantic search features (embedding-based search, clustering, impact analysis) are now specified below. V3 adds source display, code summary, and call graph analysis. V4 adds graph intelligence features: execution flow detection, blast radius analysis, scoped change detection, unified symbol context, hybrid search fusion, edge confidence scoring, inheritance tracking, and multi-repo MCP.
+- **Release strategy:** V1 is CLI-only. Editor integrations, LSP backends, and cross-language call graphs are deferred to V2. V2 semantic search features (embedding-based search, clustering, impact analysis) are now specified below. V3 adds source display, code summary, and call graph analysis. V4 adds graph intelligence features: execution flow detection, blast radius analysis, scoped change detection, unified symbol context, hybrid search fusion, edge confidence scoring, inheritance tracking, and multi-repo MCP. V5 extends reach beyond the single repo and removes the last external dependency: cross-repo contract detection (services linked by HTTP routes, gRPC, GraphQL, queue topics), a bundled default embedding model so semantic search works with zero setup, BM25 lexical scoring feeding the existing RRF fusion, a precomputed reach index for cheap blast queries, and a diff-scoped `wonk review` workflow composing change detection + blast radius + contracts.
 
 ---
 
@@ -41,8 +41,10 @@
 - **Storage:** Index size shall be approximately 1 MB per 10k symbols.
 - **Repo discovery:** The system shall discover the repo root by walking up from the current directory looking for `.git` or `.wonk`.
 - **Graceful degradation:** A stale index shall still return results. Queries shall tolerate brief write contention from the daemon without failing.
-- **Binary size:** < 30 MB including all bundled Tree-sitter grammars.
+- **Binary size:** < 30 MB including all bundled Tree-sitter grammars; < 40 MB for V5 builds that additionally bundle the default embedding model.
 - **Daemon idle resources:** < 15 MB memory, near-zero CPU.
+- **Zero external services (V5):** Every command, including semantic search, shall work with no network access and no separately installed service. External providers (Ollama) remain an opt-in quality upgrade.
+- **Cross-repo scope (V5):** Cross-repo features operate only over repositories already indexed on the same machine. No remote indexing, no network calls between repos.
 
 ---
 
@@ -1003,6 +1005,504 @@ When an LLM agent works across related repositories, it must start a separate MC
 
 ---
 
+### 3.31 Cross-Repo Contract Detection (PRD-CTR) [V5]
+
+**Problem / outcome**
+Wonk's call graph stops at the repo boundary, and static analysis stops at the process boundary. In a multi-service codebase the highest-cost question an agent cannot answer is "which other service breaks if I change this route / proto / topic?" — so agents grep every sibling repo for string literals, burning tokens and still missing matches. Contract detection extracts the implicit interfaces services publish and consume, normalizes them to canonical IDs, and links providers to consumers across the repos already indexed on this machine.
+
+**In scope**
+- Detection of contract declarations for HTTP routes, gRPC services/methods, GraphQL operations, message-queue topics (Kafka/NATS/RabbitMQ), WebSocket events, environment variables, OpenAPI documents, and scheduled/background jobs
+- Canonical contract ID normalization across framework-specific syntaxes
+- Provider/consumer role classification with confidence
+- Workspace scoping — opt-in, repo-local grouping of repositories that share a contract namespace
+- Cross-repo link resolution over locally indexed repos in the same workspace
+- Orphan consumer detection, distinguished from unscoped consumers
+- `wonk contracts` CLI command and MCP tool
+- Blast radius extension: cross-repo consumers of a changed provider
+
+**Out of scope**
+- Runtime/dynamic contract discovery (traffic capture, OpenTelemetry ingestion)
+- Remote repos not indexed on this machine
+- Semantic verification of payload schema compatibility (field-level diffing of request/response bodies)
+- Auto-generating client code from detected contracts
+
+**EARS Requirements**
+- `PRD-CTR-REQ-001` When the system indexes a file then it shall detect contract declarations for HTTP routes, gRPC services, GraphQL operations, message-queue topics, WebSocket events, environment variables, OpenAPI documents, and scheduled jobs.
+- `PRD-CTR-REQ-002` When a contract is detected then the system shall normalize it to a canonical contract ID of the form `<kind>::<qualifier>::<identifier>` (e.g. `http::GET::/api/users/{id}`).
+- `PRD-CTR-REQ-003` When normalizing an HTTP route then the system shall apply all of the following, in order, so that a provider declaration and a consumer call site produce identical IDs:
+  - trim surrounding whitespace and quote characters;
+  - strip any URI scheme and authority, so a consumer calling `http://api.example.com/v1/users` matches a provider declaring `/v1/users`;
+  - strip a leading base-URL interpolation, with or without a leading slash, so `${API_URL}/users` and `/${BASE}/users` both yield `/users`;
+  - rewrite remaining inline interpolations (`${name}`, `$name`) and framework parameter syntaxes (`:id`, `<id>`, `<int:id>`, `{id}`) to placeholders;
+  - replace each placeholder with a **positional** marker (`{p1}`, `{p2}`, …) in declaration order;
+  - ensure a leading slash.
+
+  Positional markers are required because provider and consumer teams routinely name the same slot differently (`{wid}` vs `{workspaceId}`); embedding the developer-written name in the ID is a primary source of false orphans.
+- `PRD-CTR-REQ-004` When a contract is recorded then the system shall store its role (provider or consumer), owning symbol, file, line, and a 0.0–1.0 detection confidence.
+- `PRD-CTR-REQ-005` When two contracts in indexed repos of the same workspace share a canonical ID and hold opposite roles then the system shall record a contract link between them.
+- `PRD-CTR-REQ-006` When a consumer contract has no matching provider in any indexed repo of its workspace then the system shall flag it as an orphan consumer.
+- `PRD-CTR-REQ-007` When the user requests unused providers explicitly then the system shall report provider contracts with no matching consumer; otherwise they shall be omitted from default output.
+- `PRD-CTR-REQ-008` The system shall expose a `wonk contracts` command listing contracts filtered by kind, role, and orphan status.
+- `PRD-CTR-REQ-009` When `wonk contracts --links` is invoked then the system shall list cross-repo provider↔consumer pairs annotated with both repo names.
+- `PRD-CTR-REQ-010` When blast radius analysis targets a symbol that provides a contract then the system shall include the consumers of that contract in the results, labeled as cross-repo impact.
+- `PRD-CTR-REQ-011` Contract detection shall run inside the existing index pipeline without requiring an additional file pass.
+- `PRD-CTR-REQ-012` When no other repositories are indexed then contract queries shall return within-repo results without erroring.
+- `PRD-CTR-REQ-013` The system shall support an optional workspace identifier declared in per-repo configuration, grouping repositories that share a contract namespace.
+- `PRD-CTR-REQ-014` When resolving cross-repo contract links then the system shall consider only repositories declaring the same workspace identifier as the querying repository.
+- `PRD-CTR-REQ-015` When a repository declares no workspace identifier then its **effective workspace shall default to the repository's own name**, so that it matches only itself. Absence of a declaration shall be a narrower default, not a special case in the matching logic.
+- `PRD-CTR-REQ-016` The system shall detect, store, list, filter, and link contracts for every indexed repository regardless of workspace declaration, and shall leave all non-contract features unaffected. Workspace shall bound which repositories pair, never whether contracts are extracted.
+- `PRD-CTR-REQ-017` The workspace identifier shall be read **only** from the repository-local configuration file; a workspace value present in global configuration shall be ignored, and the system shall warn that it has no effect.
+- `PRD-CTR-REQ-018` A repository shall be able to declare one or more workspace identifiers, and two repositories shall be treated as sharing a workspace when their declared sets intersect.
+- `PRD-CTR-REQ-019` When comparing workspace identifiers then the system shall trim surrounding whitespace and compare case-insensitively.
+- `PRD-CTR-REQ-020` When a repository is indexed then the system shall record its declared workspace identifiers in that repository's index metadata, so that link resolution filters candidate repositories without reading any working-tree configuration.
+- `PRD-CTR-REQ-021` The system shall report a repository's declared workspaces and the other indexed repositories sharing them, so that a mistyped or unset identifier is visible rather than silently producing an empty match set.
+- `PRD-CTR-REQ-022` When a path parameter is normalized to a positional marker then the system shall retain the original parameter name as contract metadata, so display, drift detection, and export can show the developer-written identifier.
+- `PRD-CTR-REQ-023` When a route is declared inside a nested router, group, blueprint, or mount point then the system shall compose the enclosing prefixes into the canonical path, so that a group prefix `/v1` and a route `/users` yield `/v1/users`.
+- `PRD-CTR-REQ-024` When matching RPC-family contracts (gRPC, Thrift, tRPC) then the system shall perform a second matching pass over canonical service and method names, so that pairs are not lost to package qualification, method casing, or service-level versus method-level registration differences.
+
+**Acceptance criteria**
+- A route defined in repo A and called by a client in repo B, both declaring the same workspace, resolve to the same canonical ID and produce one link
+- Two unrelated repos in different workspaces that both expose `http::GET::/health` produce no link
+- A repo with no workspace declared matches only itself, via the repo-name default — the matcher contains no `if workspace is unset` branch
+- A repo with no workspace declared still detects contracts, answers `wonk contracts --kind http`, and links its own provider↔consumer pairs; only cross-repo pairs are absent
+- `http://api.example.com/v1/users` (consumer) and `/v1/users` (provider) produce one link
+- `${API_URL}/v1/tags/${id}` (consumer) and `/v1/tags/:id` (provider) produce one link
+- `/v1/workspaces/{wid}/tags/{id}` and `/v1/workspaces/{workspaceId}/tags/{id}` produce identical canonical IDs, and both retain their original parameter names for display
+- A route registered on a group with prefix `/v1` resolves to `/v1/...`, not `/...`
+- A workspace set in global config is ignored and warned about — it cannot silently place every repo on the machine in one workspace
+- `workspace = "payments"` and `workspace = ["payments", "platform"]` both parse; a repo in two workspaces links against members of either
+- `"Payments"`, `"payments"`, and `" payments "` are treated as the same workspace
+- `wonk status` shows the repo's workspaces and which other indexed repos share them, making a typo visible immediately
+- Link resolution reads candidate workspaces from index metadata, never from another repo's working tree
+- `wonk contracts --orphans` lists consumers with no provider within the workspace
+- `wonk blast <handler>` reports the consuming repo as cross-repo impact
+- Contract extraction adds < 15% to index build time
+- Detection covers all 12 supported languages for at least the HTTP, env var, and queue-topic kinds
+
+---
+
+### 3.32 Bundled Default Embeddings (PRD-EMB) [V5]
+
+**Problem / outcome**
+Semantic search (PRD-SEM, PRD-SDEP, PRD-SCLST, PRD-SIMP) requires the user to install and run Ollama. That external dependency contradicts wonk's single-binary promise and gates the highest-value features behind setup friction — `wonk ask` fails on a fresh install. A small embedding model compiled into the binary makes semantic search work out of the box, with Ollama demoted to an opt-in quality tier.
+
+**In scope**
+- A bundled embedding model shipped inside the binary, requiring no external service or network
+- Provider abstraction with tiers: bundled (default) and Ollama (opt-in)
+- Provider and dimension recorded per stored vector
+- Provider mismatch detection and re-embed guidance
+- Graceful fallback when a configured external provider is unreachable
+
+**Out of scope**
+- Hosted/API embedding providers (OpenAI, Cohere, Voyage)
+- Fine-tuning or per-repo model training
+- GPU acceleration for the bundled model
+- Mixing multiple providers' vectors in a single similarity search
+
+**EARS Requirements**
+- `PRD-EMB-REQ-001` The system shall include a bundled embedding model requiring no external service, used as the default embedding provider.
+- `PRD-EMB-REQ-002` When a semantic command runs with no embedding configuration then the system shall use the bundled provider and shall not require Ollama.
+- `PRD-EMB-REQ-003` When Ollama is configured as the provider then the system shall use it in place of the bundled provider.
+- `PRD-EMB-REQ-004` The system shall expose provider selection via configuration and allow per-invocation override on index-building commands.
+- `PRD-EMB-REQ-005` When a stored embedding's provider or dimension differs from the active provider then the system shall refuse to mix vector spaces and shall instruct the user to re-embed.
+- `PRD-EMB-REQ-006` When an embedding is stored then the system shall record the provider name and vector dimension alongside it.
+- `PRD-EMB-REQ-007` When embedding a 10k-symbol repository with the bundled provider then the system shall complete without network access in under 60 seconds on typical developer hardware.
+- `PRD-EMB-REQ-008` The bundled model shall add no more than 10 MB to the release binary.
+- `PRD-EMB-REQ-009` When a configured external provider is unreachable then the system shall fall back to the bundled provider and emit a warning rather than failing the query.
+
+**Acceptance criteria**
+- `wonk ask "authentication"` returns results on a fresh install with no Ollama running
+- Release binary stays under the 40 MB V5 budget
+- Switching provider in config produces a clear re-embed instruction, never silently mixed results
+- Ollama-tier results remain byte-identical to V2–V4 behavior when configured
+- Bundled-provider recall on the existing semantic test corpus is within a documented margin of the Ollama tier
+
+---
+
+### 3.33 Lexical BM25 Scoring (PRD-BM25) [V5]
+
+**Problem / outcome**
+Hybrid search fusion (PRD-RRF) merges a structural/lexical list with a semantic list, but the lexical side contributes match presence rather than a relevance score — a file mentioning a term once ranks like a file where the term is central. BM25 gives the lexical side a real score, improving both standalone ranking and the quality of the fused list.
+
+**In scope**
+- Per-term document statistics computed and stored at index time
+- BM25 scoring of lexical matches
+- Configurable `k1` and `b` parameters
+- BM25-ranked list as the lexical input to RRF fusion
+- Incremental statistics maintenance on daemon re-index
+
+**Out of scope**
+- Learned/neural re-ranking
+- Field-weighted BM25F variants
+- Query expansion or synonym handling
+
+**EARS Requirements**
+- `PRD-BM25-REQ-001` When the system indexes a file then it shall compute and store the per-term document statistics required for BM25 scoring.
+- `PRD-BM25-REQ-002` When a lexical query executes then the system shall rank matches by BM25 score rather than match presence.
+- `PRD-BM25-REQ-003` The system shall expose BM25 `k1` and `b` as configuration values, defaulting to 1.2 and 0.75.
+- `PRD-BM25-REQ-004` When hybrid fusion is requested then the system shall supply the BM25-ranked list as the lexical input to RRF.
+- `PRD-BM25-REQ-005` When the daemon re-indexes a changed file then the system shall update the affected BM25 statistics incrementally.
+- `PRD-BM25-REQ-006` When BM25 statistics are absent (index built before this feature) then the system shall fall back to the previous ranking behavior and emit a re-index hint.
+
+**Acceptance criteria**
+- Ranking regression suite shows measurable precision@10 improvement over match-presence ranking
+- BM25 scoring adds < 10ms to warm queries
+- Statistics stay correct after a sequence of daemon-driven file edits and deletions
+- Pre-V5 indexes keep working without a forced rebuild
+
+---
+
+### 3.34 Precomputed Reach Index (PRD-REACH) [V5]
+
+**Problem / outcome**
+Blast radius (PRD-BLAST) and flow (PRD-FLOW) queries run BFS over the call graph on every invocation. That is fine interactively but too expensive to run on every edit or on every changed symbol in a review. Materializing a bounded-depth reachability table turns the common case into an indexed lookup, making impact analysis cheap enough to run automatically.
+
+**In scope**
+- Materialized reach table mapping symbol → reachable symbol with minimum depth
+- Configurable precomputation depth (default 3)
+- Query path that reads the table when the requested depth is covered
+- BFS fallback beyond the precomputed depth or when the table is missing
+- Incremental maintenance by the daemon
+
+**Out of scope**
+- Full transitive closure at unbounded depth
+- Reach over cross-repo contract links (V5 contract blast uses the contracts table directly)
+- Persisted path reconstruction (the table stores reachability and depth, not full paths)
+
+**EARS Requirements**
+- `PRD-REACH-REQ-001` The system shall maintain a reach table mapping each symbol to the symbols reachable from it up to a configured depth, defaulting to 3.
+- `PRD-REACH-REQ-002` When a reach entry is stored then the system shall record the minimum depth at which the target is reachable.
+- `PRD-REACH-REQ-003` When a blast radius query falls within the precomputed depth then the system shall answer it from the reach table instead of performing BFS.
+- `PRD-REACH-REQ-004` When a blast radius query exceeds the precomputed depth then the system shall fall back to BFS traversal.
+- `PRD-REACH-REQ-005` When the daemon re-indexes a file then the system shall incrementally update reach entries for the affected symbols and their predecessors within the configured depth.
+- `PRD-REACH-REQ-006` The system shall allow reach precomputation to be disabled by configuration.
+- `PRD-REACH-REQ-007` When the reach table is absent or marked stale then queries shall fall back to BFS without erroring.
+- `PRD-REACH-REQ-008` A reach set shall never be observable in a partially-built state. Until a rebuild is complete, queries shall read the previous complete set or fall back to BFS; an in-progress rebuild shall not be readable as an empty or truncated result.
+- `PRD-REACH-REQ-009` When a reach set is bounded by any cap then the result shall carry an explicit truncation marker, and consumers shall treat it as a lower bound rather than as evidence that no further dependents exist.
+- `PRD-REACH-REQ-010` The system shall precompute reach only for symbol kinds that are plausible change targets, and shall exclude structural entries such as files, imports, and parameters.
+
+**Acceptance criteria**
+- Depth-3 blast query answers in < 50ms from the reach table
+- Reach-table results are identical to BFS results at the same depth
+- Incremental update after a single-file edit completes within the daemon's re-index budget
+- Disabling precomputation returns the system to V4 behavior exactly
+
+---
+
+### 3.35 Diff-Scoped Review Workflow (PRD-REV) [V5]
+
+**Problem / outcome**
+Scoped change detection (PRD-CHG), blast radius (PRD-BLAST), and contracts (PRD-CTR) each answer part of "is this change safe?", but an agent must chain them manually and re-derive the same context each time. A single diff-scoped review command composes them into line-anchored findings with a verdict, giving agents and humans one call for change risk.
+
+**In scope**
+- Diff-scoped analysis reusing existing change scopes (unstaged, staged, all, compare-to-ref)
+- Line-anchored findings with severity
+- Overall verdict: BLOCK / REVIEW / APPROVE
+- Breaking-change detection for removed or signature-changed symbols that still have callers
+- Missing-test-coverage warnings derived from blast radius
+- Cross-repo contract impact findings
+- NDJSON output and MCP tool exposure
+
+**Out of scope**
+- Style/lint findings (delegated to existing linters)
+- LLM-authored prose review comments
+- Posting findings to GitHub/GitLab
+- Auto-fix or patch suggestion
+
+**EARS Requirements**
+- `PRD-REV-REQ-001` When `wonk review` is invoked then the system shall determine the changed symbols for the selected scope using scoped change detection.
+- `PRD-REV-REQ-002` When a changed symbol is identified then the system shall compute its blast radius and attach the affected symbols as review context.
+- `PRD-REV-REQ-003` The system shall emit each finding anchored to a file and line.
+- `PRD-REV-REQ-004` Each finding shall carry a severity of blocking, warning, or note.
+- `PRD-REV-REQ-005` The system shall emit an overall verdict of BLOCK, REVIEW, or APPROVE derived from the highest-severity finding.
+- `PRD-REV-REQ-006` When a removed or signature-changed symbol still has indexed callers then the system shall report a blocking finding naming those callers.
+- `PRD-REV-REQ-007` When a changed symbol's blast radius contains no test files then the system shall report a warning finding.
+- `PRD-REV-REQ-008` The system shall support the same change scopes as scoped change detection: unstaged, staged, all, and comparison against a git ref.
+- `PRD-REV-REQ-009` The system shall support NDJSON output for review findings.
+- `PRD-REV-REQ-010` When a changed symbol provides a contract consumed by another indexed repository then the system shall emit a cross-repo impact finding naming the consuming repo.
+- `PRD-REV-REQ-011` When anchoring a finding then the system shall resolve its location through an ordered set of strategies — new-side diff hunk, removed (old-side) diff line, post-change file, then unresolved — and shall record which strategy produced the anchor.
+- `PRD-REV-REQ-012` When a finding concerns removed code then the system shall anchor it to the removed line's old-side position, so that findings about deletions are locatable; when no strategy resolves a location, the finding shall be reported without a line rather than with a fabricated one.
+- `PRD-REV-REQ-013` Each finding shall carry a stable identity derived from its rule, category, file path, symbol, and the normalized text of the anchored line, **excluding the line number**, so that the identity survives reformatting and unrelated edits above it.
+- `PRD-REV-REQ-014` The system shall support a durable per-repository suppression list keyed by finding identity, so that a confirmed false positive stays silenced until explicitly removed.
+- `PRD-REV-REQ-015` When findings are filtered or capped then the system shall report the number dropped for each distinct reason, so that suppression is never silent.
+
+**Acceptance criteria**
+- `wonk review --since main` returns findings and a verdict in one call
+- Removing a called public function yields BLOCK with the callers listed
+- A changed symbol with no test coverage in its blast radius yields a warning, not a block
+- Changing a route handler consumed by a sibling indexed repo yields a cross-repo finding
+- NDJSON output is consumable by an agent without post-processing
+
+---
+
+### 3.36 Body Elision (PRD-ELIDE) [V5]
+
+**Problem / outcome**
+Every wonk command that returns source pays for function bodies the agent usually does not need. `wonk show` on a large file, `wonk context` on a hub symbol, and `wonk review` on a wide diff all return complete implementations when the agent is orienting, not reading. `wonk show --shallow` already recognizes this for containers, but it is a narrow special case: it works on one symbol kind and drops bodies entirely. Body elision generalizes it — any source wonk returns can be rendered with bodies collapsed to a counted stub, optionally retaining control-flow lines so the branching skeleton survives. This is the most direct expression of wonk's north-star metric: fewer lines, same answer.
+
+**In scope**
+- Body compression for any returned source: signatures, imports, top-level declarations, and comments preserved; bodies replaced by a counted stub
+- Per-language stub syntax appropriate to the grammar
+- Salience mode: retain control-flow lines verbatim inside an otherwise collapsed body
+- Opt-in application across `show`, `summary`, `context`, and `review` output
+- Fail-soft degradation to unmodified source
+
+**Out of scope**
+- Semantic summarization of bodies (that is `summary --semantic`)
+- Lossy rewriting of retained lines
+- Elision of anything other than function/method bodies — types, constants, and declarations are always returned intact
+
+**EARS Requirements**
+- `PRD-ELIDE-REQ-001` When body elision is requested then the system shall replace each function and method body with a single-line stub while preserving signatures, imports, top-level declarations, and comments.
+- `PRD-ELIDE-REQ-002` Each stub shall state the number of source lines it replaced.
+- `PRD-ELIDE-REQ-003` The stub shall use syntax appropriate to the target language, so that elided output remains recognizable as that language.
+- `PRD-ELIDE-REQ-004` When salience retention is requested then the system shall keep lines carrying control-flow structure verbatim inside an otherwise elided body.
+- `PRD-ELIDE-REQ-005` When a line is retained for salience then the surrounding elided regions shall still report their replaced line counts, so the output never implies the retained lines are the whole body.
+- `PRD-ELIDE-REQ-006` When the language is unsupported, the grammar is unavailable, or parsing fails then the system shall return the original source unchanged and signal that elision did not occur.
+- `PRD-ELIDE-REQ-007` Elision shall never alter the text of a line it retains.
+- `PRD-ELIDE-REQ-008` The system shall offer body elision on source-returning commands, defaulting to off so existing output is unchanged.
+- `PRD-ELIDE-REQ-009` When both elision and an existing shallow mode apply to the same request then the system shall apply a single, documented rendering rather than compounding them.
+- `PRD-ELIDE-REQ-010` Elision shall operate on source the system has already parsed or read, and shall not require a separate parse pass at query time.
+
+**Acceptance criteria**
+- Eliding a large source file preserves every signature and import while reducing returned lines by a measured majority
+- Every stub reports its replaced line count — no body vanishes without a number
+- Salience mode retains conditionals, loops, and match arms verbatim while still counting what it dropped
+- An unsupported language returns byte-identical original source, with elision reported as not applied
+- Retained lines are byte-identical to the source
+- Default output across all commands is unchanged when elision is not requested
+
+---
+
+### 3.37 Signal-Based Reranking (PRD-RANK) [V5]
+
+**Problem / outcome**
+Wonk ranks results by **ordinal category** — Definition outranks CallSite outranks Import, and no amount of contrary evidence changes that. The ordering is explainable and cheap, but it cannot accumulate evidence: a barely-matching definition in a generated file outranks a perfect call-site match in the file the user is editing, because tier comparison happens before anything else is considered. BM25 (PRD-BM25) improves the lexical score feeding fusion but cannot fix this, since fusion consumes *ranked lists* and the structural list is still ordered by tier alone.
+
+Signal-based reranking replaces the single ordinal comparison with a weighted sum of independent, normalized signals — lexical score, semantic similarity, structural centrality, path character, symbol-kind bias, query-term proximity. Category becomes the highest-weighted signal rather than an absolute gate, so today's ordering is the default outcome while genuinely strong contrary evidence can now overturn it.
+
+**In scope**
+- A pipeline of named signals, each contributing a normalized value, combined by configurable weights
+- Per-signal contribution retained on each result and inspectable
+- Query classification (symbol / path / signature / concept) driving per-class weight adjustment
+- Signals derived from data wonk already indexes: lexical score, semantic similarity, caller count, symbol kind, path character, term proximity, signature match, name-collision prominence
+- Migration path that preserves current ordering by default
+
+**Out of scope**
+- Signals requiring data wonk does not yet index. These are **not excluded from the roadmap** — each is specified as its own feature because each needs distinct infrastructure: history-derived signals (PRD-HIST), graph-topology signals (PRD-TOPO), near-duplicate similarity (PRD-DUP), and usage feedback (PRD-FB). This feature defines the pipeline they plug into.
+- Learned or model-based reranking (statistical feedback weighting is PRD-FB; training a model is not in scope)
+- Per-user or cross-repo personalization — feedback stays per-repository
+
+**EARS Requirements**
+- `PRD-RANK-REQ-001` The system shall score results by summing named signal contributions, where each signal returns a normalized value and is scaled by a configured weight.
+- `PRD-RANK-REQ-002` Each signal shall be a pure function of the candidate result and shared query context, with no hidden state.
+- `PRD-RANK-REQ-003` When a signal's weight is zero then the system shall skip its evaluation entirely.
+- `PRD-RANK-REQ-004` The system shall retain each signal's unweighted contribution on the result.
+- `PRD-RANK-REQ-005` The system shall provide a means to display the per-signal breakdown for returned results, so that a ranking can be explained without re-running the query.
+- `PRD-RANK-REQ-006` Signal weights shall be configurable, and an unrecognized signal name in configuration shall be rejected rather than ignored.
+- `PRD-RANK-REQ-007` The system shall classify a query as symbol-shaped, path-shaped, signature-shaped, or conceptual, and shall allow the caller to pin the class explicitly.
+- `PRD-RANK-REQ-008` When a query is classified then the system shall adjust the lexical and semantic signal weights according to that class, so literal queries lean on exact-token evidence and conceptual queries lean on semantic evidence.
+- `PRD-RANK-REQ-009` The conceptual class shall be the neutral baseline, applying no adjustment.
+- `PRD-RANK-REQ-010` The system shall provide a symbol-kind signal that reproduces the existing category ordering, weighted such that current results are preserved when no other signal discriminates.
+- `PRD-RANK-REQ-011` The system shall provide a path-character signal that reduces the contribution of results in test files, compatibility shims, examples, type-declaration files, re-export barrels, and generated files that shadow a hand-written peer.
+- `PRD-RANK-REQ-012` The system shall provide a structural-centrality signal derived from a symbol's indexed caller count.
+- `PRD-RANK-REQ-013` The system shall provide a proximity signal reflecting how closely query terms occur together in the matched text.
+- `PRD-RANK-REQ-014` The system shall provide a signature-match signal for queries that resemble a type or function signature.
+- `PRD-RANK-REQ-015` When multiple indexed symbols share a queried name then the system shall provide a prominence signal distinguishing them.
+- `PRD-RANK-REQ-016` Reranking shall add no more than 20 milliseconds to a warm query.
+- `PRD-RANK-REQ-017` Reranking shall be introduced behind configuration defaulting to the current ordering, and shall become the default only once a ranking regression suite demonstrates improvement.
+
+**Acceptance criteria**
+- A strong call-site match can outrank a weak definition, which is impossible today
+- With the kind signal dominant and others at zero, output is identical to current ranking — proving the migration is a superset
+- `wonk search --why` shows each result's per-signal breakdown and final score
+- A symbol-shaped query ranks exact-token matches above semantically related ones; a conceptual query does the reverse
+- A test-file result and an implementation result with equal lexical scores rank implementation first
+- An unknown signal name in config is an error, not a silent no-op
+- Reranking adds < 20ms to warm queries
+- Ranking regression suite shows measured precision@10 improvement before the default flips
+
+---
+
+### 3.38 History-Derived Signals (PRD-HIST) [V5]
+
+**Problem / outcome**
+Wonk ranks on the current snapshot alone. But a file rewritten fifteen times this quarter and a file untouched for three years are not equally likely to be what someone is looking for, and files that repeatedly change *together* encode a coupling no static edge records — a handler and its serializer, a schema and its migration. Git already holds this evidence; wonk indexes a git repository and never reads its history.
+
+**In scope**
+- Change frequency per file and symbol, over a bounded history window
+- Co-change coupling: which files repeatedly change in the same commit
+- Both exposed as rerank signals
+- Incremental refresh as new commits land
+
+**Out of scope**
+- Author or ownership attribution — who changed something is not used for ranking
+- Blame-level line attribution
+- Mining anything but the local repository's history
+
+**EARS Requirements**
+- `PRD-HIST-REQ-001` The system shall derive a change-frequency score per file from the repository's commit history.
+- `PRD-HIST-REQ-002` The system shall bound history mining to a configurable window, so that cost is proportional to recent activity rather than total repository age.
+- `PRD-HIST-REQ-003` When computing change frequency then the system shall weight recent changes more heavily than older ones within the window.
+- `PRD-HIST-REQ-004` The system shall derive co-change coupling between files that appear together in the same commit, retaining only the strongest couplings per file.
+- `PRD-HIST-REQ-005` When a commit touches an implausibly large number of files then the system shall exclude it from co-change derivation, so that bulk reformatting and vendored imports do not manufacture coupling.
+- `PRD-HIST-REQ-006` The system shall expose change frequency and co-change coupling as rerank signals.
+- `PRD-HIST-REQ-007` When new commits are detected then the system shall refresh history-derived data incrementally rather than re-mining the window.
+- `PRD-HIST-REQ-008` When the repository has no history, history is unreadable, or mining is disabled then history signals shall contribute nothing and no other feature shall be affected.
+
+**Acceptance criteria**
+- A frequently-modified file outranks a dormant one when other signals are equal
+- A file that repeatedly changes alongside the query's target is surfaced
+- A 500-file reformatting commit produces no co-change coupling
+- Mining a large repository's window completes within the index build budget
+- A repository with no `.git` behaves exactly as today
+
+---
+
+### 3.39 Graph-Topology Signals (PRD-TOPO) [V5]
+
+**Problem / outcome**
+Wonk stores a call graph but ranks with only its simplest property — whether an edge exists. The graph's *shape* carries information the edge list does not: which symbols are authorities that much of the codebase depends on, which are hubs that reach broadly, and which cluster into cohesive modules regardless of directory layout. Fan-in alone conflates a utility called everywhere with a core abstraction called by important callers.
+
+**In scope**
+- Hub and authority scoring over the call graph
+- Community detection identifying cohesive symbol groups
+- Both exposed as rerank signals
+- Recomputation on a cadence with explicit staleness
+
+**Out of scope**
+- Cross-repo topology — scoring is per repository
+- Replacing the existing embedding-based clustering (`wonk cluster`), which groups by meaning rather than connectivity
+- Using topology for anything other than ranking in this feature
+
+**EARS Requirements**
+- `PRD-TOPO-REQ-001` The system shall compute hub and authority scores for indexed symbols from the call graph.
+- `PRD-TOPO-REQ-002` The system shall compute community assignments grouping symbols by connectivity.
+- `PRD-TOPO-REQ-003` The system shall expose hub, authority, and community-membership as rerank signals.
+- `PRD-TOPO-REQ-004` When a query's results fall predominantly in one community then the system shall be able to favor results from that community.
+- `PRD-TOPO-REQ-005` Topology computation shall be bounded by a configurable iteration limit and shall terminate deterministically.
+- `PRD-TOPO-REQ-006` Because topology is a global property of the graph, the system shall recompute it on a cadence rather than per file change, and shall record when it was last computed.
+- `PRD-TOPO-REQ-007` When topology data is stale beyond a configured threshold then the system shall continue serving it while marking it stale, rather than blocking a query on recomputation.
+- `PRD-TOPO-REQ-008` When topology data is absent or disabled then topology signals shall contribute nothing.
+
+**Acceptance criteria**
+- A widely-depended-upon core type outranks an equally-matched leaf helper
+- Community assignment groups a cohesive subsystem together despite spanning directories
+- Recomputation is deterministic — identical graph yields identical scores
+- Staleness is visible, and a stale score never blocks a query
+- Disabling topology returns ranking to its prior behavior exactly
+
+---
+
+### 3.40 Near-Duplicate Similarity (PRD-DUP) [V5]
+
+**Problem / outcome**
+Copy-pasted code is ranked as if each copy were independent evidence, so a query can return five near-identical results and spend the budget saying one thing five times. Embeddings blur exactly the lexical detail that distinguishes near-duplicates, so semantic similarity cannot detect this.
+
+**In scope**
+- Near-duplicate detection between symbols by lexical shingling
+- A rerank signal that demotes results near-identical to a higher-ranked result
+- Reporting duplicate groups
+
+**Out of scope**
+- Refactoring suggestions or de-duplication actions
+- Cross-repository duplicate detection
+- Semantic (non-lexical) clone detection, which embeddings already approximate
+
+**EARS Requirements**
+- `PRD-DUP-REQ-001` The system shall compute a compact similarity signature per indexed symbol body.
+- `PRD-DUP-REQ-002` The system shall estimate pairwise similarity between symbols from their signatures without comparing full bodies.
+- `PRD-DUP-REQ-003` When two symbols exceed a configurable similarity threshold then the system shall record them as near-duplicates.
+- `PRD-DUP-REQ-004` When a result is a near-duplicate of a higher-ranked result in the same response then the system shall reduce its contribution, so that a response spends its budget on distinct content.
+- `PRD-DUP-REQ-005` The system shall retain at least one representative of a duplicate group in results — demotion shall never remove every copy.
+- `PRD-DUP-REQ-006` The system shall be able to report near-duplicate groups on request.
+
+**Acceptance criteria**
+- Five copy-pasted handlers return one representative ranked normally and the rest demoted, not five equal hits
+- Signature comparison does not read symbol bodies at query time
+- A duplicate group always yields at least one result
+- Threshold is tunable and its effect visible in the ranking explanation
+
+---
+
+### 3.41 Usage Feedback Loop (PRD-FB) [V5]
+
+**Problem / outcome**
+Wonk has no idea whether its answers were useful. The agent calling it knows — it discovers which result it actually opened and which were noise — and that knowledge is discarded at the end of every session. Capturing it lets a repository's ranking improve with use, which is the only signal source reflecting *this* codebase's actual work rather than general heuristics.
+
+The design question is what feedback teaches. Recording that a specific result won a specific query is memorization: it requires the same query to recur before it pays off, which in practice it rarely does, and any attempt to widen the key transfers a preference about one result onto queries it was never about. Instead, feedback adjusts **the weights of the ranking signals themselves**. The reranking pipeline (PRD-RANK) already decomposes every candidate into named signal contributions, so a feedback event is an observation about which criteria mattered — dense, transferable across queries that share nothing but shape, and expressible as a small set of numbers a human can read and override.
+
+Learning criteria rather than results also removes the mechanism by which feedback could entrench a mistake: there is no per-item boost to reinforce, so a promoted result cannot feed its own promotion.
+
+This is still the feature most in tension with wonk's other properties. Ranking that changes with accumulated feedback is not reproducible from the index alone, and a benchmark run against feedback-influenced ranking measures a moving target. The requirements below bound both.
+
+**In scope**
+- An interface for the calling agent to report which results were useful, including which alternatives were shown and passed over
+- Per-repository learning of feature weights, over both ranking signals and descriptive result properties, overall and per query class
+- Descriptive properties spanning path character, symbol attributes, match shape, graph position, modification history, and optional working-context relation
+- Cardinality control: hierarchical path features, bucketed continuous values, capped categoricals
+- Bounded drift from default weights, with decay
+- A hard-gated item-level memory for results confirmed across many distinct sessions
+- Inspection, export, reset-to-defaults, and a disable switch
+- A deterministic mode that ignores feedback entirely
+
+**Out of scope**
+- Cross-repository or cross-user feedback sharing — feedback never leaves the machine
+- Training a general ranking model; learning is confined to weights over named, human-readable features
+- Inferring usefulness from data the agent did not report
+- Feedback influencing anything other than ranking
+
+**EARS Requirements**
+- `PRD-FB-REQ-001` The system shall provide an interface by which a caller reports which returned results were useful for a query.
+- `PRD-FB-REQ-002` When feedback is reported then the system shall also record the other results returned for that query and their ranks, so that credit can be assigned by contrast rather than in isolation.
+- `PRD-FB-REQ-003` The system shall expose this interface to agent callers over the MCP server and to humans on the command line.
+- `PRD-FB-REQ-004` Feedback shall be stored per repository and shall never be transmitted off the machine.
+- `PRD-FB-REQ-005` Feedback shall be recorded against a result identity that survives re-indexing and unrelated edits to the file.
+- `PRD-FB-REQ-006` When the code a feedback entry refers to changes materially then the entry shall no longer apply.
+- `PRD-FB-REQ-007` The system shall derive adjustments to ranking signal weights from accumulated feedback, by comparing the signal contributions of results reported useful against those of results returned but not reported useful.
+- `PRD-FB-REQ-008` The system shall learn weight adjustments per query class as well as overall, so that criteria can differ between literal and conceptual queries.
+- `PRD-FB-REQ-009` When a result reported useful was already ranked first then the system shall not derive a weight adjustment from that event, so that learning is driven by cases where the existing ranking was wrong rather than by cases where it was already right.
+- `PRD-FB-REQ-010` Learned weight adjustments shall be bounded by a configurable maximum deviation from the default weights.
+- `PRD-FB-REQ-011` Learned adjustments shall decay toward the defaults with age, so that criteria reflect recent work.
+- `PRD-FB-REQ-012` The system shall present learned weights alongside their default values, so that what has been learned is legible as a set of named numbers.
+- `PRD-FB-REQ-013` The system shall allow learned weights to be reset to defaults, in whole or per signal, independently of resetting recorded feedback.
+- `PRD-FB-REQ-014` The feedback signal's contribution shall appear in the ranking explanation alongside every other signal.
+- `PRD-FB-REQ-015` The system shall record how many distinct sessions contributed feedback for a result, so that a single session cannot present as broad agreement.
+- `PRD-FB-REQ-016` The system shall apply a direct per-result preference only when that result has been reported useful across at least a configurable number of distinct sessions, and its influence shall be capped below that of learned weights.
+- `PRD-FB-REQ-017` The system shall provide a mode in which all feedback influence is ignored, producing ranking reproducible from the index alone.
+- `PRD-FB-REQ-018` When ranking is measured for benchmarking or regression testing then feedback shall be ignored by default, so that measurement is not self-confirming.
+- `PRD-FB-REQ-019` The system shall allow recorded feedback to be listed, exported, and reset, in whole or for a single result.
+- `PRD-FB-REQ-020` The system shall not require feedback to function; absent feedback, ranking shall behave exactly as it does with the feature disabled.
+- `PRD-FB-REQ-021` When results are returned then the system shall record descriptive properties of each result — path character, symbol attributes, match shape, graph position, and modification history — alongside its signal contributions, so that learning can range over attributes that are not themselves ranking criteria.
+- `PRD-FB-REQ-022` When recording a result's location then the system shall emit one feature per ancestor directory, so that a preference can be learned at whatever level of the tree the evidence supports.
+- `PRD-FB-REQ-023` When recording a continuous property then the system shall bucket it, so that learning generalizes across nearby values rather than treating each value as distinct.
+- `PRD-FB-REQ-024` When a categorical property exceeds a configured cardinality then the system shall assign further values to a shared bucket, so that the feature space stays bounded.
+- `PRD-FB-REQ-025` A feature shall contribute nothing to ranking until it has accumulated a configurable minimum number of observations across distinct sessions.
+- `PRD-FB-REQ-026` A feature never previously observed shall default to no influence, so that adding features cannot perturb ranking before evidence justifies it.
+- `PRD-FB-REQ-027` The system shall accept an optional description of the caller's current working context, and when provided shall record features relating each result to it.
+- `PRD-FB-REQ-028` The system shall make author-derived features individually switchable, so that a repository can exclude them without disabling the feature set they belong to.
+- `PRD-FB-REQ-029` When learned feature weights are presented then the system shall show each weight's supporting observation count, so that a weight resting on little evidence is distinguishable from one resting on much.
+
+**Acceptance criteria**
+- An agent reports usefulness over MCP in one call, and the call carries the alternatives that were shown
+- Reporting that implementation files were useful over test files repeatedly shifts the path-character weight, and that shift is visible as a named number against its default
+- The learned shift generalizes to a query sharing no terms with any query that produced feedback — the property item-keyed feedback cannot deliver
+- Feedback on a result already ranked first produces no weight change
+- Learned weights cannot exceed the configured deviation from defaults under adversarial repetition
+- Editing the code a feedback entry refers to retires that entry
+- A per-result preference does not apply until confirmed across the configured number of distinct sessions
+- `--no-feedback` reproduces index-only ranking exactly
+- Benchmarks run feedback-free unless explicitly enabled
+- Learned weights can be reset to defaults independently of clearing feedback history
+- A preference for results under one subtree is learned at the directory level the evidence supports, not only at the exact path
+- A feature seen three times does not influence ranking; the same feature seen across many sessions does
+- Adding a new feature to the recorded set changes no ranking until feedback accumulates for it
+- With a working-context hint supplied, results near the caller's current file rank higher once that pattern is confirmed
+- Author-derived features participate in learning like any other feature, and can be switched off individually
+- Every displayed weight carries the observation count behind it
+
+---
+
 ## 4) Traceability
 
 | Feature | Requirement IDs | Count |
@@ -1037,7 +1537,18 @@ When an LLM agent works across related repositories, it must start a separate MC
 | Edge Confidence Scoring | PRD-CONF-REQ-001 to 006 | 6 |
 | Inheritance Tracking | PRD-HRTG-REQ-001 to 005 | 5 |
 | Multi-Repo MCP | PRD-MREP-REQ-001 to 006 | 6 |
-| **Total** | | **215** |
+| Cross-Repo Contract Detection | PRD-CTR-REQ-001 to 024 | 24 |
+| Bundled Default Embeddings | PRD-EMB-REQ-001 to 009 | 9 |
+| Lexical BM25 Scoring | PRD-BM25-REQ-001 to 006 | 6 |
+| Precomputed Reach Index | PRD-REACH-REQ-001 to 010 | 10 |
+| Diff-Scoped Review Workflow | PRD-REV-REQ-001 to 015 | 15 |
+| Body Elision | PRD-ELIDE-REQ-001 to 010 | 10 |
+| Signal-Based Reranking | PRD-RANK-REQ-001 to 017 | 17 |
+| History-Derived Signals | PRD-HIST-REQ-001 to 008 | 8 |
+| Graph-Topology Signals | PRD-TOPO-REQ-001 to 008 | 8 |
+| Near-Duplicate Similarity | PRD-DUP-REQ-001 to 006 | 6 |
+| Usage Feedback Loop | PRD-FB-REQ-001 to 029 | 29 |
+| **Total** | | **360** |
 
 ---
 
@@ -1053,6 +1564,18 @@ When an LLM agent works across related repositories, it must start a separate MC
 | OQ-006 | Similarity threshold | Should there be a minimum cosine similarity score below which results are not shown? Needs calibration with real queries. | Open |
 | OQ-007 | Clustering algorithm | k-means vs. DBSCAN vs. hierarchical? Depends on typical symbol counts per directory. | Open |
 | OQ-008 | Multi-daemon resource management | With daemons running indefinitely across many repos, should there be a global limit or resource budget? | Open |
+| OQ-009 | Bundled model choice | Which small embedding model gives the best code-recall per MB within the 10 MB budget (static word vectors vs. a quantized transformer)? Needs a bake-off on the existing semantic test corpus. | Open |
+| OQ-010 | Contract kind priority | All 8 contract kinds are specified, but which subset covers the most real cross-repo questions? Detection quality per kind varies by framework — may warrant shipping HTTP + queue topics first. | Open |
+| OQ-011 | Contract confidence threshold | Should low-confidence contract detections be hidden by default, and at what cutoff? Needs calibration against real polyrepo setups. | Open |
+| OQ-012 | Reach index storage cost | Depth-3 reach on a dense call graph can approach O(symbols × reach). What is the practical size on a large repo, and does it need a per-symbol fan-out cap? | Open |
+| OQ-013 | Review verdict calibration | Which findings justify BLOCK vs. REVIEW? Over-blocking makes the verdict noise; needs validation against real PRs before defaults are frozen. | Open |
+| OQ-014 | Workspace declaration ergonomics | Requiring an explicit workspace per repo is safe but adds setup friction, and an unset workspace means no cross-repo value. Should it default to an inferred grouping (common parent directory, git remote org) with explicit declaration as override? Inference risks reintroducing the false-link problem it exists to prevent. | Open |
+| OQ-015 | Ranking ground truth | Signal weights cannot be tuned — or a regression demonstrated — without a labeled query set giving expected results for representative queries. Building one is a prerequisite for flipping reranking on by default, not a follow-up. What size and provenance? | Open |
+| OQ-016 | Feedback generalization key | ~~Exact-query-string feedback is too sparse; generalizing by query class plus term overlap risks bleeding into unrelated queries.~~ **Resolved: feedback adjusts signal weights rather than boosting results, so generalization is over criteria rather than over queries and no key is needed. Superseded by OQ-019.** | Resolved |
+| OQ-017 | History window size | How far back should mining go before old churn stops predicting relevance, and does the answer differ for churn versus co-change? | Open |
+| OQ-018 | Topology recompute cadence | Hub/authority and community are global properties, so they cannot be maintained incrementally by the daemon. How stale can they get before ranking degrades, and does recompute belong on a timer, a commit-count threshold, or an explicit command? | Open |
+| OQ-019 | Weight update rule and learning rate | Given contrastive events (useful result vs. passed-over alternatives with known signal contributions), what update rule and step size converge without oscillating on sparse feedback? A too-large step lets a handful of events swing ranking; too small and the feature never demonstrates value. Needs real usage traces. | Open |
+| OQ-020 | Feature set selection and bucketing granularity | Which descriptive properties genuinely predict usefulness, and at what bucket granularity? Too coarse and the feature carries no information; too fine and it never accumulates observations. The recorded set is deliberately broader than the useful set — pruning needs real feedback data. | Open |
 
 ---
 
@@ -1061,9 +1584,12 @@ When an LLM agent works across related repositories, it must start a separate MC
 - **LSP server integration.** V1 uses Tree-sitter only. LSP backends (for type-aware resolution) are a V2 feature.
 - ~~**Semantic / embedding search.** Natural language queries require an embedding model. Deferred to V2.~~ **Moved to V2 scope: PRD-SEM, PRD-SDEP, PRD-SCLST, PRD-SIMP.**
 - ~~**Directory summaries.** LLM-generated descriptions of what each directory does. Deferred to V2.~~ **Moved to V2 scope: PRD-SUM.**
-- **Cross-language call graphs.** Connecting a Python HTTP call to a Go handler. Remains out of scope through V4.
+- ~~**Cross-language call graphs.** Connecting a Python HTTP call to a Go handler.~~ **Partially addressed in V5 (PRD-CTR): cross-language, cross-repo links are established at contract boundaries (routes, topics, RPC), not by resolving call sites. In-process cross-language call resolution remains out of scope.**
 - **Editor integrations.** VS Code extension, Neovim plugin, etc. V1 is CLI-only.
-- ~~**Remote / monorepo support.** V1 targets single local repos. Multi-root workspaces and remote indexing are future work.~~ **Multi-repo MCP partially addressed in V4 (PRD-MREP). Cross-repo search and remote indexing remain out of scope.**
-- **Web UI.** All interaction is through the CLI.
+- ~~**Remote / monorepo support.** V1 targets single local repos. Multi-root workspaces and remote indexing are future work.~~ **Multi-repo MCP addressed in V4 (PRD-MREP); cross-repo contract linking over locally indexed repos addressed in V5 (PRD-CTR). Cross-repo symbol search and remote indexing remain out of scope.**
+- **Web UI.** All interaction is through the CLI. Graph visualization surfaces are explicitly rejected — they do not serve the agent-facing, token-efficiency mission.
 - **Dynamic dispatch resolution.** Virtual calls, trait objects, and function pointers are not resolved by static analysis. Out of scope through V4.
 - **ML-based confidence estimation.** Edge confidence uses static heuristics only (PRD-CONF). ML/runtime adjustment is out of scope.
+- **Hosted embedding APIs.** V5 ships a bundled default provider with Ollama as an opt-in tier (PRD-EMB). Cloud embedding APIs are out of scope — they would reintroduce a network dependency and send source code off-machine.
+- **Runtime contract discovery.** V5 contract detection is static (PRD-CTR). Traffic capture, OpenTelemetry ingestion, and payload schema compatibility checking are out of scope.
+- **Review posting / auto-fix.** `wonk review` (PRD-REV) emits findings; posting them to GitHub/GitLab or generating fixes is left to the calling agent.

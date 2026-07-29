@@ -4,15 +4,15 @@
 - PRD: `specs/product_specs.md`
 - Architecture: `specs/architecture.md`
 
-**Last updated:** 2026-02-25
+**Last updated:** 2026-07-29
 **Status:** In Progress
 
 ---
 
 ## Overview
 
-**Total Tasks:** 74
-**Milestones:** 25
+**Total Tasks:** 105
+**Milestones:** 36
 
 ### Milestone Summary
 
@@ -32,17 +32,28 @@
 | M12 | Semantic Blending & Dependency Scoping | 3 | Complete |
 | M13 | Semantic Clustering (`wonk cluster`) | 2 | Complete |
 | M14 | Change Impact Analysis (`wonk impact`) | 2 | Complete |
-| M15 | Call Graph Data Model & Indexing | 2 | In Progress |
+| M15 | Call Graph Data Model & Indexing | 2 | Complete |
 | M16 | Source Display (`wonk show`) | 2 | Complete |
 | M17 | Call Graph Commands | 2 | Complete |
 | M18 | Code Summary Engine (`wonk summary`) | 2 | Complete |
-| M19 | Edge Confidence & Inheritance Infrastructure | 3 | In Progress |
+| M19 | Edge Confidence & Inheritance Infrastructure | 3 | Complete |
 | M20 | Hybrid Search Fusion (RRF) | 1 | Complete |
-| M21 | Execution Flow Detection (`wonk flows`) | 1 | Not Started |
-| M22 | Blast Radius Analysis (`wonk blast`) | 1 | Not Started |
-| M23 | Scoped Change Detection (`wonk changes`) | 2 | Not Started |
-| M24 | Unified Symbol Context (`wonk context`) | 1 | Not Started |
-| M25 | Multi-Repo MCP | 1 | Not Started |
+| M21 | Execution Flow Detection (`wonk flows`) | 1 | Complete |
+| M22 | Blast Radius Analysis (`wonk blast`) | 1 | Complete |
+| M23 | Scoped Change Detection (`wonk changes`) | 2 | Complete |
+| M24 | Unified Symbol Context (`wonk context`) | 1 | Complete |
+| M25 | Multi-Repo MCP | 1 | Complete |
+| M26 | Bundled Embedding Provider | 3 | Not Started |
+| M27 | Lexical BM25 Scoring | 2 | Not Started |
+| M28 | Precomputed Reach Index | 2 | Not Started |
+| M29 | Cross-Repo Contract Detection | 5 | Not Started |
+| M30 | Diff-Scoped Review Workflow | 3 | Not Started |
+| M31 | Body Elision | 2 | Not Started |
+| M32 | Signal-Based Reranking | 4 | Not Started |
+| M33 | History-Derived Signals | 2 | Not Started |
+| M34 | Graph-Topology Signals | 2 | Not Started |
+| M35 | Near-Duplicate Similarity | 1 | Not Started |
+| M36 | Usage Feedback Loop | 5 | Not Started |
 
 ### Dependency Graph
 
@@ -107,6 +118,43 @@ M24: Unified Symbol Context (depends: M21 + M19)
 │
 M25: Multi-Repo MCP (independent)
 ├── TASK-074
+
+M26: Bundled Embedding Provider (independent)
+├── TASK-075 ──┬── TASK-076
+│              └── TASK-077 ←── TASK-075 + TASK-076
+│
+M27: Lexical BM25 Scoring (depends: V4 M20 for the fusion seam)
+├── TASK-078 ── TASK-079 ←── TASK-078 + TASK-068
+│
+M28: Precomputed Reach Index (depends: V3 M15 + V4 M22)
+├── TASK-080 ←── TASK-058 + TASK-070
+├── TASK-081 ←── TASK-080
+│
+M29: Cross-Repo Contract Detection (depends: V4 M25 for the repo registry)
+├── TASK-082 ──┬── TASK-083 ←── TASK-082
+│              ├── TASK-087 (queue/websocket/job kinds)
+│              ├── TASK-088 (grpc/graphql/openapi + RPC canonical join)
+│              └── TASK-084 ←── TASK-083 + TASK-088 + TASK-074 + TASK-070
+│
+M30: Diff-Scoped Review Workflow (depends: M28 + M29 + V4 M23)
+├── TASK-085 ←── TASK-072 + TASK-081
+├── TASK-086 ←── TASK-085 + TASK-084
+├── TASK-089 ←── TASK-085
+│
+M31: Body Elision (independent — needs only bundled grammars)
+├── TASK-090 ── TASK-091
+│
+M32: Signal-Based Reranking (depends: M27 for the lexical signal)
+├── TASK-092 ──┬── TASK-093 ←── TASK-092 + TASK-079
+│              └── TASK-094
+│                    └── TASK-095 ←── TASK-093 + TASK-094
+│
+M33-M36: Extended signals (all depend: M32 for the Signal seam)
+├── M33 TASK-096 ── TASK-097            (history: churn → co-change)
+├── M34 TASK-098 ── TASK-099            (topology: hub/authority → community)
+├── M35 TASK-100                        (near-duplicate: independent)
+└── M36 TASK-101 ── TASK-105 ── TASK-102 ──┬── TASK-103  (capture+slate → feature extraction → learning → controls)
+                                           └── TASK-104  (session-gated per-result layer)
 ```
 
 ### Critical Path
@@ -141,6 +189,26 @@ TASK-065 → TASK-066 → TASK-067 (M19)
 Track A: TASK-068 (M20 — RRF) — can start immediately
 Track B: TASK-074 (M25 — Multi-Repo MCP) — can start immediately
 Track C: TASK-071 (M23 — Hunk-to-symbol mapping) — can start immediately
+
+**V5 Critical Path (Cross-Service & Review):**
+TASK-082 → TASK-083 → TASK-084 (M29) [also depends: TASK-074 from V4]
+→ TASK-086 (M30) [also depends: TASK-085]
+
+The review workflow is the V5 integration point — it is the only task depending on all three of change detection (V4), reach (M28), and contracts (M29). Everything else in V5 ships independently.
+
+**V5 Parallel Tracks:**
+Track A: TASK-075 → TASK-076 → TASK-077 (M26 — Bundled Embeddings) — fully independent, can start immediately
+Track B: TASK-078 → TASK-079 (M27 — BM25) — needs only the existing RRF seam (TASK-068)
+Track C: TASK-080 → TASK-081 (M28 — Reach Index) — needs V3 call graph + V4 blast
+Track D: TASK-085 (M30 — Review rules) — needs V4 change detection + M28
+Track E: TASK-090 → TASK-091 (M31 — Body Elision) — fully independent, can start immediately
+Track F: TASK-092 (M32 — Rerank framework) — can start immediately; its signals need BM25 (TASK-079)
+
+**V5 note on M33–M36:** each extended signal is an independent data source plugging into the M32 `Signal` seam, so the four milestones parallelize completely after TASK-092 and any of them can be dropped without affecting the others. M36 is sequenced last within its own track deliberately — TASK-103 restores the reproducibility that TASK-102 trades away, and shipping the signal without those controls would leave ranking unmeasurable.
+
+**V5 note on M32 sequencing:** TASK-092 ports the existing ordinal ranking into the signal framework and proves equivalence before any new signal is added. That ordering is deliberate — it makes every subsequent ranking change a measurable delta against a reproduced baseline rather than an unverifiable rewrite.
+
+**V5 note on M29 sizing:** contract detection is split by kind because each framework family needs its own recognizer; TASK-082 ships normalization + HTTP + env, and the remaining kinds follow independently. Normalization correctness gates everything downstream, which is why it is alone in the first task.
 
 ---
 
@@ -3125,6 +3193,1213 @@ Extend `mcp.rs` to discover all indexed repositories at startup, lazy-load conne
 
 ---
 
+## Milestone 26: Bundled Embedding Provider
+
+**Goal:** Semantic search works on a fresh install with no Ollama and no network; Ollama becomes an opt-in quality tier.
+**Exit Criteria:** `wonk ask` returns results with no external service running, release binary stays under 40 MB, vector spaces never mix.
+
+### TASK-075: EmbeddingProvider trait and provider selection
+
+**Milestone:** M26 - Bundled Embedding Provider
+**Component:** Embedding Providers
+**Estimate:** M
+
+**Goal:**
+Introduce an `EmbeddingProvider` trait in `embedding.rs`, refactor the existing Ollama client to implement it, and wire config-driven provider selection with a per-invocation override.
+
+**Action Items:**
+- [ ] Define `trait EmbeddingProvider { fn name(&self) -> &str; fn dim(&self) -> usize; fn embed_batch(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>>; }` (PRD-EMB-REQ-001)
+- [ ] Refactor the existing V2 Ollama client into `OllamaProvider` implementing the trait — behavior must be unchanged (PRD-EMB-REQ-003)
+- [ ] Add `embedding.provider` config key with values `bundled` (default) and `ollama` (PRD-EMB-REQ-004)
+- [ ] Add per-invocation `--provider` override on index-building commands (PRD-EMB-REQ-004)
+- [ ] Add `provider TEXT DEFAULT 'ollama'` and `dim INTEGER DEFAULT 768` columns to `embeddings` via ALTER TABLE (PRD-EMB-REQ-006)
+- [ ] Record provider and dimension on every embedding write (PRD-EMB-REQ-006)
+- [ ] Filter similarity queries by active provider; fail fast with a re-embed instruction on mismatch (PRD-EMB-REQ-005)
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-076, TASK-077
+
+**Acceptance Criteria:**
+- Existing Ollama users see byte-identical results with `embedding.provider = "ollama"`
+- Pre-V5 embedding rows migrate to `('ollama', 768)` without a rebuild
+- Querying with a provider whose stored vectors have a different dim/provider errors with a clear re-embed instruction — never returns mixed-space results
+- `cargo fmt --check` and `cargo clippy -- -D warnings` pass
+- Tests pass
+
+**Related Requirements:** PRD-EMB-REQ-001, PRD-EMB-REQ-003, PRD-EMB-REQ-004, PRD-EMB-REQ-005, PRD-EMB-REQ-006
+**Related Decisions:** DR-032
+
+**Status:** Not Started
+
+---
+
+### TASK-076: Bundle the default embedding model
+
+**Milestone:** M26 - Bundled Embedding Provider
+**Component:** Embedding Providers
+**Estimate:** L
+
+**Goal:**
+Select, bundle, and implement `BundledProvider` — in-process embedding generation with no network, within a 10 MB binary budget.
+
+**Action Items:**
+- [ ] Bake-off candidate small models on the existing semantic test corpus; record the recall delta vs. `nomic-embed-text` (resolves OQ-009)
+- [ ] Embed the chosen model as a compressed `include_bytes!` blob; decompress once on first use (PRD-EMB-REQ-001, PRD-EMB-REQ-008)
+- [ ] Implement `BundledProvider::embed_batch()` running inference on the existing rayon pool (PRD-EMB-REQ-001)
+- [ ] Make `bundled` the default provider when no configuration is present (PRD-EMB-REQ-002)
+- [ ] Add a CI check enforcing the ≤ 10 MB model budget and the 40 MB total binary ceiling (PRD-EMB-REQ-008, AR-023)
+- [ ] Benchmark: 10k-symbol repo embeds in under 60s with no network (PRD-EMB-REQ-007)
+- [ ] Document the bundled-vs-Ollama quality delta in the README semantic section (AR-019)
+
+**Dependencies:**
+- Blocked by: TASK-075
+- Blocks: TASK-077
+
+**Acceptance Criteria:**
+- `wonk ask "authentication"` returns results on a machine with no Ollama installed and no network
+- Release binary under 40 MB on all CI targets
+- 10k-symbol embed completes in < 60s offline
+- Recall delta vs. Ollama tier measured and documented, not assumed
+- Tests pass
+
+**Related Requirements:** PRD-EMB-REQ-001, PRD-EMB-REQ-002, PRD-EMB-REQ-007, PRD-EMB-REQ-008
+**Related Decisions:** DR-032
+
+**Status:** Not Started
+
+---
+
+### TASK-077: Provider fallback and migration guidance
+
+**Milestone:** M26 - Bundled Embedding Provider
+**Component:** Embedding Providers
+**Estimate:** S
+
+**Goal:**
+Handle the degraded paths: unreachable external provider, and a configured provider that disagrees with stored vectors.
+
+**Action Items:**
+- [ ] When a configured Ollama is unreachable at query time, fall back to the bundled provider with a stderr warning (PRD-EMB-REQ-009)
+- [ ] Ensure the fallback never applies to a mismatched stored vector space — that path still blocks with a re-embed instruction (PRD-EMB-REQ-005)
+- [ ] Emit an actionable re-embed command in the mismatch error message
+- [ ] Update `wonk status` to show the active provider, stored vector provider, and dimension
+- [ ] Downgrade AR-008 (Ollama availability) messaging across docs — Ollama is now a quality tier, not a requirement
+
+**Dependencies:**
+- Blocked by: TASK-075, TASK-076
+- Blocks: None
+
+**Acceptance Criteria:**
+- Stopping Ollama mid-session degrades to bundled results with a warning, not an error
+- A provider switch surfaces a clear re-embed instruction and never silently searches the wrong space
+- `wonk status` reports provider and dimension
+- Tests cover both degraded paths
+- Tests pass
+
+**Related Requirements:** PRD-EMB-REQ-005, PRD-EMB-REQ-009
+**Related Decisions:** DR-032
+
+**Status:** Not Started
+
+---
+
+## Milestone 27: Lexical BM25 Scoring
+
+**Goal:** The lexical side of search and RRF fusion is ranked by BM25 relevance instead of match presence.
+**Exit Criteria:** Measurable precision@10 improvement, < 10ms added latency, pre-V5 indexes keep working.
+
+### TASK-078: BM25 statistics at index time
+
+**Milestone:** M27 - Lexical BM25 Scoring
+**Component:** Lexical Scorer
+**Estimate:** M
+
+**Goal:**
+Compute and persist the per-term document statistics BM25 needs, maintained incrementally by the daemon.
+
+**Action Items:**
+- [ ] Add `term_stats(term, file, tf)` table with an index on `term` (DR-033)
+- [ ] Populate statistics inside the existing indexing transaction — no separate pass (PRD-BM25-REQ-001)
+- [ ] Reuse `files` row counts/lengths for the document-length component rather than storing them twice
+- [ ] Incremental maintenance in the daemon path: decrement/delete on file removal, increment on re-index (PRD-BM25-REQ-005)
+- [ ] Handle file rename as delete + insert to avoid orphaned statistics (AR-024)
+- [ ] Test statistics correctness across an edit/delete/rename sequence
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-079
+
+**Acceptance Criteria:**
+- Statistics remain correct after a sequence of daemon-driven edits, deletions, and renames
+- Index build time increase is measured and within budget
+- Statistics are written in the same transaction as the file's symbol rows
+- Tests pass
+
+**Related Requirements:** PRD-BM25-REQ-001, PRD-BM25-REQ-005
+**Related Decisions:** DR-033
+
+**Status:** Not Started
+
+---
+
+### TASK-079: BM25 scoring and RRF fusion input
+
+**Milestone:** M27 - Lexical BM25 Scoring
+**Component:** Lexical Scorer
+**Estimate:** M
+
+**Goal:**
+Re-rank lexical candidates by BM25 and feed the resulting ranked list into the existing RRF fusion.
+
+**Action Items:**
+- [ ] Implement BM25 scoring over the grep candidate set — re-rank, do not re-retrieve (PRD-BM25-REQ-002)
+- [ ] Add `search.bm25_k1` (default 1.2) and `search.bm25_b` (default 0.75) config keys (PRD-BM25-REQ-003)
+- [ ] Supply the BM25-ranked list as the lexical input to `ranker.rs::fuse_rrf()` — fusion algorithm unchanged (PRD-BM25-REQ-004)
+- [ ] Detect missing `term_stats` and fall back to V4 ranking with a re-index hint (PRD-BM25-REQ-006)
+- [ ] Build a ranking regression suite with a fixed query set and expected top-10 (AR-024)
+- [ ] Benchmark: BM25 adds < 10ms to warm queries
+
+**Dependencies:**
+- Blocked by: TASK-078, TASK-068
+- Blocks: None
+
+**Acceptance Criteria:**
+- Ranking regression suite shows a measured precision@10 improvement over match-presence ranking
+- Warm query latency increase < 10ms
+- `fuse_rrf()` is unmodified — only its input list changed
+- Pre-V5 index returns V4 ranking plus a re-index hint, no error
+- Tests pass
+
+**Related Requirements:** PRD-BM25-REQ-002, PRD-BM25-REQ-003, PRD-BM25-REQ-004, PRD-BM25-REQ-006
+**Related Decisions:** DR-033, DR-027
+
+**Status:** Not Started
+
+---
+
+## Milestone 28: Precomputed Reach Index
+
+**Goal:** Bounded-depth blast queries become indexed lookups, cheap enough to run per changed symbol.
+**Exit Criteria:** Depth-3 blast in < 50ms, results identical to BFS, incremental maintenance correct, disable-able.
+
+### TASK-080: Reach table and initial build
+
+**Milestone:** M28 - Precomputed Reach Index
+**Component:** Reach Index
+**Estimate:** M
+
+**Goal:**
+Create `reach.rs` and the `reach` table, build bounded-depth reachability during index build, and route qualifying blast queries to it.
+
+**Action Items:**
+- [ ] Add `reach(source_id, target_id, min_depth)` table with `(source_id, min_depth)` and `target_id` indexes (DR-034)
+- [ ] Build reach to the configured depth over `references.caller_id` and `type_edges` during index build (PRD-REACH-REQ-001)
+- [ ] Store minimum depth per pair so blast severity tiers are preserved (PRD-REACH-REQ-002, DR-024)
+- [ ] Add `reach.depth` (default 3) and `reach.enabled` (default true) config keys (PRD-REACH-REQ-006)
+- [ ] Route blast queries within the precomputed depth to the table (PRD-REACH-REQ-003)
+- [ ] Fall back to BFS beyond the precomputed depth, or when the table is absent/stale (PRD-REACH-REQ-004, PRD-REACH-REQ-007)
+- [ ] Restrict precomputation to change-target symbol kinds — functions, methods, types, interfaces, fields, enum members, constants, variables; exclude files, imports, parameters (PRD-REACH-REQ-010, AR-020)
+- [ ] Write and replace reach rows inside the same transaction as the file's symbols/references, so a partial rebuild is never readable (PRD-REACH-REQ-008, AR-028)
+- [ ] Add a per-symbol fan-out cap; carry a truncation marker **on the result**, not only in a log (PRD-REACH-REQ-009, OQ-012, AR-020)
+- [ ] Extract the edge-eligibility predicate into one exported function called by **both** the precomputed build and the live BFS (AR-021)
+- [ ] Mandatory equivalence test: reach lookup ≡ BFS result at equal depth (AR-021)
+- [ ] Concurrency test: a reader during re-index never observes a shrunken reach set (PRD-REACH-REQ-008, AR-028)
+
+**Dependencies:**
+- Blocked by: TASK-058, TASK-070
+- Blocks: TASK-081
+
+**Acceptance Criteria:**
+- Depth-3 blast answers in < 50ms from the table
+- Reach results are identical to BFS at the same depth, asserted by test
+- `reach.enabled = false` restores exact V4 behavior
+- Missing or stale table falls back to BFS without erroring
+- Reach table size measured on a large repo and recorded (feeds OQ-012)
+- A truncated reach set is identifiable from the result alone, without reading logs
+- Build and live-walk paths share one edge predicate — verified by a test that changing it moves both
+- No reader observes a partially-published reach set during a re-index
+- Tests pass
+
+**Related Requirements:** PRD-REACH-REQ-001, PRD-REACH-REQ-002, PRD-REACH-REQ-003, PRD-REACH-REQ-004, PRD-REACH-REQ-006, PRD-REACH-REQ-007
+**Related Decisions:** DR-034
+
+**Status:** Not Started
+
+---
+
+### TASK-081: Incremental reach maintenance
+
+**Milestone:** M28 - Precomputed Reach Index
+**Component:** Reach Index
+**Estimate:** L
+
+**Goal:**
+Keep the reach table correct as the daemon re-indexes files, without recomputing the whole graph.
+
+**Action Items:**
+- [ ] On file re-index, delete reach rows sourced from that file's symbols and recompute them (PRD-REACH-REQ-005)
+- [ ] Recompute predecessors within the configured depth via reverse lookup on `target_id` (PRD-REACH-REQ-005)
+- [ ] Handle cycles correctly — visited-set traversal, no infinite recompute (AR-021)
+- [ ] Mark the table stale and fall back to BFS if an incremental update fails, rather than serving wrong data (PRD-REACH-REQ-007)
+- [ ] Test correctness after edit sequences: add caller, remove caller, rename symbol, delete file, introduce a cycle
+- [ ] Verify incremental update fits within the daemon's existing re-index budget
+
+**Dependencies:**
+- Blocked by: TASK-080
+- Blocks: TASK-085
+
+**Acceptance Criteria:**
+- After each edit in the test sequence, reach lookup still equals BFS at equal depth
+- Cyclic call graphs update without hanging or duplicating rows
+- Failed incremental update degrades to BFS, never to incorrect results
+- Daemon re-index stays within its latency budget
+- Tests pass
+
+**Related Requirements:** PRD-REACH-REQ-005, PRD-REACH-REQ-007
+**Related Decisions:** DR-034
+
+**Status:** Not Started
+
+---
+
+## Milestone 29: Cross-Repo Contract Detection
+
+**Goal:** Wonk answers "which other service breaks if I change this?" over the repos already indexed on this machine.
+**Exit Criteria:** A route in repo A and its client in repo B link via one canonical ID; orphan consumers listed; blast reports cross-repo impact.
+
+### TASK-082: Canonical ID normalization + HTTP and env contract kinds
+
+**Milestone:** M29 - Cross-Repo Contract Detection
+**Component:** Contract Extraction
+**Estimate:** L
+
+**Goal:**
+Create `contracts.rs` with the normalization core and the two highest-value contract kinds. Normalization is the correctness foundation for every later kind, so it ships first and alone.
+
+**Scoping note:** Contract detection is not one module's worth of work — comparable systems run to tens of thousands of lines because each framework family needs its own recognizer. M29 is therefore split by kind (TASK-082 → TASK-087 → TASK-088) so the highest-value kinds ship and prove the matching pipeline before the long tail. This resolves OQ-010.
+
+**Action Items:**
+- [ ] Create `contracts.rs` with per-language rule tables mapping framework idioms to contract candidates (PRD-CTR-REQ-001)
+- [ ] Detect the `http` and `env` kinds across all 12 supported languages (PRD-CTR-REQ-001)
+- [ ] Invoke extraction on the tree the symbol extractor already walks — no second parse or file read (PRD-CTR-REQ-011)
+- [ ] Implement canonical ID normalization `<kind>::<qualifier>::<identifier>` in a single function (PRD-CTR-REQ-002)
+- [ ] HTTP path pipeline in fixed order (PRD-CTR-REQ-003): trim whitespace/quotes → strip scheme+authority → strip leading base-URL interpolation → rewrite `${name}`/`$name`/`:id`/`<id>`/`<int:id>`/`{id}` → positional `{p1}`,`{p2}` → leading slash; upper-case method
+- [ ] Retain original parameter names as contract metadata alongside the positional ID (PRD-CTR-REQ-022)
+- [ ] Router prefix composition: track enclosing group/blueprint/nested-router/mount context so `/v1` + `/users` yields `/v1/users` (PRD-CTR-REQ-023)
+- [ ] Classify role as provider or consumer; record ambiguous constructs at lower confidence rather than dropping them (PRD-CTR-REQ-004)
+- [ ] Confidence on the DR-028 scale: 1.0 framework-recognized, 0.5 string-literal heuristic (PRD-CTR-REQ-004, AR-018)
+- [ ] Per-stage normalization test matrix, plus a corpus test pairing real provider/consumer spellings across frameworks (AR-017, AR-029)
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-083, TASK-087, TASK-088
+
+**Acceptance Criteria:**
+- Equivalent routes written in 4+ different frameworks normalize to the same canonical ID
+- `http://api.example.com/v1/users` and `/v1/users` produce the same ID
+- `${API_URL}/v1/tags/${id}` and `/v1/tags/:id` produce the same ID
+- `/workspaces/{wid}/tags/{id}` and `/workspaces/{workspaceId}/tags/{id}` produce the same ID, both retaining their original names
+- A route on a group with prefix `/v1` resolves to `/v1/...`
+- Extraction adds < 15% to index build time
+- Ambiguous constructs appear with confidence 0.5, not dropped
+- `cargo clippy -- -D warnings` passes
+- Tests pass
+
+**Related Requirements:** PRD-CTR-REQ-001, PRD-CTR-REQ-002, PRD-CTR-REQ-003, PRD-CTR-REQ-004, PRD-CTR-REQ-011, PRD-CTR-REQ-022, PRD-CTR-REQ-023
+**Related Decisions:** DR-031
+
+**Status:** Not Started
+
+---
+
+### TASK-087: Queue, WebSocket, and scheduled-job contract kinds
+
+**Milestone:** M29 - Cross-Repo Contract Detection
+**Component:** Contract Extraction
+**Estimate:** L
+
+**Goal:**
+Add the message-oriented contract kinds on top of the normalization core.
+
+**Action Items:**
+- [ ] Detect `queue` kind for Kafka, NATS, and RabbitMQ producers and consumers (PRD-CTR-REQ-001)
+- [ ] Detect `websocket` kind — emit sites as providers, handler registrations as consumers (PRD-CTR-REQ-001)
+- [ ] Detect `job` kind for scheduled and background job registrations (PRD-CTR-REQ-001)
+- [ ] Canonical IDs for topic names: trim, normalize separators, preserve namespace segments (PRD-CTR-REQ-002)
+- [ ] Confidence scoring — topic names are frequently string literals, so heuristic detections score 0.5 (PRD-CTR-REQ-004, AR-018)
+- [ ] Per-kind test matrix across the languages where each client library is idiomatic
+
+**Dependencies:**
+- Blocked by: TASK-082
+- Blocks: None
+
+**Acceptance Criteria:**
+- A producer in one repo and a consumer in another resolve to the same topic ID
+- String-literal topic detections carry 0.5 confidence
+- Kinds are independently disable-able so a noisy detector cannot degrade the others
+- Tests pass
+
+**Related Requirements:** PRD-CTR-REQ-001, PRD-CTR-REQ-002, PRD-CTR-REQ-004
+**Related Decisions:** DR-031
+
+**Status:** Not Started
+
+---
+
+### TASK-088: RPC-family and schema contract kinds with canonical join
+
+**Milestone:** M29 - Cross-Repo Contract Detection
+**Component:** Contract Extraction
+**Estimate:** L
+
+**Goal:**
+Add gRPC, GraphQL, and OpenAPI kinds, plus the second matching pass that RPC pairing requires.
+
+**Action Items:**
+- [ ] Detect `grpc` kind — service definitions and generated-stub call sites (PRD-CTR-REQ-001)
+- [ ] Detect `graphql` kind — resolvers as providers, queries/mutations as consumers (PRD-CTR-REQ-001)
+- [ ] Detect `openapi` kind from specification documents; record file-level contracts with a null owning symbol (PRD-CTR-REQ-001)
+- [ ] Implement the RPC canonical join: a second matching pass over canonical service/method names, tolerating package qualification, method casing, and service-level vs. method-level registration (PRD-CTR-REQ-024)
+- [ ] Verify the canonical join never pairs across workspaces — it relaxes name matching, not scope (PRD-CTR-REQ-014)
+
+**Dependencies:**
+- Blocked by: TASK-082
+- Blocks: TASK-084
+
+**Acceptance Criteria:**
+- An IDL service definition and its generated-stub call site pair despite package qualification and casing differences
+- The canonical join is a second pass — exact-ID matches are never overridden by it
+- The join respects workspace boundaries
+- Tests pass
+
+**Related Requirements:** PRD-CTR-REQ-001, PRD-CTR-REQ-024
+**Related Decisions:** DR-031
+
+**Status:** Not Started
+
+---
+
+### TASK-083: Contracts storage and `wonk contracts` command
+
+**Milestone:** M29 - Cross-Repo Contract Detection
+**Component:** Contract Extraction
+**Estimate:** M
+
+**Goal:**
+Persist detected contracts per repo and expose them through a CLI command with kind/role/orphan filters.
+
+**Action Items:**
+- [ ] Add the `contracts` table with `canonical_id`/`role`, `symbol_id`, and `file` indexes (DR-031)
+- [ ] Write contracts in the existing indexing transaction; clear and rewrite per file on re-index
+- [ ] Implement `wonk contracts` with `--kind`, `--role`, and `--orphans` filters (PRD-CTR-REQ-008)
+- [ ] Support both output formats (grep-compatible and NDJSON) per PRD-OUT
+- [ ] Ensure queries return within-repo results and do not error when no sibling repos are indexed (PRD-CTR-REQ-012)
+
+**Dependencies:**
+- Blocked by: TASK-082
+- Blocks: TASK-084
+
+**Acceptance Criteria:**
+- `wonk contracts --kind http` lists this repo's routes with role, file, line, and confidence
+- Contracts for a file are fully replaced on re-index — no stale rows
+- With no sibling repos indexed, the command succeeds and reports within-repo contracts
+- NDJSON output is consumable without post-processing
+- Tests pass
+
+**Related Requirements:** PRD-CTR-REQ-008, PRD-CTR-REQ-012
+**Related Decisions:** DR-031
+
+**Status:** Not Started
+
+---
+
+### TASK-084: Cross-repo link resolution, orphans, and blast integration
+
+**Milestone:** M29 - Cross-Repo Contract Detection
+**Component:** Contract Linking
+**Estimate:** L
+
+**Goal:**
+Resolve provider↔consumer links across locally indexed repos at query time, flag orphan consumers, and surface cross-repo impact in blast radius.
+
+**Action Items:**
+- [ ] Add `[contracts] workspace` config key accepting a string or array of strings (PRD-CTR-REQ-013, PRD-CTR-REQ-018)
+- [ ] Read the key from the **repo-local** `.wonk/config.toml` only; ignore any value in global config and warn that it has no effect (PRD-CTR-REQ-017)
+- [ ] Normalize identifiers by trimming whitespace and case-folding before comparison (PRD-CTR-REQ-019)
+- [ ] Write declared workspaces into the repo's `meta.json` at index time (PRD-CTR-REQ-020)
+- [ ] Filter the repo registry on `meta.json` workspaces — intersection non-empty — before resolving links; never read another repo's working-tree config (PRD-CTR-REQ-014, PRD-CTR-REQ-020)
+- [ ] Extend `wonk status` to report declared workspaces and the indexed repos sharing them (PRD-CTR-REQ-021, AR-027)
+- [ ] Default an undeclared workspace to the repository's own name, so the matcher contains no `if unset` branch (PRD-CTR-REQ-015, AR-025)
+- [ ] Apply the workspace filter at link resolution **only** — extraction, storage, listing, filtering, and within-repo linking stay unconditional (PRD-CTR-REQ-016)
+- [ ] Resolve links by joining on canonical ID with opposite role across same-workspace repos from the `~/.wonk/repos/*/meta.json` registry (PRD-CTR-REQ-005, DR-031)
+- [ ] Reuse the DR-030 lazy-connection pattern — do not open all repo indexes eagerly
+- [ ] Implement `wonk contracts --links` listing cross-repo pairs annotated with both repo names (PRD-CTR-REQ-009)
+- [ ] Flag consumers with no matching provider in the workspace as orphans, shown by default (PRD-CTR-REQ-006)
+- [ ] Surface unscoped state with the exact config line to add; show workspace membership in `wonk status` (AR-026)
+- [ ] Gate unused-provider reporting behind an explicit flag to avoid public-API noise (PRD-CTR-REQ-007)
+- [ ] Extend `blast.rs`: when the target owns a provider contract, append consumers as a `CrossRepo` tier below the depth tiers (PRD-CTR-REQ-010)
+- [ ] Add the `wonk_contracts` MCP tool with the same filters, honoring the V4 `repo` parameter
+- [ ] Verify no cross-repo links are persisted — resolution is live (DR-031)
+
+**Dependencies:**
+- Blocked by: TASK-083, TASK-074, TASK-070
+- Blocks: TASK-086
+
+**Acceptance Criteria:**
+- A route defined in repo A and called from repo B, both in the same workspace, produce exactly one link
+- Two repos in different workspaces both exposing `http::GET::/health` produce no link
+- A repo with no workspace declared matches only itself via the repo-name default; `wonk contracts` reports the effective workspace so "no provider" is distinguishable from "no sibling indexed"
+- A repo with no workspace declared still detects contracts, answers `wonk contracts --kind http`, and links its own provider↔consumer pairs — regression test asserts contract output is identical with and without the workspace key when no sibling repos are indexed
+- A workspace in global config is ignored with a warning, and does not group unrelated repos — explicit test
+- `workspace = "payments"` and `workspace = ["payments", "platform"]` both parse; intersection semantics verified with a repo in two workspaces
+- `"Payments"`, `"payments"`, and `" payments "` match each other
+- `wonk status` shows declared workspaces and co-members; a repo with a mistyped workspace shows as a singleton
+- Link resolution never opens a sibling repo's working-tree config — verified by resolving with sibling checkouts on other branches
+- `wonk contracts --orphans` lists consumers with no provider within the workspace
+- `wonk blast <handler>` reports the consuming repo as cross-repo impact
+- Unused providers are absent from default output and present behind the flag
+- Link resolution completes in < 100ms across a typical local repo set
+- No link rows are written to any index
+- Tests pass
+
+**Related Requirements:** PRD-CTR-REQ-005, PRD-CTR-REQ-006, PRD-CTR-REQ-007, PRD-CTR-REQ-009, PRD-CTR-REQ-010, PRD-CTR-REQ-013 through PRD-CTR-REQ-021
+**Related Decisions:** DR-031, DR-030
+
+**Status:** Not Started
+
+---
+
+## Milestone 30: Diff-Scoped Review Workflow
+
+**Goal:** One call turns a diff into line-anchored findings and a verdict, composing change detection, blast radius, and contracts.
+**Exit Criteria:** `wonk review --since main` returns findings + verdict; breaking changes block; coverage and cross-repo issues warn.
+
+### TASK-085: Review engine, rules, and verdict
+
+**Milestone:** M30 - Diff-Scoped Review Workflow
+**Component:** Review Engine
+**Estimate:** L
+
+**Goal:**
+Create `review.rs` as pure composition over existing primitives, producing line-anchored findings and a derived verdict.
+
+**Action Items:**
+- [ ] Create `review.rs`; determine changed symbols using the V4 `ChangeScope` enum verbatim — no new git handling (PRD-REV-REQ-001, PRD-REV-REQ-008)
+- [ ] For each changed symbol, compute blast radius via the reach index and attach affected symbols as context (PRD-REV-REQ-002)
+- [ ] Define `Finding { file, line, anchor_method, severity, kind, rule, message, identity, related }` (PRD-REV-REQ-003, PRD-REV-REQ-004)
+- [ ] Implement tiered anchor resolution: new-side hunk → old-side removed line → post-change file → unresolved, recording which tier resolved it (PRD-REV-REQ-011)
+- [ ] Carry old-side diff lines through change detection so findings about **removed** code are anchorable — required by the breaking-change rule (PRD-REV-REQ-012, AR-030)
+- [ ] Report unresolved anchors without a line; never fabricate one (PRD-REV-REQ-012)
+- [ ] Rule family A — breaking change: removed or signature-changed symbol with live indexed callers → blocking, naming the callers (PRD-REV-REQ-006)
+- [ ] Rule family B — coverage gap: changed symbol whose blast radius contains no test-file symbols → warning (PRD-REV-REQ-007)
+- [ ] Derive the verdict mechanically: any blocking → BLOCK, any warning → REVIEW, else APPROVE (PRD-REV-REQ-005)
+- [ ] Make each rule family independently disable-able pending OQ-013 calibration (AR-022)
+- [ ] Benchmark: typical diff reviewed in < 2s
+
+**Dependencies:**
+- Blocked by: TASK-072, TASK-081
+- Blocks: TASK-086
+
+**Acceptance Criteria:**
+- Removing a called public function yields BLOCK with the callers listed, anchored to the removed line's old-side position — not to whatever now occupies that line number
+- A changed symbol with no test coverage in its blast radius yields a warning, not a block
+- Verdict is a pure function of findings — no independent judgment path
+- `wonk review` and `wonk blast` never disagree on impact for the same symbol
+- Typical diff reviewed in < 2s with reach enabled
+- Tests pass
+
+**Related Requirements:** PRD-REV-REQ-001, PRD-REV-REQ-002, PRD-REV-REQ-003, PRD-REV-REQ-004, PRD-REV-REQ-005, PRD-REV-REQ-006, PRD-REV-REQ-007, PRD-REV-REQ-008
+**Related Decisions:** DR-035, DR-034
+
+**Status:** Not Started
+
+---
+
+### TASK-086: Cross-repo review findings, output, and MCP tool
+
+**Milestone:** M30 - Diff-Scoped Review Workflow
+**Component:** Review Engine
+**Estimate:** M
+
+**Goal:**
+Add the cross-repo rule family, NDJSON output, and MCP exposure.
+
+**Action Items:**
+- [ ] Rule family C — cross-repo impact: changed symbol owning a provider contract with consumers in another indexed repo → warning naming the consuming repo (PRD-REV-REQ-010)
+- [ ] Implement NDJSON output for findings and verdict (PRD-REV-REQ-009)
+- [ ] Add the `wonk_review` MCP tool honoring the V4 `repo` parameter
+- [ ] Grep-compatible output format for terminal use, per PRD-OUT
+- [ ] Document that findings are emitted only — no forge posting, no auto-fix (DR-035)
+- [ ] Update README and MCP server instructions with the review workflow
+
+**Dependencies:**
+- Blocked by: TASK-085, TASK-084
+- Blocks: None
+
+**Acceptance Criteria:**
+- Changing a route handler consumed by a sibling indexed repo yields a cross-repo finding naming that repo
+- NDJSON output is consumable by an agent without post-processing
+- `wonk_review` returns findings and verdict over MCP
+- README and MCP instructions document the workflow and its boundaries
+- Tests pass
+
+**Related Requirements:** PRD-REV-REQ-009, PRD-REV-REQ-010
+**Related Decisions:** DR-035, DR-031
+
+**Status:** Not Started
+
+---
+
+### TASK-089: Finding identity, durable suppression, and drop accounting
+
+**Milestone:** M30 - Diff-Scoped Review Workflow
+**Component:** Review Engine
+**Estimate:** M
+
+**Goal:**
+Make findings individually addressable so a confirmed false positive can be retired permanently, and make every suppression visible.
+
+**Action Items:**
+- [ ] Compute a stable finding identity: hash of rule, category, normalized path, symbol, and whitespace-folded anchored line — **excluding the line number** (PRD-REV-REQ-013)
+- [ ] Add the `review_suppressions` table keyed by identity, with rule and file retained for display (PRD-REV-REQ-014)
+- [ ] Consult the suppression list before a finding is kept; stamp identity even when nothing is suppressed
+- [ ] Add commands to list, add, and remove suppressions, including bulk removal by rule
+- [ ] Rank findings worst-first (severity desc, then confidence) before applying any cap (PRD-REV-REQ-015)
+- [ ] Report per-reason drop counts on every run: below confidence, below severity, out of category, over cap, identity-suppressed (PRD-REV-REQ-015)
+- [ ] Include drop counts in NDJSON output alongside findings
+
+**Dependencies:**
+- Blocked by: TASK-085
+- Blocks: None
+
+**Acceptance Criteria:**
+- Reformatting or re-indenting a flagged line preserves its identity; the suppression still applies
+- Inserting unrelated lines above a finding preserves its identity
+- **Changing the flagged code itself changes the identity**, so a suppression cannot mask a later genuine defect at that site (AR-031)
+- A capped finding list always reports how many were dropped and why
+- Suppressions are listable and removable
+- Tests pass
+
+**Related Requirements:** PRD-REV-REQ-013, PRD-REV-REQ-014, PRD-REV-REQ-015
+**Related Decisions:** DR-035
+
+**Status:** Not Started
+
+---
+
+## Milestone 31: Body Elision
+
+**Goal:** Any source wonk returns can be rendered with bodies collapsed to counted stubs, preserving signatures and structure.
+**Exit Criteria:** Majority line reduction on body-heavy source, every stub counted, retained lines byte-identical, fail-soft to raw source, default off.
+
+### TASK-090: Elision engine
+
+**Milestone:** M31 - Body Elision
+**Component:** Body Elision
+**Estimate:** M
+
+**Goal:**
+Create `elide.rs` — collect function/method body byte ranges from an already-parsed tree and rebuild the source with counted per-language stubs.
+
+**Action Items:**
+- [ ] Create `elide.rs` exposing `elide(source, language, mode) -> Result<String, NotElided>` (PRD-ELIDE-REQ-001)
+- [ ] Collect body byte ranges from the existing Tree-sitter tree — no second parse (PRD-ELIDE-REQ-010)
+- [ ] Rebuild the buffer replacing each range with a stub; preserve signatures, imports, top-level declarations, comments (PRD-ELIDE-REQ-001)
+- [ ] Every stub reports its replaced line count (PRD-ELIDE-REQ-002)
+- [ ] Per-language stub syntax: comment-in-braces for brace languages, indented comment line for indentation-sensitive languages (PRD-ELIDE-REQ-003)
+- [ ] Fail-soft: unsupported language, missing grammar, or parse failure returns original source with an explicit not-elided signal (PRD-ELIDE-REQ-006)
+- [ ] Guarantee retained lines are byte-identical to source — elision removes regions, never rewrites text (PRD-ELIDE-REQ-007)
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-091
+
+**Acceptance Criteria:**
+- Eliding a large file preserves every signature and import while reducing returned lines by a measured majority
+- No body is removed without a line count
+- Unsupported language returns byte-identical original source with elision reported as not applied
+- Retained lines byte-identical, verified by test across all 12 languages
+- < 20ms per file
+- Tests pass
+
+**Related Requirements:** PRD-ELIDE-REQ-001, PRD-ELIDE-REQ-002, PRD-ELIDE-REQ-003, PRD-ELIDE-REQ-006, PRD-ELIDE-REQ-007, PRD-ELIDE-REQ-010
+**Related Decisions:** DR-036
+
+**Status:** Not Started
+
+---
+
+### TASK-091: Salience retention and command integration
+
+**Milestone:** M31 - Body Elision
+**Component:** Body Elision
+**Estimate:** M
+
+**Goal:**
+Add control-flow retention and wire elision into the source-returning commands, default off.
+
+**Action Items:**
+- [ ] Build the control-flow node-kind set as a deliberate cross-grammar superset — conditionals, loops, switch/match arms (PRD-ELIDE-REQ-004, AR-032)
+- [ ] Retain matching lines verbatim inside otherwise-elided bodies (PRD-ELIDE-REQ-004)
+- [ ] Elided regions around retained lines still report their counts, so retained lines never read as the whole body (PRD-ELIDE-REQ-005)
+- [ ] Add opt-in elision to `show`, `summary`, `context`, and `review` source output, defaulting to off (PRD-ELIDE-REQ-008)
+- [ ] Resolve interaction with `show --shallow` to a single documented rendering; do not compound the two (PRD-ELIDE-REQ-009, DR-017)
+- [ ] Expose elision through the corresponding MCP tools
+- [ ] Measure and record the line-reduction figure per command for the north-star metric
+
+**Dependencies:**
+- Blocked by: TASK-090
+- Blocks: None
+
+**Acceptance Criteria:**
+- Salience mode retains conditionals, loops, and match arms verbatim while still counting collapsed regions
+- An unrecognized node kind causes at most a collapsed line, never a failure
+- Default output of every command is unchanged when elision is not requested
+- `show --shallow` combined with elision produces one documented rendering
+- Line-reduction figures recorded per command
+- Tests pass
+
+**Related Requirements:** PRD-ELIDE-REQ-004, PRD-ELIDE-REQ-005, PRD-ELIDE-REQ-008, PRD-ELIDE-REQ-009
+**Related Decisions:** DR-036, DR-017
+
+**Status:** Not Started
+
+---
+
+## Milestone 32: Signal-Based Reranking
+
+**Goal:** Ranking accumulates independent evidence instead of comparing a single ordinal category key, with every ranking explainable and the current ordering reproducible as a configuration.
+**Exit Criteria:** Kind-only weights reproduce current output exactly; `--why` explains any ranking; regression suite shows precision@10 improvement before the default flips.
+
+### TASK-092: Signal pipeline framework and kind-signal migration
+
+**Milestone:** M32 - Signal-Based Reranking
+**Component:** Rerank Pipeline
+**Estimate:** L
+
+**Goal:**
+Create `rerank.rs` with the signal abstraction, weighted scoring, batched context preparation, and explainability — then port the existing category ordering into it as the kind signal.
+
+**Action Items:**
+- [ ] Create `rerank.rs` with a `Signal` abstraction: name + pure function over (query, candidate, shared context) returning a normalized contribution (PRD-RANK-REQ-001, PRD-RANK-REQ-002)
+- [ ] Implement weighted summation; skip evaluation entirely for zero-weight signals (PRD-RANK-REQ-003)
+- [ ] Batch-prepare shared context (caller counts, path classification) once per candidate set, not per candidate
+- [ ] Retain each signal's unweighted contribution on the result (PRD-RANK-REQ-004)
+- [ ] Add `--why` output rendering the per-signal breakdown and final score (PRD-RANK-REQ-005)
+- [ ] Add `[rank]` config section for weights; reject unknown signal names as an error (PRD-RANK-REQ-006)
+- [ ] Port `ResultCategory` into a kind signal reproducing the existing tier ordering (PRD-RANK-REQ-010)
+- [ ] Gate the pipeline behind config defaulting to current ordering (PRD-RANK-REQ-017)
+- [ ] **Equivalence test: kind weight dominant + all others zero produces byte-identical output to the current ranker** (AR-033)
+
+**Dependencies:**
+- Blocked by: None
+- Blocks: TASK-093, TASK-094, TASK-095
+
+**Acceptance Criteria:**
+- Kind-only configuration reproduces current ranking exactly, asserted by test over a fixed query corpus
+- `wonk search --why` shows per-signal contributions and the final score
+- Unknown signal name in config is an error, not a silent no-op
+- Zero-weight signals cost nothing measurable
+- Default behavior unchanged
+- `cargo fmt --check` and `cargo clippy -- -D warnings` pass
+- Tests pass
+
+**Related Requirements:** PRD-RANK-REQ-001 through PRD-RANK-REQ-006, PRD-RANK-REQ-010, PRD-RANK-REQ-017
+**Related Decisions:** DR-037
+
+**Status:** Not Started
+
+---
+
+### TASK-093: Structural and lexical signals
+
+**Milestone:** M32 - Signal-Based Reranking
+**Component:** Rerank Pipeline
+**Estimate:** M
+
+**Goal:**
+Add the signals grounded in data wonk already indexes: lexical score, semantic similarity, caller centrality, and name prominence.
+
+**Action Items:**
+- [ ] Lexical signal consuming the BM25 score, normalized across the candidate set (PRD-RANK-REQ-001)
+- [ ] Semantic signal consuming cosine similarity where embeddings exist; contribute zero, not a penalty, when absent
+- [ ] Structural-centrality signal from indexed caller count, normalized to damp hub dominance (PRD-RANK-REQ-012)
+- [ ] Prominence signal distinguishing symbols that share a queried name (PRD-RANK-REQ-015)
+- [ ] Ensure every signal is a pure function and unit-testable in isolation (PRD-RANK-REQ-002)
+- [ ] Verify signals reusing prepared context add no additional queries
+
+**Dependencies:**
+- Blocked by: TASK-092, TASK-079
+- Blocks: TASK-095
+
+**Acceptance Criteria:**
+- A strong call-site match can outrank a weak definition — the case impossible under ordinal ranking
+- Missing embeddings contribute zero rather than penalizing a candidate
+- Caller-count normalization prevents a single hub from dominating unrelated queries
+- Each signal has isolated unit tests
+- Tests pass
+
+**Related Requirements:** PRD-RANK-REQ-001, PRD-RANK-REQ-002, PRD-RANK-REQ-012, PRD-RANK-REQ-015
+**Related Decisions:** DR-037
+
+**Status:** Not Started
+
+---
+
+### TASK-094: Path-character, proximity, and signature signals
+
+**Milestone:** M32 - Signal-Based Reranking
+**Component:** Rerank Pipeline
+**Estimate:** M
+
+**Goal:**
+Generalize wonk's existing path special-cases into one graded signal, and add the two query-shape-sensitive signals.
+
+**Action Items:**
+- [ ] Path-character signal with graded buckets: test files, compatibility shims, examples, type-declaration files, re-export barrels, module entries, and generated files shadowing a hand-written peer (PRD-RANK-REQ-011)
+- [ ] Absorb the existing `is_test_file` handling and the `.d.ts` deprioritization in symbol lookup into this one signal — remove the special cases rather than leaving both paths live
+- [ ] Confirm reduction is graded, never exclusion: a test file still appears when it is the best answer
+- [ ] Proximity signal reflecting how closely query terms co-occur in matched text (PRD-RANK-REQ-013)
+- [ ] Signature-match signal for signature-shaped queries (PRD-RANK-REQ-014)
+
+**Dependencies:**
+- Blocked by: TASK-092
+- Blocks: TASK-095
+
+**Acceptance Criteria:**
+- Test-file and implementation results with equal lexical scores rank implementation first
+- A generated file is demoted only when a hand-written same-named peer exists
+- Searching for a symbol that exists only in a test still returns it
+- No duplicate path special-casing remains outside the signal
+- Tests pass
+
+**Related Requirements:** PRD-RANK-REQ-011, PRD-RANK-REQ-013, PRD-RANK-REQ-014
+**Related Decisions:** DR-037
+
+**Status:** Not Started
+
+---
+
+### TASK-095: Query classification, weight tuning, and rollout
+
+**Milestone:** M32 - Signal-Based Reranking
+**Component:** Rerank Pipeline
+**Estimate:** L
+
+**Goal:**
+Classify queries to scale the lexical/semantic blend, tune default weights against labeled data, and flip the default only once improvement is demonstrated.
+
+**Action Items:**
+- [ ] Classify queries as symbol-shaped, path-shaped, signature-shaped, or conceptual (PRD-RANK-REQ-007)
+- [ ] Allow the caller to pin the class explicitly, bypassing detection (PRD-RANK-REQ-007)
+- [ ] Apply per-class multipliers to **lexical and semantic weights only**; leave structural signals class-independent (PRD-RANK-REQ-008)
+- [ ] Make the conceptual class the neutral 1.0 baseline (PRD-RANK-REQ-009)
+- [ ] Record the detected class on the response so a misclassification is diagnosable
+- [ ] Build the labeled query set — representative queries with expected results (OQ-015, AR-034)
+- [ ] Tune default weights against it; record the measured before/after
+- [ ] Benchmark: reranking adds < 20ms to warm queries (PRD-RANK-REQ-016)
+- [ ] **Flip the default only when the regression suite shows improvement**; leave the previous ordering available by configuration (PRD-RANK-REQ-017, AR-033)
+
+**Dependencies:**
+- Blocked by: TASK-093, TASK-094
+- Blocks: None
+
+**Acceptance Criteria:**
+- A symbol-shaped query ranks exact-token matches above semantically related ones; a conceptual query does the reverse
+- A conceptual query scores identically with and without classification
+- Detected class is visible on the response
+- Labeled query set exists and is checked in
+- Measured precision@10 improvement recorded before the default flips
+- Reranking adds < 20ms to warm queries
+- Previous ordering remains reachable by configuration
+- Tests pass
+
+**Related Requirements:** PRD-RANK-REQ-007, PRD-RANK-REQ-008, PRD-RANK-REQ-009, PRD-RANK-REQ-016, PRD-RANK-REQ-017
+**Related Decisions:** DR-038, DR-037
+
+**Status:** Not Started
+
+---
+
+## Milestone 33: History-Derived Signals
+
+**Goal:** Ranking uses the repository's own change history — what is active, and what changes together.
+**Exit Criteria:** Churn and co-change signals live, bulk commits excluded, mining bounded and incrementally refreshed, no-git repos unaffected.
+
+### TASK-096: Bounded history mining and churn signal
+
+**Milestone:** M33 - History-Derived Signals
+**Component:** History Signals
+**Estimate:** M
+
+**Action Items:**
+- [ ] Create `history.rs`, extending the existing git CLI wrapper in `impact.rs` (PRD-HIST-REQ-001)
+- [ ] Mine a configurable bounded commit window rather than full history (PRD-HIST-REQ-002, OQ-017)
+- [ ] Weight changes by age within the window (PRD-HIST-REQ-003)
+- [ ] Add the `file_churn` table; populate at index time
+- [ ] Expose churn as a rerank signal (PRD-HIST-REQ-006)
+- [ ] Refresh incrementally when new commits land, rather than re-mining (PRD-HIST-REQ-007)
+- [ ] No git, unreadable history, or mining disabled → contribute zero, affect nothing else (PRD-HIST-REQ-008)
+
+**Dependencies:**
+- Blocked by: TASK-092
+- Blocks: TASK-097
+
+**Acceptance Criteria:**
+- A frequently-modified file outranks a dormant one when other signals are equal
+- Mining a large repository's window completes within the index build budget
+- A repository with no `.git` behaves exactly as today
+- Window size is configurable and its cost scales with window, not repo age
+- Tests pass
+
+**Related Requirements:** PRD-HIST-REQ-001, PRD-HIST-REQ-002, PRD-HIST-REQ-003, PRD-HIST-REQ-006, PRD-HIST-REQ-007, PRD-HIST-REQ-008
+**Related Decisions:** DR-039
+
+**Status:** Not Started
+
+---
+
+### TASK-097: Co-change coupling
+
+**Milestone:** M33 - History-Derived Signals
+**Component:** History Signals
+**Estimate:** M
+
+**Action Items:**
+- [ ] Derive file co-occurrence within commits (PRD-HIST-REQ-004)
+- [ ] **Exclude commits touching more than a configurable file count** — reformatting sweeps and vendored imports would otherwise dominate all coupling (PRD-HIST-REQ-005)
+- [ ] Retain only top-K couplings per file, keeping storage linear (PRD-HIST-REQ-004)
+- [ ] Add the `co_change` table with a `(file_a, weight DESC)` index
+- [ ] Expose co-change as a rerank signal (PRD-HIST-REQ-006)
+- [ ] Refresh incrementally alongside churn (PRD-HIST-REQ-007)
+
+**Dependencies:**
+- Blocked by: TASK-096
+- Blocks: None
+
+**Acceptance Criteria:**
+- A file that repeatedly changes alongside the query target is surfaced
+- A 500-file reformatting commit produces no coupling — explicit test
+- Storage stays linear in files, not quadratic
+- Tests pass
+
+**Related Requirements:** PRD-HIST-REQ-004, PRD-HIST-REQ-005, PRD-HIST-REQ-006, PRD-HIST-REQ-007
+**Related Decisions:** DR-039
+
+**Status:** Not Started
+
+---
+
+## Milestone 34: Graph-Topology Signals
+
+**Goal:** Ranking uses the call graph's shape, not just whether an edge exists.
+**Exit Criteria:** Hub/authority and community signals live, deterministic, recomputed on a cadence, stale-but-served.
+
+### TASK-098: Hub and authority scoring
+
+**Milestone:** M34 - Graph-Topology Signals
+**Component:** Topology Signals
+**Estimate:** M
+
+**Action Items:**
+- [ ] Create `topology.rs`; compute hub and authority scores over `references.caller_id` edges (PRD-TOPO-REQ-001)
+- [ ] Add the `symbol_topology` table
+- [ ] Bound iterations by configuration; terminate deterministically with deterministic tie-breaking (PRD-TOPO-REQ-005)
+- [ ] Run as a distinct pass on a cadence, **not** as part of per-file re-indexing (PRD-TOPO-REQ-006)
+- [ ] Record last-computed time; serve stale data with a marker rather than blocking a query (PRD-TOPO-REQ-007)
+- [ ] Expose hub and authority as rerank signals (PRD-TOPO-REQ-003)
+- [ ] Absent or disabled topology contributes nothing (PRD-TOPO-REQ-008)
+
+**Dependencies:**
+- Blocked by: TASK-092
+- Blocks: TASK-099
+
+**Acceptance Criteria:**
+- A widely-depended-upon core type outranks an equally-matched leaf helper
+- Identical graph yields identical scores across runs — determinism asserted by test
+- A stale score never blocks a query; staleness is visible
+- Disabling topology returns ranking to its prior behavior exactly
+- Tests pass
+
+**Related Requirements:** PRD-TOPO-REQ-001, PRD-TOPO-REQ-003, PRD-TOPO-REQ-005, PRD-TOPO-REQ-006, PRD-TOPO-REQ-007, PRD-TOPO-REQ-008
+**Related Decisions:** DR-040
+
+**Status:** Not Started
+
+---
+
+### TASK-099: Community detection and membership signal
+
+**Milestone:** M34 - Graph-Topology Signals
+**Component:** Topology Signals
+**Estimate:** M
+
+**Action Items:**
+- [ ] Compute community assignments by connectivity; store on `symbol_topology` (PRD-TOPO-REQ-002)
+- [ ] Deterministic assignment — stable community identifiers across runs on an unchanged graph (PRD-TOPO-REQ-005)
+- [ ] Expose community membership as a rerank signal (PRD-TOPO-REQ-003)
+- [ ] When results concentrate in one community, favor that community's members (PRD-TOPO-REQ-004)
+- [ ] Document the distinction from `wonk cluster` — connectivity vs. embedding similarity — in help text and README
+
+**Dependencies:**
+- Blocked by: TASK-098
+- Blocks: None
+
+**Acceptance Criteria:**
+- A cohesive subsystem groups together despite spanning directories
+- Community IDs are stable across runs on an unchanged graph
+- The `wonk cluster` distinction is documented where a user would hit it
+- Tests pass
+
+**Related Requirements:** PRD-TOPO-REQ-002, PRD-TOPO-REQ-003, PRD-TOPO-REQ-004, PRD-TOPO-REQ-005
+**Related Decisions:** DR-040
+
+**Status:** Not Started
+
+---
+
+## Milestone 35: Near-Duplicate Similarity
+
+**Goal:** A response spends its budget on distinct content instead of restating one thing five times.
+**Exit Criteria:** Signatures precomputed, novelty demotes within a response, a representative always survives.
+
+### TASK-100: Shingle signatures and novelty signal
+
+**Milestone:** M35 - Near-Duplicate Similarity
+**Component:** Near-Duplicate Similarity
+**Estimate:** M
+
+**Action Items:**
+- [ ] Compute a compact lexical signature per symbol body at index time (PRD-DUP-REQ-001)
+- [ ] Add the `symbol_shingles` table
+- [ ] Estimate pairwise similarity from signatures without reading bodies at query time (PRD-DUP-REQ-002)
+- [ ] Record near-duplicates above a configurable threshold (PRD-DUP-REQ-003)
+- [ ] Novelty signal demoting a result near-identical to a **higher-ranked result in the same response**, not globally (PRD-DUP-REQ-004)
+- [ ] Guarantee at least one representative of a duplicate group survives (PRD-DUP-REQ-005)
+- [ ] Add duplicate-group reporting (PRD-DUP-REQ-006)
+
+**Dependencies:**
+- Blocked by: TASK-092
+- Blocks: None
+
+**Acceptance Criteria:**
+- Five copy-pasted handlers return one normally-ranked representative and four demoted, not five equal hits
+- No symbol body is read at query time for similarity
+- A duplicate group always yields at least one result
+- Boilerplate-heavy code is not over-demoted — threshold tunable, effect visible in `--why` (AR-041)
+- Tests pass
+
+**Related Requirements:** PRD-DUP-REQ-001 through PRD-DUP-REQ-006
+**Related Decisions:** DR-041
+
+**Status:** Not Started
+
+---
+
+## Milestone 36: Usage Feedback Loop
+
+**Goal:** The agent using wonk reports which results were useful, and the repository's ranking improves with use — bounded, inspectable, and reversible.
+**Exit Criteria:** Feedback capturable over MCP and CLI, influence capped, decaying, session-counted, and a feedback-free mode reproducing index-only ranking.
+
+### TASK-101: Feedback capture with slate
+
+**Milestone:** M36 - Usage Feedback Loop
+**Component:** Usage Feedback Loop
+**Estimate:** M
+
+**Goal:**
+Capture caller-reported usefulness together with the alternatives that were shown, which contrastive credit assignment requires.
+
+**Action Items:**
+- [ ] Create `feedback.rs`; add the `feedback_events` table (PRD-FB-REQ-001)
+- [ ] Add the `wonk_feedback` MCP tool and `wonk feedback` CLI (PRD-FB-REQ-003)
+- [ ] **Record the returned slate — every result's identity, rank, and full feature vector — not just the chosen one** (PRD-FB-REQ-002)
+- [ ] Reuse the rerank pipeline's retained signal contributions as one group within the feature vector; add no separate extraction path for them
+- [ ] Record the query class at query time to enable per-class learning (PRD-FB-REQ-008)
+- [ ] Key entries on a content-anchored result identity surviving re-index, reusing the review identity technique (PRD-FB-REQ-005)
+- [ ] Retire an entry when the code it refers to changes materially (PRD-FB-REQ-006)
+- [ ] Record contributing session (PRD-FB-REQ-015)
+- [ ] Store per repository; never transmit (PRD-FB-REQ-004)
+- [ ] Confirm the query process writes only to `feedback_events`, never index data
+
+**Dependencies:**
+- Blocked by: TASK-092, TASK-085
+- Blocks: TASK-102
+
+**Acceptance Criteria:**
+- An agent reports usefulness over MCP in one call, and the call carries the alternatives shown with their ranks
+- Captured signal vectors are the same values `--why` displays — verified by test, not by construction
+- Entries survive re-indexing; editing the referenced code retires the entry
+- Feedback from one session is distinguishable from feedback from twenty
+- No index data is written on the query path
+- Tests pass
+
+**Related Requirements:** PRD-FB-REQ-001 through PRD-FB-REQ-006, PRD-FB-REQ-015
+**Related Decisions:** DR-042
+
+**Status:** Not Started
+
+---
+
+### TASK-105: Result feature extraction
+
+**Milestone:** M36 - Usage Feedback Loop
+**Component:** Usage Feedback Loop
+**Estimate:** L
+
+**Goal:**
+Extract descriptive properties of each returned result alongside its signal contributions, in a form dense enough to accumulate evidence.
+
+**Action Items:**
+- [ ] Extract descriptive property groups per result: path character, symbol attributes, match shape, graph position, modification history (PRD-FB-REQ-021)
+- [ ] **Emit one feature per ancestor directory** (`src/`, `src/auth/`, `src/auth/tokens/`) so preferences are learnable at whatever level the evidence supports (PRD-FB-REQ-022)
+- [ ] Bucket continuous properties — recency, churn, body size, fan-in, fan-out, tree depth (PRD-FB-REQ-023)
+- [ ] Cap categorical cardinality with a shared overflow bucket (PRD-FB-REQ-024)
+- [ ] Accept an optional working-context hint on the query interface; when present, emit context-relative features — same file, same directory, same community, import-graph distance, co-change with the open file (PRD-FB-REQ-027)
+- [ ] Add author-derived features (last-touched-by, primary author), individually switchable; document how they differ from DR-039's exclusion of assumed author attribution (PRD-FB-REQ-028, AR-046)
+- [ ] Reuse graph features from `topology.rs` and history features from `history.rs` rather than recomputing
+- [ ] Verify extraction adds no query-time database round trips beyond the batched context prepare
+
+**Dependencies:**
+- Blocked by: TASK-101
+- Blocks: TASK-102
+
+**Acceptance Criteria:**
+- A result under `src/auth/tokens/` emits features for each ancestor level
+- Continuous properties appear as buckets, not raw values
+- A high-cardinality categorical collapses into the overflow bucket beyond the cap
+- With a working-context hint supplied, context-relative features are present; without it, they are absent rather than defaulted
+- Author features are extracted and switchable; switching them off removes them without affecting other features
+- Extraction adds no measurable query-time round trips
+- Tests pass
+
+**Related Requirements:** PRD-FB-REQ-021, PRD-FB-REQ-022, PRD-FB-REQ-023, PRD-FB-REQ-024, PRD-FB-REQ-027, PRD-FB-REQ-028
+**Related Decisions:** DR-043
+
+**Status:** Not Started
+
+---
+
+### TASK-102: Contrastive weight learning
+
+**Milestone:** M36 - Usage Feedback Loop
+**Component:** Usage Feedback Loop
+**Estimate:** L
+
+**Goal:**
+Convert feedback events into bounded, decaying adjustments to ranking signal weights — the mechanism that makes feedback generalize.
+
+**Action Items:**
+- [ ] Add the `learned_weights` table keyed by feature (overall and per query class)
+- [ ] Derive updates contrastively: raise weights of signals scoring the useful result above the passed-over alternatives, lower those that did not (PRD-FB-REQ-007)
+- [ ] Learn per query class as well as overall (PRD-FB-REQ-008)
+- [ ] **Skip events where the useful result was already ranked first** — learn only where the ranking was wrong (PRD-FB-REQ-009, AR-042)
+- [ ] Bound learned weights by a configurable maximum deviation from defaults (PRD-FB-REQ-010, AR-043)
+- [ ] **Gate influence on a minimum observation count across distinct sessions; unseen features default to zero influence** (PRD-FB-REQ-025, PRD-FB-REQ-026, AR-044)
+- [ ] Store and display each weight's supporting observation count (PRD-FB-REQ-029)
+- [ ] Decay learned weights toward defaults with age (PRD-FB-REQ-011)
+- [ ] Surface the feedback-derived contribution in `--why` (PRD-FB-REQ-014)
+- [ ] Absent feedback behaves exactly as the feature disabled (PRD-FB-REQ-020)
+- [ ] Tune update rule and step size against recorded traces; record what was chosen and why (OQ-019)
+- [ ] **Adversarial test: repeated feedback cannot push any weight beyond the configured deviation** (AR-043)
+- [ ] **Generalization test: feedback from one query set shifts ranking for a query sharing no terms with it** — the property item-keyed feedback cannot deliver
+
+**Dependencies:**
+- Blocked by: TASK-105
+- Blocks: TASK-103, TASK-104
+
+**Acceptance Criteria:**
+- Repeatedly preferring implementation over test results shifts the path-character weight, visible as a named number against its default
+- The shift generalizes to a query sharing no terms with any query that produced feedback
+- Feedback on an already-first result produces no weight change
+- No weight exceeds the configured deviation under adversarial repetition
+- Weights decay toward defaults as events age
+- A feature observed a handful of times has no ranking influence; the same feature observed across many sessions does
+- Adding a new feature to the recorded set changes no ranking until evidence accumulates
+- Every displayed weight carries its observation count
+- A repository with no feedback ranks exactly as with the feature disabled
+- Tests pass
+
+**Related Requirements:** PRD-FB-REQ-007 through PRD-FB-REQ-011, PRD-FB-REQ-014, PRD-FB-REQ-020, PRD-FB-REQ-025, PRD-FB-REQ-026, PRD-FB-REQ-029
+**Related Decisions:** DR-042
+
+**Status:** Not Started
+
+---
+
+### TASK-103: Determinism controls, weight inspection, and reset
+
+**Milestone:** M36 - Usage Feedback Loop
+**Component:** Usage Feedback Loop
+**Estimate:** M
+
+**Goal:**
+Preserve reproducibility on demand and make learned state legible and reversible.
+
+**Action Items:**
+- [ ] Add a feedback-free mode reproducing index-only ranking exactly (PRD-FB-REQ-017)
+- [ ] **Make benchmarks and the ranking regression suite feedback-free by default**, so measurement cannot confirm itself (PRD-FB-REQ-018, AR-039)
+- [ ] Present learned weights alongside their defaults (PRD-FB-REQ-012)
+- [ ] Reset learned weights to defaults, in whole or per signal, **independently of clearing event history** (PRD-FB-REQ-013)
+- [ ] List, export, and reset recorded feedback — whole-store and per-result (PRD-FB-REQ-019)
+- [ ] Surface feedback state in `wonk status`: event count, distinct sessions, current weight deviation
+- [ ] Document the reproducibility tradeoff and how to opt out, in README and MCP server instructions
+
+**Dependencies:**
+- Blocked by: TASK-102
+- Blocks: None
+
+**Acceptance Criteria:**
+- `--no-feedback` reproduces index-only ranking exactly — asserted against the same index
+- Regression suite runs feedback-free unless explicitly enabled
+- Learned weights display against defaults and reset independently of event history
+- Feedback can be listed, exported, and wiped in whole or per result
+- `wonk status` shows feedback state including current deviation
+- The reproducibility tradeoff is documented where a user will encounter it
+- Tests pass
+
+**Related Requirements:** PRD-FB-REQ-012, PRD-FB-REQ-013, PRD-FB-REQ-017, PRD-FB-REQ-018, PRD-FB-REQ-019
+**Related Decisions:** DR-042
+
+**Status:** Not Started
+
+---
+
+### TASK-104: Session-gated per-result preference
+
+**Milestone:** M36 - Usage Feedback Loop
+**Component:** Usage Feedback Loop
+**Estimate:** S
+
+**Goal:**
+Retain the repository-specific knowledge weight learning cannot express, behind a gate high enough that it cannot reintroduce the failure mode it comes from.
+
+**Action Items:**
+- [ ] Apply a direct per-result preference only after the result is reported useful across a configurable number of **distinct sessions** (PRD-FB-REQ-016)
+- [ ] Cap its influence below that of learned weights (PRD-FB-REQ-016)
+- [ ] Show it as its own contribution in `--why`, distinct from learned-weight effects (PRD-FB-REQ-014)
+- [ ] Decay and retire it on the same rules as every other feedback entry (PRD-FB-REQ-006, PRD-FB-REQ-011)
+- [ ] **Adversarial test: one session repeating feedback never activates the preference** (AR-036)
+
+**Dependencies:**
+- Blocked by: TASK-102
+- Blocks: None
+
+**Acceptance Criteria:**
+- A result confirmed across the configured number of distinct sessions gains a visible, capped preference
+- Repetition within a single session never activates it
+- Its contribution is distinguishable from learned-weight effects in `--why`
+- It cannot outweigh learned weights
+- Tests pass
+
+**Related Requirements:** PRD-FB-REQ-016
+**Related Decisions:** DR-042
+
+**Status:** Not Started
+
+---
+
 ## Parking Lot
 
 Tasks identified but not yet scheduled:
@@ -3132,14 +4407,18 @@ Tasks identified but not yet scheduled:
 | ID | Description | Reason Deferred |
 |----|-------------|-----------------|
 | - | LSP server integration | Future version |
-| - | Cross-language call graphs | Future version — V3 call graph is same-language only |
+| - | Cross-language call graphs | Partially addressed in V5 (M29) — links form at contract boundaries; in-process cross-language call resolution still deferred |
 | - | Editor integrations | Future version |
-| - | Remote/monorepo support | Future version |
-| - | Web UI | Future version |
-| - | Bundled/offline embedding model (ONNX) | Future version — would remove Ollama dependency |
-| - | Configurable embedding models | Future version — single model for V2 |
-| - | ANN indexing for >100K vectors | Future version — brute-force sufficient for V2 scale |
+| - | Remote/monorepo support | Future version — V5 cross-repo work is local-index-only |
+| - | Web UI | Rejected — graph visualization does not serve the agent-facing, token-efficiency mission |
+| - | ~~Bundled/offline embedding model~~ | **Scheduled — M26 (TASK-075 to TASK-077)** |
+| - | ~~Configurable embedding models~~ | **Scheduled — M26, provider trait with bundled + Ollama tiers** |
+| - | ANN indexing for >100K vectors | Future version — brute-force sufficient through V5 scale |
 | - | Dynamic dispatch resolution for call graph | Future version — V3 tracks static calls only |
+| - | Hosted embedding APIs (OpenAI/Cohere) | Rejected — reintroduces network dependency and sends source off-machine (DR-032) |
+| - | Runtime contract discovery (traffic capture, OTel) | Future version — V5 contract detection is static only |
+| - | Contract payload schema compatibility checking | Future version — V5 matches contract identity, not request/response field shapes |
+| - | Query-serving daemon / HTTP MCP transport | Future version — would replace the no-IPC short-lived-CLI model (DR-003); revisit only if per-invocation SQLite open cost is shown to matter |
 
 ---
 
@@ -3154,4 +4433,10 @@ Tasks identified but not yet scheduled:
 | 2026-02-24 | Added V3 milestones (M15-M18, TASK-057 to TASK-064). 8 tasks across 4 milestones: Call Graph Data Model & Indexing, Source Display, Call Graph Commands, Code Summary Engine. Marked M11/M12 as Complete. Updated parking lot. Total tasks: 64 across 18 milestones. | TBD |
 | 2026-02-25 | Added V4 milestones (M19-M25, TASK-065 to TASK-074). 10 tasks across 7 milestones: Edge Confidence & Inheritance Infrastructure, Hybrid Search Fusion (RRF), Execution Flow Detection, Blast Radius Analysis, Scoped Change Detection, Unified Symbol Context, Multi-Repo MCP. Total tasks: 74 across 25 milestones. | TBD |
 | 2026-02-25 | TASK-057 Complete, TASK-058 In Progress. caller_id column + migration + enclosing function detection implemented. Pipeline now resolves caller_name to caller_id FK in both batch_insert and upsert_file_data. Router query_references_db JOINs on caller_id. RefOutput includes caller_name for MCP/JSON consumers. M15 marked In Progress. | TBD |
+| 2026-07-29 | Widened the feedback feature space beyond signal contributions to descriptive result properties (PRD-FB-REQ-021 to 029, DR-043, TASK-105): path character and per-ancestor directory features, symbol attributes, match shape, graph position, modification history, and optional working-context relation. Signal-only learning could redistribute emphasis among existing criteria but could not represent repository knowledge like "answers live under packages/core" — a structural ceiling, not a tuning matter. Cardinality managed by construction: hierarchical paths, bucketed continuous values, capped categoricals. A minimum-observation gate makes unproven features inert, so the recorded set can exceed the useful set and be pruned empirically (OQ-020). Author features included and individually switchable — a deliberate departure from DR-039, which rejects *assuming* authorship predicts relevance, whereas a learned weight asserts nothing until this repo's feedback produces it (AR-046). Spurious correlation is now the feature's principal risk (AR-044). Total tasks: 105; requirements: 360. | TBD |
+| 2026-07-29 | Reframed the feedback loop (PRD-FB, DR-042) from result-boosting to contrastive learning of ranking signal weights. Keying feedback to queries was memorization over a space where queries rarely repeat — sparse by construction, with every key choice trading sparsity against transferring a result preference onto unrelated queries. Learning signal weights instead makes each event inform every weight, generalizes over criteria rather than queries, and removes the per-item lever that made rich-get-richer possible (AR-036 H→L). Requires capturing the returned slate for credit assignment (PRD-FB-REQ-002) and skipping events where the useful result was already first, to counter presentation bias (PRD-FB-REQ-009, AR-042). Session-gated per-result layer retained for knowledge weights cannot express (TASK-104). OQ-016 resolved, superseded by OQ-019 (update rule). Total tasks: 104; requirements: 351. | TBD |
+| 2026-07-29 | Added the four extended-signal features previously excluded from M32, plus a usage feedback loop: M33 History-Derived Signals (PRD-HIST, DR-039 — bounded-window churn + co-change with bulk-commit exclusion), M34 Graph-Topology Signals (PRD-TOPO, DR-040 — hub/authority + community, cadence recompute since global properties resist incremental maintenance), M35 Near-Duplicate Similarity (PRD-DUP, DR-041 — lexical shingles, response-relative demotion), M36 Usage Feedback Loop (PRD-FB, DR-042 — caller-reported usefulness, bounded/decaying/session-counted, with a feedback-free mode preserving reproducibility). TASK-096 to TASK-103. Feedback is the first component whose output is not a pure function of the index; the cost is recorded in AR-039 and bounded by PRD-FB-REQ-011/012. Total tasks: 103 across 36 milestones; requirements: 346. | TBD |
+| 2026-07-29 | Added M32 Signal-Based Reranking (TASK-092 to TASK-095, PRD-RANK, DR-037, DR-038). Replaces ordinal `ResultCategory` tier comparison with a weighted sum of independent normalized signals; category becomes the highest-weighted signal so current ordering is reproducible as a configuration and provable by equivalence test. Adds query classification scaling only the lexical/semantic channels. Signals requiring absent infrastructure (churn, co-change, feedback learning, HITS, community detection, clustering similarity) excluded by decision and recorded. Total tasks: 95 across 32 milestones; requirements: 309. | TBD |
+| 2026-07-29 | V5 revision after implementation-level review of comparable systems. Corrected three defects in the V5 specs: HTTP normalization was missing scheme/authority stripping, base-URL interpolation stripping, positional parameters, and router prefix composition (PRD-CTR-REQ-003/022/023, AR-029); review had no anchor policy for removed code, which its flagship blocking rule requires (PRD-REV-REQ-011/012, AR-030); reach had no atomic-publication invariant, where a partial read returns fewer dependents and reads as "safe to change" (PRD-REACH-REQ-008, AR-028). Simplified workspace handling to default-to-repo-name, deleting the unscoped special case. Split M29 by contract kind (TASK-087, TASK-088) after finding comparable detection runs ~20k lines. Added review finding identity + durable suppression + drop accounting (TASK-089). Added M31 Body Elision (TASK-090, TASK-091). Total tasks: 91 across 31 milestones; requirements: 292. | TBD |
+| 2026-07-29 | Added V5 milestones (M26-M30, TASK-075 to TASK-086). 12 tasks across 5 milestones: Bundled Embedding Provider, Lexical BM25 Scoring, Precomputed Reach Index, Cross-Repo Contract Detection, Diff-Scoped Review Workflow. Web UI and in-memory-graph storage explicitly rejected to preserve the CLI/MCP + SQLite/WAL identity. Total tasks: 86 across 30 milestones. | TBD |
 | 2026-03-13 | v4.10.0 MCP token efficiency fixes. Softened truncation hints ("Showing N of M" instead of "Increase budget"). Clarified wonk_search as keyword/regex only. Moved RRF semantic fusion from wonk_search to wonk_ask. Added output='files' mode to wonk_ref (PRD-REF-REQ-004). Deprioritized .d.ts files in wonk_sym. Fixed shallow mode for TS interfaces (method_signature/property_signature with scope). Updated wonk_show description. Added wonk_ask to MCP server instructions. | TBD |
