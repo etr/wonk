@@ -75,13 +75,13 @@ fn validate_token(token: &str) -> bool {
 
     // Build index with embeddings.
     let init = Command::new(&bin)
-        .args(["init", "--embed"])
+        .args(["init", "--provider", "ollama"])
         .current_dir(tmp.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .status()
         .unwrap();
-    assert!(init.success(), "wonk init --embed failed");
+    assert!(init.success(), "wonk init --provider ollama failed");
 
     // Run `wonk ask` with JSON output.
     let output = Command::new(&bin)

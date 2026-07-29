@@ -680,7 +680,7 @@ pub fn analyze_impact(
     conn: &Connection,
     file: &str,
     repo_root: &Path,
-    client: &embedding::OllamaClient,
+    provider: &dyn embedding::EmbeddingProvider,
     all_embeddings: &[(i64, Vec<f32>)],
 ) -> Result<Vec<ImpactResult>> {
     validate_file_path(file)?;
@@ -746,7 +746,7 @@ pub fn analyze_impact(
         let chunk = embedding::chunk_symbol(full_sym, &file_imports, &source_code);
 
         // Embed the chunk.
-        let mut query_vec = client.embed_single(&chunk)?;
+        let mut query_vec = provider.embed_single(&chunk)?;
         embedding::normalize(&mut query_vec);
 
         // Semantic search (limit to 20 results per changed symbol).
@@ -1312,7 +1312,7 @@ impl Bar {
         fs::write(dir.path().join("src/lib.rs"), "fn hello(x: i32) { }\n").unwrap();
 
         // Dead-port client
-        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = crate::embedding::OllamaProvider::with_base_url("http://127.0.0.1:19999");
 
         // Pass empty embeddings — should return empty (no embeddings to compare against)
         let all_embeddings = Vec::new();
@@ -1329,7 +1329,7 @@ impl Bar {
         let (dir, conn) = make_indexed_repo(source);
 
         // File unchanged, no client needed
-        let client = crate::embedding::OllamaClient::with_base_url("http://127.0.0.1:19999");
+        let client = crate::embedding::OllamaProvider::with_base_url("http://127.0.0.1:19999");
 
         let all_embeddings = Vec::new();
         let results =
@@ -1658,7 +1658,7 @@ diff --git a/src/lib.rs b/src/lib.rs
         let result = parse_all_diff_hunks(diff);
         // Pure deletion produces no new-side hunks.
         assert!(
-            result.is_empty() || result.get("src/lib.rs").map_or(true, |h| h.is_empty()),
+            result.is_empty() || result.get("src/lib.rs").is_none_or(|h| h.is_empty()),
             "pure deletion should produce no hunks"
         );
     }

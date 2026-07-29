@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
     vector BLOB NOT NULL,
     stale INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'ollama',
+    dim INTEGER NOT NULL DEFAULT 768,
     UNIQUE(symbol_id)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file);
@@ -196,6 +198,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating type_edges table")?;
     conn.execute_batch(EMBEDDINGS_SQL)
         .context("creating embeddings table")?;
+    ensure_embedding_metadata_columns(conn)?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -213,6 +216,31 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 pub fn ensure_embeddings_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(EMBEDDINGS_SQL)
         .context("creating embeddings table (migration)")?;
+    ensure_embedding_metadata_columns(conn)?;
+    Ok(())
+}
+
+/// Add provider metadata to embedding tables created before V5.
+fn ensure_embedding_metadata_columns(conn: &Connection) -> Result<()> {
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(embeddings)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if !columns.iter().any(|name| name == "provider") {
+        conn.execute_batch(
+            "ALTER TABLE embeddings
+             ADD COLUMN provider TEXT NOT NULL DEFAULT 'ollama';",
+        )
+        .context("adding provider column to embeddings table")?;
+    }
+    if !columns.iter().any(|name| name == "dim") {
+        conn.execute_batch(
+            "ALTER TABLE embeddings
+             ADD COLUMN dim INTEGER NOT NULL DEFAULT 768;",
+        )
+        .context("adding dimension column to embeddings table")?;
+    }
     Ok(())
 }
 
@@ -1161,6 +1189,69 @@ mod tests {
         // again should not fail.
         ensure_embeddings_table(&conn).unwrap();
         ensure_embeddings_table(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_pre_v5_embedding_rows_migrate_to_ollama_768() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                file TEXT NOT NULL,
+                chunk_text TEXT NOT NULL,
+                vector BLOB NOT NULL,
+                stale INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                UNIQUE(symbol_id)
+            );
+            INSERT INTO symbols (id, name, kind, file, line, col, language)
+                VALUES (1, 'main', 'function', 'src/main.rs', 1, 0, 'rust');
+            INSERT INTO embeddings
+                (symbol_id, file, chunk_text, vector, stale, created_at)
+                VALUES (1, 'src/main.rs', 'fn main() {}', X'00000000', 0, 0);",
+        )
+        .unwrap();
+
+        ensure_embeddings_table(&conn).unwrap();
+        ensure_embeddings_table(&conn).unwrap();
+
+        let metadata: (String, i64) = conn
+            .query_row(
+                "SELECT provider, dim FROM embeddings WHERE symbol_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata, ("ollama".to_string(), 768));
+    }
+
+    #[test]
+    fn test_fresh_embeddings_schema_has_provider_metadata_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        ensure_embeddings_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language)
+             VALUES (1, 'main', 'function', 'src/main.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings
+                (symbol_id, file, chunk_text, vector, created_at)
+             VALUES (1, 'src/main.rs', 'fn main() {}', X'00000000', 0)",
+            [],
+        )
+        .unwrap();
+
+        let metadata: (String, i64) = conn
+            .query_row("SELECT provider, dim FROM embeddings", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(metadata, ("ollama".to_string(), 768));
     }
 
     // -- file_exists_in_index tests ------------------------------------------

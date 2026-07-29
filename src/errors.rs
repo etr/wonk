@@ -68,6 +68,31 @@ pub enum EmbeddingError {
     #[error("invalid embedding response")]
     InvalidResponse,
 
+    /// The configured provider cannot be constructed in this build.
+    #[error("embedding provider unavailable: {0}")]
+    ProviderUnavailable(String),
+
+    /// A vector does not match the active provider's declared dimension.
+    #[error("embedding dimension mismatch: provider {provider} expects {expected}, got {actual}")]
+    VectorDimension {
+        provider: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// Stored vectors belong to a different provider or dimension.
+    #[error(
+        "embedding vector space mismatch: active {active_provider}/{active_dim}, stored \
+         {stored_provider}/{stored_dim}; run `wonk update --force --provider {active_provider}` \
+         to re-embed"
+    )]
+    VectorSpaceMismatch {
+        active_provider: String,
+        active_dim: usize,
+        stored_provider: String,
+        stored_dim: usize,
+    },
+
     /// No embeddings exist in the index.
     #[error("no embeddings found; run `wonk init --embed` to generate them")]
     NoEmbeddings,

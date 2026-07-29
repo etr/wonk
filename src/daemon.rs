@@ -19,7 +19,6 @@ use rusqlite::Connection;
 use signal_hook::flag;
 
 use crate::db;
-use crate::embedding::OllamaClient;
 use crate::pipeline;
 use crate::watcher::{self, FileWatcher};
 
@@ -406,6 +405,8 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     let embed_shutdown = Arc::clone(&shutdown);
     let embed_index_path = index_path.clone();
     let embed_repo_root = repo_root.to_path_buf();
+    let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
+    let embedding_kind = config.embedding.provider;
 
     let embed_handle = thread::Builder::new()
         .name("wonk-embed".to_string())
@@ -418,7 +419,13 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
                     return;
                 }
             };
-            let client = OllamaClient::new();
+            let provider = match crate::embedding::create_provider(embedding_kind) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    eprintln!("embedding worker: {error}");
+                    return;
+                }
+            };
 
             // Check for a full embedding build request (set by auto-init).
             if is_embedding_build_requested(&embed_conn) {
@@ -426,7 +433,7 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
                 match pipeline::build_embeddings(
                     &embed_conn,
                     &embed_repo_root,
-                    &client,
+                    provider.as_ref(),
                     progress_mode,
                 ) {
                     Ok(stats) => {
@@ -460,7 +467,7 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
                     &embed_conn,
                     &embed_repo_root,
                     &files,
-                    &client,
+                    provider.as_ref(),
                 ) {
                     Ok(_embedded) => {
                         update_embedding_activity(&embed_conn, files.len()).ok();
@@ -475,7 +482,6 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
 
     // --- File watcher event loop ---
     // Build ignore rules from .gitignore, .wonkignore, and config patterns.
-    let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
     let ignore_matcher = Arc::new(watcher::IgnoreMatcher::build(
         repo_root,
         &config.ignore.patterns,

@@ -29,6 +29,22 @@ use crate::router::QueryRouter;
 use crate::search;
 use crate::types::Symbol;
 
+fn embedding_provider_for(
+    repo_root: &Path,
+    invocation: Option<&str>,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>, String> {
+    let invocation = match invocation {
+        Some("bundled") => Some(crate::embedding::EmbeddingProviderKind::Bundled),
+        Some("ollama") => Some(crate::embedding::EmbeddingProviderKind::Ollama),
+        Some(other) => return Err(format!("invalid embedding provider: {other}")),
+        None => None,
+    };
+    let config = crate::config::Config::load(Some(repo_root))
+        .map_err(|error| format!("failed to load embedding configuration: {error:#}"))?;
+    let kind = crate::embedding::resolve_provider_kind(invocation, config.embedding.provider);
+    crate::embedding::create_provider(kind).map_err(|error| error.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 types
 // ---------------------------------------------------------------------------
@@ -590,6 +606,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "description": "Use a local (project-specific) index instead of the shared index",
                             "default": false
                         },
+                        "provider": {
+                            "type": "string",
+                            "enum": ["bundled", "ollama"],
+                            "description": "Embedding provider override for this index build"
+                        },
                         "format": {
                             "type": "string",
                             "enum": ["json", "toon"],
@@ -1086,6 +1107,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "boolean",
                             "description": "Force a full rebuild even if the index appears current",
                             "default": false
+                        },
+                        "provider": {
+                            "type": "string",
+                            "enum": ["bundled", "ollama"],
+                            "description": "Embedding provider override for this index build"
                         }
                     }
                 }),
@@ -1809,6 +1835,13 @@ impl McpServer {
         let local = args.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
         let format = extract_format(&args);
         let repo_root = self.router.repo_root().to_path_buf();
+        let provider = match embedding_provider_for(
+            &repo_root,
+            args.get("provider").and_then(|value| value.as_str()),
+        ) {
+            Ok(provider) => provider,
+            Err(error) => return CallToolResult::error(error),
+        };
 
         // Check if we can do an incremental update instead of a full rebuild.
         let index_path = match db::index_path_for(&repo_root, local) {
@@ -1833,11 +1866,10 @@ impl McpServer {
             let emb_stats = db::open(&index_path)
                 .ok()
                 .and_then(|conn| {
-                    let client = crate::embedding::OllamaClient::new();
                     pipeline::build_embeddings(
                         &conn,
                         &repo_root,
-                        &client,
+                        provider.as_ref(),
                         crate::progress::ProgressMode::Silent,
                     )
                     .ok()
@@ -1869,11 +1901,10 @@ impl McpServer {
             let emb_stats = db::open(&index_path)
                 .ok()
                 .and_then(|conn| {
-                    let client = crate::embedding::OllamaClient::new();
                     pipeline::build_missing_embeddings(
                         &conn,
                         &repo_root,
-                        &client,
+                        provider.as_ref(),
                         crate::progress::ProgressMode::Silent,
                     )
                     .ok()
@@ -2094,8 +2125,8 @@ impl McpServer {
                     let source_lines: Vec<&str> = sr.source.lines().collect();
                     if !source_lines.is_empty() {
                         let avg_chars = sr.source.len() / source_lines.len();
-                        if avg_chars > 0 {
-                            let max_lines = (remaining_chars / avg_chars)
+                        if let Some(line_budget) = remaining_chars.checked_div(avg_chars) {
+                            let max_lines = line_budget
                                 .clamp(ShowOutput::MIN_SOURCE_LINES, ShowOutput::MAX_SOURCE_LINES);
                             let fresh_out = ShowOutput::from(sr);
                             if let Some(t) = fresh_out.truncated(max_lines) {
@@ -2758,6 +2789,10 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
+        let provider = match embedding_provider_for(&repo_root, None) {
+            Ok(provider) => provider,
+            Err(error) => return CallToolResult::error(error),
+        };
 
         let from = args.get("from").and_then(|v| v.as_str());
         let to = args.get("to").and_then(|v| v.as_str());
@@ -2772,11 +2807,15 @@ impl McpServer {
 
         // Load embeddings — scoped to reachable files when from/to is specified.
         let embeddings = match &reachable_files {
-            Some(files) => match crate::embedding::load_embeddings_for_files(conn, files) {
-                Ok(e) => e,
-                Err(e) => return CallToolResult::error(format!("failed to load embeddings: {e}")),
-            },
-            None => match crate::embedding::load_all_embeddings(conn) {
+            Some(files) => {
+                match crate::embedding::load_embeddings_for_files(conn, files, provider.as_ref()) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        return CallToolResult::error(format!("failed to load embeddings: {e}"));
+                    }
+                }
+            }
+            None => match crate::embedding::load_all_embeddings(conn, provider.as_ref()) {
                 Ok(e) => e,
                 Err(e) => return CallToolResult::error(format!("failed to load embeddings: {e}")),
             },
@@ -2784,13 +2823,11 @@ impl McpServer {
 
         if embeddings.is_empty() {
             return CallToolResult::error(
-                "no embeddings available; run wonk_init with Ollama running to build embeddings"
-                    .into(),
+                "no embeddings available; run wonk_init to build embeddings".into(),
             );
         }
 
-        let client = crate::embedding::OllamaClient::new();
-        let mut query_vec = match client.embed_single(&query) {
+        let mut query_vec = match provider.embed_single(&query) {
             Ok(v) => v,
             Err(e) => return CallToolResult::error(format!("embedding query failed: {e}")),
         };
@@ -2880,6 +2917,10 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
+        let provider = match embedding_provider_for(&repo_root, None) {
+            Ok(provider) => provider,
+            Err(error) => return CallToolResult::error(error),
+        };
 
         if let Err(e) = validate_path(Path::new(&path), &repo_root) {
             return e;
@@ -2889,14 +2930,18 @@ impl McpServer {
         let prefix = path.strip_prefix("./").unwrap_or(&path);
         let prefix = if prefix == "." { "" } else { prefix };
 
-        let embeddings = match crate::embedding::load_embeddings_for_path_prefix(conn, prefix) {
+        let embeddings = match crate::embedding::load_embeddings_for_path_prefix(
+            conn,
+            prefix,
+            provider.as_ref(),
+        ) {
             Ok(e) => e,
             Err(e) => return CallToolResult::error(format!("failed to load embeddings: {e}")),
         };
 
         if embeddings.is_empty() {
             return CallToolResult::error(
-                "no embeddings found for this path; run wonk_init with Ollama running to build embeddings".into(),
+                "no embeddings found for this path; run wonk_init to build embeddings".into(),
             );
         }
 
@@ -2941,6 +2986,10 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
+        let provider = match embedding_provider_for(&repo_root, None) {
+            Ok(provider) => provider,
+            Err(error) => return CallToolResult::error(error),
+        };
 
         // Determine files to analyze.
         let files: Vec<String> = if let Some(ref since_ref) = since {
@@ -2963,22 +3012,25 @@ impl McpServer {
         }
 
         // Load all embeddings once.
-        let all_embeddings = match crate::embedding::load_all_embeddings(conn) {
+        let all_embeddings = match crate::embedding::load_all_embeddings(conn, provider.as_ref()) {
             Ok(e) if !e.is_empty() => e,
             Ok(_) => {
                 return CallToolResult::error(
-                    "no embeddings found; run wonk_init with Ollama running to build embeddings"
-                        .into(),
+                    "no embeddings found; run wonk_init to build embeddings".into(),
                 );
             }
             Err(e) => return CallToolResult::error(format!("failed to load embeddings: {e}")),
         };
 
-        let client = crate::embedding::OllamaClient::new();
-
         let mut all_results = Vec::new();
         for f in &files {
-            match crate::impact::analyze_impact(conn, f, &repo_root, &client, &all_embeddings) {
+            match crate::impact::analyze_impact(
+                conn,
+                f,
+                &repo_root,
+                provider.as_ref(),
+                &all_embeddings,
+            ) {
                 Ok(results) => all_results.extend(results),
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -3062,6 +3114,13 @@ impl McpServer {
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let repo_root = self.router.repo_root().to_path_buf();
+        let provider = match embedding_provider_for(
+            &repo_root,
+            args.get("provider").and_then(|value| value.as_str()),
+        ) {
+            Ok(provider) => provider,
+            Err(error) => return CallToolResult::error(error),
+        };
 
         // Decide whether we need a full rebuild or can do incremental.
         let needs_full_rebuild = force
@@ -3084,11 +3143,10 @@ impl McpServer {
                 .ok()
                 .and_then(|p| db::open(&p).ok())
                 .and_then(|conn| {
-                    let client = crate::embedding::OllamaClient::new();
                     pipeline::build_embeddings(
                         &conn,
                         &repo_root,
-                        &client,
+                        provider.as_ref(),
                         crate::progress::ProgressMode::Silent,
                     )
                     .ok()
@@ -3111,11 +3169,10 @@ impl McpServer {
                 .ok()
                 .and_then(|p| db::open(&p).ok())
                 .and_then(|conn| {
-                    let client = crate::embedding::OllamaClient::new();
                     pipeline::build_missing_embeddings(
                         &conn,
                         &repo_root,
-                        &client,
+                        provider.as_ref(),
                         crate::progress::ProgressMode::Silent,
                     )
                     .ok()
@@ -4191,14 +4248,14 @@ mod tests {
             if tool.name == "wonk_repos" || tool.name == "wonk_init" || tool.name == "wonk_update" {
                 continue;
             }
-            if let Some(required) = tool.input_schema.get("required") {
-                if let Some(arr) = required.as_array() {
-                    assert!(
-                        !arr.contains(&serde_json::json!("repo")),
-                        "tool {} should not require 'repo' param",
-                        tool.name
-                    );
-                }
+            if let Some(required) = tool.input_schema.get("required")
+                && let Some(arr) = required.as_array()
+            {
+                assert!(
+                    !arr.contains(&serde_json::json!("repo")),
+                    "tool {} should not require 'repo' param",
+                    tool.name
+                );
             }
         }
     }
@@ -4632,6 +4689,61 @@ mod tests {
         assert!(
             !props.contains_key("repo"),
             "wonk_update should not have 'repo' property"
+        );
+    }
+
+    #[test]
+    fn index_build_tools_expose_provider_override() {
+        let tools = tool_definitions();
+        for name in ["wonk_init", "wonk_update"] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let provider = &tool.input_schema["properties"]["provider"];
+            assert_eq!(provider["type"], "string");
+            assert_eq!(provider["enum"], serde_json::json!(["bundled", "ollama"]));
+        }
+    }
+
+    #[test]
+    fn embedding_provider_for_uses_repo_configuration_and_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_root = dir.path();
+        std::fs::create_dir_all(repo_root.join(".wonk")).unwrap();
+        std::fs::write(
+            repo_root.join(".wonk/config.toml"),
+            "[embedding]\nprovider = 'ollama'\n",
+        )
+        .unwrap();
+
+        let configured = embedding_provider_for(repo_root, None).unwrap();
+        assert_eq!(configured.name(), "ollama");
+        assert_eq!(configured.dim(), 768);
+
+        std::fs::write(
+            repo_root.join(".wonk/config.toml"),
+            "[embedding]\nprovider = 'bundled'\n",
+        )
+        .unwrap();
+        let overridden = embedding_provider_for(repo_root, Some("ollama")).unwrap();
+        assert_eq!(overridden.name(), "ollama");
+        assert_eq!(overridden.dim(), 768);
+    }
+
+    #[test]
+    fn embedding_provider_for_rejects_invalid_mcp_provider() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut server = McpServer {
+            router: QueryRouter::new(Some(dir.path().to_path_buf()), false),
+            registry: RepoRegistry::new(Vec::new()),
+        };
+        let result = server.handle_tools_call(&serde_json::json!({
+            "name": "wonk_init",
+            "arguments": {"provider": "remote"}
+        }));
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"][0]["text"],
+            "invalid embedding provider: remote"
         );
     }
 
