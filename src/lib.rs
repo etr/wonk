@@ -1,5 +1,6 @@
 pub mod blast;
 pub mod budget;
+mod bundled_embedding;
 pub mod callgraph;
 pub mod cli;
 pub mod cluster;

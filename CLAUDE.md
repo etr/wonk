@@ -37,14 +37,14 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `router.rs` | Query dispatch — routes commands to index or grep fallback, auto-initializes index on first use |
 | `indexer.rs` | Tree-sitter parsing — extracts symbols, references, and imports for 12 languages |
 | `db.rs` | SQLite layer — schema (WAL mode), repo root detection, index path computation |
-| `pipeline.rs` | Index build orchestration — parallel file walk + parse + batch insert; incremental re-indexing for daemon; embedding build pipeline (chunking → Ollama batch embed → vector storage) |
+| `pipeline.rs` | Index build orchestration — parallel file walk + parse + batch insert; incremental re-indexing for daemon; provider-neutral embedding build pipeline (chunking → batch embed → vector storage) |
 | `walker.rs` | File enumeration with gitignore/wonkignore support; worktree-aware boundary detection |
 | `search.rs` | Text search wrapping the `grep` crate (ripgrep internals) |
 | `semantic.rs` | Brute-force cosine similarity search — parallel dot product via rayon, top-N ranking, resolution of symbol IDs to SemanticResult structs; BFS dependency graph traversal for `--from`/`--to` reachability scoping |
 | `cluster.rs` | K-Means clustering engine — auto-k selection via silhouette scoring, cluster member resolution from SQLite |
 | `ranker.rs` | Classifies results (Definition > CallSite > Import > Other > Comment > Test), deduplicates re-exports; RRF fusion via `fuse_rrf()` for `--semantic` blending |
 | `output.rs` | Dual format: grep-compatible (stdout+stderr) or NDJSON (stdout) |
-| `embedding.rs` | Ollama API client, symbol chunking engine, and vector storage — sync HTTP client for embedding generation, context-rich text chunk formatting for `nomic-embed-text`, BLOB storage/retrieval with bytemuck zero-copy deserialization |
+| `embedding.rs` | Embedding provider abstraction, Ollama API client, symbol chunking engine, and vector storage — bundled offline default plus opt-in sync Ollama client, context-rich chunks, and provider-isolated BLOB storage |
 | `show.rs` | Source body retrieval — queries symbol index by name with optional file/kind/exact filters, reads source file lines line..end_line per match, falls back to signature when end_line is absent; shallow mode for containers shows signature + child signatures without bodies |
 | `summary.rs` | Structural summary engine — queries SQLite to aggregate file count, line count, symbol counts by kind, language breakdown, and dependency count for a path; supports three detail levels (rich/light/symbols), recursive depth traversal, symbol listing with location metadata, and `--tree` scope-grouped display (absorbed former `wonk ls`) |
 | `llm.rs` | LLM description generation and caching — content hash computation from (symbol.id, file.hash) pairs, prompt construction from structural metrics, Ollama `/api/generate` sync client, SQLite cache get/store for `wonk summary --semantic` |

@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "description": "Exact symbol-level relevance judgments derived from bench/tasks.json.",
+  "repositories": {
+    "ripgrep": "435f59fc4b43af3ab32f34d53fa34978f393fe52",
+    "tokio": "4308c74a65218e8ebea1a84e09c0ba4b0882f881",
+    "httpx": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+    "pydantic": "e8b6ff8dbaca8d41bc009864db24f7576237e3a2",
+    "fastify": "ea664e6c3d5ac2fdfc9b006e389a71515d9c4317"
+  },
+  "queries": [
+    {
+      "id": "rg_find_search_worker",
+      "repo": "ripgrep",
+      "query": "Find the definition of the search_parallel function and show its signature.",
+      "relevant": [{"file": "crates/core/main.rs", "symbol": "search_parallel"}]
+    },
+    {
+      "id": "rg_callers_of_sink_matched",
+      "repo": "ripgrep",
+      "query": "Find all functions that call sink_matched. List each caller's name and file.",
+      "relevant": [
+        {"file": "crates/searcher/src/searcher/core.rs", "symbol": "sink_matched"},
+        {"file": "crates/searcher/src/searcher/glue.rs", "symbol": "sink_matched"}
+      ]
+    },
+    {
+      "id": "rg_regex_module_arch",
+      "repo": "ripgrep",
+      "query": "Summarize the modules in the crates/regex directory and explain how they relate.",
+      "relevant": [{"file": "crates/regex/src/matcher.rs", "symbol": "RegexMatcher"}]
+    },
+    {
+      "id": "rg_matcher_impl",
+      "repo": "ripgrep",
+      "query": "Explain how the Matcher trait is implemented and which types implement it.",
+      "relevant": [{"file": "crates/matcher/src/lib.rs", "symbol": "Matcher"}]
+    },
+    {
+      "id": "rg_flag_parsing",
+      "repo": "ripgrep",
+      "query": "How does ripgrep parse CLI flags? Trace the flow from main to argument parsing.",
+      "relevant": [{"file": "crates/core/main.rs", "symbol": "main"}]
+    },
+    {
+      "id": "tokio_find_spawn",
+      "repo": "tokio",
+      "query": "Find the definition of the spawn function in the Tokio runtime and show its full signature.",
+      "relevant": [{"file": "tokio/src/task/spawn.rs", "symbol": "spawn"}]
+    },
+    {
+      "id": "tokio_task_wakers",
+      "repo": "tokio",
+      "query": "What functions reference Waker in the task module? List them.",
+      "relevant": [{"file": "tokio/src/runtime/task/harness.rs", "symbol": "wake_by_ref"}]
+    },
+    {
+      "id": "tokio_runtime_arch",
+      "repo": "tokio",
+      "query": "Summarize the architecture of Tokio's runtime module. What are the key components?",
+      "relevant": [{"file": "tokio/src/runtime/runtime.rs", "symbol": "Runtime"}]
+    },
+    {
+      "id": "tokio_io_driver",
+      "repo": "tokio",
+      "query": "Explain how the I/O driver polls for events. Trace from the driver struct to poll.",
+      "relevant": [{"file": "tokio/src/runtime/io/driver.rs", "symbol": "Driver"}]
+    },
+    {
+      "id": "tokio_join_handle",
+      "repo": "tokio",
+      "query": "What methods does JoinHandle provide? List them with their signatures.",
+      "relevant": [{"file": "tokio/src/runtime/task/join.rs", "symbol": "JoinHandle"}]
+    },
+    {
+      "id": "httpx_find_client",
+      "repo": "httpx",
+      "query": "Find the definition of the Client class and list its key methods.",
+      "relevant": [{"file": "httpx/_client.py", "symbol": "Client"}]
+    },
+    {
+      "id": "httpx_transport_refs",
+      "repo": "httpx",
+      "query": "What classes reference BaseTransport? List each with its file.",
+      "relevant": [
+        {"file": "httpx/_transports/base.py", "symbol": "AsyncBaseTransport"},
+        {"file": "httpx/_transports/default.py", "symbol": "HTTPTransport"}
+      ]
+    },
+    {
+      "id": "httpx_request_flow",
+      "repo": "httpx",
+      "query": "Trace how an HTTP request flows from Client.get to the transport layer.",
+      "relevant": [{"file": "httpx/_client.py", "symbol": "_send_single_request"}]
+    },
+    {
+      "id": "httpx_redirect_handling",
+      "repo": "httpx",
+      "query": "How does HTTPX handle HTTP redirects? Trace the redirect following logic.",
+      "relevant": [{"file": "httpx/_client.py", "symbol": "_send_handling_redirects"}]
+    },
+    {
+      "id": "httpx_response_methods",
+      "repo": "httpx",
+      "query": "What methods and properties does the Response class provide? List them.",
+      "relevant": [{"file": "httpx/_models.py", "symbol": "Response"}]
+    },
+    {
+      "id": "pydantic_find_basemodel",
+      "repo": "pydantic",
+      "query": "Find the definition of BaseModel and show its metaclass or model configuration.",
+      "relevant": [{"file": "pydantic/main.py", "symbol": "BaseModel"}]
+    },
+    {
+      "id": "pydantic_validator_refs",
+      "repo": "pydantic",
+      "query": "What modules import or reference field_validator? List the files.",
+      "relevant": [{"file": "pydantic/functional_validators.py", "symbol": "field_validator"}]
+    },
+    {
+      "id": "pydantic_validation_arch",
+      "repo": "pydantic",
+      "query": "How does Pydantic's validation pipeline work? What are the key components?",
+      "relevant": [{"file": "pydantic-core/src/validators/mod.rs", "symbol": "SchemaValidator"}]
+    },
+    {
+      "id": "pydantic_field_serialization",
+      "repo": "pydantic",
+      "query": "How does field serialization work when calling model_dump? Trace the flow.",
+      "relevant": [{"file": "pydantic/main.py", "symbol": "model_dump"}]
+    },
+    {
+      "id": "pydantic_config_options",
+      "repo": "pydantic",
+      "query": "What configuration options does ConfigDict provide? List them.",
+      "relevant": [{"file": "pydantic/config.py", "symbol": "ConfigDict"}]
+    },
+    {
+      "id": "fastify_find_register",
+      "repo": "fastify",
+      "query": "Find the definition of the register function and explain how plugins are loaded.",
+      "relevant": [{"file": "fastify.js", "symbol": "fastify"}]
+    },
+    {
+      "id": "fastify_hook_refs",
+      "repo": "fastify",
+      "query": "What functions reference the onRequest hook? List each with its file.",
+      "relevant": [{"file": "lib/hooks.js", "symbol": "onRequestHookRunner"}]
+    },
+    {
+      "id": "fastify_request_flow",
+      "repo": "fastify",
+      "query": "Trace how an HTTP request flows through Fastify from server to route handler.",
+      "relevant": [{"file": "lib/route.js", "symbol": "routeHandler"}]
+    },
+    {
+      "id": "fastify_error_handling",
+      "repo": "fastify",
+      "query": "How does Fastify handle errors in route handlers? Trace the error propagation path.",
+      "relevant": [{"file": "lib/error-handler.js", "symbol": "handleError"}]
+    },
+    {
+      "id": "fastify_reply_methods",
+      "repo": "fastify",
+      "query": "What methods does the Reply object provide? List them with brief descriptions.",
+      "relevant": [{"file": "lib/reply.js", "symbol": "Reply"}]
+    }
+  ]
+}

@@ -38,8 +38,8 @@ wonk search "render" -- src/components/
 ### `wonk ask <query>`
 
 Semantic search: find symbols related to a natural language query.
-Uses the configured embedding provider. In this build, configure Ollama with
-`nomic-embed-text`; the bundled provider is deferred to TASK-076.
+Uses the bundled offline embedding provider by default. Configure Ollama with
+`nomic-embed-text` only when opting into the external quality tier.
 
 ```
 wonk ask "error handling logic"
