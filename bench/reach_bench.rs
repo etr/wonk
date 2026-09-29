@@ -195,7 +195,12 @@ fn main() -> Result<()> {
         &leaf,
         "pub fn leaf_a() -> u32 {\n    1\n}\npub fn leaf_b() -> u32 {\n    leaf_a()\n}\n",
     )?;
-    wonk::pipeline::reindex_file(&conn, &leaf, root, &wonk::contracts::ContractOptions::default())?;
+    wonk::pipeline::reindex_file(
+        &conn,
+        &leaf,
+        root,
+        &wonk::contracts::ContractOptions::default(),
+    )?;
 
     // (label, rel path, a covered sample name) per edit shape. mod_0.rs is
     // the chain-calling-hub shape: its edit's reverse lookup pulls in the
@@ -234,7 +239,12 @@ fn main() -> Result<()> {
             edit_counter += 1;
             fs::write(&path, format!("{base}// bench edit {edit_counter}\n"))?;
             let start = Instant::now();
-            wonk::pipeline::reindex_file(&conn, &path, root, &wonk::contracts::ContractOptions::default())?;
+            wonk::pipeline::reindex_file(
+                &conn,
+                &path,
+                root,
+                &wonk::contracts::ContractOptions::default(),
+            )?;
             samples.push(start.elapsed().as_secs_f64() * 1000.0);
             if reach_stale(&conn)? {
                 trips += 1;
@@ -281,7 +291,12 @@ fn main() -> Result<()> {
             edit_counter += 1;
             fs::write(&path, format!("{base}// bench edit {edit_counter}\n"))?;
             let start = Instant::now();
-            wonk::pipeline::reindex_file(&conn, &path, root, &wonk::contracts::ContractOptions::default())?;
+            wonk::pipeline::reindex_file(
+                &conn,
+                &path,
+                root,
+                &wonk::contracts::ContractOptions::default(),
+            )?;
             samples.push(start.elapsed().as_secs_f64() * 1000.0);
             ensure!(
                 reach_stale(&conn)?,
