@@ -94,6 +94,9 @@ fn collect_router_context(root: Node, src: &[u8], lang: Lang) -> RouterContext {
             Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
                 collect_js_router_facts(node, src, &mut ctx);
             }
+            Lang::Python => {
+                collect_py_router_facts(node, src, &mut ctx);
+            }
             _ => {}
         }
         for i in (0..node.child_count()).rev() {
@@ -165,6 +168,155 @@ fn collect_js_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
     }
 }
 
+/// Python: `bp = Blueprint(..., url_prefix='/v1')`,
+/// `router = APIRouter(prefix='/users')`, `app = Flask(__name__)` bind
+/// router variables; `register_blueprint(bp, url_prefix=…)` and
+/// `include_router(router, prefix=…)` mount them.
+fn collect_py_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
+    match node.kind() {
+        "assignment" => {
+            let Some(left) = node.child_by_field_name("left") else {
+                return;
+            };
+            if left.kind() != "identifier" {
+                return;
+            }
+            let var = node_text(Some(left), src);
+            if var.is_empty() {
+                return;
+            }
+            let Some(right) = node.child_by_field_name("right") else {
+                return;
+            };
+            if right.kind() != "call" {
+                return;
+            }
+            let Some(func) = right.child_by_field_name("function") else {
+                return;
+            };
+            if func.kind() != "identifier" {
+                return;
+            }
+            let Some(args) = right.child_by_field_name("arguments") else {
+                return;
+            };
+            let prefix = match node_text(Some(func), src) {
+                "Blueprint" => kwarg_string(args, "url_prefix", src),
+                "APIRouter" => kwarg_string(args, "prefix", src),
+                "Flask" | "FastAPI" | "Falcon" => Some(String::new()),
+                _ => None,
+            };
+            if let Some(prefix) = prefix {
+                ctx.bindings.insert(var.to_string(), prefix);
+            }
+        }
+        "call" => {
+            let func = node.child_by_field_name("function");
+            let args = node.child_by_field_name("arguments");
+            let (Some(func), Some(args)) = (func, args) else {
+                return;
+            };
+            if func.kind() != "attribute" {
+                return;
+            }
+            let attr = node_text(func.child_by_field_name("attribute"), src);
+            let mount = match attr {
+                "register_blueprint" => kwarg_string(args, "url_prefix", src),
+                "include_router" => kwarg_string(args, "prefix", src),
+                _ => None,
+            };
+            if let Some(mount) = mount
+                && let Some(var_node) = positional_arg(args, 0)
+                && var_node.kind() == "identifier"
+            {
+                let var = node_text(Some(var_node), src);
+                if !var.is_empty() {
+                    ctx.mounts.entry(var.to_string()).or_default().push(mount);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The i-th positional argument of an argument list (skipping keywords).
+fn positional_arg(args: Node, i: usize) -> Option<Node> {
+    let mut seen = 0;
+    for j in 0..args.named_child_count() {
+        if let Some(child) = args.named_child(j as u32)
+            && child.kind() != "keyword_argument"
+        {
+            if seen == i {
+                return Some(child);
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
+/// String value of a keyword argument, if it is a string literal.
+fn kwarg_string(args: Node, name: &str, src: &[u8]) -> Option<String> {
+    for j in 0..args.named_child_count() {
+        if let Some(kw) = args.named_child(j as u32)
+            && kw.kind() == "keyword_argument"
+            && node_text(kw.child_by_field_name("name"), src) == name
+            && let Some(value) = kw.child_by_field_name("value")
+        {
+            return py_string_content(value, src);
+        }
+    }
+    None
+}
+
+/// Content of a Python string node (f-string interpolations rendered as
+/// `{expr}`).
+fn py_string_content(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut out = String::new();
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            match child.kind() {
+                "string_content" => out.push_str(node_text(Some(child), src)),
+                "interpolation" => {
+                    out.push('{');
+                    out.push_str(node_text(child.named_child(0), src));
+                    out.push('}');
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Verb for `@app.route(...)`: first entry of `methods=[...]`, else GET.
+fn py_route_verb(args: Node, src: &[u8]) -> &'static str {
+    for j in 0..args.named_child_count() {
+        if let Some(kw) = args.named_child(j as u32)
+            && kw.kind() == "keyword_argument"
+            && node_text(kw.child_by_field_name("name"), src) == "methods"
+            && let Some(value) = kw.child_by_field_name("value")
+            && value.kind() == "list"
+            && let Some(first) = value.named_child(0)
+            && let Some(method) = py_string_content(first, src)
+        {
+            return match method.to_lowercase().as_str() {
+                "post" => "post",
+                "put" => "put",
+                "patch" => "patch",
+                "delete" => "delete",
+                "head" => "head",
+                "options" => "options",
+                _ => "get",
+            };
+        }
+    }
+    "get"
+}
+
 // ---------------------------------------------------------------------------
 // Walker
 // ---------------------------------------------------------------------------
@@ -186,6 +338,14 @@ const JS_CONSUMER_RECEIVERS: &[&str] = &["axios", "got", "http", "https"];
 /// Verb-like callee names used by the 0.5 heuristic on unknown receivers.
 const AMBIGUOUS_VERBS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "any", "all", "request",
+];
+/// Receiver names treated as Flask/FastAPI routers without a tracked binding.
+const PY_ROUTER_VARS: &[&str] = &["app", "bp", "router", "api"];
+/// HTTP client receivers for Python outbound calls.
+const PY_CONSUMER_RECEIVERS: &[&str] = &["requests", "httpx", "session", "client"];
+/// Verb-named methods on those receivers.
+const PY_CONSUMER_VERBS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "request",
 ];
 
 /// Text of a node, or empty string.
@@ -225,6 +385,7 @@ impl<'a> Extractor<'a> {
     fn visit(&mut self, node: Node, prefix: &str) -> String {
         match self.lang {
             Lang::JavaScript | Lang::TypeScript | Lang::Tsx => self.visit_js(node, prefix),
+            Lang::Python => self.visit_python(node, prefix),
             _ => prefix.to_string(),
         }
     }
@@ -266,6 +427,7 @@ impl<'a> Extractor<'a> {
                         "GET",
                         prefix,
                         CONFIDENCE_FRAMEWORK,
+                        None,
                     );
                 }
             }
@@ -284,6 +446,7 @@ impl<'a> Extractor<'a> {
                         prop,
                         &join_raw(prefix, &mount_prefix),
                         CONFIDENCE_FRAMEWORK,
+                        None,
                     );
                 } else if JS_CONSUMER_RECEIVERS.contains(&recv)
                     && JS_PROVIDER_VERBS[..5].contains(&prop)
@@ -296,13 +459,14 @@ impl<'a> Extractor<'a> {
                         prop,
                         prefix,
                         CONFIDENCE_FRAMEWORK,
+                        None,
                     );
                 } else if AMBIGUOUS_VERBS.contains(&prop)
                     && !self.ctx.is_router_var(recv)
                     && !JS_ROUTER_VARS.contains(&recv)
                     && !JS_CONSUMER_RECEIVERS.contains(&recv)
                     && let Some(arg) = first_arg
-                    && matches!(self.js_path_arg(arg), Some(PathArg::Direct(ref s)) if is_path_like(s))
+                    && matches!(self.path_arg(arg), Some(PathArg::Direct(ref s)) if is_path_like(s))
                 {
                     self.emit_http(
                         node,
@@ -311,6 +475,7 @@ impl<'a> Extractor<'a> {
                         prop,
                         prefix,
                         CONFIDENCE_HEURISTIC,
+                        None,
                     );
                 }
             }
@@ -387,19 +552,267 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// Extract the textual path of a JS call argument.
-    fn js_path_arg(&self, arg: Node) -> Option<PathArg> {
-        match arg.kind() {
-            "string" => Some(PathArg::Direct(string_content(arg, self.src))),
-            "template_string" => Some(PathArg::Direct(template_content(arg, self.src))),
-            "binary_expression" if node_text(arg.child(1), self.src) == "+" => {
-                concat_literal(arg, self.src)
+    // -- Python ------------------------------------------------------------------
+
+    fn visit_python(&mut self, node: Node, prefix: &str) -> String {
+        match node.kind() {
+            "decorated_definition" => return self.py_decorated(node, prefix),
+            "call" => self.py_call(node, prefix),
+            "subscript" => self.py_env_subscript(node),
+            "assignment" => self.py_assignment(node, prefix),
+            _ => {}
+        }
+        prefix.to_string()
+    }
+
+    /// `@app.get('/x')` / `@app.route('/x', methods=['POST'])` decorators.
+    fn py_decorated(&mut self, node: Node, prefix: &str) -> String {
+        let owning = node
+            .child_by_field_name("definition")
+            .and_then(|def| def.child_by_field_name("name"))
+            .map(|n| node_text(Some(n), self.src).to_string());
+        for i in 0..node.child_count() {
+            let Some(dec) = node.child(i as u32) else {
+                continue;
+            };
+            if dec.kind() != "decorator" {
+                continue;
             }
+            let Some(call) = dec.named_child(0) else {
+                continue;
+            };
+            if call.kind() != "call" {
+                continue;
+            }
+            let Some(func) = call.child_by_field_name("function") else {
+                continue;
+            };
+            if func.kind() != "attribute" {
+                continue;
+            }
+            let args = call.child_by_field_name("arguments");
+            let Some(args) = args else { continue };
+            let recv = node_text(func.child_by_field_name("object"), self.src);
+            let attr = node_text(func.child_by_field_name("attribute"), self.src);
+            let is_router = self.ctx.is_router_var(recv) || PY_ROUTER_VARS.contains(&recv);
+            let Some(path_node) = positional_arg(args, 0) else {
+                continue;
+            };
+            let verb = match attr {
+                "route" => py_route_verb(args, self.src),
+                "get" | "post" | "put" | "patch" | "delete" if is_router => attr,
+                _ => continue,
+            };
+            let mount_prefix = self.ctx.effective_prefix(recv);
+            self.emit_http(
+                call,
+                path_node,
+                ContractRole::Provider,
+                verb,
+                &join_raw(prefix, &mount_prefix),
+                CONFIDENCE_FRAMEWORK,
+                owning.as_deref(),
+            );
+        }
+        prefix.to_string()
+    }
+
+    /// Consumer calls, Falcon `add_route`, and env accessors.
+    fn py_call(&mut self, node: Node, prefix: &str) {
+        let func = node.child_by_field_name("function");
+        let args = node.child_by_field_name("arguments");
+        let (Some(func), Some(args)) = (func, args) else {
+            return;
+        };
+        match func.kind() {
+            "attribute" => {
+                let recv = node_text(func.child_by_field_name("object"), self.src);
+                let attr = node_text(func.child_by_field_name("attribute"), self.src);
+                let first = positional_arg(args, 0);
+                match (recv, attr) {
+                    ("os.environ", "get") | ("os", "getenv") => {
+                        if let Some(arg) = first
+                            && let Some(name) = py_string_content(arg, self.src)
+                        {
+                            self.emit_env(
+                                node,
+                                &name,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                            );
+                        }
+                    }
+                    ("os.environ", "setdefault") => {
+                        if let Some(arg) = first
+                            && let Some(name) = py_string_content(arg, self.src)
+                        {
+                            self.emit_env(
+                                node,
+                                &name,
+                                ContractRole::Provider,
+                                CONFIDENCE_HEURISTIC,
+                            );
+                        }
+                    }
+                    (_, "add_route")
+                        if self.ctx.is_router_var(recv) || PY_ROUTER_VARS.contains(&recv) =>
+                    {
+                        if let Some(arg) = first {
+                            self.emit_http(
+                                node,
+                                arg,
+                                ContractRole::Provider,
+                                "ANY",
+                                prefix,
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    _ => {
+                        if PY_CONSUMER_RECEIVERS.contains(&recv)
+                            && PY_CONSUMER_VERBS.contains(&attr)
+                            && let Some(arg) = first
+                        {
+                            self.emit_http(
+                                node,
+                                arg,
+                                ContractRole::Consumer,
+                                attr,
+                                prefix,
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+            "identifier" => {
+                if node_text(Some(func), self.src) == "urlopen"
+                    && let Some(arg) = positional_arg(args, 0)
+                {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Consumer,
+                        "GET",
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `os.environ['X']` reads.
+    fn py_env_subscript(&mut self, node: Node) {
+        if let Some(parent) = node.parent()
+            && parent.kind() == "assignment"
+            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
+        {
+            return; // the assignment handler owns this site
+        }
+        let obj = node_text(node.child_by_field_name("value"), self.src);
+        let name = node
+            .child_by_field_name("subscript")
+            .filter(|n| n.kind() == "string")
+            .and_then(|n| py_string_content(n, self.src))
+            .unwrap_or_default();
+        if obj == "os.environ" && is_env_name(&name) {
+            self.emit_env(node, &name, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+        }
+    }
+
+    /// `os.environ['X'] = …` writes and Django `urlpatterns` lists.
+    fn py_assignment(&mut self, node: Node, prefix: &str) {
+        let Some(left) = node.child_by_field_name("left") else {
+            return;
+        };
+        match left.kind() {
+            "subscript" => {
+                let obj = node_text(left.child_by_field_name("value"), self.src);
+                let name = left
+                    .child_by_field_name("subscript")
+                    .filter(|n| n.kind() == "string")
+                    .and_then(|n| py_string_content(n, self.src))
+                    .unwrap_or_default();
+                if obj == "os.environ" && is_env_name(&name) {
+                    self.emit_env(node, &name, ContractRole::Provider, CONFIDENCE_HEURISTIC);
+                }
+            }
+            "identifier" if node_text(Some(left), self.src) == "urlpatterns" => {
+                // Django URLconf: each path()/re_path() call is a route (ANY).
+                let Some(right) = node.child_by_field_name("right") else {
+                    return;
+                };
+                if right.kind() == "list" {
+                    for i in 0..right.named_child_count() {
+                        let Some(call) = right.named_child(i as u32) else {
+                            continue;
+                        };
+                        if call.kind() != "call" {
+                            continue;
+                        }
+                        let Some(func) = call.child_by_field_name("function") else {
+                            continue;
+                        };
+                        if func.kind() != "identifier" {
+                            continue;
+                        }
+                        if !matches!(node_text(Some(func), self.src), "path" | "re_path") {
+                            continue;
+                        }
+                        let Some(args) = call.child_by_field_name("arguments") else {
+                            continue;
+                        };
+                        let Some(arg) = positional_arg(args, 0) else {
+                            continue;
+                        };
+                        self.emit_http(
+                            call,
+                            arg,
+                            ContractRole::Provider,
+                            "ANY",
+                            prefix,
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract the textual path of a call argument, per language.
+    fn path_arg(&self, arg: Node) -> Option<PathArg> {
+        match self.lang {
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => match arg.kind() {
+                "string" => Some(PathArg::Direct(string_content(arg, self.src))),
+                "template_string" => Some(PathArg::Direct(template_content(arg, self.src))),
+                "binary_expression" if node_text(arg.child(1), self.src) == "+" => {
+                    concat_literal(arg, self.src, &["string", "template_string"])
+                }
+                _ => None,
+            },
+            Lang::Python => match arg.kind() {
+                "string" => py_string_content(arg, self.src).map(PathArg::Direct),
+                "binary_operator" if node_text(arg.child(1), self.src) == "+" => {
+                    concat_literal(arg, self.src, &["string"])
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
 
     /// Record an HTTP contract from a call site.
+    ///
+    /// `owning` overrides the enclosing-function lookup (decorators report
+    /// the decorated function instead).
+    #[allow(clippy::too_many_arguments)]
     fn emit_http(
         &mut self,
         node: Node,
@@ -408,8 +821,9 @@ impl<'a> Extractor<'a> {
         verb: &str,
         prefix: &str,
         confidence: f64,
+        owning: Option<&str>,
     ) {
-        let (raw, confidence) = match self.js_path_arg(arg) {
+        let (raw, confidence) = match self.path_arg(arg) {
             Some(PathArg::Direct(s)) => (s, confidence),
             Some(PathArg::Concat(s)) => (s, CONFIDENCE_HEURISTIC),
             None => return,
@@ -434,7 +848,9 @@ impl<'a> Extractor<'a> {
                     name,
                 })
                 .collect(),
-            owning_symbol: crate::indexer::find_enclosing_function(node, self.src, self.lang),
+            owning_symbol: owning
+                .map(str::to_string)
+                .or_else(|| crate::indexer::find_enclosing_function(node, self.src, self.lang)),
             line: arg.start_position().row + 1,
             confidence,
         });
@@ -498,10 +914,12 @@ fn template_content(node: Node, src: &[u8]) -> String {
 }
 
 /// `+` concatenation: keep going only when the tree holds exactly one
-/// path-like string literal (PRD-CTR-REQ-004 skip rules).
-fn concat_literal(node: Node, src: &[u8]) -> Option<PathArg> {
+/// path-like string literal (PRD-CTR-REQ-004 skip rules). `leaf_kinds` names
+/// the language's string-node kinds; concat operator nodes are matched by
+/// the caller.
+fn concat_literal(node: Node, src: &[u8], leaf_kinds: &[&str]) -> Option<PathArg> {
     let mut literals = Vec::new();
-    collect_string_leaves(node, src, &mut literals);
+    collect_string_leaves(node, src, leaf_kinds, &mut literals);
     if literals.len() == 1 && is_path_like(&literals[0]) {
         Some(PathArg::Concat(literals.into_iter().next()?))
     } else {
@@ -509,19 +927,39 @@ fn concat_literal(node: Node, src: &[u8]) -> Option<PathArg> {
     }
 }
 
-fn collect_string_leaves(node: Node, src: &[u8], out: &mut Vec<String>) {
-    match node.kind() {
-        "string" => out.push(string_content(node, src)),
-        "template_string" => out.push(template_content(node, src)),
-        "binary_expression" => {
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    collect_string_leaves(child, src, out);
-                }
+fn collect_string_leaves(node: Node, src: &[u8], leaf_kinds: &[&str], out: &mut Vec<String>) {
+    if leaf_kinds.contains(&node.kind()) {
+        out.push(render_string_leaf(node, src));
+        return;
+    }
+    if node.kind().starts_with("binary") {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i as u32) {
+                collect_string_leaves(child, src, leaf_kinds, out);
             }
         }
-        _ => {}
     }
+}
+
+/// Render any language's plain string node to its content. Python f-strings
+/// are recognizable by their `interpolation` children regardless of grammar.
+fn render_string_leaf(node: Node, src: &[u8]) -> String {
+    if py_has_interpolation(node) {
+        py_string_content(node, src).unwrap_or_default()
+    } else if node.kind() == "template_string" {
+        template_content(node, src)
+    } else {
+        string_content(node, src)
+    }
+}
+
+/// Python strings carry `interpolation` children when they are f-strings.
+fn py_has_interpolation(node: Node) -> bool {
+    (0..node.child_count()).any(|i| {
+        node.child(i as u32)
+            .map(|c| c.kind() == "interpolation")
+            .unwrap_or(false)
+    })
 }
 
 /// Build the canonical contract ID `<kind>::<qualifier>::<identifier>`.
@@ -1247,5 +1685,183 @@ mod tests {
         assert_eq!(c.canonical_id, "env::::FEATURE_FLAG");
         assert_eq!(c.role, ContractRole::Provider);
         assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    // -- walker: Python (step 5) ------------------------------------------------
+
+    #[test]
+    fn flask_decorator_provider() {
+        let src = "\
+from flask import Flask
+app = Flask(__name__)
+
+@app.get('/v1/users/<int:id>')
+def get_user(id):
+    return {}
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.canonical_id, "http::GET::/v1/users/{p1}");
+        assert_eq!(
+            c.params,
+            vec![PathParam {
+                position: 1,
+                name: "id".into()
+            }]
+        );
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("get_user"));
+        assert_eq!(c.line, 4);
+    }
+
+    #[test]
+    fn flask_route_methods_kwarg_sets_verb() {
+        let src = "\
+app = Flask(__name__)
+
+@app.route('/orders', methods=['POST'])
+def create_order():
+    return {}
+";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "http::POST::/orders").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("create_order"));
+    }
+
+    #[test]
+    fn flask_route_without_methods_is_get() {
+        let src = "\
+@app.route('/health')
+def health():
+    return {}
+";
+        let cands = extract(Lang::Python, src);
+        assert!(
+            find(&cands, "http::GET::/health").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn requests_consumer_absolute_url() {
+        let src = "\
+def load():
+    r = requests.get('https://api.io/v1/users')
+";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "http::GET::/v1/users").expect("route not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("load"));
+    }
+
+    #[test]
+    fn httpx_and_session_consumers() {
+        let src = "\
+def load():
+    a = httpx.get('/v1/users')
+    b = session.get('/v1/users')
+    c = client.get('/v1/users')
+    d = urlopen('/health')
+";
+        let cands = extract(Lang::Python, src);
+        for id in ["http::GET::/v1/users", "http::GET::/health"] {
+            assert!(find(&cands, id).is_some(), "missing {id}: {cands:?}");
+        }
+        assert_eq!(cands.len(), 4, "got {cands:?}");
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+    }
+
+    #[test]
+    fn python_fstring_consumer() {
+        let src = "\
+def load():
+    r = requests.get(f'{BASE_URL}/users/{user_id}')
+";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "http::GET::/users/{p1}").expect("route not found");
+        assert_eq!(
+            c.params,
+            vec![PathParam {
+                position: 1,
+                name: "user_id".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn python_env_accessors() {
+        let src = "\
+def cfg():
+    a = os.environ['DATABASE_URL']
+    b = os.environ.get('FEATURE_FLAG')
+    c = os.getenv('HOME')
+";
+        let cands = extract(Lang::Python, src);
+        for name in ["DATABASE_URL", "FEATURE_FLAG", "HOME"] {
+            let c = find(&cands, &format!("env::::{name}")).expect("env not found");
+            assert_eq!(c.role, ContractRole::Consumer);
+            assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        }
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+    }
+
+    #[test]
+    fn python_env_setdefault_is_ambiguous_provider() {
+        let src = "os.environ.setdefault('CACHE_DIR', '/tmp')\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "env::::CACHE_DIR");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn python_environ_assign_is_ambiguous_provider() {
+        let src = "os.environ['TMP_SET'] = '1'\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "env::::TMP_SET");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn django_urlpatterns_providers() {
+        let src = "\
+from django.urls import path
+import views
+
+urlpatterns = [
+    path('users/<int:id>', views.user_detail),
+    path('health', views.health),
+]
+";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "http::ANY::/users/{p1}").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(
+            c.params,
+            vec![PathParam {
+                position: 1,
+                name: "id".into()
+            }]
+        );
+        assert!(find(&cands, "http::ANY::/health").is_some());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+    }
+
+    #[test]
+    fn falcon_add_route_provider() {
+        let src = "api.add_route('/things', ThingsResource())\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "http::ANY::/things").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
     }
 }
