@@ -1012,7 +1012,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_ask",
-                description: "Semantic search via embeddings. Requires Ollama. Use from/to for dependency scoping.",
+                description: "Semantic search via offline bundled embeddings (or configured Ollama). Use from/to for dependency scoping.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

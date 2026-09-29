@@ -40,3 +40,11 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Build stripped release binary
+        run: |
+          cargo build --release
+          strip target/release/wonk
+
+      - name: Enforce model and binary size budgets
+        run: scripts/check_embedding_sizes.sh assets/models/bundled-embedding-v1.bin.zst target/release/wonk

@@ -1,8 +1,8 @@
-//! Ollama embedding API client and symbol chunking engine.
+//! Embedding providers, symbol chunking, and vector storage.
 //!
-//! Provides a synchronous HTTP client for generating text embeddings via
-//! Ollama's `/api/embed` endpoint.  Supports health checking, batch
-//! embedding, and configurable timeouts.
+//! Provides a bundled in-process default and a synchronous opt-in Ollama
+//! client. Both implement the same provider contract so vector-space metadata
+//! and the indexing pipeline remain provider-neutral.
 //!
 //! Also provides the chunking pipeline that transforms indexed symbols into
 //! context-rich text chunks suitable for embedding by `nomic-embed-text`.
@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use ureq::Agent;
 
+pub use crate::bundled_embedding::BundledProvider;
 use crate::errors::EmbeddingError;
 use crate::types::{Symbol, SymbolKind};
 
@@ -95,17 +96,12 @@ pub fn resolve_provider_kind(
 }
 
 /// Construct the selected provider.
-///
-/// The bundled implementation is supplied by TASK-076. Keeping the error
-/// explicit here prevents silently falling back into Ollama's vector space.
 pub fn create_provider(
     kind: EmbeddingProviderKind,
 ) -> Result<Box<dyn EmbeddingProvider>, EmbeddingError> {
     match kind {
         EmbeddingProviderKind::Ollama => Ok(Box::new(OllamaProvider::new())),
-        EmbeddingProviderKind::Bundled => Err(EmbeddingError::ProviderUnavailable(
-            "bundled provider is not available in this build".to_string(),
-        )),
+        EmbeddingProviderKind::Bundled => Ok(Box::new(BundledProvider)),
     }
 }
 
@@ -1325,6 +1321,14 @@ mod tests {
         assert_eq!(provider.name(), "ollama");
         assert_eq!(provider.dim(), OLLAMA_DIM);
         assert_eq!(provider.dim(), 768);
+    }
+
+    #[test]
+    fn bundled_provider_is_available_with_stable_metadata() {
+        let provider = create_provider(EmbeddingProviderKind::Bundled)
+            .expect("the bundled provider should always be available");
+        assert_eq!(provider.name(), "bundled");
+        assert_eq!(provider.dim(), 256);
     }
 
     #[test]

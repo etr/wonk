@@ -80,13 +80,13 @@ Wonk pre-indexes your codebase with Tree-sitter so it understands code structure
 |------|-------------|
 | `wonk search <pattern>` | Full-text search ranked by code structure. Definitions first, tests last, re-exports collapsed. Add `--semantic` for hybrid RRF fusion. |
 | `wonk sym` / `sig` / `show` / `ref` | Direct symbol lookup. Find definitions, view signatures, read full source, or trace references — no regex needed. |
-| `wonk ask <query>` | Semantic search over code meaning. Use the available Ollama provider; the bundled default is deferred to TASK-076. |
+| `wonk ask <query>` | Semantic search over code meaning. Works offline with the bundled default; Ollama remains an opt-in quality tier. |
 
 ## Features at a glance
 
 **Search**
 - Smart ranking: definitions first, tests last, re-exports deduplicated
-- Semantic search via Ollama embeddings (`wonk ask`); bundled embeddings arrive in TASK-076
+- Zero-configuration offline semantic search (`wonk ask`) with optional Ollama embeddings
 - Hybrid RRF fusion blends structural + semantic results (`--semantic`)
 
 **Code intelligence**
@@ -287,6 +287,28 @@ Wonk's core features work out of the box with zero external dependencies. Advanc
 
 - **[Ollama](https://ollama.ai/)** -- optional higher-quality embedding tier and required for AI-generated summaries. Pull `nomic-embed-text` (embeddings) and `llama3.2:3b` (summaries).
 - **git** -- only needed for `wonk impact --since` and `wonk changes --scope compare`. Most likely already installed.
+
+## Semantic embedding tiers
+
+The default `bundled` provider is fully offline and needs no configuration.
+It uses the MIT-licensed `potion-code-16M-v2` model at 256 dimensions, packed
+to 6,518,611 bytes with row-wise q4 quantization. On an Apple M4 it embedded
+and stored 10,000 symbols from a cold start in 0.605 seconds. On the measured
+25-query corpus its Recall@10 was 0.20, identical to `nomic-embed-text`
+(0.00 absolute / 0.0 percentage-point delta); Ollama produced stronger
+early-rank MRR@10 (0.1080 versus 0.0480).
+
+Ollama remains available as an opt-in quality tier:
+
+```toml
+[embedding]
+provider = "ollama"
+```
+
+Switching providers changes vector spaces. Run
+`wonk update --force --provider bundled` (or `ollama`) after a switch. See the
+[measured 25-query quality bake-off](bench/semantic-quality.md) for Recall@10
+and the exact delta against `nomic-embed-text`.
 
 ## Configuration
 
