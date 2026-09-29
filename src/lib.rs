@@ -1,4 +1,5 @@
 pub mod blast;
+pub mod bm25;
 pub mod budget;
 mod bundled_embedding;
 pub mod callgraph;

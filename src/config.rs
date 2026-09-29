@@ -81,6 +81,16 @@ pub struct SearchConfig {
     /// structural and semantic result lists. Higher values produce more
     /// even blending. Default: 60.0 (standard RRF constant).
     pub rrf_k: f32,
+    /// BM25 term-frequency saturation strength (k1).
+    ///
+    /// Higher values let term frequency keep contributing longer before
+    /// saturating. Default: 1.2 (Lucene's default).
+    pub bm25_k1: f32,
+    /// BM25 length-normalization strength (b), in `[0, 1]`.
+    ///
+    /// 0 disables length normalization; 1 fully normalizes by document
+    /// length. Default: 0.75 (Lucene's default).
+    pub bm25_b: f32,
 }
 
 /// Embedding provider selection.
@@ -128,7 +138,11 @@ impl Default for LlmConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { rrf_k: 60.0 }
+        Self {
+            rrf_k: 60.0,
+            bm25_k1: 1.2,
+            bm25_b: 0.75,
+        }
     }
 }
 
@@ -188,6 +202,8 @@ struct LlmOverlay {
 #[serde(default)]
 struct SearchOverlay {
     rrf_k: Option<f32>,
+    bm25_k1: Option<f32>,
+    bm25_b: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -238,10 +254,16 @@ impl Config {
                 self.llm.generate_url = v;
             }
         }
-        if let Some(s) = overlay.search
-            && let Some(v) = s.rrf_k
-        {
-            self.search.rrf_k = v;
+        if let Some(s) = overlay.search {
+            if let Some(v) = s.rrf_k {
+                self.search.rrf_k = v;
+            }
+            if let Some(v) = s.bm25_k1 {
+                self.search.bm25_k1 = v;
+            }
+            if let Some(v) = s.bm25_b {
+                self.search.bm25_b = v;
+            }
         }
         if let Some(embedding) = overlay.embedding
             && let Some(provider) = embedding.provider
@@ -820,6 +842,57 @@ model = "llama3.2:1b"
         let env = TestEnv::new();
         let config = env.load().unwrap();
         assert!((config.search.rrf_k - 60.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_bm25_defaults() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert!((config.search.bm25_k1 - 1.2).abs() < f32::EPSILON);
+        assert!((config.search.bm25_b - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_bm25_override_from_global() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[search]
+bm25_k1 = 2.0
+bm25_b = 0.5
+"#,
+        );
+
+        let config = env.load().unwrap();
+        assert!((config.search.bm25_k1 - 2.0).abs() < f32::EPSILON);
+        assert!((config.search.bm25_b - 0.5).abs() < f32::EPSILON);
+        // rrf_k should remain default.
+        assert!((config.search.rrf_k - 60.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_bm25_repo_overrides_global() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[search]
+bm25_k1 = 2.0
+bm25_b = 0.5
+"#,
+        );
+
+        let repo = env.create_repo();
+        env.write_repo_config(
+            r#"
+[search]
+bm25_b = 0.3
+"#,
+        );
+
+        let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
+        // bm25_b from repo wins; bm25_k1 from global survives.
+        assert!((config.search.bm25_k1 - 2.0).abs() < f32::EPSILON);
+        assert!((config.search.bm25_b - 0.3).abs() < f32::EPSILON);
     }
 
     #[test]

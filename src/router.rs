@@ -209,7 +209,27 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     suppress,
                 )?;
 
-                let fused = ranker::fuse_rrf(&results, &semantic_results, rrf_k);
+                // Re-rank the grep candidate set by BM25 (TASK-079) before it
+                // enters fusion; `None` means no usable term statistics, in
+                // which case the list is passed through in V4 order.
+                let ranked = conn.as_ref().and_then(|c| {
+                    crate::bm25::rerank_lexical(
+                        c,
+                        &results,
+                        &args.pattern,
+                        crate::bm25::Bm25Params::from(&config.search),
+                    )
+                });
+                if conn.is_some() && ranked.is_none() && !results.is_empty() {
+                    output::print_hint(
+                        "bm25 ranking skipped: index predates term statistics \
+                         (run `wonk init` to re-index)",
+                        suppress,
+                    );
+                }
+                let lexical: &[search::SearchResult] = ranked.as_deref().unwrap_or(&results);
+
+                let fused = ranker::fuse_rrf(lexical, &semantic_results, rrf_k);
 
                 for fr in &fused {
                     let out = SearchOutput {

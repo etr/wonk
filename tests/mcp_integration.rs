@@ -396,3 +396,133 @@ fn mcp_ask_blocks_on_provider_switch_with_reembed_command() {
         "expected re-embed command in the tool result, got: {text}"
     );
 }
+
+// -- BM25-ranked lexical input to wonk_ask fusion (TASK-079) ------------------
+//
+// PRD-BM25-REQ-004: when hybrid fusion runs, the lexical list entering RRF
+// must be BM25-ranked, on every production `fuse_rrf` call site — including
+// the MCP `wonk_ask` tool, not just the CLI `--semantic` path.
+
+/// Fixture like [`indexed_central_repo`], but with a corpus that separates
+/// BM25 order from match-presence (walk) order: four files, all six lines
+/// long, mentioning "gewgaw" 1 / 4 / 8 / 12 times on comment lines only (so
+/// no grep match line coincides with a symbol line and fusion never boosts a
+/// lexical entry semantically). BM25 must order the files by saturation:
+/// saturated, lots, some, once.
+fn indexed_central_repo_bm25(bin: &Path) -> (tempfile::TempDir, tempfile::TempDir) {
+    let repo = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(repo.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    let src_dir = repo.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(
+        src_dir.join("once.rs"),
+        concat!(
+            "// gewgaw\n",
+            "pub fn once_probe() -> u32 {\n",
+            "    1\n",
+            "}\n",
+            "// end of once\n",
+            "// tail marker\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        src_dir.join("some.rs"),
+        concat!(
+            "// gewgaw alpha and gewgaw beta.\n",
+            "// gewgaw gamma plus gewgaw delta.\n",
+            "pub fn some_probe() -> u32 {\n",
+            "    2\n",
+            "}\n",
+            "// tail marker\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        src_dir.join("lots.rs"),
+        concat!(
+            "// gewgaw a, gewgaw b, gewgaw c.\n",
+            "// gewgaw d, gewgaw e, gewgaw f.\n",
+            "// gewgaw g plus gewgaw h complete.\n",
+            "pub fn lots_probe() -> u32 {\n",
+            "    3\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        src_dir.join("saturated.rs"),
+        concat!(
+            "// gewgaw gewgaw gewgaw gewgaw alpha.\n",
+            "// gewgaw gewgaw gewgaw gewgaw beta.\n",
+            "// gewgaw gewgaw gewgaw gewgaw gamma.\n",
+            "pub fn saturated_probe() -> u32 {\n",
+            "    4\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let home = tempfile::tempdir().unwrap();
+    let init = offline_command(bin, repo.path())
+        .env("HOME", home.path())
+        .args(["init"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "wonk init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    (repo, home)
+}
+
+#[test]
+fn mcp_ask_fuses_bm25_ranked_lexical_input() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo_bm25(&bin);
+
+    let (resp, _stderr) = mcp_wonk_ask(&bin, repo.path(), home.path(), "gewgaw");
+    assert!(
+        resp["result"]["isError"].is_null(),
+        "tool_ask should fuse results, not error: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let outputs: Vec<Value> =
+        serde_json::from_str(text).expect("structural branch returns a JSON array");
+
+    // Grep-backed entries carry no annotation; semantic-only entries are
+    // annotated "[semantic: ...]". Restrict to the grep-backed ones so the
+    // assertion observes the lexical list's fusion order.
+    let mut seen: Vec<String> = Vec::new();
+    for out in &outputs {
+        if out["annotation"].is_null()
+            && let Some(file) = out["file"].as_str()
+            && !seen.iter().any(|s| file.ends_with(s))
+        {
+            seen.push(file.rsplit('/').next().unwrap_or(file).to_string());
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            "saturated.rs".to_string(),
+            "lots.rs".to_string(),
+            "some.rs".to_string(),
+            "once.rs".to_string(),
+        ],
+        "PRD-BM25-REQ-004: wonk_ask must feed fuse_rrf the BM25-ranked list \
+         (descending term saturation), not the raw grep walk order; got [{}] \
+         in {text}",
+        seen.join(", ")
+    );
+}

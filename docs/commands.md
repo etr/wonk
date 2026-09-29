@@ -508,7 +508,10 @@ meaning rather than exact text patterns.
 - **Hybrid fusion**: `wonk search --semantic` blends structural and semantic
   result lists using Reciprocal Rank Fusion (RRF). The fusion constant K
   is configurable via `[search] rrf_k` (default: 60.0); higher values produce
-  more even blending
+  more even blending. The lexical input to fusion is BM25-ranked via index
+  term statistics (`[search] bm25_k1` / `bm25_b`, defaults 1.2 / 0.75);
+  indexes built before V5 lack those statistics, so the list fuses in the
+  previous (match-presence) order with a hint to run `wonk init`
 
 Use `wonk ask` for pure semantic search, or `wonk search --semantic` to blend
 structural and semantic results.
