@@ -1048,4 +1048,65 @@ fn bar() { }
         let result = analyze_blast(&conn, "target", &BlastOptions::default()).unwrap();
         assert!(result.truncated, "truncation marker reaches the analysis");
     }
+
+    // -- End-to-end equivalence (TASK-080, AR-021) ---------------------------
+
+    /// Over a pipeline-indexed multi-file repo, the default (table-routed)
+    /// path and the BFS path must agree exactly at every depth 1..=3.
+    #[test]
+    fn blast_table_path_equivalent_to_bfs_across_depths() {
+        let files = &[
+            ("src/one.rs", "fn one() { two(); }\n"),
+            ("src/two.rs", "fn two() { three(); }\n"),
+            ("src/three.rs", "fn three() { four(); }\n"),
+            ("src/four.rs", "fn four() { }\n"),
+            ("src/deep.rs", "fn deep_caller() { one(); }\n"),
+            ("tests/chain_test.rs", "fn chain_suite() { two(); }\n"),
+        ];
+        let (_dir, conn) = make_multi_file_repo(files);
+
+        for target in ["four", "three", "two", "one", "deep_caller", "chain_suite"] {
+            for depth in [1usize, 2, 3] {
+                assert!(
+                    crate::reach::lookup_upstream(&conn, target, depth)
+                        .unwrap()
+                        .is_some(),
+                    "pipeline build must cover {target} at depth {depth}"
+                );
+                let via_table = analyze_blast(
+                    &conn,
+                    target,
+                    &BlastOptions {
+                        depth,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let via_bfs = analyze_blast(
+                    &conn,
+                    target,
+                    &BlastOptions {
+                        depth,
+                        use_reach: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(via_table, via_bfs, "target {target} depth {depth}");
+                assert!(!via_table.truncated);
+            }
+        }
+
+        // The chain gives the depths real content: four reaches deep_caller
+        // at depth 4, i.e. not at all within depth 3.
+        let four = analyze_blast(&conn, "four", &BlastOptions::default()).unwrap();
+        let names = names(&four);
+        assert!(names.contains(&"three".to_string()), "depth-1 caller");
+        assert!(names.contains(&"two".to_string()), "depth-2 caller");
+        assert!(names.contains(&"one".to_string()), "depth-3 caller");
+        assert!(
+            !names.contains(&"deep_caller".to_string()),
+            "depth-4 is beyond the built depth"
+        );
+    }
 }
