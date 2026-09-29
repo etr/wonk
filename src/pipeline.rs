@@ -2302,6 +2302,136 @@ fn extra() -> i32 {
         assert!(crate::reach::FAIL_NEXT_FINISH.lock().unwrap().is_none());
     }
 
+    /// A Rust file of `g_fns` functions that each call `world` (defined
+    /// in the same file). Editing it yields a reach rebuild set of exactly
+    /// `g_fns + 1` names — the dial for the work-budget boundary tests.
+    fn wide_rust_source(g_fns: usize) -> String {
+        let mut src = String::from("fn world() -> u32 {\n    1\n}\n");
+        for i in 0..g_fns {
+            src.push_str(&format!("fn g{i}() -> u32 {{\n    world()\n}}\n"));
+        }
+        src
+    }
+
+    /// Work-budget guard, natural trip (TASK-081, PRD-DMN-REQ-009): when
+    /// an edit's rebuild set exceeds `MAX_INCREMENTAL_REPAIR_SOURCES`,
+    /// the refused repair flows through the same degrade wiring as the
+    /// injected failure — reindex succeeds, file data commits, the table
+    /// is marked stale in the same transaction, lookups fall back to BFS,
+    /// and the default blast path equals the plain BFS. No failpoint is
+    /// set: the graph itself is over the budget.
+    #[test]
+    fn test_reindex_oversized_repair_degrades_to_bfs_via_work_budget() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        // g-fns + world => a rebuild set of g_fns + 1 names. g_fns = MAX
+        // puts the set at MAX + 1: over the budget by exactly one source.
+        fs::write(
+            root.join("wide.rs"),
+            wide_rust_source(crate::reach::MAX_INCREMENTAL_REPAIR_SOURCES),
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        // Sanity: the table covers world before the edit.
+        assert!(
+            crate::reach::lookup_upstream(&conn, "world", 3)
+                .unwrap()
+                .is_some()
+        );
+
+        let wide = root.join("wide.rs");
+        let base = fs::read_to_string(&wide).unwrap();
+        fs::write(&wide, format!("{base}// budget edit\n")).unwrap();
+        let changed = reindex_file(&conn, &wide, root).unwrap();
+
+        assert!(changed, "the reindex itself succeeds");
+        // The file data committed despite the refused repair.
+        let symbols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'wide.rs' AND name LIKE 'g%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            symbols as usize,
+            crate::reach::MAX_INCREMENTAL_REPAIR_SOURCES,
+            "file data commits even when the repair is refused"
+        );
+        // The table was marked stale in the same transaction.
+        assert_eq!(
+            reach_meta_value(&conn, "stale").as_deref(),
+            Some("1"),
+            "over-budget repair degrades by marking stale (REQ-007)"
+        );
+        assert!(
+            crate::reach::lookup_upstream(&conn, "world", 3)
+                .unwrap()
+                .is_none(),
+            "stale table must not answer"
+        );
+
+        // The default (use_reach) path equals the plain BFS: never wrong.
+        let via_table =
+            crate::blast::analyze_blast(&conn, "world", &crate::blast::BlastOptions::default())
+                .unwrap();
+        let via_bfs = crate::blast::analyze_blast(
+            &conn,
+            "world",
+            &crate::blast::BlastOptions {
+                use_reach: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(via_table, via_bfs);
+        let names: Vec<&str> = via_table
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter().map(|s| s.name.as_str()))
+            .collect();
+        assert!(names.contains(&"g0"), "BFS still finds the callers");
+    }
+
+    /// The other side of the work-budget boundary: an edit whose rebuild
+    /// set is exactly `MAX_INCREMENTAL_REPAIR_SOURCES` names repairs
+    /// incrementally — no stale marker, no degrade, table still answers.
+    #[test]
+    fn test_reindex_at_budget_repair_stays_incremental() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        // g-fns + world => a rebuild set of exactly g_fns + 1 = MAX names.
+        fs::write(
+            root.join("wide.rs"),
+            wide_rust_source(crate::reach::MAX_INCREMENTAL_REPAIR_SOURCES - 1),
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        let wide = root.join("wide.rs");
+        let base = fs::read_to_string(&wide).unwrap();
+        fs::write(&wide, format!("{base}// at-budget edit\n")).unwrap();
+        let changed = reindex_file(&conn, &wide, root).unwrap();
+
+        assert!(changed);
+        assert!(
+            reach_meta_value(&conn, "stale").is_none(),
+            "an at-budget repair is incremental, not a degrade"
+        );
+        assert!(
+            crate::reach::lookup_upstream(&conn, "world", 3)
+                .unwrap()
+                .is_some(),
+            "the table still answers after an at-budget repair"
+        );
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
+    }
+
     /// TASK-081 acceptance: after every edit in a realistic sequence, the
     /// reach table stays equivalent to the live BFS at every depth — no
     /// staleness, no drift. Five steps through the daemon's real path

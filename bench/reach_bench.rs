@@ -10,9 +10,15 @@
 //!      at the default cap and uncapped.
 //!   5. TASK-081 incremental repair cost: reindex_file latency with the
 //!      table fresh (repair runs) vs stale (repair skipped) on four edit
-//!      shapes — leaf file, chain-calling-hub file, mids, util — with the
-//!      paired delta isolating repair and a p95 < 50ms gate on total
-//!      reindex latency (PRD-DMN-REQ-009).
+//!      shapes — leaf file, chain-calling-hub file, mids, util. The gate
+//!      is PER-SHAPE p95 < 50ms: PRD-DMN-REQ-009 states no percentile, so
+//!      the gate claims p95 explicitly and p50/p99/p100 are reported
+//!      ungated (no pooled gate — pooling dilutes the worst shape).
+//!      Shapes whose rebuild set exceeds MAX_INCREMENTAL_REPAIR_SOURCES
+//!      trip the work-budget guard and degrade to the stale/BFS path
+//!      (PRD-REACH-REQ-007); their measured reindex is the degraded
+//!      cost, and the table is rebuilt between iterations (unmeasured)
+//!      so every iteration measures the same edit.
 //!
 //! Results are recorded in bench/reach-results.md. Not a pass/fail gate
 //! beyond the latency asserts. Run: cargo bench --bench reach.
@@ -101,7 +107,7 @@ fn main() -> Result<()> {
             table_ms.push(start.elapsed().as_secs_f64() * 1000.0);
         }
     }
-    let (t_p50, t_p95, t_p100) = percentiles(&mut table_ms);
+    let (t_p50, t_p95, t_p99, t_p100) = percentiles(&mut table_ms);
     ensure!(
         t_p100 < 50.0,
         "depth-3 table-path p100 was {t_p100:.2}ms (acceptance: < 50ms)"
@@ -122,7 +128,7 @@ fn main() -> Result<()> {
             bfs_ms.push(start.elapsed().as_secs_f64() * 1000.0);
         }
     }
-    let (b_p50, b_p95, b_p100) = percentiles(&mut bfs_ms);
+    let (b_p50, b_p95, b_p99, b_p100) = percentiles(&mut bfs_ms);
 
     // 5. Table size at the default cap, then uncapped.
     let capped = table_size(&conn)?;
@@ -154,11 +160,11 @@ fn main() -> Result<()> {
         build_with_reach.saturating_sub(build_no_reach)
     );
     println!(
-        "table path depth-3:    p50 {t_p50:.3}ms  p95 {t_p95:.3}ms  p100 {t_p100:.3}ms  ({} samples)",
+        "table path depth-3:    p50 {t_p50:.3}ms  p95 {t_p95:.3}ms  p99 {t_p99:.3}ms  p100 {t_p100:.3}ms  ({} samples)",
         table_ms.len()
     );
     println!(
-        "bfs contrast depth-3:  p50 {b_p50:.3}ms  p95 {b_p95:.3}ms  p100 {b_p100:.3}ms  ({} samples)",
+        "bfs contrast depth-3:  p50 {b_p50:.3}ms  p95 {b_p95:.3}ms  p99 {b_p99:.3}ms  p100 {b_p100:.3}ms  ({} samples)",
         bfs_ms.len()
     );
     println!(
@@ -180,17 +186,7 @@ fn main() -> Result<()> {
     // 6. TASK-081: incremental repair cost per edit shape. The uncapped
     //    experiment above rebuilt the table; restore the default-capped
     //    state the repair assumes before measuring.
-    {
-        let tx = conn.unchecked_transaction()?;
-        build_reach(
-            &tx,
-            &ReachBuildOptions {
-                depth: 3,
-                max_targets: DEFAULT_MAX_TARGETS_PER_SOURCE,
-            },
-        )?;
-        tx.commit()?;
-    }
+    rebuild_reach_default(&conn)?;
 
     // A leaf file nothing else references, indexed through the daemon's
     // new-file path after the build.
@@ -212,33 +208,65 @@ fn main() -> Result<()> {
         ("util", "src/util.rs", "util_trace"),
     ];
 
+    println!();
+    println!(
+        "== TASK-081: incremental repair ({} iters/shape, work-budget guard {} sources) ==",
+        REINDEX_ITERS,
+        wonk::reach::MAX_INCREMENTAL_REPAIR_SOURCES
+    );
+
+    // On phase, table fresh. Shapes within the guard budget repair
+    // incrementally. Shapes over it are refused before any writes and
+    // degrade to the stale/BFS path (PRD-REACH-REQ-007): their measured
+    // reindex is the degraded cost (rebuild-set computation + refusal +
+    // stale marker + commit), and the table is rebuilt between
+    // iterations — outside the measured window — so every iteration
+    // measures the same edit.
     let mut edit_counter = 0usize;
     let mut on_ms: Vec<(&str, Vec<f64>)> = Vec::new();
+    let mut tripped: Vec<bool> = Vec::new();
     for (label, rel, sample) in shapes {
         let path = root.join(rel);
         let base = fs::read_to_string(&path)?;
         let mut samples = Vec::with_capacity(REINDEX_ITERS);
+        let mut trips = 0usize;
         for _ in 0..REINDEX_ITERS {
             edit_counter += 1;
             fs::write(&path, format!("{base}// bench edit {edit_counter}\n"))?;
             let start = Instant::now();
             wonk::pipeline::reindex_file(&conn, &path, root)?;
             samples.push(start.elapsed().as_secs_f64() * 1000.0);
-            ensure!(
-                !reach_stale(&conn)?,
-                "{label}: table must stay fresh after every repair"
-            );
-            ensure!(
-                wonk::reach::lookup_upstream(&conn, sample, 3)?.is_some(),
-                "{label}: lookup must stay Some after every repair"
-            );
+            if reach_stale(&conn)? {
+                trips += 1;
+                ensure!(
+                    wonk::reach::lookup_upstream(&conn, sample, 3)?.is_none(),
+                    "{label}: a guard-tripped (stale) table must not answer"
+                );
+                rebuild_reach_default(&conn)?;
+            } else {
+                ensure!(
+                    wonk::reach::lookup_upstream(&conn, sample, 3)?.is_some(),
+                    "{label}: lookup must stay Some after every repair"
+                );
+            }
         }
+        // Comment-only edits over an identical graph: the guard's verdict
+        // must be the same on every iteration.
+        ensure!(
+            trips == 0 || trips == REINDEX_ITERS,
+            "{label}: guard tripped {trips}/{} iterations; expected all or none",
+            REINDEX_ITERS
+        );
+        tripped.push(trips == REINDEX_ITERS);
         on_ms.push((label, samples));
     }
 
     // The same edits with the table stale: begin/finish skip the repair,
-    // so the paired on-off delta isolates the repair's own cost. (The
-    // table falls behind during this phase; it is only measuring.)
+    // so the paired on/off contrast isolates the repair's own cost for
+    // within-budget shapes (and shows the tripping shapes' steady-state
+    // daemon cost — once the guard trips, every later edit takes this
+    // skip path until a full rebuild). (The table falls behind during
+    // this phase; it is only measuring.)
     {
         let tx = conn.unchecked_transaction()?;
         wonk::reach::mark_stale(&tx)?;
@@ -264,41 +292,63 @@ fn main() -> Result<()> {
     }
 
     println!();
-    println!(
-        "== TASK-081: incremental repair ({} iters/shape) ==",
-        REINDEX_ITERS
-    );
-    let mut pooled_on: Vec<f64> = Vec::new();
     for (i, (label, on)) in on_ms.iter().enumerate() {
         let off = &off_ms[i].1;
-        let (o_p50, o_p95, o_p100) = percentiles(&mut on.clone());
-        let (f_p50, f_p95, f_p100) = percentiles(&mut off.clone());
-        let mut deltas: Vec<f64> = on
-            .iter()
-            .zip(off.iter())
-            .map(|(a, b)| (a - b).max(0.0))
-            .collect();
-        let (d_p50, d_p95, d_p100) = percentiles(&mut deltas);
-        pooled_on.extend(on.iter().copied());
+        let did_trip = tripped[i];
+        let (o_p50, o_p95, o_p99, o_p100) = percentiles(&mut on.clone());
+        let (f_p50, f_p95, f_p99, f_p100) = percentiles(&mut off.clone());
+        if did_trip {
+            println!(
+                "{label:<10} guard:      TRIPPED every iteration (rebuild set over budget) \
+                 — repair refused, table marked stale, lookups fall back to BFS"
+            );
+            println!(
+                "{label:<10} degraded:   p50 {o_p50:7.2}ms  p95 {o_p95:7.2}ms  p99 {o_p99:7.2}ms  p100 {o_p100:7.2}ms"
+            );
+        } else {
+            let mut deltas: Vec<f64> = on
+                .iter()
+                .zip(off.iter())
+                .map(|(a, b)| (a - b).max(0.0))
+                .collect();
+            let (d_p50, d_p95, d_p99, d_p100) = percentiles(&mut deltas);
+            println!("{label:<10} guard:      within budget (repair runs incrementally)");
+            println!(
+                "{label:<10} reindex on: p50 {o_p50:7.2}ms  p95 {o_p95:7.2}ms  p99 {o_p99:7.2}ms  p100 {o_p100:7.2}ms"
+            );
+            println!(
+                "{label:<10} repair-only: p50 {d_p50:7.2}ms  p95 {d_p95:7.2}ms  p99 {d_p99:7.2}ms  p100 {d_p100:7.2}ms"
+            );
+        }
         println!(
-            "{label:<10} reindex on:  p50 {o_p50:7.2}ms  p95 {o_p95:7.2}ms  p100 {o_p100:7.2}ms"
+            "{label:<10} reindex off: p50 {f_p50:7.2}ms  p95 {f_p95:7.2}ms  p99 {f_p99:7.2}ms  p100 {f_p100:7.2}ms"
         );
-        println!(
-            "{label:<10} reindex off: p50 {f_p50:7.2}ms  p95 {f_p95:7.2}ms  p100 {f_p100:7.2}ms"
-        );
-        println!(
-            "{label:<10} repair-only: p50 {d_p50:7.2}ms  p95 {d_p95:7.2}ms  p100 {d_p100:7.2}ms"
+        // PRD-DMN-REQ-009 gate, per shape, percentile stated explicitly:
+        // p95 of the effective reindex path (incremental when within the
+        // work budget, degraded when the guard trips) must be < 50ms.
+        let path_kind = if did_trip { "degraded" } else { "incremental" };
+        ensure!(
+            o_p95 < 50.0,
+            "{label}: {path_kind} reindex p95 was {o_p95:.2}ms \
+             (PRD-DMN-REQ-009 gate: per-shape p95 < 50ms)"
         );
     }
-    let (p50, p95, p100) = percentiles(&mut pooled_on);
-    println!(
-        "pooled reindex (repair on): p50 {p50:.2}ms  p95 {p95:.2}ms  p100 {p100:.2}ms  ({} samples)",
-        pooled_on.len()
-    );
-    ensure!(
-        p95 < 50.0,
-        "pooled reindex p95 was {p95:.2}ms (PRD-DMN-REQ-009: < 50ms)"
-    );
+    Ok(())
+}
+
+/// Restore the fresh, default-capped table the repair assumes (depth 3,
+/// default fan-out cap) — the bench's unmeasured reset between guard-trip
+/// iterations.
+fn rebuild_reach_default(conn: &rusqlite::Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    build_reach(
+        &tx,
+        &ReachBuildOptions {
+            depth: 3,
+            max_targets: DEFAULT_MAX_TARGETS_PER_SOURCE,
+        },
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -335,11 +385,11 @@ fn table_size(conn: &rusqlite::Connection) -> Result<TableSize> {
     })
 }
 
-fn percentiles(samples: &mut [f64]) -> (f64, f64, f64) {
+fn percentiles(samples: &mut [f64]) -> (f64, f64, f64, f64) {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = samples.len();
     let at = |q: f64| samples[((q * (n - 1) as f64).round()) as usize];
-    (at(0.50), at(0.95), at(1.0))
+    (at(0.50), at(0.95), at(0.99), at(1.0))
 }
 
 /// Writes a synthetic repo: per-file function chains, per-10th hub calls,

@@ -21,6 +21,25 @@ use crate::types::{BlastAffectedSymbol, SymbolKind};
 /// blow up the table.
 pub const DEFAULT_MAX_TARGETS_PER_SOURCE: usize = 500;
 
+/// Work budget for one incremental repair (TASK-081, PRD-DMN-REQ-009):
+/// the maximum number of source names a single [`finish_file_edit`] may
+/// recompute before refusing the repair and letting the caller degrade.
+///
+/// Bench evidence (bench/reach-results.md, TASK-081 section): repair cost
+/// scales with the rebuild-set size at roughly 1ms per source when the
+/// sources' traversals hit the fan-out cap (up to ~2ms/source under
+/// load), so an unbounded rebuild set puts the 50ms single-file re-index
+/// budget out of reach on all but the fastest machines. Sampled edit
+/// shapes: leaf (~2 sources) and util (1 source, the capped hub
+/// recompute) stay incremental — their reindex p95 stayed inside the
+/// budget on every observed run; mids (~31 sources, 42–125ms reindex p95
+/// across runs on the same machine) and chain-hub (~205 sources) do not
+/// fit reliably and trip the guard, degrading to the stale/BFS path of
+/// PRD-REACH-REQ-007 at their parse+upsert cost. The bound also sits
+/// above every rebuild set the correctness suites generate (largest
+/// measured: 19 sources across the full unit suite).
+pub const MAX_INCREMENTAL_REPAIR_SOURCES: usize = 25;
+
 /// `reach_meta` key holding the depth the table was built to.
 pub(crate) const META_BUILT_DEPTH: &str = "built_depth";
 
@@ -305,6 +324,14 @@ pub(crate) struct FileEditScope {
     /// `finish` no-ops when the table is absent, never built, or stale —
     /// stale tables are only cleared by a full rebuild (REQ-007).
     skipped: bool,
+    /// The pre-edit affected set alone exceeded
+    /// [`MAX_INCREMENTAL_REPAIR_SOURCES`], so the repair is certain to be
+    /// refused: `begin` skipped the remaining captures and `finish`
+    /// errors immediately. The refusal set is identical to the full
+    /// guard's — the rebuild set is a superset of `a_pre` — but the
+    /// refusal itself must stay cheap, or the guard would add the very
+    /// work it exists to bound.
+    over_budget: bool,
 }
 
 /// Statistics from one incremental repair.
@@ -343,12 +370,28 @@ pub(crate) fn begin_file_edit(tx: &rusqlite::Transaction, rel_path: &str) -> Res
             old_canonical_ids: Vec::new(),
             predecessor_ids: Vec::new(),
             skipped: true,
+            over_budget: false,
         });
     }
 
     let mut a_pre = affected_names(tx, rel_path)?;
     a_pre.sort();
     a_pre.dedup();
+
+    // Work-budget fast path: the rebuild set is a superset of `a_pre`, so
+    // a pre-edit affected set over the budget makes the repair's refusal
+    // certain. Skip the canonical-id and predecessor captures — the
+    // refusal must not add work of its own.
+    if a_pre.len() > MAX_INCREMENTAL_REPAIR_SOURCES {
+        return Ok(FileEditScope {
+            rel_path: rel_path.to_string(),
+            a_pre,
+            old_canonical_ids: Vec::new(),
+            predecessor_ids: Vec::new(),
+            skipped: false,
+            over_budget: true,
+        });
+    }
 
     let mut old_canonical_ids: Vec<i64> = canonical_ids_for_names(tx, &a_pre)?
         .values()
@@ -367,6 +410,7 @@ pub(crate) fn begin_file_edit(tx: &rusqlite::Transaction, rel_path: &str) -> Res
         old_canonical_ids,
         predecessor_ids,
         skipped: false,
+        over_budget: false,
     })
 }
 
@@ -402,6 +446,22 @@ pub(crate) fn finish_file_edit(
         }
     }
 
+    // Work budget, pre-edit side (PRD-DMN-REQ-009): begin proved the
+    // rebuild set (a superset of the pre-edit affected set) exceeds
+    // MAX_INCREMENTAL_REPAIR_SOURCES and skipped its captures. Refuse
+    // before any writes; the caller's existing degrade wiring marks the
+    // table stale in this same transaction and commits anyway, and a
+    // stale table falls back to BFS (PRD-REACH-REQ-007).
+    if scope.over_budget {
+        return Err(anyhow::anyhow!(
+            "incremental repair work budget exceeded: {}+ sources to rebuild \
+             (pre-edit affected set alone) > MAX_INCREMENTAL_REPAIR_SOURCES \
+             ({}); degrading to the stale/BFS path",
+            scope.a_pre.len(),
+            MAX_INCREMENTAL_REPAIR_SOURCES
+        ));
+    }
+
     // Post-edit affected names, unioned with the pre-edit set.
     let mut a_all = affected_names(tx, &scope.rel_path)?;
     a_all.extend(scope.a_pre.iter().cloned());
@@ -423,6 +483,21 @@ pub(crate) fn finish_file_edit(
     rebuild_names.extend(names_for_ids(tx, &predecessor_ids)?);
     rebuild_names.sort();
     rebuild_names.dedup();
+
+    // Work budget (PRD-DMN-REQ-009): refuse the repair BEFORE any writes
+    // when the rebuild set is too large to recompute inside the 50ms
+    // single-file re-index budget. The caller's existing degrade wiring
+    // marks the table stale in this same transaction and commits anyway;
+    // a stale table falls back to BFS (PRD-REACH-REQ-007), so correctness
+    // is preserved at the edit's parse+upsert cost.
+    if rebuild_names.len() > MAX_INCREMENTAL_REPAIR_SOURCES {
+        return Err(anyhow::anyhow!(
+            "incremental repair work budget exceeded: {} sources to rebuild > \
+             MAX_INCREMENTAL_REPAIR_SOURCES ({}); degrading to the stale/BFS path",
+            rebuild_names.len(),
+            MAX_INCREMENTAL_REPAIR_SOURCES
+        ));
+    }
 
     // Affected source ids: pre-edit canonicals (rows keyed under ids that
     // may stop being canonical), post-edit canonicals, and predecessors.
@@ -2383,8 +2458,21 @@ mod tests {
     /// Simulate `upsert_file_data`: begin, delete the file's old rows,
     /// insert the new rows, finish, commit — one transaction.
     fn apply_edit(conn: &Connection, file: &str, edit: &FileSpec) -> ReachRepairStats {
+        apply_edit_result(conn, file, edit).expect("apply_edit must succeed")
+    }
+
+    /// [`apply_edit`] without the expect: the work-budget tests need
+    /// [`finish_file_edit`]'s `Err`. On `Err` the transaction is dropped
+    /// (rolled back); the degrade contract — mark stale in the same
+    /// transaction and commit anyway — belongs to the pipeline caller and
+    /// is covered by the pipeline-level tests.
+    fn apply_edit_result(
+        conn: &Connection,
+        file: &str,
+        edit: &FileSpec,
+    ) -> Result<ReachRepairStats> {
         let tx = conn.unchecked_transaction().unwrap();
-        let scope = begin_file_edit(&tx, file).unwrap();
+        let scope = begin_file_edit(&tx, file)?;
 
         tx.execute(
             "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
@@ -2445,9 +2533,9 @@ mod tests {
             .unwrap();
         }
 
-        let stats = finish_file_edit(&tx, &scope).unwrap();
+        let stats = finish_file_edit(&tx, &scope)?;
         tx.commit().unwrap();
-        stats
+        Ok(stats)
     }
 
     /// Simulate `delete_file_data`: begin, delete the file's rows, finish,
@@ -3155,6 +3243,97 @@ mod tests {
         for row in &capped {
             assert!(uncapped.contains(row), "capped row {row:?} not in full set");
         }
+    }
+
+    /// A file of `n` distinct function symbols with no refs or type edges:
+    /// editing it yields a rebuild set of exactly its `n` symbol names
+    /// (no callees, no predecessors), making the guard's boundary directly
+    /// controllable.
+    fn wide_spec(n: usize) -> FileSpec {
+        FileSpec {
+            symbols: (0..n)
+                .map(|i| (format!("w{i}"), "function".to_string()))
+                .collect(),
+            refs: vec![],
+            type_edges: vec![],
+        }
+    }
+
+    /// PRD-DMN-REQ-009 work budget: a rebuild set over
+    /// [`MAX_INCREMENTAL_REPAIR_SOURCES`] must be refused BEFORE any
+    /// writes — the table is left exactly as it was, and the stale/BFS
+    /// degrade (PRD-REACH-REQ-007) is the caller's response to the `Err`.
+    #[test]
+    fn repair_refuses_rebuild_set_over_the_work_budget() {
+        let (_dir, conn) = make_db();
+        // A working chain whose rows must survive the refused repair.
+        apply_edit(
+            &conn,
+            "src/chain.rs",
+            &spec(
+                vec![("a", "function"), ("b", "function")],
+                vec![("b", Some("a"), 0.9)],
+                vec![],
+            ),
+        );
+        apply_edit(
+            &conn,
+            "src/big.rs",
+            &wide_spec(MAX_INCREMENTAL_REPAIR_SOURCES + 1),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+        let before = snapshot_reach(&conn);
+        assert!(!before.0.is_empty(), "fixture sanity: chain rows exist");
+
+        let err = apply_edit_result(
+            &conn,
+            "src/big.rs",
+            &wide_spec(MAX_INCREMENTAL_REPAIR_SOURCES + 1),
+        )
+        .expect_err("a rebuild set over the work budget must be refused");
+        assert!(
+            err.to_string().contains("work budget"),
+            "guard must fail for the budget reason, got: {err:#}"
+        );
+
+        // Refused before any writes: identical table, no self-set stale
+        // marker, meta untouched.
+        assert_eq!(
+            snapshot_reach(&conn),
+            before,
+            "a refused repair must not add, remove, or rekey any row"
+        );
+        assert!(!is_stale(&conn), "finish itself must not mark stale");
+        assert_eq!(built_depth(&conn).as_deref(), Some("3"));
+    }
+
+    /// The boundary is inclusive: a rebuild set of exactly
+    /// [`MAX_INCREMENTAL_REPAIR_SOURCES`] names is the largest repair
+    /// that still runs incrementally — no degrade, full equivalence.
+    #[test]
+    fn repair_at_exact_work_budget_succeeds_incrementally() {
+        let (_dir, conn) = make_db();
+        apply_edit(
+            &conn,
+            "src/big.rs",
+            &wide_spec(MAX_INCREMENTAL_REPAIR_SOURCES),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+
+        let stats = apply_edit(
+            &conn,
+            "src/big.rs",
+            &wide_spec(MAX_INCREMENTAL_REPAIR_SOURCES),
+        );
+
+        assert!(!stats.skipped, "at-budget repair is incremental");
+        assert_eq!(
+            stats.rebuilt_sources, MAX_INCREMENTAL_REPAIR_SOURCES,
+            "every at-budget source is recomputed"
+        );
+        assert!(!is_stale(&conn), "at-budget repair must not degrade");
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
     }
 
     #[test]
