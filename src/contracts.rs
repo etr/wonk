@@ -709,19 +709,26 @@ impl<'a> Extractor<'a> {
                         }
                     }
                     _ => {
-                        if PY_CONSUMER_RECEIVERS.contains(&recv)
-                            && PY_CONSUMER_VERBS.contains(&attr)
-                            && let Some(arg) = first
-                        {
-                            self.emit_http(
-                                node,
-                                arg,
-                                ContractRole::Consumer,
-                                attr,
-                                prefix,
-                                CONFIDENCE_FRAMEWORK,
-                                None,
-                            );
+                        if let Some(arg) = first {
+                            if PY_CONSUMER_RECEIVERS.contains(&recv)
+                                && PY_CONSUMER_VERBS.contains(&attr)
+                            {
+                                self.emit_http(
+                                    node,
+                                    arg,
+                                    ContractRole::Consumer,
+                                    attr,
+                                    prefix,
+                                    CONFIDENCE_FRAMEWORK,
+                                    None,
+                                );
+                            } else if !PY_CONSUMER_RECEIVERS.contains(&recv)
+                                && !self.ctx.is_router_var(recv)
+                                && !PY_ROUTER_VARS.contains(&recv)
+                                && AMBIGUOUS_VERBS.contains(&attr)
+                            {
+                                self.ambiguous_http(node, arg, attr, prefix);
+                            }
                         }
                     }
                 }
@@ -896,6 +903,11 @@ impl<'a> Extractor<'a> {
                             );
                         }
                     }
+                    _ if recv_text != "ENV" && AMBIGUOUS_VERBS.contains(&method) => {
+                        if let Some(arg) = first {
+                            self.ambiguous_http(node, arg, method, prefix);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1031,6 +1043,11 @@ impl<'a> Extractor<'a> {
                         CONFIDENCE_FRAMEWORK,
                         None,
                     );
+                } else if argc == 1
+                    && GO_AMBIGUOUS_VERBS.contains(&meth)
+                    && let Some(arg) = first
+                {
+                    self.ambiguous_http(node, arg, meth, prefix);
                 }
             }
         }
@@ -1413,14 +1430,29 @@ impl<'a> Extractor<'a> {
             return;
         };
         let Some(verb) = ruby_verb(name) else { return };
-        let role = if matches!(object, "app" | "group" | "router") {
-            ContractRole::Provider
+        if matches!(object, "app" | "group" | "router") {
+            self.emit_http(
+                node,
+                first,
+                ContractRole::Provider,
+                verb,
+                prefix,
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
         } else if matches!(object, "client" | "http") {
-            ContractRole::Consumer
-        } else {
-            return;
-        };
-        self.emit_http(node, first, role, verb, prefix, CONFIDENCE_FRAMEWORK, None);
+            self.emit_http(
+                node,
+                first,
+                ContractRole::Consumer,
+                verb,
+                prefix,
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
+        } else if AMBIGUOUS_VERBS.contains(&name) {
+            self.ambiguous_http(node, first, verb, prefix);
+        }
     }
 
     /// Symfony `#[Route('/x', methods: ['GET'])]` attributes.
@@ -1707,6 +1739,23 @@ impl<'a> Extractor<'a> {
         }
     }
 
+    /// 0.5 heuristic: verb-named call on an unrecognized receiver whose
+    /// first argument is a path-like string literal (PRD-CTR-REQ-004).
+    /// Non-path-like literals (`cache.get("user:1")`) stay out.
+    fn ambiguous_http(&mut self, node: Node, arg: Node, verb: &str, prefix: &str) {
+        if matches!(self.path_arg(arg), Some(PathArg::Direct(ref s)) if is_path_like(s)) {
+            self.emit_http(
+                node,
+                arg,
+                ContractRole::Provider,
+                verb,
+                prefix,
+                CONFIDENCE_HEURISTIC,
+                None,
+            );
+        }
+    }
+
     /// Extract the textual path of a call argument, per language.
     fn path_arg(&self, arg: Node) -> Option<PathArg> {
         let src = self.src;
@@ -1858,6 +1907,10 @@ const GO_PROVIDER_VERBS: &[&str] = &[
 ];
 /// Ruby HTTP client libraries (constant receivers).
 const RUBY_CONSUMER_RECEIVERS: &[&str] = &["HTTParty", "RestClient", "Faraday"];
+/// Capitalized Go verbs for the single-argument 0.5 heuristic.
+const GO_AMBIGUOUS_VERBS: &[&str] = &[
+    "Get", "Post", "Put", "Patch", "Delete", "Head", "Options", "Any", "Request",
+];
 /// C# HTTP client receiver names.
 const CSHARP_CONSUMER_RECEIVERS: &[&str] = &["httpClient", "client", "http"];
 
@@ -3534,5 +3587,103 @@ void cfg(void) {
         let w = find(&cands, "env::::TMP_SET").expect("write not found");
         assert_eq!(w.role, ContractRole::Provider);
         assert_eq!(w.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    // -- ambiguity rules: 0.5 heuristic + path-like noise gate (step 7) -------
+
+    #[test]
+    fn cache_like_receiver_is_not_a_contract() {
+        let src = "function load() {
+  const u = cache.get('user:1');
+  const k = db.get('key');
+  const t = cache.get(`${prefix}/key`);
+}
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 0, "got {cands:?}");
+    }
+
+    #[test]
+    fn unknown_receiver_path_like_is_provider_at_05() {
+        let src = "const x = registry.get('/users');\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/users");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn concat_single_literal_is_05() {
+        let src = "const r = await fetch('/api/users' + id);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/api/users");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn concat_multiple_literals_skipped() {
+        let src = "const r = await fetch('/api/' + id + '/users');\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 0, "got {cands:?}");
+    }
+
+    #[test]
+    fn python_unknown_receiver_ambiguity() {
+        let src = "def load():
+    a = store.get('/items')
+    b = store.get('user:1')
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/items");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn go_capitalized_verb_single_arg_is_05() {
+        let src = "func load() {
+	x := cache.Get(\"/items\")
+	_ = x
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/items");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn php_unknown_object_ambiguity() {
+        let src = "<?php
+function load() {
+    $x = $store->get('/items');
+}
+";
+        let cands = extract(Lang::Php, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/items");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn ruby_unknown_receiver_ambiguity() {
+        let src = "x = svc.get('/items')\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/items");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
     }
 }
