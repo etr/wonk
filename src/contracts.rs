@@ -5848,6 +5848,221 @@ fn py_graphql_decorator(dec: Node, def_name: Option<Node>, src: &[u8]) -> Option
     }
 }
 
+// ---------------------------------------------------------------------------
+// RPC canonical join (TASK-088, DQ2/DQ3, PRD-CTR-REQ-024)
+//
+// The SECOND matching pass, after exact canonical-ID equality. IDL
+// definitions and generated stubs disagree on package qualification, method
+// casing, and service- vs method-level registration; this pure in-memory
+// join recovers those pairs. Candidates with an exact counterpart in their
+// own workspace are EXCLUDED — the first pass (equality join, TASK-084)
+// owns them and is never overridden. Workspace equality on normalized
+// identifiers is the REQ-014 guard: the join relaxes names, never scope.
+// ---------------------------------------------------------------------------
+
+/// Whether `kind` belongs to the RPC family the canonical join pairs
+/// (PRD-CTR-REQ-024): gRPC today; Thrift and tRPC flip this arm when added.
+pub fn is_rpc_family(kind: ContractKind) -> bool {
+    matches!(kind, ContractKind::Grpc)
+}
+
+/// Normalize a workspace identifier for comparison: trim surrounding
+/// whitespace and case-fold (PRD-CTR-REQ-019).
+pub fn normalize_workspace_id(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+/// One workspace's contracts offered to the canonical join.
+///
+/// `workspace` is the declared identifier (pre-normalized — the join folds
+/// it itself); the join never fabricates one (PRD-CTR-REQ-015's repo-name
+/// defaulting happens at scope construction, TASK-084).
+pub struct RpcJoinScope<'a> {
+    /// Workspace identifier as declared.
+    pub workspace: String,
+    /// Contract candidates of that workspace (mixed kinds/roles allowed).
+    pub candidates: &'a [ContractCandidate],
+}
+
+/// Which tolerance recovered a relaxed pair (PRD-CTR-REQ-024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcMatchBasis {
+    /// Service names differ only by package qualification
+    /// (`users.v1.UserService` vs `UserService` — compared on the last
+    /// dot-segment, case-folded).
+    PackageQualifiedService,
+    /// Method names differ only by casing (`get_user` vs `GetUser`).
+    CaseFoldedMethod,
+    /// The provider registered the whole service (`*` identifier) and
+    /// pairs with any method-level consumer of that service.
+    ServiceLevelProvider,
+}
+
+/// One side of a relaxed link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcJoinSide {
+    /// Canonical ID of the matched candidate (developer spelling).
+    pub canonical_id: String,
+    /// Workspace the candidate lives in (as declared).
+    pub workspace: String,
+    /// Provider or consumer.
+    pub role: ContractRole,
+}
+
+/// A provider↔consumer pair recovered by the second matching pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcJoin {
+    /// The serving side.
+    pub provider: RpcJoinSide,
+    /// The calling side.
+    pub consumer: RpcJoinSide,
+    /// Why the pair matched despite unequal canonical IDs.
+    pub basis: RpcMatchBasis,
+}
+
+/// Run the canonical join over workspace-scoped candidate slices.
+///
+/// Deterministic: consumers are visited in input order (scope order, then
+/// candidate order); the best provider is method-level before service-level,
+/// then the lowest (scope, candidate) index. Pure — no storage, no mutation.
+pub fn canonical_rpc_join(scopes: &[RpcJoinScope]) -> Vec<RpcJoin> {
+    use std::collections::{HashMap, HashSet};
+
+    // Exact ID sets per role and normalized workspace: a candidate whose
+    // canonical ID has an OPPOSITE-ROLE counterpart in its own workspace
+    // belongs to the first pass and never enters the join.
+    let mut provider_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut consumer_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    for scope in scopes {
+        let ws = normalize_workspace_id(&scope.workspace);
+        for cand in scope.candidates {
+            if !is_rpc_family(cand.kind) {
+                continue;
+            }
+            let slot = if cand.role == ContractRole::Provider {
+                &mut provider_ids
+            } else {
+                &mut consumer_ids
+            };
+            slot.entry(ws.clone())
+                .or_default()
+                .insert(cand.canonical_id.clone());
+        }
+    }
+
+    // Participants, with their scope index for deterministic tie-breaks.
+    let mut providers: Vec<(usize, usize, String, &ContractCandidate)> = Vec::new();
+    let mut consumers: Vec<(usize, usize, String, &ContractCandidate)> = Vec::new();
+    for (si, scope) in scopes.iter().enumerate() {
+        let ws = normalize_workspace_id(&scope.workspace);
+        for (ci, cand) in scope.candidates.iter().enumerate() {
+            if !is_rpc_family(cand.kind) {
+                continue;
+            }
+            // Only an opposite-role exact counterpart excludes.
+            let exact_other = match cand.role {
+                ContractRole::Provider => &consumer_ids,
+                ContractRole::Consumer => &provider_ids,
+            };
+            if exact_other
+                .get(&ws)
+                .is_some_and(|ids| ids.contains(&cand.canonical_id))
+            {
+                continue;
+            }
+            let slot = if cand.role == ContractRole::Provider {
+                &mut providers
+            } else {
+                &mut consumers
+            };
+            slot.push((si, ci, ws.clone(), cand));
+        }
+    }
+
+    let mut joins = Vec::new();
+    for (csi, _cci, cws, consumer) in &consumers {
+        // Best provider: method-level before service-level, then the lowest
+        // (scope, candidate) index.
+        let mut best: Option<(u8, &ContractCandidate, usize, RpcMatchBasis)> = None;
+        for (psi, _pci, pws, provider) in &providers {
+            if pws != cws {
+                continue;
+            }
+            let Some(basis) = rpc_relaxed_match(consumer, provider) else {
+                continue;
+            };
+            let rank = u8::from(basis != RpcMatchBasis::ServiceLevelProvider);
+            let better = match best {
+                None => true,
+                Some((r, _, _, _)) => rank >= r,
+            };
+            if better {
+                best = Some((rank, provider, *psi, basis));
+            }
+        }
+        if let Some((_, provider, psi, basis)) = best {
+            joins.push(RpcJoin {
+                provider: RpcJoinSide {
+                    canonical_id: provider.canonical_id.clone(),
+                    workspace: scopes[psi].workspace.clone(),
+                    role: ContractRole::Provider,
+                },
+                consumer: RpcJoinSide {
+                    canonical_id: consumer.canonical_id.clone(),
+                    workspace: scopes[*csi].workspace.clone(),
+                    role: ContractRole::Consumer,
+                },
+                basis,
+            });
+        }
+    }
+    joins
+}
+
+/// Relaxed match of one consumer against one provider (both RPC family):
+/// service compared on the last dot-segment case-folded, method case-folded,
+/// `*` = service-level registration. IDs are never rewritten here — only
+/// compared tolerantly.
+fn rpc_relaxed_match(
+    consumer: &ContractCandidate,
+    provider: &ContractCandidate,
+) -> Option<RpcMatchBasis> {
+    let consumer_service = last_segment_folded(&consumer.qualifier)?;
+    let provider_service = last_segment_folded(&provider.qualifier)?;
+    if consumer_service != provider_service {
+        return None;
+    }
+    if provider.identifier == "*" {
+        return Some(RpcMatchBasis::ServiceLevelProvider);
+    }
+    if rpc_method_key(&provider.identifier) == rpc_method_key(&consumer.identifier) {
+        return Some(if provider.qualifier != consumer.qualifier {
+            RpcMatchBasis::PackageQualifiedService
+        } else {
+            RpcMatchBasis::CaseFoldedMethod
+        });
+    }
+    None
+}
+
+/// Match key for an RPC method name: case-folded with word separators
+/// (`_`) removed, so the proto spelling, camelCase stubs, and tonic's
+/// snake_case impls of one method compare equal
+/// (`get_user` = `GetUser` = `getUser`).
+fn rpc_method_key(method: &str) -> String {
+    method
+        .chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Last dot-segment of a service qualifier, case-folded for comparison.
+fn last_segment_folded(qualifier: &str) -> Option<String> {
+    let last = qualifier.trim().rsplit('.').next()?.trim().to_lowercase();
+    if last.is_empty() { None } else { Some(last) }
+}
+
 #[cfg(test)]
 mod extract_test_helpers {
     use super::*;
@@ -9962,5 +10177,187 @@ paths:
         };
         let src = "openapi: 3.0.0\npaths:\n  /x:\n    get: {}\n";
         assert!(extract_document_contracts(DocumentKind::OpenApi, src, &opts).is_empty());
+    }
+
+    // -- RPC canonical join (TASK-088, PRD-CTR-REQ-024) -------------------------
+
+    /// Shorthand test candidate for the join.
+    fn join_grpc(service: &str, method: &str, role: ContractRole) -> ContractCandidate {
+        grpc_candidate(service, method, role, None, 1)
+    }
+
+    fn join_scope<'a>(workspace: &str, cands: &'a [ContractCandidate]) -> RpcJoinScope<'a> {
+        RpcJoinScope {
+            workspace: workspace.to_string(),
+            candidates: cands,
+        }
+    }
+
+    #[test]
+    fn rpc_join_case_folded_method() {
+        let provider = join_grpc("UserService", "GetUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "get_user", ContractRole::Consumer);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].basis, RpcMatchBasis::CaseFoldedMethod);
+        assert_eq!(joins[0].provider.canonical_id, "grpc::UserService::GetUser");
+        assert_eq!(
+            joins[0].consumer.canonical_id,
+            "grpc::UserService::get_user"
+        );
+        assert_eq!(joins[0].provider.workspace, "alpha");
+        assert_eq!(joins[0].consumer.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn rpc_join_package_qualified_service() {
+        let provider = join_grpc("users.v1.UserService", "GetUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "GetUser", ContractRole::Consumer);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].basis, RpcMatchBasis::PackageQualifiedService);
+    }
+
+    #[test]
+    fn rpc_join_service_level_star_pairs_with_any_method() {
+        let provider = join_grpc("UserService", "*", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "DeleteUser", ContractRole::Consumer);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].basis, RpcMatchBasis::ServiceLevelProvider);
+    }
+
+    #[test]
+    fn rpc_join_method_level_beats_service_level() {
+        let star = join_grpc("UserService", "*", ContractRole::Provider);
+        let method = join_grpc("users.v1.UserService", "GetUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        // The `*` provider comes first; the method-level one must still win.
+        let cands = [star, method.clone(), consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].provider.canonical_id, method.canonical_id);
+        assert_eq!(joins[0].basis, RpcMatchBasis::PackageQualifiedService);
+    }
+
+    #[test]
+    fn rpc_join_exact_id_matches_are_excluded() {
+        // The exact pair belongs to the first pass; the join must not emit a
+        // second link for that consumer (nor consume the exact provider).
+        let exact_provider = join_grpc("UserService", "getUser", ContractRole::Provider);
+        let exact_consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let relaxed_provider = join_grpc("users.v1.UserService", "getUser", ContractRole::Provider);
+        let cands = [exact_provider, relaxed_provider, exact_consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert!(
+            joins.is_empty(),
+            "exact-ID pair must never be overridden, got {joins:?}"
+        );
+    }
+
+    #[test]
+    fn rpc_join_exact_counterpart_in_other_workspace_does_not_exclude() {
+        // Exclusion is per workspace: an exact provider behind a different
+        // workspace boundary never pairs, so the consumer stays joinable
+        // within its own workspace (PRD-CTR-REQ-014).
+        let far_provider = join_grpc("UserService", "getUser", ContractRole::Provider);
+        let near_provider = join_grpc("users.v1.UserService", "getUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let cands_a = [far_provider];
+        let cands_b = [near_provider, consumer];
+        let scopes = [join_scope("beta", &cands_a), join_scope("alpha", &cands_b)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].provider.workspace, "alpha");
+    }
+
+    #[test]
+    fn rpc_join_respects_workspace_boundaries() {
+        let provider = join_grpc("users.v1.UserService", "getUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let cands_a = [consumer];
+        let cands_b = [provider];
+        let scopes = [join_scope("alpha", &cands_a), join_scope("beta", &cands_b)];
+        assert!(
+            canonical_rpc_join(&scopes).is_empty(),
+            "the join relaxes name matching, never workspace scope"
+        );
+    }
+
+    #[test]
+    fn rpc_join_workspace_comparison_trims_and_case_folds() {
+        let provider = join_grpc("users.v1.UserService", "getUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let cands_a = [consumer];
+        let cands_b = [provider];
+        let scopes = [
+            join_scope("alpha", &cands_a),
+            join_scope("  ALPHA ", &cands_b),
+        ];
+        assert_eq!(canonical_rpc_join(&scopes).len(), 1);
+    }
+
+    #[test]
+    fn rpc_join_ignores_non_rpc_kinds() {
+        // GraphQL exact ID shape must not pair with a grpc provider here.
+        let provider = join_grpc("UserService", "getUser", ContractRole::Provider);
+        let consumer = graphql_candidate("UserService", "getUser", ContractRole::Consumer, None, 1);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        assert!(canonical_rpc_join(&scopes).is_empty());
+    }
+
+    #[test]
+    fn rpc_join_within_repo_single_scope() {
+        // REQ-016: workspace bounds pairing, never extraction — one scope
+        // with both roles links (a repo calling its own service).
+        let provider = join_grpc("UserService", "get_user", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "GetUser", ContractRole::Consumer);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("solo", &cands)];
+        assert_eq!(canonical_rpc_join(&scopes).len(), 1);
+    }
+
+    #[test]
+    fn rpc_join_deterministic_consumer_order() {
+        let provider = join_grpc("UserService", "*", ContractRole::Provider);
+        let first = join_grpc("UserService", "GetUser", ContractRole::Consumer);
+        let second = join_grpc("users.v1.UserService", "DeleteUser", ContractRole::Consumer);
+        let cands = [provider, first.clone(), second.clone()];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 2, "got {joins:?}");
+        assert_eq!(joins[0].consumer.canonical_id, first.canonical_id);
+        assert_eq!(joins[1].consumer.canonical_id, second.canonical_id);
+    }
+
+    #[test]
+    fn rpc_join_unpaired_consumer_emits_nothing() {
+        let consumer = join_grpc("OrderService", "PlaceOrder", ContractRole::Consumer);
+        let provider = join_grpc("UserService", "*", ContractRole::Provider);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        assert!(canonical_rpc_join(&scopes).is_empty());
+    }
+
+    #[test]
+    fn rpc_family_today_is_grpc_only() {
+        assert!(is_rpc_family(ContractKind::Grpc));
+        assert!(!is_rpc_family(ContractKind::Graphql));
+        assert!(!is_rpc_family(ContractKind::Http));
+    }
+
+    #[test]
+    fn workspace_id_trims_and_case_folds() {
+        assert_eq!(normalize_workspace_id("  Payments "), "payments");
+        assert_eq!(normalize_workspace_id("PAYMENTS"), "payments");
     }
 }
