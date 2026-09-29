@@ -63,11 +63,25 @@ pub fn extract_contracts(tree: &Tree, source: &str, lang: Lang) -> Vec<ContractC
 struct RouterContext {
     bindings: HashMap<String, String>,
     mounts: HashMap<String, Vec<String>>,
+    /// `let VAR = <initializer>` byte ranges: Rust chains attribute their
+    /// `.route` literals to the variable the chain initializes.
+    initializer_ranges: Vec<(std::ops::Range<usize>, String)>,
 }
+
+/// Maximum chain depth when resolving group prefixes (cycles, deep chains).
+const PREFIX_DEPTH_CAP: usize = 8;
 
 impl RouterContext {
     fn is_router_var(&self, name: &str) -> bool {
         self.bindings.contains_key(name) || self.mounts.contains_key(name)
+    }
+
+    /// Variable whose initializer contains `byte`, if any.
+    fn var_for_range(&self, byte: usize) -> Option<&str> {
+        self.initializer_ranges
+            .iter()
+            .find(|(range, _)| range.contains(&byte))
+            .map(|(_, var)| var.as_str())
     }
 
     /// Concatenated prefix for a router variable: mount paths first, then
@@ -96,6 +110,12 @@ fn collect_router_context(root: Node, src: &[u8], lang: Lang) -> RouterContext {
             }
             Lang::Python => {
                 collect_py_router_facts(node, src, &mut ctx);
+            }
+            Lang::Go => {
+                collect_go_router_facts(node, src, &mut ctx);
+            }
+            Lang::Rust => {
+                collect_rust_router_facts(node, src, &mut ctx);
             }
             _ => {}
         }
@@ -231,6 +251,143 @@ fn collect_py_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
             {
                 let var = node_text(Some(var_node), src);
                 if !var.is_empty() {
+                    ctx.mounts.entry(var.to_string()).or_default().push(mount);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Go: `v1 := r.Group("/v1")` binds a group variable to an absolute prefix;
+/// nested groups resolve through earlier bindings (depth-capped).
+fn collect_go_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
+    if node.kind() != "short_var_declaration" {
+        return;
+    }
+    let Some(var) = node
+        .child_by_field_name("left")
+        .and_then(|l| l.named_child(0))
+        .filter(|n| n.kind() == "identifier")
+    else {
+        return;
+    };
+    let var = node_text(Some(var), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(call) = node
+        .child_by_field_name("right")
+        .and_then(|r| r.named_child(0))
+        .filter(|n| n.kind() == "call_expression")
+    else {
+        return;
+    };
+    let Some(func) = call.child_by_field_name("function") else {
+        return;
+    };
+    if func.kind() != "selector_expression" {
+        return;
+    }
+    if node_text(func.child_by_field_name("field"), src) != "Group" {
+        return;
+    }
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return;
+    };
+    let Some(path_node) = positional_arg(args, 0) else {
+        return;
+    };
+    let literal = render_string_node(path_node, src, Lang::Go);
+    let mut prefix = ctx
+        .bindings
+        .get(node_text(func.child_by_field_name("operand"), src))
+        .cloned()
+        .unwrap_or_default();
+    // Cap resolution depth to keep pathological chains bounded.
+    if prefix.split('/').count() <= PREFIX_DEPTH_CAP {
+        append_segment(&mut prefix, &literal);
+        ctx.bindings.insert(var.to_string(), prefix);
+    }
+}
+
+/// Rust: `let s = web::scope("/p")…` binds scope prefixes, `.nest("/p", r)`
+/// mounts routers, and every `let VAR = …` records its initializer range.
+fn collect_rust_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
+    match node.kind() {
+        "let_declaration" => {
+            let Some(var_node) = node
+                .child_by_field_name("pattern")
+                .filter(|n| n.kind() == "identifier")
+            else {
+                return;
+            };
+            let var = node_text(Some(var_node), src);
+            if var.is_empty() {
+                return;
+            }
+            let Some(value) = node.child_by_field_name("value") else {
+                return;
+            };
+            ctx.initializer_ranges
+                .push((value.start_byte()..value.end_byte(), var.to_string()));
+            // Compose inline web::scope("p") prefixes along the chain; the
+            // callee may be scoped (`web::scope`) or a field (`x.scope`).
+            let mut prefix = String::new();
+            let mut current = Some(value);
+            let mut depth = 0;
+            while let Some(c) = current
+                && c.kind() == "call_expression"
+                && depth < PREFIX_DEPTH_CAP
+            {
+                depth += 1;
+                let Some(func) = c.child_by_field_name("function") else {
+                    break;
+                };
+                let (callee, next) = match func.kind() {
+                    "field_expression" => (
+                        node_text(func.child_by_field_name("field"), src),
+                        func.child_by_field_name("value"),
+                    ),
+                    "scoped_identifier" => (node_text(func.child_by_field_name("name"), src), None),
+                    _ => break,
+                };
+                if callee == "scope"
+                    && let Some(args) = c.child_by_field_name("arguments")
+                    && let Some(path_node) = positional_arg(args, 0)
+                    && path_node.kind() == "string_literal"
+                {
+                    append_segment(&mut prefix, &render_string_node(path_node, src, Lang::Rust));
+                }
+                current = next;
+            }
+            if !prefix.is_empty() {
+                ctx.bindings.insert(var.to_string(), prefix);
+            }
+        }
+        "call_expression" => {
+            let Some(func) = node.child_by_field_name("function") else {
+                return;
+            };
+            if func.kind() != "field_expression" {
+                return;
+            }
+            if node_text(func.child_by_field_name("field"), src) != "nest" {
+                return;
+            }
+            let Some(args) = node.child_by_field_name("arguments") else {
+                return;
+            };
+            let (Some(path_node), Some(var_node)) =
+                (positional_arg(args, 0), positional_arg(args, 1))
+            else {
+                return;
+            };
+            if path_node.kind() == "string_literal" && var_node.kind() == "identifier" {
+                let var = node_text(Some(var_node), src);
+                if !var.is_empty() {
+                    let mut mount = String::new();
+                    append_segment(&mut mount, &render_string_node(path_node, src, Lang::Rust));
                     ctx.mounts.entry(var.to_string()).or_default().push(mount);
                 }
             }
@@ -402,6 +559,17 @@ enum PathArg {
 fn is_path_like(s: &str) -> bool {
     let t = s.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'));
     t.starts_with('/') || t.contains("://")
+}
+
+/// Append a raw segment to a prefix with exactly one separating slash.
+/// Never produces a leading `//` — stage 2 reads that as a protocol-relative
+/// URL and would strip the first segment as an authority.
+fn append_segment(prefix: &mut String, seg: &str) {
+    let seg = seg.trim_start_matches('/');
+    if prefix.is_empty() || !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    prefix.push_str(seg);
 }
 
 /// Concatenate a raw prefix and a route literal; stage 6 collapses slashes.
@@ -836,33 +1004,44 @@ impl<'a> Extractor<'a> {
 
     fn visit_ruby(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
-            "call" => {
-                self.ruby_call(node, prefix);
-            }
-            "element_reference" => {
-                self.ruby_env_ref(node);
-            }
-            "assignment" => {
-                self.ruby_env_assign(node);
-            }
+            "call" => return self.ruby_call(node, prefix),
+            "element_reference" => self.ruby_env_ref(node),
+            "assignment" => self.ruby_env_assign(node),
             _ => {}
         }
         prefix.to_string()
     }
 
     /// Sinatra `get '/x' do`, Rails `get '/x', to: …` / `match`, client
-    /// libraries with constant receivers, and `ENV.fetch`.
-    fn ruby_call(&mut self, node: Node, prefix: &str) {
+    /// libraries with constant receivers, and `ENV.fetch`. `namespace`/`scope`
+    /// blocks return the prefix their children inherit.
+    fn ruby_call(&mut self, node: Node, prefix: &str) -> String {
         let method = node_text(node.child_by_field_name("method"), self.src);
         let receiver = node.child_by_field_name("receiver");
         let args = node.child_by_field_name("arguments");
-        let Some(args) = args else { return };
+        let Some(args) = args else {
+            return prefix.to_string();
+        };
         let first = positional_arg(args, 0);
         match receiver {
             None => {
+                if matches!(method, "namespace" | "scope")
+                    && let Some(arg) = positional_arg(args, 0)
+                {
+                    let seg = match arg.kind() {
+                        "simple_symbol" => node_text(Some(arg), self.src)
+                            .trim_start_matches(':')
+                            .to_string(),
+                        "string" => ruby_string_content(arg, self.src),
+                        _ => String::new(),
+                    };
+                    if !seg.is_empty() {
+                        return join_raw(prefix, &seg);
+                    }
+                }
                 let verb = match method {
                     "get" | "post" | "put" | "patch" | "delete" | "match" => method,
-                    _ => return,
+                    _ => return prefix.to_string(),
                 };
                 if let Some(arg) = first {
                     self.emit_http(
@@ -912,6 +1091,7 @@ impl<'a> Extractor<'a> {
                 }
             }
         }
+        prefix.to_string()
     }
 
     /// `ENV['X']` reads.
@@ -1138,15 +1318,15 @@ impl<'a> Extractor<'a> {
                     && let Some(arg) = first
                 {
                     let verb = positional_arg(args, 1)
-                        .and_then(|handler| rust_callee_name(handler, self.src))
-                        .and_then(ruby_verb)
+                        .and_then(|handler| rust_handler_verb(handler, self.src))
                         .unwrap_or("ANY");
+                    let route_prefix = self.rust_receiver_prefix(func.child_by_field_name("value"));
                     self.emit_http(
                         node,
                         arg,
                         ContractRole::Provider,
                         verb,
-                        prefix,
+                        &join_raw(prefix, &route_prefix),
                         CONFIDENCE_FRAMEWORK,
                         None,
                     );
@@ -1216,6 +1396,62 @@ impl<'a> Extractor<'a> {
         }
     }
 
+    /// Prefix carried by a `.route` receiver: inline `web::scope("/p")`
+    /// chain segments, plus the prefix of the variable whose initializer
+    /// the chain belongs to (Axum `let user_routes = Router::new()…`).
+    fn rust_receiver_prefix(&self, recv: Option<Node>) -> String {
+        // A bound variable (`api.route(…)`) carries its own prefix.
+        if let Some(r) = recv
+            && r.kind() == "identifier"
+        {
+            return self.ctx.effective_prefix(node_text(Some(r), self.src));
+        }
+        let mut prefix = String::new();
+        let mut current = recv;
+        let mut last = recv;
+        let mut depth = 0;
+        while let Some(c) = current
+            && c.kind() == "call_expression"
+            && depth < PREFIX_DEPTH_CAP
+        {
+            last = Some(c);
+            depth += 1;
+            let Some(func) = c.child_by_field_name("function") else {
+                break;
+            };
+            // `web::scope("/p")` parses with a scoped callee; `x.scope("/p")`
+            // with a field callee. Either way the receiver continues left.
+            let (callee, next) = match func.kind() {
+                "field_expression" => (
+                    node_text(func.child_by_field_name("field"), self.src),
+                    func.child_by_field_name("value"),
+                ),
+                "scoped_identifier" => {
+                    (node_text(func.child_by_field_name("name"), self.src), None)
+                }
+                _ => break,
+            };
+            if callee == "scope"
+                && let Some(args) = c.child_by_field_name("arguments")
+                && let Some(path_node) = positional_arg(args, 0)
+                && path_node.kind() == "string_literal"
+            {
+                append_segment(
+                    &mut prefix,
+                    &render_string_node(path_node, self.src, self.lang),
+                );
+            }
+            current = next;
+        }
+        // Attribute the chain's root to the `let` variable it initializes.
+        if let Some(root) = current.or(last)
+            && let Some(var) = self.ctx.var_for_range(root.start_byte())
+        {
+            prefix.push_str(&self.ctx.effective_prefix(var));
+        }
+        prefix
+    }
+
     /// `env!("X")` — macro_invocation children carry no field names.
     fn rust_macro(&mut self, node: Node) {
         let name = node_text(node.named_child(0), self.src);
@@ -1236,6 +1472,9 @@ impl<'a> Extractor<'a> {
 
     fn visit_java(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
+            "class_declaration" => {
+                return self.java_class(node, prefix);
+            }
             "method_declaration" => {
                 self.java_method(node, prefix);
             }
@@ -1243,6 +1482,28 @@ impl<'a> Extractor<'a> {
                 self.java_call(node, prefix);
             }
             _ => {}
+        }
+        prefix.to_string()
+    }
+
+    /// Class-level `@RequestMapping("/v1")` prefixes every member route.
+    /// (JAX-RS class-level `@Path` is not composed — documented gap.)
+    fn java_class(&mut self, node: Node, prefix: &str) -> String {
+        let Some(modifiers) = node.named_child(0).filter(|n| n.kind() == "modifiers") else {
+            return prefix.to_string();
+        };
+        for i in 0..modifiers.named_child_count() {
+            let Some(annot) = modifiers.named_child(i as u32) else {
+                continue;
+            };
+            if node_text(annot.child_by_field_name("name"), self.src) != "RequestMapping" {
+                continue;
+            }
+            if let Some(args) = annot.child_by_field_name("arguments")
+                && let Some(path) = java_annotation_path(args, self.src)
+            {
+                return join_raw(prefix, &render_string_node(path, self.src, self.lang));
+            }
         }
         prefix.to_string()
     }
@@ -1541,6 +1802,9 @@ impl<'a> Extractor<'a> {
 
     fn visit_csharp(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
+            "class_declaration" => {
+                return self.csharp_class(node, prefix);
+            }
             "method_declaration" => {
                 self.csharp_method(node, prefix);
             }
@@ -1551,6 +1815,40 @@ impl<'a> Extractor<'a> {
                 self.csharp_object_creation(node, prefix);
             }
             _ => {}
+        }
+        prefix.to_string()
+    }
+
+    /// Class-level `[Route("api/[controller]")]` prefixes member routes;
+    /// `[controller]`/`[action]` tokens become placeholder parameters.
+    fn csharp_class(&mut self, node: Node, prefix: &str) -> String {
+        for i in 0..node.named_child_count() {
+            let Some(attrs) = node.named_child(i as u32) else {
+                continue;
+            };
+            if attrs.kind() != "attribute_list" {
+                continue;
+            }
+            for j in 0..attrs.named_child_count() {
+                let Some(attr) = attrs.named_child(j as u32) else {
+                    continue;
+                };
+                if attr.kind() != "attribute" || node_text(attr.named_child(0), self.src) != "Route"
+                {
+                    continue;
+                }
+                let Some(arg_list) = attr.named_child(1) else {
+                    continue;
+                };
+                let Some(arg) = positional_arg(arg_list, 0) else {
+                    continue;
+                };
+                let raw = render_string_node(arg, self.src, self.lang);
+                let rewritten = rewrite_aspnet_tokens(raw);
+                if !rewritten.is_empty() {
+                    return join_raw(prefix, &rewritten);
+                }
+            }
         }
         prefix.to_string()
     }
@@ -1813,7 +2111,9 @@ impl<'a> Extractor<'a> {
                 _ => None,
             },
             Lang::CSharp => match arg.kind() {
-                "string_literal" => Some(PathArg::Direct(render_string_node(arg, src, lang))),
+                "string_literal" => Some(PathArg::Direct(rewrite_aspnet_tokens(
+                    render_string_node(arg, src, lang),
+                ))),
                 "binary_expression" if node_text(arg.child(1), src) == "+" => {
                     concat(arg, &["string_literal"])
                 }
@@ -1939,6 +2239,45 @@ fn go_client_verb(recv: &str, meth: &str) -> Option<&'static str> {
     }
 }
 
+/// Verb for a `.route` handler argument: the callee's own name, or the
+/// first verb-named method along its receiver chain (`web::get().to(h)`).
+fn rust_handler_verb<'t>(handler: Node<'t>, src: &'t [u8]) -> Option<&'t str> {
+    if let Some(name) = rust_callee_name(handler, src)
+        && let Some(verb) = ruby_verb(name)
+    {
+        return Some(verb);
+    }
+    let mut current = if handler.kind() == "call_expression" {
+        handler.child_by_field_name("function")
+    } else {
+        Some(handler)
+    };
+    let mut depth = 0;
+    while let Some(node) = current
+        && depth < PREFIX_DEPTH_CAP
+    {
+        depth += 1;
+        match node.kind() {
+            "call_expression" => current = node.child_by_field_name("function"),
+            "field_expression" => {
+                if let Some(verb) = ruby_verb(node_text(node.child_by_field_name("field"), src)) {
+                    return Some(verb);
+                }
+                current = node.child_by_field_name("value");
+            }
+            // `web::get()` parses with a scoped callee — the name is the verb.
+            "scoped_identifier" => {
+                if let Some(verb) = ruby_verb(node_text(node.child_by_field_name("name"), src)) {
+                    return Some(verb);
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
 /// Final callee name of a Rust call node (identifier / scoped / field).
 fn rust_callee_name<'t>(call: Node<'t>, src: &'t [u8]) -> Option<&'t str> {
     let func = call.child_by_field_name("function")?;
@@ -2058,6 +2397,13 @@ fn csharp_name_text(node: Option<Node>, src: &[u8]) -> String {
         return node_text(node.named_child(0), src).to_string();
     }
     node_text(Some(node), src).to_string()
+}
+
+/// ASP.NET route tokens become placeholder parameters:
+/// `[controller]` -> `{controller}`, `[action]` -> `{action}`.
+fn rewrite_aspnet_tokens(raw: String) -> String {
+    raw.replace("[controller]", "{controller}")
+        .replace("[action]", "{action}")
 }
 
 /// C# HttpClient method verbs.
@@ -3685,5 +4031,198 @@ function load() {
         assert_eq!(c.canonical_id, "http::GET::/items");
         assert_eq!(c.role, ContractRole::Provider);
         assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    // -- prefix composition (REQ-023, step 8) -----------------------------------
+
+    #[test]
+    fn gin_group_prefix() {
+        let src = r#"func main() {
+	r := gin.New()
+	v1 := r.Group("/v1")
+	v1.GET("/users/:id", getUser)
+}
+"#;
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "http::GET::/v1/users/{p1}").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn nested_group_two_levels() {
+        let src = r#"func main() {
+	r := gin.New()
+	api := r.Group("/api")
+	v1 := api.Group("/v1")
+	v1.GET("/users/:id", getUser)
+}
+"#;
+        let cands = extract(Lang::Go, src);
+        assert!(
+            find(&cands, "http::GET::/api/v1/users/{p1}").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn express_router_mount_same_file() {
+        let src = "const app = express();
+const router = express.Router();
+app.use('/v1', router);
+router.get('/users/:id', getUser);
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users/{p1}").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn flask_blueprint_prefix() {
+        let src = "bp = Blueprint('auth', __name__, url_prefix='/auth')
+
+@bp.route('/login', methods=['POST'])
+def login():
+    return {}
+
+app.register_blueprint(bp, url_prefix='/v1')
+";
+        let cands = extract(Lang::Python, src);
+        assert!(
+            find(&cands, "http::POST::/v1/auth/login").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn fastapi_includerouter_prefix() {
+        let src = "router = APIRouter(prefix='/users')
+
+@router.get('/{id}')
+def get_user(id):
+    return {}
+
+app.include_router(router, prefix='/v1')
+";
+        let cands = extract(Lang::Python, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users/{p1}").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn actix_scope_chain() {
+        let src = r#"async fn app() {
+    App::new().service(web::scope("/v1").route("/users/{id}", web::get().to(get_user)));
+}
+"#;
+        let cands = extract(Lang::Rust, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users/{p1}").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn actix_scope_binding() {
+        let src = r#"async fn app() {
+    let api = web::scope("/api");
+    App::new().service(api.route("/users/{id}", web::get().to(get_user)));
+}
+"#;
+        let cands = extract(Lang::Rust, src);
+        assert!(
+            find(&cands, "http::GET::/api/users/{p1}").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn axum_nest() {
+        let src = r#"async fn app() {
+    let user_routes = Router::new().route("/users/{id}", get(get_user));
+    let app = Router::new().nest("/v1", user_routes);
+}
+"#;
+        let cands = extract(Lang::Rust, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users/{p1}").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn spring_classlevel_requestmapping() {
+        let src = r#"@RestController
+@RequestMapping("/v1")
+public class UserController {
+
+    @GetMapping("/users/{id}")
+    public String getUser(@PathVariable String id) { return ""; }
+}
+"#;
+        let cands = extract(Lang::Java, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users/{p1}").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn rails_namespace_block() {
+        let src = "Rails.application.routes.draw do
+  namespace :v1 do
+    get '/users', to: 'users#index'
+  end
+end
+";
+        let cands = extract(Lang::Ruby, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn sinatra_namespace_block() {
+        let src = "namespace '/v1' do
+  get '/users' do
+    json
+  end
+end
+";
+        let cands = extract(Lang::Ruby, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn aspnet_controller_route_attribute() {
+        let src = r#"[Route("api/[controller]")]
+public class UsersController : ControllerBase
+{
+    [HttpGet("{id}")]
+    public string GetUser(string id) { return ""; }
+}
+"#;
+        let cands = extract(Lang::CSharp, src);
+        let c = find(&cands, "http::GET::/api/{p1}/{p2}").expect("route not found");
+        assert_eq!(
+            c.params,
+            vec![
+                PathParam {
+                    position: 1,
+                    name: "controller".into()
+                },
+                PathParam {
+                    position: 2,
+                    name: "id".into()
+                }
+            ]
+        );
     }
 }
