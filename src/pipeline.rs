@@ -358,14 +358,33 @@ pub fn reindex_file(
         return Ok(false);
     }
 
-    // Detect language — if unsupported, remove stale data and return.
+    // Detect language — if unsupported, try the document path, then remove
+    // stale data and return.
     let lang = match indexer::detect_language(file_path) {
         Some(l) => l,
         None => {
-            // File is not a supported language.  If it was previously indexed
-            // (unlikely), clean it up.
-            delete_file_data(conn, &rel_path)?;
-            return Ok(false);
+            // Document files (.proto/.graphql/.yaml/.json) carry contracts
+            // without a grammar (TASK-088); re-index them, and drop any
+            // stale row when they no longer yield candidates.
+            let doc = crate::contracts::document_kind(file_path).and_then(|kind| {
+                document_file_result(
+                    kind,
+                    rel_path.clone(),
+                    &content,
+                    new_hash.clone(),
+                    contract_opts,
+                )
+            });
+            match doc {
+                Some(result) => {
+                    upsert_file_data(conn, &result)?;
+                    return Ok(true);
+                }
+                None => {
+                    delete_file_data(conn, &rel_path)?;
+                    return Ok(false);
+                }
+            }
         }
     };
 
@@ -759,7 +778,11 @@ fn parse_one_file(
     repo_root: &Path,
     contract_opts: &crate::contracts::ContractOptions,
 ) -> Option<FileResult> {
-    let lang = indexer::detect_language(path)?;
+    let Some(lang) = indexer::detect_language(path) else {
+        // Not a grammar language: document files (.proto/.graphql/.yaml/
+        // .json) may still carry contracts (TASK-088).
+        return parse_document_file(path, repo_root, contract_opts);
+    };
     let content = std::fs::read_to_string(path).ok()?;
 
     // Compute content hash.
@@ -816,6 +839,57 @@ fn parse_one_file(
         imports: file_imports.imports,
         type_edges,
         term_freqs,
+        contracts,
+    })
+}
+
+/// Parse a document file (`.proto`/`.graphql`/`.yaml`/`.json`) for contracts
+/// (TASK-088). Documents carry no symbols, references, imports, or type
+/// edges; a file that yields no candidates returns `None` and stays
+/// un-indexed exactly as before the document path existed.
+fn parse_document_file(
+    path: &Path,
+    repo_root: &Path,
+    contract_opts: &crate::contracts::ContractOptions,
+) -> Option<FileResult> {
+    let kind = crate::contracts::document_kind(path)?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let rel_path = path
+        .strip_prefix(repo_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned();
+    let content_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(content.as_bytes()));
+    document_file_result(kind, rel_path, &content, content_hash, contract_opts)
+}
+
+/// Build a document [`FileResult`] from already-read content.
+///
+/// `None` when the document yields no contracts (disabled kind, failed
+/// OpenAPI sniff) — the caller leaves the file un-indexed. The row (language
+/// set to the document kind, zero symbols) is TASK-083's hash/re-index
+/// anchor for document files.
+fn document_file_result(
+    kind: crate::contracts::DocumentKind,
+    rel_path: String,
+    content: &str,
+    content_hash: String,
+    contract_opts: &crate::contracts::ContractOptions,
+) -> Option<FileResult> {
+    let contracts = crate::contracts::extract_document_contracts(kind, content, contract_opts);
+    if contracts.is_empty() {
+        return None;
+    }
+    Some(FileResult {
+        rel_path,
+        language: kind.as_str().to_string(),
+        content_hash,
+        line_count: content.lines().count(),
+        symbols: Vec::new(),
+        refs: Vec::new(),
+        imports: Vec::new(),
+        type_edges: Vec::new(),
+        term_freqs: crate::tokenizer::term_frequencies(content),
         contracts,
     })
 }
@@ -1673,6 +1747,149 @@ class Component {
         );
         let stats = build_index(dir.path(), true).unwrap();
         assert_eq!(stats.contract_count, 0, "got {stats:?}");
+    }
+
+    // -- document files (TASK-088, DQ1) ----------------------------------------
+
+    /// Repo with a contract-bearing proto document plus files that must stay
+    /// un-indexed: a non-document text file, a non-sniffing YAML, and a
+    /// package.json.
+    fn make_rpc_contract_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("proto")).unwrap();
+        fs::write(
+            root.join("proto/users.proto"),
+            "syntax = \"proto3\";\npackage users.v1;\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);\n  rpc ListUsers(ListUsersRequest) returns (stream User);\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("notes.txt"), "notes are not documents\n").unwrap();
+        fs::write(
+            root.join("docker-compose.yml"),
+            "services:\n  app:\n    image: busybox\n",
+        )
+        .unwrap();
+        fs::write(root.join("package.json"), "{\n  \"name\": \"x\"\n}\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_index_indexes_proto_document_file() {
+        let dir = make_rpc_contract_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+        // Two rpc methods -> two grpc providers; the other files contribute
+        // nothing.
+        assert_eq!(stats.contract_count, 2, "got {stats:?}");
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+        let (language, symbols_count): (String, i64) = conn
+            .query_row(
+                "SELECT language, symbols_count FROM files WHERE path = 'proto/users.proto'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("proto file must have a files row");
+        assert_eq!(language, "Proto");
+        assert_eq!(symbols_count, 0);
+
+        // meta.json carries the document language (TASK-083 anchor).
+        let meta = db::read_meta(&index_path).unwrap();
+        assert!(
+            meta.languages.iter().any(|l| l == "Proto"),
+            "got {:?}",
+            meta.languages
+        );
+    }
+
+    #[test]
+    fn build_index_skips_non_document_and_non_sniffing_files() {
+        let dir = make_rpc_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let skipped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path IN ('notes.txt', 'docker-compose.yml', 'package.json')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(skipped, 0);
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "only the proto document is indexed");
+    }
+
+    #[test]
+    fn reindex_file_document_hash_skip_and_reindex() {
+        let dir = make_rpc_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let proto = dir.path().join("proto/users.proto");
+        let opts = crate::contracts::ContractOptions::default();
+
+        // Unchanged document: hash match skips the reindex.
+        assert!(!reindex_file(&conn, &proto, dir.path(), &opts).unwrap());
+
+        // Add a method: the document re-indexes and the new hash lands.
+        let updated = "syntax = \"proto3\";\npackage users.v1;\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);\n  rpc ListUsers(ListUsersRequest) returns (stream User);\n  rpc DeleteUser(DeleteUserRequest) returns (Empty);\n}\n";
+        fs::write(&proto, updated).unwrap();
+        assert!(reindex_file(&conn, &proto, dir.path(), &opts).unwrap());
+        let hash: String = conn
+            .query_row(
+                "SELECT hash FROM files WHERE path = 'proto/users.proto'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expected = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(updated.as_bytes()));
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn reindex_file_stale_document_row_removed_when_contracts_vanish() {
+        // A document edited down to zero contracts must not keep a stale
+        // files row: reindex deletes the row and reports "not re-indexed".
+        let dir = make_rpc_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let proto = dir.path().join("proto/users.proto");
+        fs::write(
+            &proto,
+            "syntax = \"proto3\";\npackage users.v1;\n\nmessage User { string id = 1; }\n",
+        )
+        .unwrap();
+        let opts = crate::contracts::ContractOptions::default();
+        assert!(
+            !reindex_file(&conn, &proto, dir.path(), &opts).unwrap(),
+            "no contracts left -> no re-index, row cleaned"
+        );
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'proto/users.proto'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "contract-less document must be un-indexed");
+    }
+
+    #[test]
+    fn remove_file_cleans_document_row() {
+        let dir = make_rpc_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        remove_file(&conn, &dir.path().join("proto/users.proto"), dir.path()).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'proto/users.proto'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

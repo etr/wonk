@@ -4416,6 +4416,238 @@ fn stage_ensure_shape(path: &str) -> Option<String> {
     Some(shaped)
 }
 
+// ---------------------------------------------------------------------------
+// Document contracts (TASK-088, DQ1): .proto/.graphql/.yaml/.json documents
+//
+// No new crates (§4.24 constraint): these files get tiny line-oriented
+// scanners over the raw text instead of a grammar. Files that yield no
+// candidates stay un-indexed exactly as before — only contract-bearing
+// documents gain a files row, which TASK-083 uses as its re-index anchor.
+// ---------------------------------------------------------------------------
+
+/// A document file kind recognized by extension (TASK-088).
+///
+/// `Proto` covers `.proto`; `Graphql` covers `.graphql`/`.gql`; `OpenApi`
+/// covers `.yaml`/`.yml`/`.json` pending a content sniff — the extension
+/// alone never proves OpenAPI, so CI/compose/package files that fail the
+/// sniff yield no candidates and stay un-indexed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentKind {
+    /// Protocol-buffer IDL (`.proto`).
+    Proto,
+    /// GraphQL SDL or operation document (`.graphql`/`.gql`).
+    Graphql,
+    /// OpenAPI specification (`.yaml`/`.yml`/`.json`, content-sniffed).
+    OpenApi,
+}
+
+impl DocumentKind {
+    /// Language name stored in `files.language` and `meta.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocumentKind::Proto => "Proto",
+            DocumentKind::Graphql => "GraphQL",
+            DocumentKind::OpenApi => "OpenApi",
+        }
+    }
+}
+
+/// Whether `path` is a document file the contract scanner should read.
+///
+/// Extension gate only. Note this is separate from
+/// [`crate::indexer::detect_language`]: a `.yaml` file is a document kind
+/// here while remaining `None` (unparseable) to the grammar indexer.
+pub fn document_kind(path: &std::path::Path) -> Option<DocumentKind> {
+    let ext = path.extension()?.to_str()?;
+    match ext {
+        "proto" => Some(DocumentKind::Proto),
+        "graphql" | "gql" => Some(DocumentKind::Graphql),
+        "yaml" | "yml" | "json" => Some(DocumentKind::OpenApi),
+        _ => None,
+    }
+}
+
+/// Extract contract candidates from a document file's text (TASK-088).
+///
+/// Each kind is gated by its `ContractOptions` flag; a document that yields
+/// no candidates returns empty and the file stays un-indexed (pipeline
+/// treats that as "no FileResult").
+pub fn extract_document_contracts(
+    kind: DocumentKind,
+    content: &str,
+    opts: &ContractOptions,
+) -> Vec<ContractCandidate> {
+    match kind {
+        DocumentKind::Proto if opts.grpc => proto_providers(content),
+        _ => Vec::new(),
+    }
+}
+
+/// One `service` block found by the proto scanner.
+struct ProtoService {
+    /// Service name as written (package qualification is never composed —
+    /// the canonical join relaxes it at match time instead).
+    service: String,
+    /// `(method name, 1-based line)` per `rpc` declaration.
+    methods: Vec<(String, usize)>,
+}
+
+/// Scan a proto document for `service` blocks and their `rpc` methods
+/// (plan 5.2). Line-oriented and comment-aware; `extend` blocks are not
+/// services; rpc bodies with option blocks keep the service open until its
+/// own closing brace (brace-depth tracking).
+fn parse_proto_services(content: &str) -> Vec<ProtoService> {
+    let mut services = Vec::new();
+    let mut current: Option<ProtoService> = None;
+    let mut depth: i64 = 0;
+    for (idx, raw) in strip_proto_comments(content).iter().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if depth <= 0 {
+            if let Some(name) = proto_service_opener(line) {
+                let mut svc = ProtoService {
+                    service: name,
+                    methods: Vec::new(),
+                };
+                collect_proto_rpcs(line, line_no, &mut svc.methods);
+                depth = brace_delta(line);
+                if depth <= 0 {
+                    services.push(svc);
+                } else {
+                    current = Some(svc);
+                }
+            }
+        } else if let Some(svc) = current.as_mut() {
+            collect_proto_rpcs(line, line_no, &mut svc.methods);
+            depth += brace_delta(line);
+            if depth <= 0 {
+                services.push(current.take().expect("open service"));
+            }
+        }
+    }
+    services
+}
+
+/// Provider candidates for every method of every service in a proto document.
+fn proto_providers(content: &str) -> Vec<ContractCandidate> {
+    let mut out = Vec::new();
+    for svc in parse_proto_services(content) {
+        for (method, line) in svc.methods {
+            out.push(grpc_candidate(
+                &svc.service,
+                &method,
+                ContractRole::Provider,
+                None,
+                line,
+            ));
+        }
+    }
+    out
+}
+
+/// Build one grpc-family candidate with the canonical ID
+/// `grpc::<service>::<method>` (developer spelling preserved — the join, not
+/// the ID, tolerates qualification and casing).
+fn grpc_candidate(
+    service: &str,
+    method: &str,
+    role: ContractRole,
+    owning: Option<&str>,
+    line: usize,
+) -> ContractCandidate {
+    ContractCandidate {
+        kind: ContractKind::Grpc,
+        role,
+        qualifier: service.to_string(),
+        identifier: method.to_string(),
+        canonical_id: canonical_contract_id(ContractKind::Grpc, service, method),
+        params: Vec::new(),
+        owning_symbol: owning.map(str::to_string),
+        line,
+        confidence: CONFIDENCE_FRAMEWORK,
+    }
+}
+
+/// Blank out `//` line comments and `/* */` block comments, preserving line
+/// structure so line numbers stay meaningful.
+fn strip_proto_comments(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut in_block = false;
+    for line in content.lines() {
+        let mut out = String::with_capacity(line.len());
+        let bytes: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_block {
+                if c == '*' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                    in_block = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                break;
+            } else if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == '*' {
+                in_block = true;
+                i += 2;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        lines.push(out);
+    }
+    lines
+}
+
+/// `service <Name> {` opener — returns the bare service name, or `None` for
+/// `extend` and other declarations.
+fn proto_service_opener(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("service")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name: String = rest
+        .trim()
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '{')
+        .collect();
+    if name.is_empty() || !line.contains('{') {
+        return None;
+    }
+    Some(name)
+}
+
+/// Record every `rpc <Name>(` occurrence on a line (usually one per line).
+fn collect_proto_rpcs(line: &str, line_no: usize, methods: &mut Vec<(String, usize)>) {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        if *tok == "rpc"
+            && let Some(name) = tokens.get(i + 1)
+            && !name.is_empty()
+        {
+            let method: String = name
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !method.is_empty() {
+                methods.push((method, line_no));
+            }
+        }
+    }
+}
+
+/// Net brace delta of a line (option blocks inside rpc bodies keep the
+/// service depth accurate).
+fn brace_delta(line: &str) -> i64 {
+    line.chars().fold(0i64, |d, c| match c {
+        '{' => d + 1,
+        '}' => d - 1,
+        _ => d,
+    })
+}
+
 #[cfg(test)]
 mod extract_test_helpers {
     use super::*;
@@ -7770,5 +8002,146 @@ agenda.define('email-send', fn);
         assert_eq!(http.len(), 1);
         assert_eq!(http[0].kind, ContractKind::Http);
         assert_eq!(http[0].confidence, 0.5);
+    }
+
+    // -- document kinds (TASK-088, DQ1) ----------------------------------------
+
+    #[test]
+    fn document_kind_extension_gate() {
+        use crate::contracts::{DocumentKind, document_kind};
+        use std::path::Path;
+        assert_eq!(
+            document_kind(Path::new("proto/users.proto")),
+            Some(DocumentKind::Proto)
+        );
+        assert_eq!(
+            document_kind(Path::new("schema.graphql")),
+            Some(DocumentKind::Graphql)
+        );
+        assert_eq!(
+            document_kind(Path::new("queries.gql")),
+            Some(DocumentKind::Graphql)
+        );
+        // .yaml/.yml/.json pass the extension gate; the OpenAPI content
+        // sniff inside extract_document_contracts decides their fate.
+        assert_eq!(
+            document_kind(Path::new("api.yaml")),
+            Some(DocumentKind::OpenApi)
+        );
+        assert_eq!(
+            document_kind(Path::new("api.yml")),
+            Some(DocumentKind::OpenApi)
+        );
+        assert_eq!(
+            document_kind(Path::new("openapi.json")),
+            Some(DocumentKind::OpenApi)
+        );
+        assert_eq!(document_kind(Path::new("README.md")), None);
+        assert_eq!(document_kind(Path::new("main.rs")), None);
+        assert_eq!(document_kind(Path::new("plain")), None);
+    }
+
+    #[test]
+    fn document_kind_language_names() {
+        use crate::contracts::DocumentKind;
+        assert_eq!(DocumentKind::Proto.as_str(), "Proto");
+        assert_eq!(DocumentKind::Graphql.as_str(), "GraphQL");
+        assert_eq!(DocumentKind::OpenApi.as_str(), "OpenApi");
+    }
+
+    // -- proto document scanner (TASK-088, plan 5.2) ---------------------------
+
+    #[test]
+    fn proto_document_services_and_methods() {
+        let src = "\
+syntax = \"proto3\";
+package users.v1;
+
+message User { string id = 1; }
+
+service UserService {
+  rpc GetUser(GetUserRequest) returns (User);
+  rpc ListUsers(ListUsersRequest) returns (stream User);
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Proto, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let get = find(&cands, "grpc::UserService::GetUser").expect("GetUser missing");
+        assert_eq!(get.kind, ContractKind::Grpc);
+        assert_eq!(get.role, ContractRole::Provider);
+        assert_eq!(get.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(get.owning_symbol, None);
+        assert_eq!(get.params, Vec::<PathParam>::new());
+        assert_eq!(get.qualifier, "UserService");
+        // Bare service name — the package declaration is NOT composed.
+        assert_eq!(get.line, 7);
+        assert!(find(&cands, "grpc::UserService::ListUsers").is_some());
+    }
+
+    #[test]
+    fn proto_document_comment_wrapped_rpc_ignored() {
+        let src = "\
+service UserService {
+  // rpc Commented(In) returns (Out);
+  /* rpc Blocked(In) returns (Out); */
+  rpc Real(In) returns (Out);
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Proto, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let real = find(&cands, "grpc::UserService::Real").expect("Real missing");
+        assert_eq!(real.line, 4);
+    }
+
+    #[test]
+    fn proto_document_rpc_with_option_block() {
+        let src = "\
+service UserService {
+  rpc ListUsers(In) returns (stream Out) {
+    option deprecated = true;
+  }
+  rpc GetUser(In) returns (Out);
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Proto, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let list = find(&cands, "grpc::UserService::ListUsers").expect("ListUsers missing");
+        assert_eq!(list.line, 2);
+        // The option block's closing brace must not end the service early.
+        let get = find(&cands, "grpc::UserService::GetUser").expect("GetUser missing");
+        assert_eq!(get.line, 5);
+    }
+
+    #[test]
+    fn proto_document_extend_is_not_service() {
+        let src = "\
+extend google.protobuf.MethodOptions {
+  string opt = 50001;
+}
+service UserService {
+  rpc GetUser(In) returns (Out);
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Proto, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert!(find(&cands, "grpc::UserService::GetUser").is_some());
+    }
+
+    #[test]
+    fn proto_document_disabled_by_option() {
+        let opts = ContractOptions {
+            grpc: false,
+            ..ContractOptions::default()
+        };
+        let cands = extract_document_contracts(
+            DocumentKind::Proto,
+            "service UserService {\n  rpc GetUser(In) returns (Out);\n}\n",
+            &opts,
+        );
+        assert!(cands.is_empty(), "got {cands:?}");
     }
 }
