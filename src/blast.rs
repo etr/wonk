@@ -5,7 +5,7 @@
 //! risk level. Supports upstream (callers + type hierarchy children) and
 //! downstream (callees) traversal directions.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::Result;
@@ -91,42 +91,19 @@ fn risk_level_for_count(count: usize) -> BlastRiskLevel {
 
 /// Try to add a discovered symbol to the affected set.
 ///
-/// Checks visited/queued dedup. Edge eligibility (confidence floor, test-file
-/// exclusion) is decided by [`crate::reach::edge_eligible`] before this is
-/// called, so both the live BFS and the precomputed build share one predicate
-/// (AR-021).
-#[allow(clippy::too_many_arguments)]
+/// Visited/queued dedup and enqueue run through the shared
+/// [`crate::reach::NameBfs`] traversal core. Edge eligibility (confidence
+/// floor, test-file exclusion) is decided by [`crate::reach::edge_eligible`]
+/// before this is called, so both the live BFS and the precomputed build
+/// share one predicate and one enqueue rule (AR-021).
 fn push_if_new(
-    name: String,
-    kind: SymbolKind,
-    file: String,
-    line: usize,
-    depth: usize,
-    confidence: f64,
-    max_depth: usize,
-    visited: &mut HashSet<(String, String)>,
-    queued: &mut HashSet<String>,
-    queue: &mut VecDeque<(String, usize)>,
+    bfs: &mut crate::reach::NameBfs,
     affected: &mut Vec<BlastAffectedSymbol>,
+    sym: BlastAffectedSymbol,
+    max_depth: usize,
 ) {
-    let key = (name.clone(), file.clone());
-    if visited.contains(&key) {
-        return;
-    }
-    visited.insert(key);
-
-    affected.push(BlastAffectedSymbol {
-        name: name.clone(),
-        kind,
-        file,
-        line,
-        depth,
-        confidence,
-    });
-
-    if depth < max_depth && !queued.contains(&name) {
-        queued.insert(name.clone());
-        queue.push_back((name, depth + 1));
+    if bfs.admit(&sym.name, &sym.file, sym.depth, max_depth) {
+        affected.push(sym);
     }
 }
 
@@ -242,14 +219,9 @@ pub fn analyze_blast(
     };
 
     let mut affected: Vec<BlastAffectedSymbol> = Vec::new();
-    // visited: (name, file) pairs already processed — prevents output duplicates.
-    let mut visited: HashSet<(String, String)> = HashSet::new();
-    // queued: symbol names already enqueued — prevents BFS re-expansion.
-    let mut queued: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-
-    queue.push_back((symbol.to_string(), 1));
-    queued.insert(symbol.to_string());
+    // Shared visited/queued/FIFO state — the same NameBfs core the reach
+    // build traverses with, so both engines enqueue identically (AR-021).
+    let mut bfs = crate::reach::NameBfs::new(symbol);
 
     match options.direction {
         BlastDirection::Upstream => {
@@ -275,7 +247,7 @@ pub fn analyze_blast(
                  ORDER BY child.file, child.line",
             )?;
 
-            while let Some((target_name, depth)) = queue.pop_front() {
+            while let Some((target_name, depth)) = bfs.pop() {
                 if depth > max_depth {
                     continue;
                 }
@@ -298,17 +270,17 @@ pub fn analyze_blast(
                     }
                     let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
                     push_if_new(
-                        name,
-                        kind,
-                        file,
-                        line as usize,
-                        depth,
-                        confidence,
-                        max_depth,
-                        &mut visited,
-                        &mut queued,
-                        &mut queue,
+                        &mut bfs,
                         &mut affected,
+                        BlastAffectedSymbol {
+                            name,
+                            kind,
+                            file,
+                            line: line as usize,
+                            depth,
+                            confidence,
+                        },
+                        max_depth,
                     );
                 }
 
@@ -332,17 +304,17 @@ pub fn analyze_blast(
                         }
                         let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
                         push_if_new(
-                            name,
-                            kind,
-                            file,
-                            line as usize,
-                            depth,
-                            1.0,
-                            max_depth,
-                            &mut visited,
-                            &mut queued,
-                            &mut queue,
+                            &mut bfs,
                             &mut affected,
+                            BlastAffectedSymbol {
+                                name,
+                                kind,
+                                file,
+                                line: line as usize,
+                                depth,
+                                confidence: 1.0,
+                            },
+                            max_depth,
                         );
                     }
                 }
@@ -358,7 +330,7 @@ pub fn analyze_blast(
                  ORDER BY r.file, r.line, r.confidence DESC",
             )?;
 
-            while let Some((target_name, depth)) = queue.pop_front() {
+            while let Some((target_name, depth)) = bfs.pop() {
                 if depth > max_depth {
                     continue;
                 }
@@ -384,17 +356,17 @@ pub fn analyze_blast(
                         .and_then(|k| SymbolKind::from_str(k).ok())
                         .unwrap_or(SymbolKind::Function);
                     push_if_new(
-                        name,
-                        kind,
-                        file,
-                        line as usize,
-                        depth,
-                        confidence,
-                        max_depth,
-                        &mut visited,
-                        &mut queued,
-                        &mut queue,
+                        &mut bfs,
                         &mut affected,
+                        BlastAffectedSymbol {
+                            name,
+                            kind,
+                            file,
+                            line: line as usize,
+                            depth,
+                            confidence,
+                        },
+                        max_depth,
                     );
                 }
             }

@@ -75,6 +75,60 @@ pub fn edge_eligible(discovered_file: &str, confidence: f64, filter: &EdgeFilter
     true
 }
 
+/// The shared name-keyed BFS traversal core (AR-021).
+///
+/// One state holder, two engines: `blast::analyze_blast`'s live BFS and
+/// [`build_reach`]'s table build both run their traversal through it, so the
+/// rule the table's equivalence rests on — record each `(name, file)` once,
+/// expand each name once, stop expanding at `max_depth` — exists as this one
+/// copy instead of two discipline-synced ones. Candidate enumeration stays
+/// per-engine (SQL in blast, [`ReachGraph`] in reach); only the
+/// visited/queued/enqueue mechanics are shared.
+pub(crate) struct NameBfs {
+    /// `(name, file)` pairs already recorded — prevents output duplicates.
+    visited: HashSet<(String, String)>,
+    /// Symbol names already enqueued — prevents BFS re-expansion.
+    queued: HashSet<String>,
+    /// FIFO frontier of `(name, depth)`.
+    queue: VecDeque<(String, usize)>,
+}
+
+impl NameBfs {
+    /// Start a traversal at `root` (depth 1), marking it queued.
+    pub(crate) fn new(root: &str) -> Self {
+        let mut bfs = Self {
+            visited: HashSet::new(),
+            queued: HashSet::new(),
+            queue: VecDeque::new(),
+        };
+        bfs.queued.insert(root.to_string());
+        bfs.queue.push_back((root.to_string(), 1));
+        bfs
+    }
+
+    /// Pop the next frontier entry, FIFO.
+    pub(crate) fn pop(&mut self) -> Option<(String, usize)> {
+        self.queue.pop_front()
+    }
+
+    /// Try to record a discovered symbol and expand its name.
+    ///
+    /// Insert-if-new on `(name, file)`: returns `false` (no state change)
+    /// when the pair was already recorded. On the first discovery, enqueues
+    /// `(name, depth + 1)` iff `depth < max_depth` and the name was not
+    /// already queued, and returns `true` — the caller records its row.
+    pub(crate) fn admit(&mut self, name: &str, file: &str, depth: usize, max_depth: usize) -> bool {
+        if !self.visited.insert((name.to_string(), file.to_string())) {
+            return false;
+        }
+        if depth < max_depth && !self.queued.contains(name) {
+            self.queued.insert(name.to_string());
+            self.queue.push_back((name.to_string(), depth + 1));
+        }
+        true
+    }
+}
+
 /// Options for a full reach build.
 #[derive(Debug, Clone)]
 pub struct ReachBuildOptions {
@@ -137,10 +191,12 @@ struct ReachGraph {
     eligible: Vec<bool>,
     /// name -> positions into `symbols` (all kinds).
     by_name: HashMap<String, Vec<usize>>,
-    /// callee name -> (caller position, confidence) for every reference
-    /// with a resolved caller_id.
+    /// callee name -> (caller position, MAX confidence among that caller's
+    /// refs to the name), ordered by (file, line) — the caller candidate
+    /// list, finalized at load.
     refs_by_name: HashMap<String, Vec<(usize, f64)>>,
-    /// parent name -> child positions (union over same-named parents).
+    /// parent name -> child positions (union over same-named parents),
+    /// ordered by (file, line) — finalized at load.
     children_by_parent_name: HashMap<String, Vec<usize>>,
 }
 
@@ -222,6 +278,32 @@ impl ReachGraph {
             }
         }
 
+        // The candidate lists are pure functions of the immutable graph, so
+        // they are finalized once here instead of per BFS step: fold each
+        // callee's refs to the MAX confidence per caller row, and sort both
+        // maps' Vecs by (file, line) — the deterministic representative
+        // rules shared with blast's ordered traversal.
+        for candidates in refs_by_name.values_mut() {
+            let mut max_conf: HashMap<usize, f64> = HashMap::with_capacity(candidates.len());
+            for (caller_pos, confidence) in candidates.iter() {
+                let slot = max_conf.entry(*caller_pos).or_insert(*confidence);
+                if *confidence > *slot {
+                    *slot = *confidence;
+                }
+            }
+            *candidates = max_conf.into_iter().collect();
+            candidates.sort_by(|a, b| {
+                let (sa, sb) = (&symbols[a.0], &symbols[b.0]);
+                sa.file.cmp(&sb.file).then(sa.line.cmp(&sb.line))
+            });
+        }
+        for children in children_by_parent_name.values_mut() {
+            children.sort_by(|a, b| {
+                let (sa, sb) = (&symbols[*a], &symbols[*b]);
+                sa.file.cmp(&sb.file).then(sa.line.cmp(&sb.line))
+            });
+        }
+
         Ok(Self {
             symbols,
             eligible,
@@ -233,38 +315,17 @@ impl ReachGraph {
 
     /// Candidates calling `name`: one entry per caller symbol row carrying
     /// the MAX confidence among that row's references to `name`, ordered by
-    /// (file, line) — the deterministic representative rules shared with
-    /// blast's ordered traversal.
-    fn caller_candidates(&self, name: &str) -> Vec<(usize, f64)> {
-        let Some(refs) = self.refs_by_name.get(name) else {
-            return Vec::new();
-        };
-        let mut max_conf: HashMap<usize, f64> = HashMap::with_capacity(refs.len());
-        for (caller_pos, confidence) in refs {
-            let slot = max_conf.entry(*caller_pos).or_insert(*confidence);
-            if *confidence > *slot {
-                *slot = *confidence;
-            }
-        }
-        let mut candidates: Vec<(usize, f64)> = max_conf.into_iter().collect();
-        candidates.sort_by(|a, b| {
-            let (sa, sb) = (&self.symbols[a.0], &self.symbols[b.0]);
-            sa.file.cmp(&sb.file).then(sa.line.cmp(&sb.line))
-        });
-        candidates
+    /// (file, line) — precomputed at load, so traversal only looks it up.
+    fn caller_candidates(&self, name: &str) -> &[(usize, f64)] {
+        self.refs_by_name.get(name).map_or(&[], |v| v.as_slice())
     }
 
-    /// Type-edge children of any symbol named `name`, ordered by (file, line).
-    fn child_candidates(&self, name: &str) -> Vec<usize> {
-        let Some(children) = self.children_by_parent_name.get(name) else {
-            return Vec::new();
-        };
-        let mut candidates = children.clone();
-        candidates.sort_by(|a, b| {
-            let (sa, sb) = (&self.symbols[*a], &self.symbols[*b]);
-            sa.file.cmp(&sb.file).then(sa.line.cmp(&sb.line))
-        });
-        candidates
+    /// Type-edge children of any symbol named `name`, ordered by (file,
+    /// line) — precomputed at load.
+    fn child_candidates(&self, name: &str) -> &[usize] {
+        self.children_by_parent_name
+            .get(name)
+            .map_or(&[], |v| v.as_slice())
     }
 }
 
@@ -301,65 +362,51 @@ pub fn build_reach(
         sources += 1;
         let source_id = graph.symbols[source_pos].id;
 
-        let mut visited: HashSet<(String, String)> = HashSet::new();
-        let mut queued: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-        queue.push_back((name.clone(), 1));
-        queued.insert(name.clone());
+        let mut bfs = NameBfs::new(name);
 
         let mut recorded = 0usize;
         let mut truncated = false;
+
+        // One recording step for caller edges and type-edge children alike
+        // (they differ only in candidate source and confidence): fan-out cap
+        // check first — `false` means the cap was hit and the whole
+        // traversal must halt — then eligibility, the shared
+        // visited/enqueue rule, and the row write.
+        let mut record =
+            |bfs: &mut NameBfs, sym: &LoadedSymbol, confidence: f64, depth: usize| -> bool {
+                if recorded == opts.max_targets {
+                    truncated = true;
+                    return false;
+                }
+                if !edge_eligible(&sym.file, confidence, &filter) {
+                    return true;
+                }
+                if bfs.admit(&sym.name, &sym.file, depth, opts.depth) {
+                    rows.push((source_id, sym.id, depth as i64, confidence));
+                    recorded += 1;
+                }
+                true
+            };
+
         // The fan-out cap halts the whole traversal; the recorded rows are a
         // deterministic BFS prefix (a lower bound on the true reach set).
-        'traversal: while let Some((target_name, depth)) = queue.pop_front() {
+        'traversal: while let Some((target_name, depth)) = bfs.pop() {
             if depth > opts.depth {
                 continue;
             }
 
-            for (caller_pos, confidence) in graph.caller_candidates(&target_name) {
-                if recorded == opts.max_targets {
-                    truncated = true;
+            for &(caller_pos, confidence) in graph.caller_candidates(&target_name) {
+                if !record(&mut bfs, &graph.symbols[caller_pos], confidence, depth) {
                     break 'traversal;
-                }
-                let sym = &graph.symbols[caller_pos];
-                if !edge_eligible(&sym.file, confidence, &filter) {
-                    continue;
-                }
-                let key = (sym.name.clone(), sym.file.clone());
-                if visited.contains(&key) {
-                    continue;
-                }
-                visited.insert(key);
-                rows.push((source_id, sym.id, depth as i64, confidence));
-                recorded += 1;
-                if depth < opts.depth && !queued.contains(&sym.name) {
-                    queued.insert(sym.name.clone());
-                    queue.push_back((sym.name.clone(), depth + 1));
                 }
             }
 
             // Type-edge children only for the initially queried name
             // (depth == 1), mirroring PRD-HRTG-REQ-003 in blast.
             if depth == 1 {
-                for child_pos in graph.child_candidates(&target_name) {
-                    if recorded == opts.max_targets {
-                        truncated = true;
+                for &child_pos in graph.child_candidates(&target_name) {
+                    if !record(&mut bfs, &graph.symbols[child_pos], 1.0, depth) {
                         break 'traversal;
-                    }
-                    let sym = &graph.symbols[child_pos];
-                    if !edge_eligible(&sym.file, 1.0, &filter) {
-                        continue;
-                    }
-                    let key = (sym.name.clone(), sym.file.clone());
-                    if visited.contains(&key) {
-                        continue;
-                    }
-                    visited.insert(key);
-                    rows.push((source_id, sym.id, depth as i64, 1.0));
-                    recorded += 1;
-                    if depth < opts.depth && !queued.contains(&sym.name) {
-                        queued.insert(sym.name.clone());
-                        queue.push_back((sym.name.clone(), depth + 1));
                     }
                 }
             }
@@ -1171,6 +1218,68 @@ mod tests {
             "truncation must be identifiable from the result alone (REQ-009)"
         );
         let _ = hub;
+    }
+
+    // -- Shared traversal core (NameBfs) -------------------------------------
+
+    #[test]
+    fn name_bfs_seeds_root_and_pops_fifo() {
+        let mut bfs = NameBfs::new("root");
+        assert_eq!(bfs.pop(), Some(("root".to_string(), 1)));
+        assert_eq!(bfs.pop(), None, "single seed entry");
+    }
+
+    #[test]
+    fn name_bfs_admit_dedups_on_name_and_file() {
+        let mut bfs = NameBfs::new("root");
+        bfs.pop();
+
+        // Same (name, file) is admitted once.
+        assert!(bfs.admit("a", "src/a.rs", 1, 3));
+        assert!(!bfs.admit("a", "src/a.rs", 1, 3), "duplicate (name, file)");
+
+        // Same name in another file, and another name in the same file, are
+        // distinct symbol rows: both admit.
+        assert!(bfs.admit("a", "src/b.rs", 1, 3));
+        assert!(bfs.admit("b", "src/a.rs", 1, 3));
+    }
+
+    #[test]
+    fn name_bfs_admit_enqueues_only_under_the_depth_cap() {
+        let mut bfs = NameBfs::new("root");
+        bfs.pop();
+
+        // At the cap (depth == max_depth): recorded, never expanded.
+        assert!(bfs.admit("deep", "src/a.rs", 3, 3));
+        assert_eq!(bfs.pop(), None, "depth == max_depth must not enqueue");
+
+        // Under the cap: expanded at depth + 1.
+        assert!(bfs.admit("shallow", "src/a.rs", 1, 3));
+        assert_eq!(bfs.pop(), Some(("shallow".to_string(), 2)));
+    }
+
+    #[test]
+    fn name_bfs_admit_never_requeues_a_name() {
+        let mut bfs = NameBfs::new("root");
+        bfs.pop();
+
+        // Two distinct-file symbols of one name both record, but the name is
+        // enqueued for expansion exactly once.
+        assert!(bfs.admit("x", "src/a.rs", 1, 3));
+        assert!(bfs.admit("x", "src/b.rs", 1, 3));
+        assert_eq!(bfs.pop(), Some(("x".to_string(), 2)));
+        assert_eq!(bfs.pop(), None, "one name, one expansion");
+    }
+
+    #[test]
+    fn name_bfs_root_name_is_never_requeued() {
+        let mut bfs = NameBfs::new("root");
+        bfs.pop();
+
+        // A cycle back to the queried name records the self-row but does not
+        // re-expand the root (it was queued at seeding).
+        assert!(bfs.admit("root", "src/a.rs", 1, 3));
+        assert_eq!(bfs.pop(), None);
     }
 
     #[test]
