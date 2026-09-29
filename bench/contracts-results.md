@@ -1,35 +1,32 @@
-# TASK-082 contract extraction build-cost results
+# Contract extraction build-cost results (TASK-082 + TASK-087)
 
 Synthetic repo: 12 languages x 25 files, ordinary symbols plus 2-5
-framework idioms per file. `cargo bench --bench contracts`.
-
-E is measured serially over trees parsed exactly as `parse_one_file`
-parses them (read/parse outside the timed window); T_build is the warm
-`build_index` wall time, which parses and extracts in parallel. The gate
-E < 0.15 x T_build is therefore conservative.
+framework idioms per file (HTTP/env from TASK-082; ~2 message-kind
+idioms — queue/websocket/job — per file from TASK-087).
+`cargo bench --bench contracts`.
 
 | metric | value |
 |---|---|
 | files indexed | 300 |
-| contracts (build_index) | 1000 |
-| contracts (extraction pass) | 1000 |
-| E — extract_contracts total (avg of 5) | 6.483 ms |
-| T_build — warm build_index | 66.6 ms |
-| E / T_build | 9.73% (gate: < 15%) |
+| contracts (build_index) | 1375 |
+| contracts (extraction pass) | 1375 |
+| E — extract_contracts total (avg of 5) | 8.570 ms |
+| T_build — warm build_index | 83.8 ms |
+| E / T_build | 10.23% (gate: < 15%) |
 
 Per-language extraction p50/p95 (last round):
 
 | language | p50 | p95 | files |
 |---|---|---|---|
-| C | 10.5 us | 11.4 us | 25 |
-| C# | 27.3 us | 31.5 us | 25 |
-| C++ | 10.8 us | 13.2 us | 25 |
-| Go | 26.2 us | 28.5 us | 25 |
-| Java | 20.1 us | 34.3 us | 25 |
-| JavaScript | 28.3 us | 32.1 us | 25 |
-| PHP | 20.0 us | 22.5 us | 25 |
-| Python | 25.6 us | 28.5 us | 25 |
-| Ruby | 16.1 us | 19.0 us | 25 |
-| Rust | 23.8 us | 27.7 us | 25 |
-| TSX | 19.1 us | 21.7 us | 25 |
-| TypeScript | 23.5 us | 26.0 us | 25 |
+| C | 11.3 us | 12.2 us | 25 |
+| C# | 27.9 us | 32.2 us | 25 |
+| C++ | 11.5 us | 13.2 us | 25 |
+| Go | 33.1 us | 63.8 us | 25 |
+| Java | 26.0 us | 121.5 us | 25 |
+| JavaScript | 37.2 us | 41.8 us | 25 |
+| PHP | 20.1 us | 24.8 us | 25 |
+| Python | 29.8 us | 36.2 us | 25 |
+| Ruby | 23.8 us | 32.7 us | 25 |
+| Rust | 36.1 us | 41.6 us | 25 |
+| TSX | 26.1 us | 29.4 us | 25 |
+| TypeScript | 34.2 us | 39.3 us | 25 |

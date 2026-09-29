@@ -30,6 +30,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub embedding: EmbeddingConfig,
     pub reach: ReachConfig,
+    pub contracts: ContractsConfig,
 }
 
 /// Daemon-related settings.
@@ -120,6 +121,38 @@ impl Default for ReachConfig {
     }
 }
 
+/// Contract-extraction kind switches (TASK-087, PRD-CTR-REQ-001).
+///
+/// Per-kind booleans rather than a kinds list: each kind layers
+/// independently, and a noisy detector can be turned off without touching
+/// the others. All kinds default to enabled; TASK-088 adds the RPC-family
+/// booleans, and workspace scoping arrives with TASK-083+.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractsConfig {
+    /// HTTP route/outbound-call detection.
+    pub http: bool,
+    /// Environment-variable read/write detection.
+    pub env: bool,
+    /// Message-queue producer/consumer detection.
+    pub queue: bool,
+    /// WebSocket emit/handler-registration detection.
+    pub websocket: bool,
+    /// Scheduled and background job detection.
+    pub job: bool,
+}
+
+impl Default for ContractsConfig {
+    fn default() -> Self {
+        Self {
+            http: true,
+            env: true,
+            queue: true,
+            websocket: true,
+            job: true,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -185,6 +218,7 @@ struct ConfigOverlay {
     search: Option<SearchOverlay>,
     embedding: Option<EmbeddingOverlay>,
     reach: Option<ReachOverlay>,
+    contracts: Option<ContractsOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -239,6 +273,16 @@ struct EmbeddingOverlay {
 struct ReachOverlay {
     depth: Option<usize>,
     enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ContractsOverlay {
+    http: Option<bool>,
+    env: Option<bool>,
+    queue: Option<bool>,
+    websocket: Option<bool>,
+    job: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +349,23 @@ impl Config {
             }
             if let Some(v) = reach.enabled {
                 self.reach.enabled = v;
+            }
+        }
+        if let Some(contracts) = overlay.contracts {
+            if let Some(v) = contracts.http {
+                self.contracts.http = v;
+            }
+            if let Some(v) = contracts.env {
+                self.contracts.env = v;
+            }
+            if let Some(v) = contracts.queue {
+                self.contracts.queue = v;
+            }
+            if let Some(v) = contracts.websocket {
+                self.contracts.websocket = v;
+            }
+            if let Some(v) = contracts.job {
+                self.contracts.job = v;
             }
         }
     }
@@ -465,6 +526,75 @@ mod tests {
         let config = env.load().unwrap();
         assert_eq!(config.reach.depth, 3);
         assert!(config.reach.enabled);
+    }
+
+    #[test]
+    fn contracts_defaults_applied_when_no_config_exists() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert!(config.contracts.http);
+        assert!(config.contracts.env);
+        assert!(config.contracts.queue);
+        assert!(config.contracts.websocket);
+        assert!(config.contracts.job);
+    }
+
+    #[test]
+    fn contracts_reads_from_config_file() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[contracts]
+queue = false
+websocket = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(!config.contracts.queue);
+        assert!(!config.contracts.websocket);
+        assert!(config.contracts.http);
+    }
+
+    #[test]
+    fn contracts_partial_overlays_only_override_set_fields() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[contracts]
+queue = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(!config.contracts.queue);
+        assert!(
+            config.contracts.env,
+            "absent env key keeps the default (all kinds on)"
+        );
+        assert!(config.contracts.http);
+        assert!(config.contracts.websocket);
+        assert!(config.contracts.job);
+    }
+
+    #[test]
+    fn contracts_repo_layer_overrides_global() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[contracts]
+queue = false
+job = false
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[contracts]
+queue = true
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(config.contracts.queue, "repo layer wins");
+        assert!(!config.contracts.job, "global job survives repo layer");
     }
 
     #[test]

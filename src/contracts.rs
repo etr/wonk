@@ -1,5 +1,6 @@
-//! Contract extraction: canonical ID normalization plus the `http` and `env`
-//! contract kinds (TASK-082, PRD-CTR-REQ-001..004).
+//! Contract extraction: canonical ID normalization plus the `http`, `env`,
+//! `queue`, `websocket`, and `job` contract kinds (TASK-082, TASK-087,
+//! PRD-CTR-REQ-001..004).
 //!
 //! Contracts are detected by walking the tree-sitter tree that the symbol
 //! indexer already parsed — no second parse or file read (PRD-CTR-REQ-011).
@@ -11,6 +12,30 @@
 //! - [`normalize_http_path`] runs a fixed 6-stage pipeline (PRD-CTR-REQ-003).
 //! - [`normalize_method`] upper-cases verbs and maps router catch-alls to
 //!   `ANY`.
+//! - [`normalize_topic`] normalizes queue/websocket/job names; unlike the
+//!   HTTP pipeline it REJECTS computed topics outright (`None`), because
+//!   exact-ID matching is the only pairing mechanism for the message kinds.
+//!
+//! Role mappings are PER SPEC and deliberately inverted between kinds —
+//! do not "fix" one to match the other:
+//! - **queue (DR-031):** provider = the construct that registers a handler
+//!   (subscriber, `@KafkaListener`, `ch.consume`), consumer = the code that
+//!   initiates by publishing (`producer.send`, `ch.publish`). The reader of
+//!   a topic serves it; the writer calls on it.
+//! - **websocket:** provider = emit sites (`io.emit`, `@SendTo`), consumer =
+//!   handler registrations (`socket.on`, `@MessageMapping`, `app.ws`). Here
+//!   the writer serves and the reader subscribes — the mirror image of the
+//!   queue rule, per the TASK-087 specification.
+//!
+//! RabbitMQ note: producers address exchange+routing-key while consumers
+//! address queue names; the binding between them is broker config and
+//! invisible to static analysis. Pairing therefore relies on aligned names
+//! (topic-exchange convention); the Ruby `channel.queue` binding pre-pass
+//! closes part of the gap where the queue name is declared inline.
+//!
+//! Verb collisions (`send`/`emit`) resolve by guard order: websocket
+//! receivers first, then the queue generic arms, and the ambiguous HTTP
+//! arm last behind its `is_path_like` gate.
 
 use std::collections::HashMap;
 
@@ -24,18 +49,90 @@ pub const CONFIDENCE_FRAMEWORK: f64 = 1.0;
 /// Confidence for string-literal heuristics and role-ambiguous constructs.
 pub const CONFIDENCE_HEURISTIC: f64 = 0.5;
 
+/// Per-kind extraction switches threaded through the pipeline (TASK-087).
+///
+/// `Copy` so the `par_iter` in `build_index_with_progress` can carry it per
+/// file; mirrors [`crate::config::ContractsConfig`] one flag per kind so a
+/// noisy detector can be disabled without degrading the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractOptions {
+    /// HTTP route/outbound-call detection.
+    pub http: bool,
+    /// Environment-variable read/write detection.
+    pub env: bool,
+    /// Message-queue producer/consumer detection.
+    pub queue: bool,
+    /// WebSocket emit/handler-registration detection.
+    pub websocket: bool,
+    /// Scheduled and background job detection.
+    pub job: bool,
+}
+
+impl Default for ContractOptions {
+    fn default() -> Self {
+        Self {
+            http: true,
+            env: true,
+            queue: true,
+            websocket: true,
+            job: true,
+        }
+    }
+}
+
+impl ContractOptions {
+    /// Whether detections of `kind` should be emitted.
+    pub fn enabled(&self, kind: ContractKind) -> bool {
+        match kind {
+            ContractKind::Http => self.http,
+            ContractKind::Env => self.env,
+            ContractKind::Queue => self.queue,
+            ContractKind::WebSocket => self.websocket,
+            ContractKind::Job => self.job,
+        }
+    }
+}
+
+impl From<&crate::config::ContractsConfig> for ContractOptions {
+    fn from(cfg: &crate::config::ContractsConfig) -> Self {
+        Self {
+            http: cfg.http,
+            env: cfg.env,
+            queue: cfg.queue,
+            websocket: cfg.websocket,
+            job: cfg.job,
+        }
+    }
+}
+
 /// Extract contract candidates from an already-parsed tree.
 ///
 /// `source` must be the exact byte string the tree was parsed from.
 /// One binding pre-pass collects router context (REQ-023), then a single
 /// iterative DFS walks the tree and dispatches per-language matchers.
-pub fn extract_contracts(tree: &Tree, source: &str, lang: Lang) -> Vec<ContractCandidate> {
+/// `opts` gates each kind at its emit choke point, so a noisy detector can
+/// be disabled without degrading the others.
+pub fn extract_contracts(
+    tree: &Tree,
+    source: &str,
+    lang: Lang,
+    opts: &ContractOptions,
+) -> Vec<ContractCandidate> {
+    if !opts.http && !opts.env && !opts.queue && !opts.websocket && !opts.job {
+        return Vec::new();
+    }
     let src = source.as_bytes();
-    let ctx = collect_router_context(tree.root_node(), src, lang);
+    // The router pre-pass serves http prefixes and Ruby queue bindings.
+    let ctx = if opts.http || (opts.queue && matches!(lang, Lang::Ruby)) {
+        collect_router_context(tree.root_node(), src, lang)
+    } else {
+        RouterContext::default()
+    };
     let mut ex = Extractor {
         src,
         lang,
         ctx,
+        opts: *opts,
         out: Vec::new(),
     };
     let mut stack = vec![(tree.root_node(), String::new())];
@@ -66,6 +163,10 @@ struct RouterContext {
     /// `let VAR = <initializer>` byte ranges: Rust chains attribute their
     /// `.route` literals to the variable the chain initializes.
     initializer_ranges: Vec<(std::ops::Range<usize>, String)>,
+    /// Ruby `q = channel.queue("NAME")` / `channel.direct|topic|fanout`
+    /// declarations: variable -> queue/exchange name (TASK-087). A bound
+    /// variable's `.subscribe` is a RabbitMQ provider on that name.
+    queue_bindings: HashMap<String, String>,
 }
 
 /// Maximum chain depth when resolving group prefixes (cycles, deep chains).
@@ -116,6 +217,9 @@ fn collect_router_context(root: Node, src: &[u8], lang: Lang) -> RouterContext {
             }
             Lang::Rust => {
                 collect_rust_router_facts(node, src, &mut ctx);
+            }
+            Lang::Ruby => {
+                collect_ruby_queue_facts(node, src, &mut ctx);
             }
             _ => {}
         }
@@ -396,6 +500,47 @@ fn collect_rust_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
     }
 }
 
+/// Ruby: `q = channel.queue("NAME")` and `x = channel.direct|topic|fanout("NAME")`
+/// bind a variable to the queue/exchange name it addresses (TASK-087).
+fn collect_ruby_queue_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
+    if node.kind() != "assignment" {
+        return;
+    }
+    let Some(left) = node
+        .child_by_field_name("left")
+        .filter(|n| n.kind() == "identifier")
+    else {
+        return;
+    };
+    let var = node_text(Some(left), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(right) = node
+        .child_by_field_name("right")
+        .filter(|n| n.kind() == "call")
+    else {
+        return;
+    };
+    if !matches!(
+        node_text(right.child_by_field_name("method"), src),
+        "queue" | "direct" | "topic" | "fanout"
+    ) {
+        return;
+    }
+    let Some(name_node) = right
+        .child_by_field_name("arguments")
+        .and_then(|args| positional_arg(args, 0))
+        .filter(|n| n.kind() == "string")
+    else {
+        return;
+    };
+    let name = ruby_string_content(name_node, src);
+    if !name.is_empty() {
+        ctx.queue_bindings.insert(var.to_string(), name);
+    }
+}
+
 /// The i-th positional argument of an argument list (skipping keywords).
 ///
 /// Grammars that wrap each argument in an `argument` node (PHP, C#) are
@@ -445,6 +590,43 @@ fn unwrap_argument(node: Node) -> Node {
     node
 }
 
+/// Celery task decorator: bare `@app.task` (attribute form, no parens)
+/// or call form `@app.task(...)` / `@shared_task(...)`. Returns the job
+/// name and the node that carries it — the `name=` literal when given,
+/// the decorated function's name otherwise.
+fn py_job_decorator<'a>(
+    dec: Node<'a>,
+    def_name: Option<Node<'a>>,
+    src: &[u8],
+) -> Option<(String, Node<'a>)> {
+    let target = dec.named_child(0)?;
+    let is_task = match target.kind() {
+        // Bare @app.task (attribute) and bare @shared_task (identifier).
+        "attribute" => node_text(target.child_by_field_name("attribute"), src) == "task",
+        "identifier" => node_text(Some(target), src) == "shared_task",
+        "call" => {
+            let func = target.child_by_field_name("function")?;
+            match func.kind() {
+                "attribute" => node_text(func.child_by_field_name("attribute"), src) == "task",
+                "identifier" => node_text(Some(func), src) == "shared_task",
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if !is_task {
+        return None;
+    }
+    if let Some(args) = target.child_by_field_name("arguments")
+        && let Some(lit) = kwarg_string_node(args, "name", src)
+        && let Some(name) = py_string_content(lit, src)
+    {
+        return Some((name, lit));
+    }
+    let def_name = def_name?;
+    Some((node_text(Some(def_name), src).to_string(), def_name))
+}
+
 /// String value of a keyword argument, if it is a string literal.
 fn kwarg_string(args: Node, name: &str, src: &[u8]) -> Option<String> {
     for j in 0..args.named_child_count() {
@@ -454,6 +636,21 @@ fn kwarg_string(args: Node, name: &str, src: &[u8]) -> Option<String> {
             && let Some(value) = kw.child_by_field_name("value")
         {
             return py_string_content(value, src);
+        }
+    }
+    None
+}
+
+/// Value node of a keyword argument (kind-checked by the caller's
+/// topic-argument renderer).
+fn kwarg_string_node<'t>(args: Node<'t>, name: &str, src: &[u8]) -> Option<Node<'t>> {
+    for j in 0..args.named_child_count() {
+        if let Some(kw) = args.named_child(j as u32)
+            && kw.kind() == "keyword_argument"
+            && node_text(kw.child_by_field_name("name"), src) == name
+            && let Some(value) = kw.child_by_field_name("value")
+        {
+            return Some(value);
         }
     }
     None
@@ -508,6 +705,7 @@ struct Extractor<'a> {
     src: &'a [u8],
     lang: Lang,
     ctx: RouterContext,
+    opts: ContractOptions,
     out: Vec<ContractCandidate>,
 }
 
@@ -520,6 +718,17 @@ const JS_PROVIDER_VERBS: &[&str] = &["get", "post", "put", "patch", "delete", "a
 const JS_CONSUMER_VERBS: &[&str] = &["get", "post", "put", "patch", "delete"];
 /// HTTP client receivers whose verb-named methods are outbound calls.
 const JS_CONSUMER_RECEIVERS: &[&str] = &["axios", "got", "http", "https"];
+/// Receiver/chain-root names treated as websocket endpoints (TASK-087).
+/// Checked before the queue generic arms so `socket.send` is websocket,
+/// never queue.
+///
+/// Deliberately narrow: `server` and `conn` are NOT whitelisted because
+/// Node's `http`/`net` idioms use them for plain event streams
+/// (`server.on('listening')`, `conn.on('data')`), which would flood the
+/// websocket kind with false lifecycle/stream contracts. Those calls fall
+/// through to the generic `.on` skip (EventEmitter gate) in the queue
+/// arms instead.
+const WS_RECEIVERS: &[&str] = &["io", "socket", "ws", "wss", "websocket"];
 /// Verb-like callee names used by the 0.5 heuristic on unknown receivers.
 const AMBIGUOUS_VERBS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "any", "all", "request",
@@ -663,22 +872,251 @@ impl<'a> Extractor<'a> {
                         CONFIDENCE_FRAMEWORK,
                         None,
                     );
-                } else if AMBIGUOUS_VERBS.contains(&prop)
-                    && !self.ctx.is_router_var(recv)
-                    && !JS_ROUTER_VARS.contains(&recv)
-                    && !JS_CONSUMER_RECEIVERS.contains(&recv)
-                    && let Some(arg) = first_arg
-                    && matches!(self.path_arg(arg), Some(PathArg::Direct(ref s)) if is_path_like(s))
+                } else {
+                    // Message-kind matchers run between the HTTP client arm
+                    // and the ambiguous HTTP arm (TASK-087 guard order:
+                    // websocket receivers, then queue, then HTTP 0.5).
+                    self.js_message_call(node, func, recv, prop, args);
+                    self.js_job_call(node, recv, prop, args);
+                    if AMBIGUOUS_VERBS.contains(&prop)
+                        && !self.ctx.is_router_var(recv)
+                        && !JS_ROUTER_VARS.contains(&recv)
+                        && !JS_CONSUMER_RECEIVERS.contains(&recv)
+                        && let Some(arg) = first_arg
+                        && matches!(self.path_arg(arg), Some(PathArg::Direct(ref s)) if is_path_like(s))
+                    {
+                        self.emit_http(
+                            node,
+                            arg,
+                            ContractRole::Provider,
+                            prop,
+                            prefix,
+                            CONFIDENCE_HEURISTIC,
+                            None,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Queue (TASK-087) and websocket call matchers for JS/TS. Runs after
+    /// the HTTP arms so verb collisions resolve by guard order.
+    /// Websocket (TASK-087 step 6) and queue call matchers for JS/TS.
+    /// Websocket receivers win the send/emit collisions; queue generic
+    /// arms see only non-ws receivers; a generic `.emit` on an unknown
+    /// receiver is a 0.5 websocket provider; generic `.on` never fires
+    /// (EventEmitter flood).
+    fn js_message_call(&mut self, node: Node, func: Node, recv: &str, prop: &str, args: Node) {
+        let ws_receiver = self.is_ws_receiver(func);
+        let first = positional_arg(args, 0);
+        match prop {
+            _ if ws_receiver && matches!(prop, "emit" | "send") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
                 {
-                    self.emit_http(
+                    self.emit_ws(
                         node,
-                        arg,
+                        t,
+                        &raw,
                         ContractRole::Provider,
-                        prop,
-                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            _ if ws_receiver && prop == "on" => {
+                // A registration carries an event name and a handler.
+                if args.named_child_count() >= 2
+                    && let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_ws(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            // express-ws: app.ws('/path', handler) — path-identified
+            // consumer; pair-inert (its provider is io connections).
+            "ws" if self.ctx.is_router_var(recv) || JS_ROUTER_VARS.contains(&recv) => {
+                if let Some(t) = first {
+                    self.emit_ws_path(node, t, ContractRole::Consumer);
+                }
+            }
+            "emit" => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_ws(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
                         CONFIDENCE_HEURISTIC,
                         None,
                     );
+                }
+            }
+            _ => {
+                if !ws_receiver {
+                    self.js_queue_call(node, recv, prop, args);
+                }
+            }
+        }
+    }
+
+    /// Job matchers (TASK-087 step 7): cron/agenda registrations are
+    /// providers — named by the callback when it is an identifier, else by
+    /// the enclosing function; BullMQ-style queue adds are 0.5 consumers
+    /// (generic `add` verb).
+    fn js_job_call(&mut self, node: Node, recv: &str, prop: &str, args: Node) {
+        let recv_lower = recv.to_lowercase();
+        let first = positional_arg(args, 0);
+        match prop {
+            "schedule" if recv == "cron" || recv_lower.contains("cron") => {
+                let (name, name_node) =
+                    match positional_arg(args, 1).filter(|cb| cb.kind() == "identifier") {
+                        Some(cb) => (node_text(Some(cb), self.src).to_string(), cb),
+                        None => {
+                            let Some(own) =
+                                crate::indexer::find_enclosing_function(node, self.src, self.lang)
+                            else {
+                                return;
+                            };
+                            (own, node)
+                        }
+                    };
+                self.emit_job(
+                    node,
+                    name_node,
+                    &name,
+                    ContractRole::Provider,
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
+            }
+            "define" if recv_lower.contains("agenda") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_job(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            "add" if recv == "q" || recv_lower.contains("queue") || recv_lower.contains("bull") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_job(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        CONFIDENCE_HEURISTIC,
+                        None,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Queue producers/consumers (DR-031: the code that publishes initiates,
+    /// so it is the consumer; the subscriber registers the handler).
+    fn js_queue_call(&mut self, node: Node, recv: &str, prop: &str, args: Node) {
+        let argc = args.named_child_count();
+        let first = positional_arg(args, 0);
+        let cons = ContractRole::Consumer;
+        let prov = ContractRole::Provider;
+        match prop {
+            "sendToQueue" => {
+                // amqplib: sendToQueue(queue, content)
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(node, t, &raw, cons, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
+                }
+            }
+            "publish" if argc >= 3 => {
+                // amqplib: publish(exchange, routingKey, content)
+                if let Some(t) = positional_arg(args, 1)
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(node, t, &raw, cons, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
+                }
+            }
+            "consume" => {
+                // amqplib: consume(queue, callback) — the only idiomatic
+                // `.consume` in JS clients.
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(node, t, &raw, prov, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
+                }
+            }
+            "send" | "subscribe" => {
+                let role = if prop == "send" { cons } else { prov };
+                if let Some(arg) = first {
+                    // kafkajs object shape: send({topic: 'x'}) / subscribe({topic})
+                    if let Some(value_node) = js_prop_string_node(arg, "topic", self.src) {
+                        let raw = string_content(value_node, self.src);
+                        self.emit_queue(
+                            node,
+                            value_node,
+                            &raw,
+                            role,
+                            "kafka",
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    } else if matches!(recv, "nc" | "nats")
+                        && let Some(raw) = self.topic_arg(arg)
+                    {
+                        // nats.js: nc.publish(subj, payload) / nc.subscribe(subj)
+                        self.emit_queue(node, arg, &raw, role, "nats", CONFIDENCE_FRAMEWORK, None);
+                    } else if let Some(raw) = self.topic_arg(arg) {
+                        // Generic tier: broker token from the receiver name.
+                        self.emit_queue(
+                            node,
+                            arg,
+                            &raw,
+                            role,
+                            broker_token(recv),
+                            CONFIDENCE_HEURISTIC,
+                            None,
+                        );
+                    }
+                }
+            }
+            "publish" => {
+                if let Some(arg) = first {
+                    if matches!(recv, "nc" | "nats")
+                        && let Some(raw) = self.topic_arg(arg)
+                    {
+                        self.emit_queue(node, arg, &raw, cons, "nats", CONFIDENCE_FRAMEWORK, None);
+                    } else if let Some(raw) = self.topic_arg(arg) {
+                        self.emit_queue(
+                            node,
+                            arg,
+                            &raw,
+                            cons,
+                            broker_token(recv),
+                            CONFIDENCE_HEURISTIC,
+                            None,
+                        );
+                    }
                 }
             }
             _ => {}
@@ -763,15 +1201,28 @@ impl<'a> Extractor<'a> {
 
     /// `@app.get('/x')` / `@app.route('/x', methods=['POST'])` decorators.
     fn py_decorated(&mut self, node: Node, prefix: &str) -> String {
-        let owning = node
+        let def_name = node
             .child_by_field_name("definition")
-            .and_then(|def| def.child_by_field_name("name"))
-            .map(|n| node_text(Some(n), self.src).to_string());
+            .and_then(|def| def.child_by_field_name("name"));
+        let owning = def_name.map(|n| node_text(Some(n), self.src).to_string());
         for i in 0..node.child_count() {
             let Some(dec) = node.child(i as u32) else {
                 continue;
             };
             if dec.kind() != "decorator" {
+                continue;
+            }
+            // TASK-087 job: @app.task / @app.task(name=…) / @shared_task.
+            // `name=` wins; otherwise the decorated function names the job.
+            if let Some((job_name, name_node)) = py_job_decorator(dec, def_name, self.src) {
+                self.emit_job(
+                    dec,
+                    name_node,
+                    &job_name,
+                    ContractRole::Provider,
+                    CONFIDENCE_FRAMEWORK,
+                    owning.as_deref(),
+                );
                 continue;
             }
             let Some(call) = dec.named_child(0) else {
@@ -813,6 +1264,10 @@ impl<'a> Extractor<'a> {
         prefix.to_string()
     }
 
+    /// Celery task decorator: bare `@app.task` (attribute form, no parens)
+    /// or call form `@app.task(...)` / `@shared_task(...)`. Returns the job
+    /// name and the node that carries it — the `name=` literal when given,
+    /// the decorated function's name otherwise.
     /// Consumer calls, Falcon `add_route`, and env accessors.
     fn py_call(&mut self, node: Node, prefix: &str) {
         let func = node.child_by_field_name("function");
@@ -863,6 +1318,170 @@ impl<'a> Extractor<'a> {
                                 CONFIDENCE_FRAMEWORK,
                                 None,
                             );
+                        }
+                    }
+                    // -- queue (TASK-087, DR-031) --------------------------------
+                    // confluent-kafka: producer.produce('topic', value=…).
+                    (_, "produce") => {
+                        if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                "kafka",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // pika: basic_publish(…, routing_key=…) else positional 2.
+                    (_, "basic_publish") => {
+                        let t = kwarg_string_node(args, "routing_key", self.src)
+                            .or_else(|| positional_arg(args, 1));
+                        if let Some(t) = t
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // pika: basic_consume(queue=…) else positional 1.
+                    (_, "basic_consume") => {
+                        let t = kwarg_string_node(args, "queue", self.src).or(first);
+                        if let Some(t) = t
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Provider,
+                                "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // nats-py: nc.publish(subj, payload) / nc.subscribe(subj).
+                    (_, "publish") if matches!(recv, "nc" | "nats") => {
+                        if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                "nats",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    (_, "subscribe") if matches!(recv, "nc" | "nats") => {
+                        if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Provider,
+                                "nats",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // -- job (TASK-087 step 7) ---------------------------------
+                    // task_fn.delay()/apply_async(): the receiver is the
+                    // task, so a simple-identifier receiver is required.
+                    (_, "delay") | (_, "apply_async") => {
+                        if let Some(recv_node) = func
+                            .child_by_field_name("object")
+                            .filter(|n| n.kind() == "identifier")
+                        {
+                            let name = node_text(Some(recv_node), self.src).to_string();
+                            self.emit_job(
+                                node,
+                                recv_node,
+                                &name,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // celery_app.send_task('orders.sync', …) — dispatch by
+                    // name.
+                    (_, "send_task") => {
+                        if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_job(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // scheduler.add_job(fn, …): the function (or the
+                    // enclosing one) names the schedule.
+                    (_, "add_job") if recv.to_lowercase().contains("sched") => {
+                        let target = positional_arg(args, 0).filter(|n| n.kind() == "identifier");
+                        let (name, name_node) = match target {
+                            Some(id) => (node_text(Some(id), self.src).to_string(), id),
+                            None => {
+                                let Some(own) = crate::indexer::find_enclosing_function(
+                                    node, self.src, self.lang,
+                                ) else {
+                                    return;
+                                };
+                                (own, node)
+                            }
+                        };
+                        self.emit_job(
+                            node,
+                            name_node,
+                            &name,
+                            ContractRole::Provider,
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
+                    // Generic tier: send/subscribe with a string literal at
+                    // 0.5, broker token from the receiver name. The
+                    // list-of-one subscribe shape is kafka-python's and
+                    // carries 1.0.
+                    (_, "send") | (_, "subscribe") => {
+                        if let Some(t) = first {
+                            let role = if attr == "send" {
+                                ContractRole::Consumer
+                            } else {
+                                ContractRole::Provider
+                            };
+                            let (broker, confidence) =
+                                if attr == "subscribe" && matches!(t.kind(), "list" | "tuple") {
+                                    ("kafka", CONFIDENCE_FRAMEWORK)
+                                } else {
+                                    (broker_token(recv), CONFIDENCE_HEURISTIC)
+                                };
+                            if let Some(raw) = self.topic_arg(t) {
+                                self.emit_queue(node, t, &raw, role, broker, confidence, None);
+                            }
                         }
                     }
                     _ => {
@@ -991,11 +1610,41 @@ impl<'a> Extractor<'a> {
     fn visit_ruby(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "call" => return self.ruby_call(node, prefix),
+            "class" => self.ruby_class_job(node),
             "element_reference" => self.ruby_env_ref(node),
             "assignment" => self.ruby_env_assign(node),
             _ => {}
         }
         prefix.to_string()
+    }
+
+    /// TASK-087 job: a class that includes Sidekiq::Job/Sidekiq::Worker or
+    /// subclasses ApplicationJob defines a background job named after the
+    /// class.
+    fn ruby_class_job(&mut self, node: Node) {
+        let Some(name_node) = node.named_child(0).filter(|n| n.kind() == "constant") else {
+            return;
+        };
+        let is_active_job = (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i as u32))
+            .find(|n| n.kind() == "superclass")
+            .and_then(|s| s.named_child(0))
+            .is_some_and(|c| node_text(Some(c), self.src) == "ApplicationJob");
+        let is_sidekiq = (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i as u32))
+            .find(|n| n.kind() == "body_statement")
+            .is_some_and(|body| ruby_includes_sidekiq(body, self.src));
+        if is_active_job || is_sidekiq {
+            let name = node_text(Some(name_node), self.src).to_string();
+            self.emit_job(
+                node,
+                name_node,
+                &name,
+                ContractRole::Provider,
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
+        }
     }
 
     /// Sinatra `get '/x' do`, Rails `get '/x', to: …` / `match`, client
@@ -1005,6 +1654,28 @@ impl<'a> Extractor<'a> {
         let method = node_text(node.child_by_field_name("method"), self.src);
         let receiver = node.child_by_field_name("receiver");
         let args = node.child_by_field_name("arguments");
+        // TASK-087: Bunny `q.subscribe do … end` carries no argument list —
+        // the topic comes from the channel.queue binding pre-pass.
+        if method == "subscribe"
+            && let Some(recv) = receiver
+            && recv.kind() == "identifier"
+            && let Some(name) = self
+                .ctx
+                .queue_bindings
+                .get(node_text(Some(recv), self.src))
+                .cloned()
+        {
+            self.emit_queue(
+                node,
+                recv,
+                &name,
+                ContractRole::Provider,
+                "rabbitmq",
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
+            return prefix.to_string();
+        }
         let Some(args) = args else {
             return prefix.to_string();
         };
@@ -1052,6 +1723,52 @@ impl<'a> Extractor<'a> {
                                 &name,
                                 ContractRole::Consumer,
                                 CONFIDENCE_FRAMEWORK,
+                            );
+                        }
+                    }
+                    // TASK-087 job: Worker.perform_async / perform_in /
+                    // perform_at (Sidekiq) and Job.perform_later (ActiveJob)
+                    // enqueue — constant receiver names the job class.
+                    _ if matches!(
+                        method,
+                        "perform_async" | "perform_in" | "perform_at" | "perform_later"
+                    ) && recv.kind() == "constant" =>
+                    {
+                        let name = node_text(Some(recv), self.src).to_string();
+                        self.emit_job(
+                            node,
+                            recv,
+                            &name,
+                            ContractRole::Consumer,
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
+                    // TASK-087 queue: Bunny publish(payload, routing_key: …)
+                    // is a 1.0 consumer; a plain string first argument falls
+                    // to the generic tier with the receiver's broker token.
+                    _ if method == "publish" => {
+                        if let Some((t, raw)) = ruby_kwarg_string(args, "routing_key", self.src) {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        } else if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                broker_token(recv_text),
+                                CONFIDENCE_HEURISTIC,
+                                None,
                             );
                         }
                     }
@@ -1193,6 +1910,161 @@ impl<'a> Extractor<'a> {
                     self.emit_env(node, &name, ContractRole::Provider, CONFIDENCE_HEURISTIC);
                 }
             }
+            // -- queue (TASK-087, DR-031) --------------------------------
+            // Publish arity disambiguates the broker: nats.Publish(subj, data)
+            // takes 2 positional args; amqp Publish*/PublishWithContext carry
+            // exchange+key before the message. PublishWithContext carries a
+            // leading ctx: the idiomatic nats.go shape
+            // PublishWithContext(ctx, subj, data) has exactly 3 args with the
+            // subject at position 1, while amqp091's
+            // PublishWithContext(ctx, exchange, key, msg, ...) has >= 4 args
+            // with the routing key at position 2.
+            (_, "PublishWithContext") if argc >= 4 => {
+                if let Some(t) = positional_arg(args, 2)
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "rabbitmq",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "PublishWithContext") if argc == 3 => {
+                if let Some(t) = positional_arg(args, 1)
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "nats",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, m) if m.starts_with("Publish") && m != "PublishWithContext" && argc >= 3 => {
+                if let Some(t) = positional_arg(args, 1)
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "rabbitmq",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "Publish") if argc == 2 => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "nats",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "Subscribe") | (_, "QueueSubscribe") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        "nats",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "Consume") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        "rabbitmq",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            // sarama: ConsumePartition(topic, partition, offset).
+            (_, "ConsumePartition") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        "kafka",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            // sarama: producer.SendMessage(&ProducerMessage{Topic: "…"}).
+            (_, "SendMessage") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "kafka",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            // TASK-087 job: robfig/cron c.AddFunc(spec, fn)/AddJob — the
+            // scheduled function names the job, else the enclosing one.
+            (_, "AddFunc") | (_, "AddJob") => {
+                let (name, name_node) =
+                    match positional_arg(args, 1).filter(|n| n.kind() == "identifier") {
+                        Some(id) => (node_text(Some(id), self.src).to_string(), id),
+                        None => {
+                            let Some(own) =
+                                crate::indexer::find_enclosing_function(node, self.src, self.lang)
+                            else {
+                                return;
+                            };
+                            (own, node)
+                        }
+                    };
+                self.emit_job(
+                    node,
+                    name_node,
+                    &name,
+                    ContractRole::Provider,
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
+            }
             _ => {
                 if let Some(verb) = go_client_verb(recv, meth)
                     && let Some(arg) = first
@@ -1330,11 +2202,56 @@ impl<'a> Extractor<'a> {
                             None,
                         );
                     }
+                } else if matches!(field, "subscribe" | "publish")
+                    && let Some(arg) = first
+                    && let Some(raw) = self.topic_arg(arg)
+                {
+                    // TASK-087 queue: async_nats clients pass "subject".into();
+                    // rdkafka consumers pass a single-string slice &[ "topic" ].
+                    // No generic Rust tier — only these two pinned shapes.
+                    let root_text =
+                        node_text(rust_chain_root(func.child_by_field_name("value")), self.src);
+                    let is_nats = matches!(root_text, "client" | "nats" | "nc")
+                        && arg.kind() == "call_expression";
+                    let is_kafka_slice =
+                        field == "subscribe" && arg.kind() == "reference_expression";
+                    if is_nats || is_kafka_slice {
+                        self.emit_queue(
+                            node,
+                            arg,
+                            &raw,
+                            if field == "subscribe" {
+                                ContractRole::Provider
+                            } else {
+                                ContractRole::Consumer
+                            },
+                            if is_nats { "nats" } else { "kafka" },
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
                 }
             }
             "scoped_identifier" => {
                 let text = node_text(Some(func), self.src);
                 match text {
+                    // rdkafka: FutureRecord::to / BaseRecord::to — publishing
+                    // a record initiates, so the site is the consumer (DR-031).
+                    t if t.ends_with("Record::to") => {
+                        if let Some(arg) = first
+                            && let Some(raw) = self.topic_arg(arg)
+                        {
+                            self.emit_queue(
+                                node,
+                                arg,
+                                &raw,
+                                ContractRole::Consumer,
+                                "kafka",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
                     "std::env::var" | "env::var" => {
                         if let Some(arg) = first {
                             let name = render_string_node(arg, self.src, self.lang);
@@ -1501,6 +2418,9 @@ impl<'a> Extractor<'a> {
         let Some(modifiers) = node.named_child(0).filter(|n| n.kind() == "modifiers") else {
             return;
         };
+        let owning = node
+            .child_by_field_name("name")
+            .map(|n| node_text(Some(n), self.src).to_string());
         let mut verb: Option<String> = None;
         let mut path: Option<Node> = None;
         for i in 0..modifiers.named_child_count() {
@@ -1509,6 +2429,95 @@ impl<'a> Extractor<'a> {
             };
             let name = node_text(annot.child_by_field_name("name"), self.src);
             let args = annot.child_by_field_name("arguments");
+            // Queue listener registrations (TASK-087, DR-031: registering
+            // the handler is the provider side) and websocket annotations
+            // (emit = provider, handler registration = consumer).
+            if let Some(args) = args {
+                match name {
+                    "KafkaListener" => {
+                        if let Some(topics) = java_annotation_kwarg_node(args, "topics", self.src) {
+                            for lit in java_string_literals(topics) {
+                                if let Some(raw) = self.topic_arg(lit) {
+                                    self.emit_queue(
+                                        annot,
+                                        lit,
+                                        &raw,
+                                        ContractRole::Provider,
+                                        "kafka",
+                                        CONFIDENCE_FRAMEWORK,
+                                        owning.as_deref(),
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    "RabbitListener" => {
+                        if let Some(queues) = java_annotation_kwarg_node(args, "queues", self.src)
+                            && let Some(lit) = java_string_literals(queues).into_iter().next()
+                            && let Some(raw) = self.topic_arg(lit)
+                        {
+                            self.emit_queue(
+                                annot,
+                                lit,
+                                &raw,
+                                ContractRole::Provider,
+                                "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                owning.as_deref(),
+                            );
+                        }
+                        continue;
+                    }
+                    "MessageMapping" => {
+                        if let Some(lit) = positional_arg(args, 0)
+                            && let Some(raw) = self.topic_arg(lit)
+                        {
+                            self.emit_ws(
+                                annot,
+                                lit,
+                                &raw,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                                owning.as_deref(),
+                            );
+                        }
+                        continue;
+                    }
+                    "SendTo" => {
+                        if let Some(lit) = positional_arg(args, 0)
+                            && let Some(raw) = self.topic_arg(lit)
+                        {
+                            self.emit_ws(
+                                annot,
+                                lit,
+                                &raw,
+                                ContractRole::Provider,
+                                CONFIDENCE_FRAMEWORK,
+                                owning.as_deref(),
+                            );
+                        }
+                        continue;
+                    }
+                    // TASK-087 job: @Scheduled — the method is the job;
+                    // the cron expression is a schedule, not an identity.
+                    "Scheduled" => {
+                        if let Some(name_node) = node.child_by_field_name("name") {
+                            let name = node_text(Some(name_node), self.src).to_string();
+                            self.emit_job(
+                                annot,
+                                name_node,
+                                &name,
+                                ContractRole::Provider,
+                                CONFIDENCE_FRAMEWORK,
+                                owning.as_deref(),
+                            );
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             match name {
                 "GetMapping" | "PostMapping" | "PutMapping" | "DeleteMapping" | "PatchMapping" => {
                     verb = Some(
@@ -1554,9 +2563,6 @@ impl<'a> Extractor<'a> {
             }
         }
         if let (Some(verb), Some(path)) = (verb, path) {
-            let owning = node
-                .child_by_field_name("name")
-                .map(|n| node_text(Some(n), self.src).to_string());
             self.emit_http(
                 node,
                 path,
@@ -1569,7 +2575,8 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// `restTemplate.getForObject(…)`, `System.getenv(…)`.
+    /// `restTemplate.getForObject(…)`, `System.getenv(…)`, and the queue
+    /// template producers (TASK-087).
     fn java_call(&mut self, node: Node, prefix: &str) {
         let name = node_text(node.child_by_field_name("name"), self.src);
         let object = node_text(node.child_by_field_name("object"), self.src);
@@ -1580,6 +2587,61 @@ impl<'a> Extractor<'a> {
             if let Some(arg) = first {
                 let value = render_string_node(arg, self.src, self.lang);
                 self.emit_env(node, &value, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+            }
+            return;
+        }
+        // Queue template producers (DR-031: publishing initiates, so these
+        // are the consumer side).
+        let object_lower = object.to_lowercase();
+        if object_lower.contains("kafka") && name == "send" {
+            if let Some(t) = first
+                && let Some(raw) = self.topic_arg(t)
+            {
+                self.emit_queue(
+                    node,
+                    t,
+                    &raw,
+                    ContractRole::Consumer,
+                    "kafka",
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
+            }
+            return;
+        }
+        if object_lower.contains("rabbit") && matches!(name, "send" | "convertAndSend") {
+            // The routing key is the last leading string literal — the
+            // argument just before the non-literal payload.
+            if let Some(t) = java_last_leading_string(args)
+                && let Some(raw) = self.topic_arg(t)
+            {
+                self.emit_queue(
+                    node,
+                    t,
+                    &raw,
+                    ContractRole::Consumer,
+                    "rabbitmq",
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
+            }
+            return;
+        }
+        // STOMP/Simp messaging templates emit to websocket destinations
+        // (checked after the rabbit arm — `rabbitTemplate` also contains
+        // "Template").
+        if object.contains("Template") && name == "convertAndSend" {
+            if let Some(t) = first
+                && let Some(raw) = self.topic_arg(t)
+            {
+                self.emit_ws(
+                    node,
+                    t,
+                    &raw,
+                    ContractRole::Provider,
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
             }
             return;
         }
@@ -2131,6 +3193,9 @@ impl<'a> Extractor<'a> {
         confidence: f64,
         owning: Option<&str>,
     ) {
+        if !self.opts.http {
+            return;
+        }
         let (raw, confidence) = match self.path_arg(arg) {
             Some(PathArg::Direct(s)) => (s, confidence),
             Some(PathArg::Concat(s)) => (s, CONFIDENCE_HEURISTIC),
@@ -2166,7 +3231,7 @@ impl<'a> Extractor<'a> {
 
     /// Record an env contract.
     fn emit_env(&mut self, node: Node, name: &str, role: ContractRole, confidence: f64) {
-        if !is_env_name(name) {
+        if !self.opts.env || !is_env_name(name) {
             return;
         }
         self.out.push(ContractCandidate {
@@ -2180,6 +3245,223 @@ impl<'a> Extractor<'a> {
             line: node.start_position().row + 1,
             confidence,
         });
+    }
+
+    /// Record a queue contract from a call site.
+    ///
+    /// `raw` is the already-rendered topic literal; `name_node` is the
+    /// argument that carries it (line attribution).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_queue(
+        &mut self,
+        node: Node,
+        name_node: Node,
+        raw: &str,
+        role: ContractRole,
+        broker: &str,
+        confidence: f64,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.queue {
+            return;
+        }
+        self.push_message(
+            ContractKind::Queue,
+            broker,
+            node,
+            name_node,
+            raw,
+            role,
+            confidence,
+            owning,
+        );
+    }
+
+    /// Record a websocket contract from a call site (TASK-087 step 6).
+    ///
+    /// `raw` is the rendered event-name literal; `name_node` is the
+    /// argument that carries it (line attribution).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_ws(
+        &mut self,
+        node: Node,
+        name_node: Node,
+        raw: &str,
+        role: ContractRole,
+        confidence: f64,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.websocket {
+            return;
+        }
+        self.push_message(
+            ContractKind::WebSocket,
+            "",
+            node,
+            name_node,
+            raw,
+            role,
+            confidence,
+            owning,
+        );
+    }
+
+    /// Record a job contract (TASK-087 step 7). Definitions and schedule
+    /// registrations are providers; enqueue/dispatch sites are consumers.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_job(
+        &mut self,
+        node: Node,
+        name_node: Node,
+        name: &str,
+        role: ContractRole,
+        confidence: f64,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.job {
+            return;
+        }
+        self.push_message(
+            ContractKind::Job,
+            "",
+            node,
+            name_node,
+            name,
+            role,
+            confidence,
+            owning,
+        );
+    }
+
+    /// Record a websocket contract identified by an HTTP path
+    /// (express-ws `app.ws('/chat', …)`): the identifier is a normalized
+    /// path, not a topic.
+    fn emit_ws_path(&mut self, node: Node, path_node: Node, role: ContractRole) {
+        if !self.opts.websocket {
+            return;
+        }
+        let Some(PathArg::Direct(raw)) = self.path_arg(path_node) else {
+            return;
+        };
+        let Some(norm) = normalize_http_path(&raw) else {
+            return;
+        };
+        self.out.push(ContractCandidate {
+            kind: ContractKind::WebSocket,
+            role,
+            qualifier: String::new(),
+            identifier: norm.path.clone(),
+            canonical_id: canonical_contract_id(ContractKind::WebSocket, "", &norm.path),
+            params: Vec::new(),
+            owning_symbol: crate::indexer::find_enclosing_function(node, self.src, self.lang),
+            line: path_node.start_position().row + 1,
+            confidence: CONFIDENCE_FRAMEWORK,
+        });
+    }
+
+    /// Shared tail of the message-kind emitters: normalize the name, build
+    /// the canonical ID, attribute the site.
+    #[allow(clippy::too_many_arguments)]
+    fn push_message(
+        &mut self,
+        kind: ContractKind,
+        qualifier: &str,
+        node: Node,
+        name_node: Node,
+        raw: &str,
+        role: ContractRole,
+        confidence: f64,
+        owning: Option<&str>,
+    ) {
+        let Some(norm) = normalize_topic(raw) else {
+            return;
+        };
+        self.out.push(ContractCandidate {
+            kind,
+            role,
+            qualifier: qualifier.to_string(),
+            identifier: norm.clone(),
+            canonical_id: canonical_contract_id(kind, qualifier, &norm),
+            params: Vec::new(),
+            owning_symbol: owning
+                .map(str::to_string)
+                .or_else(|| crate::indexer::find_enclosing_function(node, self.src, self.lang)),
+            line: name_node.start_position().row + 1,
+            confidence,
+        });
+    }
+
+    /// Render the topic-bearing literal of a call argument, per language.
+    ///
+    /// Returns `None` for non-literals, multi-literal containers, and
+    /// computed topics (`None` from `normalize_topic` then rejects
+    /// interpolations — callers skip the site entirely).
+    fn topic_arg(&self, arg: Node) -> Option<String> {
+        let src = self.src;
+        let lang = self.lang;
+        match lang {
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => match arg.kind() {
+                "string" => Some(string_content(arg, src)),
+                "template_string" => Some(template_content(arg, src)),
+                // `"topic".toString()` wrapping.
+                "call_expression" => js_string_wrap(arg, src),
+                _ => None,
+            },
+            Lang::Python => match arg.kind() {
+                "string" => py_string_content(arg, src),
+                // kafka-python: subscribe(['orders']) — exactly one string.
+                "list" | "tuple" => {
+                    let only = (0..arg.named_child_count())
+                        .filter_map(|i| arg.named_child(i as u32))
+                        .collect::<Vec<_>>();
+                    if only.len() == 1 && only[0].kind() == "string" {
+                        py_string_content(only[0], src)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            Lang::Ruby => match arg.kind() {
+                "string" => Some(ruby_string_content(arg, src)),
+                _ => None,
+            },
+            Lang::Go => match arg.kind() {
+                "interpreted_string_literal" => Some(render_string_node(arg, src, lang)),
+                // sarama: SendMessage(&ProducerMessage{Topic: "orders"}).
+                _ => go_keyed_topic_literal(arg, src),
+            },
+            Lang::Rust => match arg.kind() {
+                "string_literal" => Some(render_string_node(arg, src, lang)),
+                // rdkafka: subscribe(&["orders"]).
+                "reference_expression" => {
+                    let inner = arg.named_child(0)?;
+                    if inner.kind() == "array_expression"
+                        && inner.named_child_count() == 1
+                        && let Some(only) = inner.named_child(0)
+                        && only.kind() == "string_literal"
+                    {
+                        Some(render_string_node(only, src, lang))
+                    } else {
+                        None
+                    }
+                }
+                // async_nats: publish("orders".into(), payload).
+                "call_expression" => rust_string_wrap(arg, src),
+                _ => None,
+            },
+            Lang::Java => match arg.kind() {
+                "string_literal" => Some(render_string_node(arg, src, lang)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a JS callee chain is rooted at a websocket receiver
+    /// (`io.to(room).emit` counts — the root decides).
+    fn is_ws_receiver(&self, func: Node) -> bool {
+        WS_RECEIVERS.contains(&node_text(Some(js_chain_root(func)), self.src))
     }
 }
 
@@ -2344,6 +3626,51 @@ fn java_annotation_kwarg_text(args: Node, name: &str, src: &[u8]) -> Option<Stri
         }
     }
     None
+}
+
+/// Value node of a Java annotation keyword argument.
+fn java_annotation_kwarg_node<'t>(args: Node<'t>, name: &str, src: &[u8]) -> Option<Node<'t>> {
+    for i in 0..args.named_child_count() {
+        if let Some(pair) = args.named_child(i as u32)
+            && pair.kind() == "element_value_pair"
+            && node_text(pair.child_by_field_name("key"), src) == name
+            && let Some(value) = pair.child_by_field_name("value")
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// String literals carried by an annotation value node: the node itself
+/// when it is a literal, or every element when it is an array initializer.
+fn java_string_literals(value: Node) -> Vec<Node> {
+    match value.kind() {
+        "string_literal" => vec![value],
+        "element_value_array_initializer" => (0..value.named_child_count())
+            .filter_map(|i| value.named_child(i as u32))
+            .filter(|n| n.kind() == "string_literal")
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Last string literal among the call's leading arguments — the routing
+/// key sits directly before the non-literal payload
+/// (`convertAndSend(exchange, routingKey, payload)`).
+fn java_last_leading_string(args: Node) -> Option<Node> {
+    let mut last = None;
+    for j in 0..args.named_child_count() {
+        let Some(arg) = args.named_child(j as u32).map(unwrap_argument) else {
+            break;
+        };
+        if arg.kind() == "string_literal" {
+            last = Some(arg);
+        } else {
+            break;
+        }
+    }
+    last
 }
 
 /// Java RestTemplate-style client method verbs.
@@ -2525,6 +3852,168 @@ fn ruby_string_content(node: Node, src: &[u8]) -> String {
     render_string_node(node, src, Lang::Ruby)
 }
 
+/// Whether a class body directly includes Sidekiq::Job / Sidekiq::Worker.
+fn ruby_includes_sidekiq(body: Node, src: &[u8]) -> bool {
+    (0..body.named_child_count())
+        .filter_map(|i| body.named_child(i as u32))
+        .any(|n| {
+            n.kind() == "call"
+                && node_text(n.child_by_field_name("method"), src) == "include"
+                && n.child_by_field_name("arguments").is_some_and(|args| {
+                    (0..args.named_child_count()).any(|i| {
+                        args.named_child(i as u32).is_some_and(|a| {
+                            matches!(node_text(Some(a), src), "Sidekiq::Job" | "Sidekiq::Worker")
+                        })
+                    })
+                })
+        })
+}
+
+/// `key: 'value'` keyword argument of a Ruby call: the pair's value node
+/// and its string content (`pair` children are key symbol then value).
+fn ruby_kwarg_string<'t>(args: Node<'t>, name: &str, src: &[u8]) -> Option<(Node<'t>, String)> {
+    for j in 0..args.named_child_count() {
+        let Some(pair) = args.named_child(j as u32) else {
+            continue;
+        };
+        if pair.kind() != "pair" {
+            continue;
+        }
+        let (Some(key), Some(value)) = (pair.named_child(0), pair.named_child(1)) else {
+            continue;
+        };
+        if node_text(Some(key), src).trim_start_matches(':') == name && value.kind() == "string" {
+            return Some((value, ruby_string_content(value, src)));
+        }
+    }
+    None
+}
+
+/// Broker family implied by a receiver/variable name (`kafkaProducer`,
+/// `nc`, `rabbitChan`, `bunny`, `amqpConn`); empty when unknown. Used by
+/// the 0.5 generic tier — the qualifier still pairs cross-repo when both
+/// sides agree on the broker.
+fn broker_token(recv: &str) -> &'static str {
+    let lower = recv.to_lowercase();
+    if lower.contains("kafka") {
+        "kafka"
+    } else if lower.contains("nats") {
+        "nats"
+    } else if lower.contains("rabbit") || lower.contains("bunny") || lower.contains("amqp") {
+        "rabbitmq"
+    } else {
+        ""
+    }
+}
+
+/// Leftmost node of a JS member/call chain (`io.to(room).emit` -> `io`).
+fn js_chain_root<'t>(mut node: Node<'t>) -> Node<'t> {
+    loop {
+        match node.kind() {
+            "member_expression" => {
+                let Some(next) = node.child_by_field_name("object") else {
+                    return node;
+                };
+                node = next;
+            }
+            "call_expression" => {
+                let Some(next) = node.child_by_field_name("function") else {
+                    return node;
+                };
+                node = next;
+            }
+            _ => return node,
+        }
+    }
+}
+
+/// String value of an object-literal property (`{topic: 'orders'}`), and
+/// the value node that carries it.
+fn js_prop_string_node<'t>(arg: Node<'t>, prop: &str, src: &[u8]) -> Option<Node<'t>> {
+    if arg.kind() != "object" {
+        return None;
+    }
+    (0..arg.named_child_count())
+        .filter_map(|i| arg.named_child(i as u32))
+        .find(|pair| {
+            pair.kind() == "pair"
+                && node_text(pair.child_by_field_name("key"), src) == prop
+                && pair
+                    .child_by_field_name("value")
+                    .is_some_and(|v| v.kind() == "string")
+        })
+        .and_then(|pair| pair.child_by_field_name("value"))
+}
+
+/// `"topic".toString()` — a call wrapping a plain string literal.
+fn js_string_wrap(arg: Node, src: &[u8]) -> Option<String> {
+    let func = arg.child_by_field_name("function")?;
+    if func.kind() != "member_expression"
+        || node_text(func.child_by_field_name("property"), src) != "toString"
+    {
+        return None;
+    }
+    let recv = func.child_by_field_name("object")?;
+    if recv.kind() == "string" {
+        Some(string_content(recv, src))
+    } else {
+        None
+    }
+}
+
+/// `"orders".into()` / `.to_string()` / `.to_owned()` — a Rust call
+/// wrapping a plain string literal.
+fn rust_string_wrap(arg: Node, src: &[u8]) -> Option<String> {
+    let func = arg.child_by_field_name("function")?;
+    if func.kind() != "field_expression"
+        || !matches!(
+            node_text(func.child_by_field_name("field"), src),
+            "into" | "to_string" | "to_owned"
+        )
+    {
+        return None;
+    }
+    let recv = func.child_by_field_name("value")?;
+    if recv.kind() == "string_literal" {
+        Some(render_string_node(recv, src, Lang::Rust))
+    } else {
+        None
+    }
+}
+
+/// sarama `&ProducerMessage{Topic: "orders"}` — a keyed composite literal
+/// (possibly behind `&`) whose `Topic` key holds the string.
+fn go_keyed_topic_literal(arg: Node, src: &[u8]) -> Option<String> {
+    let mut node = arg;
+    if node.kind() == "unary_expression"
+        && let Some(inner) = node.named_child(0)
+    {
+        node = inner;
+    }
+    if node.kind() != "composite_literal" {
+        return None;
+    }
+    // keyed elements live inside the literal_value wrapper; keys and values
+    // are each wrapped in a literal_element node.
+    let literal_value = (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i as u32))
+        .find(|n| n.kind() == "literal_value")?;
+    for i in 0..literal_value.named_child_count() {
+        let Some(keyed) = literal_value.named_child(i as u32) else {
+            continue;
+        };
+        if keyed.kind() != "keyed_element" {
+            continue;
+        }
+        let key = keyed.named_child(0)?.named_child(0)?;
+        let value = keyed.named_child(1)?.named_child(0)?;
+        if node_text(Some(key), src) == "Topic" && value.kind() == "interpreted_string_literal" {
+            return Some(render_string_node(value, src, Lang::Go));
+        }
+    }
+    None
+}
+
 /// Build the canonical contract ID `<kind>::<qualifier>::<identifier>`.
 ///
 /// This is the only place contract IDs are constructed (PRD-CTR-REQ-002);
@@ -2548,6 +4037,53 @@ pub fn normalize_method(raw: &str) -> String {
         "" | "ANY" | "ALL" | "MATCH" => "ANY".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Characters that separate topic segments across brokers (Kafka `.`,
+/// NATS `.`, RabbitMQ routing keys `.`, STOMP `/topic/x`, Redis `:`).
+const TOPIC_SEPARATORS: &[char] = &['.', ':', '/'];
+
+/// Normalize a queue/websocket/job topic name (TASK-087, PRD-CTR-REQ-002).
+///
+/// Unlike [`normalize_http_path`] this pipeline REJECTS computed topics
+/// (`None` rather than a partial-confidence tier): exact-ID matching is the
+/// only pairing mechanism for message kinds, and partial knowledge is
+/// useless there.
+///
+/// 1. trim whitespace and quote characters (stage 1 of the HTTP pipeline),
+/// 2. reject empty, internal whitespace, or `{`/`}`/`$`/`#` (interpolation),
+/// 3. trim leading/trailing separator runs,
+/// 4. collapse maximal separator runs (single or mixed `.`/`:`/`/`) to one
+///    dot — the canonical grammar (`queue::kafka::orders.created`),
+/// 5. preserve case, segment order, and all other characters — NATS
+///    wildcards `*` and `>` stay literal and never exact-match a concrete
+///    topic.
+pub fn normalize_topic(raw: &str) -> Option<String> {
+    let trimmed = stage_trim(raw);
+    if trimmed.is_empty()
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed.chars().any(|c| matches!(c, '{' | '}' | '$' | '#'))
+    {
+        return None;
+    }
+    let inner = trimmed.trim_matches(|c: char| TOPIC_SEPARATORS.contains(&c));
+    if inner.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut in_separators = false;
+    for c in inner.chars() {
+        if TOPIC_SEPARATORS.contains(&c) {
+            if !in_separators {
+                out.push('.');
+                in_separators = true;
+            }
+        } else {
+            out.push(c);
+            in_separators = false;
+        }
+    }
+    Some(out)
 }
 
 /// Result of normalizing a raw HTTP path.
@@ -2863,9 +4399,17 @@ mod extract_test_helpers {
     use crate::indexer::{Lang, get_parser};
 
     pub(crate) fn extract(lang: Lang, src: &str) -> Vec<ContractCandidate> {
+        extract_with(lang, src, &ContractOptions::default())
+    }
+
+    pub(crate) fn extract_with(
+        lang: Lang,
+        src: &str,
+        opts: &ContractOptions,
+    ) -> Vec<ContractCandidate> {
         let mut parser = get_parser(lang);
         let tree = parser.parse(src, None).expect("parse failed");
-        extract_contracts(&tree, src, lang)
+        extract_contracts(&tree, src, lang, opts)
     }
 
     pub(crate) fn find<'a>(
@@ -2928,6 +4472,177 @@ mod tests {
     #[should_panic(expected = "contract identifier must be non-empty")]
     fn canonical_rejects_empty_identifier() {
         canonical_contract_id(ContractKind::Http, "GET", "  ");
+    }
+
+    // -- topic normalization (TASK-087, PRD-CTR-REQ-002) ----------------------
+
+    /// Matrix: raw topic literal -> normalized identifier (`None` = rejected).
+    const NORMALIZE_TOPIC_CASES: &[(&str, Option<&str>)] = &[
+        (" orders.created ", Some("orders.created")),
+        ("'orders.created'", Some("orders.created")),
+        ("orders:created", Some("orders.created")),
+        ("orders/created", Some("orders.created")),
+        ("orders..created", Some("orders.created")),
+        ("orders.created.v2", Some("orders.created.v2")),
+        ("/topic/orders", Some("topic.orders")),
+        ("topic:orders", Some("topic.orders")),
+        (".:orders.:created:.", Some("orders.created")),
+        ("EmailWorker", Some("EmailWorker")),
+        ("orders.created", Some("orders.created")),
+        ("orders.*", Some("orders.*")),
+        ("orders.>", Some("orders.>")),
+        ("order-created_v2", Some("order-created_v2")),
+        ("hello world", None),
+        ("", None),
+        ("   ", None),
+        ("f\"{env}-orders\"", None),
+        ("${prefix}.orders", None),
+        ("orders.#fragment", None),
+        ("$topic", None),
+        ("orders.{env}.created", None),
+    ];
+
+    #[test]
+    fn topic_matrix_normalizes_and_rejects() {
+        for (raw, want) in NORMALIZE_TOPIC_CASES {
+            assert_eq!(
+                &normalize_topic(raw),
+                &want.map(|w| w.to_string()),
+                "normalize_topic({raw:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn topic_trims_quotes_and_whitespace() {
+        assert_eq!(
+            normalize_topic("  'orders.created'  "),
+            Some("orders.created".into())
+        );
+        assert_eq!(
+            normalize_topic("\"orders.created\""),
+            Some("orders.created".into())
+        );
+    }
+
+    #[test]
+    fn topic_preserves_case_and_segment_order() {
+        assert_eq!(
+            normalize_topic("Orders.Created"),
+            Some("Orders.Created".into())
+        );
+        assert_eq!(normalize_topic("a.b.c"), Some("a.b.c".into()));
+    }
+
+    #[test]
+    fn topic_wildcards_stay_literal() {
+        // NATS wildcards never exact-match a concrete topic — by design.
+        assert_eq!(normalize_topic("orders.*"), Some("orders.*".into()));
+        assert_eq!(normalize_topic("orders.>"), Some("orders.>".into()));
+    }
+
+    #[test]
+    fn canonical_queue_with_broker_qualifier() {
+        assert_eq!(
+            canonical_contract_id(ContractKind::Queue, "kafka", "orders.created"),
+            "queue::kafka::orders.created"
+        );
+    }
+
+    #[test]
+    fn canonical_queue_unknown_broker_has_empty_qualifier() {
+        assert_eq!(
+            canonical_contract_id(ContractKind::Queue, "", "orders.created"),
+            "queue::::orders.created"
+        );
+    }
+
+    #[test]
+    fn canonical_websocket_and_job_empty_qualifier() {
+        assert_eq!(
+            canonical_contract_id(ContractKind::WebSocket, "", "chat.message"),
+            "websocket::::chat.message"
+        );
+        assert_eq!(
+            canonical_contract_id(ContractKind::Job, "", "email-send"),
+            "job::::email-send"
+        );
+    }
+
+    // -- per-kind options (TASK-087, PRD-CTR-REQ-001) --------------------------
+
+    #[test]
+    fn contract_options_default_enables_all_kinds() {
+        let opts = ContractOptions::default();
+        assert!(opts.enabled(ContractKind::Http));
+        assert!(opts.enabled(ContractKind::Env));
+        assert!(opts.enabled(ContractKind::Queue));
+        assert!(opts.enabled(ContractKind::WebSocket));
+        assert!(opts.enabled(ContractKind::Job));
+    }
+
+    #[test]
+    fn contract_options_from_config_maps_every_flag() {
+        let cfg = crate::config::ContractsConfig {
+            http: true,
+            env: false,
+            queue: false,
+            websocket: true,
+            job: false,
+        };
+        let opts = ContractOptions::from(&cfg);
+        assert!(opts.enabled(ContractKind::Http));
+        assert!(!opts.enabled(ContractKind::Env));
+        assert!(!opts.enabled(ContractKind::Queue));
+        assert!(opts.enabled(ContractKind::WebSocket));
+        assert!(!opts.enabled(ContractKind::Job));
+    }
+
+    #[test]
+    fn contract_options_is_copy() {
+        let opts = ContractOptions::default();
+        let copy = opts;
+        assert_eq!(
+            copy.enabled(ContractKind::Queue),
+            opts.enabled(ContractKind::Queue)
+        );
+    }
+
+    #[test]
+    fn extract_with_all_kinds_disabled_returns_empty() {
+        let src = "const app = express();\napp.get('/v1/users/:id', h);\nconst db = process.env.DATABASE_URL;\n";
+        let opts = ContractOptions {
+            http: false,
+            env: false,
+            queue: false,
+            websocket: false,
+            job: false,
+        };
+        assert!(extract_with(Lang::JavaScript, src, &opts).is_empty());
+    }
+
+    #[test]
+    fn extract_with_http_disabled_keeps_env() {
+        let src = "const app = express();\napp.get('/v1/users/:id', h);\nconst db = process.env.DATABASE_URL;\n";
+        let opts = ContractOptions {
+            http: false,
+            ..ContractOptions::default()
+        };
+        let cands = extract_with(Lang::JavaScript, src, &opts);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].kind, ContractKind::Env);
+    }
+
+    #[test]
+    fn extract_with_env_disabled_keeps_http() {
+        let src = "const app = express();\napp.get('/v1/users/:id', h);\nconst db = process.env.DATABASE_URL;\n";
+        let opts = ContractOptions {
+            env: false,
+            ..ContractOptions::default()
+        };
+        let cands = extract_with(Lang::JavaScript, src, &opts);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].kind, ContractKind::Http);
     }
 
     // -- stage matrices (PRD-CTR-REQ-003, §9.1) -------------------------------
@@ -3196,7 +4911,7 @@ mod tests {
 
     // -- walker: JavaScript / TypeScript (step 4) -------------------------------
 
-    use extract_test_helpers::{extract, find};
+    use extract_test_helpers::{extract, extract_with, find};
 
     #[test]
     fn express_provider() {
@@ -3298,6 +5013,248 @@ mod tests {
         assert_eq!(c.canonical_id, "env::::FEATURE_FLAG");
         assert_eq!(c.role, ContractRole::Provider);
         assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    // -- walker: queue, JavaScript (TASK-087 step 5) ---------------------------
+
+    #[test]
+    fn kafkajs_producer_send_topic_prop() {
+        let src = "const producer = kafka.producer();\nawait producer.send({ topic: 'orders.created', messages: [m] });\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.kind, ContractKind::Queue);
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.canonical_id, "queue::kafka::orders.created");
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.line, 2);
+    }
+
+    #[test]
+    fn kafkajs_consumer_subscribe_topic_prop() {
+        let src = "await consumer.subscribe({ topic: 'orders.created', fromBeginning: true });\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.kind, ContractKind::Queue);
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn amqplib_send_to_queue() {
+        let src = "ch.sendToQueue('orders.created', Buffer.from(msg));\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn amqplib_publish_routing_key() {
+        let src = "ch.publish('orders', 'orders.created', Buffer.from(msg));\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::rabbitmq::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn amqplib_consume() {
+        let src = "ch.consume('orders.created', (msg) => {});\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn nats_js_publish() {
+        let src = "nc.publish('orders.created', payload);\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn nats_js_subscribe() {
+        let src = "nc.subscribe('orders.created', cb);\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_generic_send_heuristic() {
+        let src = "svc.send('orders.created');\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn js_generic_publish_broker_from_receiver() {
+        let src = "rabbitChan.publish('orders.created');\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::rabbitmq::orders.created");
+        assert_eq!(cands[0].confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn js_generic_subscribe_heuristic() {
+        let src = "consumer.subscribe('orders.created');\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "queue::::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn js_socket_send_is_reserved_for_websocket() {
+        // ws.send belongs to the websocket kind, never to queue.
+        let cands = extract(Lang::JavaScript, "socket.send('hello');");
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].kind, ContractKind::WebSocket);
+        assert_eq!(cands[0].canonical_id, "websocket::::hello");
+        assert_eq!(cands[0].role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_socket_send_non_literal_skipped() {
+        let cands = extract(Lang::JavaScript, "ws.send(JSON.stringify(data));");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_queue_non_literal_topic_skipped() {
+        let cands = extract(Lang::JavaScript, "svc.send(topic);");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_queue_interpolated_topic_skipped() {
+        let cands = extract(Lang::JavaScript, "svc.send(`orders.${id}`);");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    // -- walker: websocket, JS/TS (TASK-087 step 6) ----------------------------
+
+    #[test]
+    fn js_io_emit_is_ws_provider() {
+        let src = "io.emit('chat.message', payload);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.kind, ContractKind::WebSocket);
+        assert_eq!(c.canonical_id, "websocket::::chat.message");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn js_socket_emit_is_ws_provider() {
+        let cands = extract(Lang::JavaScript, "socket.emit('chat.message', data);");
+        let c = find(&cands, "websocket::::chat.message").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_socket_broadcast_emit_is_ws_provider() {
+        let cands = extract(
+            Lang::JavaScript,
+            "socket.broadcast.emit('chat.message', data);",
+        );
+        let c = find(&cands, "websocket::::chat.message").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_io_to_room_emit_is_ws_provider() {
+        let cands = extract(Lang::JavaScript, "io.to(room).emit('chat.message', d);");
+        let c = find(&cands, "websocket::::chat.message").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_socket_on_is_ws_consumer() {
+        let src = "socket.on('chat.message', (msg) => {});\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "websocket::::chat.message");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn js_ws_on_requires_handler_argument() {
+        // `.on` with a bare event name and no handler is not a registration.
+        let cands = extract(Lang::JavaScript, "socket.on('chat.message');");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_generic_emit_heuristic() {
+        let cands = extract(Lang::JavaScript, "events.emit('user.created', data);");
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "websocket::::user.created");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn js_generic_on_is_skipped() {
+        // EventEmitter `.on` registrations flood every codebase — skipped.
+        let cands = extract(Lang::JavaScript, "emitter.on('tick', cb);");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_server_on_listening_skipped() {
+        // Node http idiom: server.on('listening', cb) is a lifecycle hook,
+        // not a websocket registration — falls through to the generic `.on`
+        // skip like any other EventEmitter.
+        let cands = extract(Lang::JavaScript, "server.on('listening', cb);");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_conn_on_data_skipped() {
+        // Node net idiom: conn.on('data', cb) is a plain stream read, not a
+        // websocket registration — falls through to the generic `.on` skip.
+        let cands = extract(Lang::JavaScript, "conn.on('data', (chunk) => {});");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_ws_receiver_whitelist_stays_websocket() {
+        // Every whitelisted receiver name emits websocket contracts.
+        for recv in ["io", "socket", "ws", "wss", "websocket"] {
+            let cands = extract(
+                Lang::JavaScript,
+                &format!("{recv}.emit('chat.message', d);"),
+            );
+            assert_eq!(cands.len(), 1, "{recv}: got {cands:?}");
+            assert_eq!(cands[0].kind, ContractKind::WebSocket, "{recv}");
+            assert_eq!(cands[0].canonical_id, "websocket::::chat.message", "{recv}");
+            assert_eq!(cands[0].confidence, CONFIDENCE_FRAMEWORK, "{recv}");
+        }
+    }
+
+    #[test]
+    fn js_express_ws_route_is_ws_consumer() {
+        let src = "const app = express();\napp.ws('/chat', handler);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "websocket::::/chat");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
     }
 
     // -- walker: Python (step 5) ------------------------------------------------
@@ -3478,6 +5435,116 @@ urlpatterns = [
         assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
     }
 
+    // -- walker: queue, Python (TASK-087 step 5) -------------------------------
+
+    #[test]
+    fn py_kafka_producer_send_heuristic() {
+        let src = "def run():\n    producer.send('orders.created', value=msg)\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+        assert_eq!(c.owning_symbol.as_deref(), Some("run"));
+    }
+
+    #[test]
+    fn py_confluent_producer_produce() {
+        let src = "producer.produce('orders.created', value=msg)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_kafka_consumer_subscribe_list() {
+        let src = "consumer.subscribe(['orders.created'])\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_consumer_subscribe_plain_string_heuristic() {
+        let src = "consumer.subscribe('orders.created')\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn py_consumer_subscribe_multi_topic_list_skipped() {
+        let cands = extract(
+            Lang::Python,
+            "consumer.subscribe(['a.created', 'b.created'])",
+        );
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn py_nats_publish() {
+        let src = "async def push():\n    await nc.publish('orders.created', b'x')\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_nats_subscribe() {
+        let src = "async def listen():\n    await nc.subscribe('orders.created')\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn py_pika_basic_publish_kwarg() {
+        let src = "ch.basic_publish(exchange='', routing_key='orders.created', body=msg)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_pika_basic_publish_positional() {
+        let src = "ch.basic_publish('', 'orders.created', msg)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn py_pika_basic_consume_kwarg() {
+        let src = "ch.basic_consume(queue='orders.created', on_message_callback=cb)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_pika_basic_consume_positional() {
+        let src = "ch.basic_consume('orders.created', cb)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn py_generic_send_broker_from_receiver() {
+        let src = "kafka_producer.send('orders.created')\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::kafka::orders.created");
+        assert_eq!(cands[0].confidence, CONFIDENCE_HEURISTIC);
+    }
+
     // -- walker: Ruby (step 6) ---------------------------------------------------
 
     #[test]
@@ -3549,6 +5616,47 @@ ENV['TMP_SET'] = 'x'
         let w = find(&cands, "env::::TMP_SET").expect("write not found");
         assert_eq!(w.role, ContractRole::Provider);
         assert_eq!(w.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    // -- walker: queue, Ruby (TASK-087 step 5) ---------------------------------
+
+    #[test]
+    fn ruby_bunny_publish_routing_key_kwarg() {
+        let src = "x.publish(payload, routing_key: 'orders.created')\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::rabbitmq::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_bunny_queue_subscribe_binding() {
+        let src = "q = channel.queue('orders.created')\nq.subscribe do |info, props, body|\n  puts body\nend\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::rabbitmq::orders.created");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_subscribe_on_unbound_var_skipped() {
+        // No channel.queue binding: nothing to attribute the topic from.
+        let cands = extract(Lang::Ruby, "q.subscribe do |info, body|\nend\n");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn ruby_generic_publish_heuristic() {
+        let src = "chan.publish('orders.created')\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+        assert_eq!(cands[0].confidence, CONFIDENCE_HEURISTIC);
     }
 
     // -- walker: Go (step 6) -----------------------------------------------------
@@ -3627,6 +5735,151 @@ func cfg() {
         assert!(find(&cands, "env::::FLAG").is_some());
         let w = find(&cands, "env::::TMP_SET").expect("write not found");
         assert_eq!(w.role, ContractRole::Provider);
+    }
+
+    // -- walker: queue, Go (TASK-087 step 5) -----------------------------------
+
+    #[test]
+    fn go_nats_publish_two_args() {
+        let src = "package main\n\nfunc push() {\n\tnat.Publish(\"orders.created\", data)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::nats::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.line, 4);
+    }
+
+    #[test]
+    fn go_amqp_publish_three_args_is_rabbitmq() {
+        let src = "package main\n\nfunc pub() {\n\tch.Publish(\"orders\", \"orders.created\", false, false, msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::rabbitmq::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_amqp_publish_with_context_six_args_is_rabbitmq() {
+        let src = "package main\n\nfunc pub() {\n\tch.PublishWithContext(ctx, \"orders\", \"orders.created\", false, false, msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_publish_with_context_three_args_is_nats() {
+        // nats.go: PublishWithContext(ctx, subj, data) — exactly 3 args,
+        // subject at position 1. The literal payload is never the topic.
+        let src = "package main\n\nfunc pub() {\n\tnc.PublishWithContext(ctx, \"orders.created\", \"body\")\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::nats::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert!(
+            find(&cands, "queue::rabbitmq::body").is_none(),
+            "literal data must not be read as the topic: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn go_publish_with_context_three_args_variable_payload_is_nats() {
+        let src = "package main\n\nfunc pub() {\n\tnc.PublishWithContext(ctx, \"orders.created\", msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::nats::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_publish_with_context_four_plus_args_is_rabbitmq() {
+        // amqp091: PublishWithContext(ctx, exchange, key, msg, ...) — the
+        // ctx shifts the routing key to position 2.
+        let src = "package main\n\nfunc pub() {\n\tch.PublishWithContext(ctx, \"orders\", \"orders.created\", msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_publish_four_args_rabbitmq_topic_position() {
+        // Plain amqp Publish(exchange, key, ...): topic is arg 1, never the
+        // exchange name at arg 0.
+        let src = "package main\n\nfunc pub() {\n\tch.Publish(\"orders\", \"orders.created\", false, msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::rabbitmq::orders.created");
+        assert!(
+            find(&cands, "queue::rabbitmq::orders").is_none(),
+            "exchange name must not be the topic: {cands:?}"
+        );
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_nats_subscribe() {
+        let src = "package main\n\nfunc listen() {\n\tnc.Subscribe(\"orders.created\", cb)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_nats_queue_subscribe() {
+        let src = "package main\n\nfunc listen() {\n\tnc.QueueSubscribe(\"orders.created\", \"grp\", cb)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn go_amqp_consume() {
+        let src = "package main\n\nfunc listen() {\n\tmsgs, _ := ch.Consume(\"orders.created\", \"\", true, false, false, false, nil)\n\t_ = msgs\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_sarama_consume_partition() {
+        let src = "package main\n\nfunc listen() {\n\tpc, _ := consumer.ConsumePartition(\"orders.created\", 0, 0)\n\t_ = pc\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_sarama_producer_send_message() {
+        let src = "package main\n\nfunc pub() {\n\tproducer.SendMessage(&ProducerMessage{Topic: \"orders.created\"})\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::kafka::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_publish_arg_count_disambiguates_broker() {
+        // 2-positional Publish is nats; 3+ is amqp (paired disambiguation).
+        let two = extract(
+            Lang::Go,
+            "package main\nfunc a() {\n\tnc.Publish(\"s.a\", d)\n}\n",
+        );
+        let three = extract(
+            Lang::Go,
+            "package main\nfunc b() {\n\tch.Publish(\"e\", \"s.a\", d)\n}\n",
+        );
+        assert!(find(&two, "queue::nats::s.a").is_some(), "got {two:?}");
+        assert!(
+            find(&three, "queue::rabbitmq::s.a").is_some(),
+            "got {three:?}"
+        );
     }
 
     // -- walker: Rust (step 6) ---------------------------------------------------
@@ -3714,6 +5967,73 @@ fn cfg() {
         assert_eq!(w.role, ContractRole::Provider);
     }
 
+    // -- walker: queue, Rust (TASK-087 step 5) ---------------------------------
+
+    #[test]
+    fn rust_rdkafka_future_record_to() {
+        let src = "fn publish() {\n    let rec = FutureRecord::to(\"orders.created\", 0, payload);\n    producer.send(rec, Timeout::Never);\n}\n";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::kafka::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.line, 2);
+        assert_eq!(c.owning_symbol.as_deref(), Some("publish"));
+    }
+
+    #[test]
+    fn rust_rdkafka_base_record_to() {
+        let src = "fn publish() {\n    let rec = BaseRecord::to(\"orders.created\");\n}\n";
+        let cands = extract(Lang::Rust, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn rust_rdkafka_consumer_subscribe_slice() {
+        let src = "fn listen() {\n    consumer.subscribe(&[\"orders.created\"])?;\n}\n";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::kafka::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Provider);
+        assert_eq!(cands[0].confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn rust_rdkafka_subscribe_multi_topic_slice_skipped() {
+        let cands = extract(
+            Lang::Rust,
+            "fn listen() {\n    consumer.subscribe(&[\"a\", \"b\"])?;\n}\n",
+        );
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn rust_async_nats_publish_into() {
+        let src =
+            "async fn push() {\n    client.publish(\"orders.created\".into(), bytes).await?;\n}\n";
+        let cands = extract(Lang::Rust, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn rust_async_nats_subscribe_into() {
+        let src =
+            "async fn listen() {\n    client.subscribe(\"orders.created\".into()).await?;\n}\n";
+        let cands = extract(Lang::Rust, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn rust_subscribe_non_string_receiver_skipped() {
+        let cands = extract(Lang::Rust, "fn f() {\n    bus.subscribe(handler);\n}\n");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
     // -- walker: Java (step 6) ---------------------------------------------------
 
     #[test]
@@ -3784,6 +6104,333 @@ class Client {
         let cands = extract(Lang::Java, src);
         let c = find(&cands, "env::::DATABASE_URL").expect("env not found");
         assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    // -- walker: queue, Java (TASK-087 step 5) ---------------------------------
+
+    #[test]
+    fn java_kafka_listener_topics_string() {
+        let src = "\
+@Component
+class Orders {
+    @KafkaListener(topics = \"orders.created\")
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::kafka::orders.created");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("handle"));
+    }
+
+    #[test]
+    fn java_kafka_listener_topics_array_emits_per_element() {
+        let src = "\
+class Orders {
+    @KafkaListener(topics = {\"a.created\", \"b.created\"})
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "queue::kafka::a.created").is_some());
+        assert!(find(&cands, "queue::kafka::b.created").is_some());
+    }
+
+    #[test]
+    fn java_rabbit_listener_queues() {
+        let src = "\
+class Orders {
+    @RabbitListener(queues = \"orders.created\")
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn java_kafka_template_send() {
+        let src = "void publish() {\n    kafkaTemplate.send(\"orders.created\", key, value);\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("publish"));
+    }
+
+    #[test]
+    fn java_rabbit_template_convert_and_send() {
+        let src = "void publish() {\n    rabbitTemplate.convertAndSend(\"ex\", \"orders.created\", payload);\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn java_rabbit_template_send() {
+        let src = "void publish() {\n    rabbitTemplate.send(\"orders.created\", msg);\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    // -- walker: websocket, Java (TASK-087 step 6) ------------------------------
+
+    #[test]
+    fn java_message_mapping_is_ws_consumer() {
+        let src = "\
+@Controller
+class Orders {
+    @MessageMapping(\"orders.new\")
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "websocket::::orders.new");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("handle"));
+    }
+
+    #[test]
+    fn java_send_to_is_ws_provider() {
+        let src = "\
+@Controller
+class Orders {
+    @SendTo(\"/topic/orders\")
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "websocket::::topic.orders").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn java_messaging_template_convert_and_send_is_ws_provider() {
+        let src =
+            "void push() {\n    messagingTemplate.convertAndSend(\"/topic/orders\", payload);\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "websocket::::topic.orders").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    // -- walker: job (TASK-087 step 7) -----------------------------------------
+
+    #[test]
+    fn py_celery_task_decorator() {
+        let src = "@app.task\ndef sync_orders():\n    pass\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.kind, ContractKind::Job);
+        assert_eq!(c.canonical_id, "job::::sync_orders");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("sync_orders"));
+    }
+
+    #[test]
+    fn py_celery_task_name_kwarg() {
+        let src = "@app.task(name='orders.sync')\ndef sync():\n    pass\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::orders.sync").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("sync"));
+    }
+
+    #[test]
+    fn py_shared_task_decorator() {
+        let src = "@shared_task\ndef sync():\n    pass\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::sync").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn py_celery_delay_consumer() {
+        let src = "def enqueue(order):\n    sync_orders.delay(order)\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::sync_orders");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("enqueue"));
+    }
+
+    #[test]
+    fn py_celery_apply_async_consumer() {
+        let src = "def enqueue():\n    sync_orders.apply_async(kwargs={'o': 1})\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::sync_orders").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn py_send_task_consumer() {
+        let src = "def enqueue():\n    celery_app.send_task('orders.sync', args=[1])\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::orders.sync").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_apscheduler_add_job() {
+        let src = "def setup():\n    scheduler.add_job(sync_orders, trigger='interval')\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::sync_orders").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_sidekiq_job_class() {
+        let src = "class EmailWorker\n  include Sidekiq::Job\n\n  def perform(id)\n  end\nend\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::EmailWorker");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_sidekiq_worker_module() {
+        let src = "class CleanupWorker\n  include Sidekiq::Worker\nend\n";
+        let cands = extract(Lang::Ruby, src);
+        let c = find(&cands, "job::::CleanupWorker").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn ruby_application_job_superclass() {
+        let src = "class NotifyJob < ApplicationJob\n  def perform(user)\n  end\nend\n";
+        let cands = extract(Lang::Ruby, src);
+        let c = find(&cands, "job::::NotifyJob").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn ruby_sidekiq_perform_async_consumer() {
+        let cands = extract(Lang::Ruby, "EmailWorker.perform_async(1, 2)");
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "job::::EmailWorker");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+        assert_eq!(cands[0].confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_active_job_perform_later_consumer() {
+        let cands = extract(Lang::Ruby, "NotifyJob.perform_later(user)");
+        let c = find(&cands, "job::::NotifyJob").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn java_scheduled_fixed_rate() {
+        let src = "\
+class Poller {
+    @Scheduled(fixedRate = 5000)
+    public void pollOrders() {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::pollOrders");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("pollOrders"));
+    }
+
+    #[test]
+    fn java_scheduled_cron_expression_is_not_identity() {
+        let src = "\
+class Poller {
+    @Scheduled(cron = \"0 0 * * * *\")
+    public void cleanup() {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "job::::cleanup").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.line, 3, "job line follows the method name");
+    }
+
+    #[test]
+    fn js_cron_schedule_callback_name() {
+        let src = "cron.schedule('*/5 * * * *', fireTick);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::fireTick");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn js_cron_schedule_inline_callback_uses_owning() {
+        let src = "function poll() {\n  cron.schedule(spec, () => run());\n}\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "job::::poll").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_agenda_define() {
+        let src = "agenda.define('email-send', handler);\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "job::::email-send").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn js_bullmq_queue_add_heuristic() {
+        let src = "emailQueue.add('email-send', data);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "job::::email-send");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+        assert_eq!(cands[0].confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn js_cart_add_is_not_a_job() {
+        let cands = extract(Lang::JavaScript, "cart.add('item');");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn go_cron_add_func() {
+        let src = "package main\n\nfunc setup() {\n\tc.AddFunc(\"*/5 * * * * *\", pollOrders)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::pollOrders");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_cron_add_job() {
+        let src = "package main\n\nfunc setup() {\n\tc.AddJob(spec, nightlyJob)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "job::::nightlyJob").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
     }
 
     // -- walker: PHP (step 6) ----------------------------------------------------
@@ -4567,6 +7214,140 @@ public class UsersController : ControllerBase
             canonical_id: "env::::DATABASE_URL",
             params: &[],
         },
+        // -- message kinds (TASK-087) --------------------------------------
+        // Kafka orders.created: producer and consumer of one topic ID.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "producer.send({ topic: 'orders.created', messages: [m] });",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::kafka::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Java,
+            source: "class C {\n    @KafkaListener(topics = \"orders.created\")\n    public void handle(String m) {}\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::kafka::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Rust,
+            source: "fn f() { consumer.subscribe(&[\"orders.created\"]).unwrap(); }",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::kafka::orders.created",
+            params: &[],
+        },
+        // NATS orders.created.
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "package main\nfunc a() { nc.Publish(\"orders.created\", d) }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::nats::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "package main\nfunc a() { nc.Subscribe(\"orders.created\", cb) }",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::nats::orders.created",
+            params: &[],
+        },
+        // RabbitMQ orders.created.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "ch.consume('orders.created', (m) => {});",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::rabbitmq::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "ch.basic_publish(exchange='', routing_key='orders.created', body=b)",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::rabbitmq::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "q = channel.queue('orders.created')\nq.subscribe do |i, p, b|\nend",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::rabbitmq::orders.created",
+            params: &[],
+        },
+        // Websocket chat.message: emit and handler share one ID.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "io.emit('chat.message', payload);",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "websocket::::chat.message",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "socket.on('chat.message', (m) => {});",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "websocket::::chat.message",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Java,
+            source: "class C {\n    @SendTo(\"/topic/orders\")\n    public void handle(String m) {}\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "websocket::::topic.orders",
+            params: &[],
+        },
+        // Jobs: definition and enqueue share one ID.
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "@app.task(name='orders.sync')\ndef sync():\n    pass",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::orders.sync",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "def f():\n    celery_app.send_task('orders.sync')",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::orders.sync",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "class EmailWorker\n  include Sidekiq::Job\nend",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::EmailWorker",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "EmailWorker.perform_async(1)",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::EmailWorker",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "package main\nfunc setup() { c.AddFunc(\"*/5 * * * * *\", pollOrders) }",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::pollOrders",
+            params: &[],
+        },
     ];
 
     #[test]
@@ -4790,5 +7571,166 @@ public class UsersController : ControllerBase
         .unwrap();
         let stats = crate::pipeline::build_index(root, true).unwrap();
         assert_eq!(stats.contract_count, 1, "got {stats:?}");
+    }
+
+    // -- acceptance: message kinds (TASK-087) ---------------------------------
+
+    #[test]
+    fn acceptance_producer_consumer_same_topic_id_cross_repo() {
+        // Framework pair: kafkajs producer + Spring @KafkaListener consumer
+        // resolve to the same canonical ID across repos and languages.
+        let producer = extract(
+            Lang::JavaScript,
+            "await producer.send({ topic: 'orders.created', messages: [m] });",
+        );
+        let consumer = extract(
+            Lang::Java,
+            "class C {\n    @KafkaListener(topics = \"orders.created\")\n    public void handle(String m) {}\n}",
+        );
+        assert_eq!(producer.len(), 1, "got {producer:?}");
+        assert_eq!(consumer.len(), 1, "got {consumer:?}");
+        assert_eq!(
+            producer[0].canonical_id, consumer[0].canonical_id,
+            "cross-repo pair diverged"
+        );
+        assert_eq!(producer[0].canonical_id, "queue::kafka::orders.created");
+        assert_eq!(producer[0].role, ContractRole::Consumer);
+        assert_eq!(consumer[0].role, ContractRole::Provider);
+
+        // Generic pair: plain-string send/subscribe on unknown receivers —
+        // empty qualifier, 0.5 on both sides, same ID.
+        let g_prod = extract(Lang::Python, "producer.send('orders.created')");
+        let g_cons = extract(Lang::Python, "consumer.subscribe('orders.created')");
+        assert_eq!(g_prod.len(), 1, "got {g_prod:?}");
+        assert_eq!(g_cons.len(), 1, "got {g_cons:?}");
+        assert_eq!(g_prod[0].canonical_id, g_cons[0].canonical_id);
+        assert_eq!(g_prod[0].canonical_id, "queue::::orders.created");
+        assert_eq!(g_prod[0].confidence, 0.5);
+        assert_eq!(g_cons[0].confidence, 0.5);
+    }
+
+    #[test]
+    fn acceptance_string_literal_topic_confidence_05() {
+        // AR-018: framework-shaped constructs score 1.0 even with string
+        // literals; only the generic verb+literal tier scores 0.5.
+        let framework = extract(
+            Lang::JavaScript,
+            "ch.sendToQueue('orders.created', Buffer.from(m));",
+        );
+        assert_eq!(framework[0].confidence, 1.0);
+        let heuristic = extract(Lang::JavaScript, "svc.send('orders.created');");
+        assert_eq!(heuristic[0].confidence, 0.5);
+        // Jobs: the BullMQ add verb is generic, agenda.define is not.
+        let agenda = extract(Lang::JavaScript, "agenda.define('email-send', fn);");
+        assert_eq!(agenda[0].confidence, 1.0);
+        let bullmq = extract(Lang::JavaScript, "emailQueue.add('email-send', d);");
+        assert_eq!(bullmq[0].confidence, 0.5);
+    }
+
+    #[test]
+    fn acceptance_websocket_pairing() {
+        let emit = extract(Lang::JavaScript, "io.emit('chat.message', d);");
+        let handler = extract(Lang::JavaScript, "socket.on('chat.message', (m) => {});");
+        assert_eq!(emit[0].canonical_id, handler[0].canonical_id);
+        assert_eq!(emit[0].canonical_id, "websocket::::chat.message");
+        assert_eq!(emit[0].role, ContractRole::Provider);
+        assert_eq!(handler[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn acceptance_job_pairing() {
+        let define = extract(Lang::JavaScript, "agenda.define('email-send', fn);");
+        let enqueue = extract(Lang::JavaScript, "emailQueue.add('email-send', d);");
+        assert_eq!(define[0].canonical_id, enqueue[0].canonical_id);
+        assert_eq!(define[0].canonical_id, "job::::email-send");
+        assert_eq!(define[0].role, ContractRole::Provider);
+        assert_eq!(enqueue[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn acceptance_kinds_independently_disableable() {
+        // One idiom of every kind in one file; disabling a kind removes
+        // exactly its own contracts and leaves the others byte-identical.
+        let src = "\
+const app = express();
+app.get('/v1/users/:id', h);
+const db = process.env.DATABASE_URL;
+producer.send({ topic: 'orders.created', messages: [m] });
+io.emit('chat.message', payload);
+agenda.define('email-send', fn);
+";
+        let baseline = extract(Lang::JavaScript, src);
+        assert_eq!(baseline.len(), 5, "got {baseline:?}");
+        let mut kinds: Vec<ContractKind> = baseline.iter().map(|c| c.kind).collect();
+        kinds.sort_by_key(|k| k.as_str());
+        let mut all_kinds = vec![
+            ContractKind::Env,
+            ContractKind::Http,
+            ContractKind::Job,
+            ContractKind::Queue,
+            ContractKind::WebSocket,
+        ];
+        all_kinds.sort_by_key(|k| k.as_str());
+        assert_eq!(kinds, all_kinds, "expected one contract of each kind");
+
+        type OptionSetter = fn(&mut ContractOptions) -> &mut ContractOptions;
+        let cases: [(ContractKind, OptionSetter); 5] = [
+            (ContractKind::Http, |o| {
+                o.http = false;
+                o
+            }),
+            (ContractKind::Env, |o| {
+                o.env = false;
+                o
+            }),
+            (ContractKind::Queue, |o| {
+                o.queue = false;
+                o
+            }),
+            (ContractKind::WebSocket, |o| {
+                o.websocket = false;
+                o
+            }),
+            (ContractKind::Job, |o| {
+                o.job = false;
+                o
+            }),
+        ];
+        for (kind, disable) in cases {
+            let mut opts = ContractOptions::default();
+            disable(&mut opts);
+            let cands = extract_with(Lang::JavaScript, src, &opts);
+            let gone: Vec<&ContractCandidate> =
+                baseline.iter().filter(|c| !cands.contains(c)).collect();
+            assert_eq!(gone.len(), 1, "{kind:?}: got {gone:?}");
+            assert_eq!(gone[0].kind, kind, "{kind:?}: removed {gone:?}");
+            // Survivors are byte-identical to the baseline entries.
+            for c in &cands {
+                assert!(baseline.contains(c), "{kind:?}: mutated {c:?}");
+            }
+        }
+
+        // All kinds off: nothing at all.
+        let all_off = ContractOptions {
+            http: false,
+            env: false,
+            queue: false,
+            websocket: false,
+            job: false,
+        };
+        assert!(extract_with(Lang::JavaScript, src, &all_off).is_empty());
+    }
+
+    #[test]
+    fn acceptance_cross_kind_disambiguation() {
+        // send on a websocket receiver is websocket, never queue.
+        let ws = extract(Lang::JavaScript, "socket.send('hello');");
+        assert_eq!(ws[0].kind, ContractKind::WebSocket);
+        // A path-like literal on an unknown receiver is the ambiguous HTTP
+        // tier, never queue.
+        let http = extract(Lang::JavaScript, "registry.get('/users');");
+        assert_eq!(http.len(), 1);
+        assert_eq!(http[0].kind, ContractKind::Http);
+        assert_eq!(http[0].confidence, 0.5);
     }
 }

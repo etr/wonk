@@ -3470,7 +3470,13 @@ mod tests {
                     base.to_string()
                 };
                 fs::write(&lib, content).unwrap();
-                crate::pipeline::reindex_file(&wconn, &lib, &writer_root).unwrap();
+                crate::pipeline::reindex_file(
+                    &wconn,
+                    &lib,
+                    &writer_root,
+                    &crate::contracts::ContractOptions::default(),
+                )
+                .unwrap();
             }
         });
 

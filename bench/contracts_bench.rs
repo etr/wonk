@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
-use wonk::contracts::extract_contracts;
+use wonk::contracts::{ContractOptions, extract_contracts};
 use wonk::indexer::{self, Lang};
 use wonk::pipeline::build_index;
 
@@ -72,7 +72,8 @@ fn main() -> Result<()> {
             // Only the extractor is timed; parse/read happen outside the
             // measured window (PRD-CTR-REQ-011 means indexing never re-parses).
             let extract_start = Instant::now();
-            let contracts = extract_contracts(&tree, &parse_source, lang);
+            let contracts =
+                extract_contracts(&tree, &parse_source, lang, &ContractOptions::default());
             let took = extract_start.elapsed();
             e_total += took;
             if round == EXTRACT_ROUNDS - 1 {
@@ -119,9 +120,11 @@ fn render_report(
     per_lang: &HashMap<Lang, Vec<Duration>>,
 ) -> String {
     let mut out = String::new();
-    out.push_str("# TASK-082 contract extraction build-cost results\n\n");
+    out.push_str("# Contract extraction build-cost results (TASK-082 + TASK-087)\n\n");
     out.push_str("Synthetic repo: 12 languages x 25 files, ordinary symbols plus 2-5\n");
-    out.push_str("framework idioms per file. `cargo bench --bench contracts`.\n\n");
+    out.push_str("framework idioms per file (HTTP/env from TASK-082; ~2 message-kind\n");
+    out.push_str("idioms — queue/websocket/job — per file from TASK-087).\n");
+    out.push_str("`cargo bench --bench contracts`.\n\n");
     out.push_str("| metric | value |\n|---|---|\n");
     out.push_str(&format!("| files indexed | {} |\n", FILES_PER_LANG * 12));
     out.push_str(&format!(
@@ -224,8 +227,9 @@ fn generate_repo(root: &Path) -> Result<()> {
     Ok(())
 }
 
-// Each generator emits ordinary code plus 2-5 contract sites; numbers vary
-// per file so paths differ and no accidental dedup masks the work.
+// Each generator emits ordinary code plus 2-5 contract sites (HTTP/env
+// from TASK-082 and ~2 message-kind idioms from TASK-087); numbers vary
+// per file so paths/topics differ and no accidental dedup masks the work.
 
 fn js_source(i: u32) -> String {
     format!(
@@ -248,6 +252,9 @@ function lookup{i}(key) {{
 app.get('/api/v{i}/users/:id', showUser);
 app.post('/api/v{i}/orders', createOrder);
 app.delete('/api/v{i}/orders/:id', deleteOrder);
+
+producer.send({{ topic: 'events.js.v{i}', messages: [payload] }});
+io.emit('updates.v{i}', payload);
 
 async function sync{i}() {{
   const res = await fetch(`${{API_URL}}/api/v{i}/users`);
@@ -274,6 +281,9 @@ class Store{i} {{
   }}
 }}
 
+ch.consume('tasks.ts.v{i}', (msg) => handle(msg));
+consumer.subscribe({{ topic: 'events.ts.v{i}' }});
+
 async function pull{i}(): Promise<string> {{
   const data = await axios.get('/api/v{i}/items');
   const token = process.env['API_TOKEN'];
@@ -291,6 +301,7 @@ export function Panel{i}({{ id }}: {{ id: string }}) {{
   const [data, setData] = useState<string>('');
   useEffect(() => {{
     fetch(`/api/v{i}/panels/${{id}}`).then(r => r.text()).then(setData);
+    socket.on(`panel.v{i}`, (payload) => setData(payload));
   }}, [id]);
   return <div>{{data}}</div>;
 }}
@@ -321,6 +332,10 @@ def get_user_{i}(uid: int):
 @bp.route('/items', methods=['POST'])
 def create_item_{i}():
     return {{}}
+
+
+producer.produce('events.py.v{i}', value=payload)
+ch.basic_publish(exchange='', routing_key='events.py.v{i}', body=payload)
 
 
 def fetch_{i}():
@@ -359,6 +374,12 @@ async fn create_order_{i}() -> &'static str {{
     "ok"
 }}
 
+async fn queue_{i}() {{
+    consumer.subscribe(&["events.rs.v{i}"])?;
+    let rec = FutureRecord::to("events.rs.v{i}", 0, payload);
+    producer.send(rec, Timeout::Never).await?;
+}}
+
 async fn call_{i}() {{
     let _r = reqwest::get("https://api.example.com/api/v{i}/items").await;
     let _k = std::env::var("SERVICE_TOKEN").unwrap_or_default();
@@ -387,6 +408,11 @@ func routes{i}() {{
 	v1.GET("/users/:id", getUser)
 	v1.POST("/orders", createOrder)
 	v1.DELETE("/orders/:id", deleteOrder)
+}}
+
+func messages{i}() {{
+	nc.Publish("events.go.v{i}", data)
+	c.AddFunc("*/5 * * * * *", poll{i})
 }}
 
 func call{i}() {{
@@ -423,6 +449,14 @@ public class Service{i} {{
     @PostMapping("/api/v{i}/orders")
     public String create() {{
         return "ok";
+    }}
+
+    @KafkaListener(topics = "events.java.v{i}")
+    public void onEvent(String msg) {{
+    }}
+
+    void publish() {{
+        kafkaTemplate.send("events.java.v{i}", key, value);
     }}
 
     String call() {{
@@ -508,6 +542,13 @@ end
 post "/api/v{i}/orders" do
   status 201
 end
+
+queue_{i} = channel.queue("events.rb.v{i}")
+queue_{i}.subscribe do |info, props, body|
+  handle(body)
+end
+
+x.publish(payload, routing_key: "updates.rb.v{i}")
 
 def pull_{i}
   res = HTTParty.get("https://api.example.com/api/v{i}/users")

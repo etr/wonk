@@ -479,14 +479,20 @@ pub struct RawTypeEdge {
     pub relationship: String,
 }
 
-/// The kind of a detected contract (TASK-082).
+/// The kind of a detected contract (TASK-082, TASK-087).
 ///
 /// `Http` covers route registrations (providers) and outbound calls
-/// (consumers); `Env` covers environment-variable reads and writes.
+/// (consumers); `Env` covers environment-variable reads and writes;
+/// `Queue` covers message producers/consumers (broker as qualifier);
+/// `WebSocket` covers emit sites and handler registrations; `Job` covers
+/// scheduled and background job definitions and enqueues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContractKind {
     Http,
     Env,
+    Queue,
+    WebSocket,
+    Job,
 }
 
 impl ContractKind {
@@ -495,6 +501,9 @@ impl ContractKind {
         match self {
             ContractKind::Http => "http",
             ContractKind::Env => "env",
+            ContractKind::Queue => "queue",
+            ContractKind::WebSocket => "websocket",
+            ContractKind::Job => "job",
         }
     }
 }
@@ -547,11 +556,13 @@ pub struct PathParam {
 /// Extracted from the same tree the symbol indexer walks (PRD-CTR-REQ-011).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContractCandidate {
-    /// Contract kind (`http` or `env`).
+    /// Contract kind (`http`, `env`, `queue`, `websocket`, `job`).
     pub kind: ContractKind,
     /// Provider or consumer.
     pub role: ContractRole,
-    /// Kind qualifier: HTTP verb (`GET`, `ANY`) for http; empty for env.
+    /// Kind qualifier: HTTP verb (`GET`, `ANY`) for http; broker family for
+    /// queue (`kafka`, `nats`, `rabbitmq`, empty when unknown); empty for
+    /// env, websocket, and job.
     pub qualifier: String,
     /// Normalized identifier: HTTP path or env-var name.
     pub identifier: String,
@@ -878,6 +889,15 @@ pub struct CallPathHop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_kind_as_str_segments() {
+        assert_eq!(ContractKind::Http.as_str(), "http");
+        assert_eq!(ContractKind::Env.as_str(), "env");
+        assert_eq!(ContractKind::Queue.as_str(), "queue");
+        assert_eq!(ContractKind::WebSocket.as_str(), "websocket");
+        assert_eq!(ContractKind::Job.as_str(), "job");
+    }
 
     #[test]
     fn symbol_ref_creation() {
