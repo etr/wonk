@@ -244,7 +244,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     ensure_embedding_metadata_columns(conn)?;
     conn.execute_batch(TERM_STATS_SQL)
         .context("creating term_stats table")?;
-    conn.execute_batch(REACH_SQL).context("creating reach tables")?;
+    conn.execute_batch(REACH_SQL)
+        .context("creating reach tables")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
