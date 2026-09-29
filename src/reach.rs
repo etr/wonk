@@ -312,7 +312,10 @@ pub(crate) struct FileEditScope {
 pub(crate) struct ReachRepairStats {
     /// Source names recomputed from the post-edit graph.
     pub(crate) rebuilt_sources: usize,
-    /// Reach rows removed (the affected ids' whole row sets).
+    /// Reach rows removed by the repair's own delete pass. (Rows the FK
+    /// cascade already removed when the edited file's symbol rows died are
+    /// not counted — the behavioral guarantee is the row set, not this
+    /// number.)
     pub(crate) rows_deleted: usize,
     /// Reach rows written.
     pub(crate) rows_written: usize,
