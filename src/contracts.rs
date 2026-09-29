@@ -5194,6 +5194,7 @@ pub fn extract_document_contracts(
     match kind {
         DocumentKind::Proto if opts.grpc => proto_providers(content),
         DocumentKind::Graphql if opts.graphql => graphql_document_contracts(content),
+        DocumentKind::OpenApi if opts.openapi => openapi_providers(content),
         _ => Vec::new(),
     }
 }
@@ -5405,6 +5406,160 @@ fn graphql_candidate(
         line,
         confidence: CONFIDENCE_FRAMEWORK,
     }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI scanner (TASK-088, plan 5.4): one line-oriented scanner for YAML
+// and pretty-printed JSON documents
+// ---------------------------------------------------------------------------
+
+/// One operation found by the OpenAPI scan: `(method, raw path, 1-based
+/// line)`.
+struct OpenApiOperation {
+    method: String,
+    raw_path: String,
+    line: usize,
+}
+
+/// Whether a document carries a top-level `openapi:`/`swagger:` version key
+/// and a `paths:` block. Multi-document YAML (`---` separators) is skipped —
+/// extraction, not validation.
+fn looks_like_openapi(content: &str) -> bool {
+    let mut version = false;
+    let mut paths = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t == "---" {
+            return false;
+        }
+        match key_name(line).as_deref() {
+            Some("openapi") | Some("swagger") => version = true,
+            Some("paths") => paths = true,
+            _ => {}
+        }
+    }
+    version && paths
+}
+
+/// Key name of a YAML/JSON line (`paths:`, `"paths": {`): trimmed, quotes
+/// stripped, text before the first `:`. `None` for blank/comment/brace-only
+/// lines and empty keys.
+fn key_name(line: &str) -> Option<String> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') || matches!(t, "{" | "}" | "[" | "]" | "," | "},") {
+        return None;
+    }
+    let head = t.split(':').next()?;
+    let name = head.trim_matches(|c| c == '"' || c == '\'').trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Leading-space count of a line (YAML forbids tab indentation).
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// HTTP method tokens legal as OpenAPI path-item keys.
+const OPENAPI_METHODS: &[&str] = &[
+    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+];
+
+/// Scan an OpenAPI document's `paths:` block: path keys sit one indent deeper
+/// than `paths:`, method keys one level deeper again. Flow-style `{}` maps
+/// and multi-document YAML are skipped by construction.
+fn scan_openapi_document(content: &str) -> Vec<OpenApiOperation> {
+    if !looks_like_openapi(content) {
+        return Vec::new();
+    }
+    let mut ops = Vec::new();
+    // 0 = outside paths, 1 = inside paths, 2 = inside a path item.
+    let mut state = 0u8;
+    let mut paths_indent = 0usize;
+    let mut path = String::new();
+    let mut path_indent = 0usize;
+    for (idx, raw) in content.lines().enumerate() {
+        if raw.trim().is_empty() || raw.trim_start_matches(' ').starts_with('#') {
+            continue;
+        }
+        // Transitions re-enter the parent state on the same line, so a
+        // dedent past one level lands in the right handler.
+        loop {
+            match state {
+                0 => {
+                    if key_name(raw).as_deref() == Some("paths") {
+                        paths_indent = indent_of(raw);
+                        state = 1;
+                    }
+                    break;
+                }
+                1 => {
+                    if indent_of(raw) <= paths_indent {
+                        state = 0;
+                        continue;
+                    }
+                    if let Some(key) = key_name(raw).filter(|k| k.starts_with('/')) {
+                        path = key;
+                        path_indent = indent_of(raw);
+                        state = 2;
+                    }
+                    break;
+                }
+                _ => {
+                    if indent_of(raw) <= path_indent {
+                        state = 1;
+                        continue;
+                    }
+                    if let Some(key) = key_name(raw)
+                        && OPENAPI_METHODS.contains(&key.as_str())
+                    {
+                        ops.push(OpenApiOperation {
+                            method: key,
+                            raw_path: path.clone(),
+                            line: idx + 1,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    ops
+}
+
+/// Provider candidates for every operation of an OpenAPI document
+/// (`openapi::<METHOD>::<path>`, positional `{pN}` markers, params as
+/// metadata — the HTTP pipeline verbatim, only the kind differs).
+fn openapi_providers(content: &str) -> Vec<ContractCandidate> {
+    scan_openapi_document(content)
+        .into_iter()
+        .filter_map(|op| {
+            let norm = normalize_http_path(&op.raw_path)?;
+            let qualifier = normalize_method(&op.method);
+            Some(ContractCandidate {
+                kind: ContractKind::Openapi,
+                role: ContractRole::Provider,
+                canonical_id: canonical_contract_id(ContractKind::Openapi, &qualifier, &norm.path),
+                qualifier,
+                identifier: norm.path,
+                params: norm
+                    .params
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| PathParam {
+                        position: i + 1,
+                        name,
+                    })
+                    .collect(),
+                owning_symbol: None,
+                line: op.line,
+                confidence: CONFIDENCE_FRAMEWORK,
+            })
+        })
+        .collect()
 }
 
 /// Blank out `//` line comments and `/* */` block comments, preserving line
@@ -9668,5 +9823,144 @@ def resolve_get_user(obj, info):
         };
         let src = "const resolvers = {\n  Query: {\n    user: () => db.user(),\n  },\n};\n";
         assert!(extract_with(Lang::JavaScript, src, &opts).is_empty());
+    }
+
+    // -- openapi scanner (TASK-088, plan 5.4) ------------------------------------
+
+    #[test]
+    fn openapi_yaml_two_paths() {
+        let src = "\
+openapi: 3.0.0
+info:
+  title: Users API
+  version: 1.0.0
+paths:
+  /v1/users:
+    get:
+      summary: List users
+    post:
+      summary: Create user
+  /v1/users/{id}:
+    get:
+      summary: Fetch one user
+    delete:
+      summary: Delete a user
+components: {}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::OpenApi, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 4, "got {cands:?}");
+        let get = find(&cands, "openapi::GET::/v1/users").expect("GET missing");
+        assert_eq!(get.kind, ContractKind::Openapi);
+        assert_eq!(get.role, ContractRole::Provider);
+        assert_eq!(get.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(get.owning_symbol, None);
+        assert_eq!(get.line, 7);
+        assert!(find(&cands, "openapi::POST::/v1/users").is_some());
+        assert!(find(&cands, "openapi::GET::/v1/users/{p1}").is_some());
+        assert!(find(&cands, "openapi::DELETE::/v1/users/{p1}").is_some());
+    }
+
+    #[test]
+    fn openapi_swagger_2() {
+        let src = "\
+swagger: \"2.0\"
+info:
+  title: Pets
+paths:
+  /pets:
+    get:
+      summary: List pets
+    post:
+      summary: Add pet
+";
+        let cands =
+            extract_document_contracts(DocumentKind::OpenApi, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "openapi::GET::/pets").is_some());
+        assert!(find(&cands, "openapi::POST::/pets").is_some());
+    }
+
+    #[test]
+    fn openapi_placeholder_becomes_positional_with_params() {
+        let src = "\
+openapi: 3.0.0
+paths:
+  /workspaces/{wid}/tags/{id}:
+    get:
+      summary: Fetch tag
+";
+        let cands =
+            extract_document_contracts(DocumentKind::OpenApi, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "openapi::GET::/workspaces/{p1}/tags/{p2}");
+        // Original names retained as metadata (PRD-CTR-REQ-022 symmetry).
+        assert_eq!(
+            c.params,
+            vec![
+                PathParam {
+                    position: 1,
+                    name: "wid".to_string(),
+                },
+                PathParam {
+                    position: 2,
+                    name: "id".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn openapi_json_flavor() {
+        let src = "\
+{
+  \"openapi\": \"3.0.0\",
+  \"info\": {
+    \"title\": \"Users\"
+  },
+  \"paths\": {
+    \"/v1/users\": {
+      \"get\": {
+        \"summary\": \"List\"
+      }
+    }
+  }
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::OpenApi, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert!(find(&cands, "openapi::GET::/v1/users").is_some());
+    }
+
+    #[test]
+    fn openapi_sniff_negatives_stay_unindexed() {
+        let compose = "services:\n  app:\n    image: busybox\n";
+        assert!(
+            extract_document_contracts(DocumentKind::OpenApi, compose, &ContractOptions::default())
+                .is_empty()
+        );
+        let pkg = "{\n  \"name\": \"x\",\n  \"version\": \"1.0.0\"\n}\n";
+        assert!(
+            extract_document_contracts(DocumentKind::OpenApi, pkg, &ContractOptions::default())
+                .is_empty()
+        );
+        // Multi-document YAML is skipped (extraction, not validation).
+        let multi = "---\nopenapi: 3.0.0\npaths:\n  /x:\n    get: {}\n---\nopenapi: 3.0.1\n";
+        assert!(
+            extract_document_contracts(DocumentKind::OpenApi, multi, &ContractOptions::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn openapi_disabled_by_option() {
+        let opts = ContractOptions {
+            openapi: false,
+            ..ContractOptions::default()
+        };
+        let src = "openapi: 3.0.0\npaths:\n  /x:\n    get: {}\n";
+        assert!(extract_document_contracts(DocumentKind::OpenApi, src, &opts).is_empty());
     }
 }
