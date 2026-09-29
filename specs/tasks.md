@@ -46,7 +46,7 @@
 | M26 | Bundled Embedding Provider | 3 | Complete |
 | M27 | Lexical BM25 Scoring | 2 | Complete |
 | M28 | Precomputed Reach Index | 2 | Complete |
-| M29 | Cross-Repo Contract Detection | 5 | Not Started |
+| M29 | Cross-Repo Contract Detection | 5 | In Progress |
 | M30 | Diff-Scoped Review Workflow | 3 | Not Started |
 | M31 | Body Elision | 2 | Not Started |
 | M32 | Signal-Based Reranking | 4 | Not Started |
@@ -3480,16 +3480,16 @@ Create `contracts.rs` with the normalization core and the two highest-value cont
 **Scoping note:** Contract detection is not one module's worth of work — comparable systems run to tens of thousands of lines because each framework family needs its own recognizer. M29 is therefore split by kind (TASK-082 → TASK-087 → TASK-088) so the highest-value kinds ship and prove the matching pipeline before the long tail. This resolves OQ-010.
 
 **Action Items:**
-- [ ] Create `contracts.rs` with per-language rule tables mapping framework idioms to contract candidates (PRD-CTR-REQ-001)
-- [ ] Detect the `http` and `env` kinds across all 12 supported languages (PRD-CTR-REQ-001)
-- [ ] Invoke extraction on the tree the symbol extractor already walks — no second parse or file read (PRD-CTR-REQ-011)
-- [ ] Implement canonical ID normalization `<kind>::<qualifier>::<identifier>` in a single function (PRD-CTR-REQ-002)
-- [ ] HTTP path pipeline in fixed order (PRD-CTR-REQ-003): trim whitespace/quotes → strip scheme+authority → strip leading base-URL interpolation → rewrite `${name}`/`$name`/`:id`/`<id>`/`<int:id>`/`{id}` → positional `{p1}`,`{p2}` → leading slash; upper-case method
-- [ ] Retain original parameter names as contract metadata alongside the positional ID (PRD-CTR-REQ-022)
-- [ ] Router prefix composition: track enclosing group/blueprint/nested-router/mount context so `/v1` + `/users` yields `/v1/users` (PRD-CTR-REQ-023)
-- [ ] Classify role as provider or consumer; record ambiguous constructs at lower confidence rather than dropping them (PRD-CTR-REQ-004)
-- [ ] Confidence on the DR-028 scale: 1.0 framework-recognized, 0.5 string-literal heuristic (PRD-CTR-REQ-004, AR-018)
-- [ ] Per-stage normalization test matrix, plus a corpus test pairing real provider/consumer spellings across frameworks (AR-017, AR-029)
+- [x] Create `contracts.rs` with per-language rule tables mapping framework idioms to contract candidates (PRD-CTR-REQ-001)
+- [x] Detect the `http` and `env` kinds across all 12 supported languages (PRD-CTR-REQ-001)
+- [x] Invoke extraction on the tree the symbol extractor already walks — no second parse or file read (PRD-CTR-REQ-011)
+- [x] Implement canonical ID normalization `<kind>::<qualifier>::<identifier>` in a single function (PRD-CTR-REQ-002)
+- [x] HTTP path pipeline in fixed order (PRD-CTR-REQ-003): trim whitespace/quotes → strip scheme+authority → strip leading base-URL interpolation → rewrite `${name}`/`$name`/`:id`/`<id>`/`<int:id>`/`{id}` → positional `{p1}`,`{p2}` → leading slash; upper-case method
+- [x] Retain original parameter names as contract metadata alongside the positional ID (PRD-CTR-REQ-022)
+- [x] Router prefix composition: track enclosing group/blueprint/nested-router/mount context so `/v1` + `/users` yields `/v1/users` (PRD-CTR-REQ-023)
+- [x] Classify role as provider or consumer; record ambiguous constructs at lower confidence rather than dropping them (PRD-CTR-REQ-004)
+- [x] Confidence on the DR-028 scale: 1.0 framework-recognized, 0.5 string-literal heuristic (PRD-CTR-REQ-004, AR-018)
+- [x] Per-stage normalization test matrix, plus a corpus test pairing real provider/consumer spellings across frameworks (AR-017, AR-029)
 
 **Dependencies:**
 - Blocked by: None
@@ -3509,7 +3509,7 @@ Create `contracts.rs` with the normalization core and the two highest-value cont
 **Related Requirements:** PRD-CTR-REQ-001, PRD-CTR-REQ-002, PRD-CTR-REQ-003, PRD-CTR-REQ-004, PRD-CTR-REQ-011, PRD-CTR-REQ-022, PRD-CTR-REQ-023
 **Related Decisions:** DR-031
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
