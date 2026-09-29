@@ -1834,6 +1834,178 @@ class Component {
     }
 
     #[test]
+    fn test_rename_as_delete_and_insert_no_orphans() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        // Rename lib.rs -> renamed.rs on disk, then feed the pipeline the
+        // events the watcher derives from a rename: Deleted(old) plus
+        // Created(new) (the old path no longer exists, the new one does).
+        fs::rename(root.join("lib.rs"), root.join("renamed.rs")).unwrap();
+        let events = vec![
+            FileEvent::Deleted(root.join("lib.rs")),
+            FileEvent::Created(root.join("renamed.rs")),
+        ];
+        let result = process_events(&conn, &events, root).unwrap();
+        assert_eq!(result.updated_count, 2, "both rename halves get processed");
+
+        let old_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_rows, 0, "stats must not linger under the old name");
+
+        let new_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'renamed.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(new_rows > 0, "stats must exist under the new name");
+
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_edit_delete_rename_sequence_keeps_stats_consistent() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Edit an indexed file.
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() {\n    let v = reindex_me();\n    v\n}\n",
+        )
+        .unwrap();
+        reindex_file(&conn, &root.join("src/main.rs"), root).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Create a new file.
+        fs::write(
+            root.join("newmod.rs"),
+            "fn fresh() {\n    alpha beta alpha\n}\n",
+        )
+        .unwrap();
+        index_new_file(&conn, &root.join("newmod.rs"), root).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Rename it: delete + insert events.
+        fs::rename(root.join("newmod.rs"), root.join("moved.rs")).unwrap();
+        let events = vec![
+            FileEvent::Deleted(root.join("newmod.rs")),
+            FileEvent::Created(root.join("moved.rs")),
+        ];
+        process_events(&conn, &events, root).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Delete a file.
+        fs::remove_file(root.join("app.py")).unwrap();
+        process_events(&conn, &[FileEvent::Deleted(root.join("app.py"))], root).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Edit the renamed file again.
+        fs::write(root.join("moved.rs"), "fn fresh() {\n    gamma delta\n}\n").unwrap();
+        reindex_file(&conn, &root.join("moved.rs"), root).unwrap();
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_drop_all_data_clears_term_stats() {
+        let (dir, conn) = setup_indexed_repo();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        assert!(before > 0, "index should carry term stats before the drop");
+
+        drop_all_data(&conn).unwrap();
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "drop_all_data must clear term_stats");
+    }
+
+    #[test]
+    fn test_rebuild_clears_term_stats() {
+        let dir = make_test_repo();
+        build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+        let count1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+
+        // Rebuild over unchanged content: stats are regenerated, not doubled.
+        rebuild_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&index_path).unwrap();
+        let count2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count1, count2, "rebuild must replace, not duplicate, stats");
+
+        assert_stats_match_disk(&conn, dir.path());
+    }
+
+    #[test]
+    fn test_term_stats_and_files_row_same_transaction() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        let original = fs::read_to_string(root.join("lib.rs")).unwrap();
+
+        // Corrupt lib.rs into invalid UTF-8.  reindex_file must fail while
+        // reading — before any write — leaving the previous file row and
+        // stats exactly as they were.
+        fs::write(root.join("lib.rs"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+        let result = reindex_file(&conn, &root.join("lib.rs"), root);
+        assert!(
+            result.is_err(),
+            "invalid UTF-8 content must fail the re-index"
+        );
+
+        let hash: String = conn
+            .query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let expected_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(original.as_bytes()));
+        assert_eq!(hash, expected_hash, "files row must be untouched");
+
+        let expected = crate::tokenizer::term_frequencies(&original);
+        let actual: HashMap<String, i64> = conn
+            .prepare("SELECT term, tf FROM term_stats WHERE file = 'lib.rs'")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "stats must keep the pre-failure term set"
+        );
+        for (term, tf) in &expected {
+            assert_eq!(
+                actual.get(term).copied(),
+                Some(*tf as i64),
+                "tf for '{term}'"
+            );
+        }
+    }
+
+    #[test]
     fn test_rebuild_index() {
         let dir = make_test_repo();
 
