@@ -12,10 +12,12 @@
 //! - [`normalize_method`] upper-cases verbs and maps router catch-alls to
 //!   `ANY`.
 
-use tree_sitter::Tree;
+use std::collections::HashMap;
+
+use tree_sitter::{Node, Tree};
 
 use crate::indexer::Lang;
-use crate::types::{ContractCandidate, ContractKind};
+use crate::types::{ContractCandidate, ContractKind, ContractRole, PathParam};
 
 /// Confidence for framework-recognized constructs (DR-028 / AR-018).
 pub const CONFIDENCE_FRAMEWORK: f64 = 1.0;
@@ -25,8 +27,501 @@ pub const CONFIDENCE_HEURISTIC: f64 = 0.5;
 /// Extract contract candidates from an already-parsed tree.
 ///
 /// `source` must be the exact byte string the tree was parsed from.
-pub fn extract_contracts(_tree: &Tree, _source: &str, _lang: Lang) -> Vec<ContractCandidate> {
-    Vec::new()
+/// One binding pre-pass collects router context (REQ-023), then a single
+/// iterative DFS walks the tree and dispatches per-language matchers.
+pub fn extract_contracts(tree: &Tree, source: &str, lang: Lang) -> Vec<ContractCandidate> {
+    let src = source.as_bytes();
+    let ctx = collect_router_context(tree.root_node(), src, lang);
+    let mut ex = Extractor {
+        src,
+        lang,
+        ctx,
+        out: Vec::new(),
+    };
+    let mut stack = vec![(tree.root_node(), String::new())];
+    while let Some((node, prefix)) = stack.pop() {
+        let child_prefix = ex.visit(node, &prefix);
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push((child, child_prefix.clone()));
+            }
+        }
+    }
+    ex.out
+}
+
+// ---------------------------------------------------------------------------
+// Router context (PRD-CTR-REQ-023)
+// ---------------------------------------------------------------------------
+
+/// Variable-to-prefix knowledge gathered before the route walk.
+///
+/// `bindings` maps a router variable to its absolute prefix (e.g. a gin
+/// group resolved through its chain); `mounts` maps a router variable to
+/// the paths it is mounted under (e.g. `app.use('/v1', router)`).
+#[derive(Default)]
+struct RouterContext {
+    bindings: HashMap<String, String>,
+    mounts: HashMap<String, Vec<String>>,
+}
+
+impl RouterContext {
+    fn is_router_var(&self, name: &str) -> bool {
+        self.bindings.contains_key(name) || self.mounts.contains_key(name)
+    }
+
+    /// Concatenated prefix for a router variable: mount paths first, then
+    /// the variable's own binding.
+    fn effective_prefix(&self, var: &str) -> String {
+        let mut prefix = String::new();
+        if let Some(mount_paths) = self.mounts.get(var) {
+            for m in mount_paths {
+                prefix.push_str(m);
+            }
+        }
+        if let Some(b) = self.bindings.get(var) {
+            prefix.push_str(b);
+        }
+        prefix
+    }
+}
+
+fn collect_router_context(root: Node, src: &[u8], lang: Lang) -> RouterContext {
+    let mut ctx = RouterContext::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match lang {
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+                collect_js_router_facts(node, src, &mut ctx);
+            }
+            _ => {}
+        }
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push(child);
+            }
+        }
+    }
+    ctx
+}
+
+/// JS: `const r = express.Router() | new Router() | new Hono() | express()`
+/// binds a router variable; `app.use('/v1', r)` mounts one.
+fn collect_js_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
+    match node.kind() {
+        "variable_declarator" => {
+            let name = node_text(node.child_by_field_name("name"), src);
+            if name.is_empty() {
+                return;
+            }
+            let value = match node.child_by_field_name("value") {
+                Some(v) => v,
+                None => return,
+            };
+            let callee = match value.kind() {
+                "new_expression" => value.child_by_field_name("constructor"),
+                "call_expression" => value.child_by_field_name("function"),
+                _ => None,
+            };
+            let is_router_ctor = match callee {
+                Some(c) => matches!(
+                    node_text(Some(c), src),
+                    "express" | "express.Router" | "Router" | "Hono" | "Bun.serve"
+                ),
+                None => false,
+            };
+            if is_router_ctor {
+                ctx.bindings.insert(name.to_string(), String::new());
+            }
+        }
+        "call_expression" => {
+            let func = node.child_by_field_name("function");
+            let args = node.child_by_field_name("arguments");
+            let (Some(func), Some(args)) = (func, args) else {
+                return;
+            };
+            if func.kind() != "member_expression" {
+                return;
+            }
+            if node_text(func.child_by_field_name("property"), src) != "use" {
+                return;
+            }
+            // app.use('/v1', router): mount string -> identifier.
+            let mut iter = (0..args.named_child_count()).filter_map(|i| args.named_child(i as u32));
+            let first = iter.next();
+            let second = iter.next();
+            if let (Some(path_node), Some(var_node)) = (first, second)
+                && path_node.kind() == "string"
+                && var_node.kind() == "identifier"
+            {
+                let path = string_content(path_node, src);
+                let var = node_text(Some(var_node), src);
+                if !var.is_empty() {
+                    ctx.mounts.entry(var.to_string()).or_default().push(path);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Walker
+// ---------------------------------------------------------------------------
+
+/// Shared state for the single route walk.
+struct Extractor<'a> {
+    src: &'a [u8],
+    lang: Lang,
+    ctx: RouterContext,
+    out: Vec<ContractCandidate>,
+}
+
+/// Receiver names treated as routers even without a tracked binding.
+const JS_ROUTER_VARS: &[&str] = &["app", "router", "api", "server", "r"];
+/// Verb-named methods that register routes on a router receiver.
+const JS_PROVIDER_VERBS: &[&str] = &["get", "post", "put", "patch", "delete", "all"];
+/// HTTP client receivers whose verb-named methods are outbound calls.
+const JS_CONSUMER_RECEIVERS: &[&str] = &["axios", "got", "http", "https"];
+/// Verb-like callee names used by the 0.5 heuristic on unknown receivers.
+const AMBIGUOUS_VERBS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "any", "all", "request",
+];
+
+/// Text of a node, or empty string.
+fn node_text<'a>(node: Option<Node<'a>>, src: &'a [u8]) -> &'a str {
+    node.and_then(|n| n.utf8_text(src).ok())
+        .filter(|t| !t.is_empty())
+        .unwrap_or("")
+}
+
+/// Extracted textual content of a call's path argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathArg {
+    /// Sole string literal or rendered template — keeps caller confidence.
+    Direct(String),
+    /// Concatenation carrying exactly one path-like literal — 0.5 confidence.
+    Concat(String),
+}
+
+/// Heuristic gate deciding whether a string could be an HTTP path:
+/// it starts with `/` (including protocol-relative `//`) or carries a scheme.
+fn is_path_like(s: &str) -> bool {
+    let t = s.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'));
+    t.starts_with('/') || t.contains("://")
+}
+
+/// Concatenate a raw prefix and a route literal; stage 6 collapses slashes.
+fn join_raw(prefix: &str, literal: &str) -> String {
+    if prefix.is_empty() {
+        literal.to_string()
+    } else {
+        format!("{prefix}/{literal}")
+    }
+}
+
+impl<'a> Extractor<'a> {
+    /// Visit one node; returns the prefix its children should inherit.
+    fn visit(&mut self, node: Node, prefix: &str) -> String {
+        match self.lang {
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => self.visit_js(node, prefix),
+            _ => prefix.to_string(),
+        }
+    }
+
+    fn visit_js(&mut self, node: Node, prefix: &str) -> String {
+        match node.kind() {
+            "call_expression" => self.js_call(node, prefix),
+            "member_expression" => {
+                self.js_env_member(node);
+            }
+            "subscript_expression" => {
+                self.js_env_subscript(node);
+            }
+            "assignment_expression" => {
+                self.js_env_assign(node);
+            }
+            _ => {}
+        }
+        prefix.to_string()
+    }
+
+    fn js_call(&mut self, node: Node, prefix: &str) {
+        let func = node.child_by_field_name("function");
+        let args = node.child_by_field_name("arguments");
+        let (Some(func), Some(args)) = (func, args) else {
+            return;
+        };
+        let first_arg = args.named_child(0);
+        match func.kind() {
+            "identifier" => {
+                let name = node_text(Some(func), self.src);
+                if name == "fetch"
+                    && let Some(arg) = first_arg
+                {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Consumer,
+                        "GET",
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                    );
+                }
+            }
+            "member_expression" => {
+                let recv = node_text(func.child_by_field_name("object"), self.src);
+                let prop = node_text(func.child_by_field_name("property"), self.src);
+                if JS_PROVIDER_VERBS.contains(&prop)
+                    && (self.ctx.is_router_var(recv) || JS_ROUTER_VARS.contains(&recv))
+                    && let Some(arg) = first_arg
+                {
+                    let mount_prefix = self.ctx.effective_prefix(recv);
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Provider,
+                        prop,
+                        &join_raw(prefix, &mount_prefix),
+                        CONFIDENCE_FRAMEWORK,
+                    );
+                } else if JS_CONSUMER_RECEIVERS.contains(&recv)
+                    && JS_PROVIDER_VERBS[..5].contains(&prop)
+                    && let Some(arg) = first_arg
+                {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Consumer,
+                        prop,
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                    );
+                } else if AMBIGUOUS_VERBS.contains(&prop)
+                    && !self.ctx.is_router_var(recv)
+                    && !JS_ROUTER_VARS.contains(&recv)
+                    && !JS_CONSUMER_RECEIVERS.contains(&recv)
+                    && let Some(arg) = first_arg
+                    && matches!(self.js_path_arg(arg), Some(PathArg::Direct(ref s)) if is_path_like(s))
+                {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Provider,
+                        prop,
+                        prefix,
+                        CONFIDENCE_HEURISTIC,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `process.env.NAME` / `import.meta.env.NAME` reads.
+    fn js_env_member(&mut self, node: Node) {
+        if let Some(parent) = node.parent()
+            && parent.kind() == "assignment_expression"
+            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
+        {
+            return; // the assignment handler owns this site
+        }
+        let obj = node_text(node.child_by_field_name("object"), self.src);
+        let prop = node_text(node.child_by_field_name("property"), self.src);
+        if matches!(obj, "process.env" | "import.meta.env") && is_env_name(prop) {
+            self.emit_env(node, prop, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+        }
+    }
+
+    /// `process.env['NAME']` reads.
+    fn js_env_subscript(&mut self, node: Node) {
+        if let Some(parent) = node.parent()
+            && parent.kind() == "assignment_expression"
+            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
+        {
+            return;
+        }
+        let obj = node_text(node.child_by_field_name("object"), self.src);
+        let name = node
+            .child_by_field_name("index")
+            .filter(|n| n.kind() == "string")
+            .map(|n| string_content(n, self.src))
+            .unwrap_or_default();
+        if obj == "process.env" && is_env_name(&name) {
+            self.emit_env(node, &name, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+        }
+    }
+
+    /// `process.env.NAME = …` / `process.env['NAME'] = …` writes (0.5).
+    fn js_env_assign(&mut self, node: Node) {
+        let Some(left) = node.child_by_field_name("left") else {
+            return;
+        };
+        let name = match left.kind() {
+            "member_expression" => {
+                let obj = node_text(left.child_by_field_name("object"), self.src);
+                let prop = node_text(left.child_by_field_name("property"), self.src);
+                if matches!(obj, "process.env" | "import.meta.env") {
+                    prop.to_string()
+                } else {
+                    return;
+                }
+            }
+            "subscript_expression" => {
+                let obj = node_text(left.child_by_field_name("object"), self.src);
+                let name = left
+                    .child_by_field_name("index")
+                    .filter(|n| n.kind() == "string")
+                    .map(|n| string_content(n, self.src))
+                    .unwrap_or_default();
+                if obj == "process.env" {
+                    name
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        };
+        if is_env_name(&name) {
+            self.emit_env(node, &name, ContractRole::Provider, CONFIDENCE_HEURISTIC);
+        }
+    }
+
+    /// Extract the textual path of a JS call argument.
+    fn js_path_arg(&self, arg: Node) -> Option<PathArg> {
+        match arg.kind() {
+            "string" => Some(PathArg::Direct(string_content(arg, self.src))),
+            "template_string" => Some(PathArg::Direct(template_content(arg, self.src))),
+            "binary_expression" if node_text(arg.child(1), self.src) == "+" => {
+                concat_literal(arg, self.src)
+            }
+            _ => None,
+        }
+    }
+
+    /// Record an HTTP contract from a call site.
+    fn emit_http(
+        &mut self,
+        node: Node,
+        arg: Node,
+        role: ContractRole,
+        verb: &str,
+        prefix: &str,
+        confidence: f64,
+    ) {
+        let (raw, confidence) = match self.js_path_arg(arg) {
+            Some(PathArg::Direct(s)) => (s, confidence),
+            Some(PathArg::Concat(s)) => (s, CONFIDENCE_HEURISTIC),
+            None => return,
+        };
+        let joined = join_raw(prefix, &raw);
+        let Some(norm) = normalize_http_path(&joined) else {
+            return;
+        };
+        let qualifier = normalize_method(verb);
+        self.out.push(ContractCandidate {
+            kind: ContractKind::Http,
+            role,
+            qualifier: qualifier.clone(),
+            identifier: norm.path.clone(),
+            canonical_id: canonical_contract_id(ContractKind::Http, &qualifier, &norm.path),
+            params: norm
+                .params
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| PathParam {
+                    position: i + 1,
+                    name,
+                })
+                .collect(),
+            owning_symbol: crate::indexer::find_enclosing_function(node, self.src, self.lang),
+            line: arg.start_position().row + 1,
+            confidence,
+        });
+    }
+
+    /// Record an env contract.
+    fn emit_env(&mut self, node: Node, name: &str, role: ContractRole, confidence: f64) {
+        if !is_env_name(name) {
+            return;
+        }
+        self.out.push(ContractCandidate {
+            kind: ContractKind::Env,
+            role,
+            qualifier: String::new(),
+            identifier: name.to_string(),
+            canonical_id: canonical_contract_id(ContractKind::Env, "", name),
+            params: Vec::new(),
+            owning_symbol: crate::indexer::find_enclosing_function(node, self.src, self.lang),
+            line: node.start_position().row + 1,
+            confidence,
+        });
+    }
+}
+
+/// Env-var names: non-empty, single token, no whitespace.
+fn is_env_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(char::is_whitespace)
+}
+
+/// Content of a string node (quote-stripped, fragments concatenated).
+fn string_content(node: Node, src: &[u8]) -> String {
+    let mut out = String::new();
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32)
+            && child.kind() == "string_fragment"
+        {
+            out.push_str(node_text(Some(child), src));
+        }
+    }
+    out
+}
+
+/// Rendered content of a JS template string: substitutions reinserted as
+/// `${expr}` so stage 3/4 of the pipeline can process them.
+fn template_content(node: Node, src: &[u8]) -> String {
+    let mut out = String::new();
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            match child.kind() {
+                "string_fragment" => out.push_str(node_text(Some(child), src)),
+                "template_substitution" => {
+                    out.push_str("${");
+                    out.push_str(node_text(child.named_child(0), src));
+                    out.push('}');
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// `+` concatenation: keep going only when the tree holds exactly one
+/// path-like string literal (PRD-CTR-REQ-004 skip rules).
+fn concat_literal(node: Node, src: &[u8]) -> Option<PathArg> {
+    let mut literals = Vec::new();
+    collect_string_leaves(node, src, &mut literals);
+    if literals.len() == 1 && is_path_like(&literals[0]) {
+        Some(PathArg::Concat(literals.into_iter().next()?))
+    } else {
+        None
+    }
+}
+
+fn collect_string_leaves(node: Node, src: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "string" => out.push(string_content(node, src)),
+        "template_string" => out.push(template_content(node, src)),
+        "binary_expression" => {
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    collect_string_leaves(child, src, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build the canonical contract ID `<kind>::<qualifier>::<identifier>`.
@@ -343,9 +838,31 @@ fn stage_ensure_shape(path: &str) -> Option<String> {
     Some(shaped)
 }
 
+// temporary shape-dump helper appended as a test
+#[cfg(test)]
+mod extract_test_helpers {
+    use super::*;
+    use crate::indexer::{Lang, get_parser};
+
+    pub(crate) fn extract(lang: Lang, src: &str) -> Vec<ContractCandidate> {
+        let mut parser = get_parser(lang);
+        let tree = parser.parse(src, None).expect("parse failed");
+        extract_contracts(&tree, src, lang)
+    }
+
+    pub(crate) fn find<'a>(
+        cands: &'a [ContractCandidate],
+        canonical_id: &str,
+    ) -> Option<&'a ContractCandidate> {
+        cands.iter().find(|c| c.canonical_id == canonical_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexer::Lang;
+    use crate::types::{ContractKind, ContractRole, PathParam};
 
     #[test]
     fn method_uppercases_raw_verb() {
@@ -624,5 +1141,111 @@ mod tests {
                 params: vec!["API_URL".into()]
             })
         );
+    }
+
+    // -- walker: JavaScript / TypeScript (step 4) -------------------------------
+
+    use extract_test_helpers::{extract, find};
+
+    #[test]
+    fn express_provider() {
+        let src = "const app = express();\napp.get('/v1/users/:id', handler);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.kind, ContractKind::Http);
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.canonical_id, "http::GET::/v1/users/{p1}");
+        assert_eq!(
+            c.params,
+            vec![PathParam {
+                position: 1,
+                name: "id".into()
+            }]
+        );
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.line, 2);
+        assert_eq!(c.owning_symbol, None);
+    }
+
+    #[test]
+    fn express_router_var_binding() {
+        let src = "const r = express.Router();\nr.post('/orders', createOrder);\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "http::POST::/orders").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn fetch_consumer_absolute_url() {
+        let src =
+            "async function load() {\n  const r = await fetch('https://api.io/v1/users');\n}\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "http::GET::/v1/users").expect("route not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("load"));
+    }
+
+    #[test]
+    fn express_template_consumer() {
+        let src = "async function load() {\n  await fetch(`${API_URL}/v1/tags/${id}`);\n}\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "http::GET::/v1/tags/{p1}").expect("route not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(
+            c.params,
+            vec![PathParam {
+                position: 1,
+                name: "id".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn axios_member_consumer() {
+        let src = "const d = await axios.get('/v1/users');\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "http::GET::/v1/users").expect("route not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn process_env_member_read() {
+        let src = "const url = process.env.DATABASE_URL;\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "env::::DATABASE_URL").expect("env not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol, None);
+    }
+
+    #[test]
+    fn process_env_subscript_read() {
+        let src = "const k = process.env['API_KEY'];\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "env::::API_KEY").expect("env not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn import_meta_env_read() {
+        let src = "const k = import.meta.env.VITE_API_KEY;\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "env::::VITE_API_KEY").expect("env not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn process_env_write_is_ambiguous_provider() {
+        let src = "process.env.FEATURE_FLAG = 'on';\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "env::::FEATURE_FLAG");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
     }
 }
