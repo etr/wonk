@@ -3671,18 +3671,9 @@ function unknown() { return mystery(); }
         }
     }
 
-    /// Measure `build_index` on the synthetic corpus.  Runs the build three
-    /// times on a fresh database each and prints per-run elapsed, the
-    /// median, the `term_stats` row count, and the index DB size.  No
-    /// timing assertion — this is a measurement harness, run manually via
-    /// `cargo test --release bench_build_index_term_stats_overhead -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn bench_build_index_term_stats_overhead() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path();
-        write_bench_corpus(root);
-
+    /// Run `build_index` three times on a fresh database, printing per-run
+    /// elapsed and the median.  Returns the sorted durations.
+    fn bench_three_fresh_builds(root: &Path) -> Vec<std::time::Duration> {
         let mut durations = Vec::new();
         for run in 0..3 {
             let index_dir = root.join(".wonk");
@@ -3702,9 +3693,12 @@ function unknown() { return mystery(); }
             );
         }
         durations.sort();
-        let median = durations[1];
-        println!("bench median: {median:?}");
+        println!("bench median: {:?}", durations[1]);
+        durations
+    }
 
+    /// Print the built index's DB size and `term_stats` row count.
+    fn print_bench_db_stats(root: &Path) {
         let index_path = db::local_index_path(root);
         let db_size = fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
         println!("bench index db size: {db_size} bytes");
@@ -3725,5 +3719,34 @@ function unknown() { return mystery(); }
             0
         };
         println!("bench term_stats rows: {term_stats_rows}");
+    }
+
+    /// Measure `build_index` on the synthetic corpus.  No timing assertion —
+    /// this is a measurement harness, run manually via
+    /// `cargo test --release bench_build_index_term_stats_overhead -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_build_index_term_stats_overhead() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_bench_corpus(root);
+
+        bench_three_fresh_builds(root);
+        print_bench_db_stats(root);
+    }
+
+    /// Real-repo cross-check: build the index over this checkout itself —
+    /// the index-only counterpart to `wonk init --local` (which also runs
+    /// the embedding pass).  Removes the generated `.wonk` directory so
+    /// the tree stays clean.
+    #[test]
+    #[ignore]
+    fn bench_real_repo_build_index() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        bench_three_fresh_builds(&root);
+        print_bench_db_stats(&root);
+
+        fs::remove_dir_all(root.join(".wonk")).unwrap();
     }
 }
