@@ -293,6 +293,7 @@ mod tests {
             ref_count: 2000,
             caller_count: 150,
             type_edge_count: 0,
+            contract_count: 0,
             elapsed: Duration::from_secs_f64(1.5),
         };
         // Should not panic or produce stdout output
@@ -334,6 +335,7 @@ mod tests {
             ref_count: 200,
             caller_count: 50,
             type_edge_count: 3,
+            contract_count: 0,
             elapsed: Duration::from_secs_f64(1.5),
         };
         let summary = p.format_summary(&stats);
@@ -352,6 +354,7 @@ mod tests {
             ref_count: 200,
             caller_count: 50,
             type_edge_count: 0,
+            contract_count: 0,
             elapsed: Duration::from_secs_f64(1.5),
         };
         let summary = p.format_summary(&stats);

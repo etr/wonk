@@ -24,7 +24,7 @@ use crate::embedding::{self, EmbeddingProvider};
 use crate::errors::EmbeddingError;
 use crate::indexer;
 use crate::progress::{Progress, ProgressMode};
-use crate::types::{RawTypeEdge, Reference, Symbol};
+use crate::types::{ContractCandidate, RawTypeEdge, Reference, Symbol};
 use crate::walker::Walker;
 use crate::watcher::FileEvent;
 
@@ -45,6 +45,8 @@ pub struct IndexStats {
     pub caller_count: usize,
     /// Number of type hierarchy edges (extends/implements) stored.
     pub type_edge_count: usize,
+    /// Contract candidates extracted (TASK-082; persisted in TASK-083).
+    pub contract_count: usize,
     /// Wall-clock elapsed time.
     pub elapsed: std::time::Duration,
 }
@@ -73,6 +75,8 @@ struct FileResult {
     type_edges: Vec<RawTypeEdge>,
     /// BM25 term frequencies over the raw content (TASK-078).
     term_freqs: HashMap<String, u32>,
+    /// Contract candidates extracted on the same tree walk (TASK-082).
+    contracts: Vec<ContractCandidate>,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +146,7 @@ pub fn build_index_with_progress(
     } else {
         None
     };
-    let (sym_count, ref_count, caller_count, type_edge_count) =
+    let (sym_count, ref_count, caller_count, type_edge_count, contract_count) =
         batch_insert(&conn, &results, reach_opts.as_ref())?;
 
     // 6. Collect languages seen and write meta.json.
@@ -163,6 +167,7 @@ pub fn build_index_with_progress(
         ref_count,
         caller_count,
         type_edge_count,
+        contract_count,
         elapsed: start.elapsed(),
     })
 }
@@ -284,6 +289,9 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
         ref_count,
         caller_count,
         type_edge_count,
+        // Contracts are not persisted yet, so incremental runs report zero
+        // until TASK-083 lands storage and aggregates here.
+        contract_count: 0,
         elapsed: start.elapsed(),
     })
 }
@@ -373,6 +381,9 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
     let file_imports = indexer::extract_imports(&tree, &parse_source, &rel_path, lang);
     let type_edges = indexer::extract_type_edges(&tree, &parse_source, &rel_path, lang);
 
+    // Extract contract candidates on the same tree (PRD-CTR-REQ-011).
+    let contracts = crate::contracts::extract_contracts(&tree, &parse_source, lang);
+
     // Compute confidence for each reference.
     for r in &mut refs {
         r.confidence = indexer::compute_confidence(r, &symbols, &file_imports.imports);
@@ -394,6 +405,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
             imports: file_imports.imports,
             type_edges,
             term_freqs,
+            contracts,
         },
     )?;
 
@@ -764,6 +776,9 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
     // Extract type hierarchy edges (extends/implements).
     let type_edges = indexer::extract_type_edges(&tree, &parse_source, &rel_path, lang);
 
+    // Extract contract candidates on the same tree (PRD-CTR-REQ-011).
+    let contracts = crate::contracts::extract_contracts(&tree, &parse_source, lang);
+
     // Compute confidence for each reference.
     for r in &mut refs {
         r.confidence = indexer::compute_confidence(r, &symbols, &file_imports.imports);
@@ -782,17 +797,19 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
         imports: file_imports.imports,
         type_edges,
         term_freqs,
+        contracts,
     })
 }
 
 /// Insert all results into the database in a single transaction.
 ///
-/// Returns (symbol_count, ref_count, caller_count, type_edge_count).
+/// Returns (symbol_count, ref_count, caller_count, type_edge_count,
+/// contract_count).
 fn batch_insert(
     conn: &Connection,
     results: &[FileResult],
     reach_opts: Option<&crate::reach::ReachBuildOptions>,
-) -> Result<(usize, usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize, usize)> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -991,7 +1008,17 @@ fn batch_insert(
     }
 
     tx.commit().context("committing transaction")?;
-    Ok((total_syms, total_refs, caller_count, type_edge_count))
+    // Contracts are carried on FileResult; summing here keeps the field read
+    // until TASK-083 persists them.
+    let contract_count: usize = results.iter().map(|r| r.contracts.len()).sum();
+
+    Ok((
+        total_syms,
+        total_refs,
+        caller_count,
+        type_edge_count,
+        contract_count,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1585,6 +1612,51 @@ class Component {
         .unwrap();
 
         dir
+    }
+
+    fn make_contract_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/app.js"),
+            "const app = express();\n             app.get('/v1/users/:id', getUser);\n             app.post('/orders', createOrder);\n             const db = process.env.DATABASE_URL;\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/util.txt"), "not code\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_index_reports_contract_count() {
+        let dir = make_contract_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+        // 2 HTTP providers + 1 env consumer; util.txt contributes nothing.
+        assert_eq!(stats.contract_count, 3, "got {stats:?}");
+    }
+
+    #[test]
+    fn reindex_file_extracts_contracts() {
+        // No storage yet (TASK-083): reindex_file must run the contract
+        // extractor inline without failing, and skip unchanged content.
+        let dir = make_contract_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+        assert_eq!(stats.contract_count, 3);
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+        let file = dir.path().join("src/app.js");
+        // Unchanged content: hash match skips the reindex.
+        assert!(!reindex_file(&conn, &file, dir.path()).unwrap());
+
+        fs::write(
+            &file,
+            "const app = express();\n             app.get('/v1/users/:id', getUser);\n             app.post('/orders', createOrder);\n             app.delete('/orders/:id', deleteOrder);\n             const db = process.env.DATABASE_URL;\n",
+        )
+        .unwrap();
+        assert!(reindex_file(&conn, &file, dir.path()).unwrap());
+        assert!(!reindex_file(&conn, &file, dir.path()).unwrap());
     }
 
     #[test]
