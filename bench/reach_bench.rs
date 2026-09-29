@@ -196,7 +196,7 @@ fn table_size(conn: &rusqlite::Connection) -> Result<TableSize> {
     })
 }
 
-fn percentiles(samples: &mut Vec<f64>) -> (f64, f64, f64) {
+fn percentiles(samples: &mut [f64]) -> (f64, f64, f64) {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = samples.len();
     let at = |q: f64| samples[((q * (n - 1) as f64).round()) as usize];

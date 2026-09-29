@@ -1310,7 +1310,7 @@ mod tests {
         let d_top = g.symbol("d_top", "function", "src/a.rs");
         let d_l = g.symbol("d_l", "function", "src/b.rs");
         let d_r = g.symbol("d_r", "method", "src/b.rs");
-        let d_bot = g.symbol("d_bot", "class", "src/c.rs");
+        g.symbol("d_bot", "class", "src/c.rs");
         insert_ref(conn, "d_l", Some(d_top), 0.95);
         insert_ref(conn, "d_r", Some(d_top), 0.8);
         insert_ref(conn, "d_bot", Some(d_l), 0.85);
@@ -1413,6 +1413,16 @@ mod tests {
         }
     }
 
+    fn distinct_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT name FROM symbols ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
     /// AR-021 mandatory equivalence: for every name in every seeded graph,
     /// the table answer equals the live BFS at every depth ≤ built depth.
     #[test]
@@ -1422,17 +1432,7 @@ mod tests {
             seed_graph(&conn, seed);
             build(&conn, 3, usize::MAX);
 
-            let mut names: Vec<String> = {
-                let mut stmt = conn
-                    .prepare("SELECT DISTINCT name FROM symbols ORDER BY name")
-                    .unwrap();
-                let rows = stmt
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .unwrap()
-                    .collect::<rusqlite::Result<_>>()
-                    .unwrap();
-                rows
-            };
+            let mut names = distinct_names(&conn);
             names.push("definitely_missing_name".into());
 
             for name in &names {
