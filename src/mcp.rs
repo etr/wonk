@@ -2880,11 +2880,41 @@ impl McpServer {
         // NL queries like "error handling in route handlers" gracefully degrade to
         // pure semantic (ripgrep returns nothing for natural language).
         let repo_path = repo_root.to_string_lossy().into_owned();
-        let structural_results =
+        let mut structural_results =
             search::text_search(&query, false, true, &[repo_path]).unwrap_or_default();
+        // Normalize grep paths to repo-relative form so they key into the
+        // index (`files`/`term_stats` store repo-relative paths, like the
+        // CLI's cwd-relative search) and merge with semantic results under
+        // one (file, line) key during fusion.
+        for result in &mut structural_results {
+            if let Ok(rel) = result.file.strip_prefix(&repo_root) {
+                result.file = rel.to_path_buf();
+            }
+        }
 
         if !structural_results.is_empty() {
-            let fused = ranker::fuse_rrf(&structural_results, &semantic_results, 60.0);
+            // Re-rank the lexical candidate set by BM25 (TASK-079) before it
+            // enters fusion — the same lexical-input contract as the CLI
+            // `--semantic` path. `None` means no usable term statistics
+            // (pre-V5 index), in which case the list passes through in walk
+            // order; the MCP surface has no hint channel, so the fallback is
+            // silent.
+            let config = match crate::config::Config::load(Some(&repo_root)) {
+                Ok(c) => c,
+                Err(e) => {
+                    return CallToolResult::error(format!(
+                        "failed to load search configuration: {e:#}"
+                    ));
+                }
+            };
+            let ranked = crate::bm25::rerank_lexical(
+                conn,
+                &structural_results,
+                &query,
+                crate::bm25::Bm25Params::from(&config.search),
+            );
+            let lexical: &[search::SearchResult] = ranked.as_deref().unwrap_or(&structural_results);
+            let fused = ranker::fuse_rrf(lexical, &semantic_results, config.search.rrf_k);
 
             let mut budget = budget_limit.map(TokenBudget::new);
             let mut outputs: Vec<SearchOutput> = Vec::new();
