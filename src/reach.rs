@@ -129,6 +129,104 @@ impl NameBfs {
     }
 }
 
+/// A traversal candidate: a symbol row the BFS may record as a target.
+///
+/// Both engines enumerate candidates as these values — the full build from
+/// the in-memory [`ReachGraph`] ([`GraphCandidates`]) and the incremental
+/// repair from indexed SQL ([`SqlCandidates`]) — so their candidate lists
+/// can be compared for exact equality, which is the
+/// equivalence-by-construction guarantee the repair rests on.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReachCandidate {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) kind: SymbolKind,
+    pub(crate) file: String,
+    pub(crate) line: i64,
+    /// Confidence of the discovering edge; MAX over the caller's refs to
+    /// this name for caller candidates, 1.0 for type-edge children.
+    pub(crate) confidence: f64,
+}
+
+/// Candidate enumeration for one BFS step, abstracted over the two engines.
+///
+/// `caller_candidates(name)` lists the symbols calling `name` (one entry per
+/// caller symbol row, carrying that caller's MAX confidence among its refs
+/// to the name); `child_candidates(name)` lists the type-edge children of
+/// any symbol named `name`. Both are ordered by (file, line, id) — the
+/// deterministic representative rules shared with blast's traversal.
+pub(crate) trait CandidateSource {
+    fn caller_candidates(&mut self, name: &str) -> Result<&[ReachCandidate]>;
+    fn child_candidates(&mut self, name: &str) -> Result<&[ReachCandidate]>;
+}
+
+/// Rows computed for one source name: `(target_id, min_depth, confidence)`.
+/// The source id is the caller's choice (canonical MIN-eligible id).
+pub(crate) type ComputedSourceRows = Vec<(i64, i64, f64)>;
+
+/// One recording step of the source traversal shared by build and repair.
+///
+/// Runs the same name-keyed BFS loop `build_reach` always ran — cap check
+/// first (a `false` return halts the whole traversal), then edge
+/// eligibility, then the shared [`NameBfs`] visited/enqueue rule, then the
+/// row write — over any [`CandidateSource`], so the full build (in-memory
+/// graph) and the incremental repair (indexed SQL) execute one code path.
+///
+/// Returns `(rows, truncated)`; `truncated` is set when the fan-out cap
+/// halted the traversal, making `rows` a deterministic BFS prefix.
+pub(crate) fn compute_source_rows(
+    src: &mut dyn CandidateSource,
+    name: &str,
+    opts: &ReachBuildOptions,
+) -> Result<(ComputedSourceRows, bool)> {
+    let filter = EdgeFilter::default();
+    let mut bfs = NameBfs::new(name);
+    let mut rows: ComputedSourceRows = Vec::new();
+    let mut recorded = 0usize;
+    let mut truncated = false;
+
+    // Fan-out cap first: `false` means the cap was hit and the whole
+    // traversal must halt; the recorded rows are a deterministic BFS prefix.
+    let mut record = |bfs: &mut NameBfs, cand: &ReachCandidate, depth: usize| -> bool {
+        if recorded == opts.max_targets {
+            truncated = true;
+            return false;
+        }
+        if !edge_eligible(&cand.file, cand.confidence, &filter) {
+            return true;
+        }
+        if bfs.admit(&cand.name, &cand.file, depth, opts.depth) {
+            rows.push((cand.id, depth as i64, cand.confidence));
+            recorded += 1;
+        }
+        true
+    };
+
+    'traversal: while let Some((target_name, depth)) = bfs.pop() {
+        if depth > opts.depth {
+            continue;
+        }
+
+        for cand in src.caller_candidates(&target_name)? {
+            if !record(&mut bfs, cand, depth) {
+                break 'traversal;
+            }
+        }
+
+        // Type-edge children only for the initially queried name
+        // (depth == 1), mirroring PRD-HRTG-REQ-003 in blast.
+        if depth == 1 {
+            for cand in src.child_candidates(&target_name)? {
+                if !record(&mut bfs, cand, depth) {
+                    break 'traversal;
+                }
+            }
+        }
+    }
+
+    Ok((rows, truncated))
+}
+
 /// Options for a full reach build.
 #[derive(Debug, Clone)]
 pub struct ReachBuildOptions {
@@ -184,20 +282,21 @@ struct LoadedSymbol {
 }
 
 /// In-memory graph the per-name BFS runs over, loaded in three queries.
-struct ReachGraph {
+pub(crate) struct ReachGraph {
     /// All symbols (any kind — Modules can be targets), ordered by id.
     symbols: Vec<LoadedSymbol>,
     /// Eligibility (non-Module) per symbol position.
     eligible: Vec<bool>,
     /// name -> positions into `symbols` (all kinds).
     by_name: HashMap<String, Vec<usize>>,
-    /// callee name -> (caller position, MAX confidence among that caller's
-    /// refs to the name), ordered by (file, line) — the caller candidate
-    /// list, finalized at load.
-    refs_by_name: HashMap<String, Vec<(usize, f64)>>,
-    /// parent name -> child positions (union over same-named parents),
-    /// ordered by (file, line) — finalized at load.
-    children_by_parent_name: HashMap<String, Vec<usize>>,
+    /// callee name -> caller candidates, one per caller symbol row carrying
+    /// that row's MAX confidence among its refs to the name, ordered by
+    /// (file, line, id) — finalized at load.
+    refs_by_name: HashMap<String, Vec<ReachCandidate>>,
+    /// parent name -> child candidates (union over same-named parents,
+    /// deduplicated per child row), ordered by (file, line, id) — finalized
+    /// at load.
+    children_by_parent_name: HashMap<String, Vec<ReachCandidate>>,
 }
 
 impl ReachGraph {
@@ -232,6 +331,18 @@ impl ReachGraph {
         for (pos, sym) in symbols.iter().enumerate() {
             by_name.entry(sym.name.clone()).or_default().push(pos);
         }
+
+        let candidate = |pos: &usize| -> ReachCandidate {
+            let sym = &symbols[*pos];
+            ReachCandidate {
+                id: sym.id,
+                name: sym.name.clone(),
+                kind: sym.kind,
+                file: sym.file.clone(),
+                line: sym.line,
+                confidence: 0.0,
+            }
+        };
 
         let mut refs_by_name: HashMap<String, Vec<(usize, f64)>> = HashMap::new();
         {
@@ -280,29 +391,60 @@ impl ReachGraph {
 
         // The candidate lists are pure functions of the immutable graph, so
         // they are finalized once here instead of per BFS step: fold each
-        // callee's refs to the MAX confidence per caller row, and sort both
-        // maps' Vecs by (file, line) — the deterministic representative
-        // rules shared with blast's ordered traversal.
-        for candidates in refs_by_name.values_mut() {
-            let mut max_conf: HashMap<usize, f64> = HashMap::with_capacity(candidates.len());
-            for (caller_pos, confidence) in candidates.iter() {
-                let slot = max_conf.entry(*caller_pos).or_insert(*confidence);
-                if *confidence > *slot {
-                    *slot = *confidence;
+        // callee's refs to one row per caller (MAX confidence), dedup the
+        // children lists per child row, and sort both by (file, line, id) —
+        // the deterministic representative rules shared with blast's ordered
+        // traversal and with `SqlCandidates`'s SQL (id breaks exact
+        // (file, line) ties, which the DB layer permits).
+        let order_by_location = |a: &ReachCandidate, b: &ReachCandidate| {
+            a.file
+                .cmp(&b.file)
+                .then(a.line.cmp(&b.line))
+                .then(a.id.cmp(&b.id))
+        };
+        let refs_by_name: HashMap<String, Vec<ReachCandidate>> = refs_by_name
+            .into_iter()
+            .map(|(name, mut candidates)| {
+                let mut max_conf: HashMap<usize, f64> = HashMap::with_capacity(candidates.len());
+                for (caller_pos, confidence) in candidates.iter() {
+                    let slot = max_conf.entry(*caller_pos).or_insert(*confidence);
+                    if *confidence > *slot {
+                        *slot = *confidence;
+                    }
                 }
-            }
-            *candidates = max_conf.into_iter().collect();
-            candidates.sort_by(|a, b| {
-                let (sa, sb) = (&symbols[a.0], &symbols[b.0]);
-                sa.file.cmp(&sb.file).then(sa.line.cmp(&sb.line))
-            });
-        }
-        for children in children_by_parent_name.values_mut() {
-            children.sort_by(|a, b| {
-                let (sa, sb) = (&symbols[*a], &symbols[*b]);
-                sa.file.cmp(&sb.file).then(sa.line.cmp(&sb.line))
-            });
-        }
+                candidates = max_conf.into_iter().collect();
+                let mut folded: Vec<ReachCandidate> = candidates
+                    .iter()
+                    .map(|(pos, conf)| {
+                        let mut cand = candidate(pos);
+                        cand.confidence = *conf;
+                        cand
+                    })
+                    .collect();
+                folded.sort_by(order_by_location);
+                (name, folded)
+            })
+            .collect();
+        let children_by_parent_name: HashMap<String, Vec<ReachCandidate>> = children_by_parent_name
+            .into_iter()
+            .map(|(name, positions)| {
+                // Dedup per child row: same-named parents (or duplicate
+                // edges) can list one child twice; the traversal's
+                // (name, file) dedup would drop the repeat anyway.
+                let mut seen = HashSet::new();
+                let mut children: Vec<ReachCandidate> = positions
+                    .iter()
+                    .filter(|pos| seen.insert(**pos))
+                    .map(|pos| {
+                        let mut cand = candidate(pos);
+                        cand.confidence = 1.0;
+                        cand
+                    })
+                    .collect();
+                children.sort_by(order_by_location);
+                (name, children)
+            })
+            .collect();
 
         Ok(Self {
             symbols,
@@ -313,19 +455,141 @@ impl ReachGraph {
         })
     }
 
-    /// Candidates calling `name`: one entry per caller symbol row carrying
-    /// the MAX confidence among that row's references to `name`, ordered by
-    /// (file, line) — precomputed at load, so traversal only looks it up.
-    fn caller_candidates(&self, name: &str) -> &[(usize, f64)] {
+    /// Canonical source id for `name`: MIN id over its eligible symbols, or
+    /// `None` for unknown and Module-only names.
+    fn canonical_source_id(&self, name: &str) -> Option<i64> {
+        let positions = self.by_name.get(name)?;
+        positions
+            .iter()
+            .copied()
+            .filter(|&p| self.eligible[p])
+            .map(|p| self.symbols[p].id)
+            .min()
+    }
+
+    /// Candidates calling `name` — precomputed at load, so traversal only
+    /// looks it up.
+    fn caller_candidates(&self, name: &str) -> &[ReachCandidate] {
         self.refs_by_name.get(name).map_or(&[], |v| v.as_slice())
     }
 
-    /// Type-edge children of any symbol named `name`, ordered by (file,
-    /// line) — precomputed at load.
-    fn child_candidates(&self, name: &str) -> &[usize] {
+    /// Type-edge children of any symbol named `name` — precomputed at load.
+    fn child_candidates(&self, name: &str) -> &[ReachCandidate] {
         self.children_by_parent_name
             .get(name)
             .map_or(&[], |v| v.as_slice())
+    }
+}
+
+/// [`CandidateSource`] over the loaded [`ReachGraph`] — the full build's
+/// engine.
+pub(crate) struct GraphCandidates<'a> {
+    graph: &'a ReachGraph,
+}
+
+impl<'a> GraphCandidates<'a> {
+    pub(crate) fn new(graph: &'a ReachGraph) -> Self {
+        Self { graph }
+    }
+}
+
+impl CandidateSource for GraphCandidates<'_> {
+    fn caller_candidates(&mut self, name: &str) -> Result<&[ReachCandidate]> {
+        Ok(self.graph.caller_candidates(name))
+    }
+
+    fn child_candidates(&mut self, name: &str) -> Result<&[ReachCandidate]> {
+        Ok(self.graph.child_candidates(name))
+    }
+}
+
+/// [`CandidateSource`] over indexed SQL — the incremental repair's engine.
+///
+/// The two prepared statements fold exactly like [`ReachGraph::load`]: one
+/// row per caller symbol id with the MAX confidence among that caller's
+/// refs to the name (`GROUP BY s.id` + `MAX`), one row per child symbol id
+/// (`GROUP BY c.id`), both ordered by (file, line, id). A per-repair memo
+/// caches lookups so rebuilding many sources in one repair reuses each
+/// name's candidate list.
+// WI-2's `finish_file_edit` constructs this; the allow is dropped there.
+#[allow(dead_code)]
+pub(crate) struct SqlCandidates<'a> {
+    caller_stmt: rusqlite::Statement<'a>,
+    child_stmt: rusqlite::Statement<'a>,
+    caller_memo: HashMap<String, Vec<ReachCandidate>>,
+    child_memo: HashMap<String, Vec<ReachCandidate>>,
+}
+
+// WI-2's `finish_file_edit` constructs this; the allow is dropped there.
+#[allow(dead_code)]
+impl<'a> SqlCandidates<'a> {
+    pub(crate) fn new(conn: &'a Connection) -> Result<Self> {
+        let caller_stmt = conn.prepare(
+            "SELECT s.id, s.name, s.kind, s.file, s.line, MAX(r.confidence) \
+             FROM \"references\" r JOIN symbols s ON s.id = r.caller_id \
+             WHERE r.name = ?1 \
+             GROUP BY s.id ORDER BY s.file, s.line, s.id",
+        )?;
+        let child_stmt = conn.prepare(
+            "SELECT c.id, c.name, c.kind, c.file, c.line \
+             FROM type_edges te \
+             JOIN symbols p ON p.id = te.parent_id \
+             JOIN symbols c ON c.id = te.child_id \
+             WHERE p.name = ?1 \
+             GROUP BY c.id ORDER BY c.file, c.line, c.id",
+        )?;
+        Ok(Self {
+            caller_stmt,
+            child_stmt,
+            caller_memo: HashMap::new(),
+            child_memo: HashMap::new(),
+        })
+    }
+
+    fn map_caller_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReachCandidate> {
+        Ok(ReachCandidate {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+            file: row.get(3)?,
+            line: row.get(4)?,
+            confidence: row.get(5)?,
+        })
+    }
+
+    fn map_child_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReachCandidate> {
+        Ok(ReachCandidate {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+            file: row.get(3)?,
+            line: row.get(4)?,
+            confidence: 1.0,
+        })
+    }
+}
+
+impl CandidateSource for SqlCandidates<'_> {
+    fn caller_candidates(&mut self, name: &str) -> Result<&[ReachCandidate]> {
+        if !self.caller_memo.contains_key(name) {
+            let rows = self
+                .caller_stmt
+                .query_map(rusqlite::params![name], Self::map_caller_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            self.caller_memo.insert(name.to_string(), rows);
+        }
+        Ok(&self.caller_memo[name])
+    }
+
+    fn child_candidates(&mut self, name: &str) -> Result<&[ReachCandidate]> {
+        if !self.child_memo.contains_key(name) {
+            let rows = self
+                .child_stmt
+                .query_map(rusqlite::params![name], Self::map_child_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            self.child_memo.insert(name.to_string(), rows);
+        }
+        Ok(&self.child_memo[name])
     }
 }
 
@@ -344,7 +608,6 @@ pub fn build_reach(
     crate::db::ensure_reach_table(tx)?;
 
     let graph = ReachGraph::load(tx)?;
-    let filter = EdgeFilter::default();
 
     // Deterministic source-name order keeps row insertion stable.
     let mut names: Vec<&String> = graph.by_name.keys().collect();
@@ -354,67 +617,24 @@ pub fn build_reach(
     let mut truncated_sources: Vec<i64> = Vec::new();
     let mut sources = 0usize;
 
+    let mut candidates = GraphCandidates::new(&graph);
     for name in names {
-        let positions = &graph.by_name[name.as_str()];
-        let Some(source_pos) = positions.iter().copied().find(|&p| graph.eligible[p]) else {
+        let Some(source_id) = graph.canonical_source_id(name) else {
             continue; // Module-only names are not precomputation targets.
         };
         sources += 1;
-        let source_id = graph.symbols[source_pos].id;
 
-        let mut bfs = NameBfs::new(name);
-
-        let mut recorded = 0usize;
-        let mut truncated = false;
-
-        // One recording step for caller edges and type-edge children alike
-        // (they differ only in candidate source and confidence): fan-out cap
-        // check first — `false` means the cap was hit and the whole
-        // traversal must halt — then eligibility, the shared
-        // visited/enqueue rule, and the row write.
-        let mut record =
-            |bfs: &mut NameBfs, sym: &LoadedSymbol, confidence: f64, depth: usize| -> bool {
-                if recorded == opts.max_targets {
-                    truncated = true;
-                    return false;
-                }
-                if !edge_eligible(&sym.file, confidence, &filter) {
-                    return true;
-                }
-                if bfs.admit(&sym.name, &sym.file, depth, opts.depth) {
-                    rows.push((source_id, sym.id, depth as i64, confidence));
-                    recorded += 1;
-                }
-                true
-            };
-
-        // The fan-out cap halts the whole traversal; the recorded rows are a
-        // deterministic BFS prefix (a lower bound on the true reach set).
-        'traversal: while let Some((target_name, depth)) = bfs.pop() {
-            if depth > opts.depth {
-                continue;
-            }
-
-            for &(caller_pos, confidence) in graph.caller_candidates(&target_name) {
-                if !record(&mut bfs, &graph.symbols[caller_pos], confidence, depth) {
-                    break 'traversal;
-                }
-            }
-
-            // Type-edge children only for the initially queried name
-            // (depth == 1), mirroring PRD-HRTG-REQ-003 in blast.
-            if depth == 1 {
-                for &child_pos in graph.child_candidates(&target_name) {
-                    if !record(&mut bfs, &graph.symbols[child_pos], 1.0, depth) {
-                        break 'traversal;
-                    }
-                }
-            }
-        }
-
+        let (source_rows, truncated) = compute_source_rows(&mut candidates, name, opts)?;
         if truncated {
             truncated_sources.push(source_id);
         }
+        rows.extend(
+            source_rows
+                .into_iter()
+                .map(|(target_id, min_depth, confidence)| {
+                    (source_id, target_id, min_depth, confidence)
+                }),
+        );
     }
 
     // Phase 3: replace previous contents inside the caller's transaction.
@@ -1583,6 +1803,41 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// WI-1 parity seam: the in-memory candidate lists the full build walks
+    /// and the SQL lists the incremental repair walks must be identical —
+    /// this is the equivalence-by-construction guarantee the repair rests on.
+    #[test]
+    fn candidate_sources_agree_on_seeded_graphs() {
+        for seed in 1..=5u64 {
+            let (_dir, conn) = make_db();
+            seed_graph(&conn, seed);
+            let tx = conn.unchecked_transaction().unwrap();
+            let graph = ReachGraph::load(&tx).unwrap();
+            let names = distinct_names(&tx);
+            {
+                let mut from_graph = GraphCandidates::new(&graph);
+                let mut from_sql = SqlCandidates::new(&tx).unwrap();
+
+                for name in &names {
+                    let g_callers = from_graph.caller_candidates(name).unwrap().to_vec();
+                    let s_callers = from_sql.caller_candidates(name).unwrap().to_vec();
+                    assert_eq!(
+                        g_callers, s_callers,
+                        "seed {seed} name {name}: caller candidate lists diverge"
+                    );
+
+                    let g_children = from_graph.child_candidates(name).unwrap().to_vec();
+                    let s_children = from_sql.child_candidates(name).unwrap().to_vec();
+                    assert_eq!(
+                        g_children, s_children,
+                        "seed {seed} name {name}: child candidate lists diverge"
+                    );
+                }
+            }
+            tx.commit().unwrap();
         }
     }
 
