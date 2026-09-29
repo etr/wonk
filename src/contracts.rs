@@ -7105,6 +7105,140 @@ public class UsersController : ControllerBase
             canonical_id: "env::::DATABASE_URL",
             params: &[],
         },
+        // -- message kinds (TASK-087) --------------------------------------
+        // Kafka orders.created: producer and consumer of one topic ID.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "producer.send({ topic: 'orders.created', messages: [m] });",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::kafka::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Java,
+            source: "class C {\n    @KafkaListener(topics = \"orders.created\")\n    public void handle(String m) {}\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::kafka::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Rust,
+            source: "fn f() { consumer.subscribe(&[\"orders.created\"]).unwrap(); }",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::kafka::orders.created",
+            params: &[],
+        },
+        // NATS orders.created.
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "package main\nfunc a() { nc.Publish(\"orders.created\", d) }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::nats::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "package main\nfunc a() { nc.Subscribe(\"orders.created\", cb) }",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::nats::orders.created",
+            params: &[],
+        },
+        // RabbitMQ orders.created.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "ch.consume('orders.created', (m) => {});",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::rabbitmq::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "ch.basic_publish(exchange='', routing_key='orders.created', body=b)",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::rabbitmq::orders.created",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "q = channel.queue('orders.created')\nq.subscribe do |i, p, b|\nend",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "queue::rabbitmq::orders.created",
+            params: &[],
+        },
+        // Websocket chat.message: emit and handler share one ID.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "io.emit('chat.message', payload);",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "websocket::::chat.message",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "socket.on('chat.message', (m) => {});",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "websocket::::chat.message",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Java,
+            source: "class C {\n    @SendTo(\"/topic/orders\")\n    public void handle(String m) {}\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "websocket::::topic.orders",
+            params: &[],
+        },
+        // Jobs: definition and enqueue share one ID.
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "@app.task(name='orders.sync')\ndef sync():\n    pass",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::orders.sync",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "def f():\n    celery_app.send_task('orders.sync')",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::orders.sync",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "class EmailWorker\n  include Sidekiq::Job\nend",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::EmailWorker",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "EmailWorker.perform_async(1)",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::EmailWorker",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "package main\nfunc setup() { c.AddFunc(\"*/5 * * * * *\", pollOrders) }",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "job::::pollOrders",
+            params: &[],
+        },
     ];
 
     #[test]
@@ -7328,5 +7462,166 @@ public class UsersController : ControllerBase
         .unwrap();
         let stats = crate::pipeline::build_index(root, true).unwrap();
         assert_eq!(stats.contract_count, 1, "got {stats:?}");
+    }
+
+    // -- acceptance: message kinds (TASK-087) ---------------------------------
+
+    #[test]
+    fn acceptance_producer_consumer_same_topic_id_cross_repo() {
+        // Framework pair: kafkajs producer + Spring @KafkaListener consumer
+        // resolve to the same canonical ID across repos and languages.
+        let producer = extract(
+            Lang::JavaScript,
+            "await producer.send({ topic: 'orders.created', messages: [m] });",
+        );
+        let consumer = extract(
+            Lang::Java,
+            "class C {\n    @KafkaListener(topics = \"orders.created\")\n    public void handle(String m) {}\n}",
+        );
+        assert_eq!(producer.len(), 1, "got {producer:?}");
+        assert_eq!(consumer.len(), 1, "got {consumer:?}");
+        assert_eq!(
+            producer[0].canonical_id, consumer[0].canonical_id,
+            "cross-repo pair diverged"
+        );
+        assert_eq!(producer[0].canonical_id, "queue::kafka::orders.created");
+        assert_eq!(producer[0].role, ContractRole::Consumer);
+        assert_eq!(consumer[0].role, ContractRole::Provider);
+
+        // Generic pair: plain-string send/subscribe on unknown receivers —
+        // empty qualifier, 0.5 on both sides, same ID.
+        let g_prod = extract(Lang::Python, "producer.send('orders.created')");
+        let g_cons = extract(Lang::Python, "consumer.subscribe('orders.created')");
+        assert_eq!(g_prod.len(), 1, "got {g_prod:?}");
+        assert_eq!(g_cons.len(), 1, "got {g_cons:?}");
+        assert_eq!(g_prod[0].canonical_id, g_cons[0].canonical_id);
+        assert_eq!(g_prod[0].canonical_id, "queue::::orders.created");
+        assert_eq!(g_prod[0].confidence, 0.5);
+        assert_eq!(g_cons[0].confidence, 0.5);
+    }
+
+    #[test]
+    fn acceptance_string_literal_topic_confidence_05() {
+        // AR-018: framework-shaped constructs score 1.0 even with string
+        // literals; only the generic verb+literal tier scores 0.5.
+        let framework = extract(
+            Lang::JavaScript,
+            "ch.sendToQueue('orders.created', Buffer.from(m));",
+        );
+        assert_eq!(framework[0].confidence, 1.0);
+        let heuristic = extract(Lang::JavaScript, "svc.send('orders.created');");
+        assert_eq!(heuristic[0].confidence, 0.5);
+        // Jobs: the BullMQ add verb is generic, agenda.define is not.
+        let agenda = extract(Lang::JavaScript, "agenda.define('email-send', fn);");
+        assert_eq!(agenda[0].confidence, 1.0);
+        let bullmq = extract(Lang::JavaScript, "emailQueue.add('email-send', d);");
+        assert_eq!(bullmq[0].confidence, 0.5);
+    }
+
+    #[test]
+    fn acceptance_websocket_pairing() {
+        let emit = extract(Lang::JavaScript, "io.emit('chat.message', d);");
+        let handler = extract(Lang::JavaScript, "socket.on('chat.message', (m) => {});");
+        assert_eq!(emit[0].canonical_id, handler[0].canonical_id);
+        assert_eq!(emit[0].canonical_id, "websocket::::chat.message");
+        assert_eq!(emit[0].role, ContractRole::Provider);
+        assert_eq!(handler[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn acceptance_job_pairing() {
+        let define = extract(Lang::JavaScript, "agenda.define('email-send', fn);");
+        let enqueue = extract(Lang::JavaScript, "emailQueue.add('email-send', d);");
+        assert_eq!(define[0].canonical_id, enqueue[0].canonical_id);
+        assert_eq!(define[0].canonical_id, "job::::email-send");
+        assert_eq!(define[0].role, ContractRole::Provider);
+        assert_eq!(enqueue[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn acceptance_kinds_independently_disableable() {
+        // One idiom of every kind in one file; disabling a kind removes
+        // exactly its own contracts and leaves the others byte-identical.
+        let src = "\
+const app = express();
+app.get('/v1/users/:id', h);
+const db = process.env.DATABASE_URL;
+producer.send({ topic: 'orders.created', messages: [m] });
+io.emit('chat.message', payload);
+agenda.define('email-send', fn);
+";
+        let baseline = extract(Lang::JavaScript, src);
+        assert_eq!(baseline.len(), 5, "got {baseline:?}");
+        let mut kinds: Vec<ContractKind> = baseline.iter().map(|c| c.kind).collect();
+        kinds.sort_by_key(|k| k.as_str());
+        let mut all_kinds = vec![
+            ContractKind::Env,
+            ContractKind::Http,
+            ContractKind::Job,
+            ContractKind::Queue,
+            ContractKind::WebSocket,
+        ];
+        all_kinds.sort_by_key(|k| k.as_str());
+        assert_eq!(kinds, all_kinds, "expected one contract of each kind");
+
+        type OptionSetter = fn(&mut ContractOptions) -> &mut ContractOptions;
+        let cases: [(ContractKind, OptionSetter); 5] = [
+            (ContractKind::Http, |o| {
+                o.http = false;
+                o
+            }),
+            (ContractKind::Env, |o| {
+                o.env = false;
+                o
+            }),
+            (ContractKind::Queue, |o| {
+                o.queue = false;
+                o
+            }),
+            (ContractKind::WebSocket, |o| {
+                o.websocket = false;
+                o
+            }),
+            (ContractKind::Job, |o| {
+                o.job = false;
+                o
+            }),
+        ];
+        for (kind, disable) in cases {
+            let mut opts = ContractOptions::default();
+            disable(&mut opts);
+            let cands = extract_with(Lang::JavaScript, src, &opts);
+            let gone: Vec<&ContractCandidate> =
+                baseline.iter().filter(|c| !cands.contains(c)).collect();
+            assert_eq!(gone.len(), 1, "{kind:?}: got {gone:?}");
+            assert_eq!(gone[0].kind, kind, "{kind:?}: removed {gone:?}");
+            // Survivors are byte-identical to the baseline entries.
+            for c in &cands {
+                assert!(baseline.contains(c), "{kind:?}: mutated {c:?}");
+            }
+        }
+
+        // All kinds off: nothing at all.
+        let all_off = ContractOptions {
+            http: false,
+            env: false,
+            queue: false,
+            websocket: false,
+            job: false,
+        };
+        assert!(extract_with(Lang::JavaScript, src, &all_off).is_empty());
+    }
+
+    #[test]
+    fn acceptance_cross_kind_disambiguation() {
+        // send on a websocket receiver is websocket, never queue.
+        let ws = extract(Lang::JavaScript, "socket.send('hello');");
+        assert_eq!(ws[0].kind, ContractKind::WebSocket);
+        // A path-like literal on an unknown receiver is the ambiguous HTTP
+        // tier, never queue.
+        let http = extract(Lang::JavaScript, "registry.get('/users');");
+        assert_eq!(http.len(), 1);
+        assert_eq!(http[0].kind, ContractKind::Http);
+        assert_eq!(http[0].confidence, 0.5);
     }
 }
