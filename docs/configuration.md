@@ -32,6 +32,8 @@ generate_url = "http://localhost:11434/api/generate" # Ollama generate endpoint
 
 [search]
 rrf_k = 60.0                  # Reciprocal Rank Fusion constant K
+bm25_k1 = 1.2                # BM25 term-frequency saturation strength
+bm25_b = 0.75                # BM25 length-normalization strength
 
 [embedding]
 provider = "bundled"          # Offline default; use "ollama" for the opt-in tier
@@ -77,6 +79,8 @@ provider = "bundled"          # Offline default; use "ollama" for the opt-in tie
 | Key | Default | Description |
 |-----|---------|-------------|
 | `rrf_k` | `60.0` | Reciprocal Rank Fusion constant K for `--semantic` blending |
+| `bm25_k1` | `1.2` | BM25 term-frequency saturation strength (k1) for `--semantic` lexical re-ranking |
+| `bm25_b` | `0.75` | BM25 length-normalization strength (b) in `[0, 1]`; `0` disables it |
 
 **`[embedding]`**
 
