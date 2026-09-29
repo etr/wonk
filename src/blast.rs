@@ -5,14 +5,12 @@
 //! risk level. Supports upstream (callers + type hierarchy children) and
 //! downstream (callees) traversal directions.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::ranker;
 use crate::types::{
     BlastAffectedSymbol, BlastAnalysis, BlastDirection, BlastRiskLevel, BlastSeverity, BlastTier,
     SymbolKind,
@@ -35,6 +33,9 @@ pub struct BlastOptions {
     pub include_tests: bool,
     /// Minimum confidence threshold for edge filtering.
     pub min_confidence: Option<f64>,
+    /// Whether qualifying queries may be answered from the precomputed
+    /// reach table (default: true; PRD-REACH-REQ-003).
+    pub use_reach: bool,
 }
 
 impl Default for BlastOptions {
@@ -44,6 +45,7 @@ impl Default for BlastOptions {
             direction: BlastDirection::Upstream,
             include_tests: false,
             min_confidence: None,
+            use_reach: true,
         }
     }
 }
@@ -89,221 +91,33 @@ fn risk_level_for_count(count: usize) -> BlastRiskLevel {
 
 /// Try to add a discovered symbol to the affected set.
 ///
-/// Checks visited/queued dedup and test-file exclusion. If the symbol passes,
-/// it is pushed to `affected` and optionally enqueued for further BFS expansion.
-#[allow(clippy::too_many_arguments)]
+/// Visited/queued dedup and enqueue run through the shared
+/// [`crate::reach::NameBfs`] traversal core. Edge eligibility (confidence
+/// floor, test-file exclusion) is decided by [`crate::reach::edge_eligible`]
+/// before this is called, so both the live BFS and the precomputed build
+/// share one predicate and one enqueue rule (AR-021).
 fn push_if_new(
-    name: String,
-    kind: SymbolKind,
-    file: String,
-    line: usize,
-    depth: usize,
-    confidence: f64,
-    max_depth: usize,
-    include_tests: bool,
-    visited: &mut HashSet<(String, String)>,
-    queued: &mut HashSet<String>,
-    queue: &mut VecDeque<(String, usize)>,
+    bfs: &mut crate::reach::NameBfs,
     affected: &mut Vec<BlastAffectedSymbol>,
+    sym: BlastAffectedSymbol,
+    max_depth: usize,
 ) {
-    let key = (name.clone(), file.clone());
-    if visited.contains(&key) {
-        return;
-    }
-    visited.insert(key);
-
-    if !include_tests && ranker::is_test_file(Path::new(&file)) {
-        return;
-    }
-
-    affected.push(BlastAffectedSymbol {
-        name: name.clone(),
-        kind,
-        file,
-        line,
-        depth,
-        confidence,
-    });
-
-    if depth < max_depth && !queued.contains(&name) {
-        queued.insert(name.clone());
-        queue.push_back((name, depth + 1));
+    if bfs.admit(&sym.name, &sym.file, sym.depth, max_depth) {
+        affected.push(sym);
     }
 }
 
-/// Perform blast radius analysis from a target symbol.
-///
-/// BFS traverses the call graph (upstream or downstream) from the target,
-/// collecting all affected symbols with their depth and grouping them into
-/// severity tiers.
-pub fn analyze_blast(
-    conn: &Connection,
-    symbol: &str,
-    options: &BlastOptions,
-) -> Result<BlastAnalysis> {
-    if options.depth == 0 {
-        return Ok(BlastAnalysis {
-            target: symbol.to_string(),
-            direction: options.direction,
-            risk_level: BlastRiskLevel::Low,
-            total_affected: 0,
-            tiers: vec![],
-            affected_files: vec![],
-        });
-    }
-
-    let conf_threshold = sanitize_confidence(options.min_confidence);
-    let max_depth = options.depth;
-
-    let mut affected: Vec<BlastAffectedSymbol> = Vec::new();
-    // visited: (name, file) pairs already processed — prevents output duplicates.
-    let mut visited: HashSet<(String, String)> = HashSet::new();
-    // queued: symbol names already enqueued — prevents BFS re-expansion.
-    let mut queued: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-
-    queue.push_back((symbol.to_string(), 1));
-    queued.insert(symbol.to_string());
-
-    match options.direction {
-        BlastDirection::Upstream => {
-            let mut stmt_callers = conn.prepare(
-                "SELECT DISTINCT s.name, s.kind, s.file, s.line, r.confidence \
-                 FROM \"references\" r \
-                 JOIN symbols s ON r.caller_id = s.id \
-                 WHERE r.name = ?1 AND r.confidence >= ?2",
-            )?;
-
-            // Type hierarchy children: include direct children of the target
-            // symbol only (PRD-HRTG-REQ-003 scopes this to depth-1 dependants).
-            let mut stmt_children = conn.prepare(
-                "SELECT DISTINCT child.name, child.kind, child.file, child.line \
-                 FROM type_edges te \
-                 JOIN symbols parent ON te.parent_id = parent.id \
-                 JOIN symbols child ON te.child_id = child.id \
-                 WHERE parent.name = ?1",
-            )?;
-
-            while let Some((target_name, depth)) = queue.pop_front() {
-                if depth > max_depth {
-                    continue;
-                }
-
-                let rows: Vec<_> = stmt_callers
-                    .query_map(rusqlite::params![&target_name, conf_threshold], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, f64>(4)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                for (name, kind_str, file, line, confidence) in rows {
-                    let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
-                    push_if_new(
-                        name,
-                        kind,
-                        file,
-                        line as usize,
-                        depth,
-                        confidence,
-                        max_depth,
-                        options.include_tests,
-                        &mut visited,
-                        &mut queued,
-                        &mut queue,
-                        &mut affected,
-                    );
-                }
-
-                // Include type hierarchy children only for the initial target
-                // symbol (depth == 1), per PRD-HRTG-REQ-003.
-                if depth == 1 {
-                    let child_rows: Vec<_> = stmt_children
-                        .query_map(rusqlite::params![&target_name], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, i64>(3)?,
-                            ))
-                        })?
-                        .collect::<Result<Vec<_>, _>>()?;
-
-                    for (name, kind_str, file, line) in child_rows {
-                        let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
-                        push_if_new(
-                            name,
-                            kind,
-                            file,
-                            line as usize,
-                            depth,
-                            1.0,
-                            max_depth,
-                            options.include_tests,
-                            &mut visited,
-                            &mut queued,
-                            &mut queue,
-                            &mut affected,
-                        );
-                    }
-                }
-            }
-        }
-        BlastDirection::Downstream => {
-            let mut stmt_callees = conn.prepare(
-                "SELECT DISTINCT r.name, s_def.kind, r.file, r.line, r.confidence \
-                 FROM \"references\" r \
-                 JOIN symbols s ON s.id = r.caller_id \
-                 LEFT JOIN symbols s_def ON s_def.name = r.name \
-                 WHERE s.name = ?1 AND r.confidence >= ?2",
-            )?;
-
-            while let Some((target_name, depth)) = queue.pop_front() {
-                if depth > max_depth {
-                    continue;
-                }
-
-                let rows: Vec<_> = stmt_callees
-                    .query_map(rusqlite::params![&target_name, conf_threshold], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, f64>(4)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                for (name, kind_str, file, line, confidence) in rows {
-                    let kind = kind_str
-                        .as_deref()
-                        .and_then(|k| SymbolKind::from_str(k).ok())
-                        .unwrap_or(SymbolKind::Function);
-                    push_if_new(
-                        name,
-                        kind,
-                        file,
-                        line as usize,
-                        depth,
-                        confidence,
-                        max_depth,
-                        options.include_tests,
-                        &mut visited,
-                        &mut queued,
-                        &mut queue,
-                        &mut affected,
-                    );
-                }
-            }
-        }
-    }
-
+/// Sort, tier, and summarize a discovered affected set into a
+/// [`BlastAnalysis`]. Shared by the live BFS path and the precomputed
+/// reach-table path so both produce identical output shape.
+fn assemble_analysis(
+    target: &str,
+    direction: BlastDirection,
+    affected: Vec<BlastAffectedSymbol>,
+    truncated: bool,
+) -> BlastAnalysis {
     // Sort by depth, then file, then line for deterministic output.
+    let mut affected = affected;
     affected.sort_by(|a, b| {
         a.depth
             .cmp(&b.depth)
@@ -344,16 +158,227 @@ pub fn analyze_blast(
     affected_files.sort();
 
     let total_affected = affected.len();
-    let risk_level = risk_level_for_count(total_affected);
 
-    Ok(BlastAnalysis {
-        target: symbol.to_string(),
-        direction: options.direction,
-        risk_level,
+    BlastAnalysis {
+        target: target.to_string(),
+        direction,
+        risk_level: risk_level_for_count(total_affected),
         total_affected,
         tiers,
         affected_files,
-    })
+        truncated,
+    }
+}
+
+/// Perform blast radius analysis from a target symbol.
+///
+/// BFS traverses the call graph (upstream or downstream) from the target,
+/// collecting all affected symbols with their depth and grouping them into
+/// severity tiers.
+pub fn analyze_blast(
+    conn: &Connection,
+    symbol: &str,
+    options: &BlastOptions,
+) -> Result<BlastAnalysis> {
+    if options.depth == 0 {
+        return Ok(BlastAnalysis {
+            target: symbol.to_string(),
+            direction: options.direction,
+            risk_level: BlastRiskLevel::Low,
+            total_affected: 0,
+            tiers: vec![],
+            affected_files: vec![],
+            truncated: false,
+        });
+    }
+
+    let conf_threshold = sanitize_confidence(options.min_confidence);
+    let max_depth = options.depth;
+
+    // Routing matrix (PRD-REACH-REQ-003/004/006/007): the table answers iff
+    // the kill switch allows it, the query is upstream with default
+    // semantics (no test inclusion, no confidence narrowing), and the table
+    // is built deep enough and not stale. Otherwise: unchanged BFS.
+    if options.use_reach
+        && options.direction == BlastDirection::Upstream
+        && !options.include_tests
+        && conf_threshold <= 0.0
+        && let Some(answer) = crate::reach::lookup_upstream(conn, symbol, max_depth)?
+    {
+        return Ok(assemble_analysis(
+            symbol,
+            options.direction,
+            answer.affected,
+            answer.truncated,
+        ));
+    }
+
+    let filter = crate::reach::EdgeFilter {
+        min_confidence: conf_threshold,
+        include_tests: options.include_tests,
+    };
+
+    let mut affected: Vec<BlastAffectedSymbol> = Vec::new();
+    // Shared visited/queued/FIFO state — the same NameBfs core the reach
+    // build traverses with, so both engines enqueue identically (AR-021).
+    let mut bfs = crate::reach::NameBfs::new(symbol);
+
+    match options.direction {
+        BlastDirection::Upstream => {
+            // Deterministic candidate order: (file, line, confidence DESC) so
+            // a caller with several refs records the max confidence and
+            // duplicate (name, file) rows record the min-line representative.
+            let mut stmt_callers = conn.prepare(
+                "SELECT DISTINCT s.name, s.kind, s.file, s.line, r.confidence \
+                 FROM \"references\" r \
+                 JOIN symbols s ON r.caller_id = s.id \
+                 WHERE r.name = ?1 \
+                 ORDER BY s.file, s.line, r.confidence DESC",
+            )?;
+
+            // Type hierarchy children: include direct children of the target
+            // symbol only (PRD-HRTG-REQ-003 scopes this to depth-1 dependants).
+            let mut stmt_children = conn.prepare(
+                "SELECT DISTINCT child.name, child.kind, child.file, child.line \
+                 FROM type_edges te \
+                 JOIN symbols parent ON te.parent_id = parent.id \
+                 JOIN symbols child ON te.child_id = child.id \
+                 WHERE parent.name = ?1 \
+                 ORDER BY child.file, child.line",
+            )?;
+
+            while let Some((target_name, depth)) = bfs.pop() {
+                if depth > max_depth {
+                    continue;
+                }
+
+                let rows: Vec<_> = stmt_callers
+                    .query_map(rusqlite::params![&target_name], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, f64>(4)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                for (name, kind_str, file, line, confidence) in rows {
+                    if !crate::reach::edge_eligible(&file, confidence, &filter) {
+                        continue;
+                    }
+                    let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
+                    push_if_new(
+                        &mut bfs,
+                        &mut affected,
+                        BlastAffectedSymbol {
+                            name,
+                            kind,
+                            file,
+                            line: line as usize,
+                            depth,
+                            confidence,
+                        },
+                        max_depth,
+                    );
+                }
+
+                // Include type hierarchy children only for the initial target
+                // symbol (depth == 1), per PRD-HRTG-REQ-003.
+                if depth == 1 {
+                    let child_rows: Vec<_> = stmt_children
+                        .query_map(rusqlite::params![&target_name], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    for (name, kind_str, file, line) in child_rows {
+                        if !crate::reach::edge_eligible(&file, 1.0, &filter) {
+                            continue;
+                        }
+                        let kind = SymbolKind::from_str(&kind_str).unwrap_or(SymbolKind::Function);
+                        push_if_new(
+                            &mut bfs,
+                            &mut affected,
+                            BlastAffectedSymbol {
+                                name,
+                                kind,
+                                file,
+                                line: line as usize,
+                                depth,
+                                confidence: 1.0,
+                            },
+                            max_depth,
+                        );
+                    }
+                }
+            }
+        }
+        BlastDirection::Downstream => {
+            let mut stmt_callees = conn.prepare(
+                "SELECT DISTINCT r.name, s_def.kind, r.file, r.line, r.confidence \
+                 FROM \"references\" r \
+                 JOIN symbols s ON s.id = r.caller_id \
+                 LEFT JOIN symbols s_def ON s_def.name = r.name \
+                 WHERE s.name = ?1 \
+                 ORDER BY r.file, r.line, r.confidence DESC",
+            )?;
+
+            while let Some((target_name, depth)) = bfs.pop() {
+                if depth > max_depth {
+                    continue;
+                }
+
+                let rows: Vec<_> = stmt_callees
+                    .query_map(rusqlite::params![&target_name], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, f64>(4)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                for (name, kind_str, file, line, confidence) in rows {
+                    if !crate::reach::edge_eligible(&file, confidence, &filter) {
+                        continue;
+                    }
+                    let kind = kind_str
+                        .as_deref()
+                        .and_then(|k| SymbolKind::from_str(k).ok())
+                        .unwrap_or(SymbolKind::Function);
+                    push_if_new(
+                        &mut bfs,
+                        &mut affected,
+                        BlastAffectedSymbol {
+                            name,
+                            kind,
+                            file,
+                            line: line as usize,
+                            depth,
+                            confidence,
+                        },
+                        max_depth,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(assemble_analysis(
+        symbol,
+        options.direction,
+        affected,
+        false,
+    ))
 }
 
 #[cfg(test)]
@@ -362,6 +387,7 @@ mod tests {
     use crate::db;
     use crate::pipeline;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     /// Create a minimal Rust repo, index it, and return (TempDir, Connection).
@@ -763,5 +789,296 @@ fn bar() { }
         let (depth, clamped) = clamp_depth(15);
         assert_eq!(depth, MAX_DEPTH);
         assert!(clamped);
+    }
+
+    // -- Determinism tests (TASK-080 refactor) -----------------------------
+
+    /// Index a repo, then insert a second reference from the same caller to
+    /// the same name at a lower confidence. The deterministic traversal must
+    /// record the caller once with the MAX confidence among its refs.
+    #[test]
+    fn blast_records_max_confidence_per_caller() {
+        let source = "fn foo() { bar(); }\nfn bar() { }\n";
+        let (_dir, conn) = make_indexed_repo(source);
+
+        let foo_id: i64 = conn
+            .query_row("SELECT id FROM symbols WHERE name = 'foo'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, caller_id, confidence) \
+             VALUES ('bar', 'src/lib.rs', 99, 10, ?1, 0.5)",
+            rusqlite::params![foo_id],
+        )
+        .unwrap();
+
+        let result = analyze_blast(&conn, "bar", &BlastOptions::default()).unwrap();
+        let foo: Vec<&BlastAffectedSymbol> = result
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter())
+            .filter(|s| s.name == "foo")
+            .collect();
+        assert_eq!(foo.len(), 1, "caller recorded exactly once");
+        assert_eq!(foo[0].confidence, 0.85, "max confidence wins");
+    }
+
+    /// Two same-named caller symbols in one file: the (file, line)-min row is
+    /// the deterministic representative and its own confidence is recorded.
+    #[test]
+    fn blast_duplicate_name_file_records_min_line_row() {
+        let source = "fn foo() { bar(); }\nfn bar() { }\n";
+        let (_dir, conn) = make_indexed_repo(source);
+
+        // The pipeline-indexed foo sits at line 1; plant a second foo at a
+        // later line with a higher-confidence edge to bar.
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('foo', 'function', 'src/lib.rs', 50, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+        let later_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO \"references\" (name, file, line, col, caller_id, confidence) \
+             VALUES ('bar', 'src/lib.rs', 51, 5, ?1, 0.95)",
+            rusqlite::params![later_id],
+        )
+        .unwrap();
+
+        let result = analyze_blast(&conn, "bar", &BlastOptions::default()).unwrap();
+        let foos: Vec<&BlastAffectedSymbol> = result
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter())
+            .filter(|s| s.name == "foo")
+            .collect();
+        assert_eq!(foos.len(), 1, "duplicate (name, file) recorded once");
+        assert_eq!(foos[0].line, 1, "min-line row is the representative");
+        assert_eq!(foos[0].confidence, 0.85, "representative's own confidence");
+    }
+
+    // -- Reach-table routing tests (TASK-080) --------------------------------
+
+    /// Repo whose reach table is prepared by hand: a bogus row that only the
+    /// table path could ever return. The BFS (no ref exists) finds nothing.
+    fn make_table_repo() -> (TempDir, Connection) {
+        let source = "fn target() { }\nfn other() { }\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let target_id: i64 = conn
+            .query_row("SELECT id FROM symbols WHERE name = 'target'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let other_id: i64 = conn
+            .query_row("SELECT id FROM symbols WHERE name = 'other'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        // The pipeline build already populated the real (empty) table for
+        // this fixture; replace its contents rather than insert alongside.
+        conn.execute("DELETE FROM reach", []).unwrap();
+        conn.execute("DELETE FROM reach_truncated", []).unwrap();
+        conn.execute(
+            "INSERT INTO reach (source_id, target_id, min_depth, confidence) \
+             VALUES (?1, ?2, 1, 0.42)",
+            rusqlite::params![target_id, other_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO reach_meta (key, value) VALUES ('built_depth', '3')",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn names(result: &BlastAnalysis) -> Vec<String> {
+        result
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter().map(|s| s.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn blast_uses_reach_table_when_eligible() {
+        let (_dir, conn) = make_table_repo();
+        // Default options: table answers with the planted bogus row.
+        let result = analyze_blast(&conn, "target", &BlastOptions::default()).unwrap();
+        assert_eq!(
+            names(&result),
+            vec!["other".to_string()],
+            "the planted reach row is only reachable via the table path"
+        );
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn blast_falls_back_to_bfs_when_reach_disabled() {
+        let (_dir, conn) = make_table_repo();
+        let options = BlastOptions {
+            use_reach: false,
+            ..Default::default()
+        };
+        let result = analyze_blast(&conn, "target", &options).unwrap();
+        assert!(names(&result).is_empty(), "BFS sees no real callers");
+    }
+
+    #[test]
+    fn blast_falls_back_to_bfs_for_include_tests() {
+        let (_dir, conn) = make_table_repo();
+        let options = BlastOptions {
+            include_tests: true,
+            ..Default::default()
+        };
+        let result = analyze_blast(&conn, "target", &options).unwrap();
+        assert!(
+            names(&result).is_empty(),
+            "include_tests changes semantics: must BFS, not use the table"
+        );
+    }
+
+    #[test]
+    fn blast_falls_back_to_bfs_for_min_confidence() {
+        let (_dir, conn) = make_table_repo();
+        let options = BlastOptions {
+            min_confidence: Some(0.9),
+            ..Default::default()
+        };
+        let result = analyze_blast(&conn, "target", &options).unwrap();
+        assert!(
+            names(&result).is_empty(),
+            "confidence-filtered queries change min-depths: must BFS"
+        );
+
+        // A non-filtering threshold of 0 stays on the table.
+        let options = BlastOptions {
+            min_confidence: Some(0.0),
+            ..Default::default()
+        };
+        let result = analyze_blast(&conn, "target", &options).unwrap();
+        assert_eq!(names(&result), vec!["other".to_string()]);
+    }
+
+    #[test]
+    fn blast_falls_back_to_bfs_beyond_built_depth() {
+        let (_dir, conn) = make_table_repo();
+        let options = BlastOptions {
+            depth: 4,
+            ..Default::default()
+        };
+        let result = analyze_blast(&conn, "target", &options).unwrap();
+        assert!(
+            names(&result).is_empty(),
+            "beyond built_depth the table cannot answer (REQ-004)"
+        );
+    }
+
+    #[test]
+    fn blast_falls_back_to_bfs_for_downstream() {
+        let (_dir, conn) = make_table_repo();
+        let options = BlastOptions {
+            direction: BlastDirection::Downstream,
+            ..Default::default()
+        };
+        let result = analyze_blast(&conn, "target", &options).unwrap();
+        assert!(
+            names(&result).is_empty(),
+            "the table materializes upstream only"
+        );
+    }
+
+    #[test]
+    fn blast_falls_back_to_bfs_when_stale() {
+        let (_dir, conn) = make_table_repo();
+        conn.execute(
+            "INSERT INTO reach_meta (key, value) VALUES ('stale', '1')",
+            [],
+        )
+        .unwrap();
+        let result = analyze_blast(&conn, "target", &BlastOptions::default()).unwrap();
+        assert!(names(&result).is_empty(), "stale table must not answer");
+    }
+
+    #[test]
+    fn blast_reach_table_truncation_carries_through() {
+        let (_dir, conn) = make_table_repo();
+        let target_id: i64 = conn
+            .query_row("SELECT id FROM symbols WHERE name = 'target'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO reach_truncated (source_id) VALUES (?1)",
+            rusqlite::params![target_id],
+        )
+        .unwrap();
+        let result = analyze_blast(&conn, "target", &BlastOptions::default()).unwrap();
+        assert!(result.truncated, "truncation marker reaches the analysis");
+    }
+
+    // -- End-to-end equivalence (TASK-080, AR-021) ---------------------------
+
+    /// Over a pipeline-indexed multi-file repo, the default (table-routed)
+    /// path and the BFS path must agree exactly at every depth 1..=3.
+    #[test]
+    fn blast_table_path_equivalent_to_bfs_across_depths() {
+        let files = &[
+            ("src/one.rs", "fn one() { two(); }\n"),
+            ("src/two.rs", "fn two() { three(); }\n"),
+            ("src/three.rs", "fn three() { four(); }\n"),
+            ("src/four.rs", "fn four() { }\n"),
+            ("src/deep.rs", "fn deep_caller() { one(); }\n"),
+            ("tests/chain_test.rs", "fn chain_suite() { two(); }\n"),
+        ];
+        let (_dir, conn) = make_multi_file_repo(files);
+
+        for target in ["four", "three", "two", "one", "deep_caller", "chain_suite"] {
+            for depth in [1usize, 2, 3] {
+                assert!(
+                    crate::reach::lookup_upstream(&conn, target, depth)
+                        .unwrap()
+                        .is_some(),
+                    "pipeline build must cover {target} at depth {depth}"
+                );
+                let via_table = analyze_blast(
+                    &conn,
+                    target,
+                    &BlastOptions {
+                        depth,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let via_bfs = analyze_blast(
+                    &conn,
+                    target,
+                    &BlastOptions {
+                        depth,
+                        use_reach: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(via_table, via_bfs, "target {target} depth {depth}");
+                assert!(!via_table.truncated);
+            }
+        }
+
+        // The chain gives the depths real content: four reaches deep_caller
+        // at depth 4, i.e. not at all within depth 3.
+        let four = analyze_blast(&conn, "four", &BlastOptions::default()).unwrap();
+        let names = names(&four);
+        assert!(names.contains(&"three".to_string()), "depth-1 caller");
+        assert!(names.contains(&"two".to_string()), "depth-2 caller");
+        assert!(names.contains(&"one".to_string()), "depth-3 caller");
+        assert!(
+            !names.contains(&"deep_caller".to_string()),
+            "depth-4 is beyond the built depth"
+        );
     }
 }

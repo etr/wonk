@@ -133,8 +133,17 @@ pub fn build_index_with_progress(
         })
         .collect();
 
-    // 5. Batch insert.
-    let (sym_count, ref_count, caller_count, type_edge_count) = batch_insert(&conn, &results)?;
+    // 5. Batch insert (reach table built in the same transaction when enabled).
+    let reach_opts = if config.reach.enabled {
+        Some(crate::reach::ReachBuildOptions {
+            depth: config.reach.depth.min(crate::blast::MAX_DEPTH),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    let (sym_count, ref_count, caller_count, type_edge_count) =
+        batch_insert(&conn, &results, reach_opts.as_ref())?;
 
     // 6. Collect languages seen and write meta.json.
     let languages: Vec<String> = {
@@ -507,6 +516,10 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         rusqlite::params![rel_path],
     )?;
 
+    // Deleting symbols may invalidate reach rows both directions; mark the
+    // whole table stale until the next full rebuild (PRD-REACH-REQ-007).
+    crate::reach::mark_stale(&tx)?;
+
     tx.commit().context("committing delete transaction")?;
     Ok(())
 }
@@ -672,6 +685,11 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         }
     }
 
+    // Any per-file edit can change reach rows both directions; mark the
+    // whole table stale until the next full rebuild (PRD-REACH-REQ-007).
+    // TASK-081 replaces this coarse invalidation with incremental recompute.
+    crate::reach::mark_stale(&tx)?;
+
     tx.commit().context("committing upsert transaction")?;
     Ok(())
 }
@@ -744,7 +762,11 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
 /// Insert all results into the database in a single transaction.
 ///
 /// Returns (symbol_count, ref_count, caller_count, type_edge_count).
-fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usize, usize, usize)> {
+fn batch_insert(
+    conn: &Connection,
+    results: &[FileResult],
+    reach_opts: Option<&crate::reach::ReachBuildOptions>,
+) -> Result<(usize, usize, usize, usize)> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -933,6 +955,13 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
                 type_edge_count += 1;
             }
         }
+    }
+
+    // Build the reach table in the same transaction as the symbols and
+    // references it derives from, so readers never observe a partially
+    // published reach set (PRD-REACH-REQ-008, AR-028).
+    if let Some(opts) = reach_opts {
+        crate::reach::build_reach(&tx, opts)?;
     }
 
     tx.commit().context("committing transaction")?;
@@ -1405,6 +1434,9 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM \"references\";
          DELETE FROM file_imports;
          DELETE FROM term_stats;
+         DELETE FROM reach;
+         DELETE FROM reach_truncated;
+         DELETE FROM reach_meta;
          DELETE FROM files;",
     )
     .context("clearing index data")?;
@@ -1966,6 +1998,210 @@ class Component {
             .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
             .unwrap();
         assert_eq!(after, 0, "drop_all_data must clear term_stats");
+    }
+
+    // -- Reach pipeline integration (TASK-080) -------------------------------
+
+    fn reach_meta_value(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM reach_meta WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    fn reach_row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM reach", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Write a per-repo `[reach]` config before indexing.
+    fn write_reach_config(root: &std::path::Path, toml: &str) {
+        fs::create_dir_all(root.join(".wonk")).unwrap();
+        fs::write(root.join(".wonk/config.toml"), toml).unwrap();
+    }
+
+    #[test]
+    fn test_build_index_populates_reach() {
+        let dir = make_test_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        assert_eq!(
+            reach_meta_value(&conn, "built_depth").as_deref(),
+            Some("3"),
+            "default build depth is 3"
+        );
+        assert!(
+            reach_meta_value(&conn, "stale").is_none(),
+            "fresh build is not stale"
+        );
+        assert!(
+            reach_row_count(&conn) > 0,
+            "the test repo's call graph should yield reach rows"
+        );
+    }
+
+    #[test]
+    fn test_build_index_reach_disabled_skips_table() {
+        let dir = make_test_repo();
+        write_reach_config(dir.path(), "[reach]\nenabled = false\n");
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        assert!(
+            reach_meta_value(&conn, "built_depth").is_none(),
+            "disabled reach must not populate the table"
+        );
+        assert_eq!(reach_row_count(&conn), 0);
+    }
+
+    #[test]
+    fn test_build_index_reach_depth_config_recorded() {
+        let dir = make_test_repo();
+        write_reach_config(dir.path(), "[reach]\ndepth = 2\n");
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        assert_eq!(reach_meta_value(&conn, "built_depth").as_deref(), Some("2"));
+        // A depth-3 query is beyond the built depth: no authoritative answer.
+        assert!(
+            crate::reach::lookup_upstream(&conn, "helper", 3)
+                .unwrap()
+                .is_none()
+        );
+        // Depth within the built depth answers.
+        assert!(
+            crate::reach::lookup_upstream(&conn, "helper", 2)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_rebuild_replaces_reach_rows() {
+        let dir = make_test_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        // Add a caller and rebuild: the new edge must appear, in one build.
+        drop(conn);
+        fs::write(
+            dir.path().join("src/main.rs"),
+            r#"fn main() {
+    let x = helper();
+    let y = extra();
+    println!("{}{}", x, y);
+}
+
+fn helper() -> i32 {
+    42
+}
+
+fn extra() -> i32 {
+    7
+}
+"#,
+        )
+        .unwrap();
+        rebuild_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        let answer = crate::reach::lookup_upstream(&conn, "helper", 3)
+            .unwrap()
+            .expect("table covers the rebuilt index");
+        assert!(
+            answer.affected.iter().any(|s| s.name == "main"),
+            "main calls helper"
+        );
+        assert!(
+            reach_meta_value(&conn, "stale").is_none(),
+            "full rebuild clears staleness"
+        );
+    }
+
+    #[test]
+    fn test_reindex_file_marks_reach_stale() {
+        let (dir, conn) = setup_indexed_repo();
+        assert!(reach_meta_value(&conn, "stale").is_none());
+
+        // Touch a file with new content: the daemon's incremental path.
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn hello() { 3 }\nfn world() { 4 }",
+        )
+        .unwrap();
+        reindex_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
+
+        assert_eq!(
+            reach_meta_value(&conn, "stale").as_deref(),
+            Some("1"),
+            "any file edit conservatively marks the table stale (TASK-081 refines)"
+        );
+    }
+
+    #[test]
+    fn test_remove_file_marks_reach_stale() {
+        let (dir, conn) = setup_indexed_repo();
+        assert!(reach_meta_value(&conn, "stale").is_none());
+
+        remove_file(&conn, &dir.path().join("app.py"), dir.path()).unwrap();
+
+        assert_eq!(
+            reach_meta_value(&conn, "stale").as_deref(),
+            Some("1"),
+            "file removal marks the table stale"
+        );
+    }
+
+    #[test]
+    fn test_stale_reach_still_answers_via_blast() {
+        let (dir, conn) = setup_indexed_repo();
+
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn hello() { world(); }\nfn world() { 4 }",
+        )
+        .unwrap();
+        reindex_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
+        assert!(reach_meta_value(&conn, "stale").is_some());
+
+        // analyze_blast must silently degrade to BFS, not error or go empty.
+        let options = crate::blast::BlastOptions::default();
+        let result = crate::blast::analyze_blast(&conn, "world", &options).unwrap();
+        let names: Vec<&str> = result
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter().map(|s| s.name.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"hello"),
+            "stale table degrades to BFS and still finds callers"
+        );
+    }
+
+    #[test]
+    fn test_drop_all_data_clears_reach() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("lib.rs"),
+            "fn hello() { world(); }\nfn world() { 2 }",
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        let before = reach_row_count(&conn);
+        assert!(before > 0, "index should carry reach rows before the drop");
+
+        drop_all_data(&conn).unwrap();
+
+        assert_eq!(reach_row_count(&conn), 0);
+        assert!(reach_meta_value(&conn, "built_depth").is_none());
+        assert!(reach_meta_value(&conn, "stale").is_none());
     }
 
     #[test]

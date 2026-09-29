@@ -21,6 +21,7 @@ pub mod output;
 pub mod pipeline;
 pub mod progress;
 pub mod ranker;
+pub mod reach;
 pub mod router;
 pub mod search;
 pub mod semantic;

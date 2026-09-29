@@ -525,6 +525,12 @@ pub struct BlastOutput {
     pub total_affected: usize,
     pub tiers: Vec<BlastTierOutput>,
     pub affected_files: Vec<String>,
+    /// Whether the reach set was cut short by the per-source fan-out cap
+    /// (PRD-REACH-REQ-009): identifiable from the result alone, no logs.
+    /// Skipped when false so V4 JSON stays byte-identical.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 impl From<&crate::types::BlastAnalysis> for BlastOutput {
@@ -556,6 +562,7 @@ impl From<&crate::types::BlastAnalysis> for BlastOutput {
             total_affected: analysis.total_affected,
             tiers,
             affected_files: analysis.affected_files.clone(),
+            truncated: analysis.truncated,
         }
     }
 }
@@ -1737,6 +1744,14 @@ impl<W: Write> Formatter<W> {
                 for file in &out.affected_files {
                     writeln!(fmt.writer, "  {file}")?;
                 }
+            }
+
+            // Fan-out cap hit: the set is a lower bound (PRD-REACH-REQ-009).
+            if out.truncated {
+                writeln!(
+                    fmt.writer,
+                    "Note: reach set truncated by fan-out cap; treat as a lower bound"
+                )?;
             }
 
             Ok(())
@@ -4037,6 +4052,7 @@ mod tests {
                 },
             ],
             affected_files: vec!["src/checkout.rs".into(), "src/orders.rs".into()],
+            truncated: false,
         }
     }
 
@@ -4091,6 +4107,7 @@ mod tests {
                 }],
             }],
             affected_files: vec!["a.rs".into()],
+            truncated: false,
         };
         let out = BlastOutput::from(&analysis);
         assert_eq!(out.target, "foo");
@@ -4100,6 +4117,58 @@ mod tests {
         assert_eq!(out.tiers.len(), 1);
         assert_eq!(out.tiers[0].severity, "WILL BREAK");
         assert_eq!(out.tiers[0].symbols[0].name, "bar");
+    }
+
+    #[test]
+    fn blast_output_truncated_flag_carried_by_from() {
+        use crate::types::*;
+        let analysis = BlastAnalysis {
+            target: "foo".into(),
+            direction: BlastDirection::Upstream,
+            risk_level: BlastRiskLevel::Low,
+            total_affected: 1,
+            tiers: vec![],
+            affected_files: vec![],
+            truncated: true,
+        };
+        let out = BlastOutput::from(&analysis);
+        assert!(out.truncated, "From must carry the truncation flag");
+    }
+
+    #[test]
+    fn blast_output_truncated_skipped_when_false() {
+        // V4 JSON was emitted without any `truncated` key; false must stay
+        // byte-identical to that (PRD-REACH-REQ-009 surfaces on the result).
+        let out = make_blast_output();
+        assert!(!out.truncated);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("truncated"),
+            "false must not serialize; got: {json}"
+        );
+    }
+
+    #[test]
+    fn blast_output_truncated_rendered_when_true() {
+        let mut out = make_blast_output();
+        out.truncated = true;
+
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            json.contains("\"truncated\":true"),
+            "true must serialize; got: {json}"
+        );
+
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_blast(&out));
+        assert!(
+            rendered.contains("reach set truncated by fan-out cap; treat as a lower bound"),
+            "text mode must note the truncation without consulting logs; got:\n{rendered}"
+        );
+
+        // And no note when the set is complete.
+        let complete = make_blast_output();
+        let rendered = render(OutputFormat::Grep, |fmt| fmt.format_blast(&complete));
+        assert!(!rendered.contains("truncated by fan-out cap"));
     }
 
     // -- ChangesOutput (TASK-072) -------------------------------------------
@@ -4178,6 +4247,7 @@ mod tests {
                     total_affected: 5,
                     tiers: vec![],
                     affected_files: vec![],
+                    truncated: false,
                 }),
             }],
             combined_risk_level: Some("MEDIUM".into()),
