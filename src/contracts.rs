@@ -721,7 +721,14 @@ const JS_CONSUMER_RECEIVERS: &[&str] = &["axios", "got", "http", "https"];
 /// Receiver/chain-root names treated as websocket endpoints (TASK-087).
 /// Checked before the queue generic arms so `socket.send` is websocket,
 /// never queue.
-const WS_RECEIVERS: &[&str] = &["io", "socket", "ws", "wss", "server", "conn", "websocket"];
+///
+/// Deliberately narrow: `server` and `conn` are NOT whitelisted because
+/// Node's `http`/`net` idioms use them for plain event streams
+/// (`server.on('listening')`, `conn.on('data')`), which would flood the
+/// websocket kind with false lifecycle/stream contracts. Those calls fall
+/// through to the generic `.on` skip (EventEmitter gate) in the queue
+/// arms instead.
+const WS_RECEIVERS: &[&str] = &["io", "socket", "ws", "wss", "websocket"];
 /// Verb-like callee names used by the 0.5 heuristic on unknown receivers.
 const AMBIGUOUS_VERBS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "any", "all", "request",
@@ -1906,10 +1913,13 @@ impl<'a> Extractor<'a> {
             // -- queue (TASK-087, DR-031) --------------------------------
             // Publish arity disambiguates the broker: nats.Publish(subj, data)
             // takes 2 positional args; amqp Publish*/PublishWithContext carry
-            // exchange+key before the message (>= 3 args). The ctx first
-            // argument of PublishWithContext shifts the routing key one
-            // position later.
-            (_, "PublishWithContext") if argc >= 3 => {
+            // exchange+key before the message. PublishWithContext carries a
+            // leading ctx: the idiomatic nats.go shape
+            // PublishWithContext(ctx, subj, data) has exactly 3 args with the
+            // subject at position 1, while amqp091's
+            // PublishWithContext(ctx, exchange, key, msg, ...) has >= 4 args
+            // with the routing key at position 2.
+            (_, "PublishWithContext") if argc >= 4 => {
                 if let Some(t) = positional_arg(args, 2)
                     && let Some(raw) = self.topic_arg(t)
                 {
@@ -1919,6 +1929,21 @@ impl<'a> Extractor<'a> {
                         &raw,
                         ContractRole::Consumer,
                         "rabbitmq",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "PublishWithContext") if argc == 3 => {
+                if let Some(t) = positional_arg(args, 1)
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "nats",
                         CONFIDENCE_FRAMEWORK,
                         None,
                     );
@@ -5190,6 +5215,38 @@ mod tests {
     }
 
     #[test]
+    fn js_server_on_listening_skipped() {
+        // Node http idiom: server.on('listening', cb) is a lifecycle hook,
+        // not a websocket registration — falls through to the generic `.on`
+        // skip like any other EventEmitter.
+        let cands = extract(Lang::JavaScript, "server.on('listening', cb);");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_conn_on_data_skipped() {
+        // Node net idiom: conn.on('data', cb) is a plain stream read, not a
+        // websocket registration — falls through to the generic `.on` skip.
+        let cands = extract(Lang::JavaScript, "conn.on('data', (chunk) => {});");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_ws_receiver_whitelist_stays_websocket() {
+        // Every whitelisted receiver name emits websocket contracts.
+        for recv in ["io", "socket", "ws", "wss", "websocket"] {
+            let cands = extract(
+                Lang::JavaScript,
+                &format!("{recv}.emit('chat.message', d);"),
+            );
+            assert_eq!(cands.len(), 1, "{recv}: got {cands:?}");
+            assert_eq!(cands[0].kind, ContractKind::WebSocket, "{recv}");
+            assert_eq!(cands[0].canonical_id, "websocket::::chat.message", "{recv}");
+            assert_eq!(cands[0].confidence, CONFIDENCE_FRAMEWORK, "{recv}");
+        }
+    }
+
+    #[test]
     fn js_express_ws_route_is_ws_consumer() {
         let src = "const app = express();\napp.ws('/chat', handler);\n";
         let cands = extract(Lang::JavaScript, src);
@@ -5704,11 +5761,63 @@ func cfg() {
     }
 
     #[test]
-    fn go_amqp_publish_with_context_three_plus_args() {
+    fn go_amqp_publish_with_context_six_args_is_rabbitmq() {
         let src = "package main\n\nfunc pub() {\n\tch.PublishWithContext(ctx, \"orders\", \"orders.created\", false, false, msg)\n}\n";
         let cands = extract(Lang::Go, src);
         let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
         assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_publish_with_context_three_args_is_nats() {
+        // nats.go: PublishWithContext(ctx, subj, data) — exactly 3 args,
+        // subject at position 1. The literal payload is never the topic.
+        let src = "package main\n\nfunc pub() {\n\tnc.PublishWithContext(ctx, \"orders.created\", \"body\")\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::nats::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert!(
+            find(&cands, "queue::rabbitmq::body").is_none(),
+            "literal data must not be read as the topic: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn go_publish_with_context_three_args_variable_payload_is_nats() {
+        let src = "package main\n\nfunc pub() {\n\tnc.PublishWithContext(ctx, \"orders.created\", msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::nats::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_publish_with_context_four_plus_args_is_rabbitmq() {
+        // amqp091: PublishWithContext(ctx, exchange, key, msg, ...) — the
+        // ctx shifts the routing key to position 2.
+        let src = "package main\n\nfunc pub() {\n\tch.PublishWithContext(ctx, \"orders\", \"orders.created\", msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_publish_four_args_rabbitmq_topic_position() {
+        // Plain amqp Publish(exchange, key, ...): topic is arg 1, never the
+        // exchange name at arg 0.
+        let src = "package main\n\nfunc pub() {\n\tch.Publish(\"orders\", \"orders.created\", false, msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::rabbitmq::orders.created");
+        assert!(
+            find(&cands, "queue::rabbitmq::orders").is_none(),
+            "exchange name must not be the topic: {cands:?}"
+        );
+        assert_eq!(cands[0].role, ContractRole::Consumer);
     }
 
     #[test]
