@@ -116,3 +116,25 @@
 - OLLAMA_REQUIRED_MSG retired -> OLLAMA_UNREACHABLE_MSG (names bundled re-embed alternative)
 - This machine (macOS arm64): cargo at /opt/homebrew/bin/cargo; PATH note in Build & Test above is for a different (Linux) host
 - watcher::tests FSEvents delivery tests are flaky in this sandbox on macOS too (4 tests fail at baseline, unrelated to changes)
+
+## Reach Index (TASK-080)
+- `src/reach.rs`: name-collated bounded BFS build (`build_reach(tx, &ReachBuildOptions)`), `lookup_upstream(conn, name, depth)` -> `Option<ReachAnswer{affected, truncated}>`; `None` = fall back to BFS, `Some(empty)` = authoritative no-dependents
+- Tables: `reach(source_id, target_id, min_depth, confidence)` PK pair + idx_reach_source_depth + idx_reach_target, `reach_truncated(source_id)`, `reach_meta(key,value)` built_depth/stale; `drop_all_data` clears all 3
+- Shared predicate AR-021: `reach::edge_eligible(file, confidence, &EdgeFilter)` called by BOTH `analyze_blast` and `build_reach`; routing in analyze_blast requires use_reach && Upstream && !include_tests && min_conf<=0 && table fresh && depth <= built_depth
+- `BlastOutput.truncated` has `#[serde(skip_serializing_if)]` so V4 JSON stays byte-identical when false; grep mode renders a lower-bound note
+- Config: `[reach]` depth (3) / enabled (true); mcp/router/changes all thread `use_reach` from `Config::load(repo_root)`
+- Bench: `cargo bench --bench reach` (61k-symbol synthetic repo, results in bench/reach-results.md; table p100 0.24ms vs BFS 53ms; ~72 B/symbol)
+- Machine variance: bench session can run 1.2-1.5x slower than a prior recording (uncapped rebuild 451ms vs 540-697ms) — compare shape ratios, not absolute times
+
+## Incremental reach repair (TASK-081)
+- `upsert_file_data`/`delete_file_data` now call `reach::begin_file_edit(tx, rel_path)` BEFORE the delete block and `reach::finish_file_edit(tx, &scope)` after inserts, inside the file's own tx; on finish Err -> `mark_stale` in SAME tx + commit anyway (REQ-007)
+- Affected sources = pre/post-edit canonical (MIN-eligible) ids of names in A_pre∪A_post (file symbol names + ref callee names w/ caller + type-edge parent names) ∪ predecessors from reverse `target_id` lookup (idx_reach_target), captured pre-delete in begin AND at finish (redundant by design — belt+braces; each alone covers the other's cases)
+- FK cascade (foreign_keys=ON) removes rows referencing deleted symbol ids during the edit — repair's DELETE is idempotent; `rows_deleted` stat does NOT count cascaded rows
+- Repair runs at table's own built_depth + DEFAULT cap via `SqlCandidates` (memoized prepared stmts) through the SAME `compute_source_rows` traversal `build_reach` uses over `GraphCandidates`; WI-1 parity test pins candidate-list equality
+- Deviation from plan: repair does NOT no-op on an empty-but-built table (edge-adding edit on empty table must write rows; no-op would serve wrong Some(empty))
+- Skip conditions: reach table missing / no built_depth / stale marker present
+- Test oracle pattern: `assert_table_equivalent_to_bfs(&conn)` is `#[cfg(test)] pub(crate)` in reach.rs (shared by reach + pipeline test modules); `assert_incremental_equals_full_rebuild` rebuilds on the same conn (safe — leaves equivalent state)
+- Gotcha: global test failpoints race under the parallel test runner — key `FAIL_NEXT_FINISH` to the probe file's rel_path (Mutex<Option<String>>) and use a uniquely-named probe file per test
+- Gotcha: SQLite rowids shift on edit (delete+reinsert reuses max+1, alternating files hold the max) — never assert row-id-stable snapshots across edits; assert content via the rebuild-equivalence oracle
+- Gotcha: `git checkout -- file` during a mutation teeth-check also wipes UNCOMMITTED new tests — commit the green suite BEFORE mutation-checking
+- BlastDirection lives in types.rs and is NOT re-exported from blast.rs (private import there); bench/test code must `use wonk::types::BlastDirection`

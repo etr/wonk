@@ -45,7 +45,7 @@
 | M25 | Multi-Repo MCP | 1 | Complete |
 | M26 | Bundled Embedding Provider | 3 | Complete |
 | M27 | Lexical BM25 Scoring | 2 | Complete |
-| M28 | Precomputed Reach Index | 2 | In Progress |
+| M28 | Precomputed Reach Index | 2 | Complete |
 | M29 | Cross-Repo Contract Detection | 5 | Not Started |
 | M30 | Diff-Scoped Review Workflow | 3 | Not Started |
 | M31 | Body Elision | 2 | Not Started |
@@ -3438,12 +3438,12 @@ Create `reach.rs` and the `reach` table, build bounded-depth reachability during
 Keep the reach table correct as the daemon re-indexes files, without recomputing the whole graph.
 
 **Action Items:**
-- [ ] On file re-index, delete reach rows sourced from that file's symbols and recompute them (PRD-REACH-REQ-005)
-- [ ] Recompute predecessors within the configured depth via reverse lookup on `target_id` (PRD-REACH-REQ-005)
-- [ ] Handle cycles correctly — visited-set traversal, no infinite recompute (AR-021)
-- [ ] Mark the table stale and fall back to BFS if an incremental update fails, rather than serving wrong data (PRD-REACH-REQ-007)
-- [ ] Test correctness after edit sequences: add caller, remove caller, rename symbol, delete file, introduce a cycle
-- [ ] Verify incremental update fits within the daemon's existing re-index budget
+- [x] On file re-index, delete reach rows sourced from that file's symbols and recompute them (PRD-REACH-REQ-005)
+- [x] Recompute predecessors within the configured depth via reverse lookup on `target_id` (PRD-REACH-REQ-005)
+- [x] Handle cycles correctly — visited-set traversal, no infinite recompute (AR-021)
+- [x] Mark the table stale and fall back to BFS if an incremental update fails, rather than serving wrong data (PRD-REACH-REQ-007)
+- [x] Test correctness after edit sequences: add caller, remove caller, rename symbol, delete file, introduce a cycle
+- [x] Verify incremental update fits within the daemon's existing re-index budget
 
 **Dependencies:**
 - Blocked by: TASK-080
@@ -3459,7 +3459,7 @@ Keep the reach table correct as the daemon re-indexes files, without recomputing
 **Related Requirements:** PRD-REACH-REQ-005, PRD-REACH-REQ-007
 **Related Decisions:** DR-034
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
