@@ -271,6 +271,380 @@ pub fn mark_stale(tx: &rusqlite::Transaction) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Incremental maintenance (TASK-081, PRD-REACH-REQ-005/007)
+// ---------------------------------------------------------------------------
+
+/// Bound parameters per IN-list statement. Bundled SQLite allows 32766;
+/// 900 keeps every statement well under any build's limit.
+const IN_CHUNK: usize = 900;
+
+/// Pre-edit state of one file edit: [`begin_file_edit`] captures it before
+/// the file's old rows are deleted, [`finish_file_edit`] consumes it after
+/// the new rows are written — both inside the caller's transaction, so the
+/// two halves observe one consistent timeline.
+#[derive(Debug, Clone)]
+pub(crate) struct FileEditScope {
+    rel_path: String,
+    /// Names whose candidate lists or symbol sets the file's OLD rows
+    /// participated in: the file's symbol names, the callee names of its
+    /// references with a resolved caller, and the parent names of type
+    /// edges whose child lives in the file.
+    a_pre: Vec<String>,
+    /// Canonical (MIN-eligible) source ids of `a_pre` names as they stood
+    /// BEFORE the edit. Capturing them pre-delete is what re-keys rows when
+    /// the edit removes or demotes a name's MIN-id symbol — those rows die
+    /// here and are rewritten under the post-edit canonical id.
+    old_canonical_ids: Vec<i64>,
+    /// Sources holding pre-edit rows that target a symbol named in `a_pre`
+    /// — the reverse `target_id` lookup REQ-005 prescribes, served by
+    /// `idx_reach_target`. No depth filter: the over-approximation is safe
+    /// because repair is delete-then-rebuild. Subsumes the file's old
+    /// symbol ids (every one of them belongs to a symbol named in `a_pre`).
+    predecessor_ids: Vec<i64>,
+    /// `finish` no-ops when the table is absent, never built, or stale —
+    /// stale tables are only cleared by a full rebuild (REQ-007).
+    skipped: bool,
+}
+
+/// Statistics from one incremental repair.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReachRepairStats {
+    /// Source names recomputed from the post-edit graph.
+    pub(crate) rebuilt_sources: usize,
+    /// Reach rows removed (the affected ids' whole row sets).
+    pub(crate) rows_deleted: usize,
+    /// Reach rows written.
+    pub(crate) rows_written: usize,
+    /// True when the repair was skipped: absent, never-built, or stale
+    /// table.
+    pub(crate) skipped: bool,
+}
+
+/// One-shot failure injection point for the REQ-007 degrade test: when
+/// set, the next `finish_file_edit` returns an error and clears the flag.
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_FINISH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Capture the pre-edit state of a file edit, BEFORE the caller deletes
+/// the file's old rows. Call [`finish_file_edit`] after the new rows are
+/// written, inside the same transaction.
+pub(crate) fn begin_file_edit(tx: &rusqlite::Transaction, rel_path: &str) -> Result<FileEditScope> {
+    if !table_fresh(tx)? {
+        return Ok(FileEditScope {
+            rel_path: rel_path.to_string(),
+            a_pre: Vec::new(),
+            old_canonical_ids: Vec::new(),
+            predecessor_ids: Vec::new(),
+            skipped: true,
+        });
+    }
+
+    let mut a_pre = affected_names(tx, rel_path)?;
+    a_pre.sort();
+    a_pre.dedup();
+
+    let mut old_canonical_ids: Vec<i64> = canonical_ids_for_names(tx, &a_pre)?
+        .values()
+        .copied()
+        .collect();
+    old_canonical_ids.sort_unstable();
+    old_canonical_ids.dedup();
+
+    let mut predecessor_ids = sources_targeting_names(tx, &a_pre)?;
+    predecessor_ids.sort_unstable();
+    predecessor_ids.dedup();
+
+    Ok(FileEditScope {
+        rel_path: rel_path.to_string(),
+        a_pre,
+        old_canonical_ids,
+        predecessor_ids,
+        skipped: false,
+    })
+}
+
+/// Repair the reach table after a file edit, BEFORE the caller commits.
+///
+/// Deletes every row sourced from an affected id (pre- and post-edit
+/// canonicals plus both reverse-lookup predecessor sets) and recomputes the
+/// affected names and predecessor sources from the post-edit graph through
+/// the same [`compute_source_rows`] traversal the full build uses, at the
+/// table's own `built_depth` and the default fan-out cap. Depth and
+/// staleness meta are left untouched.
+///
+/// On error the caller must [`mark_stale`] in the same transaction and
+/// commit anyway (REQ-007): reach is a cache, and a stale table falls back
+/// to BFS rather than serving wrong data.
+pub(crate) fn finish_file_edit(
+    tx: &rusqlite::Transaction,
+    scope: &FileEditScope,
+) -> Result<ReachRepairStats> {
+    if scope.skipped {
+        return Ok(ReachRepairStats {
+            skipped: true,
+            ..ReachRepairStats::default()
+        });
+    }
+
+    #[cfg(test)]
+    if FAIL_NEXT_FINISH.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(anyhow::anyhow!("injected finish_file_edit failure"));
+    }
+
+    // Post-edit affected names, unioned with the pre-edit set.
+    let mut a_all = affected_names(tx, &scope.rel_path)?;
+    a_all.extend(scope.a_pre.iter().cloned());
+    a_all.sort();
+    a_all.dedup();
+
+    // Post-edit predecessors over the union set, still against the
+    // untouched table (rows deleted below).
+    let mut predecessor_ids = scope.predecessor_ids.clone();
+    predecessor_ids.extend(sources_targeting_names(tx, &a_all)?);
+    predecessor_ids.sort_unstable();
+    predecessor_ids.dedup();
+
+    // Names to recompute: every affected name, plus the names of the
+    // predecessor sources — their traversals pass through an affected
+    // name, so their rows may change even though the names themselves are
+    // untouched by the edit.
+    let mut rebuild_names = a_all;
+    rebuild_names.extend(names_for_ids(tx, &predecessor_ids)?);
+    rebuild_names.sort();
+    rebuild_names.dedup();
+
+    // Affected source ids: pre-edit canonicals (rows keyed under ids that
+    // may stop being canonical), post-edit canonicals, and predecessors.
+    let post_canonical = canonical_ids_for_names(tx, &rebuild_names)?;
+    let mut affected_ids: Vec<i64> = scope.old_canonical_ids.clone();
+    affected_ids.extend(post_canonical.values().copied());
+    affected_ids.extend(predecessor_ids.iter().copied());
+    affected_ids.sort_unstable();
+    affected_ids.dedup();
+
+    let mut rows_deleted = 0usize;
+    for chunk in affected_ids.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("DELETE FROM reach WHERE source_id IN ({placeholders})");
+        rows_deleted += tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+        let sql = format!("DELETE FROM reach_truncated WHERE source_id IN ({placeholders})");
+        tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+    }
+
+    // The table self-describes: repair runs at the recorded built depth
+    // under the default fan-out cap. No config plumbing.
+    let built: usize = tx
+        .query_row(
+            "SELECT value FROM reach_meta WHERE key = ?1",
+            rusqlite::params![META_BUILT_DEPTH],
+            |row| row.get::<_, String>(0),
+        )
+        .context("reading built_depth for repair")?
+        .parse()
+        .context("parsing built_depth for repair")?;
+    let opts = ReachBuildOptions {
+        depth: built,
+        max_targets: DEFAULT_MAX_TARGETS_PER_SOURCE,
+    };
+
+    let mut rows: Vec<(i64, i64, i64, f64)> = Vec::new();
+    let mut truncated_sources: Vec<i64> = Vec::new();
+    let mut rebuilt_sources = 0usize;
+    {
+        let mut candidates = SqlCandidates::new(tx)?;
+        for name in &rebuild_names {
+            let Some(&source_id) = post_canonical.get(name) else {
+                // The name lost eligibility (deleted or Module-only now):
+                // its rows are gone and lookups fall back to BFS.
+                continue;
+            };
+            rebuilt_sources += 1;
+            let (source_rows, truncated) = compute_source_rows(&mut candidates, name, &opts)?;
+            if truncated {
+                truncated_sources.push(source_id);
+            }
+            rows.extend(
+                source_rows
+                    .into_iter()
+                    .map(|(target_id, min_depth, confidence)| {
+                        (source_id, target_id, min_depth, confidence)
+                    }),
+            );
+        }
+    }
+
+    write_reach_rows(tx, &rows)?;
+    for source_id in &truncated_sources {
+        tx.execute(
+            "INSERT OR REPLACE INTO reach_truncated (source_id) VALUES (?1)",
+            rusqlite::params![source_id],
+        )?;
+    }
+
+    Ok(ReachRepairStats {
+        rebuilt_sources,
+        rows_deleted,
+        rows_written: rows.len(),
+        skipped: false,
+    })
+}
+
+/// Whether the reach table can be incrementally repaired: present, built
+/// (numeric `built_depth`), and not stale.
+fn table_fresh(conn: &Connection) -> Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reach'",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(false);
+    }
+    let built: Option<String> = conn
+        .query_row(
+            "SELECT value FROM reach_meta WHERE key = ?1",
+            rusqlite::params![META_BUILT_DEPTH],
+            |row| row.get(0),
+        )
+        .ok();
+    if built.and_then(|v| v.parse::<usize>().ok()).is_none() {
+        return Ok(false);
+    }
+    let stale: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM reach_meta WHERE key = ?1",
+        rusqlite::params![META_STALE],
+        |row| row.get(0),
+    )?;
+    Ok(stale == 0)
+}
+
+/// Names whose candidate lists or symbol sets a file edit can change: the
+/// file's symbol names, the callee names of its references with a resolved
+/// caller, and the parent names of type edges whose child is in the file.
+fn affected_names(conn: &Connection, rel_path: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for sql in [
+        "SELECT DISTINCT name FROM symbols WHERE file = ?1",
+        "SELECT DISTINCT name FROM \"references\" WHERE file = ?1 AND caller_id IS NOT NULL",
+        "SELECT DISTINCT p.name FROM type_edges te \
+         JOIN symbols p ON p.id = te.parent_id \
+         JOIN symbols c ON c.id = te.child_id \
+         WHERE c.file = ?1",
+    ] {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params![rel_path], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            names.push(row?);
+        }
+    }
+    Ok(names)
+}
+
+/// Canonical (MIN-eligible) source id per name, for the names that have
+/// one — the same rule the build and lookup key rows under.
+fn canonical_ids_for_names(conn: &Connection, names: &[String]) -> Result<HashMap<String, i64>> {
+    let mut ids = HashMap::new();
+    for chunk in names.chunks(IN_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT name, MIN(id) FROM symbols \
+             WHERE kind <> 'module' AND name IN ({placeholders}) GROUP BY name"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (name, id) = row?;
+            ids.insert(name, id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Sources holding rows that target a symbol named in `names` — the
+/// reverse `target_id` lookup REQ-005 prescribes, served by
+/// `idx_reach_target`. One hop suffices: a traversal expands a name only
+/// after recording a row targeting a symbol of that name, so roots plus
+/// this lookup cover every source whose result the edit can move.
+fn sources_targeting_names(conn: &Connection, names: &[String]) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for chunk in names.chunks(IN_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT DISTINCT source_id FROM reach \
+             WHERE target_id IN (SELECT id FROM symbols WHERE name IN ({placeholders}))"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        for row in rows {
+            ids.push(row?);
+        }
+    }
+    Ok(ids)
+}
+
+/// Names of the symbols carrying the given ids. Ids without a symbol
+/// (impossible under FK cascade, possible in hand-built databases) drop
+/// out silently — they have no name to recompute.
+fn names_for_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for chunk in ids.chunks(IN_CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("SELECT DISTINCT name FROM symbols WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            names.push(row?);
+        }
+    }
+    Ok(names)
+}
+
+/// Chunked multi-VALUES insert of reach rows, shared by the full build and
+/// the incremental repair.
+fn write_reach_rows(tx: &rusqlite::Transaction, rows: &[(i64, i64, i64, f64)]) -> Result<()> {
+    // 4 bound parameters per row; bundled SQLite allows 32766 variables.
+    const ROWS_PER_STMT: usize = 249;
+    for chunk in rows.chunks(ROWS_PER_STMT) {
+        let placeholders = chunk
+            .iter()
+            .map(|_| "(?, ?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO reach (source_id, target_id, min_depth, confidence) VALUES {placeholders}"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        stmt.execute(rusqlite::params_from_iter(chunk.iter().flat_map(
+            |(s, t, d, c)| {
+                [
+                    s as &dyn rusqlite::ToSql,
+                    t as &dyn rusqlite::ToSql,
+                    d as &dyn rusqlite::ToSql,
+                    c as &dyn rusqlite::ToSql,
+                ]
+            },
+        )))?;
+    }
+    Ok(())
+}
+
 /// A symbol row loaded for the build.
 #[derive(Debug, Clone)]
 struct LoadedSymbol {
@@ -511,8 +885,6 @@ impl CandidateSource for GraphCandidates<'_> {
 /// (`GROUP BY c.id`), both ordered by (file, line, id). A per-repair memo
 /// caches lookups so rebuilding many sources in one repair reuses each
 /// name's candidate list.
-// WI-2's `finish_file_edit` constructs this; the allow is dropped there.
-#[allow(dead_code)]
 pub(crate) struct SqlCandidates<'a> {
     caller_stmt: rusqlite::Statement<'a>,
     child_stmt: rusqlite::Statement<'a>,
@@ -520,8 +892,6 @@ pub(crate) struct SqlCandidates<'a> {
     child_memo: HashMap<String, Vec<ReachCandidate>>,
 }
 
-// WI-2's `finish_file_edit` constructs this; the allow is dropped there.
-#[allow(dead_code)]
 impl<'a> SqlCandidates<'a> {
     pub(crate) fn new(conn: &'a Connection) -> Result<Self> {
         let caller_stmt = conn.prepare(
@@ -643,29 +1013,7 @@ pub fn build_reach(
     tx.execute("DELETE FROM reach_meta", [])?;
 
     rows.sort_unstable_by_key(|r| (r.0, r.1));
-    // 4 bound parameters per row; bundled SQLite allows 32766 variables.
-    const ROWS_PER_STMT: usize = 249;
-    for chunk in rows.chunks(ROWS_PER_STMT) {
-        let placeholders = chunk
-            .iter()
-            .map(|_| "(?, ?, ?, ?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO reach (source_id, target_id, min_depth, confidence) VALUES {placeholders}"
-        );
-        let mut stmt = tx.prepare(&sql)?;
-        stmt.execute(rusqlite::params_from_iter(chunk.iter().flat_map(
-            |(s, t, d, c)| {
-                [
-                    s as &dyn rusqlite::ToSql,
-                    t as &dyn rusqlite::ToSql,
-                    d as &dyn rusqlite::ToSql,
-                    c as &dyn rusqlite::ToSql,
-                ]
-            },
-        )))?;
-    }
+    write_reach_rows(tx, &rows)?;
 
     for source_id in &truncated_sources {
         tx.execute(
@@ -808,6 +1156,91 @@ pub(crate) fn lookup_upstream_impl(
     }))
 }
 
+/// Shared AR-021 oracle: on a fresh, built table, every eligible name must
+/// be answered with exactly the live BFS result at every depth up to the
+/// built depth, and nothing else may be answered.
+///
+/// One helper, three suites: the TASK-080 build equivalence suite and the
+/// TASK-081 incremental-maintenance suites (unit and pipeline-level) all
+/// assert the same contract through it.
+#[cfg(test)]
+pub(crate) fn assert_table_equivalent_to_bfs(conn: &Connection) {
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reach_meta WHERE key = ?1",
+            rusqlite::params![META_STALE],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0, "reach table must not be stale");
+
+    let built: usize = conn
+        .query_row(
+            "SELECT value FROM reach_meta WHERE key = ?1",
+            rusqlite::params![META_BUILT_DEPTH],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .expect("built_depth must be numeric");
+
+    let mut names: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT name FROM symbols ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    names.push("definitely_missing_name".into());
+
+    for name in &names {
+        let eligible: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE name = ?1 AND kind <> 'module'",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for depth in 1..=built {
+            let where_ = format!("name {name} depth {depth}");
+            let options = |use_reach: bool| crate::blast::BlastOptions {
+                depth,
+                direction: crate::types::BlastDirection::Upstream,
+                include_tests: false,
+                min_confidence: None,
+                use_reach,
+            };
+
+            let bfs = crate::blast::analyze_blast(conn, name, &options(false)).unwrap();
+            let routed = crate::blast::analyze_blast(conn, name, &options(true)).unwrap();
+            let answer = lookup_upstream(conn, name, depth).unwrap();
+
+            if eligible > 0 {
+                let answer =
+                    answer.unwrap_or_else(|| panic!("{where_}: table must cover the name"));
+                assert!(!answer.truncated, "{where_}: uncapped table truncated");
+                assert_eq!(
+                    answer.affected.len(),
+                    bfs.total_affected,
+                    "{where_}: row count vs BFS total"
+                );
+                assert_eq!(
+                    routed, bfs,
+                    "{where_}: routed (table) result must equal the BFS result"
+                );
+            } else {
+                assert!(
+                    answer.is_none(),
+                    "{where_}: Module-only/unknown names must not be answered"
+                );
+                assert_eq!(routed, bfs, "{where_}: fallback must be the exact BFS");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,6 +1377,11 @@ mod tests {
         )
         .unwrap()
             > 0
+    }
+
+    fn reach_row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM reach", [], |row| row.get(0))
+            .unwrap()
     }
 
     #[test]
@@ -1761,48 +2199,7 @@ mod tests {
             seed_graph(&conn, seed);
             build(&conn, 3, usize::MAX);
 
-            let mut names = distinct_names(&conn);
-            names.push("definitely_missing_name".into());
-
-            for name in &names {
-                let eligible: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM symbols WHERE name = ?1 AND kind <> 'module'",
-                        rusqlite::params![name],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                for depth in [1usize, 2, 3] {
-                    let where_ = format!("seed {seed} name {name} depth {depth}");
-                    let bfs = crate::blast::analyze_blast(&conn, name, &bfs_options(depth, false))
-                        .unwrap();
-                    let routed =
-                        crate::blast::analyze_blast(&conn, name, &bfs_options(depth, true))
-                            .unwrap();
-                    let answer = lookup_upstream(&conn, name, depth).unwrap();
-
-                    if eligible > 0 {
-                        let answer =
-                            answer.unwrap_or_else(|| panic!("{where_}: table must cover the name"));
-                        assert!(!answer.truncated, "{where_}: uncapped build");
-                        assert_eq!(
-                            answer.affected.len(),
-                            bfs.total_affected,
-                            "{where_}: row count vs BFS total"
-                        );
-                        assert_eq!(
-                            routed, bfs,
-                            "{where_}: routed (table) result must equal the BFS result"
-                        );
-                    } else {
-                        assert!(
-                            answer.is_none(),
-                            "{where_}: Module-only/unknown names must not be answered"
-                        );
-                        assert_eq!(routed, bfs, "{where_}: fallback must be the exact BFS");
-                    }
-                }
-            }
+            assert_table_equivalent_to_bfs(&conn);
         }
     }
 
@@ -1934,6 +2331,901 @@ mod tests {
             "filtered BFS is a subset, never equal here"
         );
     }
+    // -- Incremental maintenance suite (TASK-081, PRD-REACH-REQ-005/007) ----
+    //
+    // Every test simulates a file edit exactly as `upsert_file_data` /
+    // `delete_file_data` perform it: begin -> delete old rows -> insert new
+    // rows -> finish -> commit, in one transaction. The strongest oracle is
+    // `assert_incremental_equals_full_rebuild`: the incrementally
+    // maintained table must equal a from-scratch rebuild, row for row.
+
+    /// A file's post-edit content, in the shape `upsert_file_data` writes.
+    struct FileSpec {
+        /// (name, kind); line numbers assigned 1..=n in order.
+        symbols: Vec<(String, String)>,
+        /// (callee name, caller symbol name in this file, confidence).
+        refs: Vec<(String, Option<String>, f64)>,
+        /// (parent name, child name); child resolved in-file, parent
+        /// in-file first then cross-file.
+        type_edges: Vec<(String, String)>,
+    }
+
+    fn spec(
+        symbols: Vec<(&str, &str)>,
+        refs: Vec<(&str, Option<&str>, f64)>,
+        type_edges: Vec<(&str, &str)>,
+    ) -> FileSpec {
+        FileSpec {
+            symbols: symbols
+                .into_iter()
+                .map(|(n, k)| (n.to_string(), k.to_string()))
+                .collect(),
+            refs: refs
+                .into_iter()
+                .map(|(n, c, f)| (n.to_string(), c.map(|s| s.to_string()), f))
+                .collect(),
+            type_edges: type_edges
+                .into_iter()
+                .map(|(p, c)| (p.to_string(), c.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Simulate `upsert_file_data`: begin, delete the file's old rows,
+    /// insert the new rows, finish, commit — one transaction.
+    fn apply_edit(conn: &Connection, file: &str, edit: &FileSpec) -> ReachRepairStats {
+        let tx = conn.unchecked_transaction().unwrap();
+        let scope = begin_file_edit(&tx, file).unwrap();
+
+        tx.execute(
+            "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
+            rusqlite::params![file],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM symbols WHERE file = ?1",
+            rusqlite::params![file],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM \"references\" WHERE file = ?1",
+            rusqlite::params![file],
+        )
+        .unwrap();
+
+        let mut ids: HashMap<String, i64> = HashMap::new();
+        for (i, (name, kind)) in edit.symbols.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO symbols (name, kind, file, line, col, language) \
+                 VALUES (?1, ?2, ?3, ?4, 1, 'rust')",
+                rusqlite::params![name, kind, file, (i + 1) as i64],
+            )
+            .unwrap();
+            ids.insert(name.clone(), tx.last_insert_rowid());
+        }
+        for (i, (callee, caller, confidence)) in edit.refs.iter().enumerate() {
+            let caller_id = caller.as_ref().and_then(|c| ids.get(c).copied());
+            tx.execute(
+                "INSERT INTO \"references\" (name, file, line, col, caller_id, confidence) \
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                rusqlite::params![callee, file, (i + 1) as i64, caller_id, confidence],
+            )
+            .unwrap();
+        }
+        for (parent, child) in &edit.type_edges {
+            let Some(&child_id) = ids.get(child) else {
+                continue;
+            };
+            let parent_id = ids.get(parent).copied().or_else(|| {
+                tx.query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 LIMIT 1",
+                    rusqlite::params![parent],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok()
+            });
+            // Mirror upsert_file_data: unresolvable parents are skipped.
+            let Some(parent_id) = parent_id else {
+                continue;
+            };
+            tx.execute(
+                "INSERT INTO type_edges (child_id, parent_id, relationship) \
+                 VALUES (?1, ?2, 'impl')",
+                rusqlite::params![child_id, parent_id],
+            )
+            .unwrap();
+        }
+
+        let stats = finish_file_edit(&tx, &scope).unwrap();
+        tx.commit().unwrap();
+        stats
+    }
+
+    /// Simulate `delete_file_data`: begin, delete the file's rows, finish,
+    /// commit — one transaction, no new rows.
+    fn apply_delete(conn: &Connection, file: &str) -> ReachRepairStats {
+        let tx = conn.unchecked_transaction().unwrap();
+        let scope = begin_file_edit(&tx, file).unwrap();
+        tx.execute(
+            "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
+            rusqlite::params![file],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM symbols WHERE file = ?1",
+            rusqlite::params![file],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM \"references\" WHERE file = ?1",
+            rusqlite::params![file],
+        )
+        .unwrap();
+        let stats = finish_file_edit(&tx, &scope).unwrap();
+        tx.commit().unwrap();
+        stats
+    }
+
+    fn symbol_id(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM symbols WHERE name = ?1",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn symbol_id_in(conn: &Connection, name: &str, file: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM symbols WHERE name = ?1 AND file = ?2",
+            rusqlite::params![name, file],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// One reach row as snapshotted: (source, target, min_depth, confidence).
+    type ReachRowSnapshot = (i64, i64, i64, f64);
+    /// Whole-table snapshot: rows plus truncation markers.
+    type ReachTableSnapshot = (Vec<ReachRowSnapshot>, std::collections::BTreeSet<i64>);
+
+    /// Snapshot of the whole table: reach rows plus truncation markers.
+    /// Rows are sorted for deterministic comparison (f64 is not `Ord`, so
+    /// this is a sorted Vec, not a BTreeSet).
+    fn snapshot_reach(conn: &Connection) -> ReachTableSnapshot {
+        let mut rows: Vec<ReachRowSnapshot> = conn
+            .prepare("SELECT source_id, target_id, min_depth, confidence FROM reach")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        rows.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.partial_cmp(&b.3).unwrap())
+        });
+        let truncated: std::collections::BTreeSet<i64> = conn
+            .prepare("SELECT source_id FROM reach_truncated")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        (rows, truncated)
+    }
+
+    /// The incremental-maintenance oracle: snapshot the table, run a full
+    /// rebuild with the repair's own options (built depth, default cap),
+    /// and require row-for-row equality including truncation markers.
+    /// Leaves the table in the rebuilt — by the assert, identical — state.
+    fn assert_incremental_equals_full_rebuild(conn: &Connection) {
+        let built: usize = built_depth(conn)
+            .expect("table must be built")
+            .parse()
+            .unwrap();
+        let incremental = snapshot_reach(conn);
+        build(conn, built, DEFAULT_MAX_TARGETS_PER_SOURCE);
+        let rebuilt = snapshot_reach(conn);
+        assert_eq!(
+            incremental, rebuilt,
+            "incrementally maintained table must equal a full rebuild"
+        );
+    }
+
+    fn assert_no_orphan_rows(conn: &Connection) {
+        for column in ["source_id", "target_id"] {
+            let orphans: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM reach r \
+                         LEFT JOIN symbols s ON s.id = r.{column} WHERE s.id IS NULL"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphans, 0, "dangling {column} rows in reach");
+        }
+    }
+
+    #[test]
+    fn repair_adds_and_removes_rows_for_caller_edits() {
+        let (_dir, conn) = make_db();
+        apply_edit(
+            &conn,
+            "src/target.rs",
+            &spec(vec![("target", "function")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/caller.rs",
+            &spec(
+                vec![("caller", "function")],
+                vec![("target", Some("caller"), 0.9)],
+                vec![],
+            ),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+
+        let target_id = symbol_id(&conn, "target");
+        let caller_id = symbol_id(&conn, "caller");
+        assert_eq!(reach_rows(&conn, target_id), vec![(caller_id, 1, 0.9)]);
+
+        // Remove the call: target's rows drop to an authoritative empty.
+        // (The old row dies via FK cascade when the caller symbol row is
+        // replaced, so the repair's own delete count is 0 here — the
+        // behavioral assert is the row's absence.)
+        let stats = apply_edit(
+            &conn,
+            "src/caller.rs",
+            &spec(vec![("caller", "function")], vec![], vec![]),
+        );
+        assert_eq!(stats.rows_written, 0, "nothing to write: no callers left");
+        assert_eq!(reach_rows(&conn, target_id), vec![]);
+        let answer = lookup_upstream(&conn, "target", 3)
+            .unwrap()
+            .expect("target is still an eligible, covered name");
+        assert!(
+            answer.affected.is_empty(),
+            "covered-no-dependents is Some(empty), never silence"
+        );
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+
+        // Add the call back (new rowid for the caller symbol).
+        apply_edit(
+            &conn,
+            "src/caller.rs",
+            &spec(
+                vec![("caller", "function")],
+                vec![("target", Some("caller"), 0.95)],
+                vec![],
+            ),
+        );
+        let caller_id = symbol_id(&conn, "caller");
+        assert_eq!(reach_rows(&conn, target_id), vec![(caller_id, 1, 0.95)]);
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+    }
+
+    #[test]
+    fn repair_rebuilds_predecessors_via_reverse_target_lookup() {
+        let (_dir, conn) = make_db();
+        // deep <- mid <- top, one file per symbol.
+        apply_edit(
+            &conn,
+            "src/deep.rs",
+            &spec(vec![("deep", "function")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/mid.rs",
+            &spec(
+                vec![("mid", "function")],
+                vec![("deep", Some("mid"), 0.9)],
+                vec![],
+            ),
+        );
+        apply_edit(
+            &conn,
+            "src/top.rs",
+            &spec(
+                vec![("top", "function")],
+                vec![("mid", Some("top"), 0.9)],
+                vec![],
+            ),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+
+        let deep_id = symbol_id(&conn, "deep");
+        let mid_id = symbol_id(&conn, "mid");
+        let top_id = symbol_id(&conn, "top");
+        assert_eq!(
+            reach_rows(&conn, deep_id),
+            vec![(mid_id, 1, 0.9), (top_id, 2, 0.9)]
+        );
+
+        // top stops calling mid. "deep" appears in neither top.rs nor any
+        // name top.rs touches — only the reverse lookup on target_id can
+        // discover that deep's traversal passes through "mid" (REQ-005).
+        let stats = apply_edit(
+            &conn,
+            "src/top.rs",
+            &spec(vec![("top", "function")], vec![], vec![]),
+        );
+        assert!(
+            stats.rebuilt_sources >= 1,
+            "the predecessor source must be recomputed"
+        );
+        assert_eq!(
+            reach_rows(&conn, deep_id),
+            vec![(mid_id, 1, 0.9)],
+            "top must drop out of deep's rows"
+        );
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+    }
+
+    #[test]
+    fn repair_rebuilds_predecessors_hidden_by_cascade() {
+        let (_dir, conn) = make_db();
+        // deep <- lowmid <- mid <- top, with BOTH mid and lowmid in one
+        // file. deep's rows pass through mid and lowmid, whose symbol rows
+        // an edit to their file deletes — FK cascade then removes deep's
+        // linking rows ((deep, lowmid), (deep, mid)) before finish runs.
+        // Two independent mechanisms must still find deep for the repair
+        // to clear the stranded (deep, top) row: the pre-delete reverse
+        // lookup (rows targeting mid/lowmid-named symbols), and the
+        // ref-callee name "deep" in the affected set (the deleted ref in
+        // mid.rs named deep). Remove either one alone and this still
+        // passes; remove both and it fails — the redundancy is the point.
+        apply_edit(
+            &conn,
+            "src/deep.rs",
+            &spec(vec![("deep", "function")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/top.rs",
+            &spec(
+                vec![("top", "function")],
+                vec![("mid", Some("top"), 0.9)],
+                vec![],
+            ),
+        );
+        apply_edit(
+            &conn,
+            "src/mid.rs",
+            &spec(
+                vec![("mid", "function"), ("lowmid", "function")],
+                vec![("lowmid", Some("mid"), 0.9), ("deep", Some("lowmid"), 0.9)],
+                vec![],
+            ),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+
+        let deep_id = symbol_id(&conn, "deep");
+        let mid_id = symbol_id(&conn, "mid");
+        let lowmid_id = symbol_id(&conn, "lowmid");
+        let top_id = symbol_id(&conn, "top");
+        assert_eq!(
+            reach_rows(&conn, deep_id),
+            // reach_rows orders by target_id: top(2)@3, mid(3)@2, lowmid(4)@1.
+            vec![(top_id, 3, 0.9), (mid_id, 2, 0.9), (lowmid_id, 1, 0.9)]
+        );
+
+        // Delete the whole mid-chain file: deep's only callers vanish, so
+        // its rows must drop to empty — including (deep, top), which only
+        // the pre-cascade predecessor capture can reach.
+        apply_delete(&conn, "src/mid.rs");
+        assert_eq!(
+            reach_rows(&conn, deep_id),
+            vec![],
+            "the cascaded linking rows must not strand (deep, top)"
+        );
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+    }
+
+    #[test]
+    fn repair_moves_rows_on_canonical_min_id_shift() {
+        let (_dir, conn) = make_db();
+        // Foo in two files; the lower id is canonical. c calls Foo.
+        apply_edit(
+            &conn,
+            "src/a.rs",
+            &spec(vec![("Foo", "struct")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/b.rs",
+            &spec(vec![("Foo", "function")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/c.rs",
+            &spec(
+                vec![("c", "function")],
+                vec![("Foo", Some("c"), 0.9)],
+                vec![],
+            ),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+
+        let a_foo = symbol_id_in(&conn, "Foo", "src/a.rs");
+        let b_foo = symbol_id_in(&conn, "Foo", "src/b.rs");
+        let c_id = symbol_id(&conn, "c");
+        assert_eq!(reach_rows(&conn, a_foo), vec![(c_id, 1, 0.9)]);
+        assert!(reach_rows(&conn, b_foo).is_empty());
+
+        // Delete the lower-id Foo: the canonical id shifts to b's Foo and
+        // the rows must be re-keyed under it.
+        apply_edit(&conn, "src/a.rs", &spec(vec![], vec![], vec![]));
+        assert!(
+            reach_rows(&conn, a_foo).is_empty(),
+            "old canonical id must lose its rows"
+        );
+        assert_eq!(
+            reach_rows(&conn, b_foo),
+            vec![(c_id, 1, 0.9)],
+            "rows re-keyed under the new canonical id"
+        );
+        let answer = lookup_upstream(&conn, "Foo", 3)
+            .unwrap()
+            .expect("Foo still has an eligible symbol");
+        assert_eq!(answer.affected.len(), 1);
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+
+        // Demote the remaining Foo to Module: the name loses eligibility,
+        // its rows die, and lookups fall back to BFS.
+        apply_edit(
+            &conn,
+            "src/b.rs",
+            &spec(vec![("Foo", "module")], vec![], vec![]),
+        );
+        assert!(reach_rows(&conn, b_foo).is_empty());
+        assert!(
+            lookup_upstream(&conn, "Foo", 3).unwrap().is_none(),
+            "module-only name must not be answered"
+        );
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+    }
+
+    #[test]
+    fn repair_delete_file_drops_rows_and_dangling_targets() {
+        let (_dir, conn) = make_db();
+        apply_edit(
+            &conn,
+            "src/deep.rs",
+            &spec(vec![("deep", "function")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/mid.rs",
+            &spec(
+                vec![("mid", "function")],
+                vec![("deep", Some("mid"), 0.9)],
+                vec![],
+            ),
+        );
+        apply_edit(
+            &conn,
+            "src/top.rs",
+            &spec(
+                vec![("top", "function")],
+                vec![("mid", Some("top"), 0.9)],
+                vec![],
+            ),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+        assert_no_orphan_rows(&conn);
+
+        let stats = apply_delete(&conn, "src/mid.rs");
+        assert!(!stats.skipped, "a fresh table is repairable on delete too");
+
+        // No rows sourced from or targeting the deleted file's symbols:
+        // cascade removes the referencing rows, the repair must not leave
+        // anything behind (every row in this graph passed through mid).
+        assert_no_orphan_rows(&conn);
+        assert_eq!(reach_row_count(&conn), 0);
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+    }
+
+    #[test]
+    fn repair_new_file_creates_sources() {
+        let (_dir, conn) = make_db();
+        apply_edit(
+            &conn,
+            "src/existing.rs",
+            &spec(vec![("existing", "function")], vec![], vec![]),
+        );
+        // Edge-less graph: the build produces an empty but fresh table.
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+        assert_eq!(reach_row_count(&conn), 0);
+
+        // A brand-new file (Created-event shape) adds the first caller.
+        let stats = apply_edit(
+            &conn,
+            "src/new.rs",
+            &spec(
+                vec![("fresh", "function")],
+                vec![("existing", Some("fresh"), 0.9)],
+                vec![],
+            ),
+        );
+        assert_eq!(stats.rows_written, 1);
+        let existing_id = symbol_id(&conn, "existing");
+        let fresh_id = symbol_id(&conn, "fresh");
+        assert_eq!(reach_rows(&conn, existing_id), vec![(fresh_id, 1, 0.9)]);
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+    }
+
+    #[test]
+    fn repair_survives_cycle_introduction() {
+        let (_dir, conn) = make_db();
+        apply_edit(
+            &conn,
+            "src/hub.rs",
+            &spec(vec![("hub", "function")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/a.rs",
+            &spec(
+                vec![("a", "function")],
+                vec![("hub", Some("a"), 0.9)],
+                vec![],
+            ),
+        );
+        apply_edit(
+            &conn,
+            "src/b.rs",
+            &spec(
+                vec![("b", "function")],
+                vec![("hub", Some("b"), 0.9)],
+                vec![],
+            ),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+
+        // Introduce mutual recursion a <-> b (both files edited).
+        let edit_a = spec(
+            vec![("a", "function")],
+            vec![("b", Some("a"), 0.9), ("hub", Some("a"), 0.9)],
+            vec![],
+        );
+        let edit_b = spec(
+            vec![("b", "function")],
+            vec![("a", Some("b"), 0.9), ("hub", Some("b"), 0.9)],
+            vec![],
+        );
+        apply_edit(&conn, "src/a.rs", &edit_a);
+        apply_edit(&conn, "src/b.rs", &edit_b);
+
+        // Terminates (this line running is the assert), stays equivalent.
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+
+        // Repeat the same edits: content-idempotent (the symbol rowids
+        // shift because the two files alternate holding the max id, so the
+        // equivalence-oracle — not raw row snapshots — is the assert), and
+        // no duplicated (source, target) pairs ever appear.
+        apply_edit(&conn, "src/a.rs", &edit_a);
+        apply_edit(&conn, "src/b.rs", &edit_b);
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+        let pairs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT source_id, target_id FROM reach \
+                 GROUP BY source_id, target_id HAVING COUNT(*) > 1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pairs, 0, "no duplicated (source, target) pairs");
+    }
+
+    #[test]
+    fn repair_noops_on_never_built_and_stale_tables() {
+        // Never built: the edit commits, nothing is captured or written.
+        let (_dir, conn) = make_db();
+        let stats = apply_edit(
+            &conn,
+            "src/a.rs",
+            &spec(
+                vec![("a", "function")],
+                vec![("missing", Some("a"), 0.9)],
+                vec![],
+            ),
+        );
+        assert!(stats.skipped, "never-built table is not repairable");
+        assert_eq!(reach_row_count(&conn), 0);
+        assert!(built_depth(&conn).is_none());
+        assert!(!is_stale(&conn));
+
+        // Stale: the edit commits, the marker stays, and the repair adds
+        // or removes nothing. Rows referencing the edited file's symbols
+        // vanish via FK cascade regardless of staleness; the assert is
+        // that rows elsewhere survive untouched.
+        apply_edit(
+            &conn,
+            "src/b.rs",
+            &spec(vec![("b", "function")], vec![("a", Some("b"), 0.9)], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/z.rs",
+            &spec(vec![("z", "function")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/y.rs",
+            &spec(vec![("y", "function")], vec![("z", Some("y"), 0.9)], vec![]),
+        );
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+        let z_id = symbol_id(&conn, "z");
+        let y_id = symbol_id(&conn, "y");
+        assert_eq!(reach_rows(&conn, z_id), vec![(y_id, 1, 0.9)]);
+
+        let tx = conn.unchecked_transaction().unwrap();
+        mark_stale(&tx).unwrap();
+        tx.commit().unwrap();
+
+        let stats = apply_edit(
+            &conn,
+            "src/a.rs",
+            &spec(
+                vec![("a2", "function")],
+                vec![("b", Some("a2"), 0.9)],
+                vec![],
+            ),
+        );
+        assert!(stats.skipped, "stale table is not incrementally repairable");
+        assert!(is_stale(&conn), "only a full rebuild clears the marker");
+        assert_eq!(
+            reach_rows(&conn, z_id),
+            vec![(y_id, 1, 0.9)],
+            "rows outside the edit survive untouched"
+        );
+        assert!(
+            lookup_upstream(&conn, "b", 3).unwrap().is_none(),
+            "stale table must fall back to BFS"
+        );
+    }
+
+    #[test]
+    fn repair_respects_built_depth() {
+        let (_dir, conn) = make_db();
+        // e1 <- e2 <- e3 <- e4, one file per link.
+        apply_edit(
+            &conn,
+            "src/e1.rs",
+            &spec(vec![("e1", "function")], vec![], vec![]),
+        );
+        apply_edit(
+            &conn,
+            "src/e2.rs",
+            &spec(
+                vec![("e2", "function")],
+                vec![("e1", Some("e2"), 0.9)],
+                vec![],
+            ),
+        );
+        apply_edit(
+            &conn,
+            "src/e3.rs",
+            &spec(
+                vec![("e3", "function")],
+                vec![("e2", Some("e3"), 0.9)],
+                vec![],
+            ),
+        );
+        apply_edit(
+            &conn,
+            "src/e4.rs",
+            &spec(
+                vec![("e4", "function")],
+                vec![("e3", Some("e4"), 0.9)],
+                vec![],
+            ),
+        );
+        build(&conn, 2, DEFAULT_MAX_TARGETS_PER_SOURCE);
+
+        // New depth-5 caller of e1: f5 -> e4 -> e3 -> e2 -> e1.
+        apply_edit(
+            &conn,
+            "src/new.rs",
+            &spec(
+                vec![("f5", "function")],
+                vec![("e4", Some("f5"), 0.9)],
+                vec![],
+            ),
+        );
+
+        assert_eq!(built_depth(&conn).as_deref(), Some("2"), "depth intact");
+        let e1_rows = reach_rows(&conn, symbol_id(&conn, "e1"));
+        assert!(
+            e1_rows.iter().all(|&(_, depth, _)| depth <= 2),
+            "repaired rows stay within built_depth: {e1_rows:?}"
+        );
+        // The chain runs f5 -> e4 -> e3 -> e2 -> e1: f5 sits at depth 5
+        // from e1 (absent at built depth 2), depth 1 from e4, depth 2 from
+        // e3, and depth 3 from e2 (absent).
+        let e4_id = symbol_id(&conn, "e4");
+        let e3_id = symbol_id(&conn, "e3");
+        let e2_id = symbol_id(&conn, "e2");
+        let f5_id = symbol_id(&conn, "f5");
+        assert_eq!(
+            reach_rows(&conn, e4_id),
+            vec![(f5_id, 1, 0.9)],
+            "f5 is a direct caller of e4"
+        );
+        assert_eq!(
+            reach_rows(&conn, e3_id),
+            vec![(e4_id, 1, 0.9), (f5_id, 2, 0.9)],
+            "e4 calls e3, f5 two hops out"
+        );
+        assert_eq!(
+            reach_rows(&conn, e2_id),
+            vec![(e3_id, 1, 0.9), (e4_id, 2, 0.9)],
+            "f5 at depth 3 from e2 is beyond built_depth"
+        );
+        assert_table_equivalent_to_bfs(&conn);
+        assert_incremental_equals_full_rebuild(&conn);
+    }
+
+    #[test]
+    fn repair_applies_cap_to_rebuilt_sources() {
+        let (_dir, conn) = make_db();
+        apply_edit(
+            &conn,
+            "src/hub.rs",
+            &spec(vec![("hub", "function")], vec![], vec![]),
+        );
+        for f in 0..6 {
+            let mut symbols: Vec<(String, String)> = Vec::new();
+            let mut refs: Vec<(String, Option<String>, f64)> = Vec::new();
+            for j in 0..100 {
+                let name = format!("c{f}_{j}");
+                symbols.push((name.clone(), "function".to_string()));
+                refs.push(("hub".to_string(), Some(name), 0.9));
+            }
+            apply_edit(
+                &conn,
+                &format!("src/callers{f}.rs"),
+                &FileSpec {
+                    symbols,
+                    refs,
+                    type_edges: vec![],
+                },
+            );
+        }
+        // Built UNCAPPED: the hub records all 600 callers.
+        build(&conn, 3, usize::MAX);
+        let hub_id = symbol_id(&conn, "hub");
+        let uncapped = reach_rows(&conn, hub_id);
+        assert_eq!(uncapped.len(), 600);
+
+        // Edit the hub's own file: the repair rewrites the hub's source
+        // under the DEFAULT cap (the table self-describes; no config). The
+        // edit replaces the hub symbol row, so the source id moves — read
+        // it back after the edit.
+        apply_edit(
+            &conn,
+            "src/hub.rs",
+            &spec(
+                vec![("hub", "function"), ("local", "function")],
+                vec![("hub", Some("local"), 0.9)],
+                vec![],
+            ),
+        );
+        let hub_id = symbol_id(&conn, "hub");
+        let capped = reach_rows(&conn, hub_id);
+        assert_eq!(
+            capped.len(),
+            DEFAULT_MAX_TARGETS_PER_SOURCE,
+            "repair applies the default fan-out cap"
+        );
+        let marked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reach_truncated WHERE source_id = ?1",
+                rusqlite::params![hub_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, 1, "capped source carries the truncation marker");
+        // The capped set is a deterministic prefix of the uncapped set.
+        for row in &capped {
+            assert!(uncapped.contains(row), "capped row {row:?} not in full set");
+        }
+    }
+
+    #[test]
+    fn incremental_equivalence_random_edit_sequences() {
+        for seed in 1..=10u64 {
+            let (_dir, conn) = make_db();
+            let mut rng = SplitMix64(seed);
+
+            // Random initial state over all five fixture files.
+            for file in EQUIV_FILES {
+                apply_edit(&conn, file, &random_spec(&mut rng));
+            }
+            build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+            assert_table_equivalent_to_bfs(&conn);
+
+            for step in 0..5 {
+                let file = EQUIV_FILES[rng.below(EQUIV_FILES.len())];
+                apply_edit(&conn, file, &random_spec(&mut rng));
+
+                let where_ = format!("seed {seed} step {step} file {file}");
+                assert!(
+                    !is_stale(&conn),
+                    "{where_}: repair must keep the table fresh"
+                );
+                assert_eq!(
+                    built_depth(&conn).as_deref(),
+                    Some("3"),
+                    "{where_}: built_depth must survive repairs"
+                );
+                assert_no_orphan_rows(&conn);
+                assert_incremental_equals_full_rebuild(&conn);
+            }
+
+            // Once per seed: the full lookup-vs-BFS sweep.
+            assert_table_equivalent_to_bfs(&conn);
+        }
+    }
+
+    /// One random file body: 1..=6 symbols with colliding names and kinds,
+    /// 0..=3 refs per symbol into the shared name pools (some unresolved),
+    /// 0..=2 type edges with in-file children and in-file or cross-file
+    /// parents.
+    fn random_spec(rng: &mut SplitMix64) -> FileSpec {
+        let symbol_count = 1 + rng.below(6);
+        let mut symbols: Vec<(String, String)> = Vec::new();
+        for _ in 0..symbol_count {
+            let name = EQUIV_POOL[rng.below(EQUIV_POOL.len())];
+            let kind = EQUIV_KINDS[rng.below(EQUIV_KINDS.len())];
+            symbols.push((name.to_string(), kind.to_string()));
+        }
+        let mut refs: Vec<(String, Option<String>, f64)> = Vec::new();
+        for (name, _) in &symbols {
+            for _ in 0..rng.below(4) {
+                let callee = if rng.below(3) == 0 {
+                    EQUIV_STRUCTURED[rng.below(EQUIV_STRUCTURED.len())]
+                } else {
+                    EQUIV_POOL[rng.below(EQUIV_POOL.len())]
+                };
+                let caller = if rng.below(10) == 0 {
+                    None
+                } else {
+                    Some(name.clone())
+                };
+                let confidence = EQUIV_CONFS[rng.below(EQUIV_CONFS.len())];
+                refs.push((callee.to_string(), caller, confidence));
+            }
+        }
+        let mut type_edges: Vec<(String, String)> = Vec::new();
+        for _ in 0..rng.below(3) {
+            let parent = EQUIV_POOL[rng.below(EQUIV_POOL.len())];
+            let child = EQUIV_POOL[rng.below(EQUIV_POOL.len())];
+            type_edges.push((parent.to_string(), child.to_string()));
+        }
+        FileSpec {
+            symbols,
+            refs,
+            type_edges,
+        }
+    }
+
     // -- Concurrency suite (PRD-REACH-REQ-008, AR-028) -----------------------
     //
     // Readers must never observe a shrunken or partially-published reach set
@@ -1941,10 +3233,11 @@ mod tests {
     // publication give that; these tests hold the line.
 
     /// Variant A — daemon re-index loop: the writer drives the per-file
-    /// upsert path (delete + reinsert + mark_stale in one transaction) while
-    /// a reader repeatedly answers from a single read snapshot. The reader
-    /// must always see the full expected set via BFS, and any table answer
-    /// must be that same full set — never empty, never a subset.
+    /// upsert path (delete + reinsert + incremental reach repair in one
+    /// transaction) while a reader repeatedly answers from a single read
+    /// snapshot. The reader must always see the full expected set via BFS,
+    /// and any table answer must be that same full set — never empty, never
+    /// a subset.
     #[test]
     fn concurrency_reader_never_observes_shrunken_set_during_reindex() {
         let dir = TempDir::new().unwrap();
