@@ -1,6 +1,7 @@
-//! Contract extraction: canonical ID normalization plus the `http`, `env`,
-//! `queue`, `websocket`, and `job` contract kinds (TASK-082, TASK-087,
-//! PRD-CTR-REQ-001..004).
+//! Contract extraction: canonical ID normalization, the `http`, `env`,
+//! `queue`, `websocket`, and `job` contract kinds (TASK-082, TASK-087), the
+//! RPC-family and schema kinds `grpc`, `graphql`, and `openapi` plus the
+//! canonical join they require (TASK-088, PRD-CTR-REQ-001..004, 024).
 //!
 //! Contracts are detected by walking the tree-sitter tree that the symbol
 //! indexer already parsed — no second parse or file read (PRD-CTR-REQ-011).
@@ -26,6 +27,41 @@
 //!   handler registrations (`socket.on`, `@MessageMapping`, `app.ws`). Here
 //!   the writer serves and the reader subscribes — the mirror image of the
 //!   queue rule, per the TASK-087 specification.
+//! - **grpc:** provider = the serving side (proto `rpc` declarations,
+//!   `XGrpc.XImplBase`/Servicer method impls, `Register<S>Server`,
+//!   `addService`, `impl …::S for T`); consumer = generated-stub call sites
+//!   (`stub.getUser`, `client.GetUser`, `pb.New<S>Client(conn).M(…)`). A
+//!   service-level registration uses identifier `*` (`grpc::S::*`) and pairs
+//!   with any method-level consumer of that service.
+//! - **graphql:** provider = resolvers (SDL root-type fields, JS resolver
+//!   maps, `@strawberry.*`, Ariadne `@Query.field`); consumer = operation
+//!   call sites (`gql` tagged templates, Apollo `.query`/`.mutate` strings,
+//!   Python `gql(…)`, operation documents).
+//! - **openapi:** provider only — specification documents are file-level
+//!   contracts with a NULL owning symbol by design (§4.24); there is no
+//!   consumer side to detect.
+//!
+//! Document files (TASK-088, no-new-crates constraint): `.proto`,
+//! `.graphql`/`.gql`, and `.yaml`/`.yml`/`.json` carry no grammar, so tiny
+//! line-oriented scanners ([`extract_document_contracts`]) read them
+//! instead. Only a document that yields candidates gets a `files` row
+//! (empty symbols, language = [`DocumentKind::as_str`]) — that row is
+//! TASK-083's hash/re-index anchor; everything else stays un-indexed
+//! exactly as before. OpenAPI additionally sniffs content (a top-level
+//! `openapi:`/`swagger:` key plus `paths:`), so CI/compose/package files
+//! never index.
+//!
+//! RPC canonical join ([`canonical_rpc_join`], PRD-CTR-REQ-024): exact ID
+//! equality is the first pass and is never overridden — candidates with an
+//! opposite-role exact counterpart in their own workspace are excluded
+//! entirely. The join is the SECOND pass, pure and in-memory over
+//! workspace-scoped slices, tolerating package qualification (service
+//! compared on the last dot-segment, case-folded), method casing and
+//! snake/camel separators (`get_user` = `GetUser` = `getUser`), and
+//! service-level `*` registration (method-level providers win). Workspace
+//! equality on normalized identifiers ([`normalize_workspace_id`],
+//! PRD-CTR-REQ-019) is the REQ-014 guard — the join relaxes names, never
+//! scope. IDs keep the developer's spelling; only the comparison relaxes.
 //!
 //! RabbitMQ note: producers address exchange+routing-key while consumers
 //! address queue names; the binding between them is broker config and
@@ -36,6 +72,13 @@
 //! Verb collisions (`send`/`emit`) resolve by guard order: websocket
 //! receivers first, then the queue generic arms, and the ambiguous HTTP
 //! arm last behind its `is_path_like` gate.
+//!
+//! Out of scope by design (extraction, not validation): GraphQL servers in
+//! Java/Go/C#/PHP/Rust; untracked gRPC receiver variables; JS grpc arms
+//! without a file-level "grpc" marker; plain look-alike strings (only
+//! `gql`/`graphql` tags, Apollo option objects, and Python `gql(…)` parse);
+//! flow-style YAML maps and multi-document YAML; a GraphQL document's
+//! second operation.
 
 use std::collections::HashMap;
 
@@ -10359,5 +10402,67 @@ paths:
     fn workspace_id_trims_and_case_folds() {
         assert_eq!(normalize_workspace_id("  Payments "), "payments");
         assert_eq!(normalize_workspace_id("PAYMENTS"), "payments");
+    }
+
+    // -- E2E acceptance (TASK-088 acceptance criterion 1) ------------------------
+
+    /// IDL definition + generated-stub call site pair despite package
+    /// qualification and casing, through both pipeline paths: the document
+    /// path for the `.proto` and the grammar path for the `.java`.
+    #[test]
+    fn acceptance_proto_idl_pairs_with_java_stub() {
+        use crate::indexer::get_parser;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("proto")).unwrap();
+        fs::create_dir_all(root.join("src/main/java")).unwrap();
+        fs::write(
+            root.join("proto/users.proto"),
+            "syntax = \"proto3\";\npackage users.v1;\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main/java/Client.java"),
+            "import io.grpc.ManagedChannel;\n\nclass Client {\n    void call(ManagedChannel channel) {\n        UserServiceGrpc.UserServiceBlockingStub stub = UserServiceGrpc.newBlockingStub(channel);\n        stub.getUser(request);\n    }\n}\n",
+        )
+        .unwrap();
+
+        let opts = ContractOptions::default();
+        let mut cands = Vec::new();
+
+        // Document path (pipeline's parse_one_file fallback).
+        let proto = root.join("proto/users.proto");
+        let content = fs::read_to_string(&proto).unwrap();
+        let kind = document_kind(&proto).expect("proto is a document kind");
+        cands.extend(extract_document_contracts(kind, &content, &opts));
+
+        // Grammar path.
+        let java = root.join("src/main/java/Client.java");
+        let src = fs::read_to_string(&java).unwrap();
+        let lang = crate::indexer::detect_language(&java).expect("java detected");
+        let mut parser = get_parser(lang);
+        let tree = parser.parse(&src, None).expect("parse failed");
+        cands.extend(extract_contracts(&tree, &src, lang, &opts));
+
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(
+            find(&cands, "grpc::UserService::GetUser").is_some(),
+            "proto provider (package NOT composed): {cands:?}"
+        );
+        assert!(
+            find(&cands, "grpc::UserService::getUser").is_some(),
+            "java stub consumer: {cands:?}"
+        );
+
+        let scopes = [RpcJoinScope {
+            workspace: "e2e".to_string(),
+            candidates: &cands,
+        }];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].provider.canonical_id, "grpc::UserService::GetUser");
+        assert_eq!(joins[0].consumer.canonical_id, "grpc::UserService::getUser");
     }
 }
