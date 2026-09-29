@@ -138,6 +138,10 @@ struct RouterContext {
     /// `let VAR = <initializer>` byte ranges: Rust chains attribute their
     /// `.route` literals to the variable the chain initializes.
     initializer_ranges: Vec<(std::ops::Range<usize>, String)>,
+    /// Ruby `q = channel.queue("NAME")` / `channel.direct|topic|fanout`
+    /// declarations: variable -> queue/exchange name (TASK-087). A bound
+    /// variable's `.subscribe` is a RabbitMQ provider on that name.
+    queue_bindings: HashMap<String, String>,
 }
 
 /// Maximum chain depth when resolving group prefixes (cycles, deep chains).
@@ -188,6 +192,9 @@ fn collect_router_context(root: Node, src: &[u8], lang: Lang) -> RouterContext {
             }
             Lang::Rust => {
                 collect_rust_router_facts(node, src, &mut ctx);
+            }
+            Lang::Ruby => {
+                collect_ruby_queue_facts(node, src, &mut ctx);
             }
             _ => {}
         }
@@ -465,6 +472,47 @@ fn collect_rust_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
             }
         }
         _ => {}
+    }
+}
+
+/// Ruby: `q = channel.queue("NAME")` and `x = channel.direct|topic|fanout("NAME")`
+/// bind a variable to the queue/exchange name it addresses (TASK-087).
+fn collect_ruby_queue_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
+    if node.kind() != "assignment" {
+        return;
+    }
+    let Some(left) = node
+        .child_by_field_name("left")
+        .filter(|n| n.kind() == "identifier")
+    else {
+        return;
+    };
+    let var = node_text(Some(left), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(right) = node
+        .child_by_field_name("right")
+        .filter(|n| n.kind() == "call")
+    else {
+        return;
+    };
+    if !matches!(
+        node_text(right.child_by_field_name("method"), src),
+        "queue" | "direct" | "topic" | "fanout"
+    ) {
+        return;
+    }
+    let Some(name_node) = right
+        .child_by_field_name("arguments")
+        .and_then(|args| positional_arg(args, 0))
+        .filter(|n| n.kind() == "string")
+    else {
+        return;
+    };
+    let name = ruby_string_content(name_node, src);
+    if !name.is_empty() {
+        ctx.queue_bindings.insert(var.to_string(), name);
     }
 }
 
@@ -1306,6 +1354,28 @@ impl<'a> Extractor<'a> {
         let method = node_text(node.child_by_field_name("method"), self.src);
         let receiver = node.child_by_field_name("receiver");
         let args = node.child_by_field_name("arguments");
+        // TASK-087: Bunny `q.subscribe do … end` carries no argument list —
+        // the topic comes from the channel.queue binding pre-pass.
+        if method == "subscribe"
+            && let Some(recv) = receiver
+            && recv.kind() == "identifier"
+            && let Some(name) = self
+                .ctx
+                .queue_bindings
+                .get(node_text(Some(recv), self.src))
+                .cloned()
+        {
+            self.emit_queue(
+                node,
+                recv,
+                &name,
+                ContractRole::Provider,
+                "rabbitmq",
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
+            return prefix.to_string();
+        }
         let Some(args) = args else {
             return prefix.to_string();
         };
@@ -1353,6 +1423,34 @@ impl<'a> Extractor<'a> {
                                 &name,
                                 ContractRole::Consumer,
                                 CONFIDENCE_FRAMEWORK,
+                            );
+                        }
+                    }
+                    // TASK-087 queue: Bunny publish(payload, routing_key: …)
+                    // is a 1.0 consumer; a plain string first argument falls
+                    // to the generic tier with the receiver's broker token.
+                    _ if method == "publish" => {
+                        if let Some((t, raw)) = ruby_kwarg_string(args, "routing_key", self.src) {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        } else if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                broker_token(recv_text),
+                                CONFIDENCE_HEURISTIC,
+                                None,
                             );
                         }
                     }
@@ -3202,6 +3300,26 @@ fn ruby_string_content(node: Node, src: &[u8]) -> String {
     render_string_node(node, src, Lang::Ruby)
 }
 
+/// `key: 'value'` keyword argument of a Ruby call: the pair's value node
+/// and its string content (`pair` children are key symbol then value).
+fn ruby_kwarg_string<'t>(args: Node<'t>, name: &str, src: &[u8]) -> Option<(Node<'t>, String)> {
+    for j in 0..args.named_child_count() {
+        let Some(pair) = args.named_child(j as u32) else {
+            continue;
+        };
+        if pair.kind() != "pair" {
+            continue;
+        }
+        let (Some(key), Some(value)) = (pair.named_child(0), pair.named_child(1)) else {
+            continue;
+        };
+        if node_text(Some(key), src).trim_start_matches(':') == name && value.kind() == "string" {
+            return Some((value, ruby_string_content(value, src)));
+        }
+    }
+    None
+}
+
 /// Broker family implied by a receiver/variable name (`kafkaProducer`,
 /// `nc`, `rabbitChan`, `bunny`, `amqpConn`); empty when unknown. Used by
 /// the 0.5 generic tier — the qualifier still pairs cross-repo when both
@@ -4804,6 +4922,47 @@ ENV['TMP_SET'] = 'x'
         let w = find(&cands, "env::::TMP_SET").expect("write not found");
         assert_eq!(w.role, ContractRole::Provider);
         assert_eq!(w.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    // -- walker: queue, Ruby (TASK-087 step 5) ---------------------------------
+
+    #[test]
+    fn ruby_bunny_publish_routing_key_kwarg() {
+        let src = "x.publish(payload, routing_key: 'orders.created')\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::rabbitmq::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_bunny_queue_subscribe_binding() {
+        let src = "q = channel.queue('orders.created')\nq.subscribe do |info, props, body|\n  puts body\nend\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::rabbitmq::orders.created");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_subscribe_on_unbound_var_skipped() {
+        // No channel.queue binding: nothing to attribute the topic from.
+        let cands = extract(Lang::Ruby, "q.subscribe do |info, body|\nend\n");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn ruby_generic_publish_heuristic() {
+        let src = "chan.publish('orders.created')\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+        assert_eq!(cands[0].confidence, CONFIDENCE_HEURISTIC);
     }
 
     // -- walker: Go (step 6) -----------------------------------------------------
