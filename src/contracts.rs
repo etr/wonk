@@ -531,6 +531,21 @@ fn kwarg_string(args: Node, name: &str, src: &[u8]) -> Option<String> {
     None
 }
 
+/// Value node of a keyword argument (kind-checked by the caller's
+/// topic-argument renderer).
+fn kwarg_string_node<'t>(args: Node<'t>, name: &str, src: &[u8]) -> Option<Node<'t>> {
+    for j in 0..args.named_child_count() {
+        if let Some(kw) = args.named_child(j as u32)
+            && kw.kind() == "keyword_argument"
+            && node_text(kw.child_by_field_name("name"), src) == name
+            && let Some(value) = kw.child_by_field_name("value")
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// Content of a Python string node (f-string interpolations rendered as
 /// `{expr}`).
 fn py_string_content(node: Node, src: &[u8]) -> Option<String> {
@@ -1044,6 +1059,111 @@ impl<'a> Extractor<'a> {
                                 CONFIDENCE_FRAMEWORK,
                                 None,
                             );
+                        }
+                    }
+                    // -- queue (TASK-087, DR-031) --------------------------------
+                    // confluent-kafka: producer.produce('topic', value=…).
+                    (_, "produce") => {
+                        if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                "kafka",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // pika: basic_publish(…, routing_key=…) else positional 2.
+                    (_, "basic_publish") => {
+                        let t = kwarg_string_node(args, "routing_key", self.src)
+                            .or_else(|| positional_arg(args, 1));
+                        if let Some(t) = t
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // pika: basic_consume(queue=…) else positional 1.
+                    (_, "basic_consume") => {
+                        let t = kwarg_string_node(args, "queue", self.src).or(first);
+                        if let Some(t) = t
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Provider,
+                                "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // nats-py: nc.publish(subj, payload) / nc.subscribe(subj).
+                    (_, "publish") if matches!(recv, "nc" | "nats") => {
+                        if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                "nats",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    (_, "subscribe") if matches!(recv, "nc" | "nats") => {
+                        if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_queue(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Provider,
+                                "nats",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // Generic tier: send/subscribe with a string literal at
+                    // 0.5, broker token from the receiver name. The
+                    // list-of-one subscribe shape is kafka-python's and
+                    // carries 1.0.
+                    (_, "send") | (_, "subscribe") => {
+                        if let Some(t) = first {
+                            let role = if attr == "send" {
+                                ContractRole::Consumer
+                            } else {
+                                ContractRole::Provider
+                            };
+                            let (broker, confidence) =
+                                if attr == "subscribe" && matches!(t.kind(), "list" | "tuple") {
+                                    ("kafka", CONFIDENCE_FRAMEWORK)
+                                } else {
+                                    (broker_token(recv), CONFIDENCE_HEURISTIC)
+                                };
+                            if let Some(raw) = self.topic_arg(t) {
+                                self.emit_queue(node, t, &raw, role, broker, confidence, None);
+                            }
                         }
                     }
                     _ => {
@@ -4258,6 +4378,116 @@ urlpatterns = [
         let c = find(&cands, "http::ANY::/things").expect("route not found");
         assert_eq!(c.role, ContractRole::Provider);
         assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    // -- walker: queue, Python (TASK-087 step 5) -------------------------------
+
+    #[test]
+    fn py_kafka_producer_send_heuristic() {
+        let src = "def run():\n    producer.send('orders.created', value=msg)\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+        assert_eq!(c.owning_symbol.as_deref(), Some("run"));
+    }
+
+    #[test]
+    fn py_confluent_producer_produce() {
+        let src = "producer.produce('orders.created', value=msg)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_kafka_consumer_subscribe_list() {
+        let src = "consumer.subscribe(['orders.created'])\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_consumer_subscribe_plain_string_heuristic() {
+        let src = "consumer.subscribe('orders.created')\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn py_consumer_subscribe_multi_topic_list_skipped() {
+        let cands = extract(
+            Lang::Python,
+            "consumer.subscribe(['a.created', 'b.created'])",
+        );
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn py_nats_publish() {
+        let src = "async def push():\n    await nc.publish('orders.created', b'x')\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_nats_subscribe() {
+        let src = "async def listen():\n    await nc.subscribe('orders.created')\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn py_pika_basic_publish_kwarg() {
+        let src = "ch.basic_publish(exchange='', routing_key='orders.created', body=msg)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_pika_basic_publish_positional() {
+        let src = "ch.basic_publish('', 'orders.created', msg)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn py_pika_basic_consume_kwarg() {
+        let src = "ch.basic_consume(queue='orders.created', on_message_callback=cb)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_pika_basic_consume_positional() {
+        let src = "ch.basic_consume('orders.created', cb)\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn py_generic_send_broker_from_receiver() {
+        let src = "kafka_producer.send('orders.created')\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::kafka::orders.created");
+        assert_eq!(cands[0].confidence, CONFIDENCE_HEURISTIC);
     }
 
     // -- walker: Ruby (step 6) ---------------------------------------------------
