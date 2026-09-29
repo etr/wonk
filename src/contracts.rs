@@ -1494,6 +1494,119 @@ impl<'a> Extractor<'a> {
                     self.emit_env(node, &name, ContractRole::Provider, CONFIDENCE_HEURISTIC);
                 }
             }
+            // -- queue (TASK-087, DR-031) --------------------------------
+            // Publish arity disambiguates the broker: nats.Publish(subj, data)
+            // takes 2 positional args; amqp Publish*/PublishWithContext carry
+            // exchange+key before the message (>= 3 args). The ctx first
+            // argument of PublishWithContext shifts the routing key one
+            // position later.
+            (_, "PublishWithContext") if argc >= 3 => {
+                if let Some(t) = positional_arg(args, 2)
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "rabbitmq",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, m) if m.starts_with("Publish") && m != "PublishWithContext" && argc >= 3 => {
+                if let Some(t) = positional_arg(args, 1)
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "rabbitmq",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "Publish") if argc == 2 => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "nats",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "Subscribe") | (_, "QueueSubscribe") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        "nats",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "Consume") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        "rabbitmq",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            // sarama: ConsumePartition(topic, partition, offset).
+            (_, "ConsumePartition") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        "kafka",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            // sarama: producer.SendMessage(&ProducerMessage{Topic: "…"}).
+            (_, "SendMessage") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_queue(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        "kafka",
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
             _ => {
                 if let Some(verb) = go_client_verb(recv, meth)
                     && let Some(arg) = first
@@ -3193,15 +3306,20 @@ fn go_keyed_topic_literal(arg: Node, src: &[u8]) -> Option<String> {
     if node.kind() != "composite_literal" {
         return None;
     }
-    for i in 0..node.named_child_count() {
-        let Some(keyed) = node.named_child(i as u32) else {
+    // keyed elements live inside the literal_value wrapper; keys and values
+    // are each wrapped in a literal_element node.
+    let literal_value = (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i as u32))
+        .find(|n| n.kind() == "literal_value")?;
+    for i in 0..literal_value.named_child_count() {
+        let Some(keyed) = literal_value.named_child(i as u32) else {
             continue;
         };
         if keyed.kind() != "keyed_element" {
             continue;
         }
-        let key = keyed.named_child(0)?;
-        let value = keyed.named_child(1)?;
+        let key = keyed.named_child(0)?.named_child(0)?;
+        let value = keyed.named_child(1)?.named_child(0)?;
         if node_text(Some(key), src) == "Topic" && value.kind() == "interpreted_string_literal" {
             return Some(render_string_node(value, src, Lang::Go));
         }
@@ -4764,6 +4882,99 @@ func cfg() {
         assert!(find(&cands, "env::::FLAG").is_some());
         let w = find(&cands, "env::::TMP_SET").expect("write not found");
         assert_eq!(w.role, ContractRole::Provider);
+    }
+
+    // -- walker: queue, Go (TASK-087 step 5) -----------------------------------
+
+    #[test]
+    fn go_nats_publish_two_args() {
+        let src = "package main\n\nfunc push() {\n\tnat.Publish(\"orders.created\", data)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::nats::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.line, 4);
+    }
+
+    #[test]
+    fn go_amqp_publish_three_args_is_rabbitmq() {
+        let src = "package main\n\nfunc pub() {\n\tch.Publish(\"orders\", \"orders.created\", false, false, msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::rabbitmq::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_amqp_publish_with_context_three_plus_args() {
+        let src = "package main\n\nfunc pub() {\n\tch.PublishWithContext(ctx, \"orders\", \"orders.created\", false, false, msg)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_nats_subscribe() {
+        let src = "package main\n\nfunc listen() {\n\tnc.Subscribe(\"orders.created\", cb)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_nats_queue_subscribe() {
+        let src = "package main\n\nfunc listen() {\n\tnc.QueueSubscribe(\"orders.created\", \"grp\", cb)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn go_amqp_consume() {
+        let src = "package main\n\nfunc listen() {\n\tmsgs, _ := ch.Consume(\"orders.created\", \"\", true, false, false, false, nil)\n\t_ = msgs\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_sarama_consume_partition() {
+        let src = "package main\n\nfunc listen() {\n\tpc, _ := consumer.ConsumePartition(\"orders.created\", 0, 0)\n\t_ = pc\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_sarama_producer_send_message() {
+        let src = "package main\n\nfunc pub() {\n\tproducer.SendMessage(&ProducerMessage{Topic: \"orders.created\"})\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::kafka::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn go_publish_arg_count_disambiguates_broker() {
+        // 2-positional Publish is nats; 3+ is amqp (paired disambiguation).
+        let two = extract(
+            Lang::Go,
+            "package main\nfunc a() {\n\tnc.Publish(\"s.a\", d)\n}\n",
+        );
+        let three = extract(
+            Lang::Go,
+            "package main\nfunc b() {\n\tch.Publish(\"e\", \"s.a\", d)\n}\n",
+        );
+        assert!(find(&two, "queue::nats::s.a").is_some(), "got {two:?}");
+        assert!(
+            find(&three, "queue::rabbitmq::s.a").is_some(),
+            "got {three:?}"
+        );
     }
 
     // -- walker: Rust (step 6) ---------------------------------------------------
