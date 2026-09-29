@@ -43,7 +43,7 @@
 | M23 | Scoped Change Detection (`wonk changes`) | 2 | Complete |
 | M24 | Unified Symbol Context (`wonk context`) | 1 | Complete |
 | M25 | Multi-Repo MCP | 1 | Complete |
-| M26 | Bundled Embedding Provider | 3 | In Progress |
+| M26 | Bundled Embedding Provider | 3 | Complete |
 | M27 | Lexical BM25 Scoring | 2 | Not Started |
 | M28 | Precomputed Reach Index | 2 | Not Started |
 | M29 | Cross-Repo Contract Detection | 5 | Not Started |
@@ -3280,11 +3280,11 @@ Select, bundle, and implement `BundledProvider` — in-process embedding generat
 Handle the degraded paths: unreachable external provider, and a configured provider that disagrees with stored vectors.
 
 **Action Items:**
-- [ ] When a configured Ollama is unreachable at query time, fall back to the bundled provider with a stderr warning (PRD-EMB-REQ-009)
-- [ ] Ensure the fallback never applies to a mismatched stored vector space — that path still blocks with a re-embed instruction (PRD-EMB-REQ-005)
-- [ ] Emit an actionable re-embed command in the mismatch error message
-- [ ] Update `wonk status` to show the active provider, stored vector provider, and dimension
-- [ ] Downgrade AR-008 (Ollama availability) messaging across docs — Ollama is now a quality tier, not a requirement
+- [x] When a configured Ollama is unreachable at query time, fall back to the bundled provider with a stderr warning (PRD-EMB-REQ-009)
+- [x] Ensure the fallback never applies to a mismatched stored vector space — that path still blocks with a re-embed instruction (PRD-EMB-REQ-005)
+- [x] Emit an actionable re-embed command in the mismatch error message
+- [x] Update `wonk status` to show the active provider, stored vector provider, and dimension
+- [x] Downgrade AR-008 (Ollama availability) messaging across docs — Ollama is now a quality tier, not a requirement
 
 **Dependencies:**
 - Blocked by: TASK-075, TASK-076
@@ -3300,7 +3300,7 @@ Handle the degraded paths: unreachable external provider, and a configured provi
 **Related Requirements:** PRD-EMB-REQ-005, PRD-EMB-REQ-009
 **Related Decisions:** DR-032
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
