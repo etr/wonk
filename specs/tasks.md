@@ -44,7 +44,7 @@
 | M24 | Unified Symbol Context (`wonk context`) | 1 | Complete |
 | M25 | Multi-Repo MCP | 1 | Complete |
 | M26 | Bundled Embedding Provider | 3 | Complete |
-| M27 | Lexical BM25 Scoring | 2 | Not Started |
+| M27 | Lexical BM25 Scoring | 2 | In Progress |
 | M28 | Precomputed Reach Index | 2 | Not Started |
 | M29 | Cross-Repo Contract Detection | 5 | Not Started |
 | M30 | Diff-Scoped Review Workflow | 3 | Not Started |
@@ -3319,12 +3319,12 @@ Handle the degraded paths: unreachable external provider, and a configured provi
 Compute and persist the per-term document statistics BM25 needs, maintained incrementally by the daemon.
 
 **Action Items:**
-- [ ] Add `term_stats(term, file, tf)` table with an index on `term` (DR-033)
-- [ ] Populate statistics inside the existing indexing transaction — no separate pass (PRD-BM25-REQ-001)
-- [ ] Reuse `files` row counts/lengths for the document-length component rather than storing them twice
-- [ ] Incremental maintenance in the daemon path: decrement/delete on file removal, increment on re-index (PRD-BM25-REQ-005)
-- [ ] Handle file rename as delete + insert to avoid orphaned statistics (AR-024)
-- [ ] Test statistics correctness across an edit/delete/rename sequence
+- [x] Add `term_stats(term, file, tf)` table with an index on `term` (DR-033)
+- [x] Populate statistics inside the existing indexing transaction — no separate pass (PRD-BM25-REQ-001)
+- [x] Reuse `files` row counts/lengths for the document-length component rather than storing them twice
+- [x] Incremental maintenance in the daemon path: decrement/delete on file removal, increment on re-index (PRD-BM25-REQ-005)
+- [x] Handle file rename as delete + insert to avoid orphaned statistics (AR-024)
+- [x] Test statistics correctness across an edit/delete/rename sequence
 
 **Dependencies:**
 - Blocked by: None
@@ -3339,7 +3339,7 @@ Compute and persist the per-term document statistics BM25 needs, maintained incr
 **Related Requirements:** PRD-BM25-REQ-001, PRD-BM25-REQ-005
 **Related Decisions:** DR-033
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
