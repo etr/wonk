@@ -240,19 +240,52 @@ fn collect_py_router_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
 }
 
 /// The i-th positional argument of an argument list (skipping keywords).
-fn positional_arg(args: Node, i: usize) -> Option<Node> {
+///
+/// Grammars that wrap each argument in an `argument` node (PHP, C#) are
+/// unwrapped to the underlying value expression; the wrapper's last named
+/// child is the value for both positional and named forms.
+fn positional_arg<'t>(args: Node<'t>, i: usize) -> Option<Node<'t>> {
     let mut seen = 0;
     for j in 0..args.named_child_count() {
         if let Some(child) = args.named_child(j as u32)
             && child.kind() != "keyword_argument"
         {
             if seen == i {
-                return Some(child);
+                return Some(unwrap_argument(child));
             }
             seen += 1;
         }
     }
     None
+}
+
+/// Depth-first search for the first descendant of the given kind.
+fn first_descendant_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        for i in 0..current.named_child_count() {
+            if let Some(child) = current.named_child(i as u32) {
+                if child.kind() == kind {
+                    return Some(child);
+                }
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+/// Unwrap `argument` / `attribute_argument` wrapper nodes to their value.
+fn unwrap_argument(node: Node) -> Node {
+    if matches!(node.kind(), "argument" | "attribute_argument") {
+        let last = (0..node.named_child_count())
+            .rev()
+            .find_map(|i| node.named_child(i as u32));
+        if let Some(inner) = last {
+            return inner;
+        }
+    }
+    node
 }
 
 /// String value of a keyword argument, if it is a string literal.
@@ -386,7 +419,13 @@ impl<'a> Extractor<'a> {
         match self.lang {
             Lang::JavaScript | Lang::TypeScript | Lang::Tsx => self.visit_js(node, prefix),
             Lang::Python => self.visit_python(node, prefix),
-            _ => prefix.to_string(),
+            Lang::Ruby => self.visit_ruby(node, prefix),
+            Lang::Go => self.visit_go(node, prefix),
+            Lang::Rust => self.visit_rust(node, prefix),
+            Lang::Java => self.visit_java(node, prefix),
+            Lang::Php => self.visit_php(node, prefix),
+            Lang::CSharp => self.visit_csharp(node, prefix),
+            Lang::C | Lang::Cpp => self.visit_c(node, prefix),
         }
     }
 
@@ -786,25 +825,958 @@ impl<'a> Extractor<'a> {
         }
     }
 
+    // -- Ruby --------------------------------------------------------------------
+
+    fn visit_ruby(&mut self, node: Node, prefix: &str) -> String {
+        match node.kind() {
+            "call" => {
+                self.ruby_call(node, prefix);
+            }
+            "element_reference" => {
+                self.ruby_env_ref(node);
+            }
+            "assignment" => {
+                self.ruby_env_assign(node);
+            }
+            _ => {}
+        }
+        prefix.to_string()
+    }
+
+    /// Sinatra `get '/x' do`, Rails `get '/x', to: …` / `match`, client
+    /// libraries with constant receivers, and `ENV.fetch`.
+    fn ruby_call(&mut self, node: Node, prefix: &str) {
+        let method = node_text(node.child_by_field_name("method"), self.src);
+        let receiver = node.child_by_field_name("receiver");
+        let args = node.child_by_field_name("arguments");
+        let Some(args) = args else { return };
+        let first = positional_arg(args, 0);
+        match receiver {
+            None => {
+                let verb = match method {
+                    "get" | "post" | "put" | "patch" | "delete" | "match" => method,
+                    _ => return,
+                };
+                if let Some(arg) = first {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Provider,
+                        verb,
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            Some(recv) => {
+                let recv_text = node_text(Some(recv), self.src);
+                match recv_text {
+                    "ENV" if method == "fetch" => {
+                        if let Some(arg) = first {
+                            let name = ruby_string_content(arg, self.src);
+                            self.emit_env(
+                                node,
+                                &name,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                            );
+                        }
+                    }
+                    _ if RUBY_CONSUMER_RECEIVERS.contains(&recv_text) => {
+                        if let (Some(arg), Some(verb)) = (first, ruby_verb(method)) {
+                            self.emit_http(
+                                node,
+                                arg,
+                                ContractRole::Consumer,
+                                verb,
+                                prefix,
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// `ENV['X']` reads.
+    fn ruby_env_ref(&mut self, node: Node) {
+        if let Some(parent) = node.parent()
+            && parent.kind() == "assignment"
+            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
+        {
+            return; // the assignment handler owns this site
+        }
+        let obj = node_text(node.named_child(0), self.src);
+        let name = node
+            .named_child(1)
+            .filter(|n| n.kind() == "string")
+            .map(|n| ruby_string_content(n, self.src))
+            .unwrap_or_default();
+        if obj == "ENV" && is_env_name(&name) {
+            self.emit_env(node, &name, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+        }
+    }
+
+    /// `ENV['X'] = …` writes (0.5).
+    fn ruby_env_assign(&mut self, node: Node) {
+        let Some(left) = node.child_by_field_name("left") else {
+            return;
+        };
+        if left.kind() != "element_reference" {
+            return;
+        }
+        let obj = node_text(left.named_child(0), self.src);
+        let name = left
+            .named_child(1)
+            .filter(|n| n.kind() == "string")
+            .map(|n| ruby_string_content(n, self.src))
+            .unwrap_or_default();
+        if obj == "ENV" && is_env_name(&name) {
+            self.emit_env(node, &name, ContractRole::Provider, CONFIDENCE_HEURISTIC);
+        }
+    }
+
+    // -- Go ----------------------------------------------------------------------
+
+    fn visit_go(&mut self, node: Node, prefix: &str) -> String {
+        if node.kind() == "call_expression" {
+            self.go_call(node, prefix);
+        }
+        prefix.to_string()
+    }
+
+    fn go_call(&mut self, node: Node, prefix: &str) {
+        let func = node.child_by_field_name("function");
+        let args = node.child_by_field_name("arguments");
+        let (Some(func), Some(args)) = (func, args) else {
+            return;
+        };
+        if func.kind() != "selector_expression" {
+            return;
+        }
+        let recv = node_text(func.child_by_field_name("operand"), self.src);
+        let meth = node_text(func.child_by_field_name("field"), self.src);
+        let first = positional_arg(args, 0);
+        let second = positional_arg(args, 1);
+        let argc = args.named_child_count();
+        match (recv, meth) {
+            // gin/chi-style registration: uppercase verb + handler arg.
+            _ if GO_PROVIDER_VERBS.contains(&meth) && argc >= 2 => {
+                if let Some(arg) = first {
+                    let pfx = join_raw(prefix, &self.ctx.effective_prefix(recv));
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Provider,
+                        meth,
+                        &pfx,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            (_, "HandleFunc") | (_, "Handle") if argc >= 2 => {
+                if let Some(arg) = first {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Provider,
+                        "ANY",
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            ("http", "NewRequest") => {
+                if let (Some(verb), Some(path)) = (first, second) {
+                    let verb = render_string_node(verb, self.src, self.lang);
+                    self.emit_http(
+                        node,
+                        path,
+                        ContractRole::Consumer,
+                        &verb,
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            ("os", "Getenv") | ("os", "LookupEnv") => {
+                if let Some(arg) = first {
+                    let name = render_string_node(arg, self.src, self.lang);
+                    self.emit_env(node, &name, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+                }
+            }
+            ("os", "Setenv") => {
+                if let Some(arg) = first {
+                    let name = render_string_node(arg, self.src, self.lang);
+                    self.emit_env(node, &name, ContractRole::Provider, CONFIDENCE_HEURISTIC);
+                }
+            }
+            _ => {
+                if let Some(verb) = go_client_verb(recv, meth)
+                    && let Some(arg) = first
+                {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Consumer,
+                        verb,
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    // -- Rust --------------------------------------------------------------------
+
+    fn visit_rust(&mut self, node: Node, prefix: &str) -> String {
+        match node.kind() {
+            "attribute_item" => {
+                self.rust_attribute(node);
+            }
+            "call_expression" => {
+                self.rust_call(node, prefix);
+            }
+            "macro_invocation" => {
+                self.rust_macro(node);
+            }
+            _ => {}
+        }
+        prefix.to_string()
+    }
+
+    /// `#[get("/x")]` / `#[route("/x", method = "GET")]` attribute macros
+    /// (Actix, Rocket).
+    fn rust_attribute(&mut self, node: Node) {
+        let Some(attr) = node.named_child(0) else {
+            return;
+        };
+        if attr.kind() != "attribute" {
+            return;
+        }
+        // tree-sitter-rust gives the attribute name no field slot; it is the
+        // leading identifier child.
+        let name = node_text(attr.named_child(0), self.src).to_string();
+        let Some(tree) = attr.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some(path_node) = tree_strings(tree).into_iter().next() else {
+            return;
+        };
+        let verb = match name.as_str() {
+            "get" | "post" | "put" | "delete" | "patch" | "head" => name.clone(),
+            "route" => {
+                // method = "GET" — the literal after the `method` token.
+                let toks: Vec<_> = (0..tree.named_child_count())
+                    .filter_map(|i| tree.named_child(i as u32))
+                    .collect();
+                let idx = toks.iter().position(|n| {
+                    n.kind() == "identifier" && node_text(Some(*n), self.src) == "method"
+                });
+                match idx.and_then(|i| toks.get(i + 1)) {
+                    Some(v) => render_string_node(*v, self.src, self.lang),
+                    None => "ANY".to_string(),
+                }
+            }
+            _ => return,
+        };
+        // The handler is the item this attribute decorates.
+        let owning = node
+            .next_named_sibling()
+            .and_then(|item| item.child_by_field_name("name"))
+            .map(|n| node_text(Some(n), self.src).to_string());
+        self.emit_http(
+            node,
+            path_node,
+            ContractRole::Provider,
+            &verb,
+            "",
+            CONFIDENCE_FRAMEWORK,
+            owning.as_deref(),
+        );
+    }
+
+    /// `.route("/x", get(handler))` providers, `reqwest`/`client` consumers,
+    /// and `std::env::var` / `set_var`.
+    fn rust_call(&mut self, node: Node, prefix: &str) {
+        let func = node.child_by_field_name("function");
+        let args = node.child_by_field_name("arguments");
+        let (Some(func), Some(args)) = (func, args) else {
+            return;
+        };
+        let first = positional_arg(args, 0);
+        match func.kind() {
+            "field_expression" => {
+                let field = node_text(func.child_by_field_name("field"), self.src);
+                if field == "route"
+                    && let Some(arg) = first
+                {
+                    let verb = positional_arg(args, 1)
+                        .and_then(|handler| rust_callee_name(handler, self.src))
+                        .and_then(ruby_verb)
+                        .unwrap_or("ANY");
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Provider,
+                        verb,
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                } else if let Some(verb) = ruby_verb(field) {
+                    let value = func.child_by_field_name("value");
+                    let root = rust_chain_root(value);
+                    let root_text = node_text(root, self.src);
+                    let is_client = matches!(root_text, "client" | "reqwest_client")
+                        || root_text.starts_with("Client::new");
+                    if is_client && let Some(arg) = first {
+                        self.emit_http(
+                            node,
+                            arg,
+                            ContractRole::Consumer,
+                            verb,
+                            prefix,
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
+                }
+            }
+            "scoped_identifier" => {
+                let text = node_text(Some(func), self.src);
+                match text {
+                    "std::env::var" | "env::var" => {
+                        if let Some(arg) = first {
+                            let name = render_string_node(arg, self.src, self.lang);
+                            self.emit_env(
+                                node,
+                                &name,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                            );
+                        }
+                    }
+                    "std::env::set_var" | "env::set_var" => {
+                        if let Some(arg) = first {
+                            let name = render_string_node(arg, self.src, self.lang);
+                            self.emit_env(
+                                node,
+                                &name,
+                                ContractRole::Provider,
+                                CONFIDENCE_HEURISTIC,
+                            );
+                        }
+                    }
+                    _ => {
+                        if text.starts_with("reqwest::")
+                            && let Some(verb) = ruby_verb(text.rsplit("::").next().unwrap_or(""))
+                            && let Some(arg) = first
+                        {
+                            self.emit_http(
+                                node,
+                                arg,
+                                ContractRole::Consumer,
+                                verb,
+                                prefix,
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `env!("X")` — macro_invocation children carry no field names.
+    fn rust_macro(&mut self, node: Node) {
+        let name = node_text(node.named_child(0), self.src);
+        if name != "env" {
+            return;
+        }
+        let Some(tree) = node.named_child(1) else {
+            return;
+        };
+        let Some(arg) = tree_strings(tree).into_iter().next() else {
+            return;
+        };
+        let value = render_string_node(arg, self.src, self.lang);
+        self.emit_env(node, &value, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+    }
+
+    // -- Java --------------------------------------------------------------------
+
+    fn visit_java(&mut self, node: Node, prefix: &str) -> String {
+        match node.kind() {
+            "method_declaration" => {
+                self.java_method(node, prefix);
+            }
+            "method_invocation" => {
+                self.java_call(node, prefix);
+            }
+            _ => {}
+        }
+        prefix.to_string()
+    }
+
+    /// Spring mapping annotations and JAX-RS `@Path` + verb markers.
+    fn java_method(&mut self, node: Node, prefix: &str) {
+        // tree-sitter-java exposes modifiers as a positional child.
+        let Some(modifiers) = node.named_child(0).filter(|n| n.kind() == "modifiers") else {
+            return;
+        };
+        let mut verb: Option<String> = None;
+        let mut path: Option<Node> = None;
+        for i in 0..modifiers.named_child_count() {
+            let Some(annot) = modifiers.named_child(i as u32) else {
+                continue;
+            };
+            let name = node_text(annot.child_by_field_name("name"), self.src);
+            let args = annot.child_by_field_name("arguments");
+            match name {
+                "GetMapping" | "PostMapping" | "PutMapping" | "DeleteMapping" | "PatchMapping" => {
+                    verb = Some(
+                        match name {
+                            "GetMapping" => "get",
+                            "PostMapping" => "post",
+                            "PutMapping" => "put",
+                            "DeleteMapping" => "delete",
+                            _ => "patch",
+                        }
+                        .to_string(),
+                    );
+                    path = args.and_then(|a| java_annotation_path(a, self.src));
+                }
+                "RequestMapping" => {
+                    // method = RequestMethod.POST — take the segment after
+                    // the last dot; absence means ANY.
+                    verb = Some(
+                        match args.and_then(|a| java_annotation_kwarg_text(a, "method", self.src)) {
+                            Some(m) => m.rsplit('.').next().unwrap_or("ANY").to_string(),
+                            None => "ANY".to_string(),
+                        },
+                    );
+                    path = args.and_then(|a| java_annotation_path(a, self.src));
+                }
+                "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" => {
+                    verb = Some(
+                        match name {
+                            "GET" => "get",
+                            "POST" => "post",
+                            "PUT" => "put",
+                            "DELETE" => "delete",
+                            "PATCH" => "patch",
+                            _ => "head",
+                        }
+                        .to_string(),
+                    );
+                }
+                "Path" => {
+                    path = args.and_then(|a| java_annotation_path(a, self.src));
+                }
+                _ => {}
+            }
+        }
+        if let (Some(verb), Some(path)) = (verb, path) {
+            let owning = node
+                .child_by_field_name("name")
+                .map(|n| node_text(Some(n), self.src).to_string());
+            self.emit_http(
+                node,
+                path,
+                ContractRole::Provider,
+                &verb,
+                prefix,
+                CONFIDENCE_FRAMEWORK,
+                owning.as_deref(),
+            );
+        }
+    }
+
+    /// `restTemplate.getForObject(…)`, `System.getenv(…)`.
+    fn java_call(&mut self, node: Node, prefix: &str) {
+        let name = node_text(node.child_by_field_name("name"), self.src);
+        let object = node_text(node.child_by_field_name("object"), self.src);
+        let args = node.child_by_field_name("arguments");
+        let Some(args) = args else { return };
+        let first = positional_arg(args, 0);
+        if object == "System" && name == "getenv" {
+            if let Some(arg) = first {
+                let value = render_string_node(arg, self.src, self.lang);
+                self.emit_env(node, &value, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+            }
+            return;
+        }
+        if let Some(verb) = java_client_verb(name)
+            && let Some(arg) = first
+        {
+            self.emit_http(
+                node,
+                arg,
+                ContractRole::Consumer,
+                verb,
+                prefix,
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
+        }
+    }
+
+    // -- PHP ---------------------------------------------------------------------
+
+    fn visit_php(&mut self, node: Node, prefix: &str) -> String {
+        match node.kind() {
+            "scoped_call_expression" => {
+                self.php_scoped_call(node, prefix);
+            }
+            "member_call_expression" => {
+                self.php_member_call(node, prefix);
+            }
+            "method_declaration" => {
+                self.php_method_attribute(node);
+            }
+            "subscript_expression" => {
+                self.php_env_subscript(node);
+            }
+            "function_call_expression" => {
+                self.php_function_call(node);
+            }
+            _ => {}
+        }
+        prefix.to_string()
+    }
+
+    /// `Route::get('/x', …)` (Laravel) providers, `Http::get(…)` consumers.
+    fn php_scoped_call(&mut self, node: Node, prefix: &str) {
+        let scope = node_text(node.child_by_field_name("scope"), self.src);
+        let name = node_text(node.child_by_field_name("name"), self.src);
+        let args = node.child_by_field_name("arguments");
+        let Some(args) = args else { return };
+        let first = positional_arg(args, 0);
+        match scope {
+            "Route" => {
+                if matches!(name, "get" | "post" | "put" | "patch" | "delete" | "any")
+                    && let Some(arg) = first
+                {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Provider,
+                        name,
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            "Http" => {
+                if let (Some(verb), Some(arg)) = (ruby_verb(name), first) {
+                    self.emit_http(
+                        node,
+                        arg,
+                        ContractRole::Consumer,
+                        verb,
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `$app->get('/x', …)` (Slim) providers, `$client->get(…)` consumers.
+    fn php_member_call(&mut self, node: Node, prefix: &str) {
+        // PHP variable_name children are positional: `$client` -> name "client".
+        let object = node
+            .child_by_field_name("object")
+            .and_then(|o| o.named_child(0))
+            .map(|o| node_text(Some(o), self.src))
+            .unwrap_or_default();
+        let name = node_text(node.child_by_field_name("name"), self.src);
+        let Some(args) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some(first) = positional_arg(args, 0) else {
+            return;
+        };
+        let Some(verb) = ruby_verb(name) else { return };
+        let role = if matches!(object, "app" | "group" | "router") {
+            ContractRole::Provider
+        } else if matches!(object, "client" | "http") {
+            ContractRole::Consumer
+        } else {
+            return;
+        };
+        self.emit_http(node, first, role, verb, prefix, CONFIDENCE_FRAMEWORK, None);
+    }
+
+    /// Symfony `#[Route('/x', methods: ['GET'])]` attributes.
+    fn php_method_attribute(&mut self, node: Node) {
+        let Some(attrs) = node.child_by_field_name("attributes") else {
+            return;
+        };
+        for i in 0..attrs.named_child_count() {
+            let Some(group) = attrs.named_child(i as u32) else {
+                continue;
+            };
+            for j in 0..group.named_child_count() {
+                let Some(attr) = group.named_child(j as u32) else {
+                    continue;
+                };
+                if node_text(attr.named_child(0), self.src) != "Route" {
+                    continue;
+                }
+                let Some(params) = attr.child_by_field_name("parameters") else {
+                    continue;
+                };
+                let Some(path) = positional_arg(params, 0) else {
+                    continue;
+                };
+                let verb = php_attribute_kwarg_verb(params, self.src).unwrap_or("ANY");
+                let owning = node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(Some(n), self.src).to_string());
+                self.emit_http(
+                    node,
+                    path,
+                    ContractRole::Provider,
+                    verb,
+                    "",
+                    CONFIDENCE_FRAMEWORK,
+                    owning.as_deref(),
+                );
+            }
+        }
+    }
+
+    /// `$_ENV['X']` reads.
+    fn php_env_subscript(&mut self, node: Node) {
+        if let Some(parent) = node.parent()
+            && parent.kind() == "assignment_expression"
+            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
+        {
+            return;
+        }
+        // PHP subscript children are positional: [variable_name, string].
+        let object = node
+            .named_child(0)
+            .and_then(|o| o.named_child(0))
+            .map(|o| node_text(Some(o), self.src))
+            .unwrap_or_default();
+        let name = node
+            .named_child(1)
+            .filter(|n| n.kind() == "string")
+            .map(|n| render_string_node(n, self.src, self.lang))
+            .unwrap_or_default();
+        if object == "_ENV" && is_env_name(&name) {
+            self.emit_env(node, &name, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+        }
+    }
+
+    /// `putenv('X=x')` writes — the name is the part before `=`.
+    fn php_function_call(&mut self, node: Node) {
+        let name = node_text(node.child_by_field_name("function"), self.src);
+        let Some(args) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some(first) = positional_arg(args, 0) else {
+            return;
+        };
+        if name != "putenv" {
+            return;
+        }
+        let value = render_string_node(first, self.src, self.lang);
+        let env_name = value.split('=').next().unwrap_or("").trim();
+        if is_env_name(env_name) {
+            self.emit_env(node, env_name, ContractRole::Provider, CONFIDENCE_HEURISTIC);
+        }
+    }
+
+    // -- C# ----------------------------------------------------------------------
+
+    fn visit_csharp(&mut self, node: Node, prefix: &str) -> String {
+        match node.kind() {
+            "method_declaration" => {
+                self.csharp_method(node, prefix);
+            }
+            "invocation_expression" => {
+                self.csharp_invocation(node, prefix);
+            }
+            "object_creation_expression" => {
+                self.csharp_object_creation(node, prefix);
+            }
+            _ => {}
+        }
+        prefix.to_string()
+    }
+
+    /// `[HttpGet("/x")]` / `[Route("x")]` attributes. tree-sitter-c-sharp
+    /// exposes attribute lists and attribute parts positionally.
+    fn csharp_method(&mut self, node: Node, prefix: &str) {
+        for i in 0..node.named_child_count() {
+            let Some(attrs) = node.named_child(i as u32) else {
+                continue;
+            };
+            if attrs.kind() != "attribute_list" {
+                continue;
+            }
+            for j in 0..attrs.named_child_count() {
+                let Some(attr) = attrs.named_child(j as u32) else {
+                    continue;
+                };
+                if attr.kind() != "attribute" {
+                    continue;
+                }
+                let name = node_text(attr.named_child(0), self.src);
+                let verb = match name {
+                    "HttpGet" => "get",
+                    "HttpPost" => "post",
+                    "HttpPut" => "put",
+                    "HttpDelete" => "delete",
+                    "HttpPatch" => "patch",
+                    "Route" => "ANY",
+                    _ => continue,
+                };
+                let Some(arg_list) = attr.named_child(1) else {
+                    continue;
+                };
+                let Some(arg) = positional_arg(arg_list, 0) else {
+                    continue;
+                };
+                let owning = node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(Some(n), self.src).to_string());
+                self.emit_http(
+                    node,
+                    arg,
+                    ContractRole::Provider,
+                    verb,
+                    prefix,
+                    CONFIDENCE_FRAMEWORK,
+                    owning.as_deref(),
+                );
+            }
+        }
+    }
+
+    /// `app.MapGet(…)` providers, `httpClient.GetAsync(…)`,
+    /// `Environment.GetEnvironmentVariable(…)`.
+    fn csharp_invocation(&mut self, node: Node, prefix: &str) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() != "member_access_expression" {
+            return;
+        }
+        let recv = node_text(func.child_by_field_name("expression"), self.src);
+        let name = csharp_name_text(func.child_by_field_name("name"), self.src);
+        let args = node.child_by_field_name("arguments");
+        let Some(args) = args else { return };
+        let Some(first) = positional_arg(args, 0) else {
+            return;
+        };
+        if name.starts_with("Map")
+            && let Some(verb) = ruby_verb(name.trim_start_matches("Map").to_lowercase().as_str())
+        {
+            self.emit_http(
+                node,
+                first,
+                ContractRole::Provider,
+                verb,
+                prefix,
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
+        } else if recv == "Environment" && name == "GetEnvironmentVariable" {
+            let value = render_string_node(first, self.src, self.lang);
+            self.emit_env(node, &value, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+        } else if recv == "Environment" && name == "SetEnvironmentVariable" {
+            let value = render_string_node(first, self.src, self.lang);
+            self.emit_env(node, &value, ContractRole::Provider, CONFIDENCE_HEURISTIC);
+        } else if CSHARP_CONSUMER_RECEIVERS.contains(&recv)
+            && let Some(verb) = csharp_client_verb(&name)
+        {
+            self.emit_http(
+                node,
+                first,
+                ContractRole::Consumer,
+                verb,
+                prefix,
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
+        }
+    }
+
+    /// `new HttpRequestMessage(HttpMethod.Get, "/x")`.
+    fn csharp_object_creation(&mut self, node: Node, prefix: &str) {
+        let type_name = node_text(node.child_by_field_name("type"), self.src);
+        if type_name != "HttpRequestMessage" {
+            return;
+        }
+        let Some(args) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let (Some(method), Some(path)) = (positional_arg(args, 0), positional_arg(args, 1)) else {
+            return;
+        };
+        if method.kind() != "member_access_expression" {
+            return;
+        }
+        let verb = csharp_name_text(method.child_by_field_name("name"), self.src);
+        self.emit_http(
+            node,
+            path,
+            ContractRole::Consumer,
+            &verb,
+            prefix,
+            CONFIDENCE_FRAMEWORK,
+            None,
+        );
+    }
+
+    // -- C / C++ -----------------------------------------------------------------
+
+    fn visit_c(&mut self, node: Node, prefix: &str) -> String {
+        if node.kind() == "call_expression" {
+            self.c_call(node, prefix);
+        }
+        prefix.to_string()
+    }
+
+    fn c_call(&mut self, node: Node, prefix: &str) {
+        let name = node_text(node.child_by_field_name("function"), self.src);
+        let Some(args) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        match name {
+            "getenv" => {
+                if let Some(arg) = positional_arg(args, 0) {
+                    let value = render_string_node(arg, self.src, self.lang);
+                    self.emit_env(node, &value, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+                }
+            }
+            "putenv" => {
+                if let Some(arg) = positional_arg(args, 0) {
+                    let value = render_string_node(arg, self.src, self.lang);
+                    let env_name = value.split('=').next().unwrap_or("").trim();
+                    if is_env_name(env_name) {
+                        self.emit_env(node, env_name, ContractRole::Provider, CONFIDENCE_HEURISTIC);
+                    }
+                }
+            }
+            "setenv" => {
+                if let Some(arg) = positional_arg(args, 0) {
+                    let value = render_string_node(arg, self.src, self.lang);
+                    self.emit_env(node, &value, ContractRole::Provider, CONFIDENCE_HEURISTIC);
+                }
+            }
+            "curl_easy_setopt" => {
+                // curl_easy_setopt(h, CURLOPT_URL, "https://…") — GET only
+                // (documented approximation: curl defaults to GET).
+                let opt = positional_arg(args, 1);
+                let url = positional_arg(args, 2);
+                if let (Some(opt), Some(url)) = (opt, url)
+                    && node_text(Some(opt), self.src) == "CURLOPT_URL"
+                {
+                    self.emit_http(
+                        node,
+                        url,
+                        ContractRole::Consumer,
+                        "GET",
+                        prefix,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Extract the textual path of a call argument, per language.
     fn path_arg(&self, arg: Node) -> Option<PathArg> {
+        let src = self.src;
+        let lang = self.lang;
+        let concat = |node: Node, leaf_kinds: &[&str]| concat_literal(node, src, lang, leaf_kinds);
         match self.lang {
             Lang::JavaScript | Lang::TypeScript | Lang::Tsx => match arg.kind() {
-                "string" => Some(PathArg::Direct(string_content(arg, self.src))),
-                "template_string" => Some(PathArg::Direct(template_content(arg, self.src))),
-                "binary_expression" if node_text(arg.child(1), self.src) == "+" => {
-                    concat_literal(arg, self.src, &["string", "template_string"])
+                "string" => Some(PathArg::Direct(string_content(arg, src))),
+                "template_string" => Some(PathArg::Direct(template_content(arg, src))),
+                "binary_expression" if node_text(arg.child(1), src) == "+" => {
+                    concat(arg, &["string", "template_string"])
                 }
                 _ => None,
             },
             Lang::Python => match arg.kind() {
-                "string" => py_string_content(arg, self.src).map(PathArg::Direct),
-                "binary_operator" if node_text(arg.child(1), self.src) == "+" => {
-                    concat_literal(arg, self.src, &["string"])
+                "string" => py_string_content(arg, src).map(PathArg::Direct),
+                "binary_operator" if node_text(arg.child(1), src) == "+" => {
+                    concat(arg, &["string"])
                 }
                 _ => None,
             },
-            _ => None,
+            Lang::Ruby => match arg.kind() {
+                "string" => Some(PathArg::Direct(ruby_string_content(arg, src))),
+                "binary" if node_text(arg.child(1), src) == "+" => concat(arg, &["string"]),
+                _ => None,
+            },
+            Lang::Go => match arg.kind() {
+                "interpreted_string_literal" => {
+                    Some(PathArg::Direct(render_string_node(arg, src, lang)))
+                }
+                "binary_expression" if node_text(arg.child(1), src) == "+" => {
+                    concat(arg, &["interpreted_string_literal"])
+                }
+                _ => None,
+            },
+            Lang::Rust => match arg.kind() {
+                "string_literal" => Some(PathArg::Direct(render_string_node(arg, src, lang))),
+                "binary_expression" if node_text(arg.child(1), src) == "+" => {
+                    concat(arg, &["string_literal"])
+                }
+                _ => None,
+            },
+            Lang::Java => match arg.kind() {
+                "string_literal" => Some(PathArg::Direct(render_string_node(arg, src, lang))),
+                "binary_expression" if node_text(arg.child(1), src) == "+" => {
+                    concat(arg, &["string_literal"])
+                }
+                _ => None,
+            },
+            Lang::Php => match arg.kind() {
+                "string" => Some(PathArg::Direct(render_string_node(arg, src, lang))),
+                "binary_expression" if node_text(arg.child(1), src) == "." => {
+                    concat(arg, &["string"])
+                }
+                _ => None,
+            },
+            Lang::CSharp => match arg.kind() {
+                "string_literal" => Some(PathArg::Direct(render_string_node(arg, src, lang))),
+                "binary_expression" if node_text(arg.child(1), src) == "+" => {
+                    concat(arg, &["string_literal"])
+                }
+                _ => None,
+            },
+            Lang::C | Lang::Cpp => match arg.kind() {
+                "string_literal" => Some(PathArg::Direct(render_string_node(arg, src, lang))),
+                "binary_expression" if node_text(arg.child(1), src) == "+" => {
+                    concat(arg, &["string_literal"])
+                }
+                _ => None,
+            },
         }
     }
 
@@ -880,6 +1852,175 @@ fn is_env_name(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(char::is_whitespace)
 }
 
+/// Uppercase gin/chi verbs accepted as route registrations.
+const GO_PROVIDER_VERBS: &[&str] = &[
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "Any",
+];
+/// Ruby HTTP client libraries (constant receivers).
+const RUBY_CONSUMER_RECEIVERS: &[&str] = &["HTTParty", "RestClient", "Faraday"];
+/// C# HTTP client receiver names.
+const CSHARP_CONSUMER_RECEIVERS: &[&str] = &["httpClient", "client", "http"];
+
+/// Map a lowercase verb name to its canonical form; `None` if not a verb.
+fn ruby_verb(name: &str) -> Option<&'static str> {
+    match name {
+        "get" => Some("get"),
+        "post" => Some("post"),
+        "put" => Some("put"),
+        "patch" => Some("patch"),
+        "delete" => Some("delete"),
+        "head" => Some("head"),
+        "options" => Some("options"),
+        _ => None,
+    }
+}
+
+/// Go client verbs: `http.Get`, `client.Get`, `http.Post`…
+fn go_client_verb(recv: &str, meth: &str) -> Option<&'static str> {
+    match (recv, meth) {
+        ("http", "Get") | ("client", "Get") => Some("get"),
+        ("http", "Post") | ("http", "PostForm") | ("client", "Post") => Some("post"),
+        ("http", "Head") => Some("head"),
+        ("client", "Do") => Some("ANY"),
+        _ => None,
+    }
+}
+
+/// Final callee name of a Rust call node (identifier / scoped / field).
+fn rust_callee_name<'t>(call: Node<'t>, src: &'t [u8]) -> Option<&'t str> {
+    let func = call.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => Some(node_text(Some(func), src)),
+        "scoped_identifier" => Some(node_text(func.child_by_field_name("name"), src)),
+        "field_expression" => Some(node_text(func.child_by_field_name("field"), src)),
+        _ => None,
+    }
+}
+
+/// Leftmost node of a Rust method chain, or the node itself.
+fn rust_chain_root<'t>(mut node: Option<Node<'t>>) -> Option<Node<'t>> {
+    while let Some(current) = node
+        && current.kind() == "field_expression"
+    {
+        node = current.child_by_field_name("value");
+    }
+    node
+}
+
+/// String literals inside a Rust token tree (attributes / macros).
+fn tree_strings(tree: Node) -> Vec<Node> {
+    (0..tree.named_child_count())
+        .filter_map(|i| tree.named_child(i as u32))
+        .filter(|n| n.kind() == "string_literal")
+        .collect()
+}
+
+/// Path argument of a Java annotation: direct string or `value=`/`path=`.
+fn java_annotation_path<'t>(args: Node<'t>, src: &'t [u8]) -> Option<Node<'t>> {
+    if let Some(direct) = positional_arg(args, 0)
+        && direct.kind() == "string_literal"
+    {
+        return Some(direct);
+    }
+    for i in 0..args.named_child_count() {
+        if let Some(pair) = args.named_child(i as u32)
+            && pair.kind() == "element_value_pair"
+            && matches!(
+                node_text(pair.child_by_field_name("key"), src),
+                "value" | "path"
+            )
+            && let Some(value) = pair.child_by_field_name("value")
+            && value.kind() == "string_literal"
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Text of a Java annotation keyword argument (non-string values included).
+fn java_annotation_kwarg_text(args: Node, name: &str, src: &[u8]) -> Option<String> {
+    for i in 0..args.named_child_count() {
+        if let Some(pair) = args.named_child(i as u32)
+            && pair.kind() == "element_value_pair"
+            && node_text(pair.child_by_field_name("key"), src) == name
+            && let Some(value) = pair.child_by_field_name("value")
+        {
+            return Some(node_text(Some(value), src).to_string());
+        }
+    }
+    None
+}
+
+/// Java RestTemplate-style client method verbs.
+fn java_client_verb(name: &str) -> Option<&'static str> {
+    match name {
+        "getForObject" | "getForEntity" => Some("get"),
+        "postForObject" | "postForEntity" => Some("post"),
+        "put" => Some("put"),
+        "delete" => Some("delete"),
+        "exchange" | "execute" => Some("ANY"),
+        _ => None,
+    }
+}
+
+/// First entry of the `methods: ['GET']` named argument of a PHP attribute.
+fn php_attribute_kwarg_verb(params: Node, src: &[u8]) -> Option<&'static str> {
+    for i in 0..params.named_child_count() {
+        let Some(arg) = params.named_child(i as u32) else {
+            continue;
+        };
+        if arg.kind() != "argument" {
+            continue;
+        }
+        let arg_name = arg
+            .child_by_field_name("name")
+            .map(|n| node_text(Some(n), src))
+            .unwrap_or_default();
+        if arg_name != "methods" {
+            continue;
+        }
+        // The value follows the name positionally inside the argument node;
+        // array elements arrive wrapped in array_element_initializer nodes.
+        let value = (0..arg.named_child_count())
+            .filter_map(|k| arg.named_child(k as u32))
+            .find(|c| c.kind() == "array_creation_expression");
+        if let Some(value) = value
+            && let Some(method_node) = first_descendant_of_kind(value, "string")
+        {
+            let method = render_string_node(method_node, src, Lang::Php);
+            return ruby_verb(&method.to_lowercase());
+        }
+    }
+    None
+}
+
+/// Name text of a C# node that may be an identifier or generic name.
+fn csharp_name_text(node: Option<Node>, src: &[u8]) -> String {
+    let Some(node) = node else {
+        return String::new();
+    };
+    if node.kind() == "generic_name" {
+        // (generic_name (identifier) (type_argument_list …)) — positional.
+        return node_text(node.named_child(0), src).to_string();
+    }
+    node_text(Some(node), src).to_string()
+}
+
+/// C# HttpClient method verbs.
+fn csharp_client_verb(name: &str) -> Option<&'static str> {
+    match name {
+        "GetAsync" | "GetFromJsonAsync" | "GetStringAsync" | "GetStreamAsync"
+        | "GetByteArrayAsync" => Some("get"),
+        "PostAsync" | "PostAsJsonAsync" => Some("post"),
+        "PutAsync" | "PutAsJsonAsync" => Some("put"),
+        "DeleteAsync" => Some("delete"),
+        "PatchAsync" => Some("patch"),
+        "SendAsync" => Some("ANY"),
+        _ => None,
+    }
+}
+
 /// Content of a string node (quote-stripped, fragments concatenated).
 fn string_content(node: Node, src: &[u8]) -> String {
     let mut out = String::new();
@@ -917,9 +2058,9 @@ fn template_content(node: Node, src: &[u8]) -> String {
 /// path-like string literal (PRD-CTR-REQ-004 skip rules). `leaf_kinds` names
 /// the language's string-node kinds; concat operator nodes are matched by
 /// the caller.
-fn concat_literal(node: Node, src: &[u8], leaf_kinds: &[&str]) -> Option<PathArg> {
+fn concat_literal(node: Node, src: &[u8], lang: Lang, leaf_kinds: &[&str]) -> Option<PathArg> {
     let mut literals = Vec::new();
-    collect_string_leaves(node, src, leaf_kinds, &mut literals);
+    collect_string_leaves(node, src, lang, leaf_kinds, &mut literals);
     if literals.len() == 1 && is_path_like(&literals[0]) {
         Some(PathArg::Concat(literals.into_iter().next()?))
     } else {
@@ -927,39 +2068,60 @@ fn concat_literal(node: Node, src: &[u8], leaf_kinds: &[&str]) -> Option<PathArg
     }
 }
 
-fn collect_string_leaves(node: Node, src: &[u8], leaf_kinds: &[&str], out: &mut Vec<String>) {
+fn collect_string_leaves(
+    node: Node,
+    src: &[u8],
+    lang: Lang,
+    leaf_kinds: &[&str],
+    out: &mut Vec<String>,
+) {
     if leaf_kinds.contains(&node.kind()) {
-        out.push(render_string_leaf(node, src));
+        out.push(render_string_node(node, src, lang));
         return;
     }
     if node.kind().starts_with("binary") {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i as u32) {
-                collect_string_leaves(child, src, leaf_kinds, out);
+                collect_string_leaves(child, src, lang, leaf_kinds, out);
             }
         }
     }
 }
 
-/// Render any language's plain string node to its content. Python f-strings
-/// are recognizable by their `interpolation` children regardless of grammar.
-fn render_string_leaf(node: Node, src: &[u8]) -> String {
-    if py_has_interpolation(node) {
-        py_string_content(node, src).unwrap_or_default()
-    } else if node.kind() == "template_string" {
-        template_content(node, src)
-    } else {
-        string_content(node, src)
+/// Render any language's string node to its content. Content children are
+/// matched by kind suffix (`*_content` / `*_fragment`), which covers every
+/// bundled grammar; interpolations render per-language (`{x}` for Python,
+/// `#{x}` for Ruby).
+fn render_string_node(node: Node, src: &[u8], lang: Lang) -> String {
+    let mut out = String::new();
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            let kind = child.kind();
+            if kind.ends_with("_content") || kind.ends_with("_fragment") {
+                out.push_str(node_text(Some(child), src));
+            } else if kind == "interpolation" {
+                let expr = node_text(child.named_child(0), src);
+                match lang {
+                    Lang::Ruby => {
+                        out.push_str("#{");
+                        out.push_str(expr);
+                        out.push('}');
+                    }
+                    _ => {
+                        out.push('{');
+                        out.push_str(expr);
+                        out.push('}');
+                    }
+                }
+            }
+        }
     }
+    out
 }
 
-/// Python strings carry `interpolation` children when they are f-strings.
-fn py_has_interpolation(node: Node) -> bool {
-    (0..node.child_count()).any(|i| {
-        node.child(i as u32)
-            .map(|c| c.kind() == "interpolation")
-            .unwrap_or(false)
-    })
+/// Ruby string content with `#{x}` interpolations preserved.
+fn ruby_string_content(node: Node, src: &[u8]) -> String {
+    render_string_node(node, src, Lang::Ruby)
 }
 
 /// Build the canonical contract ID `<kind>::<qualifier>::<identifier>`.
@@ -1276,7 +2438,6 @@ fn stage_ensure_shape(path: &str) -> Option<String> {
     Some(shaped)
 }
 
-// temporary shape-dump helper appended as a test
 #[cfg(test)]
 mod extract_test_helpers {
     use super::*;
@@ -1863,5 +3024,515 @@ urlpatterns = [
         let c = find(&cands, "http::ANY::/things").expect("route not found");
         assert_eq!(c.role, ContractRole::Provider);
         assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    // -- walker: Ruby (step 6) ---------------------------------------------------
+
+    #[test]
+    fn ruby_sinatra_provider() {
+        let src = "\
+get '/v1/users/:id' do
+  json
+end
+";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/v1/users/{p1}");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(
+            c.params,
+            vec![PathParam {
+                position: 1,
+                name: "id".into()
+            }]
+        );
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_rails_match_is_any() {
+        let src = "match '/health', to: 'health#show', via: :all\n";
+        let cands = extract(Lang::Ruby, src);
+        let c = find(&cands, "http::ANY::/health").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn ruby_consumers() {
+        let src = "\
+def pull
+  HTTParty.get('https://api.io/v1/users')
+  RestClient.get('/v1/users')
+  Faraday.get('/v1/users')
+end
+";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        assert!(
+            cands
+                .iter()
+                .all(|c| c.canonical_id == "http::GET::/v1/users")
+        );
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+        assert!(
+            cands
+                .iter()
+                .all(|c| c.owning_symbol.as_deref() == Some("pull"))
+        );
+    }
+
+    #[test]
+    fn ruby_env() {
+        let src = "\
+db = ENV['DATABASE_URL']
+k = ENV.fetch('KEY')
+ENV['TMP_SET'] = 'x'
+";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        let db = find(&cands, "env::::DATABASE_URL").expect("db not found");
+        assert_eq!(db.role, ContractRole::Consumer);
+        assert!(find(&cands, "env::::KEY").is_some());
+        let w = find(&cands, "env::::TMP_SET").expect("write not found");
+        assert_eq!(w.role, ContractRole::Provider);
+        assert_eq!(w.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    // -- walker: Go (step 6) -----------------------------------------------------
+
+    #[test]
+    fn go_gin_provider() {
+        let src = "\
+func main() {
+	r := gin.New()
+	r.GET(\"/users/:id\", getUser)
+	r.POST(\"/orders\", createOrder)
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let c = find(&cands, "http::GET::/users/{p1}").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(
+            c.params,
+            vec![PathParam {
+                position: 1,
+                name: "id".into()
+            }]
+        );
+        assert_eq!(c.owning_symbol.as_deref(), Some("main"));
+        assert!(find(&cands, "http::POST::/orders").is_some());
+    }
+
+    #[test]
+    fn go_handlefunc_is_any() {
+        let src = "\
+func main() {
+	mux.HandleFunc(\"/health\", health)
+	http.Handle(\"/static/\", files)
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert!(
+            find(&cands, "http::ANY::/health").is_some(),
+            "got {cands:?}"
+        );
+        assert!(
+            find(&cands, "http::ANY::/static").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn go_consumers() {
+        let src = "\
+func call() {
+	resp, _ := http.Get(\"https://api.io/v1/users\")
+	req, _ := http.NewRequest(\"POST\", \"/v1/orders\", nil)
+	c, _ := client.Get(\"/v1/users\")
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+        assert!(find(&cands, "http::GET::/v1/users").is_some());
+        assert!(find(&cands, "http::POST::/v1/orders").is_some());
+    }
+
+    #[test]
+    fn go_env() {
+        let src = "\
+func cfg() {
+	k := os.Getenv(\"DATABASE_URL\")
+	l, ok := os.LookupEnv(\"FLAG\")
+	os.Setenv(\"TMP_SET\", \"x\")
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        assert!(find(&cands, "env::::DATABASE_URL").is_some());
+        assert!(find(&cands, "env::::FLAG").is_some());
+        let w = find(&cands, "env::::TMP_SET").expect("write not found");
+        assert_eq!(w.role, ContractRole::Provider);
+    }
+
+    // -- walker: Rust (step 6) ---------------------------------------------------
+
+    #[test]
+    fn rust_attribute_provider() {
+        let src = "\
+#[get(\"/v1/users/{id}\")]
+async fn get_user() -> impl Responder {
+    todo!()
+}
+";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/v1/users/{p1}");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(
+            c.params,
+            vec![PathParam {
+                position: 1,
+                name: "id".into()
+            }]
+        );
+        assert_eq!(c.owning_symbol.as_deref(), Some("get_user"));
+    }
+
+    #[test]
+    fn rust_route_attribute_reads_method_kwarg() {
+        let src = "\
+#[route(\"/v1/orders\", method = \"GET\")]
+async fn list_orders() -> impl Responder {
+    todo!()
+}
+";
+        let cands = extract(Lang::Rust, src);
+        let c = find(&cands, "http::GET::/v1/orders").expect("route not found");
+        assert_eq!(c.owning_symbol.as_deref(), Some("list_orders"));
+    }
+
+    #[test]
+    fn rust_route_call_provider() {
+        let src = "\
+async fn app() {
+    let app = Router::new().route(\"/users/{id}\", get(get_user));
+}
+";
+        let cands = extract(Lang::Rust, src);
+        let c = find(&cands, "http::GET::/users/{p1}").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn rust_consumers() {
+        let src = "\
+async fn calls() {
+    let b = reqwest::get(\"https://api.io/v1/users\").await;
+    let c = client.get(\"/v1/users\").send().await;
+}
+";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+        assert!(
+            cands
+                .iter()
+                .all(|c| c.canonical_id == "http::GET::/v1/users")
+        );
+    }
+
+    #[test]
+    fn rust_env() {
+        let src = "\
+fn cfg() {
+    let u = std::env::var(\"DATABASE_URL\").unwrap();
+    let e = env!(\"API_KEY\");
+    std::env::set_var(\"TMP_SET\", \"x\");
+}
+";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        assert!(find(&cands, "env::::DATABASE_URL").is_some());
+        assert!(find(&cands, "env::::API_KEY").is_some());
+        let w = find(&cands, "env::::TMP_SET").expect("write not found");
+        assert_eq!(w.role, ContractRole::Provider);
+    }
+
+    // -- walker: Java (step 6) ---------------------------------------------------
+
+    #[test]
+    fn java_spring_provider() {
+        let src = "\
+public class UserController {
+
+    @GetMapping(\"/users/{id}\")
+    public String getUser(@PathVariable String id) { return \"\"; }
+
+    @PostMapping(\"/orders\")
+    public String create() { return \"\"; }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let c = find(&cands, "http::GET::/users/{p1}").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("getUser"));
+        assert!(find(&cands, "http::POST::/orders").is_some());
+    }
+
+    #[test]
+    fn java_jaxrs_provider() {
+        let src = "\
+@Path(\"/items\")
+public class ItemsResource {
+
+    @GET
+    @Path(\"/{id}\")
+    public String item() { return \"\"; }
+}
+";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "http::GET::/{p1}").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("item"));
+    }
+
+    #[test]
+    fn java_consumers() {
+        let src = "\
+class Client {
+    String call() {
+        String r = restTemplate.getForObject(\"https://api.io/v1/users\", String.class);
+        String p = restTemplate.postForObject(\"/v1/orders\", req, String.class);
+        return r;
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "http::GET::/v1/users").is_some());
+        assert!(find(&cands, "http::POST::/v1/orders").is_some());
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+    }
+
+    #[test]
+    fn java_env() {
+        let src = "\
+class Client {
+    String cfg() {
+        String e = System.getenv(\"DATABASE_URL\");
+        return e;
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "env::::DATABASE_URL").expect("env not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    // -- walker: PHP (step 6) ----------------------------------------------------
+
+    #[test]
+    fn php_laravel_provider() {
+        let src = "\
+<?php
+Route::get('/v1/users/{id}', [UserController::class, 'show']);
+Route::post('/orders', 'OrderController@store');
+";
+        let cands = extract(Lang::Php, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let c = find(&cands, "http::GET::/v1/users/{p1}").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert!(find(&cands, "http::POST::/orders").is_some());
+    }
+
+    #[test]
+    fn php_slim_provider() {
+        let src = "\
+<?php
+$app->get('/slim/x', function ($req, $res) { return $res; });
+";
+        let cands = extract(Lang::Php, src);
+        let c = find(&cands, "http::GET::/slim/x").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn php_symfony_attribute() {
+        let src = "\
+<?php
+class Ctrl {
+    #[Route('/sym/x', methods: ['GET'])]
+    public function show(): void {}
+}
+";
+        let cands = extract(Lang::Php, src);
+        let c = find(&cands, "http::GET::/sym/x").expect("route not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("show"));
+    }
+
+    #[test]
+    fn php_consumers() {
+        let src = "\
+<?php
+function load() {
+    $r = Http::get('https://api.io/v1/users');
+    $c = $client->get('/v1/users');
+}
+";
+        let cands = extract(Lang::Php, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+        assert!(
+            cands
+                .iter()
+                .all(|c| c.canonical_id == "http::GET::/v1/users")
+        );
+    }
+
+    #[test]
+    fn php_env() {
+        let src = "\
+<?php
+function load() {
+    $k = $_ENV['DATABASE_URL'];
+    putenv('TMP_SET=x');
+}
+";
+        let cands = extract(Lang::Php, src);
+        let k = find(&cands, "env::::DATABASE_URL").expect("env not found");
+        assert_eq!(k.role, ContractRole::Consumer);
+        let w = find(&cands, "env::::TMP_SET").expect("write not found");
+        assert_eq!(w.role, ContractRole::Provider);
+        assert_eq!(w.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    // -- walker: C# (step 6) -----------------------------------------------------
+
+    #[test]
+    fn csharp_attribute_provider() {
+        let src = "\
+public class UsersController : ControllerBase
+{
+    [HttpGet(\"/v1/users/{id}\")]
+    public string GetUser(string id) { return \"\"; }
+}
+";
+        let cands = extract(Lang::CSharp, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/v1/users/{p1}");
+        assert_eq!(c.owning_symbol.as_deref(), Some("GetUser"));
+    }
+
+    #[test]
+    fn csharp_route_attribute_is_any() {
+        let src = "\
+public class UsersController
+{
+    [Route(\"health\")]
+    public string Health() { return \"\"; }
+}
+";
+        let cands = extract(Lang::CSharp, src);
+        assert!(
+            find(&cands, "http::ANY::/health").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn csharp_mapget_provider() {
+        let src = "\
+class Program {
+    static void Map() {
+        app.MapGet(\"/mapped/x\", () => \"ok\");
+        app.MapPost(\"/mapped/y\", () => \"ok\");
+    }
+}
+";
+        let cands = extract(Lang::CSharp, src);
+        assert!(
+            find(&cands, "http::GET::/mapped/x").is_some(),
+            "got {cands:?}"
+        );
+        assert!(
+            find(&cands, "http::POST::/mapped/y").is_some(),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn csharp_consumers() {
+        let src = "\
+class Client {
+    async Task Load() {
+        var r = await httpClient.GetAsync(\"/v1/users\");
+        var j = await httpClient.GetFromJsonAsync<string>(\"/v1/users\");
+        var m = new HttpRequestMessage(HttpMethod.Get, \"/v1/users\");
+    }
+}
+";
+        let cands = extract(Lang::CSharp, src);
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+        assert!(
+            cands
+                .iter()
+                .all(|c| c.canonical_id == "http::GET::/v1/users")
+        );
+    }
+
+    #[test]
+    fn csharp_env() {
+        let src = "\
+class Client {
+    void Cfg() {
+        var e = Environment.GetEnvironmentVariable(\"DATABASE_URL\");
+    }
+}
+";
+        let cands = extract(Lang::CSharp, src);
+        let c = find(&cands, "env::::DATABASE_URL").expect("env not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    // -- walker: C / C++ (step 6) ------------------------------------------------
+
+    #[test]
+    fn c_curl_consumer() {
+        let src = "\
+void fetch_it(void) {
+    CURL *h = curl_easy_init();
+    curl_easy_setopt(h, CURLOPT_URL, \"https://api.io/v1/users\");
+}
+";
+        let cands = extract(Lang::C, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "http::GET::/v1/users");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.owning_symbol.as_deref(), Some("fetch_it"));
+    }
+
+    #[test]
+    fn c_env() {
+        let src = "\
+void cfg(void) {
+    char *k = getenv(\"DATABASE_URL\");
+    putenv(\"TMP_SET=x\");
+}
+";
+        let cands = extract(Lang::C, src);
+        let k = find(&cands, "env::::DATABASE_URL").expect("env not found");
+        assert_eq!(k.role, ContractRole::Consumer);
+        let w = find(&cands, "env::::TMP_SET").expect("write not found");
+        assert_eq!(w.role, ContractRole::Provider);
+        assert_eq!(w.confidence, CONFIDENCE_HEURISTIC);
     }
 }
