@@ -479,6 +479,94 @@ pub struct RawTypeEdge {
     pub relationship: String,
 }
 
+/// The kind of a detected contract (TASK-082).
+///
+/// `Http` covers route registrations (providers) and outbound calls
+/// (consumers); `Env` covers environment-variable reads and writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContractKind {
+    Http,
+    Env,
+}
+
+impl ContractKind {
+    /// Canonical kind segment used in contract IDs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContractKind::Http => "http",
+            ContractKind::Env => "env",
+        }
+    }
+}
+
+impl fmt::Display for ContractKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The role a detection site plays relative to the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContractRole {
+    /// Declares/serves the contract (route registration, env write).
+    Provider,
+    /// Invokes/reads the contract (outbound call, env read).
+    Consumer,
+}
+
+impl ContractRole {
+    /// Canonical role segment.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContractRole::Provider => "provider",
+            ContractRole::Consumer => "consumer",
+        }
+    }
+}
+
+impl fmt::Display for ContractRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One positional path parameter retained as contract metadata (PRD-CTR-REQ-022).
+///
+/// `position` is 1-based and matches the `{p1}`, `{p2}` markers in the
+/// canonical identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathParam {
+    /// 1-based position of the parameter in the normalized path.
+    pub position: usize,
+    /// Original parameter name as written in the source.
+    pub name: String,
+}
+
+/// A detected contract candidate (not yet persisted — TASK-083 adds storage).
+///
+/// Extracted from the same tree the symbol indexer walks (PRD-CTR-REQ-011).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractCandidate {
+    /// Contract kind (`http` or `env`).
+    pub kind: ContractKind,
+    /// Provider or consumer.
+    pub role: ContractRole,
+    /// Kind qualifier: HTTP verb (`GET`, `ANY`) for http; empty for env.
+    pub qualifier: String,
+    /// Normalized identifier: HTTP path or env-var name.
+    pub identifier: String,
+    /// Canonical ID `<kind>::<qualifier>::<identifier>`.
+    pub canonical_id: String,
+    /// Original path-parameter names, in order (http only).
+    pub params: Vec<PathParam>,
+    /// Enclosing function/method name, if any.
+    pub owning_symbol: Option<String>,
+    /// 1-based line of the route string argument.
+    pub line: usize,
+    /// 1.0 framework-recognized / 0.5 string-literal heuristic (AR-018).
+    pub confidence: f64,
+}
+
 /// A single step in an execution flow, representing a symbol at a given BFS depth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowStep {

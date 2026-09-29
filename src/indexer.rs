@@ -1924,7 +1924,7 @@ fn function_name_from_node(node: Node, src: &[u8], lang: Lang) -> Option<String>
 
 /// Walk `node.parent()` upward until a function/method node is found, then
 /// return its name.  Returns `None` for file-scope calls.
-fn find_enclosing_function(node: Node, src: &[u8], lang: Lang) -> Option<String> {
+pub(crate) fn find_enclosing_function(node: Node, src: &[u8], lang: Lang) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if is_function_node(parent.kind(), lang) {

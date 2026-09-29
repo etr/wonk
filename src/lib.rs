@@ -8,6 +8,7 @@ pub mod cluster;
 pub mod color;
 pub mod config;
 pub mod context;
+pub mod contracts;
 pub mod daemon;
 pub mod db;
 pub mod embedding;
