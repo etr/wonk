@@ -3141,4 +3141,108 @@ function unknown() { return mystery(); }
             .unwrap();
         assert_eq!(edge_count, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Benchmark: term_stats build-time overhead (TASK-078)
+    // -----------------------------------------------------------------------
+
+    /// Pick a vocabulary index with a Zipf-like skew toward small indices
+    /// (frequent head words, long tail of rare ones).
+    fn zipf_pick(rng: &mut rand::rngs::StdRng, vocab_len: usize) -> usize {
+        use rand::Rng;
+        let u: f64 = rng.r#gen();
+        ((vocab_len as f64) * u * u).floor() as usize % vocab_len
+    }
+
+    /// Build the fixed synthetic corpus used by the benchmark: 300 `.rs`
+    /// files of ~150 lines each, tokens drawn from a 500-word Zipf-ish
+    /// vocabulary, seeded so every run measures the identical corpus.
+    fn write_bench_corpus(root: &Path) {
+        use rand::SeedableRng;
+
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(78);
+        let vocab: Vec<String> = (0..500).map(|i| format!("w{i}")).collect();
+        for file_idx in 0..300 {
+            let mut lines = vec![format!("fn w{file_idx}_entry() {{")];
+            while lines.len() < 150 {
+                let picks: Vec<&str> = (0..6)
+                    .map(|_| vocab[zipf_pick(&mut rng, vocab.len())].as_str())
+                    .collect();
+                lines.push(format!("    let value = {} + {};", picks[0], picks[1]));
+                lines.push(format!(
+                    "    call_{}({}, {});",
+                    picks[2], picks[3], picks[4]
+                ));
+                if lines.len() >= 150 {
+                    break;
+                }
+                lines.push(format!("    // {} {} {}", picks[5], picks[0], picks[2]));
+            }
+            lines.push("}".to_string());
+            fs::write(
+                root.join("src").join(format!("mod_{file_idx:03}.rs")),
+                lines.join("\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Measure `build_index` on the synthetic corpus.  Runs the build three
+    /// times on a fresh database each and prints per-run elapsed, the
+    /// median, the `term_stats` row count, and the index DB size.  No
+    /// timing assertion — this is a measurement harness, run manually via
+    /// `cargo test --release bench_build_index_term_stats_overhead -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_build_index_term_stats_overhead() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_bench_corpus(root);
+
+        let mut durations = Vec::new();
+        for run in 0..3 {
+            let index_dir = root.join(".wonk");
+            if index_dir.exists() {
+                fs::remove_dir_all(&index_dir).unwrap();
+            }
+            let start = std::time::Instant::now();
+            let stats = build_index(root, true).unwrap();
+            let elapsed = start.elapsed();
+            durations.push(elapsed);
+            println!(
+                "bench run {}: {:?} ({} files, {} symbols)",
+                run + 1,
+                elapsed,
+                stats.file_count,
+                stats.symbol_count
+            );
+        }
+        durations.sort();
+        let median = durations[1];
+        println!("bench median: {median:?}");
+
+        let index_path = db::local_index_path(root);
+        let db_size = fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+        println!("bench index db size: {db_size} bytes");
+
+        // term_stats may not exist yet (baseline run before TASK-078 writes).
+        let conn = db::open_existing(&index_path).unwrap();
+        let has_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='term_stats'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let term_stats_rows: i64 = if has_table > 0 {
+            conn.query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+                .unwrap()
+        } else {
+            0
+        };
+        println!("bench term_stats rows: {term_stats_rows}");
+    }
 }
