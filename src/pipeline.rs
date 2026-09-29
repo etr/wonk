@@ -490,6 +490,10 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         .unchecked_transaction()
         .context("starting delete transaction")?;
 
+    // Capture the reach table's pre-delete view of this file before any
+    // rows go away (TASK-081, PRD-REACH-REQ-005).
+    let scope = crate::reach::begin_file_edit(&tx, rel_path)?;
+
     // Delete type edges before symbols (explicit, mirrors references/imports pattern).
     tx.execute(
         "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
@@ -516,9 +520,17 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         rusqlite::params![rel_path],
     )?;
 
-    // Deleting symbols may invalidate reach rows both directions; mark the
-    // whole table stale until the next full rebuild (PRD-REACH-REQ-007).
-    crate::reach::mark_stale(&tx)?;
+    // Incrementally repair the reach rows this deletion touched. On
+    // failure, degrade: mark the table stale in this same transaction and
+    // commit anyway — reach is a cache, and a stale table falls back to
+    // BFS rather than serving wrong data (PRD-REACH-REQ-007).
+    if let Err(e) = crate::reach::finish_file_edit(&tx, &scope) {
+        crate::reach::mark_stale(&tx)?;
+        eprintln!(
+            "warn: incremental reach repair failed for {rel_path}: {e:#}; \
+             table marked stale, queries fall back to BFS"
+        );
+    }
 
     tx.commit().context("committing delete transaction")?;
     Ok(())
@@ -535,6 +547,11 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     let tx = conn
         .unchecked_transaction()
         .context("starting upsert transaction")?;
+
+    // Capture the reach table's pre-edit view of this file BEFORE the old
+    // rows are deleted (TASK-081, PRD-REACH-REQ-005): canonical ids and
+    // reverse-target predecessors that only exist pre-delete.
+    let scope = crate::reach::begin_file_edit(&tx, &result.rel_path)?;
 
     // Delete old type edges, symbols, references, and imports for this file.
     // type_edges has ON DELETE CASCADE from symbols, but we delete explicitly
@@ -685,10 +702,19 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         }
     }
 
-    // Any per-file edit can change reach rows both directions; mark the
-    // whole table stale until the next full rebuild (PRD-REACH-REQ-007).
-    // TASK-081 replaces this coarse invalidation with incremental recompute.
-    crate::reach::mark_stale(&tx)?;
+    // Incrementally repair the reach rows this edit touched (the same
+    // traversal the full build runs, over the affected source set). On
+    // failure, degrade: mark the table stale in this same transaction and
+    // commit anyway — reach is a cache, and a stale table falls back to
+    // BFS rather than serving wrong data (PRD-REACH-REQ-007).
+    if let Err(e) = crate::reach::finish_file_edit(&tx, &scope) {
+        crate::reach::mark_stale(&tx)?;
+        eprintln!(
+            "warn: incremental reach repair failed for {}: {e:#}; \
+             table marked stale, queries fall back to BFS",
+            result.rel_path
+        );
+    }
 
     tx.commit().context("committing upsert transaction")?;
     Ok(())
@@ -2122,49 +2148,62 @@ fn extra() -> i32 {
     }
 
     #[test]
-    fn test_reindex_file_marks_reach_stale() {
+    fn test_reindex_file_repairs_reach() {
         let (dir, conn) = setup_indexed_repo();
         assert!(reach_meta_value(&conn, "stale").is_none());
 
         // Touch a file with new content: the daemon's incremental path.
         fs::write(
             dir.path().join("lib.rs"),
-            "fn hello() { 3 }\nfn world() { 4 }",
+            "fn hello() { world(); }\nfn world() { 4 }",
         )
         .unwrap();
         reindex_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
 
-        assert_eq!(
-            reach_meta_value(&conn, "stale").as_deref(),
-            Some("1"),
-            "any file edit conservatively marks the table stale (TASK-081 refines)"
+        assert!(
+            reach_meta_value(&conn, "stale").is_none(),
+            "reindex repairs the table instead of marking it stale (REQ-005)"
+        );
+        // The repaired table answers, and equals the BFS.
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
+        let answer = crate::reach::lookup_upstream(&conn, "world", 3)
+            .unwrap()
+            .expect("repaired table covers world");
+        assert!(
+            answer.affected.iter().any(|s| s.name == "hello"),
+            "hello calls world"
         );
     }
 
     #[test]
-    fn test_remove_file_marks_reach_stale() {
+    fn test_remove_file_repairs_reach() {
         let (dir, conn) = setup_indexed_repo();
         assert!(reach_meta_value(&conn, "stale").is_none());
 
         remove_file(&conn, &dir.path().join("app.py"), dir.path()).unwrap();
 
-        assert_eq!(
-            reach_meta_value(&conn, "stale").as_deref(),
-            Some("1"),
-            "file removal marks the table stale"
+        assert!(
+            reach_meta_value(&conn, "stale").is_none(),
+            "file removal repairs the table instead of marking it stale"
         );
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
     }
 
     #[test]
     fn test_stale_reach_still_answers_via_blast() {
         let (dir, conn) = setup_indexed_repo();
 
+        // Mark stale directly: this is now a degrade-path test, not the
+        // normal reindex behavior (which repairs).
         fs::write(
             dir.path().join("lib.rs"),
             "fn hello() { world(); }\nfn world() { 4 }",
         )
         .unwrap();
         reindex_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        crate::reach::mark_stale(&tx).unwrap();
+        tx.commit().unwrap();
         assert!(reach_meta_value(&conn, "stale").is_some());
 
         // analyze_blast must silently degrade to BFS, not error or go empty.
@@ -2179,6 +2218,274 @@ fn extra() -> i32 {
             names.contains(&"hello"),
             "stale table degrades to BFS and still finds callers"
         );
+    }
+
+    /// REQ-007: a failed incremental repair must degrade to BFS — the file
+    /// data still commits, the table is marked stale in the same
+    /// transaction, lookups return None, and blast answers equal the plain
+    /// BFS. The failpoint self-clears after one shot. The probe file is
+    /// uniquely named so no parallel test's reindex can consume the
+    /// path-keyed injection.
+    #[test]
+    fn test_reindex_repair_failure_degrades_to_bfs_never_wrong_data() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("degrade_probe.rs"),
+            "fn hello() { world(); }\nfn world() { 2 }",
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        // Sanity: the table covers world before the edit.
+        assert!(
+            crate::reach::lookup_upstream(&conn, "world", 3)
+                .unwrap()
+                .is_some()
+        );
+
+        *crate::reach::FAIL_NEXT_FINISH.lock().unwrap() = Some("degrade_probe.rs".to_string());
+        fs::write(
+            root.join("degrade_probe.rs"),
+            "fn hello() { world(); }\nfn world() { 4 }\nfn extra() { 7 }",
+        )
+        .unwrap();
+        let changed = reindex_file(&conn, &root.join("degrade_probe.rs"), root).unwrap();
+
+        assert!(changed, "the reindex itself succeeds");
+        // The file data committed despite the failed repair.
+        let symbols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'degrade_probe.rs' AND name = 'extra'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(symbols, 1, "file data commits even when the repair fails");
+        // The table was marked stale in the same transaction.
+        assert_eq!(
+            reach_meta_value(&conn, "stale").as_deref(),
+            Some("1"),
+            "failed repair degrades by marking stale (REQ-007)"
+        );
+        assert!(
+            crate::reach::lookup_upstream(&conn, "world", 3)
+                .unwrap()
+                .is_none(),
+            "stale table must not answer"
+        );
+
+        // The default (use_reach) path equals the plain BFS: never wrong.
+        let via_table =
+            crate::blast::analyze_blast(&conn, "world", &crate::blast::BlastOptions::default())
+                .unwrap();
+        let via_bfs = crate::blast::analyze_blast(
+            &conn,
+            "world",
+            &crate::blast::BlastOptions {
+                use_reach: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(via_table, via_bfs);
+        let names: Vec<&str> = via_table
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter().map(|s| s.name.as_str()))
+            .collect();
+        assert!(names.contains(&"hello"), "BFS still finds the caller");
+
+        // One-shot: the failpoint cleared itself.
+        assert!(crate::reach::FAIL_NEXT_FINISH.lock().unwrap().is_none());
+    }
+
+    /// A Rust file of `g_fns` functions that each call `world` (defined
+    /// in the same file). Editing it yields a reach rebuild set of exactly
+    /// `g_fns + 1` names — the dial for the work-budget boundary tests.
+    fn wide_rust_source(g_fns: usize) -> String {
+        let mut src = String::from("fn world() -> u32 {\n    1\n}\n");
+        for i in 0..g_fns {
+            src.push_str(&format!("fn g{i}() -> u32 {{\n    world()\n}}\n"));
+        }
+        src
+    }
+
+    /// Work-budget guard, natural trip (TASK-081, PRD-DMN-REQ-009): when
+    /// an edit's rebuild set exceeds `MAX_INCREMENTAL_REPAIR_SOURCES`,
+    /// the refused repair flows through the same degrade wiring as the
+    /// injected failure — reindex succeeds, file data commits, the table
+    /// is marked stale in the same transaction, lookups fall back to BFS,
+    /// and the default blast path equals the plain BFS. No failpoint is
+    /// set: the graph itself is over the budget.
+    #[test]
+    fn test_reindex_oversized_repair_degrades_to_bfs_via_work_budget() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        // g-fns + world => a rebuild set of g_fns + 1 names. g_fns = MAX
+        // puts the set at MAX + 1: over the budget by exactly one source.
+        fs::write(
+            root.join("wide.rs"),
+            wide_rust_source(crate::reach::MAX_INCREMENTAL_REPAIR_SOURCES),
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        // Sanity: the table covers world before the edit.
+        assert!(
+            crate::reach::lookup_upstream(&conn, "world", 3)
+                .unwrap()
+                .is_some()
+        );
+
+        let wide = root.join("wide.rs");
+        let base = fs::read_to_string(&wide).unwrap();
+        fs::write(&wide, format!("{base}// budget edit\n")).unwrap();
+        let changed = reindex_file(&conn, &wide, root).unwrap();
+
+        assert!(changed, "the reindex itself succeeds");
+        // The file data committed despite the refused repair.
+        let symbols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'wide.rs' AND name LIKE 'g%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            symbols as usize,
+            crate::reach::MAX_INCREMENTAL_REPAIR_SOURCES,
+            "file data commits even when the repair is refused"
+        );
+        // The table was marked stale in the same transaction.
+        assert_eq!(
+            reach_meta_value(&conn, "stale").as_deref(),
+            Some("1"),
+            "over-budget repair degrades by marking stale (REQ-007)"
+        );
+        assert!(
+            crate::reach::lookup_upstream(&conn, "world", 3)
+                .unwrap()
+                .is_none(),
+            "stale table must not answer"
+        );
+
+        // The default (use_reach) path equals the plain BFS: never wrong.
+        let via_table =
+            crate::blast::analyze_blast(&conn, "world", &crate::blast::BlastOptions::default())
+                .unwrap();
+        let via_bfs = crate::blast::analyze_blast(
+            &conn,
+            "world",
+            &crate::blast::BlastOptions {
+                use_reach: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(via_table, via_bfs);
+        let names: Vec<&str> = via_table
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter().map(|s| s.name.as_str()))
+            .collect();
+        assert!(names.contains(&"g0"), "BFS still finds the callers");
+    }
+
+    /// The other side of the work-budget boundary: an edit whose rebuild
+    /// set is exactly `MAX_INCREMENTAL_REPAIR_SOURCES` names repairs
+    /// incrementally — no stale marker, no degrade, table still answers.
+    #[test]
+    fn test_reindex_at_budget_repair_stays_incremental() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        // g-fns + world => a rebuild set of exactly g_fns + 1 = MAX names.
+        fs::write(
+            root.join("wide.rs"),
+            wide_rust_source(crate::reach::MAX_INCREMENTAL_REPAIR_SOURCES - 1),
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        let wide = root.join("wide.rs");
+        let base = fs::read_to_string(&wide).unwrap();
+        fs::write(&wide, format!("{base}// at-budget edit\n")).unwrap();
+        let changed = reindex_file(&conn, &wide, root).unwrap();
+
+        assert!(changed);
+        assert!(
+            reach_meta_value(&conn, "stale").is_none(),
+            "an at-budget repair is incremental, not a degrade"
+        );
+        assert!(
+            crate::reach::lookup_upstream(&conn, "world", 3)
+                .unwrap()
+                .is_some(),
+            "the table still answers after an at-budget repair"
+        );
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
+    }
+
+    /// TASK-081 acceptance: after every edit in a realistic sequence, the
+    /// reach table stays equivalent to the live BFS at every depth — no
+    /// staleness, no drift. Five steps through the daemon's real path
+    /// (reindex_file / remove_file): add caller, remove caller, rename
+    /// symbol with a dangling cross-file caller, delete a mid-chain file,
+    /// introduce a mutual-recursion cycle.
+    #[test]
+    fn test_edit_sequence_reach_stays_equivalent_to_bfs() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        fs::write(root.join("src/lib.rs"), "fn world() { 1 }\n").unwrap();
+        fs::write(root.join("src/mid.rs"), "fn mid() { world(); }\n").unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() { mid(); }\n").unwrap();
+        fs::write(root.join("src/extra.rs"), "fn extra() { mid(); }\n").unwrap();
+
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
+
+        // Step 1: add a direct caller of world.
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn world() { 1 }\nfn direct() { world(); }\n",
+        )
+        .unwrap();
+        reindex_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
+
+        // Step 2: remove the caller again.
+        fs::write(root.join("src/lib.rs"), "fn world() { 1 }\n").unwrap();
+        reindex_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
+
+        // Step 3: rename world -> planet. mid.rs keeps calling the old
+        // name: a dangling-name reference whose caller edges must keep
+        // answering via BFS (the renamed symbol has no table rows).
+        fs::write(root.join("src/lib.rs"), "fn planet() { 1 }\n").unwrap();
+        reindex_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
+
+        // Step 4: delete the mid-chain file.
+        fs::remove_file(root.join("src/mid.rs")).unwrap();
+        remove_file(&conn, &root.join("src/mid.rs"), root).unwrap();
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
+
+        // Step 5: introduce a mutual-recursion cycle main <-> extra.
+        fs::write(root.join("src/main.rs"), "fn main() { extra(); }\n").unwrap();
+        fs::write(root.join("src/extra.rs"), "fn extra() { main(); }\n").unwrap();
+        reindex_file(&conn, &root.join("src/main.rs"), root).unwrap();
+        reindex_file(&conn, &root.join("src/extra.rs"), root).unwrap();
+        crate::reach::assert_table_equivalent_to_bfs(&conn);
     }
 
     #[test]
