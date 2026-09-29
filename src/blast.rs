@@ -906,6 +906,10 @@ fn bar() { }
             })
             .unwrap();
 
+        // The pipeline build already populated the real (empty) table for
+        // this fixture; replace its contents rather than insert alongside.
+        conn.execute("DELETE FROM reach", []).unwrap();
+        conn.execute("DELETE FROM reach_truncated", []).unwrap();
         conn.execute(
             "INSERT INTO reach (source_id, target_id, min_depth, confidence) \
              VALUES (?1, ?2, 1, 0.42)",
@@ -913,7 +917,7 @@ fn bar() { }
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO reach_meta (key, value) VALUES ('built_depth', '3')",
+            "INSERT OR REPLACE INTO reach_meta (key, value) VALUES ('built_depth', '3')",
             [],
         )
         .unwrap();
