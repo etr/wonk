@@ -73,7 +73,8 @@ pub fn idf(n_docs: u64, df: u64) -> f32 {
 pub fn term_contribution(tf: u64, doc_len: f32, avgdl: f32, idf: f32, k1: f32, b: f32) -> f32 {
     let tf = tf as f32;
     let denominator = tf + k1 * (1.0 - b + b * doc_len / avgdl);
-    if !(denominator > 0.0) {
+    // NaN-safe: a NaN denominator compares incomparable, hence not greater.
+    if denominator.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return 0.0;
     }
     idf * tf * (k1 + 1.0) / denominator
@@ -171,8 +172,8 @@ pub fn rerank_lexical(
     }
 
     let mut ranked: Vec<(f32, SearchResult)> = results
-        .to_vec()
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|r| {
             (
                 scores
@@ -604,7 +605,7 @@ mod tests {
             }
         }
 
-        fn median(durations: &mut Vec<std::time::Duration>) -> std::time::Duration {
+        fn median(durations: &mut [std::time::Duration]) -> std::time::Duration {
             durations.sort();
             durations[durations.len() / 2]
         }
@@ -630,8 +631,9 @@ mod tests {
         for (label, pattern) in patterns {
             // Frozen candidate list: walker-relative so paths match
             // term_stats.file keys, as in the router (cwd = repo root).
-            let mut candidates = crate::search::text_search(pattern, false, false, &[root_str.clone()])
-                .unwrap();
+            let mut candidates =
+                crate::search::text_search(pattern, false, false, std::slice::from_ref(&root_str))
+                    .unwrap();
             for result in &mut candidates {
                 if let Ok(rel) = result.file.strip_prefix(root) {
                     result.file = rel.to_path_buf();
@@ -646,8 +648,13 @@ mod tests {
             let mut rerank_times = Vec::with_capacity(runs);
             for _ in 0..runs {
                 let start = Instant::now();
-                let mut found =
-                    crate::search::text_search(pattern, false, false, &[root_str.clone()]).unwrap();
+                let mut found = crate::search::text_search(
+                    pattern,
+                    false,
+                    false,
+                    std::slice::from_ref(&root_str),
+                )
+                .unwrap();
                 let search_elapsed = start.elapsed();
                 for result in &mut found {
                     if let Ok(rel) = result.file.strip_prefix(root) {
