@@ -1194,4 +1194,377 @@ mod tests {
         );
         assert!(!plan.contains("SCAN reach"), "no full scans: {plan}");
     }
+
+    // -- Equivalence suite (AR-021) -------------------------------------------
+    //
+    // The table is equivalent to the BFS by construction (one shared
+    // predicate, mirrored traversal); this suite guards against drift.
+
+    /// Inline splitmix64 — deterministic per-seed graph generation without an
+    /// external rng dependency.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    const EQUIV_KINDS: [&str; 11] = [
+        "function",
+        "method",
+        "class",
+        "struct",
+        "interface",
+        "enum",
+        "trait",
+        "type_alias",
+        "constant",
+        "variable",
+        "module",
+    ];
+
+    const EQUIV_FILES: [&str; 5] = [
+        "src/a.rs",
+        "src/b.rs",
+        "src/c.rs",
+        "tests/t1.rs",
+        "tests/t2.rs",
+    ];
+
+    const EQUIV_CONFS: [f64; 4] = [0.5, 0.8, 0.85, 0.95];
+
+    /// Small name pool: collisions across kinds and files are guaranteed.
+    const EQUIV_POOL: [&str; 24] = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra",
+        "tango", "uniform", "victor", "whiskey", "xray",
+    ];
+
+    /// Names the structured part of the graph also exposes as call targets,
+    /// so random callers cross into the deterministic structures.
+    const EQUIV_STRUCTURED: [&str; 6] = ["shared", "poly", "hub_t", "chain_2", "d_bot", "modonly"];
+
+    /// Inserts symbols with per-file unique line numbers (deterministic
+    /// candidate ordering in both traversal engines).
+    struct GraphBuilder<'a> {
+        conn: &'a Connection,
+        lines: HashMap<String, i64>,
+    }
+
+    impl<'a> GraphBuilder<'a> {
+        fn new(conn: &'a Connection) -> Self {
+            Self {
+                conn,
+                lines: HashMap::new(),
+            }
+        }
+
+        fn symbol(&mut self, name: &str, kind: &str, file: &str) -> i64 {
+            let line = {
+                let slot = self.lines.entry(file.to_string()).or_insert(0);
+                *slot += 1;
+                *slot
+            };
+            insert_symbol(self.conn, name, kind, file, line)
+        }
+    }
+
+    /// Populate one seed's synthetic graph: ~120 random background symbols on
+    /// top of deterministic structures — a 5-link chain (depth > 3), a
+    /// diamond, mutual-recursion and self-call cycles, a 15-caller hub (with
+    /// test-file callers), same-name symbols across files, duplicate
+    /// (name, file) rows, a multi-call-site caller, a Module-only name, a
+    /// kind-colliding name, and type edges including same-named parents.
+    fn seed_graph(conn: &Connection, seed: u64) {
+        let mut rng = SplitMix64(seed);
+        let mut g = GraphBuilder::new(conn);
+
+        // Chain longer than the built depth: chain_i calls chain_{i+1}.
+        for i in 0..5 {
+            g.symbol(&format!("chain_{i}"), "function", EQUIV_FILES[i % 3]);
+        }
+        for i in 0..4 {
+            let caller: i64 = conn
+                .query_row(
+                    "SELECT id FROM symbols WHERE name = ?1",
+                    rusqlite::params![format!("chain_{i}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            insert_ref(conn, &format!("chain_{}", i + 1), Some(caller), 0.85);
+        }
+
+        // Diamond: d_top -> {d_l, d_r} -> d_bot.
+        let d_top = g.symbol("d_top", "function", "src/a.rs");
+        let d_l = g.symbol("d_l", "function", "src/b.rs");
+        let d_r = g.symbol("d_r", "method", "src/b.rs");
+        let d_bot = g.symbol("d_bot", "class", "src/c.rs");
+        insert_ref(conn, "d_l", Some(d_top), 0.95);
+        insert_ref(conn, "d_r", Some(d_top), 0.8);
+        insert_ref(conn, "d_bot", Some(d_l), 0.85);
+        insert_ref(conn, "d_bot", Some(d_r), 0.95);
+
+        // Cycles: mutual recursion and a self-call.
+        let cyc_a = g.symbol("cyc_a", "function", "src/a.rs");
+        let cyc_b = g.symbol("cyc_b", "function", "src/b.rs");
+        insert_ref(conn, "cyc_b", Some(cyc_a), 0.85);
+        insert_ref(conn, "cyc_a", Some(cyc_b), 0.85);
+        let self_x = g.symbol("self_x", "function", "src/a.rs");
+        insert_ref(conn, "self_x", Some(self_x), 0.85);
+
+        // Hub with 15 callers, a few discovered in test files.
+        g.symbol("hub_t", "function", "src/a.rs");
+        for i in 0..15 {
+            let file = if i % 5 == 4 {
+                "tests/t1.rs"
+            } else {
+                EQUIV_FILES[i % 3]
+            };
+            let caller = g.symbol(&format!("hub_c{i}"), "function", file);
+            insert_ref(conn, "hub_t", Some(caller), EQUIV_CONFS[i % 4]);
+        }
+
+        // Same name across files, one landing in a test file.
+        let shared_ids: Vec<i64> = ["src/a.rs", "src/b.rs", "tests/t1.rs"]
+            .iter()
+            .map(|f| g.symbol("shared", "function", f))
+            .collect();
+        // Duplicate (name, file): two `dup` rows in one file, both calling shared.
+        for _ in 0..2 {
+            let dup = g.symbol("dup", "function", "src/a.rs");
+            insert_ref(conn, "shared", Some(dup), 0.8);
+        }
+        // Multi-call-site caller: three refs to shared at different confidences.
+        let mcs = g.symbol("mcs", "method", "src/b.rs");
+        for conf in EQUIV_CONFS {
+            insert_ref(conn, "shared", Some(mcs), conf);
+        }
+        // Module-only name with a caller (target coverage, never a source).
+        g.symbol("modonly", "module", "src/a.rs");
+        let mod_caller = g.symbol("mod_caller", "function", "src/c.rs");
+        insert_ref(conn, "modonly", Some(mod_caller), 0.95);
+        // Kind collision: struct + function under one name, each with a
+        // type-edge child (children resolve by parent NAME union).
+        let poly_struct = g.symbol("poly", "struct", "src/a.rs");
+        let poly_fn = g.symbol("poly", "function", "src/b.rs");
+        let poly_child_a = g.symbol("poly_child_a", "method", "src/a.rs");
+        let poly_child_b = g.symbol("poly_child_b", "function", "src/c.rs");
+        insert_type_edge(conn, poly_struct, poly_child_a);
+        insert_type_edge(conn, poly_fn, poly_child_b);
+        let poly_caller = g.symbol("poly_caller", "constant", "src/b.rs");
+        insert_ref(conn, "poly", Some(poly_caller), 0.5);
+        // Type-edge children under same-named parents in different files.
+        for (i, &parent) in shared_ids.iter().enumerate() {
+            let child = g.symbol(&format!("shared_child{i}"), "function", "src/c.rs");
+            insert_type_edge(conn, parent, child);
+        }
+
+        // Random background: ~120 symbols, all 11 kinds, colliding names,
+        // mixed files (incl. tests), NULL-caller refs, random out-degrees.
+        let mut ids: Vec<i64> = Vec::new();
+        for _ in 0..120 {
+            let name = EQUIV_POOL[rng.below(EQUIV_POOL.len())];
+            let kind = EQUIV_KINDS[rng.below(EQUIV_KINDS.len())];
+            let file = EQUIV_FILES[rng.below(EQUIV_FILES.len())];
+            let id = g.symbol(name, kind, file);
+            ids.push(id);
+        }
+        for &id in &ids {
+            let out = 1 + rng.below(4);
+            for _ in 0..out {
+                let callee = if rng.below(3) == 0 {
+                    EQUIV_STRUCTURED[rng.below(EQUIV_STRUCTURED.len())]
+                } else {
+                    EQUIV_POOL[rng.below(EQUIV_POOL.len())]
+                };
+                let conf = EQUIV_CONFS[rng.below(EQUIV_CONFS.len())];
+                // ~10% of refs have no resolved caller: invisible to both engines.
+                let caller = if rng.below(10) == 0 { None } else { Some(id) };
+                insert_ref(conn, callee, caller, conf);
+            }
+        }
+        // Random type edges over the background symbols.
+        for _ in 0..20 {
+            let parent = ids[rng.below(ids.len())];
+            let child = ids[rng.below(ids.len())];
+            insert_type_edge(conn, parent, child);
+        }
+    }
+
+    fn bfs_options(depth: usize, use_reach: bool) -> crate::blast::BlastOptions {
+        crate::blast::BlastOptions {
+            depth,
+            direction: crate::types::BlastDirection::Upstream,
+            include_tests: false,
+            min_confidence: None,
+            use_reach,
+        }
+    }
+
+    /// AR-021 mandatory equivalence: for every name in every seeded graph,
+    /// the table answer equals the live BFS at every depth ≤ built depth.
+    #[test]
+    fn equivalence_table_matches_bfs_on_random_graphs() {
+        for seed in 1..=20u64 {
+            let (_dir, conn) = make_db();
+            seed_graph(&conn, seed);
+            build(&conn, 3, usize::MAX);
+
+            let mut names: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT DISTINCT name FROM symbols ORDER BY name")
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                rows
+            };
+            names.push("definitely_missing_name".into());
+
+            for name in &names {
+                let eligible: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM symbols WHERE name = ?1 AND kind <> 'module'",
+                        rusqlite::params![name],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                for depth in [1usize, 2, 3] {
+                    let where_ = format!("seed {seed} name {name} depth {depth}");
+                    let bfs = crate::blast::analyze_blast(&conn, name, &bfs_options(depth, false))
+                        .unwrap();
+                    let routed =
+                        crate::blast::analyze_blast(&conn, name, &bfs_options(depth, true))
+                            .unwrap();
+                    let answer = lookup_upstream(&conn, name, depth).unwrap();
+
+                    if eligible > 0 {
+                        let answer =
+                            answer.unwrap_or_else(|| panic!("{where_}: table must cover the name"));
+                        assert!(!answer.truncated, "{where_}: uncapped build");
+                        assert_eq!(
+                            answer.affected.len(),
+                            bfs.total_affected,
+                            "{where_}: row count vs BFS total"
+                        );
+                        assert_eq!(
+                            routed, bfs,
+                            "{where_}: routed (table) result must equal the BFS result"
+                        );
+                    } else {
+                        assert!(
+                            answer.is_none(),
+                            "{where_}: Module-only/unknown names must not be answered"
+                        );
+                        assert_eq!(routed, bfs, "{where_}: fallback must be the exact BFS");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dimension canary: `include_tests` changes the shared predicate's
+    /// verdict, so the BFS under that dimension disagrees with the table
+    /// (which is built test-excluded). If the routing matrix ever let
+    /// dimension queries hit the table, both engines would wrongly agree.
+    #[test]
+    fn equivalence_canary_include_tests_dimension_moves_bfs_not_table() {
+        let (_dir, conn) = make_db();
+        let victim = insert_symbol(&conn, "victim", "function", "src/a.rs", 1);
+        let prod = insert_symbol(&conn, "prod_caller", "function", "src/b.rs", 2);
+        let test = insert_symbol(&conn, "test_caller", "function", "tests/t1.rs", 3);
+        insert_ref(&conn, "victim", Some(prod), 0.85);
+        insert_ref(&conn, "victim", Some(test), 0.85);
+        let _ = victim;
+        build(&conn, 3, usize::MAX);
+
+        let table = lookup_upstream(&conn, "victim", 3)
+            .unwrap()
+            .expect("covered");
+        let table_names: HashSet<&str> = table.affected.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            table_names,
+            HashSet::from(["prod_caller"]),
+            "table excludes tests"
+        );
+
+        // Same dimension through BFS: the shared predicate now admits the
+        // test caller, so the BFS result disagrees with the table answer.
+        let bfs_tests = crate::blast::analyze_blast(
+            &conn,
+            "victim",
+            &crate::blast::BlastOptions {
+                include_tests: true,
+                ..bfs_options(3, false)
+            },
+        )
+        .unwrap();
+        let bfs_names: HashSet<&str> = bfs_tests
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter().map(|s| s.name.as_str()))
+            .collect();
+        assert!(bfs_names.contains("test_caller"), "predicate moved the BFS");
+        assert_ne!(bfs_names, table_names, "dimension result must differ");
+
+        // Without the dimension both engines agree (the equivalence proper).
+        let bfs_default =
+            crate::blast::analyze_blast(&conn, "victim", &bfs_options(3, false)).unwrap();
+        assert_eq!(bfs_default.total_affected, table.affected.len());
+    }
+
+    /// Dimension canary: `min_confidence` narrows the shared predicate, so
+    /// the confidence-filtered BFS is a strict subset of the table answer.
+    #[test]
+    fn equivalence_canary_min_confidence_dimension_moves_bfs_not_table() {
+        let (_dir, conn) = make_db();
+        let victim = insert_symbol(&conn, "victim", "function", "src/a.rs", 1);
+        let lo = insert_symbol(&conn, "lo_caller", "function", "src/b.rs", 2);
+        let hi = insert_symbol(&conn, "hi_caller", "function", "src/c.rs", 3);
+        insert_ref(&conn, "victim", Some(lo), 0.5);
+        insert_ref(&conn, "victim", Some(hi), 0.95);
+        let _ = victim;
+        build(&conn, 3, usize::MAX);
+
+        let table = lookup_upstream(&conn, "victim", 3)
+            .unwrap()
+            .expect("covered");
+        let table_names: HashSet<&str> = table.affected.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(table_names, HashSet::from(["lo_caller", "hi_caller"]));
+
+        let bfs_strict = crate::blast::analyze_blast(
+            &conn,
+            "victim",
+            &crate::blast::BlastOptions {
+                min_confidence: Some(0.9),
+                ..bfs_options(3, false)
+            },
+        )
+        .unwrap();
+        let strict_names: HashSet<&str> = bfs_strict
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter().map(|s| s.name.as_str()))
+            .collect();
+        assert_eq!(
+            strict_names,
+            HashSet::from(["hi_caller"]),
+            "predicate moved the BFS"
+        );
+        assert!(
+            strict_names.is_subset(&table_names),
+            "filtered BFS is a subset, never equal here"
+        );
+    }
 }
