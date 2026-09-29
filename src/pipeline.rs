@@ -1669,7 +1669,7 @@ class Component {
         let dir = make_contract_repo();
         write_reach_config(
             dir.path(),
-            "[contracts]\nhttp = false\nenv = false\nqueue = false\nwebsocket = false\njob = false\n",
+            "[contracts]\nhttp = false\nenv = false\nqueue = false\nwebsocket = false\njob = false\ngrpc = false\ngraphql = false\nopenapi = false\n",
         );
         let stats = build_index(dir.path(), true).unwrap();
         assert_eq!(stats.contract_count, 0, "got {stats:?}");

@@ -479,13 +479,17 @@ pub struct RawTypeEdge {
     pub relationship: String,
 }
 
-/// The kind of a detected contract (TASK-082, TASK-087).
+/// The kind of a detected contract (TASK-082, TASK-087, TASK-088).
 ///
 /// `Http` covers route registrations (providers) and outbound calls
 /// (consumers); `Env` covers environment-variable reads and writes;
 /// `Queue` covers message producers/consumers (broker as qualifier);
 /// `WebSocket` covers emit sites and handler registrations; `Job` covers
-/// scheduled and background job definitions and enqueues.
+/// scheduled and background job definitions and enqueues; `Grpc` covers
+/// IDL service definitions and generated-stub call sites (the RPC family,
+/// PRD-CTR-REQ-024); `Graphql` covers resolver definitions and operation
+/// call sites; `Openapi` covers specification documents (file-level
+/// providers, never consumers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContractKind {
     Http,
@@ -493,6 +497,9 @@ pub enum ContractKind {
     Queue,
     WebSocket,
     Job,
+    Grpc,
+    Graphql,
+    Openapi,
 }
 
 impl ContractKind {
@@ -504,6 +511,9 @@ impl ContractKind {
             ContractKind::Queue => "queue",
             ContractKind::WebSocket => "websocket",
             ContractKind::Job => "job",
+            ContractKind::Grpc => "grpc",
+            ContractKind::Graphql => "graphql",
+            ContractKind::Openapi => "openapi",
         }
     }
 }
@@ -897,6 +907,9 @@ mod tests {
         assert_eq!(ContractKind::Queue.as_str(), "queue");
         assert_eq!(ContractKind::WebSocket.as_str(), "websocket");
         assert_eq!(ContractKind::Job.as_str(), "job");
+        assert_eq!(ContractKind::Grpc.as_str(), "grpc");
+        assert_eq!(ContractKind::Graphql.as_str(), "graphql");
+        assert_eq!(ContractKind::Openapi.as_str(), "openapi");
     }
 
     #[test]

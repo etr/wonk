@@ -139,6 +139,12 @@ pub struct ContractsConfig {
     pub websocket: bool,
     /// Scheduled and background job detection.
     pub job: bool,
+    /// gRPC IDL + generated-stub detection (RPC family, TASK-088).
+    pub grpc: bool,
+    /// GraphQL resolver + operation detection (TASK-088).
+    pub graphql: bool,
+    /// OpenAPI specification-document detection (TASK-088).
+    pub openapi: bool,
 }
 
 impl Default for ContractsConfig {
@@ -149,6 +155,9 @@ impl Default for ContractsConfig {
             queue: true,
             websocket: true,
             job: true,
+            grpc: true,
+            graphql: true,
+            openapi: true,
         }
     }
 }
@@ -283,6 +292,9 @@ struct ContractsOverlay {
     queue: Option<bool>,
     websocket: Option<bool>,
     job: Option<bool>,
+    grpc: Option<bool>,
+    graphql: Option<bool>,
+    openapi: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +378,15 @@ impl Config {
             }
             if let Some(v) = contracts.job {
                 self.contracts.job = v;
+            }
+            if let Some(v) = contracts.grpc {
+                self.contracts.grpc = v;
+            }
+            if let Some(v) = contracts.graphql {
+                self.contracts.graphql = v;
+            }
+            if let Some(v) = contracts.openapi {
+                self.contracts.openapi = v;
             }
         }
     }
@@ -537,6 +558,9 @@ mod tests {
         assert!(config.contracts.queue);
         assert!(config.contracts.websocket);
         assert!(config.contracts.job);
+        assert!(config.contracts.grpc);
+        assert!(config.contracts.graphql);
+        assert!(config.contracts.openapi);
     }
 
     #[test]
@@ -553,6 +577,38 @@ websocket = false
         assert!(!config.contracts.queue);
         assert!(!config.contracts.websocket);
         assert!(config.contracts.http);
+    }
+
+    #[test]
+    fn contracts_rpc_kinds_read_from_config_file() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[contracts]
+grpc = false
+graphql = false
+openapi = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(!config.contracts.grpc);
+        assert!(!config.contracts.graphql);
+        assert!(!config.contracts.openapi);
+    }
+
+    #[test]
+    fn contracts_rpc_kinds_partial_overlay_keeps_unset_defaults() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[contracts]
+grpc = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(!config.contracts.grpc);
+        assert!(config.contracts.graphql);
+        assert!(config.contracts.openapi);
     }
 
     #[test]

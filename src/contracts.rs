@@ -66,6 +66,12 @@ pub struct ContractOptions {
     pub websocket: bool,
     /// Scheduled and background job detection.
     pub job: bool,
+    /// gRPC IDL + generated-stub detection (RPC family, TASK-088).
+    pub grpc: bool,
+    /// GraphQL resolver + operation detection (TASK-088).
+    pub graphql: bool,
+    /// OpenAPI specification-document detection (TASK-088).
+    pub openapi: bool,
 }
 
 impl Default for ContractOptions {
@@ -76,6 +82,9 @@ impl Default for ContractOptions {
             queue: true,
             websocket: true,
             job: true,
+            grpc: true,
+            graphql: true,
+            openapi: true,
         }
     }
 }
@@ -89,6 +98,9 @@ impl ContractOptions {
             ContractKind::Queue => self.queue,
             ContractKind::WebSocket => self.websocket,
             ContractKind::Job => self.job,
+            ContractKind::Grpc => self.grpc,
+            ContractKind::Graphql => self.graphql,
+            ContractKind::Openapi => self.openapi,
         }
     }
 }
@@ -101,6 +113,9 @@ impl From<&crate::config::ContractsConfig> for ContractOptions {
             queue: cfg.queue,
             websocket: cfg.websocket,
             job: cfg.job,
+            grpc: cfg.grpc,
+            graphql: cfg.graphql,
+            openapi: cfg.openapi,
         }
     }
 }
@@ -118,7 +133,15 @@ pub fn extract_contracts(
     lang: Lang,
     opts: &ContractOptions,
 ) -> Vec<ContractCandidate> {
-    if !opts.http && !opts.env && !opts.queue && !opts.websocket && !opts.job {
+    if !opts.http
+        && !opts.env
+        && !opts.queue
+        && !opts.websocket
+        && !opts.job
+        && !opts.grpc
+        && !opts.graphql
+        && !opts.openapi
+    {
         return Vec::new();
     }
     let src = source.as_bytes();
@@ -4579,6 +4602,9 @@ mod tests {
         assert!(opts.enabled(ContractKind::Queue));
         assert!(opts.enabled(ContractKind::WebSocket));
         assert!(opts.enabled(ContractKind::Job));
+        assert!(opts.enabled(ContractKind::Grpc));
+        assert!(opts.enabled(ContractKind::Graphql));
+        assert!(opts.enabled(ContractKind::Openapi));
     }
 
     #[test]
@@ -4589,6 +4615,9 @@ mod tests {
             queue: false,
             websocket: true,
             job: false,
+            grpc: false,
+            graphql: true,
+            openapi: false,
         };
         let opts = ContractOptions::from(&cfg);
         assert!(opts.enabled(ContractKind::Http));
@@ -4596,6 +4625,9 @@ mod tests {
         assert!(!opts.enabled(ContractKind::Queue));
         assert!(opts.enabled(ContractKind::WebSocket));
         assert!(!opts.enabled(ContractKind::Job));
+        assert!(!opts.enabled(ContractKind::Grpc));
+        assert!(opts.enabled(ContractKind::Graphql));
+        assert!(!opts.enabled(ContractKind::Openapi));
     }
 
     #[test]
@@ -4617,6 +4649,9 @@ mod tests {
             queue: false,
             websocket: false,
             job: false,
+            grpc: false,
+            graphql: false,
+            openapi: false,
         };
         assert!(extract_with(Lang::JavaScript, src, &opts).is_empty());
     }
@@ -7717,6 +7752,9 @@ agenda.define('email-send', fn);
             queue: false,
             websocket: false,
             job: false,
+            grpc: false,
+            graphql: false,
+            openapi: false,
         };
         assert!(extract_with(Lang::JavaScript, src, &all_off).is_empty());
     }
