@@ -105,3 +105,14 @@
 - Graceful degradation: OllamaUnreachable -> stderr hint + None description
 - Description only at top level, not per-child in recursive traversal
 - Dead port pattern for testing: `http://127.0.0.1:19999/api/generate`
+
+## Query-time Provider Resolution (TASK-077)
+- `plan_query_provider(conn, kind)` in embedding.rs resolves ask/search/cluster/impact providers: unreachable ollama -> bundled fallback with `BUNDLED_FALLBACK_WARNING`; mismatched stored space -> `EmbeddingError::VectorSpaceMismatch` (Display carries re-embed command)
+- Pure core: `decide_query_provider(kind, healthy, &[StoredVectorSpace])` — exhaustive unit tests in embedding.rs tests
+- `fallback_after_disconnect` re-plans when ollama dies mid-query (healthy=false)
+- Offline seam for integration tests: env HTTP_PROXY=http://127.0.0.1:1 + NO_PROXY="" (ureq honors proxy env; kills localhost:11434 probes deterministically) — `offline_command()` in tests/ask_integration.rs
+- `StatusInfo` now has active_provider / stored_vector_provider / stored_vector_dim; `ollama_reachable` is `Option<bool>` (None = not probed, bundled-only users skip the 500ms probe)
+- `query_status_info(conn, configured_kind)` takes the configured kind; mcp.rs uses `embedding_provider_kind_for` helper
+- OLLAMA_REQUIRED_MSG retired -> OLLAMA_UNREACHABLE_MSG (names bundled re-embed alternative)
+- This machine (macOS arm64): cargo at /opt/homebrew/bin/cargo; PATH note in Build & Test above is for a different (Linux) host
+- watcher::tests FSEvents delivery tests are flaky in this sandbox on macOS too (4 tests fail at baseline, unrelated to changes)
