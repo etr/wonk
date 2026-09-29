@@ -548,4 +548,133 @@ mod tests {
         let results = vec![hit("a.rs", 1)];
         assert!(rerank_lexical(&conn, &results, "alpha", default_params()).is_none());
     }
+
+    // -- Benchmark (manual gate, run in release) ------------------------------
+
+    /// Measure the warm-query cost of `rerank_lexical` on the TASK-078-style
+    /// synthetic corpus (300 files x 150 lines, 500-word Zipf vocabulary,
+    /// seeded so every run measures the identical corpus). For each of five
+    /// literal patterns it reports the median of 30 timed runs for
+    /// `text_search` alone, `text_search` + rerank combined, and rerank only
+    /// (the delta). Manual acceptance gate (PRD-BM25-REQ-006): every
+    /// rerank-only median must stay below 10ms. No timing assertion — this is
+    /// a measurement harness:
+    /// `cargo test --release bench_bm25_warm_query_overhead -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_bm25_warm_query_overhead() {
+        use rand::SeedableRng;
+        use std::time::Instant;
+
+        fn zipf_pick(rng: &mut rand::rngs::StdRng, vocab_len: usize) -> usize {
+            use rand::Rng;
+            let u: f64 = rng.r#gen();
+            ((vocab_len as f64) * u * u).floor() as usize % vocab_len
+        }
+
+        fn write_bench_corpus(root: &std::path::Path) {
+            use std::fs;
+            fs::create_dir(root.join(".git")).unwrap();
+            fs::create_dir(root.join("src")).unwrap();
+
+            let mut rng = rand::rngs::StdRng::seed_from_u64(79);
+            let vocab: Vec<String> = (0..500).map(|i| format!("w{i}")).collect();
+            for file_idx in 0..300 {
+                let mut lines = vec![format!("fn w{file_idx}_entry() {{")];
+                while lines.len() < 150 {
+                    let picks: Vec<&str> = (0..6)
+                        .map(|_| vocab[zipf_pick(&mut rng, vocab.len())].as_str())
+                        .collect();
+                    lines.push(format!("    let value = {} + {};", picks[0], picks[1]));
+                    lines.push(format!(
+                        "    call_{}({}, {});",
+                        picks[2], picks[3], picks[4]
+                    ));
+                    if lines.len() >= 150 {
+                        break;
+                    }
+                    lines.push(format!("    // {} {} {}", picks[5], picks[0], picks[2]));
+                }
+                lines.push("}".to_string());
+                fs::write(
+                    root.join("src").join(format!("mod_{file_idx:03}.rs")),
+                    lines.join("\n"),
+                )
+                .unwrap();
+            }
+        }
+
+        fn median(durations: &mut Vec<std::time::Duration>) -> std::time::Duration {
+            durations.sort();
+            durations[durations.len() / 2]
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_bench_corpus(root);
+        crate::pipeline::build_index(root, true).unwrap();
+        let index_path = crate::db::find_existing_index(root).unwrap();
+        let conn = crate::db::open(&index_path).unwrap();
+
+        let root_str = root.display().to_string();
+        let patterns = [
+            ("frequent", "w0"),
+            ("frequent-2", "w1"),
+            ("rare", "w120"),
+            ("rarest", "w499"),
+            ("multi-term", "let value"),
+        ];
+        let params = default_params();
+        let runs = 30;
+
+        for (label, pattern) in patterns {
+            // Frozen candidate list: walker-relative so paths match
+            // term_stats.file keys, as in the router (cwd = repo root).
+            let mut candidates = crate::search::text_search(pattern, false, false, &[root_str.clone()])
+                .unwrap();
+            for result in &mut candidates {
+                if let Ok(rel) = result.file.strip_prefix(root) {
+                    result.file = rel.to_path_buf();
+                }
+            }
+
+            // Warm-up: first call pays statement preparation and page cache.
+            rerank_lexical(&conn, &candidates, pattern, params).unwrap();
+
+            let mut search_times = Vec::with_capacity(runs);
+            let mut combined_times = Vec::with_capacity(runs);
+            let mut rerank_times = Vec::with_capacity(runs);
+            for _ in 0..runs {
+                let start = Instant::now();
+                let mut found =
+                    crate::search::text_search(pattern, false, false, &[root_str.clone()]).unwrap();
+                let search_elapsed = start.elapsed();
+                for result in &mut found {
+                    if let Ok(rel) = result.file.strip_prefix(root) {
+                        result.file = rel.to_path_buf();
+                    }
+                }
+
+                let start = Instant::now();
+                rerank_lexical(&conn, &found, pattern, params).unwrap();
+                let rerank_elapsed = start.elapsed();
+
+                search_times.push(search_elapsed);
+                rerank_times.push(rerank_elapsed);
+                combined_times.push(search_elapsed + rerank_elapsed);
+            }
+
+            let search_median = median(&mut search_times);
+            let rerank_median = median(&mut rerank_times);
+            let combined_median = median(&mut combined_times);
+            let gate: std::time::Duration = std::time::Duration::from_millis(10);
+            println!(
+                "bench {label:<11} candidates={:<5} search={search_median:>9?} \
+                 combined={combined_median:>9?} rerank={rerank_median:>9?} \
+                 gate(<10ms): {}",
+                candidates.len(),
+                if rerank_median < gate { "PASS" } else { "FAIL" },
+            );
+        }
+    }
 }
