@@ -3523,12 +3523,12 @@ Create `contracts.rs` with the normalization core and the two highest-value cont
 Add the message-oriented contract kinds on top of the normalization core.
 
 **Action Items:**
-- [ ] Detect `queue` kind for Kafka, NATS, and RabbitMQ producers and consumers (PRD-CTR-REQ-001)
-- [ ] Detect `websocket` kind — emit sites as providers, handler registrations as consumers (PRD-CTR-REQ-001)
-- [ ] Detect `job` kind for scheduled and background job registrations (PRD-CTR-REQ-001)
-- [ ] Canonical IDs for topic names: trim, normalize separators, preserve namespace segments (PRD-CTR-REQ-002)
-- [ ] Confidence scoring — topic names are frequently string literals, so heuristic detections score 0.5 (PRD-CTR-REQ-004, AR-018)
-- [ ] Per-kind test matrix across the languages where each client library is idiomatic
+- [x] Detect `queue` kind for Kafka, NATS, and RabbitMQ producers and consumers (PRD-CTR-REQ-001)
+- [x] Detect `websocket` kind — emit sites as providers, handler registrations as consumers (PRD-CTR-REQ-001)
+- [x] Detect `job` kind for scheduled and background job registrations (PRD-CTR-REQ-001)
+- [x] Canonical IDs for topic names: trim, normalize separators, preserve namespace segments (PRD-CTR-REQ-002)
+- [x] Confidence scoring — topic names are frequently string literals, so heuristic detections score 0.5 (PRD-CTR-REQ-004, AR-018)
+- [x] Per-kind test matrix across the languages where each client library is idiomatic
 
 **Dependencies:**
 - Blocked by: TASK-082
@@ -3543,7 +3543,7 @@ Add the message-oriented contract kinds on top of the normalization core.
 **Related Requirements:** PRD-CTR-REQ-001, PRD-CTR-REQ-002, PRD-CTR-REQ-004
 **Related Decisions:** DR-031
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
