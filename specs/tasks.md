@@ -44,7 +44,7 @@
 | M24 | Unified Symbol Context (`wonk context`) | 1 | Complete |
 | M25 | Multi-Repo MCP | 1 | Complete |
 | M26 | Bundled Embedding Provider | 3 | Complete |
-| M27 | Lexical BM25 Scoring | 2 | In Progress |
+| M27 | Lexical BM25 Scoring | 2 | Complete |
 | M28 | Precomputed Reach Index | 2 | Not Started |
 | M29 | Cross-Repo Contract Detection | 5 | Not Started |
 | M30 | Diff-Scoped Review Workflow | 3 | Not Started |
@@ -3353,12 +3353,12 @@ Compute and persist the per-term document statistics BM25 needs, maintained incr
 Re-rank lexical candidates by BM25 and feed the resulting ranked list into the existing RRF fusion.
 
 **Action Items:**
-- [ ] Implement BM25 scoring over the grep candidate set — re-rank, do not re-retrieve (PRD-BM25-REQ-002)
-- [ ] Add `search.bm25_k1` (default 1.2) and `search.bm25_b` (default 0.75) config keys (PRD-BM25-REQ-003)
-- [ ] Supply the BM25-ranked list as the lexical input to `ranker.rs::fuse_rrf()` — fusion algorithm unchanged (PRD-BM25-REQ-004)
-- [ ] Detect missing `term_stats` and fall back to V4 ranking with a re-index hint (PRD-BM25-REQ-006)
-- [ ] Build a ranking regression suite with a fixed query set and expected top-10 (AR-024)
-- [ ] Benchmark: BM25 adds < 10ms to warm queries
+- [x] Implement BM25 scoring over the grep candidate set — re-rank, do not re-retrieve (PRD-BM25-REQ-002)
+- [x] Add `search.bm25_k1` (default 1.2) and `search.bm25_b` (default 0.75) config keys (PRD-BM25-REQ-003)
+- [x] Supply the BM25-ranked list as the lexical input to `ranker.rs::fuse_rrf()` — fusion algorithm unchanged (PRD-BM25-REQ-004)
+- [x] Detect missing `term_stats` and fall back to V4 ranking with a re-index hint (PRD-BM25-REQ-006)
+- [x] Build a ranking regression suite with a fixed query set and expected top-10 (AR-024)
+- [x] Benchmark: BM25 adds < 10ms to warm queries
 
 **Dependencies:**
 - Blocked by: TASK-078, TASK-068
@@ -3374,7 +3374,7 @@ Re-rank lexical candidates by BM25 and feed the resulting ranked list into the e
 **Related Requirements:** PRD-BM25-REQ-002, PRD-BM25-REQ-003, PRD-BM25-REQ-004, PRD-BM25-REQ-006
 **Related Decisions:** DR-033, DR-027
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
