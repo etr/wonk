@@ -1802,6 +1802,9 @@ impl<'a> Extractor<'a> {
         let Some(modifiers) = node.named_child(0).filter(|n| n.kind() == "modifiers") else {
             return;
         };
+        let owning = node
+            .child_by_field_name("name")
+            .map(|n| node_text(Some(n), self.src).to_string());
         let mut verb: Option<String> = None;
         let mut path: Option<Node> = None;
         for i in 0..modifiers.named_child_count() {
@@ -1810,6 +1813,48 @@ impl<'a> Extractor<'a> {
             };
             let name = node_text(annot.child_by_field_name("name"), self.src);
             let args = annot.child_by_field_name("arguments");
+            // Queue listener registrations (TASK-087, DR-031: registering
+            // the handler is the provider side).
+            if let Some(args) = args {
+                match name {
+                    "KafkaListener" => {
+                        if let Some(topics) = java_annotation_kwarg_node(args, "topics", self.src) {
+                            for lit in java_string_literals(topics) {
+                                if let Some(raw) = self.topic_arg(lit) {
+                                    self.emit_queue(
+                                        annot,
+                                        lit,
+                                        &raw,
+                                        ContractRole::Provider,
+                                        "kafka",
+                                        CONFIDENCE_FRAMEWORK,
+                                        owning.as_deref(),
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    "RabbitListener" => {
+                        if let Some(queues) = java_annotation_kwarg_node(args, "queues", self.src)
+                            && let Some(lit) = java_string_literals(queues).into_iter().next()
+                            && let Some(raw) = self.topic_arg(lit)
+                        {
+                            self.emit_queue(
+                                annot,
+                                lit,
+                                &raw,
+                                ContractRole::Provider,
+                                "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                owning.as_deref(),
+                            );
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             match name {
                 "GetMapping" | "PostMapping" | "PutMapping" | "DeleteMapping" | "PatchMapping" => {
                     verb = Some(
@@ -1855,9 +1900,6 @@ impl<'a> Extractor<'a> {
             }
         }
         if let (Some(verb), Some(path)) = (verb, path) {
-            let owning = node
-                .child_by_field_name("name")
-                .map(|n| node_text(Some(n), self.src).to_string());
             self.emit_http(
                 node,
                 path,
@@ -1870,7 +1912,8 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// `restTemplate.getForObject(…)`, `System.getenv(…)`.
+    /// `restTemplate.getForObject(…)`, `System.getenv(…)`, and the queue
+    /// template producers (TASK-087).
     fn java_call(&mut self, node: Node, prefix: &str) {
         let name = node_text(node.child_by_field_name("name"), self.src);
         let object = node_text(node.child_by_field_name("object"), self.src);
@@ -1881,6 +1924,43 @@ impl<'a> Extractor<'a> {
             if let Some(arg) = first {
                 let value = render_string_node(arg, self.src, self.lang);
                 self.emit_env(node, &value, ContractRole::Consumer, CONFIDENCE_FRAMEWORK);
+            }
+            return;
+        }
+        // Queue template producers (DR-031: publishing initiates, so these
+        // are the consumer side).
+        let object_lower = object.to_lowercase();
+        if object_lower.contains("kafka") && name == "send" {
+            if let Some(t) = first
+                && let Some(raw) = self.topic_arg(t)
+            {
+                self.emit_queue(
+                    node,
+                    t,
+                    &raw,
+                    ContractRole::Consumer,
+                    "kafka",
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
+            }
+            return;
+        }
+        if object_lower.contains("rabbit") && matches!(name, "send" | "convertAndSend") {
+            // The routing key is the last leading string literal — the
+            // argument just before the non-literal payload.
+            if let Some(t) = java_last_leading_string(args)
+                && let Some(raw) = self.topic_arg(t)
+            {
+                self.emit_queue(
+                    node,
+                    t,
+                    &raw,
+                    ContractRole::Consumer,
+                    "rabbitmq",
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
             }
             return;
         }
@@ -2783,6 +2863,51 @@ fn java_annotation_kwarg_text(args: Node, name: &str, src: &[u8]) -> Option<Stri
         }
     }
     None
+}
+
+/// Value node of a Java annotation keyword argument.
+fn java_annotation_kwarg_node<'t>(args: Node<'t>, name: &str, src: &[u8]) -> Option<Node<'t>> {
+    for i in 0..args.named_child_count() {
+        if let Some(pair) = args.named_child(i as u32)
+            && pair.kind() == "element_value_pair"
+            && node_text(pair.child_by_field_name("key"), src) == name
+            && let Some(value) = pair.child_by_field_name("value")
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// String literals carried by an annotation value node: the node itself
+/// when it is a literal, or every element when it is an array initializer.
+fn java_string_literals(value: Node) -> Vec<Node> {
+    match value.kind() {
+        "string_literal" => vec![value],
+        "element_value_array_initializer" => (0..value.named_child_count())
+            .filter_map(|i| value.named_child(i as u32))
+            .filter(|n| n.kind() == "string_literal")
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Last string literal among the call's leading arguments — the routing
+/// key sits directly before the non-literal payload
+/// (`convertAndSend(exchange, routingKey, payload)`).
+fn java_last_leading_string(args: Node) -> Option<Node> {
+    let mut last = None;
+    for j in 0..args.named_child_count() {
+        let Some(arg) = args.named_child(j as u32).map(unwrap_argument) else {
+            break;
+        };
+        if arg.kind() == "string_literal" {
+            last = Some(arg);
+        } else {
+            break;
+        }
+    }
+    last
 }
 
 /// Java RestTemplate-style client method verbs.
@@ -4795,6 +4920,81 @@ class Client {
 ";
         let cands = extract(Lang::Java, src);
         let c = find(&cands, "env::::DATABASE_URL").expect("env not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    // -- walker: queue, Java (TASK-087 step 5) ---------------------------------
+
+    #[test]
+    fn java_kafka_listener_topics_string() {
+        let src = "\
+@Component
+class Orders {
+    @KafkaListener(topics = \"orders.created\")
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::kafka::orders.created");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("handle"));
+    }
+
+    #[test]
+    fn java_kafka_listener_topics_array_emits_per_element() {
+        let src = "\
+class Orders {
+    @KafkaListener(topics = {\"a.created\", \"b.created\"})
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "queue::kafka::a.created").is_some());
+        assert!(find(&cands, "queue::kafka::b.created").is_some());
+    }
+
+    #[test]
+    fn java_rabbit_listener_queues() {
+        let src = "\
+class Orders {
+    @RabbitListener(queues = \"orders.created\")
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn java_kafka_template_send() {
+        let src = "void publish() {\n    kafkaTemplate.send(\"orders.created\", key, value);\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("publish"));
+    }
+
+    #[test]
+    fn java_rabbit_template_convert_and_send() {
+        let src = "void publish() {\n    rabbitTemplate.convertAndSend(\"ex\", \"orders.created\", payload);\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn java_rabbit_template_send() {
+        let src = "void publish() {\n    rabbitTemplate.send(\"orders.created\", msg);\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
         assert_eq!(c.role, ContractRole::Consumer);
     }
 
