@@ -590,6 +590,43 @@ fn unwrap_argument(node: Node) -> Node {
     node
 }
 
+/// Celery task decorator: bare `@app.task` (attribute form, no parens)
+/// or call form `@app.task(...)` / `@shared_task(...)`. Returns the job
+/// name and the node that carries it — the `name=` literal when given,
+/// the decorated function's name otherwise.
+fn py_job_decorator<'a>(
+    dec: Node<'a>,
+    def_name: Option<Node<'a>>,
+    src: &[u8],
+) -> Option<(String, Node<'a>)> {
+    let target = dec.named_child(0)?;
+    let is_task = match target.kind() {
+        // Bare @app.task (attribute) and bare @shared_task (identifier).
+        "attribute" => node_text(target.child_by_field_name("attribute"), src) == "task",
+        "identifier" => node_text(Some(target), src) == "shared_task",
+        "call" => {
+            let func = target.child_by_field_name("function")?;
+            match func.kind() {
+                "attribute" => node_text(func.child_by_field_name("attribute"), src) == "task",
+                "identifier" => node_text(Some(func), src) == "shared_task",
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if !is_task {
+        return None;
+    }
+    if let Some(args) = target.child_by_field_name("arguments")
+        && let Some(lit) = kwarg_string_node(args, "name", src)
+        && let Some(name) = py_string_content(lit, src)
+    {
+        return Some((name, lit));
+    }
+    let def_name = def_name?;
+    Some((node_text(Some(def_name), src).to_string(), def_name))
+}
+
 /// String value of a keyword argument, if it is a string literal.
 fn kwarg_string(args: Node, name: &str, src: &[u8]) -> Option<String> {
     for j in 0..args.named_child_count() {
@@ -833,6 +870,7 @@ impl<'a> Extractor<'a> {
                     // and the ambiguous HTTP arm (TASK-087 guard order:
                     // websocket receivers, then queue, then HTTP 0.5).
                     self.js_message_call(node, func, recv, prop, args);
+                    self.js_job_call(node, recv, prop, args);
                     if AMBIGUOUS_VERBS.contains(&prop)
                         && !self.ctx.is_router_var(recv)
                         && !JS_ROUTER_VARS.contains(&recv)
@@ -923,6 +961,68 @@ impl<'a> Extractor<'a> {
                     self.js_queue_call(node, recv, prop, args);
                 }
             }
+        }
+    }
+
+    /// Job matchers (TASK-087 step 7): cron/agenda registrations are
+    /// providers — named by the callback when it is an identifier, else by
+    /// the enclosing function; BullMQ-style queue adds are 0.5 consumers
+    /// (generic `add` verb).
+    fn js_job_call(&mut self, node: Node, recv: &str, prop: &str, args: Node) {
+        let recv_lower = recv.to_lowercase();
+        let first = positional_arg(args, 0);
+        match prop {
+            "schedule" if recv == "cron" || recv_lower.contains("cron") => {
+                let (name, name_node) =
+                    match positional_arg(args, 1).filter(|cb| cb.kind() == "identifier") {
+                        Some(cb) => (node_text(Some(cb), self.src).to_string(), cb),
+                        None => {
+                            let Some(own) =
+                                crate::indexer::find_enclosing_function(node, self.src, self.lang)
+                            else {
+                                return;
+                            };
+                            (own, node)
+                        }
+                    };
+                self.emit_job(
+                    node,
+                    name_node,
+                    &name,
+                    ContractRole::Provider,
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
+            }
+            "define" if recv_lower.contains("agenda") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_job(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            "add" if recv == "q" || recv_lower.contains("queue") || recv_lower.contains("bull") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_job(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        CONFIDENCE_HEURISTIC,
+                        None,
+                    );
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1094,15 +1194,28 @@ impl<'a> Extractor<'a> {
 
     /// `@app.get('/x')` / `@app.route('/x', methods=['POST'])` decorators.
     fn py_decorated(&mut self, node: Node, prefix: &str) -> String {
-        let owning = node
+        let def_name = node
             .child_by_field_name("definition")
-            .and_then(|def| def.child_by_field_name("name"))
-            .map(|n| node_text(Some(n), self.src).to_string());
+            .and_then(|def| def.child_by_field_name("name"));
+        let owning = def_name.map(|n| node_text(Some(n), self.src).to_string());
         for i in 0..node.child_count() {
             let Some(dec) = node.child(i as u32) else {
                 continue;
             };
             if dec.kind() != "decorator" {
+                continue;
+            }
+            // TASK-087 job: @app.task / @app.task(name=…) / @shared_task.
+            // `name=` wins; otherwise the decorated function names the job.
+            if let Some((job_name, name_node)) = py_job_decorator(dec, def_name, self.src) {
+                self.emit_job(
+                    dec,
+                    name_node,
+                    &job_name,
+                    ContractRole::Provider,
+                    CONFIDENCE_FRAMEWORK,
+                    owning.as_deref(),
+                );
                 continue;
             }
             let Some(call) = dec.named_child(0) else {
@@ -1144,6 +1257,10 @@ impl<'a> Extractor<'a> {
         prefix.to_string()
     }
 
+    /// Celery task decorator: bare `@app.task` (attribute form, no parens)
+    /// or call form `@app.task(...)` / `@shared_task(...)`. Returns the job
+    /// name and the node that carries it — the `name=` literal when given,
+    /// the decorated function's name otherwise.
     /// Consumer calls, Falcon `add_route`, and env accessors.
     fn py_call(&mut self, node: Node, prefix: &str) {
         let func = node.child_by_field_name("function");
@@ -1278,6 +1395,65 @@ impl<'a> Extractor<'a> {
                                 None,
                             );
                         }
+                    }
+                    // -- job (TASK-087 step 7) ---------------------------------
+                    // task_fn.delay()/apply_async(): the receiver is the
+                    // task, so a simple-identifier receiver is required.
+                    (_, "delay") | (_, "apply_async") => {
+                        if let Some(recv_node) = func
+                            .child_by_field_name("object")
+                            .filter(|n| n.kind() == "identifier")
+                        {
+                            let name = node_text(Some(recv_node), self.src).to_string();
+                            self.emit_job(
+                                node,
+                                recv_node,
+                                &name,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // celery_app.send_task('orders.sync', …) — dispatch by
+                    // name.
+                    (_, "send_task") => {
+                        if let Some(t) = first
+                            && let Some(raw) = self.topic_arg(t)
+                        {
+                            self.emit_job(
+                                node,
+                                t,
+                                &raw,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
+                    // scheduler.add_job(fn, …): the function (or the
+                    // enclosing one) names the schedule.
+                    (_, "add_job") if recv.to_lowercase().contains("sched") => {
+                        let target = positional_arg(args, 0).filter(|n| n.kind() == "identifier");
+                        let (name, name_node) = match target {
+                            Some(id) => (node_text(Some(id), self.src).to_string(), id),
+                            None => {
+                                let Some(own) = crate::indexer::find_enclosing_function(
+                                    node, self.src, self.lang,
+                                ) else {
+                                    return;
+                                };
+                                (own, node)
+                            }
+                        };
+                        self.emit_job(
+                            node,
+                            name_node,
+                            &name,
+                            ContractRole::Provider,
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
                     }
                     // Generic tier: send/subscribe with a string literal at
                     // 0.5, broker token from the receiver name. The
@@ -1427,11 +1603,41 @@ impl<'a> Extractor<'a> {
     fn visit_ruby(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "call" => return self.ruby_call(node, prefix),
+            "class" => self.ruby_class_job(node),
             "element_reference" => self.ruby_env_ref(node),
             "assignment" => self.ruby_env_assign(node),
             _ => {}
         }
         prefix.to_string()
+    }
+
+    /// TASK-087 job: a class that includes Sidekiq::Job/Sidekiq::Worker or
+    /// subclasses ApplicationJob defines a background job named after the
+    /// class.
+    fn ruby_class_job(&mut self, node: Node) {
+        let Some(name_node) = node.named_child(0).filter(|n| n.kind() == "constant") else {
+            return;
+        };
+        let is_active_job = (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i as u32))
+            .find(|n| n.kind() == "superclass")
+            .and_then(|s| s.named_child(0))
+            .is_some_and(|c| node_text(Some(c), self.src) == "ApplicationJob");
+        let is_sidekiq = (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i as u32))
+            .find(|n| n.kind() == "body_statement")
+            .is_some_and(|body| ruby_includes_sidekiq(body, self.src));
+        if is_active_job || is_sidekiq {
+            let name = node_text(Some(name_node), self.src).to_string();
+            self.emit_job(
+                node,
+                name_node,
+                &name,
+                ContractRole::Provider,
+                CONFIDENCE_FRAMEWORK,
+                None,
+            );
+        }
     }
 
     /// Sinatra `get '/x' do`, Rails `get '/x', to: …` / `match`, client
@@ -1512,6 +1718,24 @@ impl<'a> Extractor<'a> {
                                 CONFIDENCE_FRAMEWORK,
                             );
                         }
+                    }
+                    // TASK-087 job: Worker.perform_async / perform_in /
+                    // perform_at (Sidekiq) and Job.perform_later (ActiveJob)
+                    // enqueue — constant receiver names the job class.
+                    _ if matches!(
+                        method,
+                        "perform_async" | "perform_in" | "perform_at" | "perform_later"
+                    ) && recv.kind() == "constant" =>
+                    {
+                        let name = node_text(Some(recv), self.src).to_string();
+                        self.emit_job(
+                            node,
+                            recv,
+                            &name,
+                            ContractRole::Consumer,
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
                     }
                     // TASK-087 queue: Bunny publish(payload, routing_key: …)
                     // is a 1.0 consumer; a plain string first argument falls
@@ -1791,6 +2015,30 @@ impl<'a> Extractor<'a> {
                         None,
                     );
                 }
+            }
+            // TASK-087 job: robfig/cron c.AddFunc(spec, fn)/AddJob — the
+            // scheduled function names the job, else the enclosing one.
+            (_, "AddFunc") | (_, "AddJob") => {
+                let (name, name_node) =
+                    match positional_arg(args, 1).filter(|n| n.kind() == "identifier") {
+                        Some(id) => (node_text(Some(id), self.src).to_string(), id),
+                        None => {
+                            let Some(own) =
+                                crate::indexer::find_enclosing_function(node, self.src, self.lang)
+                            else {
+                                return;
+                            };
+                            (own, node)
+                        }
+                    };
+                self.emit_job(
+                    node,
+                    name_node,
+                    &name,
+                    ContractRole::Provider,
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
             }
             _ => {
                 if let Some(verb) = go_client_verb(recv, meth)
@@ -2219,6 +2467,22 @@ impl<'a> Extractor<'a> {
                                 annot,
                                 lit,
                                 &raw,
+                                ContractRole::Provider,
+                                CONFIDENCE_FRAMEWORK,
+                                owning.as_deref(),
+                            );
+                        }
+                        continue;
+                    }
+                    // TASK-087 job: @Scheduled — the method is the job;
+                    // the cron expression is a schedule, not an identity.
+                    "Scheduled" => {
+                        if let Some(name_node) = node.child_by_field_name("name") {
+                            let name = node_text(Some(name_node), self.src).to_string();
+                            self.emit_job(
+                                annot,
+                                name_node,
+                                &name,
                                 ContractRole::Provider,
                                 CONFIDENCE_FRAMEWORK,
                                 owning.as_deref(),
@@ -3017,6 +3281,33 @@ impl<'a> Extractor<'a> {
         );
     }
 
+    /// Record a job contract (TASK-087 step 7). Definitions and schedule
+    /// registrations are providers; enqueue/dispatch sites are consumers.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_job(
+        &mut self,
+        node: Node,
+        name_node: Node,
+        name: &str,
+        role: ContractRole,
+        confidence: f64,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.job {
+            return;
+        }
+        self.push_message(
+            ContractKind::Job,
+            "",
+            node,
+            name_node,
+            name,
+            role,
+            confidence,
+            owning,
+        );
+    }
+
     /// Record a websocket contract identified by an HTTP path
     /// (express-ws `app.ws('/chat', …)`): the identifier is a normalized
     /// path, not a topic.
@@ -3534,6 +3825,23 @@ fn render_string_node(node: Node, src: &[u8], lang: Lang) -> String {
 /// Ruby string content with `#{x}` interpolations preserved.
 fn ruby_string_content(node: Node, src: &[u8]) -> String {
     render_string_node(node, src, Lang::Ruby)
+}
+
+/// Whether a class body directly includes Sidekiq::Job / Sidekiq::Worker.
+fn ruby_includes_sidekiq(body: Node, src: &[u8]) -> bool {
+    (0..body.named_child_count())
+        .filter_map(|i| body.named_child(i as u32))
+        .any(|n| {
+            n.kind() == "call"
+                && node_text(n.child_by_field_name("method"), src) == "include"
+                && n.child_by_field_name("arguments").is_some_and(|args| {
+                    (0..args.named_child_count()).any(|i| {
+                        args.named_child(i as u32).is_some_and(|a| {
+                            matches!(node_text(Some(a), src), "Sidekiq::Job" | "Sidekiq::Worker")
+                        })
+                    })
+                })
+        })
 }
 
 /// `key: 'value'` keyword argument of a Ruby call: the pair's value node
@@ -5807,6 +6115,213 @@ class Orders {
         let c = find(&cands, "websocket::::topic.orders").expect("contract not found");
         assert_eq!(c.role, ContractRole::Provider);
         assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    // -- walker: job (TASK-087 step 7) -----------------------------------------
+
+    #[test]
+    fn py_celery_task_decorator() {
+        let src = "@app.task\ndef sync_orders():\n    pass\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.kind, ContractKind::Job);
+        assert_eq!(c.canonical_id, "job::::sync_orders");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("sync_orders"));
+    }
+
+    #[test]
+    fn py_celery_task_name_kwarg() {
+        let src = "@app.task(name='orders.sync')\ndef sync():\n    pass\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::orders.sync").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("sync"));
+    }
+
+    #[test]
+    fn py_shared_task_decorator() {
+        let src = "@shared_task\ndef sync():\n    pass\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::sync").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn py_celery_delay_consumer() {
+        let src = "def enqueue(order):\n    sync_orders.delay(order)\n";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::sync_orders");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("enqueue"));
+    }
+
+    #[test]
+    fn py_celery_apply_async_consumer() {
+        let src = "def enqueue():\n    sync_orders.apply_async(kwargs={'o': 1})\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::sync_orders").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn py_send_task_consumer() {
+        let src = "def enqueue():\n    celery_app.send_task('orders.sync', args=[1])\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::orders.sync").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn py_apscheduler_add_job() {
+        let src = "def setup():\n    scheduler.add_job(sync_orders, trigger='interval')\n";
+        let cands = extract(Lang::Python, src);
+        let c = find(&cands, "job::::sync_orders").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_sidekiq_job_class() {
+        let src = "class EmailWorker\n  include Sidekiq::Job\n\n  def perform(id)\n  end\nend\n";
+        let cands = extract(Lang::Ruby, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::EmailWorker");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_sidekiq_worker_module() {
+        let src = "class CleanupWorker\n  include Sidekiq::Worker\nend\n";
+        let cands = extract(Lang::Ruby, src);
+        let c = find(&cands, "job::::CleanupWorker").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn ruby_application_job_superclass() {
+        let src = "class NotifyJob < ApplicationJob\n  def perform(user)\n  end\nend\n";
+        let cands = extract(Lang::Ruby, src);
+        let c = find(&cands, "job::::NotifyJob").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn ruby_sidekiq_perform_async_consumer() {
+        let cands = extract(Lang::Ruby, "EmailWorker.perform_async(1, 2)");
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "job::::EmailWorker");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+        assert_eq!(cands[0].confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn ruby_active_job_perform_later_consumer() {
+        let cands = extract(Lang::Ruby, "NotifyJob.perform_later(user)");
+        let c = find(&cands, "job::::NotifyJob").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn java_scheduled_fixed_rate() {
+        let src = "\
+class Poller {
+    @Scheduled(fixedRate = 5000)
+    public void pollOrders() {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::pollOrders");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("pollOrders"));
+    }
+
+    #[test]
+    fn java_scheduled_cron_expression_is_not_identity() {
+        let src = "\
+class Poller {
+    @Scheduled(cron = \"0 0 * * * *\")
+    public void cleanup() {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "job::::cleanup").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.line, 3, "job line follows the method name");
+    }
+
+    #[test]
+    fn js_cron_schedule_callback_name() {
+        let src = "cron.schedule('*/5 * * * *', fireTick);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::fireTick");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn js_cron_schedule_inline_callback_uses_owning() {
+        let src = "function poll() {\n  cron.schedule(spec, () => run());\n}\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "job::::poll").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_agenda_define() {
+        let src = "agenda.define('email-send', handler);\n";
+        let cands = extract(Lang::JavaScript, src);
+        let c = find(&cands, "job::::email-send").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn js_bullmq_queue_add_heuristic() {
+        let src = "emailQueue.add('email-send', data);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "job::::email-send");
+        assert_eq!(cands[0].role, ContractRole::Consumer);
+        assert_eq!(cands[0].confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn js_cart_add_is_not_a_job() {
+        let cands = extract(Lang::JavaScript, "cart.add('item');");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn go_cron_add_func() {
+        let src = "package main\n\nfunc setup() {\n\tc.AddFunc(\"*/5 * * * * *\", pollOrders)\n}\n";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "job::::pollOrders");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn go_cron_add_job() {
+        let src = "package main\n\nfunc setup() {\n\tc.AddJob(spec, nightlyJob)\n}\n";
+        let cands = extract(Lang::Go, src);
+        let c = find(&cands, "job::::nightlyJob").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
     }
 
     // -- walker: PHP (step 6) ----------------------------------------------------
