@@ -41,9 +41,48 @@ pub fn canonical_contract_id(kind: ContractKind, qualifier: &str, identifier: &s
     format!("{}::{}::{}", kind.as_str(), qualifier, identifier)
 }
 
+/// Normalize an HTTP method token: upper-case, with router catch-alls
+/// (`any`, `all`, `match`) and unknown/empty verbs mapped to `ANY`.
+///
+/// Django `path()` registrations and bare `HandleFunc` mounts pass an empty
+/// verb and normalize to `ANY` here.
+pub fn normalize_method(raw: &str) -> String {
+    let upper = raw.trim().to_uppercase();
+    match upper.as_str() {
+        "" | "ANY" | "ALL" | "MATCH" => "ANY".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_uppercases_raw_verb() {
+        assert_eq!(normalize_method("get"), "GET");
+        assert_eq!(normalize_method("GET"), "GET");
+        assert_eq!(normalize_method("Delete"), "DELETE");
+        assert_eq!(normalize_method("patch"), "PATCH");
+    }
+
+    #[test]
+    fn method_catchalls_map_to_any() {
+        assert_eq!(normalize_method("any"), "ANY");
+        assert_eq!(normalize_method("ALL"), "ANY");
+        assert_eq!(normalize_method("match"), "ANY");
+        assert_eq!(normalize_method("Any"), "ANY");
+    }
+
+    #[test]
+    fn method_empty_maps_to_any() {
+        assert_eq!(normalize_method(""), "ANY");
+    }
+
+    #[test]
+    fn method_nonverb_still_uppercases() {
+        assert_eq!(normalize_method("NewRequest"), "NEWREQUEST");
+    }
 
     #[test]
     fn canonical_http() {
