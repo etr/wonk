@@ -1,5 +1,6 @@
-//! Contract extraction: canonical ID normalization plus the `http` and `env`
-//! contract kinds (TASK-082, PRD-CTR-REQ-001..004).
+//! Contract extraction: canonical ID normalization plus the `http`, `env`,
+//! `queue`, `websocket`, and `job` contract kinds (TASK-082, TASK-087,
+//! PRD-CTR-REQ-001..004).
 //!
 //! Contracts are detected by walking the tree-sitter tree that the symbol
 //! indexer already parsed — no second parse or file read (PRD-CTR-REQ-011).
@@ -11,6 +12,30 @@
 //! - [`normalize_http_path`] runs a fixed 6-stage pipeline (PRD-CTR-REQ-003).
 //! - [`normalize_method`] upper-cases verbs and maps router catch-alls to
 //!   `ANY`.
+//! - [`normalize_topic`] normalizes queue/websocket/job names; unlike the
+//!   HTTP pipeline it REJECTS computed topics outright (`None`), because
+//!   exact-ID matching is the only pairing mechanism for the message kinds.
+//!
+//! Role mappings are PER SPEC and deliberately inverted between kinds —
+//! do not "fix" one to match the other:
+//! - **queue (DR-031):** provider = the construct that registers a handler
+//!   (subscriber, `@KafkaListener`, `ch.consume`), consumer = the code that
+//!   initiates by publishing (`producer.send`, `ch.publish`). The reader of
+//!   a topic serves it; the writer calls on it.
+//! - **websocket:** provider = emit sites (`io.emit`, `@SendTo`), consumer =
+//!   handler registrations (`socket.on`, `@MessageMapping`, `app.ws`). Here
+//!   the writer serves and the reader subscribes — the mirror image of the
+//!   queue rule, per the TASK-087 specification.
+//!
+//! RabbitMQ note: producers address exchange+routing-key while consumers
+//! address queue names; the binding between them is broker config and
+//! invisible to static analysis. Pairing therefore relies on aligned names
+//! (topic-exchange convention); the Ruby `channel.queue` binding pre-pass
+//! closes part of the gap where the queue name is declared inline.
+//!
+//! Verb collisions (`send`/`emit`) resolve by guard order: websocket
+//! receivers first, then the queue generic arms, and the ambiguous HTTP
+//! arm last behind its `is_path_like` gate.
 
 use std::collections::HashMap;
 
@@ -833,9 +858,71 @@ impl<'a> Extractor<'a> {
 
     /// Queue (TASK-087) and websocket call matchers for JS/TS. Runs after
     /// the HTTP arms so verb collisions resolve by guard order.
+    /// Websocket (TASK-087 step 6) and queue call matchers for JS/TS.
+    /// Websocket receivers win the send/emit collisions; queue generic
+    /// arms see only non-ws receivers; a generic `.emit` on an unknown
+    /// receiver is a 0.5 websocket provider; generic `.on` never fires
+    /// (EventEmitter flood).
     fn js_message_call(&mut self, node: Node, func: Node, recv: &str, prop: &str, args: Node) {
-        if self.opts.queue && !self.is_ws_receiver(func) {
-            self.js_queue_call(node, recv, prop, args);
+        let ws_receiver = self.is_ws_receiver(func);
+        let first = positional_arg(args, 0);
+        match prop {
+            _ if ws_receiver && matches!(prop, "emit" | "send") => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_ws(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            _ if ws_receiver && prop == "on" => {
+                // A registration carries an event name and a handler.
+                if args.named_child_count() >= 2
+                    && let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_ws(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Consumer,
+                        CONFIDENCE_FRAMEWORK,
+                        None,
+                    );
+                }
+            }
+            // express-ws: app.ws('/path', handler) — path-identified
+            // consumer; pair-inert (its provider is io connections).
+            "ws" if self.ctx.is_router_var(recv) || JS_ROUTER_VARS.contains(&recv) => {
+                if let Some(t) = first {
+                    self.emit_ws_path(node, t, ContractRole::Consumer);
+                }
+            }
+            "emit" => {
+                if let Some(t) = first
+                    && let Some(raw) = self.topic_arg(t)
+                {
+                    self.emit_ws(
+                        node,
+                        t,
+                        &raw,
+                        ContractRole::Provider,
+                        CONFIDENCE_HEURISTIC,
+                        None,
+                    );
+                }
+            }
+            _ => {
+                if !ws_receiver {
+                    self.js_queue_call(node, recv, prop, args);
+                }
+            }
         }
     }
 
@@ -2070,7 +2157,8 @@ impl<'a> Extractor<'a> {
             let name = node_text(annot.child_by_field_name("name"), self.src);
             let args = annot.child_by_field_name("arguments");
             // Queue listener registrations (TASK-087, DR-031: registering
-            // the handler is the provider side).
+            // the handler is the provider side) and websocket annotations
+            // (emit = provider, handler registration = consumer).
             if let Some(args) = args {
                 match name {
                     "KafkaListener" => {
@@ -2102,6 +2190,36 @@ impl<'a> Extractor<'a> {
                                 &raw,
                                 ContractRole::Provider,
                                 "rabbitmq",
+                                CONFIDENCE_FRAMEWORK,
+                                owning.as_deref(),
+                            );
+                        }
+                        continue;
+                    }
+                    "MessageMapping" => {
+                        if let Some(lit) = positional_arg(args, 0)
+                            && let Some(raw) = self.topic_arg(lit)
+                        {
+                            self.emit_ws(
+                                annot,
+                                lit,
+                                &raw,
+                                ContractRole::Consumer,
+                                CONFIDENCE_FRAMEWORK,
+                                owning.as_deref(),
+                            );
+                        }
+                        continue;
+                    }
+                    "SendTo" => {
+                        if let Some(lit) = positional_arg(args, 0)
+                            && let Some(raw) = self.topic_arg(lit)
+                        {
+                            self.emit_ws(
+                                annot,
+                                lit,
+                                &raw,
+                                ContractRole::Provider,
                                 CONFIDENCE_FRAMEWORK,
                                 owning.as_deref(),
                             );
@@ -2214,6 +2332,24 @@ impl<'a> Extractor<'a> {
                     &raw,
                     ContractRole::Consumer,
                     "rabbitmq",
+                    CONFIDENCE_FRAMEWORK,
+                    None,
+                );
+            }
+            return;
+        }
+        // STOMP/Simp messaging templates emit to websocket destinations
+        // (checked after the rabbit arm — `rabbitTemplate` also contains
+        // "Template").
+        if object.contains("Template") && name == "convertAndSend" {
+            if let Some(t) = first
+                && let Some(raw) = self.topic_arg(t)
+            {
+                self.emit_ws(
+                    node,
+                    t,
+                    &raw,
+                    ContractRole::Provider,
                     CONFIDENCE_FRAMEWORK,
                     None,
                 );
@@ -2850,6 +2986,61 @@ impl<'a> Extractor<'a> {
             confidence,
             owning,
         );
+    }
+
+    /// Record a websocket contract from a call site (TASK-087 step 6).
+    ///
+    /// `raw` is the rendered event-name literal; `name_node` is the
+    /// argument that carries it (line attribution).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_ws(
+        &mut self,
+        node: Node,
+        name_node: Node,
+        raw: &str,
+        role: ContractRole,
+        confidence: f64,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.websocket {
+            return;
+        }
+        self.push_message(
+            ContractKind::WebSocket,
+            "",
+            node,
+            name_node,
+            raw,
+            role,
+            confidence,
+            owning,
+        );
+    }
+
+    /// Record a websocket contract identified by an HTTP path
+    /// (express-ws `app.ws('/chat', …)`): the identifier is a normalized
+    /// path, not a topic.
+    fn emit_ws_path(&mut self, node: Node, path_node: Node, role: ContractRole) {
+        if !self.opts.websocket {
+            return;
+        }
+        let Some(PathArg::Direct(raw)) = self.path_arg(path_node) else {
+            return;
+        };
+        let Some(norm) = normalize_http_path(&raw) else {
+            return;
+        };
+        self.out.push(ContractCandidate {
+            kind: ContractKind::WebSocket,
+            role,
+            qualifier: String::new(),
+            identifier: norm.path.clone(),
+            canonical_id: canonical_contract_id(ContractKind::WebSocket, "", &norm.path),
+            params: Vec::new(),
+            owning_symbol: crate::indexer::find_enclosing_function(node, self.src, self.lang),
+            line: path_node.start_position().row + 1,
+            confidence: CONFIDENCE_FRAMEWORK,
+        });
     }
 
     /// Shared tail of the message-kind emitters: normalize the name, build
@@ -4591,8 +4782,17 @@ mod tests {
 
     #[test]
     fn js_socket_send_is_reserved_for_websocket() {
-        // ws.send belongs to the websocket kind (step 6), never to queue.
+        // ws.send belongs to the websocket kind, never to queue.
         let cands = extract(Lang::JavaScript, "socket.send('hello');");
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].kind, ContractKind::WebSocket);
+        assert_eq!(cands[0].canonical_id, "websocket::::hello");
+        assert_eq!(cands[0].role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_socket_send_non_literal_skipped() {
+        let cands = extract(Lang::JavaScript, "ws.send(JSON.stringify(data));");
         assert!(cands.is_empty(), "got {cands:?}");
     }
 
@@ -4606,6 +4806,90 @@ mod tests {
     fn js_queue_interpolated_topic_skipped() {
         let cands = extract(Lang::JavaScript, "svc.send(`orders.${id}`);");
         assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    // -- walker: websocket, JS/TS (TASK-087 step 6) ----------------------------
+
+    #[test]
+    fn js_io_emit_is_ws_provider() {
+        let src = "io.emit('chat.message', payload);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.kind, ContractKind::WebSocket);
+        assert_eq!(c.canonical_id, "websocket::::chat.message");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn js_socket_emit_is_ws_provider() {
+        let cands = extract(Lang::JavaScript, "socket.emit('chat.message', data);");
+        let c = find(&cands, "websocket::::chat.message").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_socket_broadcast_emit_is_ws_provider() {
+        let cands = extract(
+            Lang::JavaScript,
+            "socket.broadcast.emit('chat.message', data);",
+        );
+        let c = find(&cands, "websocket::::chat.message").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_io_to_room_emit_is_ws_provider() {
+        let cands = extract(Lang::JavaScript, "io.to(room).emit('chat.message', d);");
+        let c = find(&cands, "websocket::::chat.message").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn js_socket_on_is_ws_consumer() {
+        let src = "socket.on('chat.message', (msg) => {});\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "websocket::::chat.message");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn js_ws_on_requires_handler_argument() {
+        // `.on` with a bare event name and no handler is not a registration.
+        let cands = extract(Lang::JavaScript, "socket.on('chat.message');");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_generic_emit_heuristic() {
+        let cands = extract(Lang::JavaScript, "events.emit('user.created', data);");
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "websocket::::user.created");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_HEURISTIC);
+    }
+
+    #[test]
+    fn js_generic_on_is_skipped() {
+        // EventEmitter `.on` registrations flood every codebase — skipped.
+        let cands = extract(Lang::JavaScript, "emitter.on('tick', cb);");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn js_express_ws_route_is_ws_consumer() {
+        let src = "const app = express();\napp.ws('/chat', handler);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "websocket::::/chat");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
     }
 
     // -- walker: Python (step 5) ------------------------------------------------
@@ -5478,6 +5762,51 @@ class Orders {
         let cands = extract(Lang::Java, src);
         let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
         assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    // -- walker: websocket, Java (TASK-087 step 6) ------------------------------
+
+    #[test]
+    fn java_message_mapping_is_ws_consumer() {
+        let src = "\
+@Controller
+class Orders {
+    @MessageMapping(\"orders.new\")
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "websocket::::orders.new");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("handle"));
+    }
+
+    #[test]
+    fn java_send_to_is_ws_provider() {
+        let src = "\
+@Controller
+class Orders {
+    @SendTo(\"/topic/orders\")
+    public void handle(String msg) {}
+}
+";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "websocket::::topic.orders").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn java_messaging_template_convert_and_send_is_ws_provider() {
+        let src =
+            "void push() {\n    messagingTemplate.convertAndSend(\"/topic/orders\", payload);\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "websocket::::topic.orders").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
     }
 
     // -- walker: PHP (step 6) ----------------------------------------------------
