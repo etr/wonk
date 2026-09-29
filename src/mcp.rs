@@ -2502,7 +2502,7 @@ impl McpServer {
             Err(e) => return e,
         };
 
-        let (conn, _) = match self.resolve_repo(&args) {
+        let (conn, repo_root) = match self.resolve_repo(&args) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -2534,11 +2534,16 @@ impl McpServer {
 
         let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
 
+        let use_reach = crate::config::Config::load(Some(&repo_root))
+            .map(|c| c.reach.enabled)
+            .unwrap_or(true);
+
         let options = crate::blast::BlastOptions {
             depth,
             direction,
             include_tests,
             min_confidence,
+            use_reach,
         };
 
         match crate::blast::analyze_blast(conn, &symbol, &options) {
@@ -2691,6 +2696,9 @@ impl McpServer {
                 blast,
                 flows,
                 min_confidence,
+                reach_enabled: crate::config::Config::load(Some(&repo_root))
+                    .map(|c| c.reach.enabled)
+                    .unwrap_or(true),
             },
             |_| {},
         ) {

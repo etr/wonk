@@ -4091,6 +4091,7 @@ mod tests {
                 }],
             }],
             affected_files: vec!["a.rs".into()],
+            truncated: false,
         };
         let out = BlastOutput::from(&analysis);
         assert_eq!(out.target, "foo");

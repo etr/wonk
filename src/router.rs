@@ -1827,6 +1827,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 direction,
                 include_tests: include_tests || args.include_tests,
                 min_confidence: args.min_confidence,
+                use_reach: config.reach.enabled,
             };
 
             let result = crate::blast::analyze_blast(&conn, &args.symbol, &options)?;
@@ -1876,6 +1877,10 @@ fn dispatch_changes<W: io::Write>(
         .and_then(|path| db::open(&path).ok())
         .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
 
+    let reach_enabled = crate::config::Config::load(Some(&repo_root))
+        .map(|c| c.reach.enabled)
+        .unwrap_or(true);
+
     // 2. Parse scope string to ChangeScope enum.
     let scope = if args.scope == "compare" {
         let base = args
@@ -1904,6 +1909,7 @@ fn dispatch_changes<W: io::Write>(
             blast: args.blast,
             flows: args.flows,
             min_confidence: args.min_confidence,
+            reach_enabled,
         },
         |msg| output::print_hint(msg, suppress),
     )?;
@@ -1967,6 +1973,7 @@ pub(crate) struct ChangesChainOptions {
     pub blast: bool,
     pub flows: bool,
     pub min_confidence: Option<f64>,
+    pub reach_enabled: bool,
 }
 
 /// Build a [`ChangesOutput`] from a [`ChangeAnalysis`], optionally chaining
@@ -1992,6 +1999,7 @@ pub(crate) fn build_changes_output(
                 direction: crate::types::BlastDirection::Upstream,
                 include_tests: false,
                 min_confidence: opts.min_confidence,
+                use_reach: opts.reach_enabled,
             };
             match crate::blast::analyze_blast(conn, &cs.name, &blast_opts) {
                 Ok(ref result) => {

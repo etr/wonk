@@ -628,6 +628,9 @@ pub struct BlastAnalysis {
     pub tiers: Vec<BlastTier>,
     /// Deduplicated list of files containing affected symbols.
     pub affected_files: Vec<String>,
+    /// Whether the recorded reach set was cut short by the per-source
+    /// fan-out cap (PRD-REACH-REQ-009). Always `false` for live BFS results.
+    pub truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,6 +1372,7 @@ mod tests {
             total_affected: 2,
             tiers: vec![],
             affected_files: vec!["src/billing.ts".into()],
+            truncated: false,
         };
         assert_eq!(analysis.target, "processPayment");
         assert_eq!(analysis.direction, BlastDirection::Upstream);
@@ -1452,6 +1456,7 @@ mod tests {
             total_affected: 5,
             tiers: vec![],
             affected_files: vec![],
+            truncated: false,
         };
         let b = a.clone();
         assert_eq!(a, b);
