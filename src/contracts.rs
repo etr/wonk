@@ -4225,4 +4225,491 @@ public class UsersController : ControllerBase
             ]
         );
     }
+    // -- cross-framework corpus (AR-017, AR-029, step 10) ----------------------
+
+    struct CorpusEntry {
+        lang: Lang,
+        source: &'static str,
+        role: ContractRole,
+        confidence: f64,
+        canonical_id: &'static str,
+        params: &'static [(&'static str, &'static str)],
+    }
+
+    const CORPUS: &[CorpusEntry] = &[
+        // Providers of GET /v1/users/{id} across frameworks.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "const app = express(); app.get('/v1/users/:id', h);",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "@app.get('/v1/users/<int:id>')\ndef f(id):\n    return {}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "@app.get('/v1/users/{id}')\ndef f(id):\n    return {}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "func main() {\n\tr.GET(\"/v1/users/:id\", h)\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::Rust,
+            source: "#[get(\"/v1/users/{id}\")]\nasync fn f() -> impl Responder { todo!() }",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::Rust,
+            source: "fn app() { let a = Router::new().route(\"/v1/users/{id}\", get(h)); }",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::Java,
+            source: "class C {\n    @GetMapping(\"/v1/users/{id}\")\n    public String f() { return \"\"; }\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "get '/v1/users/:id' do\n  json\nend",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::Php,
+            source: "<?php\nRoute::get('/v1/users/{id}', 'UserController@show');",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
+            lang: Lang::CSharp,
+            source: "public class C {\n    [HttpGet(\"/v1/users/{id}\")]\n    public string F() { return \"\"; }\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        // Consumers of GET /v1/users across languages.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "async function f() { await fetch('https://api.io/v1/users'); }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "async function f() { await fetch(`${API_URL}/v1/users`); }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "const d = axios.get('/v1/users');",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "def f():\n    r = requests.get('https://api.io/v1/users')",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "def f():\n    r = httpx.get('/v1/users')",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "func f() { r, _ := http.Get(\"https://api.io/v1/users\") }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Rust,
+            source: "async fn f() { let r = reqwest::get(\"https://api.io/v1/users\").await; }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Java,
+            source: "class C { String f() { return restTemplate.getForObject(\"https://api.io/v1/users\", String.class); } }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "def f\n  HTTParty.get('https://api.io/v1/users')\nend",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Php,
+            source: "<?php\nfunction f() { $r = Http::get('https://api.io/v1/users'); }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::CSharp,
+            source: "class C { async Task F() { var r = await httpClient.GetAsync(\"/v1/users\"); } }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::C,
+            source: "void f(void) { curl_easy_setopt(h, CURLOPT_URL, \"https://api.io/v1/users\"); }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users",
+            params: &[],
+        },
+        // Env accessors across languages -> one ID.
+        CorpusEntry {
+            lang: Lang::JavaScript,
+            source: "const d = process.env.DATABASE_URL;",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "d = os.environ['DATABASE_URL']",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Ruby,
+            source: "d = ENV['DATABASE_URL']",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Go,
+            source: "func f() { d := os.Getenv(\"DATABASE_URL\") }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Rust,
+            source: "fn f() { let d = std::env::var(\"DATABASE_URL\").unwrap(); }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Java,
+            source: "class C { String f() { return System.getenv(\"DATABASE_URL\"); } }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::Php,
+            source: "<?php\n$d = $_ENV['DATABASE_URL'];",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::CSharp,
+            source: "class C { string F() { return Environment.GetEnvironmentVariable(\"DATABASE_URL\"); } }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+        CorpusEntry {
+            lang: Lang::C,
+            source: "void f(void) { char *d = getenv(\"DATABASE_URL\"); }",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "env::::DATABASE_URL",
+            params: &[],
+        },
+    ];
+
+    #[test]
+    fn corpus_entries_all_match() {
+        for e in CORPUS {
+            let cands = extract(e.lang, e.source);
+            let c = find(&cands, e.canonical_id)
+                .unwrap_or_else(|| panic!("{}: no {} in {cands:?}", e.lang.name(), e.canonical_id));
+            assert_eq!(c.role, e.role, "{} {c:?}", e.lang.name());
+            assert_eq!(c.confidence, e.confidence, "{} {c:?}", e.lang.name());
+            let params: Vec<(String, String)> = c
+                .params
+                .iter()
+                .map(|p| (format!("p{}", p.position), p.name.clone()))
+                .collect();
+            let want: Vec<(String, String)> = e
+                .params
+                .iter()
+                .map(|(m, n)| (m.to_string(), n.to_string()))
+                .collect();
+            assert_eq!(params, want, "{} {c:?}", e.lang.name());
+        }
+    }
+
+    #[test]
+    fn corpus_provider_group_shares_one_id() {
+        let provider_langs: std::collections::HashSet<Lang> = CORPUS
+            .iter()
+            .filter(|e| e.role == ContractRole::Provider)
+            .map(|e| e.lang)
+            .collect();
+        assert!(
+            provider_langs.len() >= 4,
+            "need providers in 4+ languages, got {}",
+            provider_langs.len()
+        );
+        let ids: std::collections::HashSet<&str> = CORPUS
+            .iter()
+            .filter(|e| e.role == ContractRole::Provider)
+            .filter(|e| e.canonical_id.starts_with("http::GET::/v1/users/"))
+            .map(|e| e.canonical_id)
+            .collect();
+        assert_eq!(ids.len(), 1, "provider IDs diverged: {ids:?}");
+    }
+
+    #[test]
+    fn corpus_consumer_group_shares_one_id() {
+        let entries: Vec<&CorpusEntry> = CORPUS
+            .iter()
+            .filter(|e| e.canonical_id == "http::GET::/v1/users")
+            .collect();
+        let langs: std::collections::HashSet<Lang> = entries.iter().map(|e| e.lang).collect();
+        assert!(
+            langs.len() >= 4,
+            "need consumers in 4+ languages, got {}",
+            langs.len()
+        );
+        assert!(entries.iter().all(|e| e.role == ContractRole::Consumer));
+    }
+
+    #[test]
+    fn corpus_pairs_provider_and_consumer_across_languages() {
+        // AR-029: same route spelled as provider in one language and consumer
+        // in others resolves into the matching ID family.
+        assert!(
+            CORPUS
+                .iter()
+                .any(|e| e.canonical_id == "http::GET::/v1/users/{p1}"
+                    && e.role == ContractRole::Provider)
+        );
+        assert!(
+            CORPUS
+                .iter()
+                .any(|e| e.canonical_id == "http::GET::/v1/users"
+                    && e.role == ContractRole::Consumer)
+        );
+    }
+
+    #[test]
+    fn corpus_env_group_shares_one_id() {
+        let ids: std::collections::HashSet<&str> = CORPUS
+            .iter()
+            .filter(|e| e.canonical_id.starts_with("env::::"))
+            .map(|e| e.canonical_id)
+            .collect();
+        let want: std::collections::HashSet<&str> = ["env::::DATABASE_URL"].into_iter().collect();
+        assert_eq!(ids, want);
+    }
+
+    // -- acceptance tests (1:1 with TASK-082 criteria) --------------------------
+
+    #[test]
+    fn acceptance_four_frameworks_same_id() {
+        // Express, Flask/FastAPI, gin, Actix — same canonical ID.
+        let cases: &[(Lang, &str)] = &[
+            (
+                Lang::JavaScript,
+                "const app = express(); app.get('/v1/users/:id', h);",
+            ),
+            (
+                Lang::Python,
+                "@app.get('/v1/users/<int:id>')\ndef f(id):\n    return {}",
+            ),
+            (Lang::Go, "func main() { r.GET(\"/v1/users/:id\", h) }"),
+            (
+                Lang::Rust,
+                "#[get(\"/v1/users/{id}\")]\nasync fn f() -> impl Responder { todo!() }",
+            ),
+        ];
+        let mut ids = Vec::new();
+        for (lang, src) in cases {
+            let cands = extract(*lang, src);
+            ids.push(
+                cands
+                    .iter()
+                    .map(|c| c.canonical_id.clone())
+                    .max_by_key(|id| id.len())
+                    .expect("at least one contract"),
+            );
+        }
+        assert!(
+            ids.iter().all(|id| id == &ids[0]),
+            "canonical IDs diverged: {ids:?}"
+        );
+        assert_eq!(ids[0], "http::GET::/v1/users/{p1}");
+    }
+
+    #[test]
+    fn acceptance_scheme_authority_matches_relative() {
+        let a = extract(
+            Lang::JavaScript,
+            "async function f() { await fetch('http://api.example.com/v1/users'); }",
+        );
+        let b = extract(
+            Lang::JavaScript,
+            "async function f() { await fetch('/v1/users'); }",
+        );
+        assert_eq!(a[0].canonical_id, b[0].canonical_id);
+        assert_eq!(a[0].canonical_id, "http::GET::/v1/users");
+    }
+
+    #[test]
+    fn acceptance_base_interpolation_matches_colon_param() {
+        let a = extract(
+            Lang::JavaScript,
+            "async function f() { await fetch(`${API_URL}/v1/tags/${id}`); }",
+        );
+        let b = extract(
+            Lang::JavaScript,
+            "const app = express(); app.get('/v1/tags/:id', h);",
+        );
+        assert_eq!(a[0].canonical_id, b[0].canonical_id);
+        assert_eq!(a[0].canonical_id, "http::GET::/v1/tags/{p1}");
+    }
+
+    #[test]
+    fn acceptance_positional_params_retain_names() {
+        let a = extract(
+            Lang::JavaScript,
+            "const app = express(); app.get('/workspaces/{wid}/tags/{id}', h);",
+        );
+        let b = extract(
+            Lang::JavaScript,
+            "const app = express(); app.get('/workspaces/{workspaceId}/tags/{id}', h);",
+        );
+        assert_eq!(a[0].canonical_id, b[0].canonical_id);
+        assert_eq!(a[0].canonical_id, "http::GET::/workspaces/{p1}/tags/{p2}");
+        assert_eq!(
+            a[0].params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wid", "id"]
+        );
+        assert_eq!(
+            b[0].params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspaceId", "id"]
+        );
+    }
+
+    #[test]
+    fn acceptance_group_prefix_v1() {
+        let cands = extract(
+            Lang::Go,
+            "func main() {\n\tr := gin.New()\n\tv1 := r.Group(\"/v1\")\n\tv1.GET(\"/users/:id\", h)\n}",
+        );
+        assert!(
+            cands
+                .iter()
+                .any(|c| c.canonical_id == "http::GET::/v1/users/{p1}"),
+            "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn acceptance_ambiguous_confidence_05() {
+        let http = extract(Lang::JavaScript, "const x = registry.get('/users');");
+        assert_eq!(http.len(), 1);
+        assert_eq!(http[0].confidence, 0.5);
+        assert_eq!(http[0].role, ContractRole::Provider);
+        let env = extract(Lang::JavaScript, "process.env.FEATURE_FLAG = 'on';");
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].confidence, 0.5);
+        assert_eq!(env[0].role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn acceptance_extraction_runs_during_build() {
+        // End-to-end: build_index extracts contracts on the pipeline path.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            "const app = express();\napp.get('/v1/users/:id', h);\n",
+        )
+        .unwrap();
+        let stats = crate::pipeline::build_index(root, true).unwrap();
+        assert_eq!(stats.contract_count, 1, "got {stats:?}");
+    }
 }
