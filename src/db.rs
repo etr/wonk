@@ -118,6 +118,34 @@ CREATE TABLE IF NOT EXISTS term_stats (
 CREATE INDEX IF NOT EXISTS idx_term_stats_file ON term_stats(file);
 ";
 
+// Precomputed upstream reachability (TASK-080, DR-034). One row per
+// (source, target) pair with the minimum BFS depth at which the target is
+// reachable from the source, so blast severity tiers are preserved.
+// `confidence` carries the discovering edge's confidence — a documented
+// deviation from the architecture DDL's (source_id, target_id, min_depth)
+// needed to reproduce BlastAffectedSymbol.confidence without changing
+// V4 BFS semantics.
+const REACH_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS reach (
+    source_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    target_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    min_depth INTEGER NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (source_id, target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reach_source_depth ON reach(source_id, min_depth);
+CREATE INDEX IF NOT EXISTS idx_reach_target ON reach(target_id);
+
+CREATE TABLE IF NOT EXISTS reach_truncated (
+    source_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS reach_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#;
+
 const SUMMARIES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS summaries (
     path TEXT PRIMARY KEY,
@@ -216,6 +244,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     ensure_embedding_metadata_columns(conn)?;
     conn.execute_batch(TERM_STATS_SQL)
         .context("creating term_stats table")?;
+    conn.execute_batch(REACH_SQL).context("creating reach tables")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -317,6 +346,18 @@ pub fn ensure_type_edges_table(conn: &Connection) -> Result<()> {
 pub fn ensure_term_stats_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(TERM_STATS_SQL)
         .context("creating term_stats table (migration)")?;
+    Ok(())
+}
+
+/// Ensure the `reach`, `reach_truncated`, and `reach_meta` tables exist,
+/// creating them if missing.
+///
+/// Handles schema migration for indexes created before the precomputed
+/// reach table (TASK-080) was added.  Safe to call on databases that
+/// already have the tables (uses `CREATE TABLE IF NOT EXISTS`).
+pub fn ensure_reach_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(REACH_SQL)
+        .context("creating reach tables (migration)")?;
     Ok(())
 }
 
@@ -610,6 +651,9 @@ mod tests {
         assert!(tables.contains(&"embeddings".to_string()));
         assert!(tables.contains(&"type_edges".to_string()));
         assert!(tables.contains(&"term_stats".to_string()));
+        assert!(tables.contains(&"reach".to_string()));
+        assert!(tables.contains(&"reach_truncated".to_string()));
+        assert!(tables.contains(&"reach_meta".to_string()));
     }
 
     #[test]
@@ -2056,6 +2100,127 @@ mod tests {
         assert_eq!(
             postings,
             vec![("a.rs".to_string(), 3), ("b.rs".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn test_open_creates_reach_tables() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let _conn = open(&db_path).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        for table in ["reach", "reach_truncated", "reach_meta"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "open() should create {table}");
+        }
+    }
+
+    #[test]
+    fn test_ensure_reach_table_migration() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // Simulate an old database created before the reach tables existed.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reach'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "table should not exist before migration");
+
+        ensure_reach_table(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reach'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "ensure_reach_table should create it");
+    }
+
+    #[test]
+    fn test_ensure_reach_table_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        ensure_reach_table(&conn).unwrap();
+        ensure_reach_table(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reach'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn test_reach_pk_rejects_duplicate_source_target() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["a", "function", "a.rs", 1, 1, "rust"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["b", "function", "a.rs", 5, 1, "rust"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reach (source_id, target_id, min_depth, confidence) VALUES (1, 2, 1, 0.85)",
+            [],
+        )
+        .unwrap();
+
+        let dup = conn.execute(
+            "INSERT INTO reach (source_id, target_id, min_depth, confidence) VALUES (1, 2, 2, 0.9)",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate (source_id, target_id) pair must violate the primary key"
+        );
+    }
+
+    #[test]
+    fn test_reach_indexes_exist() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            indexes.contains(&"idx_reach_source_depth".to_string()),
+            "idx_reach_source_depth should exist for the lookup path"
+        );
+        assert!(
+            indexes.contains(&"idx_reach_target".to_string()),
+            "idx_reach_target should exist for the reverse lookup path (TASK-081)"
         );
     }
 
