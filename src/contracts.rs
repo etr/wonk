@@ -24,6 +24,62 @@ pub const CONFIDENCE_FRAMEWORK: f64 = 1.0;
 /// Confidence for string-literal heuristics and role-ambiguous constructs.
 pub const CONFIDENCE_HEURISTIC: f64 = 0.5;
 
+/// Per-kind extraction switches threaded through the pipeline (TASK-087).
+///
+/// `Copy` so the `par_iter` in `build_index_with_progress` can carry it per
+/// file; mirrors [`crate::config::ContractsConfig`] one flag per kind so a
+/// noisy detector can be disabled without degrading the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractOptions {
+    /// HTTP route/outbound-call detection.
+    pub http: bool,
+    /// Environment-variable read/write detection.
+    pub env: bool,
+    /// Message-queue producer/consumer detection.
+    pub queue: bool,
+    /// WebSocket emit/handler-registration detection.
+    pub websocket: bool,
+    /// Scheduled and background job detection.
+    pub job: bool,
+}
+
+impl Default for ContractOptions {
+    fn default() -> Self {
+        Self {
+            http: true,
+            env: true,
+            queue: true,
+            websocket: true,
+            job: true,
+        }
+    }
+}
+
+impl ContractOptions {
+    /// Whether detections of `kind` should be emitted.
+    pub fn enabled(&self, kind: ContractKind) -> bool {
+        match kind {
+            ContractKind::Http => self.http,
+            ContractKind::Env => self.env,
+            ContractKind::Queue => self.queue,
+            ContractKind::WebSocket => self.websocket,
+            ContractKind::Job => self.job,
+        }
+    }
+}
+
+impl From<&crate::config::ContractsConfig> for ContractOptions {
+    fn from(cfg: &crate::config::ContractsConfig) -> Self {
+        Self {
+            http: cfg.http,
+            env: cfg.env,
+            queue: cfg.queue,
+            websocket: cfg.websocket,
+            job: cfg.job,
+        }
+    }
+}
+
 /// Extract contract candidates from an already-parsed tree.
 ///
 /// `source` must be the exact byte string the tree was parsed from.
@@ -3069,6 +3125,45 @@ mod tests {
         assert_eq!(
             canonical_contract_id(ContractKind::Job, "", "email-send"),
             "job::::email-send"
+        );
+    }
+
+    // -- per-kind options (TASK-087, PRD-CTR-REQ-001) --------------------------
+
+    #[test]
+    fn contract_options_default_enables_all_kinds() {
+        let opts = ContractOptions::default();
+        assert!(opts.enabled(ContractKind::Http));
+        assert!(opts.enabled(ContractKind::Env));
+        assert!(opts.enabled(ContractKind::Queue));
+        assert!(opts.enabled(ContractKind::WebSocket));
+        assert!(opts.enabled(ContractKind::Job));
+    }
+
+    #[test]
+    fn contract_options_from_config_maps_every_flag() {
+        let cfg = crate::config::ContractsConfig {
+            http: true,
+            env: false,
+            queue: false,
+            websocket: true,
+            job: false,
+        };
+        let opts = ContractOptions::from(&cfg);
+        assert!(opts.enabled(ContractKind::Http));
+        assert!(!opts.enabled(ContractKind::Env));
+        assert!(!opts.enabled(ContractKind::Queue));
+        assert!(opts.enabled(ContractKind::WebSocket));
+        assert!(!opts.enabled(ContractKind::Job));
+    }
+
+    #[test]
+    fn contract_options_is_copy() {
+        let opts = ContractOptions::default();
+        let copy = opts;
+        assert_eq!(
+            copy.enabled(ContractKind::Queue),
+            opts.enabled(ContractKind::Queue)
         );
     }
 
