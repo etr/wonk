@@ -499,6 +499,10 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         rusqlite::params![rel_path],
     )?;
     tx.execute(
+        "DELETE FROM term_stats WHERE file = ?1",
+        rusqlite::params![rel_path],
+    )?;
+    tx.execute(
         "DELETE FROM files WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
@@ -536,6 +540,10 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     )?;
     tx.execute(
         "DELETE FROM file_imports WHERE source_file = ?1",
+        rusqlite::params![result.rel_path],
+    )?;
+    tx.execute(
+        "DELETE FROM term_stats WHERE file = ?1",
         rusqlite::params![result.rel_path],
     )?;
 
@@ -619,6 +627,14 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
             tx.prepare("INSERT INTO file_imports (source_file, import_path) VALUES (?1, ?2)")?;
         for import in &result.imports {
             stmt.execute(rusqlite::params![result.rel_path, import])?;
+        }
+    }
+
+    // Insert BM25 term statistics — same transaction as the file's symbols.
+    {
+        let mut stmt = tx.prepare("INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)")?;
+        for (term, tf) in &result.term_freqs {
+            stmt.execute(rusqlite::params![term, result.rel_path, *tf as i64])?;
         }
     }
 
@@ -844,8 +860,7 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
 
     // Insert BM25 term statistics — same transaction as the file's symbols.
     {
-        let mut stmt =
-            tx.prepare("INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)")?;
+        let mut stmt = tx.prepare("INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)")?;
         for r in results {
             for (term, tf) in &r.term_freqs {
                 stmt.execute(rusqlite::params![term, r.rel_path, *tf as i64])?;
@@ -1595,8 +1610,8 @@ class Component {
         assert!(!paths.is_empty(), "index should contain files");
 
         for rel in &paths {
-            let content = fs::read_to_string(root.join(rel))
-                .unwrap_or_else(|e| panic!("reading {rel}: {e}"));
+            let content =
+                fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("reading {rel}: {e}"));
             let expected = crate::tokenizer::term_frequencies(&content);
             let actual: HashMap<String, i64> = conn
                 .prepare("SELECT term, tf FROM term_stats WHERE file = ?1")
@@ -1695,6 +1710,127 @@ class Component {
         let conn = db::open_existing(&index_path).unwrap();
 
         assert_stats_match_disk(&conn, dir.path());
+    }
+
+    #[test]
+    fn test_reindex_file_updates_term_stats() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        // Rewrite lib.rs with different term content.
+        fs::write(
+            root.join("lib.rs"),
+            "fn goodbye() { 100 }\nfn farewell() { 200 }",
+        )
+        .unwrap();
+        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        assert!(changed, "modified file should be re-indexed");
+
+        // Old terms are gone, new terms carry correct tf.
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs' AND term = 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "stats for removed terms must be deleted");
+
+        let tf_goodbye: i64 = conn
+            .query_row(
+                "SELECT tf FROM term_stats WHERE file = 'lib.rs' AND term = 'goodbye'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tf_goodbye, 1);
+
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_reindex_file_unchanged_leaves_stats() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        let rows_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+
+        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        assert!(!changed, "unchanged file should be skipped");
+
+        let rows_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rows_before, rows_after,
+            "unchanged-hash early exit must leave term_stats untouched"
+        );
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_remove_file_deletes_term_stats() {
+        let (dir, conn) = setup_indexed_repo();
+
+        // "hello" occurs only in lib.rs.
+        let df_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE term = 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(df_before, 1, "'hello' should start in exactly one file");
+
+        remove_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
+
+        // Document frequency decrements exactly — no orphaned postings.
+        let df_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE term = 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(df_after, 0, "df must drop to zero when its only file goes");
+
+        let lib_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lib_rows, 0);
+    }
+
+    #[test]
+    fn test_incremental_update_removes_term_stats() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+        drop(conn);
+
+        // Delete a file from disk, then run the incremental update pass.
+        fs::remove_file(root.join("lib.rs")).unwrap();
+        let _stats = incremental_update(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+        let lib_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lib_rows, 0,
+            "incremental update must purge stats of deleted files"
+        );
+
+        assert_stats_match_disk(&conn, root);
     }
 
     #[test]
