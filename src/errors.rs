@@ -191,6 +191,10 @@ impl WonkError {
             WonkError::Embedding(EmbeddingError::NoEmbeddings) => {
                 Some("run `wonk init --embed` to generate embeddings")
             }
+            WonkError::Embedding(EmbeddingError::VectorSpaceMismatch { .. }) => Some(
+                "start Ollama with 'ollama serve' to keep the ollama tier, or run the \
+                 re-embed command above",
+            ),
             WonkError::Embedding(EmbeddingError::StorageFailed(_)) => {
                 Some("the index may be corrupt; try `wonk init` to rebuild it")
             }
@@ -415,6 +419,19 @@ mod tests {
         let err = WonkError::Embedding(EmbeddingError::StorageFailed("test".to_string()));
         let hint = err.hint().unwrap();
         assert!(hint.contains("rebuild"));
+    }
+
+    #[test]
+    fn hint_vector_space_mismatch() {
+        let err = WonkError::Embedding(EmbeddingError::VectorSpaceMismatch {
+            active_provider: "bundled".to_string(),
+            active_dim: 256,
+            stored_provider: "ollama".to_string(),
+            stored_dim: 768,
+        });
+        let hint = err.hint().unwrap();
+        assert!(hint.contains("ollama serve"));
+        assert!(hint.contains("re-embed"));
     }
 
     // -- LlmError tests -------------------------------------------------------

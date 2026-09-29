@@ -52,6 +52,17 @@ wonk ask --to src/db.rs "query builder"
 | `--from <file>` | Restrict to symbols reachable from this file |
 | `--to <file>` | Restrict to symbols that can reach this file |
 
+Degraded modes:
+
+- **Configured Ollama unreachable**: the query falls back to the bundled
+  provider with a `warning:` on stderr instead of failing, so stopping
+  Ollama mid-session only lowers result quality.
+- **Stored vectors from a different provider**: the query is refused with a
+  `vector space mismatch` error naming the exact re-embed command (for
+  example `wonk update --force --provider bundled`). Wonk never silently
+  searches — or rewrites — the wrong vector space, and the fallback above
+  never applies across a mismatch.
+
 ## Symbol lookup
 
 ### `wonk sym <name>`
@@ -369,11 +380,31 @@ wonk update --force --provider ollama
 
 ### `wonk status`
 
-Show indexing status for the current repository.
+Show indexing status for the current repository, including the active
+embedding provider and the stored vector space.
 
 ```
 wonk status
 ```
+
+Sample output:
+
+```
+Index: 42 files, 300 symbols, 1200 references
+Embeddings: 280 embeddings (3 stale)
+Provider: bundled
+Stored vectors: bundled, 256-dim
+```
+
+When Ollama is configured (or ollama vectors are stored), an `Ollama:` line
+reports reachability and, when unreachable with Ollama configured, notes that
+semantic queries fall back to the bundled provider. `Stored vectors: none`
+means the index has no embeddings yet.
+
+With `--format json` (or the MCP `wonk_status` tool) the same data is
+serialized, including `active_provider`, `stored_vector_provider`,
+`stored_vector_dim`, and `ollama_reachable` (`null` when Ollama was not
+probed).
 
 ### `wonk repos <list|clean>`
 
@@ -465,6 +496,12 @@ meaning rather than exact text patterns.
 - **Vector-space safety**: Provider and dimension are stored with every vector;
   a mismatch stops the query and prints the exact `wonk update --force
   --provider ...` command needed to rebuild
+- **Unreachable-provider fallback**: A configured Ollama that is down at query
+  time degrades to the bundled provider with a stderr warning instead of
+  failing the query. The fallback only applies when the stored vectors are
+  compatible (bundled or none); if any foreign-space vectors are stored, the
+  query blocks with the re-embed command above — so switching providers is
+  always an explicit `wonk update --force --provider <bundled|ollama>`
 - **Dependency scoping**: Use `--from <file>` and `--to <file>` to restrict
   semantic results to symbols reachable from or leading to a specific file,
   using the indexed dependency graph

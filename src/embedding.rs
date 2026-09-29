@@ -33,9 +33,18 @@ pub const DEFAULT_MODEL: &str = "nomic-embed-text";
 /// Dimension produced by the legacy `nomic-embed-text` Ollama provider.
 pub const OLLAMA_DIM: usize = 768;
 
-/// User-facing error message when Ollama is required but unreachable.
-pub const OLLAMA_REQUIRED_MSG: &str = "Ollama is required for semantic search. \
-    Start Ollama with 'ollama serve' and ensure nomic-embed-text is available.";
+/// User-facing error message when the configured Ollama provider is needed
+/// but unreachable. Ollama is a quality tier, not a requirement: the bundled
+/// provider is always a working alternative via re-embed.
+pub const OLLAMA_UNREACHABLE_MSG: &str = "configured embedding provider 'ollama' is \
+    unreachable; start Ollama ('ollama serve'), or re-embed with the bundled provider: \
+    `wonk update --force --provider bundled`";
+
+/// Stderr warning emitted when a query degrades to the bundled provider
+/// because the configured Ollama provider is unreachable (PRD-EMB-REQ-009).
+pub const BUNDLED_FALLBACK_WARNING: &str = "configured embedding provider 'ollama' is \
+    unreachable; falling back to the bundled provider for this query — start Ollama \
+    ('ollama serve') to restore the higher-quality tier";
 
 // ---------------------------------------------------------------------------
 // Serde types for the Ollama /api/embed endpoint
@@ -85,6 +94,14 @@ pub trait EmbeddingProvider: Send + Sync {
     fn is_healthy(&self) -> bool {
         true
     }
+
+    /// Quick health probe with a short timeout for interactive paths.
+    ///
+    /// Defaults to [`Self::is_healthy`]; network providers override with a
+    /// tighter bound so query-time planning never stalls on a dead server.
+    fn is_healthy_quick(&self) -> bool {
+        self.is_healthy()
+    }
 }
 
 /// Resolve invocation precedence: explicit override, then configured value.
@@ -102,6 +119,200 @@ pub fn create_provider(
     match kind {
         EmbeddingProviderKind::Ollama => Ok(Box::new(OllamaProvider::new())),
         EmbeddingProviderKind::Bundled => Ok(Box::new(BundledProvider)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query-time provider resolution
+// ---------------------------------------------------------------------------
+
+/// One distinct vector space present in the embeddings table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredVectorSpace {
+    pub provider: String,
+    pub dim: usize,
+    pub rows: usize,
+}
+
+/// What to do about the embedding provider for a semantic query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryProviderDecision {
+    /// Use the configured provider as-is.
+    Active,
+    /// Substitute the bundled provider for this query (PRD-EMB-REQ-009).
+    BundledFallback,
+    /// Refuse: stored vectors belong to a different space (PRD-EMB-REQ-005).
+    Block {
+        active_provider: String,
+        active_dim: usize,
+        stored_provider: String,
+        stored_dim: usize,
+    },
+}
+
+/// Decide which provider a query should run against.
+///
+/// Pure decision table over the configured provider, its health, and the
+/// vector spaces present in the index — no I/O, so every row is unit-testable.
+///
+/// The fallback rule is strict: an unreachable configured provider may degrade
+/// to the bundled provider only when doing so never crosses a vector space.
+/// Falling back while foreign-space rows exist would either silently drop the
+/// user's indexed corpus from results or store the query in the wrong space,
+/// so that path blocks with a re-embed instruction instead.
+pub fn decide_query_provider(
+    configured: EmbeddingProviderKind,
+    active_healthy: bool,
+    stored: &[StoredVectorSpace],
+) -> QueryProviderDecision {
+    let active = match configured {
+        EmbeddingProviderKind::Bundled => ("bundled", BundledProvider.dim()),
+        EmbeddingProviderKind::Ollama => ("ollama", OLLAMA_DIM),
+    };
+
+    match configured {
+        // A healthy active provider uses its own space when present; a
+        // non-empty table without it is a provider switch, which blocks.
+        EmbeddingProviderKind::Bundled => use_active_or_block(active, stored),
+        EmbeddingProviderKind::Ollama if active_healthy => use_active_or_block(active, stored),
+        // Unreachable Ollama degrades to bundled — but only when no
+        // foreign-space rows exist that the fallback would strand.
+        EmbeddingProviderKind::Ollama => {
+            if stored.is_empty() || stored.iter().all(is_bundled) {
+                QueryProviderDecision::BundledFallback
+            } else {
+                let foreign: Vec<_> = stored.iter().filter(|s| !is_bundled(s)).cloned().collect();
+                block(("bundled", BundledProvider.dim()), dominant_of(&foreign))
+            }
+        }
+    }
+}
+
+fn use_active_or_block(
+    active: (&str, usize),
+    stored: &[StoredVectorSpace],
+) -> QueryProviderDecision {
+    let has_active_space = stored
+        .iter()
+        .any(|s| s.provider == active.0 && s.dim == active.1);
+    if stored.is_empty() || has_active_space {
+        QueryProviderDecision::Active
+    } else {
+        block(active, dominant_of(stored))
+    }
+}
+
+fn is_bundled(space: &StoredVectorSpace) -> bool {
+    space.provider == "bundled" && space.dim == BundledProvider.dim()
+}
+
+fn block(active: (&str, usize), stored: StoredVectorSpace) -> QueryProviderDecision {
+    QueryProviderDecision::Block {
+        active_provider: active.0.to_string(),
+        active_dim: active.1,
+        stored_provider: stored.provider,
+        stored_dim: stored.dim,
+    }
+}
+
+/// The stored space with the most rows; callers guarantee `stored` is non-empty.
+fn dominant_of(stored: &[StoredVectorSpace]) -> StoredVectorSpace {
+    stored
+        .iter()
+        .max_by_key(|s| s.rows)
+        .cloned()
+        .expect("dominant_of requires a non-empty slice")
+}
+
+/// List the distinct vector spaces present in the embeddings table,
+/// ordered by row count descending (dominant space first).
+pub fn stored_vector_spaces(conn: &Connection) -> Result<Vec<StoredVectorSpace>, EmbeddingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT provider, dim, COUNT(*) AS rows
+             FROM embeddings
+             GROUP BY provider, dim
+             ORDER BY rows DESC",
+        )
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let spaces = stmt
+        .query_map([], |row| {
+            Ok(StoredVectorSpace {
+                provider: row.get(0)?,
+                dim: row.get::<_, i64>(1)? as usize,
+                rows: row.get::<_, i64>(2)? as usize,
+            })
+        })
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(spaces)
+}
+
+/// The resolved provider for one semantic query.
+pub struct QueryProviderPlan {
+    pub provider: Box<dyn EmbeddingProvider>,
+    /// Set when PRD-EMB-REQ-009 fallback was applied.
+    pub fallback_warning: Option<&'static str>,
+}
+
+/// Resolve the provider for a semantic query against this index.
+///
+/// Health-checks the configured provider (Ollama via a 500 ms probe; the
+/// bundled provider never touches the network), runs the pure decision
+/// table, and maps a refused space through
+/// [`EmbeddingError::VectorSpaceMismatch`], whose message carries the exact
+/// re-embed command.
+pub fn plan_query_provider(
+    conn: &Connection,
+    configured: EmbeddingProviderKind,
+) -> Result<QueryProviderPlan, EmbeddingError> {
+    let stored = stored_vector_spaces(conn)?;
+    let probe = create_provider(configured)?;
+    let decision = decide_query_provider(configured, probe.is_healthy_quick(), &stored);
+    plan_from_decision(configured, decision)
+}
+
+/// Re-plan after the configured provider died mid-query.
+///
+/// The health check is skipped (we just watched the request fail), so an
+/// Ollama configuration degrades to the bundled provider — or blocks when
+/// the stored vectors make that unsafe.
+pub fn fallback_after_disconnect(
+    conn: &Connection,
+    configured: EmbeddingProviderKind,
+) -> Result<QueryProviderPlan, EmbeddingError> {
+    let stored = stored_vector_spaces(conn)?;
+    let decision = decide_query_provider(configured, false, &stored);
+    plan_from_decision(configured, decision)
+}
+
+fn plan_from_decision(
+    configured: EmbeddingProviderKind,
+    decision: QueryProviderDecision,
+) -> Result<QueryProviderPlan, EmbeddingError> {
+    match decision {
+        QueryProviderDecision::Active => Ok(QueryProviderPlan {
+            provider: create_provider(configured)?,
+            fallback_warning: None,
+        }),
+        QueryProviderDecision::BundledFallback => Ok(QueryProviderPlan {
+            provider: create_provider(EmbeddingProviderKind::Bundled)?,
+            fallback_warning: Some(BUNDLED_FALLBACK_WARNING),
+        }),
+        QueryProviderDecision::Block {
+            active_provider,
+            active_dim,
+            stored_provider,
+            stored_dim,
+        } => Err(EmbeddingError::VectorSpaceMismatch {
+            active_provider,
+            active_dim,
+            stored_provider,
+            stored_dim,
+        }),
     }
 }
 
@@ -249,6 +460,10 @@ impl EmbeddingProvider for OllamaProvider {
 
     fn is_healthy(&self) -> bool {
         OllamaProvider::is_healthy(self)
+    }
+
+    fn is_healthy_quick(&self) -> bool {
+        OllamaProvider::is_healthy_quick(self)
     }
 }
 
@@ -3118,5 +3333,281 @@ mod tests {
 
         let results = load_embeddings_for_path_prefix(&conn, "", &OneDimProvider).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // -- decide_query_provider decision table ----------------------------------
+
+    use super::{QueryProviderDecision, StoredVectorSpace, decide_query_provider};
+
+    fn space(provider: &str, dim: usize, rows: usize) -> StoredVectorSpace {
+        StoredVectorSpace {
+            provider: provider.to_string(),
+            dim,
+            rows,
+        }
+    }
+
+    const BUNDLED: (&str, usize) = ("bundled", 256);
+    const OLLAMA: (&str, usize) = ("ollama", 768);
+
+    #[test]
+    fn decide_bundled_with_empty_table_is_active() {
+        let decision = decide_query_provider(EmbeddingProviderKind::Bundled, true, &[]);
+        assert_eq!(decision, QueryProviderDecision::Active);
+    }
+
+    #[test]
+    fn decide_bundled_with_stored_bundled_rows_is_active() {
+        let stored = [space(BUNDLED.0, BUNDLED.1, 10)];
+        let decision = decide_query_provider(EmbeddingProviderKind::Bundled, true, &stored);
+        assert_eq!(decision, QueryProviderDecision::Active);
+    }
+
+    #[test]
+    fn decide_bundled_with_mixed_rows_still_uses_bundled() {
+        let stored = [space(BUNDLED.0, BUNDLED.1, 3), space(OLLAMA.0, OLLAMA.1, 7)];
+        let decision = decide_query_provider(EmbeddingProviderKind::Bundled, true, &stored);
+        assert_eq!(decision, QueryProviderDecision::Active);
+    }
+
+    #[test]
+    fn decide_bundled_with_only_foreign_rows_blocks() {
+        let stored = [space(OLLAMA.0, OLLAMA.1, 9)];
+        let decision = decide_query_provider(EmbeddingProviderKind::Bundled, true, &stored);
+        assert_eq!(
+            decision,
+            QueryProviderDecision::Block {
+                active_provider: "bundled".to_string(),
+                active_dim: 256,
+                stored_provider: "ollama".to_string(),
+                stored_dim: 768,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_ollama_healthy_with_empty_table_is_active() {
+        let decision = decide_query_provider(EmbeddingProviderKind::Ollama, true, &[]);
+        assert_eq!(decision, QueryProviderDecision::Active);
+    }
+
+    #[test]
+    fn decide_ollama_healthy_with_stored_ollama_rows_is_active() {
+        let stored = [space(OLLAMA.0, OLLAMA.1, 5)];
+        let decision = decide_query_provider(EmbeddingProviderKind::Ollama, true, &stored);
+        assert_eq!(decision, QueryProviderDecision::Active);
+    }
+
+    #[test]
+    fn decide_ollama_healthy_after_switch_to_bundled_index_blocks() {
+        let stored = [space(BUNDLED.0, BUNDLED.1, 5)];
+        let decision = decide_query_provider(EmbeddingProviderKind::Ollama, true, &stored);
+        assert_eq!(
+            decision,
+            QueryProviderDecision::Block {
+                active_provider: "ollama".to_string(),
+                active_dim: 768,
+                stored_provider: "bundled".to_string(),
+                stored_dim: 256,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_ollama_unreachable_with_empty_table_falls_back() {
+        let decision = decide_query_provider(EmbeddingProviderKind::Ollama, false, &[]);
+        assert_eq!(decision, QueryProviderDecision::BundledFallback);
+    }
+
+    #[test]
+    fn decide_ollama_unreachable_with_stored_bundled_rows_falls_back() {
+        let stored = [space(BUNDLED.0, BUNDLED.1, 12)];
+        let decision = decide_query_provider(EmbeddingProviderKind::Ollama, false, &stored);
+        assert_eq!(decision, QueryProviderDecision::BundledFallback);
+    }
+
+    #[test]
+    fn decide_ollama_unreachable_with_only_ollama_rows_blocks() {
+        let stored = [space(OLLAMA.0, OLLAMA.1, 4)];
+        let decision = decide_query_provider(EmbeddingProviderKind::Ollama, false, &stored);
+        assert_eq!(
+            decision,
+            QueryProviderDecision::Block {
+                active_provider: "bundled".to_string(),
+                active_dim: 256,
+                stored_provider: "ollama".to_string(),
+                stored_dim: 768,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_ollama_unreachable_with_mixed_rows_blocks_on_foreign_space() {
+        let stored = [space(BUNDLED.0, BUNDLED.1, 8), space(OLLAMA.0, OLLAMA.1, 2)];
+        let decision = decide_query_provider(EmbeddingProviderKind::Ollama, false, &stored);
+        assert_eq!(
+            decision,
+            QueryProviderDecision::Block {
+                active_provider: "bundled".to_string(),
+                active_dim: 256,
+                stored_provider: "ollama".to_string(),
+                stored_dim: 768,
+            }
+        );
+    }
+
+    #[test]
+    fn vector_space_mismatch_display_carries_reembed_command() {
+        let err = EmbeddingError::VectorSpaceMismatch {
+            active_provider: "bundled".to_string(),
+            active_dim: 256,
+            stored_provider: "ollama".to_string(),
+            stored_dim: 768,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("wonk update --force --provider bundled"));
+    }
+
+    // -- stored_vector_spaces / plan_query_provider ----------------------------
+
+    use super::{fallback_after_disconnect, plan_query_provider, stored_vector_spaces};
+
+    fn seed_space_rows(conn: &Connection, entries: &[(&str, usize)]) {
+        for (i, (provider, dim)) in entries.iter().enumerate() {
+            let sym_id = insert_symbol(
+                conn,
+                &format!("sym_{provider}_{i}"),
+                "function",
+                "a.rs",
+                1,
+                Some(1),
+                None,
+                "fn f()",
+                "Rust",
+            );
+            conn.execute(
+                "INSERT INTO embeddings
+                    (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+                 VALUES (?1, 'a.rs', 'chunk', x'00000000', 0, 1000, ?2, ?3)",
+                rusqlite::params![sym_id, provider, *dim as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn stored_vector_spaces_empty_table_returns_empty() {
+        let conn = setup_test_db_with_embeddings();
+        assert!(stored_vector_spaces(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stored_vector_spaces_groups_and_orders_by_rows() {
+        let conn = setup_test_db_with_embeddings();
+        seed_space_rows(
+            &conn,
+            &[
+                ("bundled", 256),
+                ("bundled", 256),
+                ("bundled", 256),
+                ("ollama", 768),
+            ],
+        );
+
+        let spaces = stored_vector_spaces(&conn).unwrap();
+        assert_eq!(
+            spaces,
+            vec![
+                StoredVectorSpace {
+                    provider: "bundled".to_string(),
+                    dim: 256,
+                    rows: 3,
+                },
+                StoredVectorSpace {
+                    provider: "ollama".to_string(),
+                    dim: 768,
+                    rows: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_query_provider_bundled_index_stays_active_without_warning() {
+        let conn = setup_test_db_with_embeddings();
+        seed_space_rows(&conn, &[("bundled", 256), ("bundled", 256)]);
+
+        let plan = plan_query_provider(&conn, EmbeddingProviderKind::Bundled).unwrap();
+        assert_eq!(plan.provider.name(), "bundled");
+        assert_eq!(plan.provider.dim(), 256);
+        assert!(plan.fallback_warning.is_none());
+    }
+
+    #[test]
+    fn plan_query_provider_bundled_config_over_foreign_index_blocks() {
+        let conn = setup_test_db_with_embeddings();
+        seed_space_rows(&conn, &[("ollama", 768)]);
+
+        let err = match plan_query_provider(&conn, EmbeddingProviderKind::Bundled) {
+            Err(e) => e,
+            Ok(_) => panic!("expected VectorSpaceMismatch, got a provider plan"),
+        };
+        match err {
+            EmbeddingError::VectorSpaceMismatch {
+                active_provider,
+                active_dim,
+                stored_provider,
+                stored_dim,
+            } => {
+                assert_eq!(active_provider, "bundled");
+                assert_eq!(active_dim, 256);
+                assert_eq!(stored_provider, "ollama");
+                assert_eq!(stored_dim, 768);
+            }
+            other => panic!("expected VectorSpaceMismatch, got {other:?}"),
+        }
+    }
+
+    // -- fallback_after_disconnect (mid-query re-plan) -------------------------
+
+    #[test]
+    fn fallback_after_disconnect_bundled_space_degrades_with_warning() {
+        // The provider died mid-query over a bundled index: re-planning skips
+        // the health check and degrades to the bundled provider.
+        let conn = setup_test_db_with_embeddings();
+        seed_space_rows(&conn, &[("bundled", 256), ("bundled", 256)]);
+
+        let plan = fallback_after_disconnect(&conn, EmbeddingProviderKind::Ollama).unwrap();
+        assert_eq!(plan.provider.name(), "bundled");
+        assert_eq!(plan.provider.dim(), 256);
+        assert_eq!(plan.fallback_warning, Some(BUNDLED_FALLBACK_WARNING));
+    }
+
+    #[test]
+    fn fallback_after_disconnect_foreign_space_blocks() {
+        // The stored vectors are foreign (ollama dim): degrading to bundled
+        // would strand the indexed corpus, so the re-plan must refuse with
+        // the re-embed instruction instead.
+        let conn = setup_test_db_with_embeddings();
+        seed_space_rows(&conn, &[("ollama", 768)]);
+
+        let err = match fallback_after_disconnect(&conn, EmbeddingProviderKind::Ollama) {
+            Err(e) => e,
+            Ok(_) => panic!("expected VectorSpaceMismatch, got a provider plan"),
+        };
+        match err {
+            EmbeddingError::VectorSpaceMismatch {
+                active_provider,
+                active_dim,
+                stored_provider,
+                stored_dim,
+            } => {
+                assert_eq!(active_provider, "bundled");
+                assert_eq!(active_dim, 256);
+                assert_eq!(stored_provider, "ollama");
+                assert_eq!(stored_dim, 768);
+            }
+            other => panic!("expected VectorSpaceMismatch, got {other:?}"),
+        }
     }
 }

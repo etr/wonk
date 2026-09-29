@@ -2050,6 +2050,20 @@ pub fn print_error(msg: &str) {
     eprintln!("error: {msg}");
 }
 
+/// The single-line form of a stderr warning.
+///
+/// Pure so tests can pin the exact prefix `wonk` emits for degraded-mode
+/// warnings (integration tests grep stderr for it).
+pub fn warning_line(msg: &str) -> String {
+    format!("warning: {msg}")
+}
+
+/// Print a warning to stderr. Never suppressed: stderr does not pollute
+/// structured stdout, and degraded-results warnings are load-bearing.
+pub fn print_warning(msg: &str) {
+    eprintln!("{}", warning_line(msg));
+}
+
 /// Format a [`WonkError`] to stderr with structured `error:` / `hint:` lines.
 ///
 /// * Always prints `error: <message>` to stderr.
@@ -2096,6 +2110,14 @@ mod tests {
             f(&mut fmt).unwrap();
         }
         String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn warning_line_prefixes_with_warning() {
+        assert_eq!(
+            warning_line("falling back to the bundled provider"),
+            "warning: falling back to the bundled provider"
+        );
     }
 
     // -- SearchOutput --------------------------------------------------------

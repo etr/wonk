@@ -201,12 +201,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 // output interleaved by descending RRF score.
                 use crate::ranker;
 
-                let provider = crate::embedding::create_provider(config.embedding.provider)?;
                 let rrf_k = config.search.rrf_k;
                 let semantic_results = fetch_semantic_results(
                     &args.pattern,
                     conn.as_ref(),
-                    provider.as_ref(),
+                    config.embedding.provider,
                     suppress,
                 )?;
 
@@ -666,9 +665,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Ask(args) => {
-            let ollama_error_msg = crate::embedding::OLLAMA_REQUIRED_MSG;
-            let provider = crate::embedding::create_provider(config.embedding.provider)?;
-
             // Discover repo root (needed for embedding build).
             let repo_root = std::env::current_dir()
                 .ok()
@@ -689,6 +685,17 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
             };
+
+            // Resolve the query provider against the stored vector spaces: an
+            // unreachable configured Ollama degrades to the bundled provider
+            // with a warning (PRD-EMB-REQ-009), while a stored space that
+            // disagrees with the resolved provider blocks with a re-embed
+            // command (PRD-EMB-REQ-005).
+            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
+            if let Some(warning) = plan.fallback_warning {
+                output::print_warning(warning);
+            }
+            let mut provider = plan.provider;
 
             // Validate --from/--to files exist in the index before computing
             // reachability (fail fast with a clear error).
@@ -747,8 +754,25 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        output::print_error(&format!("embedding build failed: {e:#}"));
-                        return Ok(());
+                        // A configured Ollama that dies mid-build degrades to
+                        // the bundled provider instead of failing the query.
+                        if config.embedding.provider
+                            == crate::embedding::EmbeddingProviderKind::Ollama
+                        {
+                            let fallback = crate::embedding::fallback_after_disconnect(
+                                &conn,
+                                config.embedding.provider,
+                            )?;
+                            output::print_warning(
+                                fallback
+                                    .fallback_warning
+                                    .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
+                            );
+                            provider = fallback.provider;
+                        } else {
+                            output::print_error(&format!("embedding build failed: {e:#}"));
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -772,8 +796,18 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let mut query_vec = match provider.embed_single(&args.query) {
                 Ok(v) => v,
                 Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
-                    output::print_error(ollama_error_msg);
-                    return Ok(());
+                    // Ollama died between the health check and the query
+                    // embed: re-plan and degrade if the stored space allows.
+                    let fallback = crate::embedding::fallback_after_disconnect(
+                        &conn,
+                        config.embedding.provider,
+                    )?;
+                    output::print_warning(
+                        fallback
+                            .fallback_warning
+                            .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
+                    );
+                    fallback.provider.embed_single(&args.query)?
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -824,7 +858,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 .and_then(|root| db::find_existing_index(&root))
                 .and_then(|path| db::open(&path).ok());
 
-            let info = query_status_info(conn.as_ref());
+            let info = query_status_info(conn.as_ref(), config.embedding.provider);
 
             if format.is_structured() {
                 let json =
@@ -984,7 +1018,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             McpCommand::Serve => crate::mcp::serve()?,
         },
         Command::Cluster(args) => {
-            let provider = crate::embedding::create_provider(config.embedding.provider)?;
             let conn = std::env::current_dir()
                 .ok()
                 .and_then(|cwd| db::find_repo_root(&cwd).ok())
@@ -1001,6 +1034,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
             };
+
+            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
+            if let Some(warning) = plan.fallback_warning {
+                output::print_warning(warning);
+            }
+            let provider = plan.provider;
 
             // Normalize path: strip leading "./", normalize "." to empty.
             let prefix = args.path.strip_prefix("./").unwrap_or(&args.path);
@@ -1067,7 +1106,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Impact(args) => {
-            let provider = crate::embedding::create_provider(config.embedding.provider)?;
             let repo_root = match std::env::current_dir()
                 .ok()
                 .and_then(|cwd| db::find_repo_root(&cwd).ok())
@@ -1090,6 +1128,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         return Ok(());
                     }
                 };
+
+            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
+            if let Some(warning) = plan.fallback_warning {
+                output::print_warning(warning);
+            }
+            let provider = plan.provider;
 
             // Determine files to analyze.
             let files: Vec<String> = if let Some(ref since) = args.since {
@@ -2296,11 +2340,11 @@ fn is_query_command(cmd: &Command) -> bool {
 /// Fetch semantic search results without formatting them.
 ///
 /// Returns the resolved semantic results, or an empty Vec on graceful
-/// degradation (no DB, no embeddings, Ollama unreachable).
+/// degradation (no DB, no embeddings, provider died mid-query).
 fn fetch_semantic_results(
     pattern: &str,
     conn: Option<&Connection>,
-    provider: &dyn crate::embedding::EmbeddingProvider,
+    configured: crate::embedding::EmbeddingProviderKind,
     suppress: bool,
 ) -> Result<Vec<crate::types::SemanticResult>> {
     let conn = match conn {
@@ -2311,7 +2355,16 @@ fn fetch_semantic_results(
         }
     };
 
-    let all_embeddings = match crate::embedding::load_all_embeddings(conn, provider) {
+    // Resolve the query provider against the stored spaces: unreachable
+    // configured Ollama degrades to bundled with a warning; a mismatched
+    // stored space blocks with a re-embed command.
+    let plan = crate::embedding::plan_query_provider(conn, configured)?;
+    if let Some(warning) = plan.fallback_warning {
+        output::print_warning(warning);
+    }
+    let provider = plan.provider;
+
+    let all_embeddings = match crate::embedding::load_all_embeddings(conn, provider.as_ref()) {
         Ok(e) if !e.is_empty() => e,
         Ok(_) => {
             output::print_hint(
@@ -2335,8 +2388,15 @@ fn fetch_semantic_results(
     let mut query_vec = match provider.embed_single(pattern) {
         Ok(v) => v,
         Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
-            output::print_hint("semantic blending skipped: Ollama is unreachable", suppress);
-            return Ok(Vec::new());
+            // Mid-query disconnect: degrade when the stored space allows it,
+            // otherwise surface the re-embed instruction.
+            let fallback = crate::embedding::fallback_after_disconnect(conn, configured)?;
+            output::print_warning(
+                fallback
+                    .fallback_warning
+                    .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
+            );
+            fallback.provider.embed_single(pattern)?
         }
         Err(e) => return Err(e.into()),
     };
@@ -2397,7 +2457,14 @@ pub struct StatusInfo {
     pub reference_count: i64,
     pub embedding_count: usize,
     pub stale_embedding_count: usize,
-    pub ollama_reachable: bool,
+    /// The provider a semantic query would use (`bundled` or `ollama`).
+    pub active_provider: String,
+    /// Dominant stored vector space; `None` when no embeddings exist.
+    pub stored_vector_provider: Option<String>,
+    pub stored_vector_dim: Option<usize>,
+    /// Ollama reachability, probed only when Ollama is relevant (configured
+    /// provider or stored ollama rows). `None` means "not probed".
+    pub ollama_reachable: Option<bool>,
 }
 
 /// Format status info as a human-readable string for stderr output.
@@ -2422,23 +2489,44 @@ pub fn format_status_info(info: &StatusInfo) -> String {
         lines.push("Embeddings: none".to_string());
     }
 
-    let ollama_status = if info.ollama_reachable {
-        "reachable"
-    } else {
-        "unreachable"
-    };
-    lines.push(format!("Ollama: {ollama_status}"));
+    lines.push(format!("Provider: {}", info.active_provider));
+
+    match (&info.stored_vector_provider, info.stored_vector_dim) {
+        (Some(provider), Some(dim)) => {
+            lines.push(format!("Stored vectors: {provider}, {dim}-dim"));
+        }
+        _ => lines.push("Stored vectors: none".to_string()),
+    }
+
+    if let Some(reachable) = info.ollama_reachable {
+        if reachable {
+            lines.push("Ollama: reachable".to_string());
+        } else if info.active_provider == "ollama" {
+            lines.push(
+                "Ollama: unreachable — semantic queries fall back to the bundled provider"
+                    .to_string(),
+            );
+        } else {
+            lines.push("Ollama: unreachable".to_string());
+        }
+    }
 
     lines.join("\n")
 }
 
-/// Query status from the database and Ollama health check.
+/// Query status from the database and the embedding-provider state.
 ///
-/// Uses a quick 500ms timeout for the Ollama health check so that
-/// `wonk status` doesn't block for 2 seconds when Ollama is unreachable.
-pub fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
-    let client = crate::embedding::OllamaProvider::new();
-    let ollama_reachable = client.is_healthy_quick();
+/// Ollama is probed (quick 500 ms check) only when it is relevant — the
+/// configured provider is Ollama or stored vectors include ollama rows — so
+/// bundled-only users pay no network round trip.
+pub fn query_status_info(
+    conn: Option<&Connection>,
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> StatusInfo {
+    let active_provider = match configured {
+        crate::embedding::EmbeddingProviderKind::Bundled => "bundled",
+        crate::embedding::EmbeddingProviderKind::Ollama => "ollama",
+    };
 
     let Some(conn) = conn else {
         return StatusInfo {
@@ -2448,7 +2536,11 @@ pub fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
             reference_count: 0,
             embedding_count: 0,
             stale_embedding_count: 0,
-            ollama_reachable,
+            active_provider: active_provider.to_string(),
+            stored_vector_provider: None,
+            stored_vector_dim: None,
+            ollama_reachable: (configured == crate::embedding::EmbeddingProviderKind::Ollama)
+                .then(|| crate::embedding::OllamaProvider::new().is_healthy_quick()),
         };
     };
 
@@ -2464,6 +2556,14 @@ pub fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
     let (embedding_count, stale_embedding_count) =
         crate::embedding::embedding_stats(conn).unwrap_or((0, 0));
 
+    let stored = crate::embedding::stored_vector_spaces(conn).unwrap_or_default();
+    let dominant = stored.first();
+    let stored_ollama = stored
+        .iter()
+        .any(|s| s.provider == "ollama" && s.dim == crate::embedding::OLLAMA_DIM);
+    let probe_ollama =
+        configured == crate::embedding::EmbeddingProviderKind::Ollama || stored_ollama;
+
     StatusInfo {
         indexed: true,
         file_count,
@@ -2471,7 +2571,11 @@ pub fn query_status_info(conn: Option<&Connection>) -> StatusInfo {
         reference_count,
         embedding_count,
         stale_embedding_count,
-        ollama_reachable,
+        active_provider: active_provider.to_string(),
+        stored_vector_provider: dominant.map(|s| s.provider.clone()),
+        stored_vector_dim: dominant.map(|s| s.dim),
+        ollama_reachable: probe_ollama
+            .then(|| crate::embedding::OllamaProvider::new().is_healthy_quick()),
     }
 }
 
@@ -5170,7 +5274,10 @@ mod tests {
             reference_count: 2000,
             embedding_count: 300,
             stale_embedding_count: 10,
-            ollama_reachable: true,
+            active_provider: "ollama".to_string(),
+            stored_vector_provider: Some("ollama".to_string()),
+            stored_vector_dim: Some(768),
+            ollama_reachable: Some(true),
         };
         let output = format_status_info(&info);
         assert!(output.contains("100 files"));
@@ -5178,7 +5285,9 @@ mod tests {
         assert!(output.contains("2000 references"));
         assert!(output.contains("300 embeddings"));
         assert!(output.contains("10 stale"));
-        assert!(output.contains("reachable"));
+        assert!(output.contains("Provider: ollama"));
+        assert!(output.contains("Stored vectors: ollama, 768-dim"));
+        assert!(output.contains("Ollama: reachable"));
     }
 
     #[test]
@@ -5190,7 +5299,10 @@ mod tests {
             reference_count: 0,
             embedding_count: 0,
             stale_embedding_count: 0,
-            ollama_reachable: false,
+            active_provider: "bundled".to_string(),
+            stored_vector_provider: None,
+            stored_vector_dim: None,
+            ollama_reachable: None,
         };
         let output = format_status_info(&info);
         assert!(output.contains("No index"));
@@ -5205,18 +5317,89 @@ mod tests {
             reference_count: 800,
             embedding_count: 0,
             stale_embedding_count: 0,
-            ollama_reachable: false,
+            active_provider: "ollama".to_string(),
+            stored_vector_provider: Some("bundled".to_string()),
+            stored_vector_dim: Some(256),
+            ollama_reachable: Some(false),
         };
         let output = format_status_info(&info);
-        assert!(output.contains("unreachable"));
+        assert!(
+            output.contains(
+                "Ollama: unreachable — semantic queries fall back to the bundled provider"
+            ),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_status_info_format_bundled_only_skips_ollama_probe_line() {
+        let info = StatusInfo {
+            indexed: true,
+            file_count: 42,
+            symbol_count: 300,
+            reference_count: 1200,
+            embedding_count: 280,
+            stale_embedding_count: 3,
+            active_provider: "bundled".to_string(),
+            stored_vector_provider: Some("bundled".to_string()),
+            stored_vector_dim: Some(256),
+            ollama_reachable: None,
+        };
+        let output = format_status_info(&info);
+        assert!(output.contains("Provider: bundled"));
+        assert!(output.contains("Stored vectors: bundled, 256-dim"));
+        assert!(!output.contains("Ollama:"), "got: {output}");
+    }
+
+    #[test]
+    fn test_status_info_format_no_stored_vectors() {
+        let info = StatusInfo {
+            indexed: true,
+            file_count: 1,
+            symbol_count: 1,
+            reference_count: 0,
+            embedding_count: 0,
+            stale_embedding_count: 0,
+            active_provider: "bundled".to_string(),
+            stored_vector_provider: None,
+            stored_vector_dim: None,
+            ollama_reachable: None,
+        };
+        let output = format_status_info(&info);
+        assert!(output.contains("Stored vectors: none"), "got: {output}");
+    }
+
+    #[test]
+    fn test_status_info_serializes_provider_fields() {
+        let info = StatusInfo {
+            indexed: true,
+            file_count: 1,
+            symbol_count: 1,
+            reference_count: 0,
+            embedding_count: 2,
+            stale_embedding_count: 0,
+            active_provider: "bundled".to_string(),
+            stored_vector_provider: Some("bundled".to_string()),
+            stored_vector_dim: Some(256),
+            ollama_reachable: None,
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["active_provider"], "bundled");
+        assert_eq!(value["stored_vector_provider"], "bundled");
+        assert_eq!(value["stored_vector_dim"], 256);
+        assert_eq!(value["ollama_reachable"], serde_json::Value::Null);
     }
 
     // -- Semantic fetch + RRF helpers -----------------------------------------
 
     #[test]
     fn test_fetch_semantic_no_conn_returns_empty() {
-        let provider = crate::embedding::OllamaProvider::new();
-        let result = fetch_semantic_results("test", None, &provider, true);
+        let result = fetch_semantic_results(
+            "test",
+            None,
+            crate::embedding::EmbeddingProviderKind::Ollama,
+            true,
+        );
         assert!(result.unwrap().is_empty());
     }
 
@@ -5226,8 +5409,12 @@ mod tests {
         let db_path = dir.path().join("index.db");
         let conn = db::open(&db_path).unwrap();
 
-        let provider = crate::embedding::OllamaProvider::new();
-        let result = fetch_semantic_results("test", Some(&conn), &provider, true);
+        let result = fetch_semantic_results(
+            "test",
+            Some(&conn),
+            crate::embedding::EmbeddingProviderKind::Ollama,
+            true,
+        );
         assert!(result.unwrap().is_empty());
     }
 
@@ -5237,7 +5424,8 @@ mod tests {
         let db_path = dir.path().join("index.db");
         let conn = db::open(&db_path).unwrap();
 
-        // Insert a symbol and a fake embedding.
+        // Insert a symbol and a fake bundled-space embedding so the test is
+        // deterministic offline (no Ollama health probe on the active path).
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
              VALUES ('test_fn', 'function', 'src/test.rs', 1, 0, 'Rust', 'fn test_fn()')",
@@ -5245,20 +5433,22 @@ mod tests {
         )
         .unwrap();
         let symbol_id = conn.last_insert_rowid();
-        let fake_vec: Vec<f32> = vec![0.1; 768];
+        let fake_vec: Vec<f32> = vec![0.1; 256];
         let bytes: &[u8] = bytemuck::cast_slice(&fake_vec);
         conn.execute(
-            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, stale, created_at) \
-             VALUES (?1, 'src/test.rs', 'test chunk', ?2, 0, strftime('%s','now'))",
+            "INSERT INTO embeddings \
+             (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim) \
+             VALUES (?1, 'src/test.rs', 'test chunk', ?2, 0, strftime('%s','now'), 'bundled', 256)",
             rusqlite::params![symbol_id, bytes],
         )
         .unwrap();
 
-        // Should succeed regardless of whether Ollama is running:
-        // - If unreachable: graceful degradation, returns empty Vec
-        // - If reachable: may produce results, still returns Ok
-        let provider = crate::embedding::OllamaProvider::new();
-        let result = fetch_semantic_results("test_query", Some(&conn), &provider, true);
+        let result = fetch_semantic_results(
+            "test_query",
+            Some(&conn),
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            true,
+        );
         assert!(result.is_ok(), "fetch_semantic_results should not error");
     }
 
