@@ -1,10 +1,15 @@
 //! Integration tests for the MCP server (`wonk mcp serve`).
 //!
 //! Spawns the server as a subprocess with piped stdin/stdout and verifies
-//! the JSON-RPC handshake and tool listing.
+//! the JSON-RPC handshake and tool listing. The degraded embedding-provider
+//! tests additionally pin the child process's proxy environment (as in
+//! tests/ask_integration.rs) so the configured Ollama is deterministically
+//! unreachable.
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
 use serde_json::Value;
 
@@ -168,4 +173,226 @@ fn mcp_server_initialize_and_list_tools() {
     drop(stdin);
     let status = child.wait().unwrap();
     assert!(status.success(), "server exited with status: {status}");
+}
+
+// -- degraded embedding-provider paths ---------------------------------------
+//
+// The MCP tools resolve the query provider with the same contract as
+// `wonk ask`: an unreachable configured Ollama degrades to the bundled
+// provider with a warning, and a stored foreign vector space errors with
+// the re-embed command instead of silently searching the wrong space.
+
+/// Offline command (proxy-pinned, no Ollama) rooted at `dir`.
+fn offline_command(bin: &Path, dir: &Path) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .current_dir(dir)
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env_remove("OLLAMA_HOST");
+    command
+}
+
+/// Fixture: temp git repo with an indexed `src/auth.rs` (bundled
+/// embeddings) in the *central* index location, plus the isolated `$HOME`
+/// that central location lives under (`wonk mcp serve` resolves the central
+/// index, unlike `wonk ask` which prefers the local one).
+///
+/// Returns `(repo, home)`; both tempdirs must outlive the server child.
+fn indexed_central_repo(bin: &Path) -> (tempfile::TempDir, tempfile::TempDir) {
+    let repo = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(repo.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    let src_dir = repo.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(
+        src_dir.join("auth.rs"),
+        r#"
+/// Authenticate a user and create an application session.
+pub fn authenticate_user(token: &str) -> Session {
+    Session::from_token(token)
+}
+"#,
+    )
+    .unwrap();
+
+    let home = tempfile::tempdir().unwrap();
+    let init = offline_command(bin, repo.path())
+        .env("HOME", home.path())
+        .args(["init"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "wonk init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    (repo, home)
+}
+
+/// The central `index.db` built by [`indexed_central_repo`] under `home`.
+fn central_index_path(home: &Path) -> PathBuf {
+    let repos_dir = home.join(".wonk").join("repos");
+    for entry in fs::read_dir(&repos_dir).expect("central repos dir after init") {
+        let index = entry.unwrap().path().join("index.db");
+        if index.exists() {
+            return index;
+        }
+    }
+    panic!("no central index found under {}", repos_dir.display());
+}
+
+/// Rewrite every stored embedding row so it claims the ollama vector space,
+/// simulating an index built (or switched) with a different provider.
+fn relabel_embeddings_as_ollama(index: &Path) {
+    let conn = rusqlite::Connection::open(index).unwrap();
+    let changed = conn
+        .execute("UPDATE embeddings SET provider = 'ollama', dim = 768", [])
+        .unwrap();
+    assert!(changed > 0, "expected existing embeddings to relabel");
+}
+
+/// Spawn `wonk mcp serve` offline (proxy-pinned) in `repo`, with the
+/// isolated `home` holding the central index and the global config.
+fn spawn_offline_mcp_server(bin: &Path, repo: &Path, home: &Path) -> Child {
+    offline_command(bin, repo)
+        .env("HOME", home)
+        .args(["mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn wonk mcp serve")
+}
+
+/// Run the initialize handshake and a `wonk_ask` tool call; return the
+/// tools/call response plus everything the server wrote to stderr by the
+/// time it exited.
+fn mcp_wonk_ask(bin: &Path, repo: &Path, home: &Path, query: &str) -> (Value, String) {
+    let mut child = spawn_offline_mcp_server(bin, repo, home);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = child.stderr.take().unwrap();
+
+    let init_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0.1"}
+        }
+    });
+    let init_resp = send_and_recv(&mut stdin, &mut reader, &init_req);
+    assert!(
+        init_resp["error"].is_null(),
+        "initialize failed: {init_resp}"
+    );
+
+    send_notification(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+
+    let ask_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "wonk_ask",
+            "arguments": {"query": query}
+        }
+    });
+    let ask_resp = send_and_recv(&mut stdin, &mut reader, &ask_req);
+    assert_eq!(ask_resp["id"], 2, "response id mismatch: {ask_resp}");
+    assert!(ask_resp["error"].is_null(), "tools/call failed: {ask_resp}");
+
+    // Close stdin so the server exits, then drain stderr.
+    drop(stdin);
+    let mut stderr_text = String::new();
+    stderr
+        .read_to_string(&mut stderr_text)
+        .expect("read server stderr");
+    let status = child.wait().unwrap();
+    assert!(status.success(), "server exited with status: {status}");
+    (ask_resp, stderr_text)
+}
+
+#[test]
+fn mcp_ask_degrades_to_bundled_when_ollama_unreachable() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo(&bin);
+
+    // Configure the (offline) Ollama provider after the bundled index was
+    // built, so queries must degrade to bundled.
+    fs::create_dir_all(repo.path().join(".wonk")).unwrap();
+    fs::write(
+        repo.path().join(".wonk/config.toml"),
+        "[embedding]\nprovider = \"ollama\"\n",
+    )
+    .unwrap();
+
+    let (resp, stderr) = mcp_wonk_ask(&bin, repo.path(), home.path(), "authentication");
+    assert!(
+        resp["result"]["isError"].is_null(),
+        "tool_ask should degrade to bundled results, not error: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("authenticate_user"),
+        "expected bundled-space results in the tool output, got: {text}"
+    );
+    assert!(
+        stderr.contains("falling back to the bundled provider"),
+        "expected the fallback warning on the server's stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn mcp_ask_blocks_on_provider_switch_with_reembed_command() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo(&bin);
+    relabel_embeddings_as_ollama(&central_index_path(home.path()));
+
+    fs::create_dir_all(repo.path().join(".wonk")).unwrap();
+    fs::write(
+        repo.path().join(".wonk/config.toml"),
+        "[embedding]\nprovider = \"ollama\"\n",
+    )
+    .unwrap();
+
+    let (resp, _stderr) = mcp_wonk_ask(&bin, repo.path(), home.path(), "authentication");
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "tool_ask must refuse a provider switch, got: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("vector space mismatch"),
+        "expected mismatch error in the tool result, got: {text}"
+    );
+    assert!(
+        text.contains("active bundled/256"),
+        "expected the bundled fallback space in the error, got: {text}"
+    );
+    assert!(
+        text.contains("stored ollama/768"),
+        "expected the stored ollama space in the error, got: {text}"
+    );
+    assert!(
+        text.contains("wonk update --force --provider bundled"),
+        "expected re-embed command in the tool result, got: {text}"
+    );
 }

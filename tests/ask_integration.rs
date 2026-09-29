@@ -4,6 +4,8 @@
 //! ignored so CI does not require an external service.
 
 use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::{SocketAddr, TcpListener};
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
@@ -466,5 +468,230 @@ fn status_reports_provider_and_dimension() {
     assert!(
         stderr.contains("Ollama: unreachable — semantic queries fall back to the bundled provider"),
         "expected fallback note in status output, got: {stderr}"
+    );
+}
+
+// -- mid-session disconnect (mock Ollama) -----------------------------------
+//
+// The plan-time degraded paths above pin the probe-failing direction. The
+// two tests below pin the race the mid-embed fallback exists for: the probe
+// succeeds, then the embed endpoint dies.
+
+/// A stand-in Ollama that is stopped mid-session: it answers exactly one
+/// health probe (`GET /` → 200 OK), then stops listening, so every later
+/// connection — the `/api/embed` the query needs — is refused. The client
+/// reports that as `ConnectionFailed`, which the embedding layer classifies
+/// as `EmbeddingError::OllamaUnreachable`: "Ollama was healthy at plan time
+/// and is gone by embed time".
+///
+/// The binary hardcodes `http://localhost:11434` for the embedding provider,
+/// so the mock impersonates Ollama by acting as the child process's HTTP
+/// proxy: ureq routes even localhost through HTTP_PROXY when NO_PROXY is
+/// empty and establishes the proxy tunnel with `CONNECT`, after which the
+/// real `GET /` request arrives on the same connection.
+fn spawn_mock_ollama_stopped_after_the_probe() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock ollama");
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        // Serve the plan-time probe, then die.
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut method = request_method(&read_request_head(&mut stream));
+            if method == "CONNECT" {
+                // Complete the proxy tunnel handshake.
+                let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                let _ = stream.flush();
+                method = request_method(&read_request_head(&mut stream));
+            }
+            if method == "GET" {
+                // Health probe: the server is up (for now).
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                );
+                let _ = stream.flush();
+            }
+            // Stop Ollama: nothing further is accepted or answered.
+            drop(listener);
+            break;
+        }
+    });
+    addr
+}
+
+/// Read from `stream` until the end of the request headers (or EOF/error).
+fn read_request_head(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                request.extend_from_slice(&chunk[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    request
+}
+
+/// First token of a raw HTTP request head (the method).
+fn request_method(request: &[u8]) -> String {
+    request
+        .split(|&b| b == b' ')
+        .next()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .unwrap_or_default()
+}
+
+/// Offline command whose ollama traffic is routed through the mock.
+fn mock_routed_command(
+    bin: &std::path::Path,
+    repo: &std::path::Path,
+    proxy: SocketAddr,
+) -> Command {
+    let mut command = Command::new(bin);
+    let proxy = format!("http://{proxy}");
+    command
+        .current_dir(repo)
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("NO_PROXY", "")
+        .env_remove("OLLAMA_HOST");
+    command
+}
+
+/// Mid-session disconnect through the embedding build: the plan-time probe
+/// succeeds (Active: ollama), then Ollama is stopped, so the build's next
+/// contact with it fails. The build failure must degrade to the bundled
+/// provider with the fallback warning instead of failing the query.
+///
+/// This path cannot produce results on stdout: results would require stored
+/// bundled vectors, and a *healthy* configured Ollama over bundled vectors is
+/// a provider switch that blocks at plan time (pinned by
+/// `decide_ollama_healthy_after_switch_to_bundled_index_blocks`). Degrade
+/// with results only happens when the probe itself fails — pinned by
+/// `ask_falls_back_to_bundled_when_ollama_unreachable`. Here the vectors are
+/// dropped, so after degrading there is nothing to search yet: `wonk ask`
+/// exits 0 with a hint and clean stdout.
+#[test]
+fn ask_degrades_to_bundled_when_ollama_dies_mid_build() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let tmp = indexed_bundled_repo(&bin);
+
+    // Drop every stored vector but keep the symbols: the plan resolves
+    // against an empty table (Active: ollama), and `wonk ask` must rebuild
+    // the missing embeddings through the configured provider — which the
+    // mock has stopped by then.
+    let conn = rusqlite::Connection::open(tmp.path().join(".wonk/index.db")).unwrap();
+    conn.execute("DELETE FROM embeddings", []).unwrap();
+    drop(conn);
+
+    fs::create_dir_all(tmp.path().join(".wonk")).unwrap();
+    fs::write(
+        tmp.path().join(".wonk/config.toml"),
+        "[embedding]\nprovider = \"ollama\"\n",
+    )
+    .unwrap();
+
+    let mock = spawn_mock_ollama_stopped_after_the_probe();
+    let output = mock_routed_command(&bin, tmp.path(), mock)
+        .args(["ask", "authentication", "--format", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a mid-build disconnect should degrade, not fail: {stderr}"
+    );
+    assert!(
+        stderr.contains("falling back to the bundled provider"),
+        "expected fallback warning on stderr, got: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no structured results are possible on this path, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// Mid-session disconnect at the query embed: the stored vectors already
+/// belong to the ollama space (padded to valid 768-float blobs so they
+/// load), so the probe succeeding keeps the provider ollama until the query
+/// embed dies. The mid-embed fallback must then refuse — degrading to
+/// bundled would silently drop the indexed corpus — surfacing the mismatch
+/// with the exact re-embed command.
+#[test]
+fn ask_mid_embed_disconnect_over_foreign_space_blocks_with_reembed_command() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let tmp = indexed_bundled_repo(&bin);
+
+    // Relabel into the ollama space and pad the vectors to real 768-float
+    // blobs so they load as valid ollama vectors (a plain relabel keeps
+    // 256-float blobs, which would fail vector decoding before the query
+    // embed ever runs).
+    let mut vector = Vec::with_capacity(768 * 4);
+    for _ in 0..768 {
+        vector.extend_from_slice(&0.25_f32.to_le_bytes());
+    }
+    let conn = rusqlite::Connection::open(tmp.path().join(".wonk/index.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE embeddings SET provider = 'ollama', dim = 768, vector = ?1",
+            rusqlite::params![vector],
+        )
+        .unwrap();
+    assert!(changed > 0, "expected existing embeddings to relabel");
+    drop(conn);
+
+    fs::create_dir_all(tmp.path().join(".wonk")).unwrap();
+    fs::write(
+        tmp.path().join(".wonk/config.toml"),
+        "[embedding]\nprovider = \"ollama\"\n",
+    )
+    .unwrap();
+
+    let mock = spawn_mock_ollama_stopped_after_the_probe();
+    let output = mock_routed_command(&bin, tmp.path(), mock)
+        .args(["ask", "authentication", "--format", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the mid-embed fallback must refuse to search a foreign space: {stderr}"
+    );
+    assert!(
+        stderr.contains("vector space mismatch"),
+        "expected the re-plan's mismatch error (not a plain transport failure), got: {stderr}"
+    );
+    assert!(
+        stderr.contains("active bundled/256"),
+        "expected the bundled fallback space in the error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("stored ollama/768"),
+        "expected the stored ollama space in the error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("wonk update --force --provider bundled"),
+        "expected re-embed command, got: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no structured results on a blocked query, got: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }

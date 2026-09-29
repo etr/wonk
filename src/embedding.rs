@@ -3470,7 +3470,7 @@ mod tests {
 
     // -- stored_vector_spaces / plan_query_provider ----------------------------
 
-    use super::{plan_query_provider, stored_vector_spaces};
+    use super::{fallback_after_disconnect, plan_query_provider, stored_vector_spaces};
 
     fn seed_space_rows(conn: &Connection, entries: &[(&str, usize)]) {
         for (i, (provider, dim)) in entries.iter().enumerate() {
@@ -3549,6 +3549,49 @@ mod tests {
         seed_space_rows(&conn, &[("ollama", 768)]);
 
         let err = match plan_query_provider(&conn, EmbeddingProviderKind::Bundled) {
+            Err(e) => e,
+            Ok(_) => panic!("expected VectorSpaceMismatch, got a provider plan"),
+        };
+        match err {
+            EmbeddingError::VectorSpaceMismatch {
+                active_provider,
+                active_dim,
+                stored_provider,
+                stored_dim,
+            } => {
+                assert_eq!(active_provider, "bundled");
+                assert_eq!(active_dim, 256);
+                assert_eq!(stored_provider, "ollama");
+                assert_eq!(stored_dim, 768);
+            }
+            other => panic!("expected VectorSpaceMismatch, got {other:?}"),
+        }
+    }
+
+    // -- fallback_after_disconnect (mid-query re-plan) -------------------------
+
+    #[test]
+    fn fallback_after_disconnect_bundled_space_degrades_with_warning() {
+        // The provider died mid-query over a bundled index: re-planning skips
+        // the health check and degrades to the bundled provider.
+        let conn = setup_test_db_with_embeddings();
+        seed_space_rows(&conn, &[("bundled", 256), ("bundled", 256)]);
+
+        let plan = fallback_after_disconnect(&conn, EmbeddingProviderKind::Ollama).unwrap();
+        assert_eq!(plan.provider.name(), "bundled");
+        assert_eq!(plan.provider.dim(), 256);
+        assert_eq!(plan.fallback_warning, Some(BUNDLED_FALLBACK_WARNING));
+    }
+
+    #[test]
+    fn fallback_after_disconnect_foreign_space_blocks() {
+        // The stored vectors are foreign (ollama dim): degrading to bundled
+        // would strand the indexed corpus, so the re-plan must refuse with
+        // the re-embed instruction instead.
+        let conn = setup_test_db_with_embeddings();
+        seed_space_rows(&conn, &[("ollama", 768)]);
+
+        let err = match fallback_after_disconnect(&conn, EmbeddingProviderKind::Ollama) {
             Err(e) => e,
             Ok(_) => panic!("expected VectorSpaceMismatch, got a provider plan"),
         };
