@@ -71,6 +71,8 @@ struct FileResult {
     imports: Vec<String>,
     /// Extracted type hierarchy edges (extends/implements).
     type_edges: Vec<RawTypeEdge>,
+    /// BM25 term frequencies over the raw content (TASK-078).
+    term_freqs: HashMap<String, u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +370,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
     }
 
     let line_count = content.lines().count();
+    let term_freqs = crate::tokenizer::term_frequencies(&content);
 
     // Single transaction: delete old data, insert new data.
     upsert_file_data(
@@ -381,6 +384,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
             refs,
             imports: file_imports.imports,
             type_edges,
+            term_freqs,
         },
     )?;
 
@@ -706,6 +710,7 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
     }
 
     let line_count = content.lines().count();
+    let term_freqs = crate::tokenizer::term_frequencies(&content);
 
     Some(FileResult {
         rel_path,
@@ -716,6 +721,7 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
         refs,
         imports: file_imports.imports,
         type_edges,
+        term_freqs,
     })
 }
 
@@ -832,6 +838,17 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
         for r in results {
             for import in &r.imports {
                 stmt.execute(rusqlite::params![r.rel_path, import])?;
+            }
+        }
+    }
+
+    // Insert BM25 term statistics — same transaction as the file's symbols.
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)")?;
+        for r in results {
+            for (term, tf) in &r.term_freqs {
+                stmt.execute(rusqlite::params![term, r.rel_path, *tf as i64])?;
             }
         }
     }
@@ -1338,6 +1355,7 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM symbols;
          DELETE FROM \"references\";
          DELETE FROM file_imports;
+         DELETE FROM term_stats;
          DELETE FROM files;",
     )
     .context("clearing index data")?;
@@ -1557,6 +1575,126 @@ class Component {
 
         assert!(!meta.languages.is_empty(), "meta should list languages");
         assert!(meta.created > 0, "meta should have a timestamp");
+    }
+
+    // -----------------------------------------------------------------------
+    // term_stats (TASK-078)
+    // -----------------------------------------------------------------------
+
+    /// Assert the DB term_stats are exactly what the tokenizer oracle
+    /// produces from the current disk content of every indexed file, with
+    /// no orphan rows and no missing document lengths.
+    fn assert_stats_match_disk(conn: &Connection, root: &Path) {
+        let paths: Vec<String> = conn
+            .prepare("SELECT path FROM files")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(!paths.is_empty(), "index should contain files");
+
+        for rel in &paths {
+            let content = fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("reading {rel}: {e}"));
+            let expected = crate::tokenizer::term_frequencies(&content);
+            let actual: HashMap<String, i64> = conn
+                .prepare("SELECT term, tf FROM term_stats WHERE file = ?1")
+                .unwrap()
+                .query_map(rusqlite::params![rel], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{rel}: distinct term count differs from tokenizer oracle"
+            );
+            for (term, tf) in &expected {
+                assert_eq!(
+                    actual.get(term).copied(),
+                    Some(*tf as i64),
+                    "{rel}: tf for term '{term}' differs from tokenizer oracle"
+                );
+            }
+        }
+
+        // No orphan rows: every stats row must reference an indexed file.
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats \
+                 WHERE file NOT IN (SELECT path FROM files)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "term_stats rows must not outlive their file");
+
+        // Document lengths are BM25's |D| — never NULL for files with stats.
+        let null_lengths: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE line_count IS NULL \
+                 AND path IN (SELECT DISTINCT file FROM term_stats)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_lengths, 0, "files with stats must have a line_count");
+    }
+
+    #[test]
+    fn test_build_index_populates_term_stats() {
+        let dir = make_test_repo();
+        let _stats = build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // src/main.rs contains "helper" twice: the call site and the
+        // definition. Lowercased alphanumeric tokens, punctuation stripped.
+        let tf_helper: i64 = conn
+            .query_row(
+                "SELECT tf FROM term_stats WHERE term = 'helper' AND file = 'src/main.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tf_helper, 2, "tf for 'helper' in src/main.rs");
+
+        // "helper" only occurs in src/main.rs → document frequency 1.
+        let df_helper: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE term = 'helper'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(df_helper, 1);
+
+        // Every indexed file contributes at least one distinct term.
+        let total_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        let file_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            total_rows >= file_count,
+            "each indexed file should have term_stats rows ({total_rows} rows for {file_count} files)"
+        );
+    }
+
+    #[test]
+    fn test_term_stats_tf_matches_tokenizer_per_file() {
+        let dir = make_test_repo();
+        let _stats = build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+
+        assert_stats_match_disk(&conn, dir.path());
     }
 
     #[test]
