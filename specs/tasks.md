@@ -45,7 +45,7 @@
 | M25 | Multi-Repo MCP | 1 | Complete |
 | M26 | Bundled Embedding Provider | 3 | Complete |
 | M27 | Lexical BM25 Scoring | 2 | Complete |
-| M28 | Precomputed Reach Index | 2 | Not Started |
+| M28 | Precomputed Reach Index | 2 | In Progress |
 | M29 | Cross-Repo Contract Detection | 5 | Not Started |
 | M30 | Diff-Scoped Review Workflow | 3 | Not Started |
 | M31 | Body Elision | 2 | Not Started |
@@ -3393,18 +3393,18 @@ Re-rank lexical candidates by BM25 and feed the resulting ranked list into the e
 Create `reach.rs` and the `reach` table, build bounded-depth reachability during index build, and route qualifying blast queries to it.
 
 **Action Items:**
-- [ ] Add `reach(source_id, target_id, min_depth)` table with `(source_id, min_depth)` and `target_id` indexes (DR-034)
-- [ ] Build reach to the configured depth over `references.caller_id` and `type_edges` during index build (PRD-REACH-REQ-001)
-- [ ] Store minimum depth per pair so blast severity tiers are preserved (PRD-REACH-REQ-002, DR-024)
-- [ ] Add `reach.depth` (default 3) and `reach.enabled` (default true) config keys (PRD-REACH-REQ-006)
-- [ ] Route blast queries within the precomputed depth to the table (PRD-REACH-REQ-003)
-- [ ] Fall back to BFS beyond the precomputed depth, or when the table is absent/stale (PRD-REACH-REQ-004, PRD-REACH-REQ-007)
-- [ ] Restrict precomputation to change-target symbol kinds — functions, methods, types, interfaces, fields, enum members, constants, variables; exclude files, imports, parameters (PRD-REACH-REQ-010, AR-020)
-- [ ] Write and replace reach rows inside the same transaction as the file's symbols/references, so a partial rebuild is never readable (PRD-REACH-REQ-008, AR-028)
-- [ ] Add a per-symbol fan-out cap; carry a truncation marker **on the result**, not only in a log (PRD-REACH-REQ-009, OQ-012, AR-020)
-- [ ] Extract the edge-eligibility predicate into one exported function called by **both** the precomputed build and the live BFS (AR-021)
-- [ ] Mandatory equivalence test: reach lookup ≡ BFS result at equal depth (AR-021)
-- [ ] Concurrency test: a reader during re-index never observes a shrunken reach set (PRD-REACH-REQ-008, AR-028)
+- [x] Add `reach(source_id, target_id, min_depth)` table with `(source_id, min_depth)` and `target_id` indexes (DR-034)
+- [x] Build reach to the configured depth over `references.caller_id` and `type_edges` during index build (PRD-REACH-REQ-001)
+- [x] Store minimum depth per pair so blast severity tiers are preserved (PRD-REACH-REQ-002, DR-024)
+- [x] Add `reach.depth` (default 3) and `reach.enabled` (default true) config keys (PRD-REACH-REQ-006)
+- [x] Route blast queries within the precomputed depth to the table (PRD-REACH-REQ-003)
+- [x] Fall back to BFS beyond the precomputed depth, or when the table is absent/stale (PRD-REACH-REQ-004, PRD-REACH-REQ-007)
+- [x] Restrict precomputation to change-target symbol kinds — functions, methods, types, interfaces, fields, enum members, constants, variables; exclude files, imports, parameters (PRD-REACH-REQ-010, AR-020)
+- [x] Write and replace reach rows inside the same transaction as the file's symbols/references, so a partial rebuild is never readable (PRD-REACH-REQ-008, AR-028)
+- [x] Add a per-symbol fan-out cap; carry a truncation marker **on the result**, not only in a log (PRD-REACH-REQ-009, OQ-012, AR-020)
+- [x] Extract the edge-eligibility predicate into one exported function called by **both** the precomputed build and the live BFS (AR-021)
+- [x] Mandatory equivalence test: reach lookup ≡ BFS result at equal depth (AR-021)
+- [x] Concurrency test: a reader during re-index never observes a shrunken reach set (PRD-REACH-REQ-008, AR-028)
 
 **Dependencies:**
 - Blocked by: TASK-058, TASK-070
@@ -3424,7 +3424,7 @@ Create `reach.rs` and the `reach` table, build bounded-depth reachability during
 **Related Requirements:** PRD-REACH-REQ-001, PRD-REACH-REQ-002, PRD-REACH-REQ-003, PRD-REACH-REQ-004, PRD-REACH-REQ-006, PRD-REACH-REQ-007
 **Related Decisions:** DR-034
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
