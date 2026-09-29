@@ -151,10 +151,24 @@ pub fn extract_contracts(
     } else {
         RouterContext::default()
     };
+    // The RPC pre-pass binds generated stubs to their services (TASK-088);
+    // JS/TS additionally require a file-level "grpc" marker before any
+    // generated-code detection fires — `new XClient(...)` alone is not
+    // evidence of gRPC.
+    let rpc = if opts.grpc {
+        collect_rpc_context(tree.root_node(), src, lang)
+    } else {
+        RpcContext::default()
+    };
+    let grpc_hint = opts.grpc
+        && matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
+        && source.to_lowercase().contains("grpc");
     let mut ex = Extractor {
         src,
         lang,
         ctx,
+        rpc,
+        grpc_hint,
         opts: *opts,
         out: Vec::new(),
     };
@@ -564,6 +578,223 @@ fn collect_ruby_queue_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RPC context (TASK-088, plan 5.1): generated-stub bindings
+// ---------------------------------------------------------------------------
+
+/// Variable-to-service knowledge for generated gRPC stubs/clients, gathered
+/// before the contract walk so `stub.GetUser(req)` call sites can resolve
+/// their service (mirrors [`RouterContext`]).
+#[derive(Default)]
+struct RpcContext {
+    /// Client variable -> service qualifier as written by the developer
+    /// (`stub` -> `UserService`, JS `client` -> `user.UserService`).
+    stubs: HashMap<String, String>,
+}
+
+fn collect_rpc_context(root: Node, src: &[u8], lang: Lang) -> RpcContext {
+    let mut ctx = RpcContext::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match lang {
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+                collect_js_rpc_facts(node, src, &mut ctx);
+            }
+            Lang::Python => collect_py_rpc_facts(node, src, &mut ctx),
+            Lang::Go => collect_go_rpc_facts(node, src, &mut ctx),
+            Lang::Rust => collect_rust_rpc_facts(node, src, &mut ctx),
+            Lang::Java => collect_java_rpc_facts(node, src, &mut ctx),
+            _ => {}
+        }
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push(child);
+            }
+        }
+    }
+    ctx
+}
+
+/// `XGrpc` receiver of a stub constructor -> service `X` (dotted
+/// qualification before `Grpc` survives).
+fn java_grpc_service_from_object(object: Option<Node>, src: &[u8]) -> Option<String> {
+    let rest = node_text(object, src).strip_suffix("Grpc")?;
+    if rest.rsplit('.').next().unwrap_or("").is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// `New<S>Client` generated constructor -> `S` (Go: always the bare service).
+fn go_service_from_new_client(func: Node, src: &[u8]) -> Option<String> {
+    let last = node_text(Some(func), src).rsplit('.').next().unwrap_or("");
+    let service = last.strip_prefix("New")?.strip_suffix("Client")?;
+    if service.is_empty() {
+        return None;
+    }
+    Some(service.to_string())
+}
+
+/// `Register<S>Server(...)` registration function -> `S`.
+fn go_service_from_register(name: &str) -> Option<String> {
+    let service = name.strip_prefix("Register")?.strip_suffix("Server")?;
+    if service.is_empty() {
+        return None;
+    }
+    Some(service.to_string())
+}
+
+/// `UserServiceGrpc.newBlockingStub(channel)` initializer binding (Java).
+fn collect_java_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "variable_declarator" {
+        return;
+    }
+    let var = node_text(node.child_by_field_name("name"), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    if value.kind() != "method_invocation"
+        || !matches!(
+            node_text(value.child_by_field_name("name"), src),
+            "newBlockingStub" | "newStub" | "newFutureStub"
+        )
+    {
+        return;
+    }
+    if let Some(service) = java_grpc_service_from_object(value.child_by_field_name("object"), src) {
+        ctx.stubs.insert(var.to_string(), service);
+    }
+}
+
+/// `client := pb.NewUserServiceClient(conn)` binding (Go).
+fn collect_go_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "short_var_declaration" {
+        return;
+    }
+    let Some(var) = node
+        .child_by_field_name("left")
+        .and_then(|l| l.named_child(0))
+        .filter(|n| n.kind() == "identifier")
+    else {
+        return;
+    };
+    let var = node_text(Some(var), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(func) = node
+        .child_by_field_name("right")
+        .and_then(|r| r.named_child(0))
+        .filter(|n| n.kind() == "call_expression")
+        .and_then(|call| call.child_by_field_name("function"))
+    else {
+        return;
+    };
+    if let Some(service) = go_service_from_new_client(func, src) {
+        ctx.stubs.insert(var.to_string(), service);
+    }
+}
+
+/// `let client = UserServiceClient::new(channel)` binding (Rust/tonic).
+fn collect_rust_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "let_declaration" {
+        return;
+    }
+    // tonic convention is `let mut client`; the pattern then wraps the
+    // identifier in a `mut_pattern`.
+    let var_node = match node.child_by_field_name("pattern") {
+        Some(p) if p.kind() == "identifier" => Some(p),
+        Some(p) if p.kind() == "mut_pattern" => {
+            p.named_child(0).filter(|c| c.kind() == "identifier")
+        }
+        _ => None,
+    };
+    let Some(var) = var_node else {
+        return;
+    };
+    let var = node_text(Some(var), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    if value.kind() != "call_expression" {
+        return;
+    }
+    let Some(func) = value.child_by_field_name("function") else {
+        return;
+    };
+    // `<path>::new` where the constructor path ends in `<S>Client`.
+    let text = node_text(Some(func), src);
+    let Some(ctor) = text.strip_suffix("::new") else {
+        return;
+    };
+    let Some(last) = ctor.rsplit("::").next() else {
+        return;
+    };
+    if let Some(service) = last.strip_suffix("Client").filter(|s| !s.is_empty()) {
+        ctx.stubs.insert(var.to_string(), service.to_string());
+    }
+}
+
+/// `stub = user_service_pb2.UserServiceStub(channel)` binding (Python).
+fn collect_py_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "assignment" {
+        return;
+    }
+    let Some(var) = node
+        .child_by_field_name("left")
+        .filter(|n| n.kind() == "identifier")
+    else {
+        return;
+    };
+    let var = node_text(Some(var), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(func) = node
+        .child_by_field_name("right")
+        .filter(|n| n.kind() == "call")
+        .and_then(|call| call.child_by_field_name("function"))
+    else {
+        return;
+    };
+    // `<module>.<S>Stub` — the pb2 module prefix is a Python import
+    // artifact, so the bare service name is kept.
+    let last = node_text(Some(func), src).rsplit('.').next().unwrap_or("");
+    if let Some(service) = last.strip_suffix("Stub").filter(|s| !s.is_empty()) {
+        ctx.stubs.insert(var.to_string(), service.to_string());
+    }
+}
+
+/// `const c = new user.UserServiceClient(host, creds)` binding (JS/TS) —
+/// the package-qualification acceptance case: the dotted prefix stays in the
+/// service qualifier, and the canonical join relaxes it at match time.
+fn collect_js_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "variable_declarator" {
+        return;
+    }
+    let var = node_text(node.child_by_field_name("name"), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(ctor) = node
+        .child_by_field_name("value")
+        .filter(|n| n.kind() == "new_expression")
+        .and_then(|new| new.child_by_field_name("constructor"))
+    else {
+        return;
+    };
+    let text = node_text(Some(ctor), src);
+    if let Some(service) = text.strip_suffix("Client").filter(|s| !s.is_empty()) {
+        ctx.stubs.insert(var.to_string(), service.to_string());
+    }
+}
+
 /// The i-th positional argument of an argument list (skipping keywords).
 ///
 /// Grammars that wrap each argument in an `argument` node (PHP, C#) are
@@ -728,6 +959,9 @@ struct Extractor<'a> {
     src: &'a [u8],
     lang: Lang,
     ctx: RouterContext,
+    rpc: RpcContext,
+    /// JS/TS only: the file mentions "grpc" somewhere (TASK-088 gate).
+    grpc_hint: bool,
     opts: ContractOptions,
     out: Vec<ContractCandidate>,
 }
@@ -842,6 +1076,9 @@ impl<'a> Extractor<'a> {
     }
 
     fn js_call(&mut self, node: Node, prefix: &str) {
+        if self.grpc_hint {
+            self.js_grpc_call(node);
+        }
         let func = node.child_by_field_name("function");
         let args = node.child_by_field_name("arguments");
         let (Some(func), Some(args)) = (func, args) else {
@@ -1214,9 +1451,17 @@ impl<'a> Extractor<'a> {
     fn visit_python(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "decorated_definition" => return self.py_decorated(node, prefix),
-            "call" => self.py_call(node, prefix),
+            "call" => {
+                if self.opts.grpc {
+                    self.python_grpc_call(node);
+                }
+                self.py_call(node, prefix);
+            }
             "subscript" => self.py_env_subscript(node),
             "assignment" => self.py_assignment(node, prefix),
+            "class_definition" if self.opts.grpc => {
+                self.python_grpc_class(node);
+            }
             _ => {}
         }
         prefix.to_string()
@@ -1859,6 +2104,9 @@ impl<'a> Extractor<'a> {
 
     fn visit_go(&mut self, node: Node, prefix: &str) -> String {
         if node.kind() == "call_expression" {
+            if self.opts.grpc {
+                self.go_grpc(node);
+            }
             self.go_call(node, prefix);
         }
         prefix.to_string()
@@ -2119,7 +2367,15 @@ impl<'a> Extractor<'a> {
                 self.rust_attribute(node);
             }
             "call_expression" => {
+                if self.opts.grpc {
+                    self.rust_grpc_call(node);
+                }
                 self.rust_call(node, prefix);
+            }
+            "impl_item" => {
+                if self.opts.grpc {
+                    self.rust_grpc_impl(node);
+                }
             }
             "macro_invocation" => {
                 self.rust_macro(node);
@@ -2397,12 +2653,18 @@ impl<'a> Extractor<'a> {
     fn visit_java(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "class_declaration" => {
+                if self.opts.grpc {
+                    self.java_grpc_impl_base(node);
+                }
                 return self.java_class(node, prefix);
             }
             "method_declaration" => {
                 self.java_method(node, prefix);
             }
             "method_invocation" => {
+                if self.opts.grpc {
+                    self.java_grpc_call(node);
+                }
                 self.java_call(node, prefix);
             }
             _ => {}
@@ -3485,6 +3747,311 @@ impl<'a> Extractor<'a> {
     /// (`io.to(room).emit` counts — the root decides).
     fn is_ws_receiver(&self, func: Node) -> bool {
         WS_RECEIVERS.contains(&node_text(Some(js_chain_root(func)), self.src))
+    }
+
+    /// Emit one grpc-family contract at `node`'s line (TASK-088 emit choke
+    /// point — the single place the kind is gated).
+    fn emit_grpc(
+        &mut self,
+        node: Node,
+        service: &str,
+        method: &str,
+        role: ContractRole,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.grpc || service.is_empty() || method.is_empty() {
+            return;
+        }
+        let owning = owning
+            .map(str::to_string)
+            .or_else(|| crate::indexer::find_enclosing_function(node, self.src, self.lang));
+        let line = node.start_position().row + 1;
+        self.out.push(grpc_candidate(
+            service,
+            method,
+            role,
+            owning.as_deref(),
+            line,
+        ));
+    }
+
+    // -- grpc generated/server code arms (TASK-088, plan 5.1) ------------------
+
+    /// Java provider: `class X extends <…><S>Grpc.<S>ImplBase` — every member
+    /// method serves one rpc.
+    fn java_grpc_impl_base(&mut self, node: Node) {
+        let sup = node_text(node.child_by_field_name("superclass"), self.src);
+        let Some(service) = sup
+            .split('.')
+            .next_back()
+            .and_then(|last| last.strip_suffix("ImplBase"))
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        for i in 0..body.child_count() {
+            let Some(m) = body.child(i as u32) else {
+                continue;
+            };
+            if m.kind() != "method_declaration" {
+                continue;
+            }
+            let name_node = m.child_by_field_name("name");
+            let name = node_text(name_node, self.src);
+            if let Some(anchor) = name_node.filter(|_| !name.is_empty()) {
+                self.emit_grpc(anchor, service, name, ContractRole::Provider, Some(name));
+            }
+        }
+    }
+
+    /// Java call sites: `addService(XGrpc.bindService(...))` registers the
+    /// whole service (`*`); bound `stub.M(req)` and inline
+    /// `XGrpc.newBlockingStub(ch).M(req)` consume one method.
+    fn java_grpc_call(&mut self, node: Node) {
+        let name = node_text(node.child_by_field_name("name"), self.src);
+        if name == "addService" {
+            let bind = node
+                .child_by_field_name("arguments")
+                .and_then(|args| positional_arg(args, 0))
+                .filter(|arg| arg.kind() == "method_invocation")
+                .filter(|arg| {
+                    node_text(arg.child_by_field_name("name"), self.src) == "bindService"
+                });
+            if let Some(bind) = bind
+                && let Some(service) =
+                    java_grpc_service_from_object(bind.child_by_field_name("object"), self.src)
+            {
+                self.emit_grpc(node, &service, "*", ContractRole::Provider, None);
+            }
+            return;
+        }
+        let Some(object) = node.child_by_field_name("object") else {
+            return;
+        };
+        // Inline chain: XGrpc.newBlockingStub(ch).M(req)
+        if object.kind() == "method_invocation"
+            && matches!(
+                node_text(object.child_by_field_name("name"), self.src),
+                "newBlockingStub" | "newStub" | "newFutureStub"
+            )
+            && let Some(service) =
+                java_grpc_service_from_object(object.child_by_field_name("object"), self.src)
+        {
+            self.emit_grpc(node, &service, name, ContractRole::Consumer, None);
+            return;
+        }
+        // Bound stub: stub.M(req)
+        let recv = node_text(Some(object), self.src);
+        if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+            self.emit_grpc(node, &service, name, ContractRole::Consumer, None);
+        }
+    }
+
+    /// Go sites: `Register<S>Server(...)` registers the service (`*`);
+    /// bound `client.M(...)` and inline `pb.New<S>Client(conn).M(...)`
+    /// consume one method.
+    fn go_grpc(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        match func.kind() {
+            "identifier" => {
+                if let Some(service) = go_service_from_register(node_text(Some(func), self.src)) {
+                    self.emit_grpc(node, &service, "*", ContractRole::Provider, None);
+                }
+            }
+            "selector_expression" => {
+                let meth = node_text(func.child_by_field_name("field"), self.src);
+                if meth.is_empty() {
+                    return;
+                }
+                // pb.Register<S>Server(...) — qualified registration call.
+                if let Some(service) = go_service_from_register(meth) {
+                    self.emit_grpc(node, &service, "*", ContractRole::Provider, None);
+                    return;
+                }
+                let operand = func.child_by_field_name("operand");
+                if let Some(op) = operand.filter(|op| op.kind() == "call_expression")
+                    && let Some(inner) = op.child_by_field_name("function")
+                    && let Some(service) = go_service_from_new_client(inner, self.src)
+                {
+                    self.emit_grpc(node, &service, meth, ContractRole::Consumer, None);
+                    return;
+                }
+                let recv = node_text(operand, self.src);
+                if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+                    self.emit_grpc(node, &service, meth, ContractRole::Consumer, None);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Rust provider: `impl <path>::<S> for T` — every impl method serves one
+    /// rpc (tonic generates snake_case method names; the join folds casing).
+    /// The trait must be a qualified path: `impl UserService for T` without a
+    /// module path is indistinguishable from any std trait impl.
+    fn rust_grpc_impl(&mut self, node: Node) {
+        let trait_text = node_text(node.child_by_field_name("trait"), self.src);
+        let Some(service) = trait_text
+            .rsplit("::")
+            .next()
+            .filter(|s| trait_text.contains("::") && !s.is_empty())
+        else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        for i in 0..body.child_count() {
+            let Some(f) = body.child(i as u32) else {
+                continue;
+            };
+            if f.kind() != "function_item" {
+                continue;
+            }
+            let name_node = f.child_by_field_name("name");
+            let name = node_text(name_node, self.src);
+            if let Some(anchor) = name_node.filter(|_| !name.is_empty()) {
+                self.emit_grpc(anchor, service, name, ContractRole::Provider, Some(name));
+            }
+        }
+    }
+
+    /// Rust consumer: bound `client.m(req)` and inline
+    /// `<S>Client::new(ch).m(req)` (with or without `.await`).
+    fn rust_grpc_call(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() != "field_expression" {
+            return;
+        }
+        let meth = node_text(func.child_by_field_name("field"), self.src);
+        if meth.is_empty() {
+            return;
+        }
+        // This grammar names the receiver field "value" (not "object").
+        let object = func.child_by_field_name("value");
+        // Inline: UserServiceClient::new(ch).get_user(req)
+        if let Some(op) = object.filter(|op| op.kind() == "call_expression")
+            && let Some(inner) = op.child_by_field_name("function")
+            && let Some(ctor) = node_text(Some(inner), self.src).strip_suffix("::new")
+            && let Some(last) = ctor.rsplit("::").next()
+            && let Some(service) = last.strip_suffix("Client").filter(|s| !s.is_empty())
+        {
+            self.emit_grpc(node, service, meth, ContractRole::Consumer, None);
+            return;
+        }
+        let recv = node_text(object, self.src);
+        if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+            self.emit_grpc(node, &service, meth, ContractRole::Consumer, None);
+        }
+    }
+
+    /// Python provider: `class S(<pkg>.<S>Servicer)` — each member def serves
+    /// one rpc; free `add_<S>Servicer_to_server` registers the service (`*`).
+    fn python_grpc_class(&mut self, node: Node) {
+        let bases = node.child_by_field_name("superclasses");
+        let Some(bases) = bases else { return };
+        let mut service: Option<&str> = None;
+        for i in 0..bases.named_child_count() {
+            let Some(base) = bases.named_child(i as u32) else {
+                continue;
+            };
+            let last = node_text(Some(base), self.src)
+                .rsplit('.')
+                .next()
+                .unwrap_or("");
+            if let Some(s) = last.strip_suffix("Servicer").filter(|s| !s.is_empty()) {
+                service = Some(s);
+                break;
+            }
+        }
+        let Some(service) = service else { return };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        for i in 0..body.child_count() {
+            let Some(d) = body.child(i as u32) else {
+                continue;
+            };
+            if d.kind() != "function_definition" {
+                continue;
+            }
+            let name_node = d.child_by_field_name("name");
+            let name = node_text(name_node, self.src);
+            if let Some(anchor) = name_node.filter(|_| !name.is_empty()) {
+                self.emit_grpc(anchor, service, name, ContractRole::Provider, Some(name));
+            }
+        }
+    }
+
+    /// Python sites: the free call `add_<S>Servicer_to_server(...)` (the
+    /// generated registration function, imported — never defined here)
+    /// registers the service (`*`); bound `stub.M(req)` consumes a method.
+    fn python_grpc_call(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() == "identifier" {
+            let name = node_text(Some(func), self.src);
+            if let Some(service) = name
+                .strip_prefix("add_")
+                .and_then(|m| m.strip_suffix("_to_server"))
+                .and_then(|m| m.strip_suffix("Servicer"))
+                .filter(|s| !s.is_empty())
+            {
+                self.emit_grpc(node, service, "*", ContractRole::Provider, None);
+            }
+            return;
+        }
+        if func.kind() != "attribute" {
+            return;
+        }
+        let meth = node_text(func.child_by_field_name("attribute"), self.src);
+        if meth.is_empty() {
+            return;
+        }
+        let recv = node_text(func.child_by_field_name("object"), self.src);
+        if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+            self.emit_grpc(node, &service, meth, ContractRole::Consumer, None);
+        }
+    }
+
+    /// JS/TS sites (gated by the file-level grpc marker):
+    /// `addService(<x>.service, …)` registers the service (`*`); bound
+    /// `client.m(arg, cb)` consumes one method.
+    fn js_grpc_call(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() != "member_expression" {
+            return;
+        }
+        let prop = node_text(func.child_by_field_name("property"), self.src);
+        if prop.is_empty() {
+            return;
+        }
+        if prop == "addService" {
+            let svc = node
+                .child_by_field_name("arguments")
+                .and_then(|args| positional_arg(args, 0))
+                .map(|arg| node_text(Some(arg), self.src).to_string())
+                .and_then(|text| text.strip_suffix(".service").map(str::to_string))
+                .filter(|s| !s.is_empty());
+            if let Some(service) = svc {
+                self.emit_grpc(node, &service, "*", ContractRole::Provider, None);
+            }
+            return;
+        }
+        let recv = node_text(func.child_by_field_name("object"), self.src);
+        if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+            self.emit_grpc(node, &service, prop, ContractRole::Consumer, None);
+        }
     }
 }
 
@@ -8143,5 +8710,230 @@ service UserService {
             &opts,
         );
         assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    // -- grpc generated/server code (TASK-088, plan 5.1) ------------------------
+
+    #[test]
+    fn grpc_java_impl_base_provider() {
+        let src = "\
+public class UserServiceImpl extends UserServiceGrpc.UserServiceImplBase {
+    @Override
+    public void getUser(GetUserRequest req, StreamObserver<User> obs) { }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::getUser");
+        assert_eq!(c.kind, ContractKind::Grpc);
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("getUser"));
+        assert_eq!(c.line, 3);
+    }
+
+    #[test]
+    fn grpc_java_stub_consumers_bound_and_inline() {
+        let src = "\
+class Client {
+    void call(Channel channel) {
+        UserServiceGrpc.UserServiceBlockingStub stub = UserServiceGrpc.newBlockingStub(channel);
+        stub.getUser(request);
+        UserServiceGrpc.newBlockingStub(channel).getUser(request);
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        for c in &cands {
+            assert_eq!(c.canonical_id, "grpc::UserService::getUser");
+            assert_eq!(c.role, ContractRole::Consumer);
+            assert_eq!(c.owning_symbol.as_deref(), Some("call"));
+            assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        }
+        assert_eq!(cands[0].line, 4);
+        assert_eq!(cands[1].line, 5);
+    }
+
+    #[test]
+    fn grpc_java_add_service_bind_service() {
+        let src = "\
+class Server {
+    void start() {
+        ServerBuilder.forPort(50051)
+            .addService(UserServiceGrpc.bindService(new UserServiceImpl()))
+            .build();
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::*");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("start"));
+    }
+
+    #[test]
+    fn grpc_go_register_server_provider() {
+        let src = "\
+package main
+
+func serve() {
+    s := grpc.NewServer()
+    pb.RegisterUserServiceServer(s, &server{})
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::*");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("serve"));
+    }
+
+    #[test]
+    fn grpc_go_client_consumers_bound_and_inline() {
+        let src = "\
+package main
+
+func call(conn *grpc.ClientConn) error {
+    client := pb.NewUserServiceClient(conn)
+    _, err := client.GetUser(ctx, req)
+    _, err2 := pb.NewUserServiceClient(conn).GetUser(ctx, req)
+    return err
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        for c in &cands {
+            assert_eq!(c.canonical_id, "grpc::UserService::GetUser");
+            assert_eq!(c.role, ContractRole::Consumer);
+            assert_eq!(c.owning_symbol.as_deref(), Some("call"));
+        }
+    }
+
+    #[test]
+    fn grpc_rust_tonic_impl_provider_snake_case() {
+        let src = "\
+use tonic::{Request, Response, Status};
+
+impl user_service_server::UserService for MyService {
+    async fn get_user(&self, request: Request<GetUserRequest>)
+        -> Result<Response<User>, Status> {
+        todo!()
+    }
+}
+";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        // snake_case preserved in the ID; the canonical join folds casing.
+        assert_eq!(c.canonical_id, "grpc::UserService::get_user");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("get_user"));
+        assert_eq!(c.line, 4);
+    }
+
+    #[test]
+    fn grpc_rust_bound_client_await_consumer() {
+        let src = "\
+async fn call(channel: Channel) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = UserServiceClient::new(channel);
+    let response = client.get_user(request).await?;
+    Ok(())
+}
+";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::get_user");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.owning_symbol.as_deref(), Some("call"));
+    }
+
+    #[test]
+    fn grpc_python_servicer_and_add_to_server() {
+        let src = "\
+import grpc
+import user_service_pb2
+
+class UserServiceServicer(user_service_pb2.UserServiceServicer):
+    def GetUser(self, request, context):
+        return user_service_pb2.User()
+
+def serve():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    add_UserServiceServicer_to_server(UserServiceServicer(), server)
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let method = find(&cands, "grpc::UserService::GetUser").expect("method provider missing");
+        assert_eq!(method.role, ContractRole::Provider);
+        assert_eq!(method.owning_symbol.as_deref(), Some("GetUser"));
+        assert_eq!(method.line, 5);
+        let service = find(&cands, "grpc::UserService::*").expect("service provider missing");
+        assert_eq!(service.role, ContractRole::Provider);
+        assert_eq!(service.owning_symbol.as_deref(), Some("serve"));
+    }
+
+    #[test]
+    fn grpc_python_bound_stub_consumer() {
+        let src = "\
+import user_service_pb2
+
+def call(channel):
+    stub = user_service_pb2.UserServiceStub(channel)
+    return stub.GetUser(user_service_pb2.GetUserRequest())
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::GetUser");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.owning_symbol.as_deref(), Some("call"));
+    }
+
+    #[test]
+    fn grpc_js_gated_client_and_add_service() {
+        let src = "\
+const grpc = require('@grpc/grpc-js');
+const client = new user.UserServiceClient(host, creds);
+client.getUser(arg, cb);
+server.addService(user.UserService.service, { getUser: handler });
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let call = find(&cands, "grpc::user.UserService::getUser").expect("consumer missing");
+        assert_eq!(call.role, ContractRole::Consumer);
+        assert_eq!(call.confidence, CONFIDENCE_FRAMEWORK);
+        // Package qualification preserved in the ID (plan 4); the canonical
+        // join relaxes it at match time.
+        let svc = find(&cands, "grpc::user.UserService::*").expect("service provider missing");
+        assert_eq!(svc.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn grpc_js_negative_without_grpc_marker() {
+        // new XClient alone is not evidence: with no grpc marker in the file
+        // nothing is detected.
+        let src = "\
+const client = new user.UserServiceClient(host, creds);
+client.getUser(arg, cb);
+server.addService(user.UserService.service, { getUser: handler });
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn grpc_generated_code_disabled_by_option() {
+        let opts = ContractOptions {
+            grpc: false,
+            ..ContractOptions::default()
+        };
+        let src = "public class UserServiceImpl extends UserServiceGrpc.UserServiceImplBase {\n    public void getUser(GetUserRequest req, StreamObserver<User> obs) { }\n}\n";
+        assert!(extract_with(Lang::Java, src, &opts).is_empty());
     }
 }
