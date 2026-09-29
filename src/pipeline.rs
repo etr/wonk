@@ -71,6 +71,8 @@ struct FileResult {
     imports: Vec<String>,
     /// Extracted type hierarchy edges (extends/implements).
     type_edges: Vec<RawTypeEdge>,
+    /// BM25 term frequencies over the raw content (TASK-078).
+    term_freqs: HashMap<String, u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +370,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
     }
 
     let line_count = content.lines().count();
+    let term_freqs = crate::tokenizer::term_frequencies(&content);
 
     // Single transaction: delete old data, insert new data.
     upsert_file_data(
@@ -381,6 +384,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
             refs,
             imports: file_imports.imports,
             type_edges,
+            term_freqs,
         },
     )?;
 
@@ -495,6 +499,10 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         rusqlite::params![rel_path],
     )?;
     tx.execute(
+        "DELETE FROM term_stats WHERE file = ?1",
+        rusqlite::params![rel_path],
+    )?;
+    tx.execute(
         "DELETE FROM files WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
@@ -532,6 +540,10 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     )?;
     tx.execute(
         "DELETE FROM file_imports WHERE source_file = ?1",
+        rusqlite::params![result.rel_path],
+    )?;
+    tx.execute(
+        "DELETE FROM term_stats WHERE file = ?1",
         rusqlite::params![result.rel_path],
     )?;
 
@@ -617,6 +629,14 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
             stmt.execute(rusqlite::params![result.rel_path, import])?;
         }
     }
+
+    // Insert BM25 term statistics — same transaction as the file's symbols.
+    let term_rows: Vec<(&str, &str, i64)> = result
+        .term_freqs
+        .iter()
+        .map(|(term, tf)| (term.as_str(), result.rel_path.as_str(), *tf as i64))
+        .collect();
+    insert_term_stats(&tx, &term_rows)?;
 
     // Insert type hierarchy edges, resolving names to symbol IDs.
     {
@@ -706,6 +726,7 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
     }
 
     let line_count = content.lines().count();
+    let term_freqs = crate::tokenizer::term_frequencies(&content);
 
     Some(FileResult {
         rel_path,
@@ -716,6 +737,7 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
         refs,
         imports: file_imports.imports,
         type_edges,
+        term_freqs,
     })
 }
 
@@ -835,6 +857,15 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
             }
         }
     }
+
+    // Insert BM25 term statistics — same transaction as the file's symbols.
+    let mut term_rows: Vec<(&str, &str, i64)> = Vec::new();
+    for r in results {
+        for (term, tf) in &r.term_freqs {
+            term_rows.push((term.as_str(), r.rel_path.as_str(), *tf as i64));
+        }
+    }
+    insert_term_stats(&tx, &term_rows)?;
 
     // Insert type hierarchy edges, resolving names to symbol IDs.
     // Batch-resolve cross-file parent names to avoid N+1 queries.
@@ -1330,6 +1361,41 @@ pub fn reembed_changed_files(
     Ok(embedded)
 }
 
+/// Insert BM25 term statistics in the caller's transaction.
+///
+/// Rows are sorted by (term, file) and written via multi-row statements:
+/// the primary-key B-tree receives sequential appends instead of random
+/// inserts, and per-row execute overhead disappears on full builds.
+fn insert_term_stats(tx: &rusqlite::Transaction, rows: &[(&str, &str, i64)]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut sorted = rows.to_vec();
+    sorted.sort_unstable();
+
+    // 3 bound parameters per row; bundled SQLite allows 32766 variables.
+    const ROWS_PER_STMT: usize = 1000;
+    for chunk in sorted.chunks(ROWS_PER_STMT) {
+        let placeholders = chunk
+            .iter()
+            .map(|_| "(?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO term_stats (term, file, tf) VALUES {placeholders}");
+        let mut stmt = tx.prepare(&sql)?;
+        stmt.execute(rusqlite::params_from_iter(chunk.iter().flat_map(
+            |(term, file, tf)| {
+                [
+                    term as &dyn rusqlite::ToSql,
+                    file as &dyn rusqlite::ToSql,
+                    tf as &dyn rusqlite::ToSql,
+                ]
+            },
+        )))?;
+    }
+    Ok(())
+}
+
 /// Drop all data from the main tables (used before rebuild).
 fn drop_all_data(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -1338,6 +1404,7 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM symbols;
          DELETE FROM \"references\";
          DELETE FROM file_imports;
+         DELETE FROM term_stats;
          DELETE FROM files;",
     )
     .context("clearing index data")?;
@@ -1557,6 +1624,420 @@ class Component {
 
         assert!(!meta.languages.is_empty(), "meta should list languages");
         assert!(meta.created > 0, "meta should have a timestamp");
+    }
+
+    // -----------------------------------------------------------------------
+    // term_stats (TASK-078)
+    // -----------------------------------------------------------------------
+
+    /// Assert the DB term_stats are exactly what the tokenizer oracle
+    /// produces from the current disk content of every indexed file, with
+    /// no orphan rows and no missing document lengths.
+    fn assert_stats_match_disk(conn: &Connection, root: &Path) {
+        let paths: Vec<String> = conn
+            .prepare("SELECT path FROM files")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(!paths.is_empty(), "index should contain files");
+
+        for rel in &paths {
+            let content =
+                fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("reading {rel}: {e}"));
+            let expected = crate::tokenizer::term_frequencies(&content);
+            let actual: HashMap<String, i64> = conn
+                .prepare("SELECT term, tf FROM term_stats WHERE file = ?1")
+                .unwrap()
+                .query_map(rusqlite::params![rel], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{rel}: distinct term count differs from tokenizer oracle"
+            );
+            for (term, tf) in &expected {
+                assert_eq!(
+                    actual.get(term).copied(),
+                    Some(*tf as i64),
+                    "{rel}: tf for term '{term}' differs from tokenizer oracle"
+                );
+            }
+        }
+
+        // No orphan rows: every stats row must reference an indexed file.
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats \
+                 WHERE file NOT IN (SELECT path FROM files)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "term_stats rows must not outlive their file");
+
+        // Document lengths are BM25's |D| — never NULL for files with stats.
+        let null_lengths: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE line_count IS NULL \
+                 AND path IN (SELECT DISTINCT file FROM term_stats)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_lengths, 0, "files with stats must have a line_count");
+    }
+
+    #[test]
+    fn test_build_index_populates_term_stats() {
+        let dir = make_test_repo();
+        let _stats = build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+
+        // src/main.rs contains "helper" twice: the call site and the
+        // definition. Lowercased alphanumeric tokens, punctuation stripped.
+        let tf_helper: i64 = conn
+            .query_row(
+                "SELECT tf FROM term_stats WHERE term = 'helper' AND file = 'src/main.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tf_helper, 2, "tf for 'helper' in src/main.rs");
+
+        // "helper" only occurs in src/main.rs → document frequency 1.
+        let df_helper: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE term = 'helper'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(df_helper, 1);
+
+        // Every indexed file contributes at least one distinct term.
+        let total_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        let file_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            total_rows >= file_count,
+            "each indexed file should have term_stats rows ({total_rows} rows for {file_count} files)"
+        );
+    }
+
+    #[test]
+    fn test_term_stats_tf_matches_tokenizer_per_file() {
+        let dir = make_test_repo();
+        let _stats = build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+
+        assert_stats_match_disk(&conn, dir.path());
+    }
+
+    #[test]
+    fn test_reindex_file_updates_term_stats() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        // Rewrite lib.rs with different term content.
+        fs::write(
+            root.join("lib.rs"),
+            "fn goodbye() { 100 }\nfn farewell() { 200 }",
+        )
+        .unwrap();
+        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        assert!(changed, "modified file should be re-indexed");
+
+        // Old terms are gone, new terms carry correct tf.
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs' AND term = 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "stats for removed terms must be deleted");
+
+        let tf_goodbye: i64 = conn
+            .query_row(
+                "SELECT tf FROM term_stats WHERE file = 'lib.rs' AND term = 'goodbye'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tf_goodbye, 1);
+
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_reindex_file_unchanged_leaves_stats() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        let rows_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+
+        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        assert!(!changed, "unchanged file should be skipped");
+
+        let rows_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rows_before, rows_after,
+            "unchanged-hash early exit must leave term_stats untouched"
+        );
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_remove_file_deletes_term_stats() {
+        let (dir, conn) = setup_indexed_repo();
+
+        // "hello" occurs only in lib.rs.
+        let df_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE term = 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(df_before, 1, "'hello' should start in exactly one file");
+
+        remove_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
+
+        // Document frequency decrements exactly — no orphaned postings.
+        let df_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE term = 'hello'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(df_after, 0, "df must drop to zero when its only file goes");
+
+        let lib_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lib_rows, 0);
+    }
+
+    #[test]
+    fn test_incremental_update_removes_term_stats() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+        drop(conn);
+
+        // Delete a file from disk, then run the incremental update pass.
+        fs::remove_file(root.join("lib.rs")).unwrap();
+        let _stats = incremental_update(root, true).unwrap();
+
+        let index_path = db::local_index_path(root);
+        let conn = db::open_existing(&index_path).unwrap();
+        let lib_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lib_rows, 0,
+            "incremental update must purge stats of deleted files"
+        );
+
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_rename_as_delete_and_insert_no_orphans() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        // Rename lib.rs -> renamed.rs on disk, then feed the pipeline the
+        // events the watcher derives from a rename: Deleted(old) plus
+        // Created(new) (the old path no longer exists, the new one does).
+        fs::rename(root.join("lib.rs"), root.join("renamed.rs")).unwrap();
+        let events = vec![
+            FileEvent::Deleted(root.join("lib.rs")),
+            FileEvent::Created(root.join("renamed.rs")),
+        ];
+        let result = process_events(&conn, &events, root).unwrap();
+        assert_eq!(result.updated_count, 2, "both rename halves get processed");
+
+        let old_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_rows, 0, "stats must not linger under the old name");
+
+        let new_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'renamed.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(new_rows > 0, "stats must exist under the new name");
+
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_edit_delete_rename_sequence_keeps_stats_consistent() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Edit an indexed file.
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() {\n    let v = reindex_me();\n    v\n}\n",
+        )
+        .unwrap();
+        reindex_file(&conn, &root.join("src/main.rs"), root).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Create a new file.
+        fs::write(
+            root.join("newmod.rs"),
+            "fn fresh() {\n    alpha beta alpha\n}\n",
+        )
+        .unwrap();
+        index_new_file(&conn, &root.join("newmod.rs"), root).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Rename it: delete + insert events.
+        fs::rename(root.join("newmod.rs"), root.join("moved.rs")).unwrap();
+        let events = vec![
+            FileEvent::Deleted(root.join("newmod.rs")),
+            FileEvent::Created(root.join("moved.rs")),
+        ];
+        process_events(&conn, &events, root).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Delete a file.
+        fs::remove_file(root.join("app.py")).unwrap();
+        process_events(&conn, &[FileEvent::Deleted(root.join("app.py"))], root).unwrap();
+        assert_stats_match_disk(&conn, root);
+
+        // Edit the renamed file again.
+        fs::write(root.join("moved.rs"), "fn fresh() {\n    gamma delta\n}\n").unwrap();
+        reindex_file(&conn, &root.join("moved.rs"), root).unwrap();
+        assert_stats_match_disk(&conn, root);
+    }
+
+    #[test]
+    fn test_drop_all_data_clears_term_stats() {
+        // The TempDir must outlive the test; only the connection is used.
+        let (_dir, conn) = setup_indexed_repo();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        assert!(before > 0, "index should carry term stats before the drop");
+
+        drop_all_data(&conn).unwrap();
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "drop_all_data must clear term_stats");
+    }
+
+    #[test]
+    fn test_rebuild_clears_term_stats() {
+        let dir = make_test_repo();
+        build_index(dir.path(), true).unwrap();
+
+        let index_path = db::local_index_path(dir.path());
+        let conn = db::open_existing(&index_path).unwrap();
+        let count1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+
+        // Rebuild over unchanged content: stats are regenerated, not doubled.
+        rebuild_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&index_path).unwrap();
+        let count2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count1, count2, "rebuild must replace, not duplicate, stats");
+
+        assert_stats_match_disk(&conn, dir.path());
+    }
+
+    #[test]
+    fn test_term_stats_and_files_row_same_transaction() {
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        let original = fs::read_to_string(root.join("lib.rs")).unwrap();
+
+        // Corrupt lib.rs into invalid UTF-8.  reindex_file must fail while
+        // reading — before any write — leaving the previous file row and
+        // stats exactly as they were.
+        fs::write(root.join("lib.rs"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+        let result = reindex_file(&conn, &root.join("lib.rs"), root);
+        assert!(
+            result.is_err(),
+            "invalid UTF-8 content must fail the re-index"
+        );
+
+        let hash: String = conn
+            .query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let expected_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(original.as_bytes()));
+        assert_eq!(hash, expected_hash, "files row must be untouched");
+
+        let expected = crate::tokenizer::term_frequencies(&original);
+        let actual: HashMap<String, i64> = conn
+            .prepare("SELECT term, tf FROM term_stats WHERE file = 'lib.rs'")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "stats must keep the pre-failure term set"
+        );
+        for (term, tf) in &expected {
+            assert_eq!(
+                actual.get(term).copied(),
+                Some(*tf as i64),
+                "tf for '{term}'"
+            );
+        }
     }
 
     #[test]
@@ -3140,5 +3621,132 @@ function unknown() { return mystery(); }
             .query_row("SELECT COUNT(*) FROM type_edges", [], |row| row.get(0))
             .unwrap();
         assert_eq!(edge_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Benchmark: term_stats build-time overhead (TASK-078)
+    // -----------------------------------------------------------------------
+
+    /// Pick a vocabulary index with a Zipf-like skew toward small indices
+    /// (frequent head words, long tail of rare ones).
+    fn zipf_pick(rng: &mut rand::rngs::StdRng, vocab_len: usize) -> usize {
+        use rand::Rng;
+        let u: f64 = rng.r#gen();
+        ((vocab_len as f64) * u * u).floor() as usize % vocab_len
+    }
+
+    /// Build the fixed synthetic corpus used by the benchmark: 300 `.rs`
+    /// files of ~150 lines each, tokens drawn from a 500-word Zipf-ish
+    /// vocabulary, seeded so every run measures the identical corpus.
+    fn write_bench_corpus(root: &Path) {
+        use rand::SeedableRng;
+
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(78);
+        let vocab: Vec<String> = (0..500).map(|i| format!("w{i}")).collect();
+        for file_idx in 0..300 {
+            let mut lines = vec![format!("fn w{file_idx}_entry() {{")];
+            while lines.len() < 150 {
+                let picks: Vec<&str> = (0..6)
+                    .map(|_| vocab[zipf_pick(&mut rng, vocab.len())].as_str())
+                    .collect();
+                lines.push(format!("    let value = {} + {};", picks[0], picks[1]));
+                lines.push(format!(
+                    "    call_{}({}, {});",
+                    picks[2], picks[3], picks[4]
+                ));
+                if lines.len() >= 150 {
+                    break;
+                }
+                lines.push(format!("    // {} {} {}", picks[5], picks[0], picks[2]));
+            }
+            lines.push("}".to_string());
+            fs::write(
+                root.join("src").join(format!("mod_{file_idx:03}.rs")),
+                lines.join("\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Run `build_index` three times on a fresh database, printing per-run
+    /// elapsed and the median.  Returns the sorted durations.
+    fn bench_three_fresh_builds(root: &Path) -> Vec<std::time::Duration> {
+        let mut durations = Vec::new();
+        for run in 0..3 {
+            let index_dir = root.join(".wonk");
+            if index_dir.exists() {
+                fs::remove_dir_all(&index_dir).unwrap();
+            }
+            let start = std::time::Instant::now();
+            let stats = build_index(root, true).unwrap();
+            let elapsed = start.elapsed();
+            durations.push(elapsed);
+            println!(
+                "bench run {}: {:?} ({} files, {} symbols)",
+                run + 1,
+                elapsed,
+                stats.file_count,
+                stats.symbol_count
+            );
+        }
+        durations.sort();
+        println!("bench median: {:?}", durations[1]);
+        durations
+    }
+
+    /// Print the built index's DB size and `term_stats` row count.
+    fn print_bench_db_stats(root: &Path) {
+        let index_path = db::local_index_path(root);
+        let db_size = fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+        println!("bench index db size: {db_size} bytes");
+
+        // term_stats may not exist yet (baseline run before TASK-078 writes).
+        let conn = db::open_existing(&index_path).unwrap();
+        let has_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='term_stats'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let term_stats_rows: i64 = if has_table > 0 {
+            conn.query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
+                .unwrap()
+        } else {
+            0
+        };
+        println!("bench term_stats rows: {term_stats_rows}");
+    }
+
+    /// Measure `build_index` on the synthetic corpus.  No timing assertion —
+    /// this is a measurement harness, run manually via
+    /// `cargo test --release bench_build_index_term_stats_overhead -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_build_index_term_stats_overhead() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_bench_corpus(root);
+
+        bench_three_fresh_builds(root);
+        print_bench_db_stats(root);
+    }
+
+    /// Real-repo cross-check: build the index over this checkout itself —
+    /// the index-only counterpart to `wonk init --local` (which also runs
+    /// the embedding pass).  Removes the generated `.wonk` directory so
+    /// the tree stays clean.
+    #[test]
+    #[ignore]
+    fn bench_real_repo_build_index() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        bench_three_fresh_builds(&root);
+        print_bench_db_stats(&root);
+
+        fs::remove_dir_all(root.join(".wonk")).unwrap();
     }
 }

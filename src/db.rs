@@ -103,6 +103,21 @@ CREATE TABLE IF NOT EXISTS embeddings (
 CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file);
 "#;
 
+// BM25 per-term document statistics (TASK-078). One row per distinct
+// (term, file): `tf` is the term's frequency in the file's tokenized
+// content. Document frequency is derived at query time
+// (COUNT(*) WHERE term = ?); document length is NOT stored here —
+// it reuses files.line_count (DR-033).
+const TERM_STATS_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS term_stats (
+    term TEXT NOT NULL,
+    file TEXT NOT NULL,
+    tf INTEGER NOT NULL,
+    PRIMARY KEY (term, file)
+);
+CREATE INDEX IF NOT EXISTS idx_term_stats_file ON term_stats(file);
+";
+
 const SUMMARIES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS summaries (
     path TEXT PRIMARY KEY,
@@ -199,6 +214,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(EMBEDDINGS_SQL)
         .context("creating embeddings table")?;
     ensure_embedding_metadata_columns(conn)?;
+    conn.execute_batch(TERM_STATS_SQL)
+        .context("creating term_stats table")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -284,11 +301,22 @@ pub fn ensure_confidence_column(conn: &Connection) -> Result<()> {
 /// Ensure the `type_edges` table exists, creating it if missing.
 ///
 /// Handles schema migration for indexes created before type hierarchy
-/// support was added.  Safe to call on databases that already have the
-/// table (uses `CREATE TABLE IF NOT EXISTS`).
+/// support was added.  Safe to call on databases that already
+/// have the table (uses `CREATE TABLE IF NOT EXISTS`).
 pub fn ensure_type_edges_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(TYPE_EDGES_SQL)
         .context("creating type_edges table (migration)")?;
+    Ok(())
+}
+
+/// Ensure the `term_stats` table exists, creating it if missing.
+///
+/// Handles schema migration for indexes created before BM25 term
+/// statistics (TASK-078) were added.  Safe to call on databases that
+/// already have the table (uses `CREATE TABLE IF NOT EXISTS`).
+pub fn ensure_term_stats_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(TERM_STATS_SQL)
+        .context("creating term_stats table (migration)")?;
     Ok(())
 }
 
@@ -581,6 +609,7 @@ mod tests {
         assert!(tables.contains(&"file_imports".to_string()));
         assert!(tables.contains(&"embeddings".to_string()));
         assert!(tables.contains(&"type_edges".to_string()));
+        assert!(tables.contains(&"term_stats".to_string()));
     }
 
     #[test]
@@ -1871,6 +1900,163 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(tables.len(), 1);
+    }
+
+    #[test]
+    fn test_open_creates_term_stats_table() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let _conn = open(&db_path).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='term_stats'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(tables.len(), 1, "open() should create term_stats");
+    }
+
+    #[test]
+    fn test_ensure_term_stats_table_migration() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // Simulate an old database created before term_stats existed.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='term_stats'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "table should not exist before migration");
+
+        ensure_term_stats_table(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='term_stats'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "ensure_term_stats_table should create it");
+    }
+
+    #[test]
+    fn test_ensure_term_stats_table_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        // Table already exists via open(); calling ensure again must not fail.
+        ensure_term_stats_table(&conn).unwrap();
+        ensure_term_stats_table(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='term_stats'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn test_term_stats_pk_rejects_duplicate_term_file() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        conn.execute(
+            "INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["hello", "src/main.rs", 2],
+        )
+        .unwrap();
+
+        let dup = conn.execute(
+            "INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["hello", "src/main.rs", 5],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate (term, file) pair must violate the primary key"
+        );
+
+        // A different file for the same term is fine.
+        conn.execute(
+            "INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["hello", "lib.rs", 1],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_term_stats_file_index_exists() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            indexes.contains(&"idx_term_stats_file".to_string()),
+            "idx_term_stats_file should exist for the delete-by-file path"
+        );
+    }
+
+    #[test]
+    fn test_term_stats_insert_and_df_query() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        for (term, file, tf) in [
+            ("hello", "a.rs", 3),
+            ("hello", "b.rs", 1),
+            ("world", "a.rs", 2),
+        ] {
+            conn.execute(
+                "INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)",
+                rusqlite::params![term, file, tf],
+            )
+            .unwrap();
+        }
+
+        // Document frequency for "hello" is the number of files containing it.
+        let df_hello: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE term = ?1",
+                rusqlite::params!["hello"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(df_hello, 2);
+
+        // Postings for "hello" carry per-file tf.
+        let postings: Vec<(String, i64)> = conn
+            .prepare("SELECT file, tf FROM term_stats WHERE term = ?1 ORDER BY file")
+            .unwrap()
+            .query_map(rusqlite::params!["hello"], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            postings,
+            vec![("a.rs".to_string(), 3), ("b.rs".to_string(), 1)]
+        );
     }
 
     #[test]
