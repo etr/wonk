@@ -407,6 +407,7 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     let embed_repo_root = repo_root.to_path_buf();
     let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
     let embedding_kind = config.embedding.provider;
+    let contract_opts = crate::contracts::ContractOptions::from(&config.contracts);
 
     let embed_handle = thread::Builder::new()
         .name("wonk-embed".to_string())
@@ -493,7 +494,7 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     watcher::run_event_loop(&rx, &shutdown, |events| {
         update_queue_depth(&conn, events.len()).ok();
 
-        match pipeline::process_events(&conn, events, &repo_root_buf) {
+        match pipeline::process_events(&conn, events, &repo_root_buf, &contract_opts) {
             Ok(result) => {
                 if result.updated_count > 0 {
                     update_activity(&conn).ok();

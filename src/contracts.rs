@@ -85,13 +85,29 @@ impl From<&crate::config::ContractsConfig> for ContractOptions {
 /// `source` must be the exact byte string the tree was parsed from.
 /// One binding pre-pass collects router context (REQ-023), then a single
 /// iterative DFS walks the tree and dispatches per-language matchers.
-pub fn extract_contracts(tree: &Tree, source: &str, lang: Lang) -> Vec<ContractCandidate> {
+/// `opts` gates each kind at its emit choke point, so a noisy detector can
+/// be disabled without degrading the others.
+pub fn extract_contracts(
+    tree: &Tree,
+    source: &str,
+    lang: Lang,
+    opts: &ContractOptions,
+) -> Vec<ContractCandidate> {
+    if !opts.http && !opts.env && !opts.queue && !opts.websocket && !opts.job {
+        return Vec::new();
+    }
     let src = source.as_bytes();
-    let ctx = collect_router_context(tree.root_node(), src, lang);
+    // The router pre-pass serves http prefixes and Ruby queue bindings.
+    let ctx = if opts.http || (opts.queue && matches!(lang, Lang::Ruby)) {
+        collect_router_context(tree.root_node(), src, lang)
+    } else {
+        RouterContext::default()
+    };
     let mut ex = Extractor {
         src,
         lang,
         ctx,
+        opts: *opts,
         out: Vec::new(),
     };
     let mut stack = vec![(tree.root_node(), String::new())];
@@ -564,6 +580,7 @@ struct Extractor<'a> {
     src: &'a [u8],
     lang: Lang,
     ctx: RouterContext,
+    opts: ContractOptions,
     out: Vec<ContractCandidate>,
 }
 
@@ -2187,6 +2204,9 @@ impl<'a> Extractor<'a> {
         confidence: f64,
         owning: Option<&str>,
     ) {
+        if !self.opts.http {
+            return;
+        }
         let (raw, confidence) = match self.path_arg(arg) {
             Some(PathArg::Direct(s)) => (s, confidence),
             Some(PathArg::Concat(s)) => (s, CONFIDENCE_HEURISTIC),
@@ -2222,7 +2242,7 @@ impl<'a> Extractor<'a> {
 
     /// Record an env contract.
     fn emit_env(&mut self, node: Node, name: &str, role: ContractRole, confidence: f64) {
-        if !is_env_name(name) {
+        if !self.opts.env || !is_env_name(name) {
             return;
         }
         self.out.push(ContractCandidate {
@@ -2966,9 +2986,17 @@ mod extract_test_helpers {
     use crate::indexer::{Lang, get_parser};
 
     pub(crate) fn extract(lang: Lang, src: &str) -> Vec<ContractCandidate> {
+        extract_with(lang, src, &ContractOptions::default())
+    }
+
+    pub(crate) fn extract_with(
+        lang: Lang,
+        src: &str,
+        opts: &ContractOptions,
+    ) -> Vec<ContractCandidate> {
         let mut parser = get_parser(lang);
         let tree = parser.parse(src, None).expect("parse failed");
-        extract_contracts(&tree, src, lang)
+        extract_contracts(&tree, src, lang, opts)
     }
 
     pub(crate) fn find<'a>(
@@ -3165,6 +3193,43 @@ mod tests {
             copy.enabled(ContractKind::Queue),
             opts.enabled(ContractKind::Queue)
         );
+    }
+
+    #[test]
+    fn extract_with_all_kinds_disabled_returns_empty() {
+        let src = "const app = express();\napp.get('/v1/users/:id', h);\nconst db = process.env.DATABASE_URL;\n";
+        let opts = ContractOptions {
+            http: false,
+            env: false,
+            queue: false,
+            websocket: false,
+            job: false,
+        };
+        assert!(extract_with(Lang::JavaScript, src, &opts).is_empty());
+    }
+
+    #[test]
+    fn extract_with_http_disabled_keeps_env() {
+        let src = "const app = express();\napp.get('/v1/users/:id', h);\nconst db = process.env.DATABASE_URL;\n";
+        let opts = ContractOptions {
+            http: false,
+            ..ContractOptions::default()
+        };
+        let cands = extract_with(Lang::JavaScript, src, &opts);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].kind, ContractKind::Env);
+    }
+
+    #[test]
+    fn extract_with_env_disabled_keeps_http() {
+        let src = "const app = express();\napp.get('/v1/users/:id', h);\nconst db = process.env.DATABASE_URL;\n";
+        let opts = ContractOptions {
+            env: false,
+            ..ContractOptions::default()
+        };
+        let cands = extract_with(Lang::JavaScript, src, &opts);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].kind, ContractKind::Http);
     }
 
     // -- stage matrices (PRD-CTR-REQ-003, §9.1) -------------------------------
@@ -3433,7 +3498,7 @@ mod tests {
 
     // -- walker: JavaScript / TypeScript (step 4) -------------------------------
 
-    use extract_test_helpers::{extract, find};
+    use extract_test_helpers::{extract, extract_with, find};
 
     #[test]
     fn express_provider() {

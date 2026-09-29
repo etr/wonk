@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
-use wonk::contracts::extract_contracts;
+use wonk::contracts::{ContractOptions, extract_contracts};
 use wonk::indexer::{self, Lang};
 use wonk::pipeline::build_index;
 
@@ -72,7 +72,8 @@ fn main() -> Result<()> {
             // Only the extractor is timed; parse/read happen outside the
             // measured window (PRD-CTR-REQ-011 means indexing never re-parses).
             let extract_start = Instant::now();
-            let contracts = extract_contracts(&tree, &parse_source, lang);
+            let contracts =
+                extract_contracts(&tree, &parse_source, lang, &ContractOptions::default());
             let took = extract_start.elapsed();
             e_total += took;
             if round == EXTRACT_ROUNDS - 1 {

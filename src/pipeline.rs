@@ -128,10 +128,11 @@ pub fn build_index_with_progress(
     progress.set_total(paths.len());
 
     // 4. Parse in parallel.
+    let contract_opts = crate::contracts::ContractOptions::from(&config.contracts);
     let results: Vec<FileResult> = paths
         .par_iter()
         .filter_map(|path| {
-            let result = parse_one_file(path, repo_root);
+            let result = parse_one_file(path, repo_root, &contract_opts);
             progress.inc();
             result
         })
@@ -242,9 +243,10 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
     }
 
     // Re-index files on disk (reindex_file skips unchanged via hash).
+    let contract_opts = crate::contracts::ContractOptions::from(&config.contracts);
     for rel in &on_disk {
         let abs = repo_root.join(rel);
-        let _ = reindex_file(&conn, &abs, repo_root);
+        let _ = reindex_file(&conn, &abs, repo_root, &contract_opts);
     }
 
     // Collect languages and rewrite meta.json.
@@ -323,7 +325,12 @@ pub struct ProcessResult {
 /// symbols and references for that file are deleted and the file is re-parsed
 /// and re-inserted in a single transaction.  Returns `Ok(true)` when the
 /// file was actually re-indexed.
-pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Result<bool> {
+pub fn reindex_file(
+    conn: &Connection,
+    file_path: &Path,
+    repo_root: &Path,
+    contract_opts: &crate::contracts::ContractOptions,
+) -> Result<bool> {
     // Compute the relative path used as the key in the DB.
     let rel_path = file_path
         .strip_prefix(repo_root)
@@ -382,7 +389,7 @@ pub fn reindex_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Re
     let type_edges = indexer::extract_type_edges(&tree, &parse_source, &rel_path, lang);
 
     // Extract contract candidates on the same tree (PRD-CTR-REQ-011).
-    let contracts = crate::contracts::extract_contracts(&tree, &parse_source, lang);
+    let contracts = crate::contracts::extract_contracts(&tree, &parse_source, lang, contract_opts);
 
     // Compute confidence for each reference.
     for r in &mut refs {
@@ -432,11 +439,16 @@ pub fn remove_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Res
 /// Detects the language, parses the file with tree-sitter, and inserts the
 /// file metadata, symbols, and references into the database.  If the file
 /// has an unsupported language extension, this is a no-op.
-pub fn index_new_file(conn: &Connection, file_path: &Path, repo_root: &Path) -> Result<()> {
+pub fn index_new_file(
+    conn: &Connection,
+    file_path: &Path,
+    repo_root: &Path,
+    contract_opts: &crate::contracts::ContractOptions,
+) -> Result<()> {
     // Delegate to reindex_file — it handles the "not yet in index" case
     // identically to "hash changed" (the stored hash will be None, so the
     // comparison will always trigger a full index).
-    let _ = reindex_file(conn, file_path, repo_root)?;
+    let _ = reindex_file(conn, file_path, repo_root, contract_opts)?;
     Ok(())
 }
 
@@ -450,6 +462,7 @@ pub fn process_events(
     conn: &Connection,
     events: &[FileEvent],
     repo_root: &Path,
+    contract_opts: &crate::contracts::ContractOptions,
 ) -> Result<ProcessResult> {
     let mut updated = 0usize;
     let mut changed_files = Vec::new();
@@ -463,8 +476,10 @@ pub fn process_events(
             .into_owned();
 
         let result = match event {
-            FileEvent::Created(path) => index_new_file(conn, path, repo_root).map(|()| true),
-            FileEvent::Modified(path) => reindex_file(conn, path, repo_root),
+            FileEvent::Created(path) => {
+                index_new_file(conn, path, repo_root, contract_opts).map(|()| true)
+            }
+            FileEvent::Modified(path) => reindex_file(conn, path, repo_root, contract_opts),
             FileEvent::Deleted(path) => remove_file(conn, path, repo_root).map(|()| true),
         };
 
@@ -739,7 +754,11 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
 /// Parse a single file and extract everything we need.
 ///
 /// Returns `None` if the file is not a supported language or cannot be read.
-fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
+fn parse_one_file(
+    path: &Path,
+    repo_root: &Path,
+    contract_opts: &crate::contracts::ContractOptions,
+) -> Option<FileResult> {
     let lang = indexer::detect_language(path)?;
     let content = std::fs::read_to_string(path).ok()?;
 
@@ -777,7 +796,7 @@ fn parse_one_file(path: &Path, repo_root: &Path) -> Option<FileResult> {
     let type_edges = indexer::extract_type_edges(&tree, &parse_source, &rel_path, lang);
 
     // Extract contract candidates on the same tree (PRD-CTR-REQ-011).
-    let contracts = crate::contracts::extract_contracts(&tree, &parse_source, lang);
+    let contracts = crate::contracts::extract_contracts(&tree, &parse_source, lang, contract_opts);
 
     // Compute confidence for each reference.
     for r in &mut refs {
@@ -1637,6 +1656,26 @@ class Component {
     }
 
     #[test]
+    fn test_build_index_contracts_kind_disabled_by_config() {
+        let dir = make_contract_repo();
+        write_reach_config(dir.path(), "[contracts]\nhttp = false\n");
+        let stats = build_index(dir.path(), true).unwrap();
+        // Only the env read survives when http detection is off.
+        assert_eq!(stats.contract_count, 1, "got {stats:?}");
+    }
+
+    #[test]
+    fn test_build_index_contracts_all_disabled_by_config() {
+        let dir = make_contract_repo();
+        write_reach_config(
+            dir.path(),
+            "[contracts]\nhttp = false\nenv = false\nqueue = false\nwebsocket = false\njob = false\n",
+        );
+        let stats = build_index(dir.path(), true).unwrap();
+        assert_eq!(stats.contract_count, 0, "got {stats:?}");
+    }
+
+    #[test]
     fn reindex_file_extracts_contracts() {
         // No storage yet (TASK-083): reindex_file must run the contract
         // extractor inline without failing, and skip unchanged content.
@@ -1648,15 +1687,39 @@ class Component {
         let conn = db::open_existing(&index_path).unwrap();
         let file = dir.path().join("src/app.js");
         // Unchanged content: hash match skips the reindex.
-        assert!(!reindex_file(&conn, &file, dir.path()).unwrap());
+        assert!(
+            !reindex_file(
+                &conn,
+                &file,
+                dir.path(),
+                &crate::contracts::ContractOptions::default()
+            )
+            .unwrap()
+        );
 
         fs::write(
             &file,
             "const app = express();\n             app.get('/v1/users/:id', getUser);\n             app.post('/orders', createOrder);\n             app.delete('/orders/:id', deleteOrder);\n             const db = process.env.DATABASE_URL;\n",
         )
         .unwrap();
-        assert!(reindex_file(&conn, &file, dir.path()).unwrap());
-        assert!(!reindex_file(&conn, &file, dir.path()).unwrap());
+        assert!(
+            reindex_file(
+                &conn,
+                &file,
+                dir.path(),
+                &crate::contracts::ContractOptions::default()
+            )
+            .unwrap()
+        );
+        assert!(
+            !reindex_file(
+                &conn,
+                &file,
+                dir.path(),
+                &crate::contracts::ContractOptions::default()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1887,7 +1950,13 @@ class Component {
             "fn goodbye() { 100 }\nfn farewell() { 200 }",
         )
         .unwrap();
-        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert!(changed, "modified file should be re-indexed");
 
         // Old terms are gone, new terms carry correct tf.
@@ -1921,7 +1990,13 @@ class Component {
             .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
             .unwrap();
 
-        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert!(!changed, "unchanged file should be skipped");
 
         let rows_after: i64 = conn
@@ -2010,7 +2085,13 @@ class Component {
             FileEvent::Deleted(root.join("lib.rs")),
             FileEvent::Created(root.join("renamed.rs")),
         ];
-        let result = process_events(&conn, &events, root).unwrap();
+        let result = process_events(
+            &conn,
+            &events,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_eq!(result.updated_count, 2, "both rename halves get processed");
 
         let old_rows: i64 = conn
@@ -2048,7 +2129,13 @@ class Component {
             "fn main() {\n    let v = reindex_me();\n    v\n}\n",
         )
         .unwrap();
-        reindex_file(&conn, &root.join("src/main.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("src/main.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_stats_match_disk(&conn, root);
 
         // Create a new file.
@@ -2057,7 +2144,13 @@ class Component {
             "fn fresh() {\n    alpha beta alpha\n}\n",
         )
         .unwrap();
-        index_new_file(&conn, &root.join("newmod.rs"), root).unwrap();
+        index_new_file(
+            &conn,
+            &root.join("newmod.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_stats_match_disk(&conn, root);
 
         // Rename it: delete + insert events.
@@ -2066,17 +2159,35 @@ class Component {
             FileEvent::Deleted(root.join("newmod.rs")),
             FileEvent::Created(root.join("moved.rs")),
         ];
-        process_events(&conn, &events, root).unwrap();
+        process_events(
+            &conn,
+            &events,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_stats_match_disk(&conn, root);
 
         // Delete a file.
         fs::remove_file(root.join("app.py")).unwrap();
-        process_events(&conn, &[FileEvent::Deleted(root.join("app.py"))], root).unwrap();
+        process_events(
+            &conn,
+            &[FileEvent::Deleted(root.join("app.py"))],
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_stats_match_disk(&conn, root);
 
         // Edit the renamed file again.
         fs::write(root.join("moved.rs"), "fn fresh() {\n    gamma delta\n}\n").unwrap();
-        reindex_file(&conn, &root.join("moved.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("moved.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_stats_match_disk(&conn, root);
     }
 
@@ -2230,7 +2341,13 @@ fn extra() -> i32 {
             "fn hello() { world(); }\nfn world() { 4 }",
         )
         .unwrap();
-        reindex_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
+        reindex_file(
+            &conn,
+            &dir.path().join("lib.rs"),
+            dir.path(),
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         assert!(
             reach_meta_value(&conn, "stale").is_none(),
@@ -2272,7 +2389,13 @@ fn extra() -> i32 {
             "fn hello() { world(); }\nfn world() { 4 }",
         )
         .unwrap();
-        reindex_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
+        reindex_file(
+            &conn,
+            &dir.path().join("lib.rs"),
+            dir.path(),
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         crate::reach::mark_stale(&tx).unwrap();
         tx.commit().unwrap();
@@ -2324,7 +2447,13 @@ fn extra() -> i32 {
             "fn hello() { world(); }\nfn world() { 4 }\nfn extra() { 7 }",
         )
         .unwrap();
-        let changed = reindex_file(&conn, &root.join("degrade_probe.rs"), root).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &root.join("degrade_probe.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         assert!(changed, "the reindex itself succeeds");
         // The file data committed despite the failed repair.
@@ -2417,7 +2546,13 @@ fn extra() -> i32 {
         let wide = root.join("wide.rs");
         let base = fs::read_to_string(&wide).unwrap();
         fs::write(&wide, format!("{base}// budget edit\n")).unwrap();
-        let changed = reindex_file(&conn, &wide, root).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &wide,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         assert!(changed, "the reindex itself succeeds");
         // The file data committed despite the refused repair.
@@ -2488,7 +2623,13 @@ fn extra() -> i32 {
         let wide = root.join("wide.rs");
         let base = fs::read_to_string(&wide).unwrap();
         fs::write(&wide, format!("{base}// at-budget edit\n")).unwrap();
-        let changed = reindex_file(&conn, &wide, root).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &wide,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         assert!(changed);
         assert!(
@@ -2532,19 +2673,37 @@ fn extra() -> i32 {
             "fn world() { 1 }\nfn direct() { world(); }\n",
         )
         .unwrap();
-        reindex_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("src/lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         crate::reach::assert_table_equivalent_to_bfs(&conn);
 
         // Step 2: remove the caller again.
         fs::write(root.join("src/lib.rs"), "fn world() { 1 }\n").unwrap();
-        reindex_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("src/lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         crate::reach::assert_table_equivalent_to_bfs(&conn);
 
         // Step 3: rename world -> planet. mid.rs keeps calling the old
         // name: a dangling-name reference whose caller edges must keep
         // answering via BFS (the renamed symbol has no table rows).
         fs::write(root.join("src/lib.rs"), "fn planet() { 1 }\n").unwrap();
-        reindex_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("src/lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         crate::reach::assert_table_equivalent_to_bfs(&conn);
 
         // Step 4: delete the mid-chain file.
@@ -2555,8 +2714,20 @@ fn extra() -> i32 {
         // Step 5: introduce a mutual-recursion cycle main <-> extra.
         fs::write(root.join("src/main.rs"), "fn main() { extra(); }\n").unwrap();
         fs::write(root.join("src/extra.rs"), "fn extra() { main(); }\n").unwrap();
-        reindex_file(&conn, &root.join("src/main.rs"), root).unwrap();
-        reindex_file(&conn, &root.join("src/extra.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("src/main.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
+        reindex_file(
+            &conn,
+            &root.join("src/extra.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         crate::reach::assert_table_equivalent_to_bfs(&conn);
     }
 
@@ -2617,7 +2788,12 @@ fn extra() -> i32 {
         // reading — before any write — leaving the previous file row and
         // stats exactly as they were.
         fs::write(root.join("lib.rs"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
-        let result = reindex_file(&conn, &root.join("lib.rs"), root);
+        let result = reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        );
         assert!(
             result.is_err(),
             "invalid UTF-8 content must fail the re-index"
@@ -2800,7 +2976,13 @@ fn extra() -> i32 {
 
         // Rewrite lib.rs to include an import.
         fs::write(root.join("lib.rs"), "use std::io;\nfn hello() { 1 }").unwrap();
-        reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         let new_imports: i64 = conn
             .query_row(
@@ -2902,7 +3084,13 @@ fn extra() -> i32 {
     fn test_reindex_file_unchanged_skips() {
         let (dir, conn) = setup_indexed_repo();
         // File content hasn't changed — reindex_file should return false.
-        let changed = reindex_file(&conn, &dir.path().join("lib.rs"), dir.path()).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &dir.path().join("lib.rs"),
+            dir.path(),
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert!(!changed, "unchanged file should be skipped");
     }
 
@@ -2933,7 +3121,13 @@ fn extra() -> i32 {
         )
         .unwrap();
 
-        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert!(changed, "modified file should be re-indexed");
 
         // Hash should have changed.
@@ -2973,7 +3167,13 @@ fn extra() -> i32 {
 
         // Change the file.
         fs::write(root.join("lib.rs"), "fn only_one() {}").unwrap();
-        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert!(changed);
 
         // last_indexed should be updated.
@@ -3028,7 +3228,13 @@ fn extra() -> i32 {
 
         // Rewrite the file with completely different symbols.
         fs::write(root.join("lib.rs"), "fn alpha() {}\nfn beta() {}").unwrap();
-        reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         // Old symbols should be gone.
         let has_hello_after: i64 = conn
@@ -3074,7 +3280,13 @@ fn extra() -> i32 {
 
         // Rewrite file without 'hello'.
         fs::write(root.join("lib.rs"), "fn replacement() {}").unwrap();
-        reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         // 'hello' should be gone from FTS.
         let fts_hello_after: i64 = conn
@@ -3232,7 +3444,13 @@ fn extra() -> i32 {
         )
         .unwrap();
 
-        index_new_file(&conn, &root.join("new_file.rs"), root).unwrap();
+        index_new_file(
+            &conn,
+            &root.join("new_file.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         // File should be in the index.
         let file_count: i64 = conn
@@ -3272,7 +3490,13 @@ fn extra() -> i32 {
 
         fs::write(root.join("readme.txt"), "not code").unwrap();
         // Should not error, just a no-op.
-        index_new_file(&conn, &root.join("readme.txt"), root).unwrap();
+        index_new_file(
+            &conn,
+            &root.join("readme.txt"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         let file_count: i64 = conn
             .query_row(
@@ -3301,7 +3525,13 @@ fn extra() -> i32 {
             FileEvent::Deleted(root.join("app.py")),
         ];
 
-        let result = process_events(&conn, &events, root).unwrap();
+        let result = process_events(
+            &conn,
+            &events,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         // ProcessResult should report the count and the changed file paths.
         assert_eq!(result.updated_count, 3);
@@ -3330,7 +3560,13 @@ fn extra() -> i32 {
             FileEvent::Deleted(root.join("app.py")),
         ];
 
-        let result = process_events(&conn, &events, root).unwrap();
+        let result = process_events(
+            &conn,
+            &events,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         // All three should count as updates (modify changed hash, new file, delete).
         assert_eq!(
             result.updated_count, 3,
@@ -3372,7 +3608,13 @@ fn extra() -> i32 {
     fn test_process_events_empty_batch() {
         let (dir, conn) = setup_indexed_repo();
         let events: Vec<FileEvent> = vec![];
-        let result = process_events(&conn, &events, dir.path()).unwrap();
+        let result = process_events(
+            &conn,
+            &events,
+            dir.path(),
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_eq!(
             result.updated_count, 0,
             "empty batch should produce 0 updates"
@@ -3387,7 +3629,13 @@ fn extra() -> i32 {
 
         // Send a Modified event for a file that hasn't actually changed.
         let events = vec![FileEvent::Modified(root.join("lib.rs"))];
-        let result = process_events(&conn, &events, root).unwrap();
+        let result = process_events(
+            &conn,
+            &events,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_eq!(
             result.updated_count, 0,
             "unchanged file should not count as updated"
@@ -3409,7 +3657,13 @@ fn extra() -> i32 {
             FileEvent::Modified(root.join("lib.rs")),
         ];
 
-        let result = process_events(&conn, &events, root).unwrap();
+        let result = process_events(
+            &conn,
+            &events,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         // The ghost.rs error should not prevent lib.rs from being processed.
         assert_eq!(
             result.updated_count, 1,
@@ -3509,7 +3763,13 @@ fn extra() -> i32 {
             "fn hello() { 1 }\nfn world() { 2 }\n// comment",
         )
         .unwrap();
-        reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         let new_count: i64 = conn
             .query_row(
@@ -3886,7 +4146,13 @@ fn helper() -> i32 {
 
         let index_path = db::local_index_path(root);
         let conn = db::open_existing(&index_path).unwrap();
-        reindex_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("src/lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
 
         // Check that confidence is stored for the re-indexed reference.
         let confidence: f64 = conn
@@ -4003,7 +4269,13 @@ class Worker implements Runnable { run() {} }
         )
         .unwrap();
 
-        let changed = reindex_file(&conn, &root.join("app.ts"), root).unwrap();
+        let changed = reindex_file(
+            &conn,
+            &root.join("app.ts"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert!(changed, "modified file should be re-indexed");
 
         // Old edge (Dog -> Animal) should be gone.
@@ -4180,7 +4452,13 @@ function unknown() { return mystery(); }
         .unwrap();
 
         let events = vec![FileEvent::Modified(root.join("app.ts"))];
-        let result = process_events(&conn, &events, root).unwrap();
+        let result = process_events(
+            &conn,
+            &events,
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
         assert_eq!(result.updated_count, 1);
 
         // Old edges (Dog -> Animal) should be gone.
