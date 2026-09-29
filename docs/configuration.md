@@ -98,6 +98,16 @@ wonk update --force --provider bundled
 
 Use `--provider ollama` in that command when switching to the Ollama tier.
 
+Ollama is a quality tier, not a requirement. When the configured Ollama
+provider is unreachable at query time, semantic commands (`ask`,
+`search --semantic`, `cluster`, `impact`) fall back to the bundled provider
+and print a `warning:` on stderr. The fallback applies only while the stored
+vectors are compatible (bundled, or none yet): a stored vector space that
+disagrees with the resolved provider blocks the query with the re-embed
+command above instead of silently searching — or overwriting — the wrong
+space. `wonk status` always shows the active provider, the stored provider,
+and the stored dimension.
+
 ## Background daemon
 
 Wonk runs a background daemon that watches for file changes and keeps the index

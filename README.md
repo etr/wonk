@@ -306,7 +306,12 @@ provider = "ollama"
 ```
 
 Switching providers changes vector spaces. Run
-`wonk update --force --provider bundled` (or `ollama`) after a switch. See the
+`wonk update --force --provider bundled` (or `ollama`) after a switch. If the
+configured Ollama is unreachable at query time, semantic commands fall back to
+the bundled provider with a stderr warning instead of failing — the fallback
+never crosses a mismatched vector space, which always blocks with the re-embed
+command above. `wonk status` reports the active provider, the stored provider,
+and the stored dimension. See the
 [measured 25-query quality bake-off](bench/semantic-quality.md) for Recall@10
 and the exact delta against `nomic-embed-text`.
 

@@ -1162,8 +1162,10 @@ pub fn build_embeddings(
     if !provider.is_healthy() {
         if progress_mode != ProgressMode::Silent {
             eprintln!(
-                "Ollama not available — skipping embedding generation. \
-                 Semantic search will not be available until embeddings are built."
+                "embedding provider '{}' is unreachable — skipping embedding generation. \
+                 Retry later, or re-embed with the bundled provider: \
+                 `wonk update --force --provider bundled`",
+                provider.name()
             );
         }
         return Ok(EmbeddingBuildStats {
@@ -1235,10 +1237,10 @@ pub fn build_missing_embeddings(
     let total = chunks.len();
 
     // Health check — bail before starting the expensive batch-embed loop.
-    // Unlike build_embeddings we return Err because the caller (wonk ask)
-    // requires Ollama.
+    // Unlike build_embeddings we return Err so the caller can decide how to
+    // degrade (query-time fallback to the bundled provider).
     if !provider.is_healthy() {
-        anyhow::bail!("{}", embedding::OLLAMA_REQUIRED_MSG);
+        anyhow::bail!("{}", embedding::OLLAMA_UNREACHABLE_MSG);
     }
 
     let embedded = embed_chunks(

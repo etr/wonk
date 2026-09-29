@@ -29,10 +29,10 @@ use crate::router::QueryRouter;
 use crate::search;
 use crate::types::Symbol;
 
-fn embedding_provider_for(
+fn embedding_provider_kind_for(
     repo_root: &Path,
     invocation: Option<&str>,
-) -> Result<Box<dyn crate::embedding::EmbeddingProvider>, String> {
+) -> Result<crate::embedding::EmbeddingProviderKind, String> {
     let invocation = match invocation {
         Some("bundled") => Some(crate::embedding::EmbeddingProviderKind::Bundled),
         Some("ollama") => Some(crate::embedding::EmbeddingProviderKind::Ollama),
@@ -41,8 +41,40 @@ fn embedding_provider_for(
     };
     let config = crate::config::Config::load(Some(repo_root))
         .map_err(|error| format!("failed to load embedding configuration: {error:#}"))?;
-    let kind = crate::embedding::resolve_provider_kind(invocation, config.embedding.provider);
+    Ok(crate::embedding::resolve_provider_kind(
+        invocation,
+        config.embedding.provider,
+    ))
+}
+
+fn embedding_provider_for(
+    repo_root: &Path,
+    invocation: Option<&str>,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>, String> {
+    let kind = embedding_provider_kind_for(repo_root, invocation)?;
     crate::embedding::create_provider(kind).map_err(|error| error.to_string())
+}
+
+/// Resolve the query provider for a semantic tool call against the repo's
+/// stored vector spaces: an unreachable configured Ollama degrades to the
+/// bundled provider with a stderr warning, while a mismatched stored space
+/// errors with the re-embed command — the same contract as `wonk ask`.
+fn plan_query_provider(
+    conn: &rusqlite::Connection,
+    repo_root: &Path,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>, CallToolResult> {
+    let configured = match embedding_provider_kind_for(repo_root, None) {
+        Ok(kind) => kind,
+        Err(error) => return Err(CallToolResult::error(error)),
+    };
+    let plan = match crate::embedding::plan_query_provider(conn, configured) {
+        Ok(plan) => plan,
+        Err(error) => return Err(CallToolResult::error(format!("{error}"))),
+    };
+    if let Some(warning) = plan.fallback_warning {
+        eprintln!("warning: {warning}");
+    }
+    Ok(plan.provider)
 }
 
 // ---------------------------------------------------------------------------
@@ -1826,7 +1858,11 @@ impl McpServer {
         } else {
             self.router.conn()
         };
-        let info = crate::router::query_status_info(conn);
+        let configured = match embedding_provider_kind_for(self.router.repo_root(), None) {
+            Ok(kind) => kind,
+            Err(error) => return CallToolResult::error(error),
+        };
+        let info = crate::router::query_status_info(conn, configured);
         let status = serde_json::to_value(&info).unwrap_or_default();
         format_result(&status, format)
     }
@@ -2789,9 +2825,9 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match embedding_provider_for(&repo_root, None) {
+        let provider = match plan_query_provider(conn, &repo_root) {
             Ok(provider) => provider,
-            Err(error) => return CallToolResult::error(error),
+            Err(e) => return e,
         };
 
         let from = args.get("from").and_then(|v| v.as_str());
@@ -2917,9 +2953,9 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match embedding_provider_for(&repo_root, None) {
+        let provider = match plan_query_provider(conn, &repo_root) {
             Ok(provider) => provider,
-            Err(error) => return CallToolResult::error(error),
+            Err(e) => return e,
         };
 
         if let Err(e) = validate_path(Path::new(&path), &repo_root) {
@@ -2986,9 +3022,9 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match embedding_provider_for(&repo_root, None) {
+        let provider = match plan_query_provider(conn, &repo_root) {
             Ok(provider) => provider,
-            Err(error) => return CallToolResult::error(error),
+            Err(e) => return e,
         };
 
         // Determine files to analyze.
@@ -4726,6 +4762,29 @@ mod tests {
         let overridden = embedding_provider_for(repo_root, Some("ollama")).unwrap();
         assert_eq!(overridden.name(), "ollama");
         assert_eq!(overridden.dim(), 768);
+    }
+
+    #[test]
+    fn embedding_provider_kind_for_uses_repo_configuration_and_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_root = dir.path();
+        std::fs::create_dir_all(repo_root.join(".wonk")).unwrap();
+        std::fs::write(
+            repo_root.join(".wonk/config.toml"),
+            "[embedding]\nprovider = 'ollama'\n",
+        )
+        .unwrap();
+
+        let configured = embedding_provider_kind_for(repo_root, None).unwrap();
+        assert_eq!(configured, crate::embedding::EmbeddingProviderKind::Ollama);
+
+        let overridden = embedding_provider_kind_for(repo_root, Some("bundled")).unwrap();
+        assert_eq!(overridden, crate::embedding::EmbeddingProviderKind::Bundled);
+
+        assert_eq!(
+            embedding_provider_kind_for(repo_root, Some("remote")).unwrap_err(),
+            "invalid embedding provider: remote"
+        );
     }
 
     #[test]
