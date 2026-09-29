@@ -2550,6 +2550,53 @@ pub fn normalize_method(raw: &str) -> String {
     }
 }
 
+/// Characters that separate topic segments across brokers (Kafka `.`,
+/// NATS `.`, RabbitMQ routing keys `.`, STOMP `/topic/x`, Redis `:`).
+const TOPIC_SEPARATORS: &[char] = &['.', ':', '/'];
+
+/// Normalize a queue/websocket/job topic name (TASK-087, PRD-CTR-REQ-002).
+///
+/// Unlike [`normalize_http_path`] this pipeline REJECTS computed topics
+/// (`None` rather than a partial-confidence tier): exact-ID matching is the
+/// only pairing mechanism for message kinds, and partial knowledge is
+/// useless there.
+///
+/// 1. trim whitespace and quote characters (stage 1 of the HTTP pipeline),
+/// 2. reject empty, internal whitespace, or `{`/`}`/`$`/`#` (interpolation),
+/// 3. trim leading/trailing separator runs,
+/// 4. collapse maximal separator runs (single or mixed `.`/`:`/`/`) to one
+///    dot — the canonical grammar (`queue::kafka::orders.created`),
+/// 5. preserve case, segment order, and all other characters — NATS
+///    wildcards `*` and `>` stay literal and never exact-match a concrete
+///    topic.
+pub fn normalize_topic(raw: &str) -> Option<String> {
+    let trimmed = stage_trim(raw);
+    if trimmed.is_empty()
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed.chars().any(|c| matches!(c, '{' | '}' | '$' | '#'))
+    {
+        return None;
+    }
+    let inner = trimmed.trim_matches(|c: char| TOPIC_SEPARATORS.contains(&c));
+    if inner.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut in_separators = false;
+    for c in inner.chars() {
+        if TOPIC_SEPARATORS.contains(&c) {
+            if !in_separators {
+                out.push('.');
+                in_separators = true;
+            }
+        } else {
+            out.push(c);
+            in_separators = false;
+        }
+    }
+    Some(out)
+}
+
 /// Result of normalizing a raw HTTP path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedPath {
@@ -2928,6 +2975,101 @@ mod tests {
     #[should_panic(expected = "contract identifier must be non-empty")]
     fn canonical_rejects_empty_identifier() {
         canonical_contract_id(ContractKind::Http, "GET", "  ");
+    }
+
+    // -- topic normalization (TASK-087, PRD-CTR-REQ-002) ----------------------
+
+    /// Matrix: raw topic literal -> normalized identifier (`None` = rejected).
+    const NORMALIZE_TOPIC_CASES: &[(&str, Option<&str>)] = &[
+        (" orders.created ", Some("orders.created")),
+        ("'orders.created'", Some("orders.created")),
+        ("orders:created", Some("orders.created")),
+        ("orders/created", Some("orders.created")),
+        ("orders..created", Some("orders.created")),
+        ("orders.created.v2", Some("orders.created.v2")),
+        ("/topic/orders", Some("topic.orders")),
+        ("topic:orders", Some("topic.orders")),
+        (".:orders.:created:.", Some("orders.created")),
+        ("EmailWorker", Some("EmailWorker")),
+        ("orders.created", Some("orders.created")),
+        ("orders.*", Some("orders.*")),
+        ("orders.>", Some("orders.>")),
+        ("order-created_v2", Some("order-created_v2")),
+        ("hello world", None),
+        ("", None),
+        ("   ", None),
+        ("f\"{env}-orders\"", None),
+        ("${prefix}.orders", None),
+        ("orders.#fragment", None),
+        ("$topic", None),
+        ("orders.{env}.created", None),
+    ];
+
+    #[test]
+    fn topic_matrix_normalizes_and_rejects() {
+        for (raw, want) in NORMALIZE_TOPIC_CASES {
+            assert_eq!(
+                &normalize_topic(raw),
+                &want.map(|w| w.to_string()),
+                "normalize_topic({raw:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn topic_trims_quotes_and_whitespace() {
+        assert_eq!(
+            normalize_topic("  'orders.created'  "),
+            Some("orders.created".into())
+        );
+        assert_eq!(
+            normalize_topic("\"orders.created\""),
+            Some("orders.created".into())
+        );
+    }
+
+    #[test]
+    fn topic_preserves_case_and_segment_order() {
+        assert_eq!(
+            normalize_topic("Orders.Created"),
+            Some("Orders.Created".into())
+        );
+        assert_eq!(normalize_topic("a.b.c"), Some("a.b.c".into()));
+    }
+
+    #[test]
+    fn topic_wildcards_stay_literal() {
+        // NATS wildcards never exact-match a concrete topic — by design.
+        assert_eq!(normalize_topic("orders.*"), Some("orders.*".into()));
+        assert_eq!(normalize_topic("orders.>"), Some("orders.>".into()));
+    }
+
+    #[test]
+    fn canonical_queue_with_broker_qualifier() {
+        assert_eq!(
+            canonical_contract_id(ContractKind::Queue, "kafka", "orders.created"),
+            "queue::kafka::orders.created"
+        );
+    }
+
+    #[test]
+    fn canonical_queue_unknown_broker_has_empty_qualifier() {
+        assert_eq!(
+            canonical_contract_id(ContractKind::Queue, "", "orders.created"),
+            "queue::::orders.created"
+        );
+    }
+
+    #[test]
+    fn canonical_websocket_and_job_empty_qualifier() {
+        assert_eq!(
+            canonical_contract_id(ContractKind::WebSocket, "", "chat.message"),
+            "websocket::::chat.message"
+        );
+        assert_eq!(
+            canonical_contract_id(ContractKind::Job, "", "email-send"),
+            "job::::email-send"
+        );
     }
 
     // -- stage matrices (PRD-CTR-REQ-003, §9.1) -------------------------------
