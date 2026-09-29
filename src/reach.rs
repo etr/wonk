@@ -321,11 +321,13 @@ pub(crate) struct ReachRepairStats {
     pub(crate) skipped: bool,
 }
 
-/// One-shot failure injection point for the REQ-007 degrade test: when
-/// set, the next `finish_file_edit` returns an error and clears the flag.
+/// One-shot failure injection point for the REQ-007 degrade test: when set
+/// to a relative path, the next `finish_file_edit` for exactly that path
+/// returns an error and clears the flag. Keyed by path — the crate's tests
+/// run in parallel, and a global flag would let an unrelated test's
+/// reindex consume the injection.
 #[cfg(test)]
-pub(crate) static FAIL_NEXT_FINISH: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub(crate) static FAIL_NEXT_FINISH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Capture the pre-edit state of a file edit, BEFORE the caller deletes
 /// the file's old rows. Call [`finish_file_edit`] after the new rows are
@@ -389,8 +391,12 @@ pub(crate) fn finish_file_edit(
     }
 
     #[cfg(test)]
-    if FAIL_NEXT_FINISH.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        return Err(anyhow::anyhow!("injected finish_file_edit failure"));
+    {
+        let mut fail_for = FAIL_NEXT_FINISH.lock().unwrap();
+        if fail_for.as_deref() == Some(scope.rel_path.as_str()) {
+            *fail_for = None;
+            return Err(anyhow::anyhow!("injected finish_file_edit failure"));
+        }
     }
 
     // Post-edit affected names, unioned with the pre-edit set.

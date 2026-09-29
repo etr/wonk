@@ -2223,11 +2223,21 @@ fn extra() -> i32 {
     /// REQ-007: a failed incremental repair must degrade to BFS — the file
     /// data still commits, the table is marked stale in the same
     /// transaction, lookups return None, and blast answers equal the plain
-    /// BFS. The failpoint self-clears after one shot.
+    /// BFS. The failpoint self-clears after one shot. The probe file is
+    /// uniquely named so no parallel test's reindex can consume the
+    /// path-keyed injection.
     #[test]
     fn test_reindex_repair_failure_degrades_to_bfs_never_wrong_data() {
-        let (dir, conn) = setup_indexed_repo();
+        let dir = TempDir::new().unwrap();
         let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("degrade_probe.rs"),
+            "fn hello() { world(); }\nfn world() { 2 }",
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
 
         // Sanity: the table covers world before the edit.
         assert!(
@@ -2236,19 +2246,19 @@ fn extra() -> i32 {
                 .is_some()
         );
 
-        crate::reach::FAIL_NEXT_FINISH.store(true, std::sync::atomic::Ordering::SeqCst);
+        *crate::reach::FAIL_NEXT_FINISH.lock().unwrap() = Some("degrade_probe.rs".to_string());
         fs::write(
-            root.join("lib.rs"),
+            root.join("degrade_probe.rs"),
             "fn hello() { world(); }\nfn world() { 4 }\nfn extra() { 7 }",
         )
         .unwrap();
-        let changed = reindex_file(&conn, &root.join("lib.rs"), root).unwrap();
+        let changed = reindex_file(&conn, &root.join("degrade_probe.rs"), root).unwrap();
 
         assert!(changed, "the reindex itself succeeds");
         // The file data committed despite the failed repair.
         let symbols: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs' AND name = 'extra'",
+                "SELECT COUNT(*) FROM symbols WHERE file = 'degrade_probe.rs' AND name = 'extra'",
                 [],
                 |row| row.get(0),
             )
@@ -2289,7 +2299,7 @@ fn extra() -> i32 {
         assert!(names.contains(&"hello"), "BFS still finds the caller");
 
         // One-shot: the failpoint cleared itself.
-        assert!(!crate::reach::FAIL_NEXT_FINISH.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(crate::reach::FAIL_NEXT_FINISH.lock().unwrap().is_none());
     }
 
     /// TASK-081 acceptance: after every edit in a realistic sequence, the
