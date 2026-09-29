@@ -545,6 +545,9 @@ pub(crate) fn lookup_upstream_impl(
 mod tests {
     use super::*;
     use crate::db;
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     #[test]
@@ -1565,6 +1568,190 @@ mod tests {
         assert!(
             strict_names.is_subset(&table_names),
             "filtered BFS is a subset, never equal here"
+        );
+    }
+    // -- Concurrency suite (PRD-REACH-REQ-008, AR-028) -----------------------
+    //
+    // Readers must never observe a shrunken or partially-published reach set
+    // while a writer re-indexes or rebuilds. WAL + one transaction per
+    // publication give that; these tests hold the line.
+
+    /// Variant A — daemon re-index loop: the writer drives the per-file
+    /// upsert path (delete + reinsert + mark_stale in one transaction) while
+    /// a reader repeatedly answers from a single read snapshot. The reader
+    /// must always see the full expected set via BFS, and any table answer
+    /// must be that same full set — never empty, never a subset.
+    #[test]
+    fn concurrency_reader_never_observes_shrunken_set_during_reindex() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        let lib = root.join("src/lib.rs");
+        let base = "fn hello() { world(); }\nfn world() { 42 }\n";
+        fs::write(&lib, base).unwrap();
+
+        crate::pipeline::build_index(&root, true).unwrap();
+        let index_path = db::local_index_path(&root);
+
+        // The toggle comment shifts line numbers, so the stable expectation
+        // is the affected NAME SET, not exact locations.
+        let expected_names: Vec<String> = {
+            let conn = db::open_existing(&index_path).unwrap();
+            let analysis =
+                crate::blast::analyze_blast(&conn, "world", &bfs_options(3, false)).unwrap();
+            assert_eq!(
+                analysis.total_affected, 1,
+                "fixture sanity: exactly hello calls world"
+            );
+            analysis
+                .tiers
+                .iter()
+                .flat_map(|t| t.symbols.iter().map(|s| s.name.clone()))
+                .collect()
+        };
+        assert_eq!(expected_names, vec!["hello".to_string()]);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let observations = Arc::new(AtomicUsize::new(0));
+
+        let writer_root = root.clone();
+        let writer = std::thread::spawn(move || {
+            let wconn = db::open_existing(&db::local_index_path(&writer_root)).unwrap();
+            for i in 0..30 {
+                let content = if i % 2 == 0 {
+                    format!("// toggle {i}\n{base}")
+                } else {
+                    base.to_string()
+                };
+                fs::write(&lib, content).unwrap();
+                crate::pipeline::reindex_file(&wconn, &lib, &writer_root).unwrap();
+            }
+        });
+
+        let reader_root = root.clone();
+        let reader_done = Arc::clone(&done);
+        let reader_observations = Arc::clone(&observations);
+        let reader = std::thread::spawn(move || {
+            let rconn = db::open_existing(&db::local_index_path(&reader_root)).unwrap();
+            while !reader_done.load(Ordering::Relaxed) {
+                let tx = rconn.unchecked_transaction().unwrap();
+                let bfs =
+                    crate::blast::analyze_blast(&tx, "world", &bfs_options(3, false)).unwrap();
+                let observed: Vec<String> = bfs
+                    .tiers
+                    .iter()
+                    .flat_map(|t| t.symbols.iter().map(|s| s.name.clone()))
+                    .collect();
+                assert_eq!(
+                    observed, expected_names,
+                    "reader must always observe the full set on its snapshot"
+                );
+                if let Some(answer) = lookup_upstream_impl(&tx, "world", 3).unwrap() {
+                    let names: Vec<String> =
+                        answer.affected.iter().map(|s| s.name.clone()).collect();
+                    assert_eq!(
+                        names, expected_names,
+                        "a table answer is authoritative or absent, never a subset"
+                    );
+                    assert!(!answer.truncated);
+                }
+                tx.commit().unwrap();
+                reader_observations.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        writer.join().unwrap();
+        done.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
+        assert!(
+            observations.load(Ordering::SeqCst) > 0,
+            "reader must have shared the timeline with the writer"
+        );
+    }
+
+    /// Variant B — full rebuild loop: the writer rebuilds the whole index
+    /// while a reader answers per snapshot. A table answer must be the full
+    /// expected set; the only window where the table may be absent is the
+    /// one where the symbols themselves are gone (rules out partial
+    /// publication of reach rows ahead of or behind the symbols).
+    #[test]
+    fn concurrency_reader_never_observes_partial_publication_during_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        for (path, content) in [
+            ("src/one.rs", "fn one() { two(); }\n"),
+            ("src/two.rs", "fn two() { three(); }\n"),
+            ("src/three.rs", "fn three() { four(); }\n"),
+            ("src/four.rs", "fn four() { }\n"),
+            ("src/deep.rs", "fn deep_caller() { one(); }\n"),
+            ("tests/chain_test.rs", "fn chain_suite() { two(); }\n"),
+        ] {
+            fs::write(root.join(path), content).unwrap();
+        }
+
+        crate::pipeline::build_index(&root, true).unwrap();
+        let index_path = db::local_index_path(&root);
+
+        let expected = {
+            let conn = db::open_existing(&index_path).unwrap();
+            crate::blast::analyze_blast(&conn, "two", &bfs_options(3, false)).unwrap()
+        };
+        assert!(
+            expected.total_affected >= 2,
+            "fixture sanity: two has callers (one, deep_caller)"
+        );
+
+        let done = Arc::new(AtomicBool::new(false));
+        let observations = Arc::new(AtomicUsize::new(0));
+
+        let writer_root = root.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..10 {
+                crate::pipeline::build_index(&writer_root, true).unwrap();
+            }
+        });
+
+        let reader_root = root.clone();
+        let reader_done = Arc::clone(&done);
+        let reader_observations = Arc::clone(&observations);
+        let reader = std::thread::spawn(move || {
+            let rconn = db::open_existing(&db::local_index_path(&reader_root)).unwrap();
+            while !reader_done.load(Ordering::Relaxed) {
+                let tx = rconn.unchecked_transaction().unwrap();
+                let symbols: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+                    .unwrap();
+                if let Some(answer) = lookup_upstream_impl(&tx, "two", 3).unwrap() {
+                    assert!(symbols > 0, "an answer implies a populated snapshot");
+                    assert_eq!(
+                        answer.affected.len(),
+                        expected.total_affected,
+                        "table answers are the full set, never partially published"
+                    );
+                    let bfs =
+                        crate::blast::analyze_blast(&tx, "two", &bfs_options(3, false)).unwrap();
+                    assert_eq!(bfs, expected, "table ≡ BFS on the same snapshot");
+                } else {
+                    assert_eq!(
+                        symbols, 0,
+                        "absent table is allowed only inside the empty drop window"
+                    );
+                }
+                tx.commit().unwrap();
+                reader_observations.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        writer.join().unwrap();
+        done.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
+        assert!(
+            observations.load(Ordering::SeqCst) > 0,
+            "reader must have shared the timeline with the writer"
         );
     }
 }
