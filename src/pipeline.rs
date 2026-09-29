@@ -1918,7 +1918,8 @@ class Component {
 
     #[test]
     fn test_drop_all_data_clears_term_stats() {
-        let (dir, conn) = setup_indexed_repo();
+        // The TempDir must outlive the test; only the connection is used.
+        let (_dir, conn) = setup_indexed_repo();
 
         let before: i64 = conn
             .query_row("SELECT COUNT(*) FROM term_stats", [], |row| row.get(0))
