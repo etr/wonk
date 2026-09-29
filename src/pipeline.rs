@@ -631,12 +631,12 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     }
 
     // Insert BM25 term statistics — same transaction as the file's symbols.
-    {
-        let mut stmt = tx.prepare("INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)")?;
-        for (term, tf) in &result.term_freqs {
-            stmt.execute(rusqlite::params![term, result.rel_path, *tf as i64])?;
-        }
-    }
+    let term_rows: Vec<(&str, &str, i64)> = result
+        .term_freqs
+        .iter()
+        .map(|(term, tf)| (term.as_str(), result.rel_path.as_str(), *tf as i64))
+        .collect();
+    insert_term_stats(&tx, &term_rows)?;
 
     // Insert type hierarchy edges, resolving names to symbol IDs.
     {
@@ -859,14 +859,13 @@ fn batch_insert(conn: &Connection, results: &[FileResult]) -> Result<(usize, usi
     }
 
     // Insert BM25 term statistics — same transaction as the file's symbols.
-    {
-        let mut stmt = tx.prepare("INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)")?;
-        for r in results {
-            for (term, tf) in &r.term_freqs {
-                stmt.execute(rusqlite::params![term, r.rel_path, *tf as i64])?;
-            }
+    let mut term_rows: Vec<(&str, &str, i64)> = Vec::new();
+    for r in results {
+        for (term, tf) in &r.term_freqs {
+            term_rows.push((term.as_str(), r.rel_path.as_str(), *tf as i64));
         }
     }
+    insert_term_stats(&tx, &term_rows)?;
 
     // Insert type hierarchy edges, resolving names to symbol IDs.
     // Batch-resolve cross-file parent names to avoid N+1 queries.
@@ -1360,6 +1359,41 @@ pub fn reembed_changed_files(
     )?;
 
     Ok(embedded)
+}
+
+/// Insert BM25 term statistics in the caller's transaction.
+///
+/// Rows are sorted by (term, file) and written via multi-row statements:
+/// the primary-key B-tree receives sequential appends instead of random
+/// inserts, and per-row execute overhead disappears on full builds.
+fn insert_term_stats(tx: &rusqlite::Transaction, rows: &[(&str, &str, i64)]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut sorted = rows.to_vec();
+    sorted.sort_unstable();
+
+    // 3 bound parameters per row; bundled SQLite allows 32766 variables.
+    const ROWS_PER_STMT: usize = 1000;
+    for chunk in sorted.chunks(ROWS_PER_STMT) {
+        let placeholders = chunk
+            .iter()
+            .map(|_| "(?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO term_stats (term, file, tf) VALUES {placeholders}");
+        let mut stmt = tx.prepare(&sql)?;
+        stmt.execute(rusqlite::params_from_iter(chunk.iter().flat_map(
+            |(term, file, tf)| {
+                [
+                    term as &dyn rusqlite::ToSql,
+                    file as &dyn rusqlite::ToSql,
+                    tf as &dyn rusqlite::ToSql,
+                ]
+            },
+        )))?;
+    }
+    Ok(())
 }
 
 /// Drop all data from the main tables (used before rebuild).
