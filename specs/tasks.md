@@ -43,7 +43,7 @@
 | M23 | Scoped Change Detection (`wonk changes`) | 2 | Complete |
 | M24 | Unified Symbol Context (`wonk context`) | 1 | Complete |
 | M25 | Multi-Repo MCP | 1 | Complete |
-| M26 | Bundled Embedding Provider | 3 | Not Started |
+| M26 | Bundled Embedding Provider | 3 | In Progress |
 | M27 | Lexical BM25 Scoring | 2 | Not Started |
 | M28 | Precomputed Reach Index | 2 | Not Started |
 | M29 | Cross-Repo Contract Detection | 5 | Not Started |
@@ -3244,13 +3244,13 @@ Introduce an `EmbeddingProvider` trait in `embedding.rs`, refactor the existing 
 Select, bundle, and implement `BundledProvider` — in-process embedding generation with no network, within a 10 MB binary budget.
 
 **Action Items:**
-- [ ] Bake-off candidate small models on the existing semantic test corpus; record the recall delta vs. `nomic-embed-text` (resolves OQ-009)
-- [ ] Embed the chosen model as a compressed `include_bytes!` blob; decompress once on first use (PRD-EMB-REQ-001, PRD-EMB-REQ-008)
-- [ ] Implement `BundledProvider::embed_batch()` running inference on the existing rayon pool (PRD-EMB-REQ-001)
-- [ ] Make `bundled` the default provider when no configuration is present (PRD-EMB-REQ-002)
-- [ ] Add a CI check enforcing the ≤ 10 MB model budget and the 40 MB total binary ceiling (PRD-EMB-REQ-008, AR-023)
-- [ ] Benchmark: 10k-symbol repo embeds in under 60s with no network (PRD-EMB-REQ-007)
-- [ ] Document the bundled-vs-Ollama quality delta in the README semantic section (AR-019)
+- [x] Bake-off candidate small models on the existing semantic test corpus; record the recall delta vs. `nomic-embed-text` (resolves OQ-009)
+- [x] Embed the chosen model as a compressed `include_bytes!` blob; decompress once on first use (PRD-EMB-REQ-001, PRD-EMB-REQ-008)
+- [x] Implement `BundledProvider::embed_batch()` running inference on the existing rayon pool (PRD-EMB-REQ-001)
+- [x] Make `bundled` the default provider when no configuration is present (PRD-EMB-REQ-002)
+- [x] Add a CI check enforcing the ≤ 10 MB model budget and the 40 MB total binary ceiling (PRD-EMB-REQ-008, AR-023)
+- [x] Benchmark: 10k-symbol repo embeds in under 60s with no network (PRD-EMB-REQ-007)
+- [x] Document the bundled-vs-Ollama quality delta in the README semantic section (AR-019)
 
 **Dependencies:**
 - Blocked by: TASK-075
@@ -3266,7 +3266,7 @@ Select, bundle, and implement `BundledProvider` — in-process embedding generat
 **Related Requirements:** PRD-EMB-REQ-001, PRD-EMB-REQ-002, PRD-EMB-REQ-007, PRD-EMB-REQ-008
 **Related Decisions:** DR-032
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
