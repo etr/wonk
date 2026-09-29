@@ -1842,11 +1842,56 @@ impl<'a> Extractor<'a> {
                             None,
                         );
                     }
+                } else if matches!(field, "subscribe" | "publish")
+                    && let Some(arg) = first
+                    && let Some(raw) = self.topic_arg(arg)
+                {
+                    // TASK-087 queue: async_nats clients pass "subject".into();
+                    // rdkafka consumers pass a single-string slice &[ "topic" ].
+                    // No generic Rust tier — only these two pinned shapes.
+                    let root_text =
+                        node_text(rust_chain_root(func.child_by_field_name("value")), self.src);
+                    let is_nats = matches!(root_text, "client" | "nats" | "nc")
+                        && arg.kind() == "call_expression";
+                    let is_kafka_slice =
+                        field == "subscribe" && arg.kind() == "reference_expression";
+                    if is_nats || is_kafka_slice {
+                        self.emit_queue(
+                            node,
+                            arg,
+                            &raw,
+                            if field == "subscribe" {
+                                ContractRole::Provider
+                            } else {
+                                ContractRole::Consumer
+                            },
+                            if is_nats { "nats" } else { "kafka" },
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
                 }
             }
             "scoped_identifier" => {
                 let text = node_text(Some(func), self.src);
                 match text {
+                    // rdkafka: FutureRecord::to / BaseRecord::to — publishing
+                    // a record initiates, so the site is the consumer (DR-031).
+                    t if t.ends_with("Record::to") => {
+                        if let Some(arg) = first
+                            && let Some(raw) = self.topic_arg(arg)
+                        {
+                            self.emit_queue(
+                                node,
+                                arg,
+                                &raw,
+                                ContractRole::Consumer,
+                                "kafka",
+                                CONFIDENCE_FRAMEWORK,
+                                None,
+                            );
+                        }
+                    }
                     "std::env::var" | "env::var" => {
                         if let Some(arg) = first {
                             let name = render_string_node(arg, self.src, self.lang);
@@ -5219,6 +5264,73 @@ fn cfg() {
         assert!(find(&cands, "env::::API_KEY").is_some());
         let w = find(&cands, "env::::TMP_SET").expect("write not found");
         assert_eq!(w.role, ContractRole::Provider);
+    }
+
+    // -- walker: queue, Rust (TASK-087 step 5) ---------------------------------
+
+    #[test]
+    fn rust_rdkafka_future_record_to() {
+        let src = "fn publish() {\n    let rec = FutureRecord::to(\"orders.created\", 0, payload);\n    producer.send(rec, Timeout::Never);\n}\n";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "queue::kafka::orders.created");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.line, 2);
+        assert_eq!(c.owning_symbol.as_deref(), Some("publish"));
+    }
+
+    #[test]
+    fn rust_rdkafka_base_record_to() {
+        let src = "fn publish() {\n    let rec = BaseRecord::to(\"orders.created\");\n}\n";
+        let cands = extract(Lang::Rust, src);
+        let c = find(&cands, "queue::kafka::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn rust_rdkafka_consumer_subscribe_slice() {
+        let src = "fn listen() {\n    consumer.subscribe(&[\"orders.created\"])?;\n}\n";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert_eq!(cands[0].canonical_id, "queue::kafka::orders.created");
+        assert_eq!(cands[0].role, ContractRole::Provider);
+        assert_eq!(cands[0].confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn rust_rdkafka_subscribe_multi_topic_slice_skipped() {
+        let cands = extract(
+            Lang::Rust,
+            "fn listen() {\n    consumer.subscribe(&[\"a\", \"b\"])?;\n}\n",
+        );
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn rust_async_nats_publish_into() {
+        let src =
+            "async fn push() {\n    client.publish(\"orders.created\".into(), bytes).await?;\n}\n";
+        let cands = extract(Lang::Rust, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn rust_async_nats_subscribe_into() {
+        let src =
+            "async fn listen() {\n    client.subscribe(\"orders.created\".into()).await?;\n}\n";
+        let cands = extract(Lang::Rust, src);
+        let c = find(&cands, "queue::nats::orders.created").expect("contract not found");
+        assert_eq!(c.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn rust_subscribe_non_string_receiver_skipped() {
+        let cands = extract(Lang::Rust, "fn f() {\n    bus.subscribe(handler);\n}\n");
+        assert!(cands.is_empty(), "got {cands:?}");
     }
 
     // -- walker: Java (step 6) ---------------------------------------------------
