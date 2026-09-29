@@ -493,15 +493,7 @@ fn py_route_verb(args: Node, src: &[u8]) -> &'static str {
             && let Some(first) = value.named_child(0)
             && let Some(method) = py_string_content(first, src)
         {
-            return match method.to_lowercase().as_str() {
-                "post" => "post",
-                "put" => "put",
-                "patch" => "patch",
-                "delete" => "delete",
-                "head" => "head",
-                "options" => "options",
-                _ => "get",
-            };
+            return canonical_verb(&method.to_lowercase()).unwrap_or("get");
         }
     }
     "get"
@@ -523,6 +515,9 @@ struct Extractor<'a> {
 const JS_ROUTER_VARS: &[&str] = &["app", "router", "api", "server", "r"];
 /// Verb-named methods that register routes on a router receiver.
 const JS_PROVIDER_VERBS: &[&str] = &["get", "post", "put", "patch", "delete", "all"];
+/// Verb-named methods on HTTP client receivers (provider verbs minus the
+/// `all` catch-all, which has no consumer meaning).
+const JS_CONSUMER_VERBS: &[&str] = &["get", "post", "put", "patch", "delete"];
 /// HTTP client receivers whose verb-named methods are outbound calls.
 const JS_CONSUMER_RECEIVERS: &[&str] = &["axios", "got", "http", "https"];
 /// Verb-like callee names used by the 0.5 heuristic on unknown receivers.
@@ -656,7 +651,7 @@ impl<'a> Extractor<'a> {
                         None,
                     );
                 } else if JS_CONSUMER_RECEIVERS.contains(&recv)
-                    && JS_PROVIDER_VERBS[..5].contains(&prop)
+                    && JS_CONSUMER_VERBS.contains(&prop)
                     && let Some(arg) = first_arg
                 {
                     self.emit_http(
@@ -692,10 +687,7 @@ impl<'a> Extractor<'a> {
 
     /// `process.env.NAME` / `import.meta.env.NAME` reads.
     fn js_env_member(&mut self, node: Node) {
-        if let Some(parent) = node.parent()
-            && parent.kind() == "assignment_expression"
-            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
-        {
+        if is_assignment_target(node, "assignment_expression") {
             return; // the assignment handler owns this site
         }
         let obj = node_text(node.child_by_field_name("object"), self.src);
@@ -707,10 +699,7 @@ impl<'a> Extractor<'a> {
 
     /// `process.env['NAME']` reads.
     fn js_env_subscript(&mut self, node: Node) {
-        if let Some(parent) = node.parent()
-            && parent.kind() == "assignment_expression"
-            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
-        {
+        if is_assignment_target(node, "assignment_expression") {
             return;
         }
         let obj = node_text(node.child_by_field_name("object"), self.src);
@@ -922,10 +911,7 @@ impl<'a> Extractor<'a> {
 
     /// `os.environ['X']` reads.
     fn py_env_subscript(&mut self, node: Node) {
-        if let Some(parent) = node.parent()
-            && parent.kind() == "assignment"
-            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
-        {
+        if is_assignment_target(node, "assignment") {
             return; // the assignment handler owns this site
         }
         let obj = node_text(node.child_by_field_name("value"), self.src);
@@ -1070,7 +1056,7 @@ impl<'a> Extractor<'a> {
                         }
                     }
                     _ if RUBY_CONSUMER_RECEIVERS.contains(&recv_text) => {
-                        if let (Some(arg), Some(verb)) = (first, ruby_verb(method)) {
+                        if let (Some(arg), Some(verb)) = (first, canonical_verb(method)) {
                             self.emit_http(
                                 node,
                                 arg,
@@ -1096,10 +1082,7 @@ impl<'a> Extractor<'a> {
 
     /// `ENV['X']` reads.
     fn ruby_env_ref(&mut self, node: Node) {
-        if let Some(parent) = node.parent()
-            && parent.kind() == "assignment"
-            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
-        {
+        if is_assignment_target(node, "assignment") {
             return; // the assignment handler owns this site
         }
         let obj = node_text(node.named_child(0), self.src);
@@ -1330,7 +1313,7 @@ impl<'a> Extractor<'a> {
                         CONFIDENCE_FRAMEWORK,
                         None,
                     );
-                } else if let Some(verb) = ruby_verb(field) {
+                } else if let Some(verb) = canonical_verb(field) {
                     let value = func.child_by_field_name("value");
                     let root = rust_chain_root(value);
                     let root_text = node_text(root, self.src);
@@ -1376,7 +1359,8 @@ impl<'a> Extractor<'a> {
                     }
                     _ => {
                         if text.starts_with("reqwest::")
-                            && let Some(verb) = ruby_verb(text.rsplit("::").next().unwrap_or(""))
+                            && let Some(verb) =
+                                canonical_verb(text.rsplit("::").next().unwrap_or(""))
                             && let Some(arg) = first
                         {
                             self.emit_http(
@@ -1486,8 +1470,8 @@ impl<'a> Extractor<'a> {
         prefix.to_string()
     }
 
-    /// Class-level `@RequestMapping("/v1")` prefixes every member route.
-    /// (JAX-RS class-level `@Path` is not composed — documented gap.)
+    /// Class-level `@RequestMapping("/v1")` (Spring) and `@Path("/items")`
+    /// (JAX-RS) prefix every member route.
     fn java_class(&mut self, node: Node, prefix: &str) -> String {
         let Some(modifiers) = node.named_child(0).filter(|n| n.kind() == "modifiers") else {
             return prefix.to_string();
@@ -1496,7 +1480,10 @@ impl<'a> Extractor<'a> {
             let Some(annot) = modifiers.named_child(i as u32) else {
                 continue;
             };
-            if node_text(annot.child_by_field_name("name"), self.src) != "RequestMapping" {
+            if !matches!(
+                node_text(annot.child_by_field_name("name"), self.src),
+                "RequestMapping" | "Path"
+            ) {
                 continue;
             }
             if let Some(args) = annot.child_by_field_name("arguments")
@@ -1659,7 +1646,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             "Http" => {
-                if let (Some(verb), Some(arg)) = (ruby_verb(name), first) {
+                if let (Some(verb), Some(arg)) = (canonical_verb(name), first) {
                     self.emit_http(
                         node,
                         arg,
@@ -1690,7 +1677,9 @@ impl<'a> Extractor<'a> {
         let Some(first) = positional_arg(args, 0) else {
             return;
         };
-        let Some(verb) = ruby_verb(name) else { return };
+        let Some(verb) = canonical_verb(name) else {
+            return;
+        };
         if matches!(object, "app" | "group" | "router") {
             self.emit_http(
                 node,
@@ -1757,10 +1746,7 @@ impl<'a> Extractor<'a> {
 
     /// `$_ENV['X']` reads.
     fn php_env_subscript(&mut self, node: Node) {
-        if let Some(parent) = node.parent()
-            && parent.kind() == "assignment_expression"
-            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
-        {
+        if is_assignment_target(node, "assignment_expression") {
             return;
         }
         // PHP subscript children are positional: [variable_name, string].
@@ -1919,7 +1905,8 @@ impl<'a> Extractor<'a> {
             return;
         };
         if name.starts_with("Map")
-            && let Some(verb) = ruby_verb(name.trim_start_matches("Map").to_lowercase().as_str())
+            && let Some(verb) =
+                canonical_verb(name.trim_start_matches("Map").to_lowercase().as_str())
         {
             self.emit_http(
                 node,
@@ -2196,6 +2183,17 @@ impl<'a> Extractor<'a> {
     }
 }
 
+/// Whether `node` is the left-hand side of an assignment of kind
+/// `assign_kind` (`assignment_expression` for JS/PHP, `assignment` for
+/// Python/Ruby). Read matchers skip such sites — the assignment handler
+/// owns them.
+fn is_assignment_target(node: Node, assign_kind: &str) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == assign_kind
+            && parent.child_by_field_name("left").map(|n| n.id()) == Some(node.id())
+    })
+}
+
 /// Env-var names: non-empty, single token, no whitespace.
 fn is_env_name(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(char::is_whitespace)
@@ -2214,8 +2212,9 @@ const GO_AMBIGUOUS_VERBS: &[&str] = &[
 /// C# HTTP client receiver names.
 const CSHARP_CONSUMER_RECEIVERS: &[&str] = &["httpClient", "client", "http"];
 
-/// Map a lowercase verb name to its canonical form; `None` if not a verb.
-fn ruby_verb(name: &str) -> Option<&'static str> {
+/// Map a lowercase verb name to its canonical form; `None` if not a
+/// verb. Shared across language walkers (Ruby, Rust, PHP, C#).
+fn canonical_verb(name: &str) -> Option<&'static str> {
     match name {
         "get" => Some("get"),
         "post" => Some("post"),
@@ -2243,7 +2242,7 @@ fn go_client_verb(recv: &str, meth: &str) -> Option<&'static str> {
 /// first verb-named method along its receiver chain (`web::get().to(h)`).
 fn rust_handler_verb<'t>(handler: Node<'t>, src: &'t [u8]) -> Option<&'t str> {
     if let Some(name) = rust_callee_name(handler, src)
-        && let Some(verb) = ruby_verb(name)
+        && let Some(verb) = canonical_verb(name)
     {
         return Some(verb);
     }
@@ -2260,14 +2259,17 @@ fn rust_handler_verb<'t>(handler: Node<'t>, src: &'t [u8]) -> Option<&'t str> {
         match node.kind() {
             "call_expression" => current = node.child_by_field_name("function"),
             "field_expression" => {
-                if let Some(verb) = ruby_verb(node_text(node.child_by_field_name("field"), src)) {
+                if let Some(verb) =
+                    canonical_verb(node_text(node.child_by_field_name("field"), src))
+                {
                     return Some(verb);
                 }
                 current = node.child_by_field_name("value");
             }
             // `web::get()` parses with a scoped callee — the name is the verb.
             "scoped_identifier" => {
-                if let Some(verb) = ruby_verb(node_text(node.child_by_field_name("name"), src)) {
+                if let Some(verb) = canonical_verb(node_text(node.child_by_field_name("name"), src))
+                {
                     return Some(verb);
                 }
                 break;
@@ -2381,7 +2383,7 @@ fn php_attribute_kwarg_verb(params: Node, src: &[u8]) -> Option<&'static str> {
             && let Some(method_node) = first_descendant_of_kind(value, "string")
         {
             let method = render_string_node(method_node, src, Lang::Php);
-            return ruby_verb(&method.to_lowercase());
+            return canonical_verb(&method.to_lowercase());
         }
     }
     None
@@ -2642,16 +2644,34 @@ fn strip_scheme(s: &str) -> Option<&str> {
     }
 }
 
-/// Stage 3: strip a single leading base-URL interpolation token
-/// (`${VAR}`, `$VAR`, `{VAR}`) — only when a `/` follows it, so a lone
-/// `/{id}` route remains a parameter route.
+/// Stage 3: strip a single leading base-URL interpolation token — only
+/// when a `/` follows it, so a lone `/{id}` route remains a parameter
+/// route. Dollar-sigil forms (`${name}`, `$name`) are always
+/// interpolations; the curly `{name}` form doubles as a path-parameter
+/// syntax (stage 4 rewrites it), so it is stripped only when the name is
+/// base-URL-like — contains an underscore or is ALL_CAPS (`API_URL`,
+/// `BASE`) — while parameter-like names (`tenant`, `org`) survive as
+/// the route's leading parameter.
 fn stage_strip_base_interpolation(path: &str) -> String {
     let body = path.strip_prefix('/').unwrap_or(path);
-    let token_len = interpolation_token_len(body);
-    match token_len {
-        Some(len) if body[len..].starts_with('/') => body[len + 1..].to_string(),
-        _ => path.to_string(),
+    let Some(len) = interpolation_token_len(body) else {
+        return path.to_string();
+    };
+    if !body[len..].starts_with('/') {
+        return path.to_string();
     }
+    if body.starts_with('{') && !is_base_url_name(&body[1..len - 1]) {
+        return path.to_string();
+    }
+    body[len + 1..].to_string()
+}
+
+/// Whether a curly `{NAME}` token names a base-URL variable rather than
+/// a route parameter: underscored (`API_URL`) or ALL_CAPS (`BASE`).
+fn is_base_url_name(name: &str) -> bool {
+    name.contains('_')
+        || (name.chars().any(|c| c.is_ascii_uppercase())
+            && !name.chars().any(|c| c.is_ascii_lowercase()))
 }
 
 /// Length of an interpolation token (`${…}`, `{…}`, `$name`) at the start of
@@ -2977,6 +2997,15 @@ mod tests {
         // Lone token (no following path) stays — it is the route itself.
         ("/{id}", "/{id}"),
         ("${API_URL}", "${API_URL}"),
+        // Curly tokens with parameter-like names stay for stage 4 to
+        // rewrite — only base-URL-like names (underscore / ALL_CAPS)
+        // are treated as interpolations.
+        ("/{tenant}/users", "/{tenant}/users"),
+        ("/{org}/{repo}", "/{org}/{repo}"),
+        ("{BASE_URL}/x", "x"),
+        ("/{BASE}/x", "x"),
+        ("${A}/x", "x"),
+        ("$A/x", "x"),
     ];
 
     #[test]
@@ -3139,6 +3168,30 @@ mod tests {
                 params: vec!["API_URL".into()]
             })
         );
+    }
+
+    #[test]
+    fn pipeline_leading_curly_param_is_param_not_base() {
+        // A leading `{name}` path parameter must survive stage 3 and be
+        // rewritten positionally by stage 4 with its name retained.
+        assert_eq!(
+            norm("/{tenant}/users"),
+            Some(NormalizedPath {
+                path: "/{p1}/users".into(),
+                params: vec!["tenant".into()]
+            })
+        );
+        assert_eq!(
+            norm("/{org}/{repo}"),
+            Some(NormalizedPath {
+                path: "/{p1}/{p2}".into(),
+                params: vec!["org".into(), "repo".into()]
+            })
+        );
+        // Dollar-sigil and base-URL-like curly tokens still strip.
+        assert_eq!(norm("${A}/x").map(|n| n.path), Some("/x".into()));
+        assert_eq!(norm("$A/x").map(|n| n.path), Some("/x".into()));
+        assert_eq!(norm("{BASE_URL}/x").map(|n| n.path), Some("/x".into()));
     }
 
     // -- walker: JavaScript / TypeScript (step 4) -------------------------------
@@ -3695,7 +3748,7 @@ public class ItemsResource {
 }
 ";
         let cands = extract(Lang::Java, src);
-        let c = find(&cands, "http::GET::/{p1}").expect("route not found");
+        let c = find(&cands, "http::GET::/items/{p1}").expect("route not found");
         assert_eq!(c.role, ContractRole::Provider);
         assert_eq!(c.owning_symbol.as_deref(), Some("item"));
     }
@@ -4295,6 +4348,14 @@ public class UsersController : ControllerBase
             params: &[("p1", "id")],
         },
         CorpusEntry {
+            lang: Lang::Java,
+            source: "@Path(\"/v1/users\")\npublic class UsersResource {\n    @GET\n    @Path(\"/{id}\")\n    public String f() { return \"\"; }\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/v1/users/{p1}",
+            params: &[("p1", "id")],
+        },
+        CorpusEntry {
             lang: Lang::Ruby,
             source: "get '/v1/users/:id' do\n  json\nend",
             role: ContractRole::Provider,
@@ -4414,6 +4475,24 @@ public class UsersController : ControllerBase
             confidence: CONFIDENCE_FRAMEWORK,
             canonical_id: "http::GET::/v1/users",
             params: &[],
+        },
+        // Leading-parameter route: provider and consumer pair on
+        // GET /{tenant}/users across languages.
+        CorpusEntry {
+            lang: Lang::Java,
+            source: "class C {\n    @GetMapping(\"/{tenant}/users\")\n    public String f() { return \"\"; }\n}",
+            role: ContractRole::Provider,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/{p1}/users",
+            params: &[("p1", "tenant")],
+        },
+        CorpusEntry {
+            lang: Lang::Python,
+            source: "def f(tenant):\n    r = httpx.get(f\"/{tenant}/users\")",
+            role: ContractRole::Consumer,
+            confidence: CONFIDENCE_FRAMEWORK,
+            canonical_id: "http::GET::/{p1}/users",
+            params: &[("p1", "tenant")],
         },
         // Env accessors across languages -> one ID.
         CorpusEntry {
