@@ -29,6 +29,7 @@ pub struct Config {
     pub llm: LlmConfig,
     pub search: SearchConfig,
     pub embedding: EmbeddingConfig,
+    pub reach: ReachConfig,
 }
 
 /// Daemon-related settings.
@@ -99,6 +100,26 @@ pub struct EmbeddingConfig {
     pub provider: EmbeddingProviderKind,
 }
 
+/// Precomputed reach index settings (TASK-080, DR-034).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReachConfig {
+    /// Depth to which the reach table is materialized during index build.
+    /// Clamped to `blast::MAX_DEPTH` at the use site.
+    pub depth: usize,
+    /// Kill switch: `false` skips the build and restores exact V4 behavior
+    /// (PRD-REACH-REQ-006).
+    pub enabled: bool,
+}
+
+impl Default for ReachConfig {
+    fn default() -> Self {
+        Self {
+            depth: 3,
+            enabled: true,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -163,6 +184,7 @@ struct ConfigOverlay {
     llm: Option<LlmOverlay>,
     search: Option<SearchOverlay>,
     embedding: Option<EmbeddingOverlay>,
+    reach: Option<ReachOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -210,6 +232,13 @@ struct SearchOverlay {
 #[serde(default)]
 struct EmbeddingOverlay {
     provider: Option<EmbeddingProviderKind>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ReachOverlay {
+    depth: Option<usize>,
+    enabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +298,14 @@ impl Config {
             && let Some(provider) = embedding.provider
         {
             self.embedding.provider = provider;
+        }
+        if let Some(reach) = overlay.reach {
+            if let Some(v) = reach.depth {
+                self.reach.depth = v;
+            }
+            if let Some(v) = reach.enabled {
+                self.reach.enabled = v;
+            }
         }
     }
 }
@@ -420,6 +457,65 @@ mod tests {
         assert_eq!(config.output.default_format, "grep");
         assert_eq!(config.output.color, "auto");
         assert!(config.ignore.patterns.is_empty());
+    }
+
+    #[test]
+    fn reach_defaults_applied_when_no_config_exists() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert_eq!(config.reach.depth, 3);
+        assert!(config.reach.enabled);
+    }
+
+    #[test]
+    fn reach_reads_from_config_file() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[reach]
+depth = 2
+enabled = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(config.reach.depth, 2);
+        assert!(!config.reach.enabled);
+    }
+
+    #[test]
+    fn reach_partial_overlays_only_override_set_fields() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[reach]
+depth = 1
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(config.reach.depth, 1);
+        assert!(config.reach.enabled, "absent enabled key keeps the default");
+    }
+
+    #[test]
+    fn reach_repo_layer_overrides_global() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[reach]
+depth = 5
+enabled = true
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[reach]
+enabled = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(config.reach.depth, 5, "global depth survives repo layer");
+        assert!(!config.reach.enabled, "repo layer wins");
     }
 
     #[test]
