@@ -1061,6 +1061,11 @@ impl<'a> Extractor<'a> {
     fn visit_js(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "call_expression" => self.js_call(node, prefix),
+            "pair" => {
+                if self.opts.graphql {
+                    self.js_graphql_pair(node);
+                }
+            }
             "member_expression" => {
                 self.js_env_member(node);
             }
@@ -1078,6 +1083,9 @@ impl<'a> Extractor<'a> {
     fn js_call(&mut self, node: Node, prefix: &str) {
         if self.grpc_hint {
             self.js_grpc_call(node);
+        }
+        if self.opts.graphql {
+            self.js_graphql_call(node);
         }
         let func = node.child_by_field_name("function");
         let args = node.child_by_field_name("arguments");
@@ -1455,6 +1463,9 @@ impl<'a> Extractor<'a> {
                 if self.opts.grpc {
                     self.python_grpc_call(node);
                 }
+                if self.opts.graphql {
+                    self.python_graphql_call(node);
+                }
                 self.py_call(node, prefix);
             }
             "subscript" => self.py_env_subscript(node),
@@ -1478,6 +1489,22 @@ impl<'a> Extractor<'a> {
                 continue;
             };
             if dec.kind() != "decorator" {
+                continue;
+            }
+            // TASK-088 graphql: @strawberry.field/@strawberry.mutation and
+            // Ariadne @Query.field("name")/@Mutation.mutation declare
+            // resolvers (providers).
+            if self.opts.graphql
+                && let Some((root, field)) = py_graphql_decorator(dec, def_name, self.src)
+            {
+                let anchor = def_name.unwrap_or(dec);
+                self.out.push(graphql_candidate(
+                    &root,
+                    &field,
+                    ContractRole::Provider,
+                    owning.as_deref(),
+                    anchor.start_position().row + 1,
+                ));
                 continue;
             }
             // TASK-087 job: @app.task / @app.task(name=…) / @shared_task.
@@ -4053,6 +4080,126 @@ impl<'a> Extractor<'a> {
             self.emit_grpc(node, &service, prop, ContractRole::Consumer, None);
         }
     }
+
+    // -- graphql arms (TASK-088, plan 5.3) --------------------------------------
+
+    /// JS/TS resolver map: `Query: { user: (…) => … }` — each inner property
+    /// of a Query/Mutation/Subscription key declares one resolver.
+    fn js_graphql_pair(&mut self, node: Node) {
+        let key = node_text(node.child_by_field_name("key"), self.src);
+        if !matches!(key, "Query" | "Mutation" | "Subscription") {
+            return;
+        }
+        let Some(value) = node
+            .child_by_field_name("value")
+            .filter(|v| v.kind() == "object")
+        else {
+            return;
+        };
+        for i in 0..value.child_count() {
+            let Some(p) = value.child(i as u32) else {
+                continue;
+            };
+            if p.kind() != "pair" {
+                continue;
+            }
+            let field = node_text(p.child_by_field_name("key"), self.src);
+            if !field.is_empty() {
+                self.out.push(graphql_candidate(
+                    key,
+                    field,
+                    ContractRole::Provider,
+                    None,
+                    p.start_position().row + 1,
+                ));
+            }
+        }
+    }
+
+    /// JS/TS operation call sites: `gql`…`` / `graphql`…`` tagged templates
+    /// (rendered as calls with a template argument) and Apollo-style
+    /// `client.query({query: '…'})` / `.mutate(…)` / `.subscribe(…)` with
+    /// an operation string. The mini-parser is the gate — plain look-alike
+    /// strings parse to nothing and are ignored.
+    fn js_graphql_call(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        let Some(args) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        match func.kind() {
+            "identifier" if matches!(node_text(Some(func), self.src), "gql" | "graphql") => {
+                let text = if args.kind() == "template_string" {
+                    Some(template_content(args, self.src))
+                } else {
+                    args.named_child(0)
+                        .filter(|a| a.kind() == "template_string")
+                        .map(|a| template_content(a, self.src))
+                };
+                if let Some(text) = text {
+                    self.emit_graphql_ops(node, &text);
+                }
+            }
+            "member_expression" => {
+                let prop = node_text(func.child_by_field_name("property"), self.src);
+                if !matches!(prop, "query" | "mutate" | "subscribe") {
+                    return;
+                }
+                for i in 0..args.named_child_count() {
+                    let Some(arg) = args.named_child(i as u32) else {
+                        continue;
+                    };
+                    let text = match arg.kind() {
+                        "string" => Some(string_content(arg, self.src)),
+                        "template_string" => Some(template_content(arg, self.src)),
+                        "object" => js_object_operation_string(arg, self.src),
+                        _ => None,
+                    };
+                    if let Some(text) = text {
+                        self.emit_graphql_ops(node, &text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit one consumer per top-level field of a parsed GraphQL operation.
+    fn emit_graphql_ops(&mut self, node: Node, text: &str) {
+        let Some(ops) = parse_graphql_operation(text) else {
+            return;
+        };
+        let owning = crate::indexer::find_enclosing_function(node, self.src, self.lang);
+        let line = node.start_position().row + 1;
+        for (root, field) in ops {
+            self.out.push(graphql_candidate(
+                &root,
+                &field,
+                ContractRole::Consumer,
+                owning.as_deref(),
+                line,
+            ));
+        }
+    }
+
+    /// Python `gql("query { user }")` operation call site.
+    fn python_graphql_call(&mut self, node: Node) {
+        let is_gql = node
+            .child_by_field_name("function")
+            .filter(|f| f.kind() == "identifier")
+            .is_some_and(|f| node_text(Some(f), self.src) == "gql");
+        if !is_gql {
+            return;
+        }
+        let text = node
+            .child_by_field_name("arguments")
+            .and_then(|args| positional_arg(args, 0))
+            .and_then(|arg| py_string_content(arg, self.src));
+        if let Some(text) = text {
+            self.emit_graphql_ops(node, &text);
+        }
+    }
 }
 
 /// Whether `node` is the left-hand side of an assignment of kind
@@ -5046,6 +5193,7 @@ pub fn extract_document_contracts(
 ) -> Vec<ContractCandidate> {
     match kind {
         DocumentKind::Proto if opts.grpc => proto_providers(content),
+        DocumentKind::Graphql if opts.graphql => graphql_document_contracts(content),
         _ => Vec::new(),
     }
 }
@@ -5135,6 +5283,130 @@ fn grpc_candidate(
     }
 }
 
+/// Contracts of a `.graphql`/`.gql` document (TASK-088): an SDL document
+/// yields resolvers (providers) for the root operation types; an operation
+/// document yields consumers for its top-level fields.
+fn graphql_document_contracts(content: &str) -> Vec<ContractCandidate> {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("query")
+        || trimmed.starts_with("mutation")
+        || trimmed.starts_with("subscription")
+        || trimmed.starts_with('{')
+    {
+        let mut out = Vec::new();
+        if let Some(ops) = parse_graphql_operation(content) {
+            for (root, field) in ops {
+                out.push(graphql_candidate(
+                    &root,
+                    &field,
+                    ContractRole::Consumer,
+                    None,
+                    1,
+                ));
+            }
+        }
+        return out;
+    }
+    scan_graphql_document(content)
+        .into_iter()
+        .map(|(root, field, line)| {
+            graphql_candidate(&root, &field, ContractRole::Provider, None, line)
+        })
+        .collect()
+}
+
+/// One root-type field found by the SDL scan: `(root, field, 1-based line)`.
+type GraphqlSdlField = (String, String, usize);
+
+/// Scan an SDL document for `type Query|Mutation|Subscription {` and
+/// `extend type <Root> {` blocks; each field definition inside yields one
+/// resolver. Non-root types (`type User`) are ignored. One-line blocks
+/// (`type Query { base: String }`) scan their inline field.
+fn scan_graphql_document(content: &str) -> Vec<GraphqlSdlField> {
+    let mut out = Vec::new();
+    let mut root: Option<String> = None;
+    for (idx, raw) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if let Some(root_name) = root.as_ref() {
+            if line.starts_with('}') {
+                root = None;
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let name: String = line
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.push((root_name.clone(), name, line_no));
+            }
+            continue;
+        }
+        if let Some(root_name) = sdl_root_opener(line) {
+            // One-line block? Scan the inline field and stay outside.
+            let after_brace = line.split_once('{').map(|(_, rest)| rest).unwrap_or("");
+            if let Some(close) = after_brace.rfind('}') {
+                let inner = after_brace[..close].trim();
+                let name: String = inner
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    out.push((root_name, name, line_no));
+                }
+            } else {
+                root = Some(root_name);
+            }
+        }
+    }
+    out
+}
+
+/// `type Query {` / `extend type Mutation {` opener for a root operation
+/// type; `None` for other declarations.
+fn sdl_root_opener(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("extend type ")
+        .or_else(|| line.strip_prefix("type "))?;
+    let name: String = rest
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
+        .collect();
+    if !line.contains('{') {
+        return None;
+    }
+    match name.as_str() {
+        "Query" | "Mutation" | "Subscription" => Some(name),
+        _ => None,
+    }
+}
+
+/// Build one graphql candidate: `graphql::<Root>::<field>` with the root
+/// operation type capitalized (plan 4).
+fn graphql_candidate(
+    root: &str,
+    field: &str,
+    role: ContractRole,
+    owning: Option<&str>,
+    line: usize,
+) -> ContractCandidate {
+    ContractCandidate {
+        kind: ContractKind::Graphql,
+        role,
+        qualifier: root.to_string(),
+        identifier: field.to_string(),
+        canonical_id: canonical_contract_id(ContractKind::Graphql, root, field),
+        params: Vec::new(),
+        owning_symbol: owning.map(str::to_string),
+        line,
+        confidence: CONFIDENCE_FRAMEWORK,
+    }
+}
+
 /// Blank out `//` line comments and `/* */` block comments, preserving line
 /// structure so line numbers stay meaningful.
 fn strip_proto_comments(content: &str) -> Vec<String> {
@@ -5213,6 +5485,212 @@ fn brace_delta(line: &str) -> i64 {
         '}' => d - 1,
         _ => d,
     })
+}
+
+// ---------------------------------------------------------------------------
+// GraphQL mini-parser and SDL scan (TASK-088, plan 5.3)
+// ---------------------------------------------------------------------------
+
+/// Parse one GraphQL operation, returning `(root, field)` pairs for its
+/// top-level selection set (TASK-088).
+///
+/// Recognizes `query|mutation|subscription [Name][(args)] {…}` plus the
+/// shorthand `{…}` (implicitly Query). Field arguments, aliases (`alias:`),
+/// and nested selection sets are skipped; only depth-0 field names are
+/// returned. Returns `None` when the text is not an operation — callers use
+/// that to ignore plain look-alike strings. Only the FIRST operation in the
+/// text is parsed (documents with several operations are rare; extraction,
+/// not validation).
+fn parse_graphql_operation(text: &str) -> Option<Vec<(String, String)>> {
+    let t = text.trim();
+    let (root, rest) = if let Some(r) = t.strip_prefix("query") {
+        ("Query", r)
+    } else if let Some(r) = t.strip_prefix("mutation") {
+        ("Mutation", r)
+    } else if let Some(r) = t.strip_prefix("subscription") {
+        ("Subscription", r)
+    } else if t.starts_with('{') {
+        ("Query", t)
+    } else {
+        return None;
+    };
+    if !rest.starts_with(|c: char| c.is_whitespace() || c == '(' || c == '{') {
+        // `queryx {…}` — an identifier, not the keyword.
+        return None;
+    }
+    // Skip the optional operation name and variable declarations.
+    let rest = rest.trim_start();
+    let name_len = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .count();
+    let rest = rest[name_len..].trim_start();
+    let rest = skip_balanced(rest, '(', ')')?.trim_start();
+    let body = rest.strip_prefix('{')?;
+    Some(
+        top_level_fields(body)
+            .into_iter()
+            .map(|f| (root.to_string(), f))
+            .collect(),
+    )
+}
+
+/// Skip a balanced `open…close` group at the start of `s` (whitespace
+/// trimmed); `None` when unbalanced.
+fn skip_balanced(s: &str, open: char, close: char) -> Option<&str> {
+    let s = s.trim_start();
+    if !s.starts_with(open) {
+        return Some(s);
+    }
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&s[i + c.len_utf8()..]);
+            }
+        }
+    }
+    None
+}
+
+/// Depth-0 field names of a selection-set body (the text after the opening
+/// `{`). Field arguments, nested selection sets, aliases (`alias: field`
+/// reports `field`), and spreads (`...name`) are skipped.
+fn top_level_fields(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut fields = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '{' => {
+                depth += 1;
+                i += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    break;
+                }
+                i += 1;
+            }
+            '(' => {
+                // Balanced argument group (may nest default values).
+                let mut d = 0i32;
+                while i < chars.len() {
+                    if chars[i] == '(' {
+                        d += 1;
+                    } else if chars[i] == ')' {
+                        d -= 1;
+                    }
+                    i += 1;
+                    if d == 0 {
+                        break;
+                    }
+                }
+            }
+            _ if depth == 0 && (c.is_ascii_alphanumeric() || c == '_') => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let is_spread = start > 0 && chars[start - 1] == '.';
+                if is_spread {
+                    continue;
+                }
+                let name: String = chars[start..i].iter().collect();
+                // Alias? `alias: field` — the next identifier is the field.
+                let mut j = i;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ':' {
+                    continue;
+                }
+                fields.push(name);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    fields
+}
+
+/// The `query`/`mutation`/`subscription` string property of an Apollo-style
+/// options object argument (JS).
+fn js_object_operation_string(obj: Node, src: &[u8]) -> Option<String> {
+    for i in 0..obj.named_child_count() {
+        let Some(p) = obj.named_child(i as u32) else {
+            continue;
+        };
+        if p.kind() != "pair" {
+            continue;
+        }
+        let key = node_text(p.child_by_field_name("key"), src);
+        if !matches!(key, "query" | "mutation" | "subscription") {
+            continue;
+        }
+        let v = p.child_by_field_name("value")?;
+        return match v.kind() {
+            "string" => Some(string_content(v, src)),
+            "template_string" => Some(template_content(v, src)),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// GraphQL resolver decorators (Python): `@strawberry.field` /
+/// `@strawberry.mutation` / `@strawberry.subscription` name the field after
+/// the function; Ariadne `@Query.field("name")` / `@Mutation.mutation`
+/// after the string argument. Returns `(root, field)`.
+fn py_graphql_decorator(dec: Node, def_name: Option<Node>, src: &[u8]) -> Option<(String, String)> {
+    let inner = dec.named_child(0)?;
+    let def = node_text(def_name, src);
+    match inner.kind() {
+        // @strawberry.field (no call)
+        "attribute" => {
+            let obj = node_text(inner.child_by_field_name("object"), src);
+            let attr = node_text(inner.child_by_field_name("attribute"), src);
+            let root = match (obj, attr) {
+                ("strawberry", "field") => "Query",
+                ("strawberry", "mutation") => "Mutation",
+                ("strawberry", "subscription") => "Subscription",
+                _ => return None,
+            };
+            if def.is_empty() {
+                return None;
+            }
+            Some((root.to_string(), def.to_string()))
+        }
+        // @Query.field("name") / @Mutation.mutation("name") (Ariadne)
+        "call" => {
+            let f = inner.child_by_field_name("function")?;
+            if f.kind() != "attribute" {
+                return None;
+            }
+            let root = match node_text(f.child_by_field_name("object"), src) {
+                r @ ("Query" | "Mutation" | "Subscription") => r,
+                _ => return None,
+            };
+            let arg_name = inner
+                .child_by_field_name("arguments")
+                .and_then(|args| positional_arg(args, 0))
+                .and_then(|a| py_string_content(a, src));
+            let field = match arg_name {
+                Some(name) if !name.is_empty() => name,
+                _ if !def.is_empty() => def.to_string(),
+                _ => return None,
+            };
+            Some((root.to_string(), field))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -8935,5 +9413,260 @@ server.addService(user.UserService.service, { getUser: handler });
         };
         let src = "public class UserServiceImpl extends UserServiceGrpc.UserServiceImplBase {\n    public void getUser(GetUserRequest req, StreamObserver<User> obs) { }\n}\n";
         assert!(extract_with(Lang::Java, src, &opts).is_empty());
+    }
+
+    // -- graphql (TASK-088, plan 5.3) -------------------------------------------
+
+    #[test]
+    fn graphql_parse_named_query_multiple_fields() {
+        let ops = parse_graphql_operation(
+            "query GetUser($id: ID!) { user(id: $id) { name } posts { title } }",
+        );
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "user".to_string()),
+                    ("Query".to_string(), "posts".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn graphql_parse_anonymous_mutation() {
+        let ops = parse_graphql_operation("mutation { deleteUser(id: 1) }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(&[("Mutation".to_string(), "deleteUser".to_string())][..])
+        );
+    }
+
+    #[test]
+    fn graphql_parse_shorthand_query() {
+        let ops = parse_graphql_operation("{ user posts }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "user".to_string()),
+                    ("Query".to_string(), "posts".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn graphql_parse_subscription() {
+        let ops = parse_graphql_operation("subscription Sub { userAdded }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(&[("Subscription".to_string(), "userAdded".to_string())][..])
+        );
+    }
+
+    #[test]
+    fn graphql_parse_nested_braces_do_not_leak() {
+        let ops = parse_graphql_operation("query Q { a { b { c } } d }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "a".to_string()),
+                    ("Query".to_string(), "d".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn graphql_parse_non_operation_rejected() {
+        assert!(parse_graphql_operation("SELECT * FROM users").is_none());
+        assert!(parse_graphql_operation("").is_none());
+        // `queryx` is an identifier, not the keyword.
+        assert!(parse_graphql_operation("queryx { a }").is_none());
+        // No selection set.
+        assert!(parse_graphql_operation("query GetUser").is_none());
+    }
+
+    #[test]
+    fn graphql_document_sdl_resolvers() {
+        let src = "\
+type Query {
+  user(id: ID!): User
+  posts: [Post]
+}
+
+type Mutation {
+  deleteUser(id: ID!): Boolean
+}
+
+type User {
+  id: ID
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Graphql, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        let user = find(&cands, "graphql::Query::user").expect("user missing");
+        assert_eq!(user.role, ContractRole::Provider);
+        assert_eq!(user.kind, ContractKind::Graphql);
+        assert_eq!(user.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(user.line, 2);
+        assert!(find(&cands, "graphql::Query::posts").is_some());
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_document_extend_type() {
+        let src = "\
+type Query { base: String }
+
+extend type Query {
+  extra: Int
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Graphql, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "graphql::Query::base").is_some());
+        let extra = find(&cands, "graphql::Query::extra").expect("extra missing");
+        assert_eq!(extra.line, 4);
+    }
+
+    #[test]
+    fn graphql_document_operation_document_consumers() {
+        let src = "\
+query GetUser {
+  user(id: 1) {
+    name
+  }
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Graphql, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "graphql::Query::user");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.line, 1);
+    }
+
+    #[test]
+    fn graphql_js_resolver_map_providers() {
+        let src = "\
+const resolvers = {
+  Query: {
+    user: (parent, args) => db.user(),
+    posts: () => [],
+  },
+  Mutation: {
+    deleteUser: (parent, { id }) => true,
+  },
+};
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        let user = find(&cands, "graphql::Query::user").expect("user missing");
+        assert_eq!(user.role, ContractRole::Provider);
+        assert_eq!(user.kind, ContractKind::Graphql);
+        assert_eq!(user.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(user.line, 3);
+        assert!(find(&cands, "graphql::Query::posts").is_some());
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_js_gql_tagged_template_consumers() {
+        let src = "import { gql } from '@apollo/client';\nconst USER = gql`query { user }`;\nconst DEL = graphql`mutation { deleteUser(id: 1) }`;\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let user = find(&cands, "graphql::Query::user").expect("user missing");
+        assert_eq!(user.role, ContractRole::Consumer);
+        assert_eq!(user.line, 2);
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_js_apollo_client_call_consumers() {
+        let src = "client.query({ query: 'query { user }' });\nclient.mutate({ mutation: 'mutation { deleteUser(id: 1) }' });\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "graphql::Query::user").is_some());
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_js_plain_strings_ignored() {
+        // A plain string that merely looks like a query is not a contract
+        // site; only tagged templates and client .query/.mutate calls are.
+        let cands = extract(Lang::JavaScript, "const q = 'query { user }';\n");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn graphql_python_gql_consumer() {
+        let src = "\
+from gql import gql
+
+def fetch(client):
+    return client.execute(gql('query { user }'))
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "graphql::Query::user");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.owning_symbol.as_deref(), Some("fetch"));
+    }
+
+    #[test]
+    fn graphql_python_strawberry_providers() {
+        let src = "\
+import strawberry
+
+class Query:
+    @strawberry.field
+    def user(self) -> User:
+        return db.user()
+
+    @strawberry.mutation
+    def deleteUser(self) -> bool:
+        return True
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let user = find(&cands, "graphql::Query::user").expect("user missing");
+        assert_eq!(user.role, ContractRole::Provider);
+        assert_eq!(user.owning_symbol.as_deref(), Some("user"));
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_python_ariadne_provider() {
+        let src = "\
+from ariadne import QueryType
+Query = QueryType()
+
+@Query.field('get_user')
+def resolve_get_user(obj, info):
+    return db.user()
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "graphql::Query::get_user");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("resolve_get_user"));
+    }
+
+    #[test]
+    fn graphql_disabled_by_option() {
+        let opts = ContractOptions {
+            graphql: false,
+            ..ContractOptions::default()
+        };
+        let src = "const resolvers = {\n  Query: {\n    user: () => db.user(),\n  },\n};\n";
+        assert!(extract_with(Lang::JavaScript, src, &opts).is_empty());
     }
 }
