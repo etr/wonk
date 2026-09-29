@@ -34,5 +34,36 @@ pub fn extract_contracts(_tree: &Tree, _source: &str, _lang: Lang) -> Vec<Contra
 /// This is the only place contract IDs are constructed (PRD-CTR-REQ-002);
 /// every extractor funnels through it so the format can never drift.
 pub fn canonical_contract_id(kind: ContractKind, qualifier: &str, identifier: &str) -> String {
+    assert!(
+        !identifier.trim().is_empty(),
+        "contract identifier must be non-empty"
+    );
     format!("{}::{}::{}", kind.as_str(), qualifier, identifier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_http() {
+        assert_eq!(
+            canonical_contract_id(ContractKind::Http, "GET", "/v1/users/{p1}"),
+            "http::GET::/v1/users/{p1}"
+        );
+    }
+
+    #[test]
+    fn canonical_env_empty_qualifier() {
+        assert_eq!(
+            canonical_contract_id(ContractKind::Env, "", "DATABASE_URL"),
+            "env::::DATABASE_URL"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "contract identifier must be non-empty")]
+    fn canonical_rejects_empty_identifier() {
+        canonical_contract_id(ContractKind::Http, "GET", "  ");
+    }
 }
