@@ -90,6 +90,29 @@ workspace = ["payments"]      # Workspace ids this repo links contracts across
 | `bm25_k1` | `1.2` | BM25 term-frequency saturation strength (k1) for `--semantic` lexical re-ranking |
 | `bm25_b` | `0.75` | BM25 length-normalization strength (b) in `[0, 1]`; `0` disables it |
 
+**`[rank]`**
+
+Signal-pipeline re-ranking for `wonk search` (smart ranked mode).
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Route smart-ranked search results through the signal pipeline. `false` keeps the legacy ordering byte-for-byte |
+| `weights.kind` | `1.0` | Weight of the kind signal (category tier ordering). A weight of `0` skips the signal entirely; absent names weigh zero |
+
+```toml
+[rank]
+enabled = true
+
+[rank.weights]
+kind = 1.0
+```
+
+Unknown signal names in `[rank.weights]` are a hard configuration error
+naming the offender and the valid names, not a silent no-op. The weights
+table replaces the previous layer's wholesale (per-repo over global over
+default). `wonk search --why` opts into the pipeline for a single
+invocation regardless of `enabled`, printing the per-signal breakdown.
+
 **`[embedding]`**
 
 | Key | Default | Description |

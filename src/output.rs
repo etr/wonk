@@ -65,6 +65,77 @@ pub struct SearchOutput {
     /// Optional source indicator for blended search ("structural" or "semantic").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Optional per-signal scoring breakdown (`wonk search --why`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<WhyOutput>,
+}
+
+/// The per-result scoring breakdown shown by `wonk search --why`
+/// (PRD-RANK-REQ-005): the final score plus every signal's contribution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WhyOutput {
+    /// Weighted sum of all contributions.
+    pub total: f32,
+    /// One entry per active signal, in registry order.
+    pub signals: Vec<ContributionOutput>,
+}
+
+/// One signal's contribution to one result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContributionOutput {
+    /// Signal name.
+    pub signal: String,
+    /// Unweighted normalized contribution.
+    pub value: f32,
+    /// Configured weight applied.
+    pub weight: f32,
+    /// `value * weight` as summed into the total.
+    pub weighted: f32,
+}
+
+impl WhyOutput {
+    /// Build the breakdown from pipeline contributions without re-running
+    /// any signal (PRD-RANK-REQ-005).
+    pub fn from_contributions(total: f32, contributions: &[crate::rerank::Contribution]) -> Self {
+        Self {
+            total,
+            signals: contributions
+                .iter()
+                .map(|c| ContributionOutput {
+                    signal: c.signal.to_string(),
+                    value: c.value,
+                    weight: c.weight,
+                    weighted: c.weighted,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Render one `--why` stderr line (pure; pinned by test):
+/// `why: {file}:{line} total={score:.4} [{name} {value:.3}*{weight:.2}={weighted:.4} ...]`
+pub fn format_why_line(
+    file: &str,
+    line: u64,
+    total: f32,
+    contributions: &[ContributionOutput],
+) -> String {
+    let parts: Vec<String> = contributions
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {:.3}*{:.2}={:.4}",
+                c.signal, c.value, c.weight, c.weighted
+            )
+        })
+        .collect();
+    format!("why: {file}:{line} total={total:.4} [{}]", parts.join(" "))
+}
+
+/// Emit a rendered `--why` line to stderr. Not TTY-gated and never mixed
+/// into stdout, so piping and `grep` over search output stay clean.
+pub fn print_why_line(file: &str, line: u64, why: &WhyOutput) {
+    eprintln!("{}", format_why_line(file, line, why.total, &why.signals));
 }
 
 /// A symbol definition result.
@@ -1058,6 +1129,7 @@ impl SearchOutput {
             content: content.to_string(),
             annotation: None,
             source: None,
+            why: None,
         }
     }
 }
@@ -2553,6 +2625,102 @@ mod tests {
         );
     }
 
+    // -- --why explainability --------------------------------------------------
+
+    #[test]
+    fn format_why_line_pinned_single_signal() {
+        let contributions = vec![ContributionOutput {
+            signal: "kind".to_string(),
+            value: 0.8,
+            weight: 1.0,
+            weighted: 0.8,
+        }];
+        assert_eq!(
+            format_why_line("src/lib.rs", 10, 1.0, &contributions),
+            "why: src/lib.rs:10 total=1.0000 [kind 0.800*1.00=0.8000]"
+        );
+    }
+
+    #[test]
+    fn format_why_line_pinned_two_signals() {
+        let contributions = vec![
+            ContributionOutput {
+                signal: "alpha".to_string(),
+                value: 0.5,
+                weight: 2.0,
+                weighted: 1.0,
+            },
+            ContributionOutput {
+                signal: "beta".to_string(),
+                value: 0.25,
+                weight: 0.5,
+                weighted: 0.125,
+            },
+        ];
+        assert_eq!(
+            format_why_line("src/a.rs", 7, 1.125, &contributions),
+            "why: src/a.rs:7 total=1.1250 [alpha 0.500*2.00=1.0000 beta 0.250*0.50=0.1250]"
+        );
+    }
+
+    #[test]
+    fn format_why_line_pinned_no_signals() {
+        assert_eq!(
+            format_why_line("src/a.rs", 7, 0.0, &[]),
+            "why: src/a.rs:7 total=0.0000 []"
+        );
+    }
+
+    #[test]
+    fn why_output_serializes_and_round_trips() {
+        let result = SearchOutput {
+            file: "src/main.rs".into(),
+            line: 42,
+            col: 1,
+            content: "fn main() {}".into(),
+            annotation: None,
+            source: None,
+            why: Some(WhyOutput {
+                total: 0.8,
+                signals: vec![ContributionOutput {
+                    signal: "kind".to_string(),
+                    value: 0.8,
+                    weight: 1.0,
+                    weighted: 0.8,
+                }],
+            }),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.contains("\"why\""),
+            "json embeds the why object: {json}"
+        );
+        assert!(json.contains("\"kind\""), "json names the signal: {json}");
+
+        let back: SearchOutput = serde_json::from_str(&json).unwrap();
+        let why = back.why.expect("why round-trips");
+        assert_eq!(why.total, 0.8);
+        assert_eq!(why.signals.len(), 1);
+        assert_eq!(why.signals[0].signal, "kind");
+        assert_eq!(why.signals[0].weight, 1.0);
+    }
+
+    #[test]
+    fn why_absent_leaves_json_unchanged() {
+        let result = SearchOutput::from_search_result(
+            std::path::Path::new("src/main.rs"),
+            42,
+            1,
+            "fn main() {}",
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            !json.contains("why"),
+            "skip-none must omit the field: {json}"
+        );
+        assert_eq!(result.why, None);
+    }
+
     // -- SearchOutput --------------------------------------------------------
 
     #[test]
@@ -2564,6 +2732,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -2578,6 +2747,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -2598,6 +2768,7 @@ mod tests {
                 content: "let x = 1;".into(),
                 annotation: None,
                 source: None,
+                why: None,
             },
             SearchOutput {
                 file: "src/a.rs".into(),
@@ -2606,6 +2777,7 @@ mod tests {
                 content: "let y = 2;".into(),
                 annotation: None,
                 source: None,
+                why: None,
             },
         ];
         let mut buf = Vec::new();
@@ -2839,6 +3011,7 @@ mod tests {
                 content: "first".into(),
                 annotation: None,
                 source: None,
+                why: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
@@ -2847,6 +3020,7 @@ mod tests {
                 content: "second".into(),
                 annotation: None,
                 source: None,
+                why: None,
             },
         ];
         let out = render(OutputFormat::Json, |fmt| {
@@ -2873,6 +3047,7 @@ mod tests {
                 content: "first".into(),
                 annotation: None,
                 source: None,
+                why: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
@@ -2881,6 +3056,7 @@ mod tests {
                 content: "second".into(),
                 annotation: None,
                 source: None,
+                why: None,
             },
         ];
         let out = render(OutputFormat::Grep, |fmt| {
@@ -2918,6 +3094,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: Some("(+3 other locations)".into()),
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}  (+3 other locations)\n");
@@ -2932,6 +3109,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}\n");
@@ -2946,6 +3124,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: Some("(+2 other locations)".into()),
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -2961,6 +3140,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         assert!(!out.contains("annotation"));
@@ -2977,6 +3157,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: None,
             source: Some("structural".into()),
+            why: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -2992,6 +3173,7 @@ mod tests {
             content: "pub fn foo() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         assert!(!out.contains("source"));
@@ -3015,6 +3197,7 @@ mod tests {
             content: "key: value".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         // Grep format: file:line:content (colons in content are fine)
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
@@ -3030,6 +3213,7 @@ mod tests {
             content: "he said \"hello\"".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -3076,6 +3260,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -3090,6 +3275,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // File path should be wrapped in magenta+bold
@@ -3112,6 +3298,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Line number should be wrapped in green
@@ -3134,6 +3321,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Separator should be wrapped in cyan
@@ -3152,6 +3340,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let mut buf = Vec::new();
         {
@@ -3174,6 +3363,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let mut buf = Vec::new();
         {
@@ -3198,6 +3388,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let mut buf = Vec::new();
         {
@@ -3222,6 +3413,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let mut buf = Vec::new();
         {
@@ -3339,6 +3531,7 @@ mod tests {
                 content: "fn some_function_here() {}".into(),
                 annotation: None,
                 source: None,
+                why: None,
             })
             .collect();
 
@@ -3378,6 +3571,7 @@ mod tests {
                 content: "fn some_function_here() {}".into(),
                 annotation: None,
                 source: None,
+                why: None,
             })
             .collect();
 
@@ -3426,6 +3620,7 @@ mod tests {
                 content: "fn main() {}".into(),
                 annotation: None,
                 source: None,
+                why: None,
             })
             .collect();
 
@@ -3459,6 +3654,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         fmt.format_search_result(&r).unwrap();
         assert!(fmt.budget_used() > 0);
@@ -3508,6 +3704,7 @@ mod tests {
             content: "Hello WORLD hello".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let mut buf = Vec::new();
         {
@@ -3560,6 +3757,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let out = render(OutputFormat::Toon, |fmt| fmt.format_search_result(&result));
         assert!(!out.is_empty());
@@ -3650,6 +3848,7 @@ mod tests {
             content: "fn main() {}".into(),
             annotation: None,
             source: None,
+            why: None,
         };
         let mut buf = Vec::new();
         {

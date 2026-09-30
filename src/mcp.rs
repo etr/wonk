@@ -1614,7 +1614,25 @@ impl McpServer {
             results.retain(|r| !ranker::is_test_file(&r.file));
         }
 
-        let groups = ranker::rank_and_dedup(&results, ranker_conn, &query);
+        // Config-gated pipeline (REQ-017); no why parameter over MCP in
+        // TASK-092 — rows are unchanged either way.
+        let config = match crate::config::Config::load(Some(&repo_root)) {
+            Ok(c) => c,
+            Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
+        };
+        let weights = match crate::rerank::WeightTable::from_config(&config.rank.weights) {
+            Ok(w) => w,
+            Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),
+        };
+        let groups = crate::rerank::rank_and_explain(
+            &results,
+            ranker_conn,
+            &query,
+            &crate::rerank::RankSettings {
+                use_pipeline: config.rank.enabled,
+                weights,
+            },
+        );
 
         let mut budget = budget_limit.map(|limit| {
             if let Some(p) = page {
@@ -1629,12 +1647,12 @@ impl McpServer {
         for (_category, items) in &groups {
             for item in items {
                 let mut out = SearchOutput::from_search_result(
-                    &item.result.file,
-                    item.result.line,
-                    item.result.col,
-                    &item.result.content,
+                    &item.classified.result.file,
+                    item.classified.result.line,
+                    item.classified.result.col,
+                    &item.classified.result.content,
                 );
-                out.annotation = item.annotation.clone();
+                out.annotation = item.classified.annotation.clone();
 
                 if let Some(ref mut b) = budget {
                     let estimate = (out.file.len() + out.content.len() + 20) / 4;
