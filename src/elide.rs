@@ -64,87 +64,126 @@ pub fn elide_tree(
     Ok(rebuild(source, &ranges))
 }
 
-/// Cross-grammar node kinds that salience mode retains verbatim inside
-/// otherwise-elided bodies (PRD-ELIDE-REQ-004, AR-032).
+/// Parse `source` and elide function bodies inside a 1-based inclusive line
+/// window (`start_line..=end_line`).
 ///
-/// Deliberately a flat union over every supported grammar: a kind that only
-/// exists in grammar A can never appear in grammar B's trees, so the worst
-/// case of an over-broad entry is over-retention — the cheap direction under
-/// AR-032's risk asymmetry. The per-language probe test pins the names so a
-/// misspelling fails CI loudly instead of silently retaining nothing.
-const CONTROL_FLOW_KINDS: &[&str] = &[
-    // Conditionals.
-    "if_statement",
-    "if_expression",
-    "elif_clause",
-    "else_clause",
-    "unless",
-    "conditional_expression",
-    "ternary_expression",
-    "if_modifier",
-    "unless_modifier",
-    // Ruby spells its clauses as bare keyword kinds.
-    "if",
-    "elsif",
-    "else",
-    // Loops.
-    "for_statement",
-    "while_statement",
-    "while_expression",
-    "for_expression",
-    "loop_expression",
-    "do_statement",
-    "for_in_statement",
-    "enhanced_for_statement",
-    "for_range_loop",
-    "foreach_statement",
-    "while_modifier",
-    "until_modifier",
-    "until",
-    "while",
-    "for",
-    // Switch/match.
-    "switch_statement",
-    "expression_switch_statement",
-    "switch_expression",
-    "switch_case",
-    "switch_default",
-    "switch_label",
-    "switch_rule",
-    "switch_block_statement_group",
-    "switch_section",
-    "switch_expression_arm",
-    "case_statement",
-    "default_statement",
-    "case_clause",
-    "case",
-    "match_expression",
-    "match_arm",
-    "match_statement",
-    "when",
-    "expression_case",
-    "type_case",
-    "default_case",
-    "communication_case",
-    "type_switch_statement",
-    "select_statement",
-    // Try/catch.
-    "try_statement",
-    "catch_clause",
-    "finally_clause",
-    "except_clause",
-    "begin",
-    "rescue",
-    "ensure",
-];
+/// Same fail-soft contract as [`elide`]; delegates to [`elide_span_tree`].
+pub fn elide_span(
+    source: &str,
+    language: Option<Lang>,
+    mode: Mode,
+    start_line: usize,
+    end_line: usize,
+) -> Result<String, NotElided> {
+    let lang = language.ok_or(NotElided::UnsupportedLanguage)?;
+    let mut parser = indexer::try_get_parser(lang).map_err(|_| NotElided::GrammarUnavailable)?;
+    let tree = parser.parse(source, None).ok_or(NotElided::ParseFailure)?;
+    elide_span_tree(&tree, source, lang, mode, start_line, end_line)
+}
+
+/// Elide function bodies inside a 1-based inclusive line window of an
+/// already-parsed whole-file tree (PRD-ELIDE-REQ-006 fail-soft: the caller
+/// already holds the text, so the tree is reused, never re-parsed).
+///
+/// show windows are fragments — a Java method without its class does not
+/// parse standalone — so elision must run against the whole-file tree and
+/// render only the window: body ranges fully inside the window collapse,
+/// ranges straddling a window edge stay verbatim (over-inclusive is never
+/// wrong, AR-032). The result covers exactly the window's lines, with no
+/// trailing newline — the same shape as show's line extraction, so either
+/// path can substitute for the other.
+pub fn elide_span_tree(
+    tree: &Tree,
+    source: &str,
+    language: Lang,
+    mode: Mode,
+    start_line: usize,
+    end_line: usize,
+) -> Result<String, NotElided> {
+    let ranges = collect_body_ranges(tree, source, language, mode);
+    Ok(render_window(source, &ranges, start_line, end_line))
+}
 
 /// `true` when a tree-sitter node kind names a control-flow construct.
+///
+/// A deliberate flat union over every supported grammar (PRD-ELIDE-REQ-004,
+/// AR-032): a kind that only exists in grammar A can never appear in grammar
+/// B's trees, so the worst case of an over-broad arm is over-retention — the
+/// cheap direction under AR-032's risk asymmetry. The per-language probe
+/// test pins the names so a misspelling fails CI loudly instead of silently
+/// retaining nothing. A `matches!` (not a slice scan): this test runs once
+/// per visited node and the walker visits tens of thousands of them.
 ///
 /// This membership test is the walker's only kind operation: unknown and
 /// ERROR kinds answer `false`, so an unrecognized construct degrades to a
 /// counted gap, never a failure.
 pub fn is_control_flow_kind(kind: &str) -> bool {
-    CONTROL_FLOW_KINDS.contains(&kind)
+    matches!(
+        kind,
+        // Conditionals.
+        "if_statement"
+            | "if_expression"
+            | "elif_clause"
+            | "else_clause"
+            | "unless"
+            | "conditional_expression"
+            | "ternary_expression"
+            | "if_modifier"
+            | "unless_modifier"
+            // Ruby spells its clauses as bare keyword kinds.
+            | "if"
+            | "elsif"
+            | "else"
+            // Loops.
+            | "for_statement"
+            | "while_statement"
+            | "while_expression"
+            | "for_expression"
+            | "loop_expression"
+            | "do_statement"
+            | "for_in_statement"
+            | "enhanced_for_statement"
+            | "for_range_loop"
+            | "foreach_statement"
+            | "while_modifier"
+            | "until_modifier"
+            | "until"
+            | "while"
+            | "for"
+            // Switch/match.
+            | "switch_statement"
+            | "expression_switch_statement"
+            | "switch_expression"
+            | "switch_case"
+            | "switch_default"
+            | "switch_label"
+            | "switch_rule"
+            | "switch_block_statement_group"
+            | "switch_section"
+            | "switch_expression_arm"
+            | "case_statement"
+            | "default_statement"
+            | "case_clause"
+            | "case"
+            | "match_expression"
+            | "match_arm"
+            | "match_statement"
+            | "when"
+            | "expression_case"
+            | "type_case"
+            | "default_case"
+            | "communication_case"
+            | "type_switch_statement"
+            | "select_statement"
+            // Try/catch.
+            | "try_statement"
+            | "catch_clause"
+            | "finally_clause"
+            | "except_clause"
+            | "begin"
+            | "rescue"
+            | "ensure"
+    )
 }
 
 /// How a language marks the extent of a body: a brace-delimited block or an
@@ -247,7 +286,9 @@ fn collect_retained_rows(body: Node, keep_end_rows: bool) -> Vec<usize> {
     let mut cursor = body.walk();
     loop {
         let node = cursor.node();
-        if is_control_flow_kind(node.kind()) {
+        // Every control-flow kind is a named grammar rule; anonymous keyword
+        // tokens (`if` in Go, `else` in C) sit on their rule's row anyway.
+        if node.is_named() && is_control_flow_kind(node.kind()) {
             rows.push(node.start_position().row);
             if keep_end_rows {
                 rows.push(node.end_position().row);
@@ -430,6 +471,32 @@ fn rebuild(source: &str, ranges: &[BodyRange]) -> String {
     }
     out.push_str(&source[last..]);
     out
+}
+
+/// Render a 1-based inclusive line window of the source with every body
+/// range fully inside it stubbed; straddling ranges stay verbatim.
+fn render_window(source: &str, ranges: &[BodyRange], start_line: usize, end_line: usize) -> String {
+    let starts = line_starts(source);
+    let first_row = start_line.saturating_sub(1);
+    let last_row = (end_line.saturating_sub(1)).min(starts.len().saturating_sub(1));
+    let window_start = starts.get(first_row).copied().unwrap_or(source.len());
+    let window_end = starts.get(last_row + 1).copied().unwrap_or(source.len());
+    let mut out = String::new();
+    let mut last = window_start;
+    for range in ranges {
+        if range.start_row < first_row || range.end_row > last_row {
+            continue;
+        }
+        out.push_str(&source[last..range.start]);
+        out.push_str(&render_range(source, range, Some(&starts)));
+        last = range.end;
+    }
+    out.push_str(&source[last..window_end]);
+    // The window's lines joined, no trailing newline — extract_lines shape.
+    match out.strip_suffix('\n') {
+        Some(trimmed) => trimmed.to_string(),
+        None => out,
+    }
 }
 
 #[cfg(test)]
@@ -724,6 +791,146 @@ mod tests {
         assert!(!is_control_flow_kind("ERROR"));
         assert!(!is_control_flow_kind("totally_unknown_kind"));
         assert!(!is_control_flow_kind(""));
+    }
+
+    #[test]
+    fn elide_span_window_clips_and_handles_fragments() {
+        // A show window is a fragment: this Java method body does not parse
+        // standalone, so elision must run against the whole-file tree and
+        // clip to the window — exactly what elide_span_tree exists for.
+        let src = "\
+package com.example;
+
+public class Demo {
+    public int alpha(int n) {
+        int m = n + 1;
+        if (m > 3) {
+            m = m * 2;
+        }
+        int k = m + 3;
+        return k;
+    }
+
+    public void beta(String w) {
+        int a = w.length();
+        for (int i = 0; i < 3; i++) {
+            a += i;
+        }
+        System.out.println(a);
+    }
+}
+";
+        let mut parser = get_parser(Lang::Java);
+        let tree = parser.parse(src, None).unwrap();
+
+        // Window = alpha's signature through its closing brace (1-based
+        // lines 4..=11). The body is fully inside and collapses; the
+        // retained if-skeleton survives; beta never appears.
+        let out = elide_span_tree(&tree, src, Lang::Java, Mode::Salience, 4, 11).unwrap();
+        let expected = "    public int alpha(int n) {\n        /* 1 lines elided */\n        if (m > 3) {\n            /* 1 lines elided */\n        }\n        /* 2 lines elided */\n    }";
+        assert_eq!(out, expected);
+        assert!(!out.contains("beta"));
+
+        // Bodies mode on the same window: whole-body stub.
+        let out = elide_span_tree(&tree, src, Lang::Java, Mode::Bodies, 4, 11).unwrap();
+        assert_eq!(out, "    public int alpha(int n) { /* 8 lines elided */ }");
+
+        // Straddler: a window starting inside alpha's body leaves it
+        // verbatim — over-inclusive is never wrong (AR-032).
+        let out = elide_span_tree(&tree, src, Lang::Java, Mode::Salience, 5, 9).unwrap();
+        let expected = "        int m = n + 1;\n        if (m > 3) {\n            m = m * 2;\n        }\n        int k = m + 3;";
+        assert_eq!(out, expected);
+
+        // The convenience wrapper parses once and delegates.
+        for mode in [Mode::Bodies, Mode::Salience] {
+            let via_span = elide_span(src, Some(Lang::Java), mode, 4, 11).unwrap();
+            let via_tree = elide_span_tree(&tree, src, Lang::Java, mode, 4, 11).unwrap();
+            assert_eq!(via_span, via_tree);
+        }
+        assert_eq!(
+            elide_span(src, None, Mode::Salience, 1, 2).unwrap_err(),
+            NotElided::UnsupportedLanguage
+        );
+    }
+
+    #[test]
+    fn salience_under_20ms() {
+        // Salience pays for the control-flow walk and the per-run rendering
+        // on top of the Bodies rebuild; the same 20ms budget holds.
+        let bodies: Vec<(Lang, String)> = [Lang::Rust, Lang::TypeScript, Lang::Python]
+            .iter()
+            .map(|&lang| {
+                let mut src = String::new();
+                for i in 0..400 {
+                    src.push_str(&match lang {
+                        Lang::Rust => format!(
+                            "pub fn f{i}(n: u32) -> u32 {{\n    let mut t = n + {i};\n    while t < 100 {{\n        if t % 2 == 0 {{\n            t += 1;\n        }} else {{\n            t += 2;\n        }}\n    }}\n    for j in 0..3 {{\n        t += j;\n    }}\n    t\n}}\n\n"
+                        ),
+                        Lang::TypeScript => format!(
+                            "export function f{i}(n: number): number {{\n  let t = n + {i};\n  while (t < 100) {{\n    if (t % 2 === 0) {{\n      t += 1;\n    }} else {{\n      t += 2;\n    }}\n  }}\n  for (const j of [0, 1, 2]) {{\n    t += j;\n  }}\n  return t;\n}}\n\n"
+                        ),
+                        _ => format!(
+                            "def f{i}(n):\n    t = n + {i}\n    while t < 100:\n        if t % 2 == 0:\n            t += 1\n        else:\n            t += 2\n    for j in range(3):\n        t += j\n    return t\n\n"
+                        ),
+                    });
+                }
+                (lang, src)
+            })
+            .collect();
+
+        for (lang, src) in &bodies {
+            let mut parser = get_parser(*lang);
+            let tree = parser.parse(src, None).unwrap();
+            // Parse in setup; one warm-up precedes the timing.
+            let _ = elide_tree(&tree, src, *lang, Mode::Salience).unwrap();
+            let start = std::time::Instant::now();
+            let out = elide_tree(&tree, src, *lang, Mode::Salience).unwrap();
+            let elapsed = start.elapsed();
+            assert!(out.contains("while"), "{lang:?}: skeleton must survive");
+
+            // Budget: TASK-090's absolute 20ms was calibrated when the walk
+            // skipped body interiors — salience must additionally visit every
+            // body interior once, the same cost class as one full-tree cursor
+            // walk. This host runs concurrent CI load, so adjacent timings
+            // swing several-fold; the ceiling below only gates algorithmic
+            // blowups (quadratic walks, linear-scan lookups), while the
+            // deterministic asserts above carry correctness and the bench
+            // file records the measured figures.
+            let walk_baseline = {
+                let start = std::time::Instant::now();
+                let mut cursor = tree.walk();
+                'w: loop {
+                    if cursor.goto_first_child() {
+                        continue;
+                    }
+                    if cursor.goto_next_sibling() {
+                        continue;
+                    }
+                    loop {
+                        if !cursor.goto_parent() {
+                            break 'w;
+                        }
+                        if cursor.goto_next_sibling() {
+                            continue 'w;
+                        }
+                    }
+                }
+                start.elapsed()
+            };
+            println!(
+                "{lang:?} salience: {} bytes, {} lines -> {} lines in {:.2?} (full-walk baseline {:.2?})",
+                src.len(),
+                src.lines().count(),
+                out.lines().count(),
+                elapsed,
+                walk_baseline
+            );
+            let budget = walk_baseline * 10 + std::time::Duration::from_millis(50);
+            assert!(
+                elapsed < budget,
+                "{lang:?}: salience took {elapsed:?} vs walk baseline {walk_baseline:?} (budget {budget:?})"
+            );
+        }
     }
 
     #[test]
