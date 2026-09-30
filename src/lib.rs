@@ -12,6 +12,7 @@ pub mod contracts;
 pub mod daemon;
 pub mod db;
 pub mod embedding;
+pub mod elide;
 pub mod errors;
 pub mod flows;
 pub mod impact;

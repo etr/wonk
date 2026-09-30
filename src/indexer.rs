@@ -1865,7 +1865,10 @@ fn make_ref(
 
 /// Returns `true` if the tree-sitter node kind represents a function or method
 /// definition in the given language.
-fn is_function_node(kind: &str, lang: Lang) -> bool {
+///
+/// Shared by the call graph (caller-name resolution) and the elision engine,
+/// so both agree on what counts as a function body.
+pub fn is_function_node(kind: &str, lang: Lang) -> bool {
     match lang {
         Lang::Rust => kind == "function_item",
         Lang::Python => kind == "function_definition",
