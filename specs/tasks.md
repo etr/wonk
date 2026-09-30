@@ -3685,17 +3685,17 @@ Resolve provider↔consumer links across locally indexed repos at query time, fl
 Create `review.rs` as pure composition over existing primitives, producing line-anchored findings and a derived verdict.
 
 **Action Items:**
-- [ ] Create `review.rs`; determine changed symbols using the V4 `ChangeScope` enum verbatim — no new git handling (PRD-REV-REQ-001, PRD-REV-REQ-008)
-- [ ] For each changed symbol, compute blast radius via the reach index and attach affected symbols as context (PRD-REV-REQ-002)
-- [ ] Define `Finding { file, line, anchor_method, severity, kind, rule, message, identity, related }` (PRD-REV-REQ-003, PRD-REV-REQ-004)
-- [ ] Implement tiered anchor resolution: new-side hunk → old-side removed line → post-change file → unresolved, recording which tier resolved it (PRD-REV-REQ-011)
-- [ ] Carry old-side diff lines through change detection so findings about **removed** code are anchorable — required by the breaking-change rule (PRD-REV-REQ-012, AR-030)
-- [ ] Report unresolved anchors without a line; never fabricate one (PRD-REV-REQ-012)
-- [ ] Rule family A — breaking change: removed or signature-changed symbol with live indexed callers → blocking, naming the callers (PRD-REV-REQ-006)
-- [ ] Rule family B — coverage gap: changed symbol whose blast radius contains no test-file symbols → warning (PRD-REV-REQ-007)
-- [ ] Derive the verdict mechanically: any blocking → BLOCK, any warning → REVIEW, else APPROVE (PRD-REV-REQ-005)
-- [ ] Make each rule family independently disable-able pending OQ-013 calibration (AR-022)
-- [ ] Benchmark: typical diff reviewed in < 2s
+- [x] Create `review.rs`; determine changed symbols using the V4 `ChangeScope` enum verbatim — no new git handling (PRD-REV-REQ-001, PRD-REV-REQ-008)
+- [x] For each changed symbol, compute blast radius via the reach index and attach affected symbols as context (PRD-REV-REQ-002)
+- [x] Define `Finding { file, line, anchor_method, severity, kind, rule, message, identity, related }` (PRD-REV-REQ-003, PRD-REV-REQ-004)
+- [x] Implement tiered anchor resolution: new-side hunk → old-side removed line → post-change file → unresolved, recording which tier resolved it (PRD-REV-REQ-011)
+- [x] Carry old-side diff lines through change detection so findings about **removed** code are anchorable — required by the breaking-change rule (PRD-REV-REQ-012, AR-030)
+- [x] Report unresolved anchors without a line; never fabricate one (PRD-REV-REQ-012)
+- [x] Rule family A — breaking change: removed or signature-changed symbol with live indexed callers → blocking, naming the callers (PRD-REV-REQ-006)
+- [x] Rule family B — coverage gap: changed symbol whose blast radius contains no test-file symbols → warning (PRD-REV-REQ-007)
+- [x] Derive the verdict mechanically: any blocking → BLOCK, any warning → REVIEW, else APPROVE (PRD-REV-REQ-005)
+- [x] Make each rule family independently disable-able pending OQ-013 calibration (AR-022)
+- [x] Benchmark: typical diff reviewed in < 2s
 
 **Dependencies:**
 - Blocked by: TASK-072, TASK-081
@@ -3712,7 +3712,7 @@ Create `review.rs` as pure composition over existing primitives, producing line-
 **Related Requirements:** PRD-REV-REQ-001, PRD-REV-REQ-002, PRD-REV-REQ-003, PRD-REV-REQ-004, PRD-REV-REQ-005, PRD-REV-REQ-006, PRD-REV-REQ-007, PRD-REV-REQ-008
 **Related Decisions:** DR-035, DR-034
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
