@@ -108,6 +108,9 @@ pub enum Command {
 
     /// List service contracts detected in this repository (routes, env vars, topics)
     Contracts(ContractsArgs),
+
+    /// Review the current diff for breaking changes and coverage gaps
+    Review(ReviewArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -473,6 +476,21 @@ pub struct ChangesArgs {
     /// Minimum confidence threshold (0.0-1.0) for blast/flow edges
     #[arg(long)]
     pub min_confidence: Option<f64>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewArgs {
+    /// Change scope: unstaged (default), staged, all, or compare
+    #[arg(long, default_value = "unstaged", conflicts_with = "since")]
+    pub scope: String,
+
+    /// Base git ref for compare scope (required when --scope=compare)
+    #[arg(long, conflicts_with = "since")]
+    pub base: Option<String>,
+
+    /// Sugar for --scope=compare --base=<ref>: review everything since a ref
+    #[arg(long)]
+    pub since: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1550,6 +1568,60 @@ mod tests {
             }
             _ => panic!("expected Command::Changes"),
         }
+    }
+
+    // -- Review tests (TASK-085) ----------------------------------------------
+
+    #[test]
+    fn parse_review_default_scope() {
+        let cli = Cli::try_parse_from(["wonk", "review"]).unwrap();
+        match cli.command {
+            Command::Review(args) => {
+                assert_eq!(args.scope, "unstaged");
+                assert!(args.base.is_none());
+                assert!(args.since.is_none());
+            }
+            _ => panic!("expected Command::Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_scope_compare_with_base() {
+        let cli = Cli::try_parse_from(["wonk", "review", "--scope", "compare", "--base", "main"])
+            .unwrap();
+        match cli.command {
+            Command::Review(args) => {
+                assert_eq!(args.scope, "compare");
+                assert_eq!(args.base.as_deref(), Some("main"));
+            }
+            _ => panic!("expected Command::Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_since_is_sugar_for_compare() {
+        let cli = Cli::try_parse_from(["wonk", "review", "--since", "main"]).unwrap();
+        match cli.command {
+            Command::Review(args) => {
+                assert_eq!(args.since.as_deref(), Some("main"));
+            }
+            _ => panic!("expected Command::Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_since_conflicts_with_scope() {
+        let result = Cli::try_parse_from(["wonk", "review", "--since", "main", "--scope", "all"]);
+        assert!(
+            result.is_err(),
+            "--since and --scope are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn parse_review_since_conflicts_with_base() {
+        let result = Cli::try_parse_from(["wonk", "review", "--since", "main", "--base", "HEAD"]);
+        assert!(result.is_err(), "--since and --base are mutually exclusive");
     }
 
     // -- Context tests (TASK-073) ---------------------------------------------
