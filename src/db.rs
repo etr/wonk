@@ -566,10 +566,20 @@ pub struct Meta {
     pub languages: Vec<String>,
     #[serde(default)]
     pub wonk_version: Option<String>,
+    /// Workspace ids this repo declared at index time (TASK-084,
+    /// PRD-CTR-REQ-020). Absent in pre-TASK-084 meta.json — reads back
+    /// empty, meaning "undeclared" (own-name default applies).
+    #[serde(default)]
+    pub workspaces: Vec<String>,
 }
 
 /// Write `meta.json` next to the given `index_db_path`.
-pub fn write_meta(index_db_path: &Path, repo_path: &Path, languages: &[String]) -> Result<()> {
+pub fn write_meta(
+    index_db_path: &Path,
+    repo_path: &Path,
+    languages: &[String],
+    workspaces: &[String],
+) -> Result<()> {
     let meta_path = index_db_path
         .parent()
         .expect("index.db must have a parent directory")
@@ -585,6 +595,7 @@ pub fn write_meta(index_db_path: &Path, repo_path: &Path, languages: &[String]) 
         created: now,
         languages: languages.to_vec(),
         wonk_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        workspaces: workspaces.to_vec(),
     };
 
     let json = serde_json::to_string_pretty(&meta).context("serializing meta.json")?;
@@ -915,12 +926,47 @@ mod tests {
         let repo_path = Path::new("/fake/repo");
         let langs = vec!["rust".to_string(), "python".to_string()];
 
-        write_meta(&db_path, repo_path, &langs).unwrap();
+        write_meta(&db_path, repo_path, &langs, &[]).unwrap();
 
         let meta = read_meta(&db_path).unwrap();
         assert_eq!(meta.repo_path, "/fake/repo");
         assert_eq!(meta.languages, vec!["rust", "python"]);
         assert!(meta.created > 0);
+    }
+
+    #[test]
+    fn meta_roundtrips_workspaces() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let workspaces = vec!["payments".to_string(), "platform".to_string()];
+
+        write_meta(
+            &db_path,
+            Path::new("/fake/repo"),
+            &["rust".to_string()],
+            &workspaces,
+        )
+        .unwrap();
+
+        let meta = read_meta(&db_path).unwrap();
+        assert_eq!(meta.workspaces, workspaces);
+    }
+
+    #[test]
+    fn meta_reads_missing_workspaces_as_empty() {
+        let dir = TempDir::new().unwrap();
+        // A meta.json written before TASK-084: no workspaces key at all.
+        fs::write(
+            dir.path().join("meta.json"),
+            r#"{"repo_path":"/fake/repo","created":1,"languages":["rust"]}"#,
+        )
+        .unwrap();
+
+        let meta = read_meta(&dir.path().join("index.db")).unwrap();
+        assert!(
+            meta.workspaces.is_empty(),
+            "legacy meta.json must read back undeclared, not error"
+        );
     }
 
     #[test]

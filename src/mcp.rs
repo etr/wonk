@@ -4162,7 +4162,7 @@ mod tests {
         let index_path = hash_dir.join("index.db");
         let conn = db::open(&index_path).unwrap();
         drop(conn);
-        db::write_meta(&index_path, &repo_dir, &["rust".to_string()]).unwrap();
+        db::write_meta(&index_path, &repo_dir, &["rust".to_string()], &[]).unwrap();
 
         let entries = discover_repos(&repos_dir);
         assert_eq!(entries.len(), 1);
@@ -4384,7 +4384,7 @@ mod tests {
         let index_path = hash_dir.join("index.db");
         let conn = db::open(&index_path).unwrap();
         drop(conn);
-        db::write_meta(&index_path, &repo_dir, &["rust".to_string()]).unwrap();
+        db::write_meta(&index_path, &repo_dir, &["rust".to_string()], &[]).unwrap();
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
@@ -4445,7 +4445,7 @@ mod tests {
         let local_db = repo_dir.join(".wonk/index.db");
         let central_db = hash_dir.join("index.db");
         std::fs::copy(&local_db, &central_db).unwrap();
-        db::write_meta(&central_db, &repo_dir, &["rust".to_string()]).unwrap();
+        db::write_meta(&central_db, &repo_dir, &["rust".to_string()], &[]).unwrap();
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
@@ -4501,7 +4501,7 @@ mod tests {
         let local_db = other_dir.join(".wonk/index.db");
         let central_db = hash_dir.join("index.db");
         std::fs::copy(&local_db, &central_db).unwrap();
-        db::write_meta(&central_db, &other_dir, &["rust".to_string()]).unwrap();
+        db::write_meta(&central_db, &other_dir, &["rust".to_string()], &[]).unwrap();
 
         (dir, primary_dir, repos_dir)
     }
