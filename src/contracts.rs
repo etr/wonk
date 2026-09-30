@@ -6373,26 +6373,15 @@ fn same_repo(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// Lazy connections over the scanned member set (DR-030): an index is
 /// opened with `db::open_existing` on first use and cached — non-members
 /// are never opened at all, and members cost one open per resolution.
-// First production consumer is `resolve_workspace` (TASK-084 phase 4);
-// exercised by unit tests until then.
-#[allow(dead_code)]
 pub struct SiblingConnections {
-    siblings: Vec<SiblingRepo>,
     open: std::collections::HashMap<std::path::PathBuf, rusqlite::Connection>,
 }
 
-#[allow(dead_code)]
 impl SiblingConnections {
-    fn new(siblings: Vec<SiblingRepo>) -> Self {
+    fn new() -> Self {
         Self {
-            siblings,
             open: std::collections::HashMap::new(),
         }
-    }
-
-    /// The scanned members (in deterministic order).
-    fn siblings(&self) -> &[SiblingRepo] {
-        &self.siblings
     }
 
     /// Get or lazily open the sibling's index connection.
@@ -6416,6 +6405,453 @@ impl SiblingConnections {
 #[allow(dead_code)]
 pub(crate) fn default_repos_dir() -> Option<std::path::PathBuf> {
     crate::config::home_dir().map(|h| h.join(".wonk").join("repos"))
+}
+
+/// Why a resolved provider↔consumer pair matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkBasis {
+    /// Canonical IDs are equal (first pass, REQ-005).
+    ExactId,
+    /// IDs differ; the RPC-relaxed join recovered the pair (REQ-024).
+    Rpc(RpcMatchBasis),
+}
+
+/// One endpoint (side) of a cross-repo link.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkEndpoint {
+    /// Repo name (last path component of that repo's root).
+    pub repo: String,
+    /// `<kind>::<qualifier>::<identifier>` canonical ID.
+    pub canonical_id: String,
+    /// Contract kind.
+    pub kind: ContractKind,
+    /// Path relative to that repo's root.
+    pub file: String,
+    /// 1-based line of the detection site.
+    pub line: usize,
+    /// Owning symbol name, when stored.
+    pub symbol: Option<String>,
+    /// Stored confidence.
+    pub confidence: f64,
+}
+
+impl LinkEndpoint {
+    fn from_row(repo: &str, row: &ContractRow) -> Self {
+        Self {
+            repo: repo.to_string(),
+            canonical_id: row.canonical_id.clone(),
+            kind: row.kind,
+            file: row.file.clone(),
+            line: row.line,
+            symbol: row.symbol.clone(),
+            confidence: row.confidence,
+        }
+    }
+}
+
+/// A provider↔consumer pair resolved across repo boundaries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossRepoLink {
+    /// Why the pair matched.
+    pub basis: LinkBasis,
+    /// The serving side.
+    pub provider: LinkEndpoint,
+    /// The calling side.
+    pub consumer: LinkEndpoint,
+}
+
+/// Every own-repo consumer row carries exactly one of these (AR-025).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConsumerStatus {
+    /// An opposite-role match (exact or RPC-relaxed) exists in this repo
+    /// or any same-workspace sibling.
+    Linked,
+    /// No match anywhere in the workspace AND this repo declares ≥1
+    /// workspace.
+    Orphan,
+    /// No match AND nothing declared — the effective workspace is the
+    /// repo's own name. A configuration gap is never labeled a defect.
+    Unscoped,
+}
+
+impl ConsumerStatus {
+    /// Grep-token form used by `wonk contracts` rows.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConsumerStatus::Linked => "linked",
+            ConsumerStatus::Orphan => "orphan",
+            ConsumerStatus::Unscoped => "unscoped",
+        }
+    }
+}
+
+/// Live (never persisted, DR-031) result of resolving one repo's workspace.
+#[derive(Debug, Clone)]
+pub struct WorkspaceResolution {
+    /// The querying repo's workspace scope.
+    pub scope: WorkspaceScope,
+    /// Same-workspace siblings found in the registry.
+    pub siblings: Vec<SiblingRepo>,
+    /// Resolved cross-repo pairs involving this repo.
+    pub links: Vec<CrossRepoLink>,
+    /// Status for every own consumer row, keyed by
+    /// `(canonical_id, file, line)`.
+    pub status: HashMap<(String, String, usize), ConsumerStatus>,
+    /// Own provider rows with no consumer in this repo or any sibling.
+    pub unused_providers: Vec<ContractRow>,
+}
+
+/// Row identity used for status keys and link dedup.
+fn row_key(row: &ContractRow) -> (String, String, usize) {
+    (row.canonical_id.clone(), row.file.clone(), row.line)
+}
+
+/// Rebuild a comparable candidate from a stored row (split the canonical
+/// ID back into qualifier + identifier). `None` for malformed IDs.
+pub fn row_to_candidate(row: &ContractRow) -> Option<ContractCandidate> {
+    let mut parts = row.canonical_id.splitn(3, "::");
+    let kind = parts.next()?.parse::<ContractKind>().ok()?;
+    let qualifier = parts.next()?.to_string();
+    let identifier = parts.next()?.to_string();
+    if identifier.is_empty() {
+        return None;
+    }
+    Some(ContractCandidate {
+        kind,
+        role: row.role,
+        qualifier,
+        identifier,
+        canonical_id: row.canonical_id.clone(),
+        params: Vec::new(),
+        owning_symbol: row.symbol.clone(),
+        line: row.line,
+        confidence: row.confidence,
+    })
+}
+
+/// Per-repo contract rows indexed for opposite-role lookup.
+struct RepoRows {
+    name: String,
+    providers_by_id: HashMap<String, Vec<ContractRow>>,
+    consumers_by_id: HashMap<String, Vec<ContractRow>>,
+}
+
+impl RepoRows {
+    fn build(name: &str, rows: &[ContractRow]) -> Self {
+        let mut providers_by_id: HashMap<String, Vec<ContractRow>> = HashMap::new();
+        let mut consumers_by_id: HashMap<String, Vec<ContractRow>> = HashMap::new();
+        for row in rows {
+            let slot = if row.role == ContractRole::Provider {
+                &mut providers_by_id
+            } else {
+                &mut consumers_by_id
+            };
+            slot.entry(row.canonical_id.clone())
+                .or_default()
+                .push(row.clone());
+        }
+        Self {
+            name: name.to_string(),
+            providers_by_id,
+            consumers_by_id,
+        }
+    }
+}
+
+/// Resolve provider↔consumer links across the same-workspace registry
+/// (TASK-084). Pure query-time joins over existing indexes — nothing is
+/// written anywhere (DR-031). With no members this is a no-op pass over
+/// `own_rows` (PRD-CTR-REQ-012).
+///
+/// Pass 1 (exact): own consumers × member providers and own providers ×
+/// member consumers by equal canonical ID. In-repo pairs participate only
+/// as status, never as links. Pass 2 (RPC-relaxed): for each shared
+/// workspace, own + member gRPC candidates go through
+/// [`canonical_rpc_join`], whose built-in exact exclusion keeps the first
+/// pass authoritative.
+pub fn resolve_workspace(
+    own_root: &std::path::Path,
+    own_rows: &[ContractRow],
+    declared: &[String],
+    repos_dir: &std::path::Path,
+) -> anyhow::Result<WorkspaceResolution> {
+    let scope = workspace_scope(declared, own_root);
+    let siblings = scan_registry(repos_dir, own_root, &scope.effective);
+    let mut conns = SiblingConnections::new();
+
+    let own = RepoRows::build(&scope.repo_name, own_rows);
+    let mut members = Vec::new();
+    for sibling in &siblings {
+        let conn = conns.connection(sibling)?;
+        let rows = list_contracts(conn, &ContractQuery::default())?;
+        members.push(RepoRows::build(&sibling.name, &rows));
+    }
+
+    let mut links: Vec<CrossRepoLink> = Vec::new();
+    let mut linked_consumer_keys: std::collections::HashSet<(String, String, usize)> =
+        std::collections::HashSet::new();
+    let mut consumed_provider_keys: std::collections::HashSet<(String, String, usize)> =
+        std::collections::HashSet::new();
+
+    // Exact pass: own consumers served by member providers.
+    for (id, crows) in &own.consumers_by_id {
+        for m in &members {
+            let Some(prows) = m.providers_by_id.get(id) else {
+                continue;
+            };
+            for c in crows {
+                linked_consumer_keys.insert(row_key(c));
+                for p in prows {
+                    links.push(CrossRepoLink {
+                        basis: LinkBasis::ExactId,
+                        provider: LinkEndpoint::from_row(&m.name, p),
+                        consumer: LinkEndpoint::from_row(&own.name, c),
+                    });
+                }
+            }
+        }
+    }
+    // Exact pass: own providers consumed by member consumers.
+    for (id, prows) in &own.providers_by_id {
+        for m in &members {
+            let Some(crows) = m.consumers_by_id.get(id) else {
+                continue;
+            };
+            for p in prows {
+                consumed_provider_keys.insert(row_key(p));
+                for c in crows {
+                    links.push(CrossRepoLink {
+                        basis: LinkBasis::ExactId,
+                        provider: LinkEndpoint::from_row(&own.name, p),
+                        consumer: LinkEndpoint::from_row(&m.name, c),
+                    });
+                }
+            }
+        }
+    }
+
+    // RPC-relaxed pass, one join per shared normalized workspace. Own rows
+    // enter every shared workspace; a member enters the ones it shares.
+    let mut shared = scope.effective.clone();
+    shared.sort();
+    shared.dedup();
+    for w in &shared {
+        let mut scopes: Vec<RpcJoinScope> = Vec::new();
+        let mut own_cands = Vec::new();
+        for row in own_rows.iter().filter(|r| is_rpc_family(r.kind)) {
+            if let Some(c) = row_to_candidate(row) {
+                own_cands.push(c);
+            }
+        }
+        if !own_cands.is_empty() {
+            scopes.push(RpcJoinScope {
+                workspace: w.clone(),
+                candidates: &own_cands,
+            });
+        }
+        let mut member_cands: Vec<Vec<ContractCandidate>> = Vec::new();
+        for sibling in &siblings {
+            if !sibling.workspaces.contains(w) {
+                continue;
+            }
+            let member = members
+                .iter()
+                .find(|m| m.name == sibling.name)
+                .expect("member built per sibling");
+            let mut cands = Vec::new();
+            for row in member.grpc_rows().iter() {
+                if let Some(c) = row_to_candidate(row) {
+                    cands.push(c);
+                }
+            }
+            if !cands.is_empty() {
+                member_cands.push(cands);
+            }
+        }
+        // Borrow discipline: candidates must outlive the scopes.
+        for cands in &member_cands {
+            scopes.push(RpcJoinScope {
+                workspace: w.clone(),
+                candidates: cands,
+            });
+        }
+
+        for join in canonical_rpc_join(&scopes) {
+            // Expand both sides back to concrete rows: every repo in scope
+            // for w holding a row with that (id, role).
+            let provider_rows = sides_to_rows(&own, &members, &join.provider);
+            let consumer_rows = sides_to_rows(&own, &members, &join.consumer);
+            for (_, p) in &provider_rows {
+                consumed_provider_keys.insert(row_key(p));
+            }
+            for (_, c) in &consumer_rows {
+                linked_consumer_keys.insert(row_key(c));
+            }
+            for (p_repo, p_row) in &provider_rows {
+                for (c_repo, c_row) in &consumer_rows {
+                    if p_repo == c_repo {
+                        continue; // in-repo pair: status only, never a link
+                    }
+                    if p_repo != &own.name && c_repo != &own.name {
+                        continue; // member↔member pair: not this repo's query
+                    }
+                    let link = CrossRepoLink {
+                        basis: LinkBasis::Rpc(join.basis),
+                        provider: LinkEndpoint::from_row(p_repo, p_row),
+                        consumer: LinkEndpoint::from_row(c_repo, c_row),
+                    };
+                    // Deduplicate on the endpoint pair (a row can enter the
+                    // join through several shared workspaces).
+                    if !links.iter().any(|existing| {
+                        existing.provider.repo == link.provider.repo
+                            && existing.provider.canonical_id == link.provider.canonical_id
+                            && existing.provider.file == link.provider.file
+                            && existing.provider.line == link.provider.line
+                            && existing.consumer.repo == link.consumer.repo
+                            && existing.consumer.canonical_id == link.consumer.canonical_id
+                            && existing.consumer.file == link.consumer.file
+                            && existing.consumer.line == link.consumer.line
+                    }) {
+                        links.push(link);
+                    }
+                }
+            }
+        }
+    }
+
+    // Statuses: one of linked / orphan / unscoped for every own consumer.
+    let mut status = HashMap::new();
+    for row in own_rows.iter().filter(|r| r.role == ContractRole::Consumer) {
+        let key = row_key(row);
+        let exact = own.providers_by_id.contains_key(&row.canonical_id)
+            || members
+                .iter()
+                .any(|m| m.providers_by_id.contains_key(&row.canonical_id));
+        let st = if exact || linked_consumer_keys.contains(&key) {
+            ConsumerStatus::Linked
+        } else if !scope.declared.is_empty() {
+            ConsumerStatus::Orphan
+        } else {
+            ConsumerStatus::Unscoped
+        };
+        status.insert(key, st);
+    }
+
+    // Unused providers (REQ-007): own rows iterate in list order so the
+    // result is deterministic without an extra sort.
+    let mut unused_providers = Vec::new();
+    for row in own_rows.iter().filter(|r| r.role == ContractRole::Provider) {
+        let consumed = own.consumers_by_id.contains_key(&row.canonical_id)
+            || members
+                .iter()
+                .any(|m| m.consumers_by_id.contains_key(&row.canonical_id))
+            || consumed_provider_keys.contains(&row_key(row));
+        if !consumed {
+            unused_providers.push(row.clone());
+        }
+    }
+
+    links.sort_by(|a, b| {
+        a.provider
+            .repo
+            .cmp(&b.provider.repo)
+            .then_with(|| a.provider.file.cmp(&b.provider.file))
+            .then_with(|| a.provider.line.cmp(&b.provider.line))
+            .then_with(|| a.consumer.repo.cmp(&b.consumer.repo))
+            .then_with(|| a.consumer.file.cmp(&b.consumer.file))
+            .then_with(|| a.consumer.line.cmp(&b.consumer.line))
+            .then_with(|| a.provider.canonical_id.cmp(&b.provider.canonical_id))
+    });
+
+    Ok(WorkspaceResolution {
+        scope,
+        siblings,
+        links,
+        status,
+        unused_providers,
+    })
+}
+
+impl RepoRows {
+    /// All RPC-family rows, in deterministic order (for the relaxed join).
+    fn grpc_rows(&self) -> Vec<ContractRow> {
+        let mut rows: Vec<ContractRow> = self
+            .providers_by_id
+            .values()
+            .flatten()
+            .chain(self.consumers_by_id.values().flatten())
+            .filter(|r| is_rpc_family(r.kind))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.canonical_id
+                .cmp(&b.canonical_id)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.role.as_str().cmp(b.role.as_str()))
+        });
+        rows
+    }
+}
+
+/// Expand one join side back to concrete `(repo name, row)` pairs: every
+/// repo in the join holding a row with the side's canonical ID and role.
+fn sides_to_rows(
+    own: &RepoRows,
+    members: &[RepoRows],
+    side: &RpcJoinSide,
+) -> Vec<(String, ContractRow)> {
+    let want_providers = side.role == ContractRole::Provider;
+    let mut out = Vec::new();
+    for repo in std::iter::once(own).chain(members.iter()) {
+        let by_id = if want_providers {
+            &repo.providers_by_id
+        } else {
+            &repo.consumers_by_id
+        };
+        if let Some(rows) = by_id.get(&side.canonical_id) {
+            for r in rows {
+                out.push((repo.name.clone(), r.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Workspace membership snapshot for `wonk status` (REQ-021, AR-027).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceStatus {
+    /// Verbatim declared ids (empty when undeclared).
+    pub declared: Vec<String>,
+    /// Normalized effective set.
+    pub effective: Vec<String>,
+    /// Workspaces stored in this repo's `meta.json`; `None` when unreadable.
+    pub stored: Option<Vec<String>>,
+    /// Names of same-workspace repos found in the registry.
+    pub comembers: Vec<String>,
+    /// The stored set no longer matches the declared set — a `wonk update`
+    /// would publish it.
+    pub stored_diverges: bool,
+}
+
+/// Build the workspace section of `wonk status`.
+pub fn workspace_status(
+    repos_dir: &std::path::Path,
+    own_root: &std::path::Path,
+    own_index: &std::path::Path,
+    declared: &[String],
+) -> WorkspaceStatus {
+    let scope = workspace_scope(declared, own_root);
+    let members = scan_registry(repos_dir, own_root, &scope.effective);
+    let stored = crate::db::read_meta(own_index).ok().map(|m| m.workspaces);
+    let stored_diverges = stored.as_ref().is_some_and(|s| s != &scope.declared);
+    WorkspaceStatus {
+        declared: scope.declared.clone(),
+        effective: scope.effective.clone(),
+        stored,
+        comembers: members.into_iter().map(|m| m.name).collect(),
+        stored_diverges,
+    }
 }
 
 #[cfg(test)]
@@ -11112,11 +11548,25 @@ paths:
         name: &str,
         workspaces: &[&str],
     ) -> (tempfile::TempDir, std::path::PathBuf) {
+        registry_repo_files(repos_dir, name, workspaces, &[("src/app.js", REGISTRY_SRC)])
+    }
+
+    /// [`registry_repo`] with explicit source files.
+    fn registry_repo_files(
+        repos_dir: &std::path::Path,
+        name: &str,
+        workspaces: &[&str],
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(name);
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/app.js"), REGISTRY_SRC).unwrap();
+        for (path, content) in files {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                std::fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            std::fs::write(root.join(path), content).unwrap();
+        }
         if !workspaces.is_empty() {
             std::fs::create_dir_all(root.join(".wonk")).unwrap();
             let list = workspaces
@@ -11136,6 +11586,30 @@ paths:
         std::fs::copy(root.join(".wonk/index.db"), dest.join("index.db")).unwrap();
         std::fs::copy(root.join(".wonk/meta.json"), dest.join("meta.json")).unwrap();
         (dir, root)
+    }
+
+    /// Build and register the querying repo, opening its local index the
+    /// way the CLI does. Returns `(TempDir, root, connection)`.
+    fn own_indexed_repo_files(
+        repos_dir: &std::path::Path,
+        name: &str,
+        workspaces: &[&str],
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, std::path::PathBuf, rusqlite::Connection) {
+        let (dir, root) = registry_repo_files(repos_dir, name, workspaces, files);
+        let conn = crate::db::open_existing(&root.join(".wonk").join("index.db")).unwrap();
+        (dir, root, conn)
+    }
+
+    /// Resolve the own repo's workspace the way dispatch will.
+    fn resolve_around(
+        own_root: &std::path::Path,
+        own_conn: &rusqlite::Connection,
+        declared: &[String],
+        repos_dir: &std::path::Path,
+    ) -> WorkspaceResolution {
+        let rows = list_contracts(own_conn, &ContractQuery::default()).unwrap();
+        resolve_workspace(own_root, &rows, declared, repos_dir).unwrap()
     }
 
     #[test]
@@ -11213,12 +11687,11 @@ paths:
 
         let scope = workspace_scope(&["payments".to_string()], &own_root);
         let members = scan_registry(repos_dir.path(), &own_root, &scope.effective);
-        let mut conns = SiblingConnections::new(members);
-        assert_eq!(conns.siblings().len(), 1);
+        assert_eq!(members.len(), 1);
+        let mut conns = SiblingConnections::new();
         // First use opens the member index; repeat calls reuse the cache.
         for _ in 0..2 {
-            let member = conns.siblings()[0].clone();
-            let conn = conns.connection(&member).expect("member connection");
+            let conn = conns.connection(&members[0]).expect("member connection");
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM contracts", [], |r| r.get(0))
                 .unwrap();
@@ -11258,5 +11731,346 @@ paths:
         let members = scan_registry(repos_dir.path(), &own_root, &scope.effective);
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].name, "sibling-in");
+    }
+
+    // -- resolution engine (TASK-084 phase 4) ----------------------------------
+
+    const HTTP_CONSUMER_USERS: &str =
+        "async function load() { await fetch('https://api.io/v1/users'); }";
+    const HTTP_PROVIDER_USERS: &str = "const app = express();\napp.get('/v1/users', h);\n";
+    const HTTP_PROVIDER_ORDERS: &str = "const app = express();\napp.get('/v1/orders', h);\n";
+    const HTTP_PROVIDER_HEALTH: &str = "const app = express();\napp.get('/health', h);\n";
+    const GRPC_JS_CONSUMER: &str = "const grpc = require('@grpc/grpc-js');\nconst client = new user.UserServiceClient(host, creds);\nclient.getUser(arg, cb);\n";
+    const GRPC_PROTO_PROVIDER: &str = "syntax = \"proto3\";\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);\n}\n";
+
+    #[test]
+    fn row_to_candidate_splits_canonical_id() {
+        let grpc_row = ContractRow {
+            canonical_id: "grpc::users.v1.UserService::GetUser".to_string(),
+            kind: ContractKind::Grpc,
+            role: ContractRole::Provider,
+            symbol: Some("impl".to_string()),
+            file: "src/server.rs".to_string(),
+            line: 3,
+            confidence: 1.0,
+        };
+        let cand = row_to_candidate(&grpc_row).expect("grpc id must split");
+        assert_eq!(cand.kind, ContractKind::Grpc);
+        assert_eq!(cand.qualifier, "users.v1.UserService");
+        assert_eq!(cand.identifier, "GetUser");
+        assert_eq!(cand.canonical_id, grpc_row.canonical_id);
+        assert_eq!(cand.role, ContractRole::Provider);
+
+        let env_row = ContractRow {
+            canonical_id: "env::::DATABASE_URL".to_string(),
+            kind: ContractKind::Env,
+            role: ContractRole::Consumer,
+            symbol: None,
+            file: "src/config.js".to_string(),
+            line: 1,
+            confidence: 1.0,
+        };
+        let env_cand = row_to_candidate(&env_row).expect("env id must split");
+        assert_eq!(env_cand.qualifier, "");
+        assert_eq!(env_cand.identifier, "DATABASE_URL");
+    }
+
+    #[test]
+    fn exact_link_one_pair_same_workspace() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "own-api",
+            &["payments"],
+            &[("src/client.js", HTTP_CONSUMER_USERS)],
+        );
+        let (_sib_dir, _sib_root) = registry_repo_files(
+            repos_dir.path(),
+            "users-svc",
+            &["payments"],
+            &[("src/app.js", HTTP_PROVIDER_USERS)],
+        );
+
+        let r = resolve_around(
+            &own_root,
+            &own_conn,
+            &["payments".to_string()],
+            repos_dir.path(),
+        );
+        assert_eq!(r.links.len(), 1, "got {:?}", r.links);
+        let link = &r.links[0];
+        assert_eq!(link.basis, LinkBasis::ExactId);
+        assert_eq!(link.provider.repo, "users-svc");
+        assert_eq!(link.consumer.repo, "own-api");
+        assert_eq!(link.provider.canonical_id, "http::GET::/v1/users");
+        assert_eq!(link.consumer.canonical_id, "http::GET::/v1/users");
+        assert_eq!(
+            r.status
+                .get(&(
+                    link.consumer.canonical_id.clone(),
+                    link.consumer.file.clone(),
+                    link.consumer.line
+                ))
+                .copied(),
+            Some(ConsumerStatus::Linked),
+            "matched consumers are never orphans"
+        );
+    }
+
+    #[test]
+    fn no_link_across_workspaces() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        // Both repos expose GET /health, but in disjoint workspaces.
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "own-api",
+            &["payments"],
+            &[("src/app.js", HTTP_PROVIDER_HEALTH)],
+        );
+        let (_sib_dir, _sib_root) = registry_repo_files(
+            repos_dir.path(),
+            "billing-svc",
+            &["billing"],
+            &[("src/app.js", HTTP_PROVIDER_HEALTH)],
+        );
+
+        let r = resolve_around(
+            &own_root,
+            &own_conn,
+            &["payments".to_string()],
+            repos_dir.path(),
+        );
+        assert!(r.links.is_empty(), "got {:?}", r.links);
+        assert!(r.siblings.is_empty());
+    }
+
+    #[test]
+    fn link_directions_both_ways() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "own-api",
+            &["payments"],
+            &[
+                ("src/a.js", HTTP_PROVIDER_ORDERS),
+                ("src/b.js", HTTP_CONSUMER_USERS),
+            ],
+        );
+        let (_sib_dir, _sib_root) = registry_repo_files(
+            repos_dir.path(),
+            "sib-svc",
+            &["payments"],
+            &[
+                ("src/a.js", "const d = axios.get('/v1/orders');"),
+                ("src/b.js", HTTP_PROVIDER_USERS),
+            ],
+        );
+
+        let r = resolve_around(
+            &own_root,
+            &own_conn,
+            &["payments".to_string()],
+            repos_dir.path(),
+        );
+        assert_eq!(r.links.len(), 2, "got {:?}", r.links);
+        let own_as_provider = r
+            .links
+            .iter()
+            .any(|l| l.provider.repo == "own-api" && l.consumer.repo == "sib-svc");
+        let own_as_consumer = r
+            .links
+            .iter()
+            .any(|l| l.consumer.repo == "own-api" && l.provider.repo == "sib-svc");
+        assert!(own_as_provider, "own provider consumed by sibling");
+        assert!(own_as_consumer, "own consumer served by sibling");
+    }
+
+    #[test]
+    fn multi_workspace_repo_links_both_and_dedupes_overlap() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "own-api",
+            &["payments", "platform"],
+            &[
+                ("src/a.js", HTTP_CONSUMER_USERS),
+                (
+                    "src/b.js",
+                    "async function load() { await fetch('https://api.io/v1/orders'); }",
+                ),
+            ],
+        );
+        // Same two workspaces: the shared overlap must not double-link.
+        let (_both_dir, _both_root) = registry_repo_files(
+            repos_dir.path(),
+            "both-svc",
+            &["payments", "platform"],
+            &[("src/app.js", HTTP_PROVIDER_USERS)],
+        );
+        let (_plat_dir, _plat_root) = registry_repo_files(
+            repos_dir.path(),
+            "plat-svc",
+            &["platform"],
+            &[("src/app.js", HTTP_PROVIDER_ORDERS)],
+        );
+
+        let r = resolve_around(
+            &own_root,
+            &own_conn,
+            &["payments".to_string(), "platform".to_string()],
+            repos_dir.path(),
+        );
+        assert_eq!(r.links.len(), 2, "got {:?}", r.links);
+        let to_both = r
+            .links
+            .iter()
+            .filter(|l| l.provider.repo == "both-svc")
+            .count();
+        assert_eq!(to_both, 1, "two shared workspaces still yield one link");
+        assert!(r.links.iter().any(|l| l.provider.repo == "plat-svc"));
+    }
+
+    #[test]
+    fn rpc_relaxed_cross_repo_link() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "own-api",
+            &["payments"],
+            &[("src/client.js", GRPC_JS_CONSUMER)],
+        );
+        let (_sib_dir, _sib_root) = registry_repo_files(
+            repos_dir.path(),
+            "proto-svc",
+            &["payments"],
+            &[("proto/user.proto", GRPC_PROTO_PROVIDER)],
+        );
+
+        let r = resolve_around(
+            &own_root,
+            &own_conn,
+            &["payments".to_string()],
+            repos_dir.path(),
+        );
+        assert_eq!(r.links.len(), 1, "got {:?}", r.links);
+        let link = &r.links[0];
+        assert_eq!(
+            link.basis,
+            LinkBasis::Rpc(RpcMatchBasis::PackageQualifiedService)
+        );
+        assert_eq!(link.provider.canonical_id, "grpc::UserService::GetUser");
+        assert_eq!(
+            link.consumer.canonical_id,
+            "grpc::user.UserService::getUser"
+        );
+        assert_eq!(
+            r.status
+                .get(&(
+                    link.consumer.canonical_id.clone(),
+                    link.consumer.file.clone(),
+                    link.consumer.line
+                ))
+                .copied(),
+            Some(ConsumerStatus::Linked),
+            "a relaxed match still satisfies the consumer"
+        );
+    }
+
+    #[test]
+    fn consumer_status_orphan_vs_unscoped_vs_linked() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "lone-api",
+            &[],
+            &[
+                (
+                    "src/client.js",
+                    "async function a() { await fetch('https://api.io/v1/users'); }\nasync function b() { await fetch('https://api.io/v1/orders'); }",
+                ),
+                ("src/app.js", HTTP_PROVIDER_ORDERS),
+            ],
+        );
+
+        // Undeclared: no match AND nothing declared -> Unscoped (AR-025).
+        let undeclared = resolve_around(&own_root, &own_conn, &[], repos_dir.path());
+        assert_eq!(
+            undeclared
+                .status
+                .get(&(
+                    "http::GET::/v1/users".to_string(),
+                    "src/client.js".to_string(),
+                    1
+                ))
+                .copied(),
+            Some(ConsumerStatus::Unscoped)
+        );
+        assert_eq!(
+            undeclared
+                .status
+                .get(&(
+                    "http::GET::/v1/orders".to_string(),
+                    "src/client.js".to_string(),
+                    2
+                ))
+                .copied(),
+            Some(ConsumerStatus::Linked)
+        );
+
+        // Declared with no matching sibling: same row is now an Orphan.
+        let declared = resolve_around(
+            &own_root,
+            &own_conn,
+            &["payments".to_string()],
+            repos_dir.path(),
+        );
+        assert_eq!(
+            declared
+                .status
+                .get(&(
+                    "http::GET::/v1/users".to_string(),
+                    "src/client.js".to_string(),
+                    1
+                ))
+                .copied(),
+            Some(ConsumerStatus::Orphan)
+        );
+    }
+
+    #[test]
+    fn unused_providers_computed() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "own-api",
+            &["payments"],
+            &[
+                (
+                    "src/app.js",
+                    "const app = express();\napp.get('/v1/orders', h);\napp.get('/v1/health', h);\napp.get('/v1/metrics', h);\n",
+                ),
+                ("src/client.js", "const d = axios.get('/v1/orders');"),
+            ],
+        );
+        // /v1/health is consumed by the sibling; /v1/metrics by nobody.
+        let (_sib_dir, _sib_root) = registry_repo_files(
+            repos_dir.path(),
+            "sib-svc",
+            &["payments"],
+            &[("src/client.js", "const h = axios.get('/v1/health');")],
+        );
+
+        let r = resolve_around(
+            &own_root,
+            &own_conn,
+            &["payments".to_string()],
+            repos_dir.path(),
+        );
+        let unused: Vec<&str> = r
+            .unused_providers
+            .iter()
+            .map(|p| p.canonical_id.as_str())
+            .collect();
+        assert_eq!(unused, vec!["http::GET::/v1/metrics"], "got {unused:?}");
     }
 }
