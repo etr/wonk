@@ -156,6 +156,19 @@ pub struct ReviewOptions {
     pub reach_enabled: bool,
     /// Blast traversal depth.
     pub depth: usize,
+    /// Drop findings whose confidence is below this floor
+    /// (PRD-REV-REQ-015). `None` keeps everything.
+    pub min_confidence: Option<f64>,
+    /// Drop findings less severe than this floor (PRD-REV-REQ-015).
+    /// `None` keeps everything.
+    pub min_severity: Option<FindingSeverity>,
+    /// Keep only these finding categories (the `kind` field). Empty keeps
+    /// every category (PRD-REV-REQ-015).
+    pub kinds: Vec<String>,
+    /// Keep at most this many findings after ranking — the cap trims the
+    /// least severe and least confident first (PRD-REV-REQ-015). `None`
+    /// keeps everything.
+    pub max_findings: Option<usize>,
 }
 
 impl Default for ReviewOptions {
@@ -166,6 +179,10 @@ impl Default for ReviewOptions {
             cross_repo: true,
             reach_enabled: true,
             depth: blast::DEFAULT_DEPTH,
+            min_confidence: None,
+            min_severity: None,
+            kinds: Vec::new(),
+            max_findings: None,
         }
     }
 }
@@ -207,13 +224,84 @@ impl CrossRepoInputs {
 pub struct ReviewResult {
     /// The scope that was reviewed.
     pub scope: ChangeScope,
-    /// All findings, sorted by severity (desc), file, line, rule.
+    /// The findings kept after ranking, suppression, filtering, and any
+    /// cap — what the report and the verdict describe.
     pub findings: Vec<Finding>,
     /// Mechanically derived from `findings` by [`derive_verdict`].
     pub verdict: ReviewVerdict,
+    /// Why each produced finding did not make the report, by reason
+    /// (PRD-REV-REQ-015). Zeros included: the object is always present.
+    pub drops: DropCounts,
     /// Non-fatal problems (e.g. a per-symbol blast failure) — findings the
     /// engine could not compute are never silently dropped.
     pub warnings: Vec<String>,
+}
+
+/// Per-reason counts of produced findings that did not make the report
+/// (PRD-REV-REQ-015). Every finding is counted at most once, by the first
+/// stage of [`rank_filter_cap`] that rejects it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DropCounts {
+    /// Confidence below [`ReviewOptions::min_confidence`].
+    pub below_confidence: usize,
+    /// Severity below [`ReviewOptions::min_severity`].
+    pub below_severity: usize,
+    /// Category not in [`ReviewOptions::kinds`].
+    pub out_of_category: usize,
+    /// Ranked past [`ReviewOptions::max_findings`].
+    pub over_cap: usize,
+    /// Identity in the durable `review_suppressions` table.
+    pub identity_suppressed: usize,
+}
+
+/// Rank, suppress, filter, and cap in one pure pass (PRD-REV-REQ-015).
+///
+/// Order is fixed: ranking first (so a cap trims the least severe and
+/// least confident), suppression before the cap (a suppressed finding
+/// must not consume a cap slot), then the confidence floor, the severity
+/// floor, the category filter, and the cap. Each finding is dropped by
+/// exactly one reason — the first rejecting stage — so the kept list plus
+/// every count always equals the input. The verdict is derived by the
+/// caller from the kept list only.
+pub fn rank_filter_cap(
+    findings: Vec<Finding>,
+    suppressed: &HashSet<String>,
+    options: &ReviewOptions,
+) -> (Vec<Finding>, DropCounts) {
+    let mut drops = DropCounts::default();
+    let mut staged = findings;
+    rank_findings(&mut staged);
+
+    let mut kept = Vec::with_capacity(staged.len());
+    for finding in staged {
+        if suppressed.contains(&finding.identity) {
+            drops.identity_suppressed += 1;
+        } else if options
+            .min_confidence
+            .is_some_and(|floor| finding.confidence < floor)
+        {
+            drops.below_confidence += 1;
+        } else if options
+            .min_severity
+            .is_some_and(|floor| finding.severity.rank() < floor.rank())
+        {
+            drops.below_severity += 1;
+        } else if !options.kinds.is_empty()
+            && !options.kinds.iter().any(|kind| kind == &finding.kind)
+        {
+            drops.out_of_category += 1;
+        } else {
+            kept.push(finding);
+        }
+    }
+
+    if let Some(cap) = options.max_findings
+        && kept.len() > cap
+    {
+        drops.over_cap = kept.len() - cap;
+        kept.truncate(cap);
+    }
+    (kept, drops)
 }
 
 // ---------------------------------------------------------------------------
@@ -896,11 +984,11 @@ pub fn run_review(
         }
     }
 
-    // Suppressed identities never reach the report or the verdict: a retired
-    // false positive is not a finding of this run.
-    findings.retain(|f| !suppressed.contains(&f.identity));
-
-    rank_findings(&mut findings);
+    // One pure pass decides what the report contains (PRD-REV-REQ-015):
+    // suppressed identities never reach the report or the verdict — a
+    // retired false positive is not a finding of this run — and the
+    // verdict derives from what is kept.
+    let (findings, drops) = rank_filter_cap(findings, &suppressed, options);
 
     let verdict = derive_verdict(&findings);
 
@@ -908,6 +996,7 @@ pub fn run_review(
         scope: scope.clone(),
         findings,
         verdict,
+        drops,
         warnings,
     })
 }
@@ -1137,6 +1226,170 @@ mod tests {
         ];
         rank_findings(&mut findings);
         assert_eq!(findings[0].rule, "r-unanchored");
+    }
+
+    // -- filter + cap pipeline (TASK-089, PRD-REV-REQ-015) ----------------------
+
+    fn pipelined(severity: FindingSeverity, confidence: f64, kind: &str, rule: &str) -> Finding {
+        Finding {
+            kind: kind.into(),
+            ..ranked(severity, confidence, "src/a.rs", Some(1), rule)
+        }
+    }
+
+    #[test]
+    fn cap_trims_the_least_severe_and_counts_over_cap() {
+        let findings = vec![
+            pipelined(FindingSeverity::Note, 0.9, "test", "r-note"),
+            pipelined(FindingSeverity::Warning, 0.5, "test", "r-warn-lo"),
+            pipelined(FindingSeverity::Warning, 0.9, "test", "r-warn-hi"),
+            pipelined(FindingSeverity::Blocking, 0.1, "test", "r-block"),
+        ];
+        let options = ReviewOptions {
+            max_findings: Some(2),
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
+        let rules: Vec<&str> = kept.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, vec!["r-block", "r-warn-hi"], "cap keeps the worst");
+        assert_eq!(drops.over_cap, 2);
+        assert_eq!(
+            drops,
+            DropCounts {
+                over_cap: 2,
+                ..DropCounts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn each_stage_counts_only_its_own_drops() {
+        // One finding per stage, each dropped by exactly the first stage
+        // that rejects it — plus one that rejects on none.
+        let findings = vec![
+            pipelined(FindingSeverity::Warning, 0.3, "test", "r-conf"),
+            pipelined(FindingSeverity::Note, 0.9, "test", "r-sev"),
+            pipelined(FindingSeverity::Warning, 0.9, "other", "r-kind"),
+            pipelined(FindingSeverity::Blocking, 0.9, "test", "r-kept"),
+        ];
+        let options = ReviewOptions {
+            min_confidence: Some(0.5),
+            min_severity: Some(FindingSeverity::Warning),
+            kinds: vec!["test".into()],
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
+        assert_eq!(
+            kept.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>(),
+            vec!["r-kept"]
+        );
+        assert_eq!(drops.below_confidence, 1);
+        assert_eq!(drops.below_severity, 1);
+        assert_eq!(drops.out_of_category, 1);
+        assert_eq!(drops.over_cap, 0);
+        assert_eq!(drops.identity_suppressed, 0);
+    }
+
+    #[test]
+    fn suppressed_findings_never_count_as_any_other_drop() {
+        // The suppressed finding is also below every filter floor — the
+        // first rejecting stage is suppression, so it must be counted
+        // there and only there.
+        let findings = vec![
+            pipelined(FindingSeverity::Note, 0.1, "other", "r-sup"),
+            pipelined(FindingSeverity::Blocking, 0.9, "test", "r-kept"),
+        ];
+        let suppressed: HashSet<String> = ["id-r-sup"].into_iter().map(str::to_string).collect();
+        let options = ReviewOptions {
+            min_confidence: Some(0.5),
+            min_severity: Some(FindingSeverity::Warning),
+            kinds: vec!["test".into()],
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &suppressed, &options);
+        assert_eq!(
+            kept.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>(),
+            vec!["r-kept"]
+        );
+        assert_eq!(drops.identity_suppressed, 1);
+        assert_eq!(drops.below_confidence, 0);
+        assert_eq!(drops.below_severity, 0);
+        assert_eq!(drops.out_of_category, 0);
+    }
+
+    #[test]
+    fn kept_plus_every_drop_reason_equals_produced() {
+        let findings = vec![
+            pipelined(FindingSeverity::Note, 0.2, "other", "r-a"),
+            pipelined(FindingSeverity::Warning, 0.5, "test", "r-b"),
+            pipelined(FindingSeverity::Blocking, 0.95, "test", "r-c"),
+            pipelined(FindingSeverity::Warning, 0.9, "test", "r-d"),
+            pipelined(FindingSeverity::Warning, 0.4, "test", "r-e"),
+        ];
+        let suppressed: HashSet<String> = ["id-r-c"].into_iter().map(str::to_string).collect();
+        let options = ReviewOptions {
+            min_confidence: Some(0.45),
+            min_severity: Some(FindingSeverity::Warning),
+            kinds: vec!["test".into()],
+            max_findings: Some(1),
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &suppressed, &options);
+        let total = kept.len()
+            + drops.identity_suppressed
+            + drops.below_confidence
+            + drops.below_severity
+            + drops.out_of_category
+            + drops.over_cap;
+        assert_eq!(total, 5, "every finding is kept or dropped exactly once");
+    }
+
+    #[test]
+    fn all_filters_off_keeps_everything_with_zero_drops() {
+        let findings = vec![
+            pipelined(FindingSeverity::Note, 0.1, "other", "r-a"),
+            pipelined(FindingSeverity::Blocking, 0.9, "test", "r-b"),
+        ];
+        let expected: Vec<String> = vec!["r-b".into(), "r-a".into()];
+        let (kept, drops) =
+            rank_filter_cap(findings.clone(), &HashSet::new(), &ReviewOptions::default());
+        assert_eq!(
+            kept.iter().map(|f| f.rule.clone()).collect::<Vec<_>>(),
+            expected,
+            "defaults are today's behavior: rank only"
+        );
+        assert_eq!(drops, DropCounts::default());
+    }
+
+    #[test]
+    fn confidence_floor_is_inclusive() {
+        let findings = vec![pipelined(FindingSeverity::Warning, 0.5, "test", "r-at")];
+        let options = ReviewOptions {
+            min_confidence: Some(0.5),
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
+        assert_eq!(kept.len(), 1, "a finding AT the floor survives");
+        assert_eq!(drops.below_confidence, 0);
+    }
+
+    #[test]
+    fn severity_floor_keeps_the_named_tier_and_above() {
+        let findings = vec![
+            pipelined(FindingSeverity::Blocking, 0.9, "test", "r-block"),
+            pipelined(FindingSeverity::Warning, 0.9, "test", "r-warn"),
+            pipelined(FindingSeverity::Note, 0.9, "test", "r-note"),
+        ];
+        let options = ReviewOptions {
+            min_severity: Some(FindingSeverity::Warning),
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
+        assert_eq!(
+            kept.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>(),
+            vec!["r-block", "r-warn"]
+        );
+        assert_eq!(drops.below_severity, 1);
     }
 
     // -- resolve_anchor table tests ---------------------------------------------
@@ -1819,6 +2072,15 @@ mod tests {
             after.findings
         );
         assert_eq!(after.verdict, ReviewVerdict::Approve);
+        assert_eq!(
+            after.drops,
+            DropCounts {
+                identity_suppressed: 1,
+                ..DropCounts::default()
+            },
+            "the drop is attributed to suppression alone — never also over_cap"
+        );
+        assert_eq!(before.drops, DropCounts::default());
     }
 
     #[test]

@@ -5251,6 +5251,7 @@ mod tests {
             scope: crate::types::ChangeScope::Unstaged,
             findings: vec![],
             verdict: crate::types::ReviewVerdict::Review,
+            drops: crate::review::DropCounts::default(),
             warnings: vec!["cross-repo impact skipped: no cross-repo inputs".into()],
         };
         let out = ReviewOutput::from(&result);
