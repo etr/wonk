@@ -85,6 +85,33 @@ pub fn resolve_anchor(
     (Some(cur_line), AnchorMethod::PostChangeFile)
 }
 
+/// The text of the line the anchor resolved against (REQ-013's identity
+/// input).
+///
+/// The side follows the tier: tiers 1/3 read the POST-change working-tree
+/// file (`current_lines`, the same side `resolve_anchor` resolved the line
+/// on); [`AnchorMethod::OldSideLine`] reads the PRE-change side — the
+/// removed `-` lines the impact diff already carries. Unresolved anchors
+/// have no text.
+pub fn anchored_line_text(
+    anchor_method: AnchorMethod,
+    line: Option<usize>,
+    hunks: Option<&FileDiffHunks>,
+    current_lines: Option<&[String]>,
+) -> Option<String> {
+    match anchor_method {
+        AnchorMethod::Unresolved => None,
+        AnchorMethod::OldSideLine => {
+            line.and_then(|n| hunks.and_then(|h| h.removed_lines.get(&n)).cloned())
+        }
+        AnchorMethod::NewSideHunk | AnchorMethod::PostChangeFile => line.and_then(|n| {
+            current_lines
+                .and_then(|lines| lines.get(n.checked_sub(1)?))
+                .cloned()
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Verdict (PRD-REV-REQ-005)
 // ---------------------------------------------------------------------------
@@ -234,6 +261,21 @@ pub fn finding_identity(
         .collect()
 }
 
+/// Stamp a rule-constructed finding with its identity — the ONE place
+/// identities are minted for engine output. Rules push `identity:
+/// String::new()`; the anchor text side is a run-review concern the rules
+/// never see.
+fn stamp_identity(mut finding: Finding, cs: &ChangedSymbol, anchor_text: Option<&str>) -> Finding {
+    finding.identity = finding_identity(
+        &finding.rule,
+        &finding.kind,
+        &finding.file,
+        &cs.name,
+        anchor_text,
+    );
+    finding
+}
+
 // ---------------------------------------------------------------------------
 // Rule family A — breaking change (PRD-REV-REQ-006)
 // ---------------------------------------------------------------------------
@@ -310,7 +352,7 @@ fn rule_breaking_change(
         kind: "breaking-change".into(),
         rule: rule.into(),
         message,
-        identity: finding_identity(rule, "breaking-change", &cs.file, &cs.name, None),
+        identity: String::new(),
         related: surviving
             .iter()
             .map(|s| SymbolRef {
@@ -375,7 +417,7 @@ fn rule_coverage_gap(
         kind: "coverage-gap".into(),
         rule: rule.into(),
         message,
-        identity: finding_identity(rule, "coverage-gap", &cs.file, &cs.name, None),
+        identity: String::new(),
         related: context
             .tiers
             .iter()
@@ -486,7 +528,7 @@ fn rule_cross_repo(
         kind: "cross-repo".into(),
         rule: rule.into(),
         message,
-        identity: finding_identity(rule, "cross-repo", &cs.file, &cs.name, None),
+        identity: String::new(),
         related,
     })
 }
@@ -547,6 +589,8 @@ pub fn run_review(
 
     // Per-file cache of current-file symbols for tier-3 re-resolution.
     let mut current_cache: HashMap<String, Option<Vec<Symbol>>> = HashMap::new();
+    // Per-file cache of current-file LINES — the tier 1/3 anchor-text side.
+    let mut current_lines_cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
 
     // Outer = attempted (None until the first rule-C candidate with
     // provider contracts); inner = the resolution, None when it failed.
@@ -611,13 +655,30 @@ pub fn run_review(
             current_cache.insert(cs.file.clone(), parsed);
         }
         let current_symbols = current_cache.get(&cs.file).and_then(|opt| opt.as_deref());
+        if !current_lines_cache.contains_key(&cs.file) {
+            let lines = std::fs::read_to_string(repo_root.join(&cs.file))
+                .ok()
+                .map(|s| s.lines().map(str::to_string).collect::<Vec<_>>());
+            current_lines_cache.insert(cs.file.clone(), lines);
+        }
+        let current_lines = current_lines_cache
+            .get(&cs.file)
+            .and_then(|opt| opt.as_deref());
         let (line, anchor_method) = resolve_anchor(cs, detail.hunks.get(&cs.file), current_symbols);
+        // Anchor text is resolved once per symbol: the side the anchor
+        // resolved against, feeding the identity stamped at the push seam.
+        let anchor_text = anchored_line_text(
+            anchor_method,
+            line,
+            detail.hunks.get(&cs.file),
+            current_lines,
+        );
 
         if rule_a_candidate
             && let Some(ref context) = context
             && let Some(finding) = rule_breaking_change(cs, context, &removed, line, anchor_method)
         {
-            findings.push(finding);
+            findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
         }
 
         if rule_b_candidate && let Some(ref context) = context {
@@ -636,7 +697,7 @@ pub fn run_review(
                     if let Some(finding) =
                         rule_coverage_gap(cs, &with_tests, context, line, anchor_method)
                     {
-                        findings.push(finding);
+                        findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
                     }
                 }
                 Err(e) => warnings.push(format!(
@@ -667,7 +728,7 @@ pub fn run_review(
                             && let Some(finding) =
                                 rule_cross_repo(cs, &ids, resolution, line, anchor_method)
                         {
-                            findings.push(finding);
+                            findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
                         }
                     }
                     Err(e) => warnings.push(format!(
@@ -864,6 +925,7 @@ mod tests {
         FileDiffHunks {
             new_ranges: new,
             removed_ranges: removed,
+            removed_lines: HashMap::new(),
         }
     }
 
@@ -1008,6 +1070,81 @@ mod tests {
 
     // -- Display strings ---------------------------------------------------------
 
+    // -- anchored-line text (TASK-089, PRD-REV-REQ-013) -------------------------
+
+    fn removed_hunks(lines: &[(usize, &str)]) -> FileDiffHunks {
+        FileDiffHunks {
+            removed_lines: lines.iter().map(|&(n, t)| (n, t.to_string())).collect(),
+            ..hunks(vec![], vec![])
+        }
+    }
+
+    #[test]
+    fn anchored_line_text_new_side_reads_post_change_file() {
+        let h = hunks(vec![(2, 2)], vec![]);
+        let lines = vec!["one".to_string(), "pub fn f(x: i32) {".to_string()];
+        assert_eq!(
+            anchored_line_text(AnchorMethod::NewSideHunk, Some(2), Some(&h), Some(&lines)),
+            Some("pub fn f(x: i32) {".to_string())
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_post_change_reads_post_change_file() {
+        let lines = vec!["one".to_string(), "two".to_string(), "fn g() {".to_string()];
+        assert_eq!(
+            anchored_line_text(AnchorMethod::PostChangeFile, Some(3), None, Some(&lines)),
+            Some("fn g() {".to_string())
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_old_side_reads_removed_lines_from_diff() {
+        // Tier-2 anchors read the pre-change side: the removed `-` lines the
+        // impact diff already carries, never the post-change file (whatever
+        // now occupies that line is unrelated code).
+        let h = removed_hunks(&[(1, "pub fn used() {}")]);
+        let lines = vec!["pub fn caller() { used(); }".to_string()];
+        assert_eq!(
+            anchored_line_text(AnchorMethod::OldSideLine, Some(1), Some(&h), Some(&lines)),
+            Some("pub fn used() {}".to_string())
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_old_side_without_text_is_none() {
+        assert_eq!(
+            anchored_line_text(AnchorMethod::OldSideLine, Some(1), None, None),
+            None,
+            "no hunks, no old-side text"
+        );
+        let h = removed_hunks(&[(4, "x")]);
+        assert_eq!(
+            anchored_line_text(AnchorMethod::OldSideLine, Some(7), Some(&h), None),
+            None,
+            "line not among the removed lines"
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_unresolved_is_none() {
+        assert_eq!(
+            anchored_line_text(AnchorMethod::Unresolved, None, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_out_of_range_post_change_is_none() {
+        // The file shrank below the anchored line: honest None over a panic
+        // or a wrong line's text.
+        let lines = vec!["one".to_string()];
+        assert_eq!(
+            anchored_line_text(AnchorMethod::PostChangeFile, Some(9), None, Some(&lines)),
+            None
+        );
+    }
+
     #[test]
     fn display_strings_are_stable() {
         assert_eq!(ReviewVerdict::Block.to_string(), "BLOCK");
@@ -1034,6 +1171,16 @@ mod tests {
             .arg("--version")
             .output()
             .is_ok_and(|o| o.status.success())
+    }
+
+    /// Every stamped identity is 64 lowercase hex characters.
+    fn assert_stable_identity(f: &Finding) {
+        assert_eq!(f.identity.len(), 64, "identity must be sha256 hex: {:?}", f);
+        assert!(
+            f.identity.bytes().all(|b| b.is_ascii_hexdigit()),
+            "identity must be hex: {}",
+            f.identity
+        );
     }
 
     /// Real git repo (diff scopes need commits) with an index reflecting the
@@ -1123,6 +1270,7 @@ mod tests {
             f.message,
             "removed function `used` still has 1 indexed caller(s): caller"
         );
+        assert_stable_identity(f);
     }
 
     #[test]
@@ -1591,6 +1739,9 @@ mod tests {
             .expect("breaking-change finding must still be emitted");
         assert_eq!(finding.anchor_method, AnchorMethod::Unresolved);
         assert_eq!(finding.line, None);
+        // Identity is stamped even when the anchor did not resolve — the
+        // suppression key space covers unanchored findings too.
+        assert_stable_identity(finding);
     }
 
     #[test]

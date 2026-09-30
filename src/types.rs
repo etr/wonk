@@ -850,6 +850,10 @@ pub struct FileDiffHunks {
     /// Removed-line ranges on the old (pre-change) side, `(start, end)`
     /// inclusive, 1-based.
     pub removed_ranges: Vec<(usize, usize)>,
+    /// Text of the removed lines keyed by old-side line number, `-` prefix
+    /// stripped — the anchor text for findings about removed code
+    /// (TASK-089, PRD-REV-REQ-013).
+    pub removed_lines: HashMap<usize, String>,
 }
 
 /// Scoped change analysis plus the diff detail review needs: old-side hunk
