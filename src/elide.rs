@@ -440,6 +440,10 @@ def b(): return 42
         let ts = "\
 // module docs
 const double = (n: number): number => n * 2;
+const pick = (n: number): number =>
+  n > 0
+    ? n * 2
+    : 0 - n;
 const run = (n: number): number => {
   const m = n + 1;
   return m * 2;
@@ -449,6 +453,10 @@ const run = (n: number): number => {
         let expected = "\
 // module docs
 const double = (n: number): number => n * 2;
+const pick = (n: number): number =>
+  n > 0
+    ? n * 2
+    : 0 - n;
 const run = (n: number): number => { /* 4 lines elided */ };
 ";
         assert_eq!(out, expected);
