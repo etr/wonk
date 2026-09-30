@@ -47,7 +47,7 @@
 | M27 | Lexical BM25 Scoring | 2 | Complete |
 | M28 | Precomputed Reach Index | 2 | Complete |
 | M29 | Cross-Repo Contract Detection | 5 | Complete |
-| M30 | Diff-Scoped Review Workflow | 3 | Not Started |
+| M30 | Diff-Scoped Review Workflow | 3 | In Progress |
 | M31 | Body Elision | 2 | Not Started |
 | M32 | Signal-Based Reranking | 4 | Not Started |
 | M33 | History-Derived Signals | 2 | Not Started |
@@ -3712,7 +3712,7 @@ Create `review.rs` as pure composition over existing primitives, producing line-
 **Related Requirements:** PRD-REV-REQ-001, PRD-REV-REQ-002, PRD-REV-REQ-003, PRD-REV-REQ-004, PRD-REV-REQ-005, PRD-REV-REQ-006, PRD-REV-REQ-007, PRD-REV-REQ-008
 **Related Decisions:** DR-035, DR-034
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
