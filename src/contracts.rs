@@ -10873,4 +10873,64 @@ paths:
             .unwrap();
         assert_eq!(document.symbol, None, "document contracts have no symbol");
     }
+
+    /// TASK-083 acceptance: a built single-repo index answers the `wonk
+    /// contracts` queries end to end — routes with role/file/line/confidence
+    /// (AC1), within-repo orphans with no sibling repos indexed and no error
+    /// (AC3), NDJSON rows that parse without post-processing (AC4).
+    #[test]
+    fn contracts_end_to_end_single_repo() {
+        use crate::output::{ContractOutput, Formatter, OutputFormat};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            "const app = express();\n\nfunction setupRoutes() {\n  app.get('/v1/users/:id', getUser);\n  app.post('/orders', createOrder);\n}\n\nasync function load() {\n  const db = process.env.DATABASE_URL;\n  process.env.FEATURE_X = '1';\n}\n",
+        )
+        .unwrap();
+
+        crate::pipeline::build_index(root, true).unwrap();
+        let conn = crate::db::open_existing(&crate::db::local_index_path(root)).unwrap();
+
+        // AC1: kind=http lists this repo's routes with role, file, line,
+        // and confidence.
+        let routes = list_contracts(&conn, &query(Some(ContractKind::Http), None, false)).unwrap();
+        assert_eq!(routes.len(), 2, "got {routes:?}");
+        for r in &routes {
+            assert_eq!(r.role, ContractRole::Provider);
+            assert_eq!(r.file, "src/app.js");
+            assert_eq!(r.confidence, 1.0);
+            assert_eq!(r.symbol.as_deref(), Some("setupRoutes"));
+        }
+
+        // AC3: no sibling repos indexed — the query still succeeds and
+        // answers within-repo orphans (DATABASE_URL read has no writer;
+        // FEATURE_X is written, so a provider, and routes are providers).
+        let orphans = list_contracts(&conn, &query(None, None, true)).unwrap();
+        assert_eq!(
+            orphans
+                .iter()
+                .map(|r| r.canonical_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["env::::DATABASE_URL"]
+        );
+
+        // AC4: NDJSON rows parse straight off the formatter.
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, OutputFormat::Json, false);
+            for row in &orphans {
+                fmt.format_contract(&ContractOutput::from(row)).unwrap();
+            }
+        }
+        let text = String::from_utf8(buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(v["canonical_id"], "env::::DATABASE_URL");
+        assert_eq!(v["kind"], "env");
+        assert_eq!(v["role"], "consumer");
+        assert_eq!(v["symbol"], "load", "the read sits inside load()");
+    }
 }

@@ -105,6 +105,9 @@ pub enum Command {
 
     /// Aggregate full context for a symbol: definition, callers, callees, importers, flows, children
     Context(ContextArgs),
+
+    /// List service contracts detected in this repository (routes, env vars, topics)
+    Contracts(ContractsArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -485,9 +488,24 @@ pub struct ContextArgs {
     #[arg(long)]
     pub kind: Option<String>,
 
-    /// Minimum confidence threshold (0.0-1.0) to filter edges
+    /// Minimum confidence threshold (0.0-1.0) for blast/flow edges
     #[arg(long)]
     pub min_confidence: Option<f64>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ContractsArgs {
+    /// Filter by contract kind (http, env, queue, websocket, job, grpc, graphql, openapi)
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Filter by role (provider or consumer)
+    #[arg(long)]
+    pub role: Option<String>,
+
+    /// Only list consumers with no provider in this repository
+    #[arg(long)]
+    pub orphans: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -518,6 +536,41 @@ pub fn parse() -> Cli {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn parse_contracts_filters() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "contracts",
+            "--kind",
+            "http",
+            "--role",
+            "provider",
+            "--orphans",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Contracts(args) => {
+                assert_eq!(args.kind.as_deref(), Some("http"));
+                assert_eq!(args.role.as_deref(), Some("provider"));
+                assert!(args.orphans);
+            }
+            _ => panic!("expected Command::Contracts"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_defaults_to_no_filters() {
+        let cli = Cli::try_parse_from(["wonk", "contracts"]).unwrap();
+        match cli.command {
+            Command::Contracts(args) => {
+                assert_eq!(args.kind, None);
+                assert_eq!(args.role, None);
+                assert!(!args.orphans);
+            }
+            _ => panic!("expected Command::Contracts"),
+        }
+    }
 
     #[test]
     fn parse_ask_basic_query() {

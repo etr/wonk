@@ -805,6 +805,44 @@ pub enum BudgetStatus {
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
+/// One stored contract row for `wonk contracts` output (TASK-083).
+///
+/// Field order is the NDJSON contract: kind, role, canonical_id, file,
+/// line, confidence, symbol — `symbol` is omitted entirely when the stored
+/// row has none (documents, top-level sites).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractOutput {
+    /// Contract kind (`http`, `env`, …).
+    pub kind: String,
+    /// `provider` or `consumer`.
+    pub role: String,
+    /// `<kind>::<qualifier>::<identifier>` canonical ID.
+    pub canonical_id: String,
+    /// Path relative to repo root.
+    pub file: String,
+    /// 1-based line of the detection site.
+    pub line: usize,
+    /// 1.0 framework-recognized / 0.5 heuristic (AR-018).
+    pub confidence: f64,
+    /// Owning symbol name, absent for file-level contracts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+}
+
+impl From<&crate::contracts::ContractRow> for ContractOutput {
+    fn from(row: &crate::contracts::ContractRow) -> Self {
+        Self {
+            kind: row.kind.as_str().to_string(),
+            role: row.role.as_str().to_string(),
+            canonical_id: row.canonical_id.clone(),
+            file: row.file.clone(),
+            line: row.line,
+            confidence: row.confidence,
+            symbol: row.symbol.clone(),
+        }
+    }
+}
+
 impl SearchOutput {
     /// Build a `SearchOutput` from the internal `search::SearchResult`.
     pub fn from_search_result(file: &Path, line: u64, col: u64, content: &str) -> Self {
@@ -1423,6 +1461,37 @@ impl<W: Write> Formatter<W> {
             fmt.write_line_no(out.line)?;
             fmt.write_sep()?;
             writeln!(fmt.writer, "  {}", out.signature)
+        }
+    }
+
+    /// Format a single contract row (`wonk contracts`).
+    pub fn format_contract(&mut self, out: &ContractOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_contract(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_contract(fmt, &out))
+    }
+
+    /// Shared render logic for a contract row.
+    fn render_contract<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &ContractOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            fmt.write_file(&out.file)?;
+            fmt.write_sep()?;
+            fmt.write_line_no(out.line)?;
+            fmt.write_sep()?;
+            write!(fmt.writer, "{} role={}", out.canonical_id, out.role)?;
+            if let Some(ref symbol) = out.symbol {
+                write!(fmt.writer, " symbol={symbol}")?;
+            }
+            writeln!(fmt.writer, " confidence={:.1}", out.confidence)
         }
     }
 
@@ -4487,5 +4556,91 @@ mod tests {
             text.contains("---"),
             "multiple symbols should be separated by ---"
         );
+    }
+
+    // -- ContractOutput (TASK-083) -------------------------------------------
+
+    #[test]
+    fn format_contract_grep_line() {
+        let out = ContractOutput {
+            kind: "http".into(),
+            role: "provider".into(),
+            canonical_id: "http::GET::/v1/users/{p1}".into(),
+            file: "src/routes.js".into(),
+            line: 4,
+            confidence: 1.0,
+            symbol: Some("setupRoutes".into()),
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_contract(&out));
+        assert_eq!(
+            text,
+            "src/routes.js:4:http::GET::/v1/users/{p1} role=provider symbol=setupRoutes confidence=1.0\n"
+        );
+    }
+
+    #[test]
+    fn format_contract_grep_omits_symbol_and_formats_half_confidence() {
+        let out = ContractOutput {
+            kind: "env".into(),
+            role: "consumer".into(),
+            canonical_id: "env::::DATABASE_URL".into(),
+            file: "src/app.js".into(),
+            line: 9,
+            confidence: 0.5,
+            symbol: None,
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_contract(&out));
+        assert_eq!(
+            text,
+            "src/app.js:9:env::::DATABASE_URL role=consumer confidence=0.5\n"
+        );
+    }
+
+    #[test]
+    fn format_contract_ndjson_rows() {
+        let rows = vec![
+            ContractOutput {
+                kind: "http".into(),
+                role: "provider".into(),
+                canonical_id: "http::GET::/v1/users/{p1}".into(),
+                file: "src/routes.js".into(),
+                line: 4,
+                confidence: 1.0,
+                symbol: Some("setupRoutes".into()),
+            },
+            ContractOutput {
+                kind: "env".into(),
+                role: "consumer".into(),
+                canonical_id: "env::::DATABASE_URL".into(),
+                file: "src/app.js".into(),
+                line: 9,
+                confidence: 0.5,
+                symbol: None,
+            },
+        ];
+        let text = render(OutputFormat::Json, |fmt| {
+            for r in &rows {
+                fmt.format_contract(r)?;
+            }
+            Ok(())
+        });
+        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+        assert_eq!(lines.len(), 2, "one NDJSON line per row");
+
+        // Exact field set and order (serde emits declaration order).
+        assert_eq!(
+            lines[0],
+            "{\"kind\":\"http\",\"role\":\"provider\",\"canonical_id\":\"http::GET::/v1/users/{p1}\",\"file\":\"src/routes.js\",\"line\":4,\"confidence\":1.0,\"symbol\":\"setupRoutes\"}"
+        );
+        assert_eq!(
+            lines[1],
+            "{\"kind\":\"env\",\"role\":\"consumer\",\"canonical_id\":\"env::::DATABASE_URL\",\"file\":\"src/app.js\",\"line\":9,\"confidence\":0.5}"
+        );
+
+        // Each line is independently consumable without post-processing.
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(v["canonical_id"].is_string());
+        }
     }
 }

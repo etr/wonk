@@ -1845,6 +1845,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Context(args) => {
             dispatch_context(args, &mut fmt, suppress, include_tests)?;
         }
+        Command::Contracts(args) => {
+            dispatch_contracts(args, &mut fmt, suppress)?;
+        }
     }
 
     // In single-line (piped) mode, emit a final newline so the output is
@@ -1961,6 +1964,63 @@ fn dispatch_context<W: io::Write>(
         .collect();
     fmt.format_context(&outputs)?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `wonk contracts` dispatch (TASK-083)
+// ---------------------------------------------------------------------------
+
+fn dispatch_contracts<W: io::Write>(
+    args: crate::cli::ContractsArgs,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+) -> Result<()> {
+    // 1. Resolve repo root and open connection (callgraph_conn-style errors).
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
+
+    let conn = db::find_existing_index(&repo_root)
+        .and_then(|path| db::open(&path).ok())
+        .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
+
+    // 2. Parse raw filter strings into enums (BlastDirection precedent).
+    let kind = match &args.kind {
+        Some(k) => Some(
+            k.parse::<crate::types::ContractKind>()
+                .map_err(crate::errors::WonkError::Usage)?,
+        ),
+        None => None,
+    };
+    let role = match &args.role {
+        Some(r) => Some(
+            r.parse::<crate::types::ContractRole>()
+                .map_err(crate::errors::WonkError::Usage)?,
+        ),
+        None => None,
+    };
+
+    // 3. Query and stream one row per line (NDJSON in structured mode).
+    let query = crate::contracts::ContractQuery {
+        kind,
+        role,
+        orphans: args.orphans,
+    };
+    let rows = crate::contracts::list_contracts(&conn, &query)?;
+
+    if rows.is_empty() {
+        output::print_hint(
+            "no contracts found; if this index predates contract storage, run `wonk update` to re-index",
+            suppress,
+        );
+        return Ok(());
+    }
+
+    for row in &rows {
+        fmt.format_contract(&output::ContractOutput::from(row))?;
+    }
     Ok(())
 }
 
@@ -2358,6 +2418,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Blast(_)
             | Command::Changes(_)
             | Command::Context(_)
+            | Command::Contracts(_)
     )
 }
 
@@ -5244,6 +5305,16 @@ mod tests {
     #[test]
     fn test_is_query_command_not_status() {
         assert!(!is_query_command(&Command::Status));
+    }
+
+    #[test]
+    fn test_is_query_command_contracts() {
+        use crate::cli::ContractsArgs;
+        assert!(is_query_command(&Command::Contracts(ContractsArgs {
+            kind: None,
+            role: None,
+            orphans: false,
+        })));
     }
 
     #[test]
