@@ -12052,6 +12052,76 @@ paths:
         );
     }
 
+    /// ~40-contract fixture: 20 routes + 20 outbound calls. `prov` and
+    /// `cons` steer which repo's routes the calls target.
+    fn bulk_contract_source(prov: usize, cons: usize) -> String {
+        let mut src = String::from("const app = express();\nfunction routes() {\n");
+        for i in 0..20 {
+            src.push_str(&format!("  app.get('/v{prov}/p{i}', h);\n"));
+        }
+        src.push_str("}\nasync function callers() {\n");
+        for i in 0..20 {
+            src.push_str(&format!("  await fetch('https://api.io/v{cons}/p{i}');\n"));
+        }
+        src.push_str("}\n");
+        src
+    }
+
+    #[test]
+    fn link_resolution_typical_set_under_100ms() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "own-api",
+            &["payments"],
+            &[("src/app.js", &bulk_contract_source(98, 0))],
+        );
+        // Keep every sibling TempDir alive through the scan below: a repo
+        // deleted mid-test loses its registry entry (meta.json guards fail).
+        let mut keepalive = Vec::new();
+        for i in 0..10 {
+            keepalive.push(registry_repo_files(
+                repos_dir.path(),
+                &format!("sibling-{i}"),
+                &["payments"],
+                &[("src/app.js", &bulk_contract_source(i, 90 + i))],
+            ));
+        }
+
+        let rows = list_contracts(&own_conn, &ContractQuery::default()).unwrap();
+        assert!(
+            rows.len() >= 40,
+            "fixture must hold a typical set: {}",
+            rows.len()
+        );
+
+        // Library boundary only — process startup excluded (AC 13). A
+        // cold first run can be inflated by parallel test load, so the
+        // measured number is the best of two full resolutions.
+        let measure = || {
+            let start = std::time::Instant::now();
+            let resolution = resolve_workspace(
+                &own_root,
+                &rows,
+                &["payments".to_string()],
+                repos_dir.path(),
+            )
+            .unwrap();
+            (start.elapsed(), resolution.links.len())
+        };
+        let (first, links) = measure();
+        let (elapsed, links) = if first.as_millis() < 100 {
+            (first, links)
+        } else {
+            measure()
+        };
+        assert!(
+            elapsed.as_millis() < 100,
+            "resolution over 11 repos took {first:?}/{elapsed:?} (AC: <100ms)"
+        );
+        assert!(links > 0);
+    }
+
     #[test]
     fn unused_providers_computed() {
         let repos_dir = tempfile::tempdir().unwrap();
