@@ -225,4 +225,36 @@ fn beta(x: u32) -> u32 { /* 4 lines elided */ }
 ";
         assert_eq!(out, expected);
     }
+
+    #[test]
+    fn python_bodies_replaced_with_indented_comment_stub() {
+        let src = "\
+# module docs
+import os
+import sys
+
+def alpha(flag):
+    a = os.getcwd()
+    b = len(sys.argv)
+    return a if flag else b
+
+def beta(x):
+    return x + 1
+";
+        let mut parser = get_parser(Lang::Python);
+        let tree = parser.parse(src, None).unwrap();
+        let out = elide_tree(&tree, src, Lang::Python, Mode::Bodies).unwrap();
+        let expected = "\
+# module docs
+import os
+import sys
+
+def alpha(flag):
+    # 3 lines elided
+
+def beta(x):
+    return x + 1
+";
+        assert_eq!(out, expected);
+    }
 }
