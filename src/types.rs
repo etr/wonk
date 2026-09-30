@@ -1,5 +1,6 @@
 //! Shared types and data structures.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -833,6 +834,41 @@ pub struct ChangeAnalysis {
     pub scope: ChangeScope,
     /// All changed symbols found across the scoped files.
     pub changed_symbols: Vec<ChangedSymbol>,
+}
+
+/// Per-file changed-line ranges from a `git diff --unified=0`, carrying both
+/// sides of every hunk (TASK-085, PRD-REV-REQ-012).
+///
+/// With `--unified=0` a hunk contains no context lines, so the old-side
+/// range of each hunk is exactly its removed lines and the new-side range
+/// exactly its added lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileDiffHunks {
+    /// Added-line ranges on the new (post-change) side, `(start, end)`
+    /// inclusive, 1-based.
+    pub new_ranges: Vec<(usize, usize)>,
+    /// Removed-line ranges on the old (pre-change) side, `(start, end)`
+    /// inclusive, 1-based.
+    pub removed_ranges: Vec<(usize, usize)>,
+}
+
+/// Scoped change analysis plus the diff detail review needs: old-side hunk
+/// ranges (so findings about removed code can be anchored to where the code
+/// was) and the set of symbols whose signatures — not just bodies — changed
+/// (TASK-085).
+///
+/// Produced by the same single git subprocess as [`ChangeAnalysis`];
+/// `analysis` is byte-identical to what `detect_changes` returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeAnalysisDetail {
+    /// The standard change analysis (unchanged wire shape).
+    pub analysis: ChangeAnalysis,
+    /// Per-file diff hunks keyed by file path (b-side), carrying both sides.
+    pub hunks: HashMap<String, FileDiffHunks>,
+    /// `(name, kind)` pairs of symbols classified `Modified` because their
+    /// signature changed (tree-sitter path), as opposed to body-only
+    /// hunk-overlap modifications.
+    pub signature_changed: HashSet<(String, SymbolKind)>,
 }
 
 // ---------------------------------------------------------------------------
