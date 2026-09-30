@@ -694,6 +694,10 @@ pub enum BlastSeverity {
     LikelyAffected,
     /// Depth 3+: symbols further out that may need testing.
     MayNeedTesting,
+    /// Consumers in other indexed repos of provider contracts the target
+    /// owns (TASK-084). Appended below all depth tiers — reachability is
+    /// by contract ownership, not call-graph distance.
+    CrossRepo,
 }
 
 impl fmt::Display for BlastSeverity {
@@ -702,6 +706,7 @@ impl fmt::Display for BlastSeverity {
             BlastSeverity::WillBreak => "WILL BREAK",
             BlastSeverity::LikelyAffected => "LIKELY AFFECTED",
             BlastSeverity::MayNeedTesting => "MAY NEED TESTING",
+            BlastSeverity::CrossRepo => "CROSS-REPO IMPACT",
         };
         write!(f, "{s}")
     }

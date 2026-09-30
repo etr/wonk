@@ -160,7 +160,12 @@ pub fn build_index_with_progress(
         v.sort();
         v
     };
-    db::write_meta(&index_path, repo_root, &languages)?;
+    db::write_meta(
+        &index_path,
+        repo_root,
+        &languages,
+        &config.contracts.workspace,
+    )?;
 
     Ok(IndexStats {
         file_count: results.len(),
@@ -256,7 +261,12 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
         .filter_map(|r| r.ok())
         .collect();
     languages.sort();
-    db::write_meta(&index_path, repo_root, &languages)?;
+    db::write_meta(
+        &index_path,
+        repo_root,
+        &languages,
+        &config.contracts.workspace,
+    )?;
 
     // Gather final stats from DB.
     let file_count = conn
@@ -1793,6 +1803,32 @@ class Component {
         let stats = build_index(dir.path(), true).unwrap();
         // 2 HTTP providers + 1 env consumer; util.txt contributes nothing.
         assert_eq!(stats.contract_count, 3, "got {stats:?}");
+    }
+
+    #[test]
+    fn build_index_writes_declared_workspaces_to_meta() {
+        let dir = make_contract_repo();
+        write_reach_config(
+            dir.path(),
+            "[contracts]\nworkspace = [\"payments\", \"platform\"]\n",
+        );
+        build_index(dir.path(), true).unwrap();
+
+        let meta = db::read_meta(&db::local_index_path(dir.path())).unwrap();
+        assert_eq!(
+            meta.workspaces,
+            vec!["payments".to_string(), "platform".to_string()],
+            "declared workspaces are published to the registry via meta.json (REQ-020)"
+        );
+    }
+
+    #[test]
+    fn build_index_no_config_writes_empty_workspaces() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+
+        let meta = db::read_meta(&db::local_index_path(dir.path())).unwrap();
+        assert!(meta.workspaces.is_empty());
     }
 
     #[test]

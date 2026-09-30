@@ -827,6 +827,11 @@ pub struct ContractOutput {
     /// Owning symbol name, absent for file-level contracts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// Consumer workspace status (`linked`/`orphan`/`unscoped`), present
+    /// only on unmatched consumer rows (TASK-084); providers and matched
+    /// consumers stay byte-identical to TASK-083 output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 impl From<&crate::contracts::ContractRow> for ContractOutput {
@@ -839,6 +844,52 @@ impl From<&crate::contracts::ContractRow> for ContractOutput {
             line: row.line,
             confidence: row.confidence,
             symbol: row.symbol.clone(),
+            status: None,
+        }
+    }
+}
+
+/// One endpoint of a cross-repo link row (TASK-084).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkEndpointOutput {
+    /// Repo name of this side.
+    pub repo: String,
+    /// Canonical ID of the contract.
+    pub canonical_id: String,
+    /// Path relative to that repo's root.
+    pub file: String,
+    /// 1-based line of the site.
+    pub line: usize,
+    /// Owning symbol name, when stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+}
+
+/// One resolved cross-repo provider↔consumer pair (`wonk contracts
+/// --links`, TASK-084).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkOutput {
+    /// Why the pair matched (`exact` or the RPC-relaxed basis).
+    pub basis: String,
+    /// The serving side.
+    pub provider: LinkEndpointOutput,
+    /// The calling side.
+    pub consumer: LinkEndpointOutput,
+}
+
+impl From<&crate::contracts::CrossRepoLink> for LinkOutput {
+    fn from(link: &crate::contracts::CrossRepoLink) -> Self {
+        let endpoint = |e: &crate::contracts::LinkEndpoint| LinkEndpointOutput {
+            repo: e.repo.clone(),
+            canonical_id: e.canonical_id.clone(),
+            file: e.file.clone(),
+            line: e.line,
+            symbol: e.symbol.clone(),
+        };
+        Self {
+            basis: link.basis.to_string(),
+            provider: endpoint(&link.provider),
+            consumer: endpoint(&link.consumer),
         }
     }
 }
@@ -1499,7 +1550,46 @@ impl<W: Write> Formatter<W> {
             if let Some(ref symbol) = out.symbol {
                 write!(fmt.writer, " symbol={symbol}")?;
             }
-            writeln!(fmt.writer, " confidence={:.1}", out.confidence)
+            write!(fmt.writer, " confidence={:.1}", out.confidence)?;
+            if let Some(ref status) = out.status {
+                write!(fmt.writer, " status={status}")?;
+            }
+            writeln!(fmt.writer)
+        }
+    }
+
+    /// Format one cross-repo link row (`wonk contracts --links`).
+    pub fn format_contract_link(&mut self, out: &LinkOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_contract_link(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_contract_link(fmt, &out))
+    }
+
+    /// Shared render logic for a cross-repo link row.
+    fn render_contract_link<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &LinkOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            write!(
+                fmt.writer,
+                "{}:{}:{} {} role=provider <-> {}:{}:{} role=consumer basis={}",
+                out.provider.repo,
+                out.provider.file,
+                out.provider.line,
+                out.provider.canonical_id,
+                out.consumer.repo,
+                out.consumer.file,
+                out.consumer.line,
+                out.basis
+            )?;
+            writeln!(fmt.writer)
         }
     }
 
@@ -4642,6 +4732,7 @@ mod tests {
             line: 4,
             confidence: 1.0,
             symbol: Some("setupRoutes".into()),
+            status: None,
         };
         let text = render(OutputFormat::Grep, |fmt| fmt.format_contract(&out));
         assert_eq!(
@@ -4660,6 +4751,7 @@ mod tests {
             line: 9,
             confidence: 0.5,
             symbol: None,
+            status: None,
         };
         let text = render(OutputFormat::Grep, |fmt| fmt.format_contract(&out));
         assert_eq!(
@@ -4679,6 +4771,7 @@ mod tests {
                 line: 4,
                 confidence: 1.0,
                 symbol: Some("setupRoutes".into()),
+                status: None,
             },
             ContractOutput {
                 kind: "env".into(),
@@ -4688,6 +4781,7 @@ mod tests {
                 line: 9,
                 confidence: 0.5,
                 symbol: None,
+                status: None,
             },
         ];
         let text = render(OutputFormat::Json, |fmt| {
@@ -4714,5 +4808,105 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             assert!(v["canonical_id"].is_string());
         }
+    }
+
+    // -- contracts workspace output (TASK-084) ---------------------------------
+
+    #[test]
+    fn contract_row_with_status_grep_token() {
+        let out = ContractOutput {
+            kind: "env".into(),
+            role: "consumer".into(),
+            canonical_id: "env::::DATABASE_URL".into(),
+            file: "src/app.js".into(),
+            line: 9,
+            confidence: 1.0,
+            symbol: None,
+            status: Some("unscoped".into()),
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_contract(&out));
+        assert_eq!(
+            text,
+            "src/app.js:9:env::::DATABASE_URL role=consumer confidence=1.0 status=unscoped\n"
+        );
+
+        // None keeps the 083 shape byte-identical (providers never carry it).
+        let provider = ContractOutput {
+            kind: "http".into(),
+            role: "provider".into(),
+            canonical_id: "http::GET::/v1/users".into(),
+            file: "src/routes.js".into(),
+            line: 4,
+            confidence: 1.0,
+            symbol: None,
+            status: None,
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_contract(&provider));
+        assert_eq!(
+            text,
+            "src/routes.js:4:http::GET::/v1/users role=provider confidence=1.0\n"
+        );
+    }
+
+    #[test]
+    fn contract_row_status_serializes_only_when_present() {
+        let with_status = ContractOutput {
+            kind: "http".into(),
+            role: "consumer".into(),
+            canonical_id: "http::GET::/v1/users".into(),
+            file: "src/client.js".into(),
+            line: 2,
+            confidence: 1.0,
+            symbol: None,
+            status: Some("orphan".into()),
+        };
+        let text = render(OutputFormat::Json, |fmt| fmt.format_contract(&with_status));
+        assert_eq!(
+            text,
+            "{\"kind\":\"http\",\"role\":\"consumer\",\"canonical_id\":\"http::GET::/v1/users\",\"file\":\"src/client.js\",\"line\":2,\"confidence\":1.0,\"status\":\"orphan\"}\n"
+        );
+    }
+
+    fn link_fixture() -> LinkOutput {
+        LinkOutput {
+            basis: "exact".into(),
+            provider: LinkEndpointOutput {
+                repo: "users-svc".into(),
+                canonical_id: "http::GET::/v1/users".into(),
+                file: "src/app.js".into(),
+                line: 4,
+                symbol: Some("setupRoutes".into()),
+            },
+            consumer: LinkEndpointOutput {
+                repo: "own-api".into(),
+                canonical_id: "http::GET::/v1/users".into(),
+                file: "src/client.js".into(),
+                line: 2,
+                symbol: Some("loadUsers".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn contract_link_grep_line() {
+        let text = render(OutputFormat::Grep, |fmt| {
+            fmt.format_contract_link(&link_fixture())
+        });
+        assert_eq!(
+            text,
+            "users-svc:src/app.js:4 http::GET::/v1/users role=provider <-> own-api:src/client.js:2 role=consumer basis=exact\n"
+        );
+    }
+
+    #[test]
+    fn contract_link_ndjson_parses() {
+        let text = render(OutputFormat::Json, |fmt| {
+            fmt.format_contract_link(&link_fixture())
+        });
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(v["basis"], "exact");
+        assert_eq!(v["provider"]["repo"], "users-svc");
+        assert_eq!(v["consumer"]["repo"], "own-api");
+        assert_eq!(v["provider"]["canonical_id"], "http::GET::/v1/users");
     }
 }

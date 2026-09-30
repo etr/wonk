@@ -6,7 +6,6 @@
 //!
 //! Transport: NDJSON over stdin/stdout. No async runtime required.
 
-use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -1150,6 +1149,50 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
         ];
 
+        // Service contracts with workspace resolution (TASK-084). Defined
+        // before repo-injection so it inherits the optional `repo` param.
+        tools.push(Tool {
+            name: "wonk_contracts",
+            description: "List indexed service contracts (providers/consumers) for a repo,                 with workspace status on unmatched consumers, resolved cross-repo links,                 and orphans/unused-providers filters.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["http", "env", "queue", "websocket", "job", "grpc", "graphql", "openapi"],
+                        "description": "Filter by contract kind"
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ["provider", "consumer"],
+                        "description": "Filter by role"
+                    },
+                    "orphans": {
+                        "type": "boolean",
+                        "description": "Only consumers with no provider in the repo's workspace (default false)"
+                    },
+                    "links": {
+                        "type": "boolean",
+                        "description": "Return resolved cross-repo provider<->consumer pairs instead of rows (default false)"
+                    },
+                    "unused_providers": {
+                        "type": "boolean",
+                        "description": "Only providers with no consumer in the workspace (default false)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["json", "toon"],
+                        "description": "Output format (default json)",
+                        "default": "json"
+                    },
+                    "budget": {
+                        "type": "integer",
+                        "description": "Limit output to approximately N tokens, applied to contracts first and then links"
+                    }
+                }
+            }),
+        });
+
         // Inject optional `repo` parameter into all existing tools except wonk_init
         // and wonk_update (both always operate on the working directory repo).
         for tool in &mut tools {
@@ -1206,8 +1249,8 @@ struct RepoEntry {
 /// Registry of all discovered indexed repositories.
 struct RepoRegistry {
     entries: Vec<RepoEntry>,
-    /// Lazy-opened connections keyed by index_path string.
-    connections: HashMap<String, Connection>,
+    /// Lazy-opened connections keyed by index path (shared DR-030 cache).
+    connections: db::ConnectionCache,
 }
 
 /// Result of resolving a repo reference.
@@ -1221,7 +1264,7 @@ impl RepoRegistry {
     fn new(entries: Vec<RepoEntry>) -> Self {
         Self {
             entries,
-            connections: HashMap::new(),
+            connections: db::ConnectionCache::new(),
         }
     }
 
@@ -1268,57 +1311,33 @@ impl RepoRegistry {
 
     /// Get or lazily open a connection for the given index path.
     fn get_or_open_connection(&mut self, index_path: &Path) -> Result<&Connection, String> {
-        let key = index_path.to_string_lossy().into_owned();
-        if !self.connections.contains_key(&key) {
-            let conn = db::open_existing(index_path)
-                .map_err(|e| format!("failed to open index at {}: {e}", index_path.display()))?;
-            self.connections.insert(key.clone(), conn);
-        }
-        Ok(self.connections.get(&key).expect("just inserted"))
+        self.connections
+            .get_or_open(index_path)
+            .map_err(|e| format!("failed to open index at {}: {e}", index_path.display()))
     }
 }
 
 /// Discover all indexed repositories under a repos directory.
 ///
-/// Scans `repos_dir/*/index.db`, reads the adjacent `meta.json` for metadata,
-/// and validates that the claimed repo path contains a `.git` or `.wonk` marker.
+/// The shared walk and validation live in [`db::registry_entries`]; this
+/// layers the registry-name derivation on top.
 fn discover_repos(repos_dir: &Path) -> Vec<RepoEntry> {
-    let mut entries = Vec::new();
-
-    if repos_dir.is_dir()
-        && let Ok(read_dir) = std::fs::read_dir(repos_dir)
-    {
-        for dir_entry in read_dir.flatten() {
-            let index_dir = dir_entry.path();
-            if !index_dir.is_dir() {
-                continue;
+    db::registry_entries(repos_dir)
+        .into_iter()
+        .map(|(repo_path, index_path, meta)| {
+            let name = repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string());
+            RepoEntry {
+                repo_path,
+                index_path,
+                name,
+                languages: meta.languages,
+                created: meta.created,
             }
-            let index_path = index_dir.join("index.db");
-            if !index_path.exists() {
-                continue;
-            }
-            if let Ok(meta) = db::read_meta(&index_path) {
-                let repo_path = PathBuf::from(&meta.repo_path);
-                // Validate the claimed repo path has a git or wonk marker.
-                if !repo_path.join(".git").exists() && !repo_path.join(".wonk").exists() {
-                    continue;
-                }
-                let name = repo_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "unknown".to_string());
-                entries.push(RepoEntry {
-                    repo_path,
-                    index_path,
-                    name,
-                    languages: meta.languages,
-                    created: meta.created,
-                });
-            }
-        }
-    }
-
-    entries
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,7 +1411,8 @@ impl McpServer {
                  - Architecture: wonk_summary(path='dir/', depth=1, budget=8000) — use budget=8000\n\
                  - References: wonk_ref (output='files' for just file paths)\n\
                  - Text search: wonk_search (keyword/regex, ranked, definitions first)\n\
-                 - Pagination: use page=N to read more results; read only the minimum necessary",
+                 - Pagination: use page=N to read more results; read only the minimum necessary\n\
+                 - Service contracts / cross-repo API impact: wonk_contracts (kind/role filters; orphans=true, links=true)",
             ),
         })
         .expect("serialize InitializeResult")
@@ -1436,6 +1456,7 @@ impl McpServer {
             "wonk_cluster" => self.tool_cluster(call.arguments),
             "wonk_impact" => self.tool_impact(call.arguments),
             "wonk_update" => self.tool_update(call.arguments),
+            "wonk_contracts" => self.tool_contracts(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -1845,6 +1866,24 @@ impl McpServer {
 
     fn tool_status(&mut self, args: Value) -> CallToolResult {
         let format = extract_format(&args);
+        // Workspace membership (TASK-084) resolves first — its inputs are
+        // plain paths, so the registry borrow below stays exclusive.
+        let repo_root = match args.get("repo").and_then(|v| v.as_str()) {
+            Some(name) => match self.registry.resolve(name) {
+                Ok(r) => r.repo_path,
+                Err(e) => return CallToolResult::error(e),
+            },
+            None => self.router.repo_root().to_path_buf(),
+        };
+        let workspace = crate::contracts::default_repos_dir().and_then(|repos| {
+            let index = db::find_existing_index(&repo_root)?;
+            let declared = crate::config::Config::load(Some(&repo_root))
+                .map(|c| c.contracts.workspace)
+                .unwrap_or_default();
+            Some(crate::contracts::workspace_status(
+                &repos, &repo_root, &index, &declared,
+            ))
+        });
         // status works even without a connection (shows "not indexed").
         let conn = if let Some(repo_name) = args.get("repo").and_then(|v| v.as_str()) {
             let resolved = match self.registry.resolve(repo_name) {
@@ -1862,7 +1901,7 @@ impl McpServer {
             Ok(kind) => kind,
             Err(error) => return CallToolResult::error(error),
         };
-        let info = crate::router::query_status_info(conn, configured);
+        let info = crate::router::query_status_info(conn, configured, workspace);
         let status = serde_json::to_value(&info).unwrap_or_default();
         format_result(&status, format)
     }
@@ -2547,12 +2586,140 @@ impl McpServer {
         };
 
         match crate::blast::analyze_blast(conn, &symbol, &options) {
-            Ok(ref analysis) => {
-                let out = crate::output::BlastOutput::from(analysis);
+            Ok(mut analysis) => {
+                // Cross-repo tier (TASK-084): degrade silently on registry
+                // problems — blast's depth tiers never depend on the registry.
+                let provider_ids =
+                    crate::blast::provider_contract_ids(conn, &symbol).unwrap_or_default();
+                if !provider_ids.is_empty()
+                    && let Some(repos_dir) = crate::contracts::default_repos_dir()
+                {
+                    let declared = crate::config::Config::load(Some(&repo_root))
+                        .map(|c| c.contracts.workspace)
+                        .unwrap_or_default();
+                    if let Ok(consumers) = crate::blast::resolve_cross_repo_consumers(
+                        &repo_root,
+                        conn,
+                        &declared,
+                        &repos_dir,
+                        &provider_ids,
+                    ) {
+                        crate::blast::append_cross_repo_tier(&mut analysis, consumers);
+                    }
+                }
+                let out = crate::output::BlastOutput::from(&analysis);
                 format_result(&out, format)
             }
             Err(e) => CallToolResult::error(format!("blast analysis failed: {e}")),
         }
+    }
+
+    fn tool_contracts(&mut self, args: Value) -> CallToolResult {
+        let kind = match args.get("kind").and_then(|v| v.as_str()) {
+            Some(k) => match k.parse::<crate::types::ContractKind>() {
+                Ok(k) => Some(k),
+                Err(e) => return CallToolResult::error(e),
+            },
+            None => None,
+        };
+        let role = match args.get("role").and_then(|v| v.as_str()) {
+            Some(r) => match r.parse::<crate::types::ContractRole>() {
+                Ok(r) => Some(r),
+                Err(e) => return CallToolResult::error(e),
+            },
+            None => None,
+        };
+        let links = args.get("links").and_then(|v| v.as_bool()).unwrap_or(false);
+        let orphans = args
+            .get("orphans")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let unused_providers = args
+            .get("unused_providers")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        let Some(repos_dir) = crate::contracts::default_repos_dir() else {
+            return CallToolResult::error("no home directory; cannot resolve workspaces".into());
+        };
+        let filters = crate::router::ContractsQueryFilters {
+            kind,
+            role,
+            links,
+            orphans,
+            unused_providers,
+        };
+        let payload =
+            match crate::router::build_contracts_payload(conn, &repo_root, &repos_dir, &filters) {
+                Ok(p) => p,
+                Err(e) => return CallToolResult::error(format!("contracts query failed: {e}")),
+            };
+
+        // Same row selection the CLI prints: links mode empties the row set.
+        let source_rows: Vec<&crate::contracts::ContractRow> = if links {
+            Vec::new()
+        } else if unused_providers {
+            payload.unused_providers.iter().collect()
+        } else {
+            payload.rows.iter().collect()
+        };
+        let contracts: Vec<crate::output::ContractOutput> = source_rows
+            .iter()
+            .map(|row| {
+                let mut out = crate::output::ContractOutput::from(*row);
+                out.status = payload.status_token(row).map(str::to_string);
+                out
+            })
+            .collect();
+        let link_rows: Vec<crate::output::LinkOutput> = payload
+            .links
+            .iter()
+            .map(crate::output::LinkOutput::from)
+            .collect();
+
+        let workspace = serde_json::json!({
+            "declared": payload.workspace.declared,
+            "effective": payload.workspace.effective,
+            "comembers": payload.workspace.comembers,
+            "stored_diverges": payload.workspace.stored_diverges,
+        });
+        // Budget: the same token-budget convention the callgraph tools
+        // use, applied in-place to the contracts and links arrays
+        // (contracts first). No budget leaves both arrays unbounded.
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let result = match budget_limit {
+            None => serde_json::json!({
+                "workspace": workspace,
+                "contracts": contracts,
+                "links": link_rows,
+            }),
+            Some(limit) => {
+                let mut budget = TokenBudget::new(limit);
+                let mut truncated = 0usize;
+                let kept_contracts = keep_within_budget(&mut budget, contracts, &mut truncated);
+                let kept_links = keep_within_budget(&mut budget, link_rows, &mut truncated);
+                let mut result = serde_json::json!({
+                    "workspace": workspace,
+                    "contracts": kept_contracts,
+                    "links": kept_links,
+                });
+                if truncated > 0 {
+                    result["truncated"] = serde_json::json!(truncated);
+                    result["hint"] = serde_json::json!(format!(
+                        "Budget {limit} reached; {truncated} entries truncated. Raise budget to see more."
+                    ));
+                }
+                result
+            }
+        };
+        format_result(&result, extract_format(&args))
     }
 
     fn tool_flows(&mut self, args: Value) -> CallToolResult {
@@ -3280,6 +3447,28 @@ impl McpServer {
 // Budget collection helper
 // ---------------------------------------------------------------------------
 
+/// Keep the outputs that fit within `budget`, counting the dropped ones in
+/// `truncated` — the inner half of [`collect_with_budget_and_page`], usable
+/// on arrays inside a structured result (e.g. `tool_contracts`).
+fn keep_within_budget<T: serde::Serialize>(
+    budget: &mut TokenBudget,
+    outputs: Vec<T>,
+    truncated: &mut usize,
+) -> Vec<T> {
+    outputs
+        .into_iter()
+        .filter(|out| {
+            let serialized = serde_json::to_string(out).unwrap_or_default();
+            if budget.try_consume(&serialized) {
+                true
+            } else {
+                *truncated += 1;
+                false
+            }
+        })
+        .collect()
+}
+
 /// Collect serializable outputs, applying optional token budget and pagination,
 /// and format the final `CallToolResult`. Shared by tool_callers, tool_callees, etc.
 fn collect_with_budget<T: serde::Serialize>(
@@ -3465,7 +3654,159 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
+    }
+
+    // -- wonk_contracts tests (TASK-084) ---------------------------------------
+
+    #[test]
+    fn tool_contracts_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_contracts").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        for key in [
+            "kind",
+            "role",
+            "orphans",
+            "links",
+            "unused_providers",
+            "format",
+            "budget",
+        ] {
+            assert!(props.contains_key(key), "missing '{key}' property");
+        }
+        // The repo parameter is injected alongside the filters (V4 multi-repo).
+        assert!(
+            props.contains_key("repo"),
+            "missing injected 'repo' property"
+        );
+    }
+
+    /// Index a JS contracts repo and register it in a temp registry.
+    fn contracts_server() -> (tempfile::TempDir, McpServer) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_dir = dir.path().join("own-api");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/app.js"),
+            "const app = express();\napp.get('/v1/users', h);\nconst d = axios.get('/v1/health');\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
+
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join(crate::db::repo_hash(&repo_dir));
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        pipeline::build_index(&repo_dir, true).unwrap();
+        std::fs::copy(repo_dir.join(".wonk/index.db"), hash_dir.join("index.db")).unwrap();
+        db::write_meta(
+            &hash_dir.join("index.db"),
+            &repo_dir,
+            &["javascript".to_string()],
+            &[],
+        )
+        .unwrap();
+
+        let entries = discover_repos(&repos_dir);
+        let server = McpServer {
+            router: QueryRouter::new(None, false),
+            registry: RepoRegistry::new(entries),
+        };
+        (dir, server)
+    }
+
+    #[test]
+    fn tool_contracts_dispatches_with_repo_param() {
+        let (_dir, mut server) = contracts_server();
+        let params = serde_json::json!({
+            "name": "wonk_contracts",
+            "arguments": {"repo": "own-api", "kind": "http"}
+        });
+        let result = server.handle_tools_call(&params);
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let contracts = parsed["contracts"].as_array().unwrap();
+        assert_eq!(contracts.len(), 2, "got {contracts:?}");
+        assert!(
+            contracts
+                .iter()
+                .any(|c| c["canonical_id"] == "http::GET::/v1/users" && c["role"] == "provider")
+        );
+        // The unmatched consumer carries its workspace status token.
+        assert!(
+            contracts
+                .iter()
+                .any(|c| c["canonical_id"] == "http::GET::/v1/health" && c["status"] == "unscoped")
+        );
+        assert_eq!(parsed["workspace"]["effective"][0], "own-api");
+        assert!(parsed["links"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_contracts_bad_kind_is_an_error() {
+        let (_dir, mut server) = contracts_server();
+        let params = serde_json::json!({
+            "name": "wonk_contracts",
+            "arguments": {"repo": "own-api", "kind": "rest"}
+        });
+        let result = server.handle_tools_call(&params);
+        assert!(result["isError"].as_bool().unwrap_or(false), "{result}");
+    }
+
+    #[test]
+    fn tool_contracts_honors_budget() {
+        let (_dir, mut server) = contracts_server();
+        // A tiny budget cannot hold either row: the arrays are truncated
+        // and the truncation is reported instead of silently dropping rows.
+        let params = serde_json::json!({
+            "name": "wonk_contracts",
+            "arguments": {"repo": "own-api", "budget": 25}
+        });
+        let result = server.handle_tools_call(&params);
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed["contracts"].as_array().unwrap().is_empty(),
+            "budget 25 fits no row: {}",
+            parsed["contracts"]
+        );
+        assert_eq!(
+            parsed["truncated"].as_u64().unwrap_or(0),
+            2,
+            "both dropped rows are counted: {parsed}"
+        );
+
+        // A generous budget keeps every row and adds no truncation note.
+        let params = serde_json::json!({
+            "name": "wonk_contracts",
+            "arguments": {"repo": "own-api", "budget": 10000}
+        });
+        let result = server.handle_tools_call(&params);
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["contracts"].as_array().unwrap().len(), 2, "{parsed}");
+        assert!(
+            parsed.get("truncated").is_none(),
+            "nothing dropped, no note: {parsed}"
+        );
+    }
+
+    #[test]
+    fn tool_status_includes_workspaces() {
+        let (_dir, mut server) = contracts_server();
+        let params = serde_json::json!({
+            "name": "wonk_status",
+            "arguments": {"repo": "own-api"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["workspaces"][0], "own-api");
+        assert!(!parsed["workspace_declared"].as_bool().unwrap_or(true));
+        assert!(parsed["workspace_comembers"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -3691,7 +4032,7 @@ mod tests {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
     }
 
     #[test]
@@ -4162,7 +4503,7 @@ mod tests {
         let index_path = hash_dir.join("index.db");
         let conn = db::open(&index_path).unwrap();
         drop(conn);
-        db::write_meta(&index_path, &repo_dir, &["rust".to_string()]).unwrap();
+        db::write_meta(&index_path, &repo_dir, &["rust".to_string()], &[]).unwrap();
 
         let entries = discover_repos(&repos_dir);
         assert_eq!(entries.len(), 1);
@@ -4384,7 +4725,7 @@ mod tests {
         let index_path = hash_dir.join("index.db");
         let conn = db::open(&index_path).unwrap();
         drop(conn);
-        db::write_meta(&index_path, &repo_dir, &["rust".to_string()]).unwrap();
+        db::write_meta(&index_path, &repo_dir, &["rust".to_string()], &[]).unwrap();
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
@@ -4445,7 +4786,7 @@ mod tests {
         let local_db = repo_dir.join(".wonk/index.db");
         let central_db = hash_dir.join("index.db");
         std::fs::copy(&local_db, &central_db).unwrap();
-        db::write_meta(&central_db, &repo_dir, &["rust".to_string()]).unwrap();
+        db::write_meta(&central_db, &repo_dir, &["rust".to_string()], &[]).unwrap();
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
@@ -4501,7 +4842,7 @@ mod tests {
         let local_db = other_dir.join(".wonk/index.db");
         let central_db = hash_dir.join("index.db");
         std::fs::copy(&local_db, &central_db).unwrap();
-        db::write_meta(&central_db, &other_dir, &["rust".to_string()]).unwrap();
+        db::write_meta(&central_db, &other_dir, &["rust".to_string()], &[]).unwrap();
 
         (dir, primary_dir, repos_dir)
     }
