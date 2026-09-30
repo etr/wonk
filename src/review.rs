@@ -1,9 +1,14 @@
-//! Diff-scoped review engine (TASK-085).
+//! Diff-scoped review engine (TASK-085, widened 089).
 //!
 //! Pure composition over existing primitives: review never computes impact
 //! of its own — every affected-symbol set is [`crate::blast::analyze_blast`]'s
 //! own output, so `wonk review` and `wonk blast` cannot disagree. Findings
 //! are emitted only (DR-035): no forge posting, no auto-fix.
+//!
+//! Every finding carries a line-independent identity over its
+//! whitespace-folded anchored line (PRD-REV-REQ-013), consulted against the
+//! durable `review_suppressions` table (REQ-014), and every produced finding
+//! is either kept or dropped for exactly one counted reason (REQ-015).
 //!
 //! Index currency caveat (inherited V4 semantics): the index must reflect
 //! the base state of the diff. Re-indexing mid-diff (auto-indexing the
