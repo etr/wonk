@@ -5082,6 +5082,7 @@ mod tests {
                 AnchorMethod::Unresolved
             },
             severity: FindingSeverity::Blocking,
+            confidence: 0.85,
             kind: "breaking-change".into(),
             rule: "breaking-change/removed-symbol-with-callers".into(),
             message: "removed function `used` still has 1 indexed caller(s): caller".into(),

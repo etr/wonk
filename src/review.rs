@@ -390,6 +390,29 @@ pub fn suppressed_identities(conn: &Connection) -> Result<HashSet<String>> {
 // Rule family A — breaking change (PRD-REV-REQ-006)
 // ---------------------------------------------------------------------------
 
+/// Fixed confidence for coverage-gap findings (rule B). Provisional value;
+/// OQ-013 owns calibration (PRD-REV-REQ-015).
+pub const COVERAGE_GAP_CONFIDENCE: f64 = 0.8;
+
+/// Fixed confidence for cross-repo findings (rule C). Provisional value;
+/// OQ-013 owns calibration (PRD-REV-REQ-015).
+pub const CROSS_REPO_CONFIDENCE: f64 = 0.8;
+
+/// Rank findings worst-first: severity desc, then confidence desc, then
+/// file, line, rule (PRD-REV-REQ-015). The rank order decides which
+/// findings a cap trims — the least severe and least confident go first.
+pub fn rank_findings(findings: &mut [Finding]) {
+    findings.sort_by(|a, b| {
+        b.severity
+            .rank()
+            .cmp(&a.severity.rank())
+            .then_with(|| b.confidence.total_cmp(&a.confidence))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule.cmp(&b.rule))
+    });
+}
+
 /// Format the caller-name list: up to three names, then ` (+k more)`.
 fn format_caller_names(names: &[&str]) -> String {
     let listed = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
@@ -430,6 +453,12 @@ fn rule_breaking_change(
     }
 
     let names: Vec<&str> = surviving.iter().map(|s| s.name.as_str()).collect();
+    // REQ-015: data-derived confidence — the strongest surviving caller
+    // edge. (A caller deleted in the same diff never reaches `surviving`.)
+    let confidence = surviving
+        .iter()
+        .map(|s| s.confidence)
+        .fold(f64::NEG_INFINITY, f64::max);
     let (rule, message) = if cs.change_type == crate::types::ChangeType::Removed {
         (
             "breaking-change/removed-symbol-with-callers",
@@ -459,6 +488,7 @@ fn rule_breaking_change(
         line,
         anchor_method,
         severity: FindingSeverity::Blocking,
+        confidence,
         kind: "breaking-change".into(),
         rule: rule.into(),
         message,
@@ -524,6 +554,7 @@ fn rule_coverage_gap(
         line,
         anchor_method,
         severity: FindingSeverity::Warning,
+        confidence: COVERAGE_GAP_CONFIDENCE,
         kind: "coverage-gap".into(),
         rule: rule.into(),
         message,
@@ -635,6 +666,7 @@ fn rule_cross_repo(
         line,
         anchor_method,
         severity: FindingSeverity::Warning,
+        confidence: CROSS_REPO_CONFIDENCE,
         kind: "cross-repo".into(),
         rule: rule.into(),
         message,
@@ -868,13 +900,7 @@ pub fn run_review(
     // false positive is not a finding of this run.
     findings.retain(|f| !suppressed.contains(&f.identity));
 
-    findings.sort_by(|a, b| {
-        b.severity
-            .cmp(&a.severity)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.rule.cmp(&b.rule))
-    });
+    rank_findings(&mut findings);
 
     let verdict = derive_verdict(&findings);
 
@@ -934,6 +960,7 @@ mod tests {
             line: Some(1),
             anchor_method: crate::types::AnchorMethod::PostChangeFile,
             severity,
+            confidence: 0.5,
             kind: "test".into(),
             rule: "test/rule".into(),
             message: "msg".into(),
@@ -1026,6 +1053,90 @@ mod tests {
             unresolved,
             finding_identity("r", "k", "src/lib.rs", "g", None)
         );
+    }
+
+    // -- confidence + ranking (TASK-089, PRD-REV-REQ-015) -----------------------
+
+    fn ranked(
+        severity: FindingSeverity,
+        confidence: f64,
+        file: &str,
+        line: Option<usize>,
+        rule: &str,
+    ) -> Finding {
+        Finding {
+            file: file.into(),
+            line,
+            anchor_method: AnchorMethod::PostChangeFile,
+            severity,
+            kind: "test".into(),
+            rule: rule.into(),
+            message: "m".into(),
+            identity: format!("id-{rule}"),
+            confidence,
+            related: vec![],
+        }
+    }
+
+    #[test]
+    fn coverage_gap_and_cross_repo_confidence_consts_are_calibrated() {
+        // The fixed confidences are provisional by design (OQ-013 owns
+        // calibration); pinning the values here makes a later re-tuning a
+        // visible, reviewed change.
+        assert_eq!(COVERAGE_GAP_CONFIDENCE, 0.8);
+        assert_eq!(CROSS_REPO_CONFIDENCE, 0.8);
+        assert!(
+            (0.0..=1.0).contains(&COVERAGE_GAP_CONFIDENCE)
+                && (0.0..=1.0).contains(&CROSS_REPO_CONFIDENCE),
+            "confidence is a [0, 1] quantity"
+        );
+    }
+
+    #[test]
+    fn ranking_is_severity_desc_then_confidence_desc_then_file_line_rule() {
+        let mut findings = vec![
+            ranked(FindingSeverity::Note, 0.99, "src/a.rs", Some(1), "r-note"),
+            ranked(FindingSeverity::Warning, 0.5, "src/a.rs", Some(9), "r-a9"),
+            ranked(FindingSeverity::Warning, 0.9, "src/b.rs", Some(2), "r-conf"),
+            ranked(FindingSeverity::Warning, 0.5, "src/a.rs", Some(2), "r-a2b"),
+            ranked(FindingSeverity::Warning, 0.5, "src/a.rs", Some(2), "r-a2a"),
+            ranked(
+                FindingSeverity::Blocking,
+                0.1,
+                "src/z.rs",
+                Some(1),
+                "r-block",
+            ),
+        ];
+        rank_findings(&mut findings);
+        let rules: Vec<&str> = findings.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(
+            rules,
+            vec!["r-block", "r-conf", "r-a2a", "r-a2b", "r-a9", "r-note"],
+            "severity desc, then confidence desc, then file, line, rule"
+        );
+    }
+
+    #[test]
+    fn ranking_unresolved_lines_sort_first_within_their_tier() {
+        let mut findings = vec![
+            ranked(
+                FindingSeverity::Warning,
+                0.5,
+                "src/a.rs",
+                Some(4),
+                "r-lined",
+            ),
+            ranked(
+                FindingSeverity::Warning,
+                0.5,
+                "src/a.rs",
+                None,
+                "r-unanchored",
+            ),
+        ];
+        rank_findings(&mut findings);
+        assert_eq!(findings[0].rule, "r-unanchored");
     }
 
     // -- resolve_anchor table tests ---------------------------------------------
@@ -1490,6 +1601,63 @@ mod tests {
     }
 
     #[test]
+    fn rule_a_confidence_is_max_surviving_caller_edge_confidence() {
+        // REQ-015: rule A's confidence is data-derived — the strongest
+        // surviving caller edge — never a constant. A caller deleted in the
+        // same diff is dead code and must not inflate it.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn used() {}\n\npub fn keep_a() { used(); }\npub fn keep_b() { used(); }\n\npub fn dead() { used(); }\n",
+        )]);
+        let root = dir.path();
+
+        for (caller, confidence) in [("keep_a", 0.6), ("keep_b", 0.9), ("dead", 1.0)] {
+            conn.execute(
+                "UPDATE \"references\" SET confidence = ?1 \
+                 WHERE name = 'used' AND caller_id = \
+                 (SELECT id FROM symbols WHERE name = ?2)",
+                rusqlite::params![confidence, caller],
+            )
+            .unwrap();
+        }
+
+        // Working tree deletes used() AND dead() (dead code going with it).
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn keep_a() { used(); }\npub fn keep_b() { used(); }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions {
+                // The live BFS reads the reference rows this test edits; the
+                // precomputed reach table would still hold the original
+                // confidences (ac4b: both paths yield identical findings).
+                reach_enabled: false,
+                ..ReviewOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let f = result
+            .findings
+            .iter()
+            .find(|f| f.kind == "breaking-change")
+            .expect("breaking-change finding");
+        assert_eq!(
+            f.confidence, 0.9,
+            "max SURVIVING edge confidence; dead's 1.0 must not count"
+        );
+    }
+
+    #[test]
     fn rule_a_body_only_modified_with_callers_is_not_blocking() {
         // Blocking on any body edit would make BLOCK meaningless: only
         // removed or signature-changed symbols are candidates.
@@ -1595,6 +1763,7 @@ mod tests {
         assert_eq!(f.severity, FindingSeverity::Warning);
         assert_eq!(f.kind, "coverage-gap");
         assert_eq!(f.rule, "coverage-gap/no-test-in-blast-radius");
+        assert_eq!(f.confidence, COVERAGE_GAP_CONFIDENCE);
         assert_eq!(
             f.message,
             "function `f` changed but no test file appears in its blast radius (1 affected symbol(s), none in tests)"
@@ -2253,6 +2422,7 @@ mod tests {
             f.rule,
             "cross-repo/changed-provider-with-external-consumers"
         );
+        assert_eq!(f.confidence, CROSS_REPO_CONFIDENCE);
         assert_eq!(
             f.message,
             "function `registerUserRoutes` changed but provides contract(s) http::GET::/v1/users consumed by 1 other repo(s): own-api"

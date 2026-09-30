@@ -890,6 +890,19 @@ pub enum FindingSeverity {
     Note,
 }
 
+impl FindingSeverity {
+    /// Worst-first ordinal: higher = more severe. The derived `Ord` orders
+    /// by declaration (Blocking < Warning < Note), which is the opposite of
+    /// severity — ranking must use this instead (PRD-REV-REQ-015).
+    pub fn rank(self) -> u8 {
+        match self {
+            FindingSeverity::Blocking => 2,
+            FindingSeverity::Warning => 1,
+            FindingSeverity::Note => 0,
+        }
+    }
+}
+
 impl fmt::Display for FindingSeverity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -969,6 +982,10 @@ pub struct Finding {
     pub anchor_method: AnchorMethod,
     /// How strongly the finding weighs on the verdict.
     pub severity: FindingSeverity,
+    /// How sure the rule is, in `[0, 1]`. Rule A derives it from the
+    /// strongest surviving caller edge; rules B/C use fixed consts —
+    /// provisional values pending calibration (OQ-013, PRD-REV-REQ-015).
+    pub confidence: f64,
     /// Finding category: `breaking-change`, `coverage-gap`, or
     /// `cross-repo` (rule family C, TASK-086).
     pub kind: String,
