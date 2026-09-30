@@ -314,3 +314,71 @@ fn default_config_gates_to_legacy_ordering() {
         assert_equivalent(&found, None, query, &settings);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. End-to-end CLI byte identity (AR-033, the --why gate)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_why_stdout_is_byte_identical_to_default_smart_run() {
+    let (dir, _conn) = setup_indexed_corpus();
+    let root = dir.path();
+    // Isolated $HOME so the child processes cannot pick up a real global
+    // config (the local index at <root>/.wonk/index.db needs no $HOME).
+    let home = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_wonk");
+
+    let run = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.current_dir(root)
+            .env("HOME", home.path())
+            .arg("search")
+            .arg("cache")
+            .arg("--smart");
+        for arg in extra {
+            cmd.arg(arg);
+        }
+        let output = cmd.output().expect("wonk binary to run");
+        assert!(
+            output.status.success(),
+            "wonk search {extra:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    let plain = run(&[]);
+    let explained = run(&["--why"]);
+
+    assert!(
+        !plain.stdout.is_empty(),
+        "fixture corpus must produce search output"
+    );
+    // AR-033 at the CLI surface: stdout is byte-identical with --why.
+    assert_eq!(
+        plain.stdout, explained.stdout,
+        "--why must not change stdout bytes"
+    );
+
+    let plain_err = String::from_utf8_lossy(&plain.stderr);
+    let why_err = String::from_utf8_lossy(&explained.stderr);
+    assert!(
+        !plain_err.contains("why: "),
+        "default run prints no why lines: {plain_err}"
+    );
+    assert!(
+        why_err.contains("why: "),
+        "--why prints per-result breakdown to stderr: {why_err}"
+    );
+    // Every why line carries the kind signal breakdown.
+    for line in why_err.lines().filter(|l| l.starts_with("why: ")) {
+        assert!(
+            line.contains("kind "),
+            "why line names the kind signal: {line}"
+        );
+        assert!(
+            line.contains("total="),
+            "why line shows the final score: {line}"
+        );
+    }
+}
