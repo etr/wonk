@@ -886,4 +886,28 @@ public class Demo {
             );
         }
     }
+
+    #[test]
+    fn body_heavy_majority_reduction() {
+        let mut src = String::from("// module docs\nuse std::fmt;\n\n");
+        for i in 0..30 {
+            src.push_str(&format!(
+                "pub fn f{i}(n: u32) -> u32 {{\n    let a = n + {i};\n    let b = a * 2;\n    let c = b + 1;\n    let d = c * 3;\n    let e = d + 2;\n    let f = e * 4;\n    let g = f + 5;\n    let h = g * 6;\n    let j = h + 7;\n    let k = j * 8;\n    let m = k + 9;\n    m\n}}\n\n"
+            ));
+        }
+        let out = elided(&src, Lang::Rust);
+        let in_lines = src.lines().count();
+        let out_lines = out.lines().count();
+        assert!(out.contains("use std::fmt;"));
+        for i in 0..30 {
+            assert!(out.contains(&format!("pub fn f{i}(n: u32) -> u32 {{")),
+                "signature of f{i} must survive");
+        }
+        assert!(
+            out_lines * 2 < in_lines,
+            "expected a majority reduction: {out_lines} of {in_lines} lines remain"
+        );
+        let ratio = out_lines as f64 / in_lines as f64;
+        println!("body-heavy reduction: {out_lines}/{in_lines} lines retained (ratio {ratio:.3})");
+    }
 }
