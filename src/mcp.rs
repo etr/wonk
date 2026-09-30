@@ -1193,6 +1193,39 @@ fn tool_definitions() -> &'static Vec<Tool> {
             }),
         });
 
+        // Diff-scoped review (TASK-086). Also pre-injection: review is a
+        // per-repo query like contracts. No budget param (tool_changes
+        // parity) — the payload is findings plus one verdict.
+        tools.push(Tool {
+            name: "wonk_review",
+            description: "Review a diff scope: line-anchored findings (breaking change, coverage gap, cross-repo contract impact) plus an overall BLOCK/REVIEW/APPROVE verdict. Findings are emitted only — nothing is posted to a forge and nothing is auto-fixed.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["unstaged", "staged", "all", "compare"],
+                        "description": "Diff scope to review (default: unstaged)",
+                        "default": "unstaged"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Base git ref for compare scope (required when scope=compare)"
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "Sugar for scope=compare with this base ref: review everything since a ref"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["json", "toon"],
+                        "description": "Output format (default: json)",
+                        "default": "json"
+                    }
+                }
+            }),
+        });
+
         // Inject optional `repo` parameter into all existing tools except wonk_init
         // and wonk_update (both always operate on the working directory repo).
         for tool in &mut tools {
@@ -1412,7 +1445,8 @@ impl McpServer {
                  - References: wonk_ref (output='files' for just file paths)\n\
                  - Text search: wonk_search (keyword/regex, ranked, definitions first)\n\
                  - Pagination: use page=N to read more results; read only the minimum necessary\n\
-                 - Service contracts / cross-repo API impact: wonk_contracts (kind/role filters; orphans=true, links=true)",
+                 - Service contracts / cross-repo API impact: wonk_contracts (kind/role filters; orphans=true, links=true)\n\
+                 - Review a diff before committing: wonk_review (scope/since; returns findings + BLOCK/REVIEW/APPROVE verdict; cross-repo contract impact included; findings only, no posting/auto-fix)",
             ),
         })
         .expect("serialize InitializeResult")
@@ -1457,6 +1491,7 @@ impl McpServer {
             "wonk_impact" => self.tool_impact(call.arguments),
             "wonk_update" => self.tool_update(call.arguments),
             "wonk_contracts" => self.tool_contracts(call.arguments),
+            "wonk_review" => self.tool_review(call.arguments),
             _ => CallToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -2722,6 +2757,70 @@ impl McpServer {
         format_result(&result, extract_format(&args))
     }
 
+    fn tool_review(&mut self, args: Value) -> CallToolResult {
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        let format = extract_format(&args);
+
+        // Scope parsing mirrors tool_changes, plus `since` as sugar for
+        // compare+base (the CLI's --since).
+        let scope_str = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unstaged");
+        let (scope_str, base) = match args.get("since").and_then(|v| v.as_str()) {
+            Some(since) => ("compare".to_string(), Some(since.to_string())),
+            None => (
+                scope_str.to_string(),
+                args.get("base").and_then(|v| v.as_str()).map(String::from),
+            ),
+        };
+        let scope = if scope_str == "compare" {
+            match base {
+                Some(b) => crate::types::ChangeScope::Compare(b),
+                None => {
+                    return CallToolResult::error(
+                        "'base' is required when scope=compare (or use 'since')".into(),
+                    );
+                }
+            }
+        } else {
+            match scope_str.parse::<crate::types::ChangeScope>() {
+                Ok(s) => s,
+                Err(e) => return CallToolResult::error(e),
+            }
+        };
+
+        let config = match crate::config::Config::load(Some(&repo_root)) {
+            Ok(c) => c,
+            Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
+        };
+        let options = crate::review::ReviewOptions {
+            breaking_change: config.review.breaking_change,
+            coverage_gap: config.review.coverage_gap,
+            cross_repo: config.review.cross_repo,
+            reach_enabled: config.reach.enabled,
+            ..crate::review::ReviewOptions::default()
+        };
+        let cross_repo = config
+            .review
+            .cross_repo
+            .then(|| crate::review::CrossRepoInputs::discover(&repo_root))
+            .flatten();
+
+        match crate::review::run_review(conn, &scope, &repo_root, &options, cross_repo.as_ref()) {
+            Ok(result) => {
+                // One object, not NDJSON — NDJSON is the CLI's streaming
+                // format for terminal pipelines; an MCP caller wants a
+                // single structured payload.
+                format_result(&crate::output::ReviewOutput::from(&result), format)
+            }
+            Err(e) => CallToolResult::error(format!("review failed: {e}")),
+        }
+    }
+
     fn tool_flows(&mut self, args: Value) -> CallToolResult {
         let (conn, repo_root) = match self.resolve_repo(&args) {
             Ok(r) => r,
@@ -3654,7 +3753,114 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 24);
+    }
+
+    // -- wonk_review tests (TASK-086) ------------------------------------------
+
+    #[test]
+    fn tool_review_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_review").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        for key in ["scope", "base", "since", "format"] {
+            assert!(props.contains_key(key), "missing '{key}' property");
+        }
+        assert!(
+            props.contains_key("repo"),
+            "review is defined before repo injection, so it inherits 'repo'"
+        );
+        assert!(
+            !props.contains_key("budget"),
+            "review has no budget param (tool_changes parity)"
+        );
+        // The DR-035 boundary is part of the tool's contract.
+        assert!(
+            tool.description.contains("nothing is posted to a forge"),
+            "description must state the findings-only boundary"
+        );
+    }
+
+    /// Git-committed, indexed, and registered repo with an unstaged working
+    /// tree edit applied — the state `wonk review` diffs.
+    fn review_server() -> (tempfile::TempDir, McpServer) {
+        use std::process::Command;
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_dir = dir.path().join("review-svc");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub fn used() {}\n\npub fn caller() { used(); }\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-m", "initial"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+
+        let repos_dir = dir.path().join("repos");
+        let hash_dir = repos_dir.join(crate::db::repo_hash(&repo_dir));
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        pipeline::build_index(&repo_dir, true).unwrap();
+        std::fs::copy(repo_dir.join(".wonk/index.db"), hash_dir.join("index.db")).unwrap();
+        db::write_meta(
+            &hash_dir.join("index.db"),
+            &repo_dir,
+            &["rust".to_string()],
+            &[],
+        )
+        .unwrap();
+
+        // The unstaged diff under review: used() deleted, caller kept.
+        std::fs::write(repo_dir.join("src/lib.rs"), "pub fn caller() { used(); }\n").unwrap();
+
+        let entries = discover_repos(&repos_dir);
+        let server = McpServer {
+            router: QueryRouter::new(None, false),
+            registry: RepoRegistry::new(entries),
+        };
+        (dir, server)
+    }
+
+    #[test]
+    fn tool_review_dispatches_findings_and_verdict() {
+        let (_dir, mut server) = review_server();
+        let params = serde_json::json!({
+            "name": "wonk_review",
+            "arguments": {"repo": "review-svc"}
+        });
+        let result = server.handle_tools_call(&params);
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        // MCP payload is one object (NDJSON is the CLI streaming format).
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        let findings = parsed["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1, "{parsed}");
+        assert_eq!(findings[0]["kind"], "breaking-change");
+        assert_eq!(parsed["verdict"], "BLOCK");
+    }
+
+    #[test]
+    fn tool_review_compare_scope_requires_base() {
+        let (_dir, mut server) = review_server();
+        let params = serde_json::json!({
+            "name": "wonk_review",
+            "arguments": {"repo": "review-svc", "scope": "compare"}
+        });
+        let result = server.handle_tools_call(&params);
+        assert!(result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("base"), "must name the missing param: {text}");
     }
 
     // -- wonk_contracts tests (TASK-084) ---------------------------------------
@@ -4028,11 +4234,11 @@ mod tests {
     // -- Callers/Callees MCP tests -------------------------------------------
 
     #[test]
-    fn tools_list_returns_twenty_three_tools() {
+    fn tools_list_returns_twenty_four_tools() {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 24);
     }
 
     #[test]
