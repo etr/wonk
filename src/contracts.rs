@@ -5,8 +5,8 @@
 //!
 //! Contracts are detected by walking the tree-sitter tree that the symbol
 //! indexer already parsed — no second parse or file read (PRD-CTR-REQ-011).
-//! Storage lands in TASK-083; this module only produces
-//! [`ContractCandidate`] values.
+//! Detected candidates persist in the per-repo `contracts` table via the
+//! indexing pipeline; [`list_contracts`] queries them back (TASK-083).
 //!
 //! Normalization core (AR-017):
 //! - [`canonical_contract_id`] is the only place contract IDs are built.
@@ -45,11 +45,11 @@
 //! `.graphql`/`.gql`, and `.yaml`/`.yml`/`.json` carry no grammar, so tiny
 //! line-oriented scanners ([`extract_document_contracts`]) read them
 //! instead. Only a document that yields candidates gets a `files` row
-//! (empty symbols, language = [`DocumentKind::as_str`]) — that row is
-//! TASK-083's hash/re-index anchor; everything else stays un-indexed
-//! exactly as before. OpenAPI additionally sniffs content (a top-level
-//! `openapi:`/`swagger:` key plus `paths:`), so CI/compose/package files
-//! never index.
+//! (empty symbols, language = [`DocumentKind::as_str`]) — that row is the
+//! hash/re-index anchor, and the stored contracts carry a NULL symbol_id;
+//! everything else stays un-indexed exactly as before. OpenAPI additionally
+//! sniffs content (a top-level `openapi:`/`swagger:` key plus `paths:`), so
+//! CI/compose/package files never index.
 //!
 //! RPC canonical join ([`canonical_rpc_join`], PRD-CTR-REQ-024): exact ID
 //! equality is the first pass and is never overridden — candidates with an

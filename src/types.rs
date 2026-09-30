@@ -596,9 +596,10 @@ pub struct PathParam {
     pub name: String,
 }
 
-/// A detected contract candidate (not yet persisted — TASK-083 adds storage).
+/// A detected contract candidate.
 ///
-/// Extracted from the same tree the symbol indexer walks (PRD-CTR-REQ-011).
+/// Extracted from the same tree the symbol indexer walks (PRD-CTR-REQ-011)
+/// and persisted by the indexing pipeline into the `contracts` table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContractCandidate {
     /// Contract kind (`http`, `env`, `queue`, `websocket`, `job`).

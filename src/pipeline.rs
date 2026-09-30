@@ -45,7 +45,7 @@ pub struct IndexStats {
     pub caller_count: usize,
     /// Number of type hierarchy edges (extends/implements) stored.
     pub type_edge_count: usize,
-    /// Contract candidates extracted (TASK-082; persisted in TASK-083).
+    /// Contract rows persisted in the `contracts` table (TASK-083).
     pub contract_count: usize,
     /// Wall-clock elapsed time.
     pub elapsed: std::time::Duration,
@@ -284,6 +284,11 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
             row.get::<_, i64>(0)
         })
         .unwrap_or(0) as usize;
+    let contract_count = conn
+        .query_row("SELECT COUNT(*) FROM contracts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize;
 
     Ok(IndexStats {
         file_count,
@@ -291,9 +296,7 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
         ref_count,
         caller_count,
         type_edge_count,
-        // Contracts are not persisted yet, so incremental runs report zero
-        // until TASK-083 lands storage and aggregates here.
-        contract_count: 0,
+        contract_count,
         elapsed: start.elapsed(),
     })
 }
@@ -886,8 +889,8 @@ fn parse_document_file(
 ///
 /// `None` when the document yields no contracts (disabled kind, failed
 /// OpenAPI sniff) — the caller leaves the file un-indexed. The row (language
-/// set to the document kind, zero symbols) is TASK-083's hash/re-index
-/// anchor for document files.
+/// set to the document kind, zero symbols) is the hash/re-index anchor for
+/// document files: their contract rows are stored with a NULL symbol_id.
 fn document_file_result(
     kind: crate::contracts::DocumentKind,
     rel_path: String,
@@ -1955,7 +1958,7 @@ class Component {
         assert_eq!(language, "Proto");
         assert_eq!(symbols_count, 0);
 
-        // meta.json carries the document language (TASK-083 anchor).
+        // meta.json carries the document language.
         let meta = db::read_meta(&index_path).unwrap();
         assert!(
             meta.languages.iter().any(|l| l == "Proto"),
@@ -2022,7 +2025,7 @@ class Component {
     #[test]
     fn reindex_file_skips_lockfile_document() {
         // The incremental path pays the same guard: a changed lock file
-        // re-hashes (TASK-083 anchor) but never gains a row.
+        // re-hashes but never gains a row.
         let dir = make_rpc_contract_repo();
         build_index(dir.path(), true).unwrap();
         let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
@@ -2218,8 +2221,8 @@ class Component {
 
     #[test]
     fn reindex_file_extracts_contracts() {
-        // No storage yet (TASK-083): reindex_file must run the contract
-        // extractor inline without failing, and skip unchanged content.
+        // reindex_file runs the contract extractor inline and skips
+        // unchanged content by hash.
         let dir = make_contract_repo();
         let stats = build_index(dir.path(), true).unwrap();
         assert_eq!(stats.contract_count, 3);
@@ -2584,6 +2587,28 @@ class Component {
             )
             .unwrap();
         assert_eq!(lib_rows, 0);
+    }
+
+    #[test]
+    fn incremental_update_reports_stored_contract_count() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+
+        // Change app.js: one route replaced, one added -> four stored rows.
+        let file = dir.path().join("src/app.js");
+        fs::write(
+            &file,
+            "const app = express();\napp.get('/v1/users/:id', getUser);\napp.post('/orders', createOrder);\napp.delete('/orders/:id', deleteOrder);\nconst db = process.env.DATABASE_URL;\n",
+        )
+        .unwrap();
+        let stats = incremental_update(dir.path(), true).unwrap();
+        assert_eq!(stats.contract_count, 4, "got {stats:?}");
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM contracts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 4, "stats must reflect what is in the database");
     }
 
     #[test]
