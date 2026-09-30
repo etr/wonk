@@ -6155,6 +6155,108 @@ fn last_segment_folded(qualifier: &str) -> Option<String> {
     if last.is_empty() { None } else { Some(last) }
 }
 
+// ---------------------------------------------------------------------------
+// Storage query API (TASK-083)
+// ---------------------------------------------------------------------------
+
+/// Filters for [`list_contracts`] (`wonk contracts` CLI, PRD-CTR-REQ-008).
+///
+/// `None` kind/role means no filter on that axis; `orphans` restricts the
+/// result to consumers with no provider for the same canonical ID.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContractQuery {
+    /// Restrict to one contract kind.
+    pub kind: Option<ContractKind>,
+    /// Restrict to one role.
+    pub role: Option<ContractRole>,
+    /// Only orphan consumers (no same-canonical_id provider in this repo).
+    pub orphans: bool,
+}
+
+/// One stored contract row with the owning symbol's name resolved.
+///
+/// `symbol` is `None` for file-level contracts (documents, top-level
+/// registrations) whose `symbol_id` is NULL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractRow {
+    /// `<kind>::<qualifier>::<identifier>` canonical ID.
+    pub canonical_id: String,
+    /// Contract kind.
+    pub kind: ContractKind,
+    /// Provider or consumer.
+    pub role: ContractRole,
+    /// Owning symbol name, when `symbol_id` resolved at write time.
+    pub symbol: Option<String>,
+    /// Path relative to repo root.
+    pub file: String,
+    /// 1-based line of the detection site.
+    pub line: usize,
+    /// 1.0 framework-recognized / 0.5 heuristic (AR-018).
+    pub confidence: f64,
+}
+
+/// List stored contracts matching `query`.
+///
+/// One static statement — NULL parameters disable their filter, so no SQL
+/// is ever assembled dynamically. Reads only the passed connection: a
+/// single-repo index answers from its own rows and never errors for lack
+/// of sibling repos (PRD-CTR-REQ-012, the degenerate case of REQ-006's
+/// workspace scoping that TASK-084 widens).
+pub fn list_contracts(
+    conn: &rusqlite::Connection,
+    query: &ContractQuery,
+) -> anyhow::Result<Vec<ContractRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.canonical_id, c.kind, c.role, s.name, c.file, c.line, c.confidence \
+         FROM contracts c LEFT JOIN symbols s ON s.id = c.symbol_id \
+         WHERE (?1 IS NULL OR c.kind = ?1) \
+           AND (?2 IS NULL OR c.role = ?2) \
+           AND (?3 = 0 OR (c.role = 'consumer' AND NOT EXISTS ( \
+                SELECT 1 FROM contracts p \
+                WHERE p.canonical_id = c.canonical_id AND p.role = 'provider'))) \
+         ORDER BY c.kind, c.canonical_id, c.file, c.line",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            query.kind.map(|k| k.as_str()),
+            query.role.map(|r| r.as_str()),
+            i64::from(query.orphans),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, f64>(6)?,
+            ))
+        },
+    )?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (canonical_id, kind, role, symbol, file, line, confidence) = row?;
+        let kind = kind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("corrupt contract row {canonical_id}: {e}"))?;
+        let role = role
+            .parse()
+            .map_err(|e| anyhow::anyhow!("corrupt contract row {canonical_id}: {e}"))?;
+        out.push(ContractRow {
+            canonical_id,
+            kind,
+            role,
+            symbol,
+            file,
+            line: line.max(0) as usize,
+            confidence,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod extract_test_helpers {
     use super::*;
@@ -10561,5 +10663,214 @@ paths:
         assert_eq!(joins.len(), 1, "got {joins:?}");
         assert_eq!(joins[0].provider.canonical_id, "grpc::UserService::GetUser");
         assert_eq!(joins[0].consumer.canonical_id, "grpc::UserService::getUser");
+    }
+
+    // -- storage query API (TASK-083) -----------------------------------------
+
+    /// Contract row shape used to seed [`list_contracts`] test databases.
+    struct SeedRow {
+        canonical_id: &'static str,
+        kind: &'static str,
+        role: &'static str,
+        symbol_id: Option<i64>,
+        file: &'static str,
+        line: i64,
+        confidence: f64,
+    }
+
+    /// Open a temp index and seed it with one symbol (`load` in src/a.js)
+    /// plus the given contract rows.
+    fn seeded_query_db(rows: &[SeedRow]) -> rusqlite::Connection {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        // Leak the TempDir: the SQLite file must outlive this helper for the
+        // duration of the test (tempfiles delete on drop; the OS cleans up).
+        std::mem::forget(dir);
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language, signature) \
+             VALUES ('load', 'function', 'src/a.js', 10, 0, 'JavaScript', 'async function load()')",
+            [],
+        )
+        .unwrap();
+        for r in rows {
+            conn.execute(
+                "INSERT INTO contracts (canonical_id, kind, role, symbol_id, file, line, confidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![r.canonical_id, r.kind, r.role, r.symbol_id, r.file, r.line, r.confidence],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn query(
+        kind: Option<ContractKind>,
+        role: Option<ContractRole>,
+        orphans: bool,
+    ) -> ContractQuery {
+        ContractQuery {
+            kind,
+            role,
+            orphans,
+        }
+    }
+
+    #[test]
+    fn list_contracts_filters_kind_and_role() {
+        let conn = seeded_query_db(&[
+            SeedRow {
+                canonical_id: "http::GET::/users",
+                kind: "http",
+                role: "provider",
+                symbol_id: None,
+                file: "src/a.js",
+                line: 1,
+                confidence: 1.0,
+            },
+            SeedRow {
+                canonical_id: "http::GET::/users",
+                kind: "http",
+                role: "consumer",
+                symbol_id: Some(1),
+                file: "src/b.js",
+                line: 5,
+                confidence: 1.0,
+            },
+            SeedRow {
+                canonical_id: "env::::API_KEY",
+                kind: "env",
+                role: "consumer",
+                symbol_id: Some(1),
+                file: "src/b.js",
+                line: 7,
+                confidence: 0.5,
+            },
+        ]);
+
+        let all = list_contracts(&conn, &query(None, None, false)).unwrap();
+        assert_eq!(all.len(), 3);
+        // ORDER BY kind, canonical_id, file, line: env sorts before http.
+        assert_eq!(all[0].canonical_id, "env::::API_KEY");
+        assert_eq!(all[1].canonical_id, "http::GET::/users");
+        assert_eq!(all[1].file, "src/a.js");
+
+        let http = list_contracts(&conn, &query(Some(ContractKind::Http), None, false)).unwrap();
+        assert_eq!(http.len(), 2);
+
+        let consumers =
+            list_contracts(&conn, &query(None, Some(ContractRole::Consumer), false)).unwrap();
+        assert_eq!(consumers.len(), 2);
+
+        let env_consumers = list_contracts(
+            &conn,
+            &query(Some(ContractKind::Env), Some(ContractRole::Consumer), false),
+        )
+        .unwrap();
+        assert_eq!(env_consumers.len(), 1);
+        assert_eq!(env_consumers[0].canonical_id, "env::::API_KEY");
+    }
+
+    #[test]
+    fn list_contracts_orphans_within_repo() {
+        let conn = seeded_query_db(&[
+            SeedRow {
+                canonical_id: "http::GET::/users",
+                kind: "http",
+                role: "provider",
+                symbol_id: None,
+                file: "src/a.js",
+                line: 1,
+                confidence: 1.0,
+            },
+            SeedRow {
+                canonical_id: "http::GET::/users",
+                kind: "http",
+                role: "consumer",
+                symbol_id: Some(1),
+                file: "src/b.js",
+                line: 5,
+                confidence: 1.0,
+            },
+            SeedRow {
+                canonical_id: "env::::DATABASE_URL",
+                kind: "env",
+                role: "consumer",
+                symbol_id: Some(1),
+                file: "src/b.js",
+                line: 9,
+                confidence: 1.0,
+            },
+            SeedRow {
+                canonical_id: "env::::FEATURE_X",
+                kind: "env",
+                role: "provider",
+                symbol_id: None,
+                file: "src/a.js",
+                line: 3,
+                confidence: 1.0,
+            },
+        ]);
+
+        // The matched http pair is excluded; only the env consumer lacks an
+        // in-repo provider; providers are never orphans.
+        let orphans = list_contracts(&conn, &query(None, None, true)).unwrap();
+        assert_eq!(
+            orphans
+                .iter()
+                .map(|r| r.canonical_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["env::::DATABASE_URL"]
+        );
+
+        // Without the flag every row is listed (REQ-008 wording: orphans
+        // appear only when asked for).
+        let all = list_contracts(&conn, &query(None, None, false)).unwrap();
+        assert_eq!(all.len(), 4);
+
+        // --orphans hard-constrains role=consumer: the combination with
+        // role=provider is deterministically empty.
+        let none = list_contracts(&conn, &query(None, Some(ContractRole::Provider), true)).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn list_contracts_resolves_symbol_name() {
+        let conn = seeded_query_db(&[
+            SeedRow {
+                canonical_id: "http::GET::/users",
+                kind: "http",
+                role: "consumer",
+                symbol_id: Some(1),
+                file: "src/b.js",
+                line: 5,
+                confidence: 1.0,
+            },
+            SeedRow {
+                canonical_id: "env::::DATABASE_URL",
+                kind: "env",
+                role: "consumer",
+                symbol_id: None,
+                file: "doc/policy.yaml",
+                line: 2,
+                confidence: 1.0,
+            },
+        ]);
+
+        let rows = list_contracts(&conn, &query(None, None, false)).unwrap();
+        let named = rows
+            .iter()
+            .find(|r| r.canonical_id == "http::GET::/users")
+            .unwrap();
+        assert_eq!(named.symbol.as_deref(), Some("load"));
+        assert_eq!(named.kind, ContractKind::Http);
+        assert_eq!(named.role, ContractRole::Consumer);
+        assert_eq!(named.line, 5);
+        assert_eq!(named.confidence, 1.0);
+
+        let document = rows
+            .iter()
+            .find(|r| r.canonical_id == "env::::DATABASE_URL")
+            .unwrap();
+        assert_eq!(document.symbol, None, "document contracts have no symbol");
     }
 }
