@@ -850,6 +850,10 @@ pub struct FileDiffHunks {
     /// Removed-line ranges on the old (pre-change) side, `(start, end)`
     /// inclusive, 1-based.
     pub removed_ranges: Vec<(usize, usize)>,
+    /// Text of the removed lines keyed by old-side line number, `-` prefix
+    /// stripped — the anchor text for findings about removed code
+    /// (TASK-089, PRD-REV-REQ-013).
+    pub removed_lines: HashMap<usize, String>,
 }
 
 /// Scoped change analysis plus the diff detail review needs: old-side hunk
@@ -886,6 +890,19 @@ pub enum FindingSeverity {
     Note,
 }
 
+impl FindingSeverity {
+    /// Worst-first ordinal: higher = more severe. The derived `Ord` orders
+    /// by declaration (Blocking < Warning < Note), which is the opposite of
+    /// severity — ranking must use this instead (PRD-REV-REQ-015).
+    pub fn rank(self) -> u8 {
+        match self {
+            FindingSeverity::Blocking => 2,
+            FindingSeverity::Warning => 1,
+            FindingSeverity::Note => 0,
+        }
+    }
+}
+
 impl fmt::Display for FindingSeverity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -894,6 +911,21 @@ impl fmt::Display for FindingSeverity {
             FindingSeverity::Note => "note",
         };
         write!(f, "{s}")
+    }
+}
+
+impl std::str::FromStr for FindingSeverity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "blocking" => Ok(FindingSeverity::Blocking),
+            "warning" => Ok(FindingSeverity::Warning),
+            "note" => Ok(FindingSeverity::Note),
+            other => Err(format!(
+                "unknown severity: {other} (expected one of: blocking, warning, note)"
+            )),
+        }
     }
 }
 
@@ -965,6 +997,10 @@ pub struct Finding {
     pub anchor_method: AnchorMethod,
     /// How strongly the finding weighs on the verdict.
     pub severity: FindingSeverity,
+    /// How sure the rule is, in `[0, 1]`. Rule A derives it from the
+    /// strongest surviving caller edge; rules B/C use fixed consts —
+    /// provisional values pending calibration (OQ-013, PRD-REV-REQ-015).
+    pub confidence: f64,
     /// Finding category: `breaking-change`, `coverage-gap`, or
     /// `cross-repo` (rule family C, TASK-086).
     pub kind: String,
@@ -972,8 +1008,10 @@ pub struct Finding {
     pub rule: String,
     /// Human-readable description.
     pub message: String,
-    /// Stable identity for suppression/dedup (formula is provisional until
-    /// TASK-089's REQ-013 implementation).
+    /// Stable identity for suppression/dedup: SHA-256 hex of
+    /// `rule \x1f kind \x1f file \x1f symbol \x1f fold(anchor_text)` — the
+    /// line number is deliberately absent so line shifts cannot change it
+    /// (PRD-REV-REQ-013; see [`crate::review::finding_identity`]).
     pub identity: String,
     /// Affected symbols as context for the finding (PRD-REV-REQ-002).
     pub related: Vec<SymbolRef>,
@@ -1084,6 +1122,29 @@ pub struct CallPathHop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finding_severity_from_str_valid_tiers() {
+        assert_eq!(
+            "blocking".parse::<FindingSeverity>().unwrap(),
+            FindingSeverity::Blocking
+        );
+        assert_eq!(
+            "warning".parse::<FindingSeverity>().unwrap(),
+            FindingSeverity::Warning
+        );
+        assert_eq!(
+            "note".parse::<FindingSeverity>().unwrap(),
+            FindingSeverity::Note
+        );
+    }
+
+    #[test]
+    fn finding_severity_from_str_rejects_unknown() {
+        assert!("fatal".parse::<FindingSeverity>().is_err());
+        assert!("BLOCKING".parse::<FindingSeverity>().is_err());
+        assert!("".parse::<FindingSeverity>().is_err());
+    }
 
     #[test]
     fn contract_kind_as_str_segments() {

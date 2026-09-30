@@ -382,30 +382,54 @@ pub fn parse_diff_hunks(diff_output: &str) -> Vec<(usize, usize)> {
 }
 
 /// Parse multi-file `git diff --unified=0` output into per-file hunk maps,
-/// carrying both sides of every hunk.
+/// carrying both sides of every hunk plus the text of every removed line.
 ///
 /// With `--unified=0` a hunk has no context lines, so `removed_ranges` is
 /// exactly the removed lines of the pre-change file and `new_ranges` exactly
-/// the added lines of the post-change file.
+/// the added lines of the post-change file; `removed_lines` keys the same
+/// removed lines by old-side number, so every tier-2 anchor has text
+/// (TASK-089).
 fn parse_all_diff_hunks_sides(diff_output: &str) -> HashMap<String, FileDiffHunks> {
     let mut result: HashMap<String, FileDiffHunks> = HashMap::new();
     let mut current_file: Option<String> = None;
+    // Old-side line number of the next body line; None between hunks, so
+    // `--- a/x` file headers (which only appear before the first `@@` of a
+    // file) can never be misread as a removed line.
+    let mut old_line: Option<usize> = None;
 
     for line in diff_output.lines() {
         if let Some(rest) = line.strip_prefix("diff --git a/") {
             // Extract the b/ path: "diff --git a/foo b/foo"
+            old_line = None;
             if let Some(b_pos) = rest.find(" b/") {
                 current_file = Some(rest[b_pos + 3..].to_string());
             }
-        } else if line.starts_with("@@")
-            && let (Some(file), Some(sides)) = (&current_file, parse_hunk_header_sides(line))
-        {
-            let entry = result.entry(file.clone()).or_default();
-            if let Some(old) = sides.old {
-                entry.removed_ranges.push(old);
+        } else if line.starts_with("@@") {
+            old_line = None;
+            if let (Some(file), Some(sides)) = (&current_file, parse_hunk_header_sides(line)) {
+                let entry = result.entry(file.clone()).or_default();
+                if let Some(old) = sides.old {
+                    entry.removed_ranges.push(old);
+                    old_line = Some(old.0);
+                }
+                if let Some(new) = sides.new {
+                    entry.new_ranges.push(new);
+                }
             }
-            if let Some(new) = sides.new {
-                entry.new_ranges.push(new);
+        } else if let Some(counter) = old_line.as_mut() {
+            // Hunk body. Added lines advance only the new side; the
+            // "\ No newline at end of file" marker is metadata for neither.
+            if let Some(text) = line.strip_prefix('-') {
+                if let Some(file) = &current_file {
+                    result
+                        .entry(file.clone())
+                        .or_default()
+                        .removed_lines
+                        .insert(*counter, text.to_string());
+                }
+                *counter += 1;
+            } else if line.starts_with(' ') {
+                *counter += 1;
             }
         }
     }
@@ -1838,6 +1862,89 @@ deleted file mode 100644
     #[test]
     fn parse_all_diff_hunks_sides_empty_input() {
         assert!(parse_all_diff_hunks_sides("").is_empty());
+    }
+
+    // -- removed_lines text capture (TASK-089, REQ-013 anchor text) ----------
+
+    #[test]
+    fn parse_all_diff_hunks_sides_captures_removed_line_text() {
+        // Body lines keyed by old line number, '-' prefix stripped; added,
+        // context, and no-newline marker lines never land in the map.
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,3 +1,4 @@
+-old one
+ context line
++new line
+-old three
+diff --git a/src/b.rs b/src/b.rs
+deleted file mode 100644
+--- a/src/b.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-b one
+\\ No newline at end of file
+-b two
+diff --git a/src/c.rs b/src/c.rs
+new file mode 100644
+--- /dev/null
++++ b/src/c.rs
+@@ -0,0 +1,2 @@
++c one
++c two
+";
+        let result = parse_all_diff_hunks_sides(diff);
+        let a = &result["src/a.rs"];
+        assert_eq!(a.removed_lines.get(&1), Some(&"old one".to_string()));
+        assert_eq!(a.removed_lines.get(&3), Some(&"old three".to_string()));
+        assert_eq!(a.removed_lines.len(), 2, "context/added lines excluded");
+        // A whole-file deletion still carries its text.
+        let b = &result["src/b.rs"];
+        assert_eq!(b.removed_lines.get(&1), Some(&"b one".to_string()));
+        assert_eq!(b.removed_lines.get(&2), Some(&"b two".to_string()));
+        // A pure addition captures nothing on the old side.
+        let c = &result["src/c.rs"];
+        assert!(c.removed_lines.is_empty());
+    }
+
+    #[test]
+    fn parse_all_diff_hunks_sides_removed_lines_counter_resets_per_hunk() {
+        // The old-side counter restarts from each hunk header, continuing the
+        // file's old-side numbering across hunks.
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,2 +1,2 @@
+-x
++y
+@@ -10,1 +11,1 @@
+-z
++w
+";
+        let result = parse_all_diff_hunks_sides(diff);
+        let a = &result["src/a.rs"];
+        assert_eq!(a.removed_lines.get(&1), Some(&"x".to_string()));
+        assert_eq!(a.removed_lines.get(&10), Some(&"z".to_string()));
+        assert_eq!(a.removed_lines.len(), 2);
+    }
+
+    #[test]
+    fn parse_all_diff_hunks_sides_header_only_diff_has_no_removed_lines() {
+        // The pre-existing header-only fixtures carry no body: the map stays
+        // empty rather than inventing text.
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,3 +1,4 @@
+@@ -10,2 +12,0 @@
+";
+        let result = parse_all_diff_hunks_sides(diff);
+        assert!(result["src/a.rs"].removed_lines.is_empty());
+        assert_eq!(result["src/a.rs"].removed_ranges, vec![(1, 3), (10, 11)]);
     }
 
     // -- map_hunks_to_symbols tests -------------------------------------------

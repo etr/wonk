@@ -1963,6 +1963,12 @@ fn dispatch_review<W: io::Write>(
     fmt: &mut Formatter<W>,
     suppress: bool,
 ) -> Result<()> {
+    // 0. `wonk review suppress ...` manages durable suppressions; it shares
+    // the review's no-auto-init guard, never a review of the diff.
+    if let Some(cmd) = args.suppress {
+        return dispatch_review_suppress(cmd, fmt, suppress);
+    }
+
     // 1. Resolve repo root. No auto-init here (deliberately): the index must
     // reflect the diff's base state, and indexing the current tree would
     // empty the diff and fake an APPROVE.
@@ -1987,13 +1993,18 @@ fn dispatch_review<W: io::Write>(
     };
     let scope = parse_change_scope(&scope_str, base.as_deref())?;
 
-    // 3. Load [review] rule switches and the [reach] kill switch.
+    // 3. Load [review] rule switches, the [reach] kill switch, and the
+    //    REQ-015 filter knobs from the CLI (default off = today's report).
     let config = crate::config::Config::load(Some(&repo_root))?;
     let options = crate::review::ReviewOptions {
         breaking_change: config.review.breaking_change,
         coverage_gap: config.review.coverage_gap,
         cross_repo: config.review.cross_repo,
         reach_enabled: config.reach.enabled,
+        min_confidence: args.min_confidence,
+        min_severity: args.min_severity,
+        kinds: args.kind,
+        max_findings: args.max_findings,
         ..crate::review::ReviewOptions::default()
     };
 
@@ -2013,11 +2024,79 @@ fn dispatch_review<W: io::Write>(
     for warning in &result.warnings {
         output::print_hint(warning, suppress);
     }
+    if let Some(summary) = result.drops.summary_line() {
+        output::print_hint(&summary, suppress);
+    }
     if result.findings.is_empty() {
         output::print_hint("no findings for this scope", suppress);
     }
 
     fmt.format_review(&output::ReviewOutput::from(&result))?;
+    Ok(())
+}
+
+/// `wonk review suppress list|add|remove` (PRD-REV-REQ-014). Same
+/// no-auto-init guard as the review itself: suppressions live in the
+/// index DB, and auto-indexing mid-diff would fake the next review.
+fn dispatch_review_suppress<W: io::Write>(
+    cmd: crate::cli::ReviewSuppressCommand,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+) -> Result<()> {
+    let crate::cli::ReviewSuppressCommand::Suppress { action } = cmd;
+
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
+
+    let conn = db::find_existing_index(&repo_root)
+        .and_then(|path| db::open(&path).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no index found; run `wonk init` first so suppressions land in the \
+                 repository's index"
+            )
+        })?;
+    crate::db::ensure_review_suppressions_table(&conn)?;
+
+    use crate::cli::ReviewSuppressAction;
+    match action {
+        ReviewSuppressAction::List { rule } => {
+            let rows = crate::review::list_suppressions(&conn, rule.as_deref())?;
+            if rows.is_empty() {
+                if rule.is_some() {
+                    output::print_hint("no suppressions for this rule", suppress);
+                } else {
+                    output::print_hint("no suppressions", suppress);
+                }
+                return Ok(());
+            }
+            for row in &rows {
+                fmt.format_suppression(&output::SuppressionOutput::from(row))?;
+            }
+        }
+        ReviewSuppressAction::Add {
+            identity,
+            rule,
+            file,
+            note,
+        } => {
+            crate::review::add_suppression(
+                &conn,
+                &identity,
+                rule.as_deref().unwrap_or(""),
+                file.as_deref().unwrap_or(""),
+                note.as_deref(),
+            )?;
+            output::print_hint(&format!("suppressed {identity}"), suppress);
+        }
+        ReviewSuppressAction::Remove(args) => {
+            let removed =
+                crate::review::remove_suppressions(&conn, &args.identities, args.rule.as_deref())?;
+            output::print_hint(&format!("removed {} suppression(s)", removed), suppress);
+        }
+    }
     Ok(())
 }
 
@@ -6101,6 +6180,11 @@ mod tests {
             scope: "unstaged".into(),
             base: None,
             since: None,
+            min_confidence: None,
+            min_severity: None,
+            kind: Vec::new(),
+            max_findings: None,
+            suppress: None,
         });
         assert!(!is_query_command(&cmd));
     }

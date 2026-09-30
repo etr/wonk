@@ -1,9 +1,14 @@
-//! Diff-scoped review engine (TASK-085).
+//! Diff-scoped review engine (TASK-085, widened 089).
 //!
 //! Pure composition over existing primitives: review never computes impact
 //! of its own — every affected-symbol set is [`crate::blast::analyze_blast`]'s
 //! own output, so `wonk review` and `wonk blast` cannot disagree. Findings
 //! are emitted only (DR-035): no forge posting, no auto-fix.
+//!
+//! Every finding carries a line-independent identity over its
+//! whitespace-folded anchored line (PRD-REV-REQ-013), consulted against the
+//! durable `review_suppressions` table (REQ-014), and every produced finding
+//! is either kept or dropped for exactly one counted reason (REQ-015).
 //!
 //! Index currency caveat (inherited V4 semantics): the index must reflect
 //! the base state of the diff. Re-indexing mid-diff (auto-indexing the
@@ -85,6 +90,33 @@ pub fn resolve_anchor(
     (Some(cur_line), AnchorMethod::PostChangeFile)
 }
 
+/// The text of the line the anchor resolved against (REQ-013's identity
+/// input).
+///
+/// The side follows the tier: tiers 1/3 read the POST-change working-tree
+/// file (`current_lines`, the same side `resolve_anchor` resolved the line
+/// on); [`AnchorMethod::OldSideLine`] reads the PRE-change side — the
+/// removed `-` lines the impact diff already carries. Unresolved anchors
+/// have no text.
+pub fn anchored_line_text(
+    anchor_method: AnchorMethod,
+    line: Option<usize>,
+    hunks: Option<&FileDiffHunks>,
+    current_lines: Option<&[String]>,
+) -> Option<String> {
+    match anchor_method {
+        AnchorMethod::Unresolved => None,
+        AnchorMethod::OldSideLine => {
+            line.and_then(|n| hunks.and_then(|h| h.removed_lines.get(&n)).cloned())
+        }
+        AnchorMethod::NewSideHunk | AnchorMethod::PostChangeFile => line.and_then(|n| {
+            current_lines
+                .and_then(|lines| lines.get(n.checked_sub(1)?))
+                .cloned()
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Verdict (PRD-REV-REQ-005)
 // ---------------------------------------------------------------------------
@@ -129,6 +161,19 @@ pub struct ReviewOptions {
     pub reach_enabled: bool,
     /// Blast traversal depth.
     pub depth: usize,
+    /// Drop findings whose confidence is below this floor
+    /// (PRD-REV-REQ-015). `None` keeps everything.
+    pub min_confidence: Option<f64>,
+    /// Drop findings less severe than this floor (PRD-REV-REQ-015).
+    /// `None` keeps everything.
+    pub min_severity: Option<FindingSeverity>,
+    /// Keep only these finding categories (the `kind` field). Empty keeps
+    /// every category (PRD-REV-REQ-015).
+    pub kinds: Vec<String>,
+    /// Keep at most this many findings after ranking — the cap trims the
+    /// least severe and least confident first (PRD-REV-REQ-015). `None`
+    /// keeps everything.
+    pub max_findings: Option<usize>,
 }
 
 impl Default for ReviewOptions {
@@ -139,6 +184,10 @@ impl Default for ReviewOptions {
             cross_repo: true,
             reach_enabled: true,
             depth: blast::DEFAULT_DEPTH,
+            min_confidence: None,
+            min_severity: None,
+            kinds: Vec::new(),
+            max_findings: None,
         }
     }
 }
@@ -180,31 +229,161 @@ impl CrossRepoInputs {
 pub struct ReviewResult {
     /// The scope that was reviewed.
     pub scope: ChangeScope,
-    /// All findings, sorted by severity (desc), file, line, rule.
+    /// The findings kept after ranking, suppression, filtering, and any
+    /// cap — what the report and the verdict describe.
     pub findings: Vec<Finding>,
     /// Mechanically derived from `findings` by [`derive_verdict`].
     pub verdict: ReviewVerdict,
+    /// Why each produced finding did not make the report, by reason
+    /// (PRD-REV-REQ-015). Zeros included: the object is always present.
+    pub drops: DropCounts,
     /// Non-fatal problems (e.g. a per-symbol blast failure) — findings the
     /// engine could not compute are never silently dropped.
     pub warnings: Vec<String>,
 }
 
+/// Per-reason counts of produced findings that did not make the report
+/// (PRD-REV-REQ-015). Every finding is counted at most once, by the first
+/// stage of [`rank_filter_cap`] that rejects it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DropCounts {
+    /// Confidence below [`ReviewOptions::min_confidence`].
+    pub below_confidence: usize,
+    /// Severity below [`ReviewOptions::min_severity`].
+    pub below_severity: usize,
+    /// Category not in [`ReviewOptions::kinds`].
+    pub out_of_category: usize,
+    /// Ranked past [`ReviewOptions::max_findings`].
+    pub over_cap: usize,
+    /// Identity in the durable `review_suppressions` table.
+    pub identity_suppressed: usize,
+}
+
+impl DropCounts {
+    /// How many produced findings did not make the report, across every
+    /// reason.
+    pub fn total(&self) -> usize {
+        self.below_confidence
+            + self.below_severity
+            + self.out_of_category
+            + self.over_cap
+            + self.identity_suppressed
+    }
+
+    /// One-line human summary of the nonzero reasons, for the text output
+    /// path; `None` when nothing was dropped.
+    pub fn summary_line(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        let reasons = [
+            ("below_confidence", self.below_confidence),
+            ("below_severity", self.below_severity),
+            ("out_of_category", self.out_of_category),
+            ("over_cap", self.over_cap),
+            ("identity_suppressed", self.identity_suppressed),
+        ];
+        let listed: Vec<String> = reasons
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(name, n)| format!("{name}={n}"))
+            .collect();
+        Some(format!(
+            "review dropped {} finding(s): {}",
+            self.total(),
+            listed.join(", ")
+        ))
+    }
+}
+
+/// Rank, suppress, filter, and cap in one pure pass (PRD-REV-REQ-015).
+///
+/// Order is fixed: ranking first (so a cap trims the least severe and
+/// least confident), suppression before the cap (a suppressed finding
+/// must not consume a cap slot), then the confidence floor, the severity
+/// floor, the category filter, and the cap. Each finding is dropped by
+/// exactly one reason — the first rejecting stage — so the kept list plus
+/// every count always equals the input. The verdict is derived by the
+/// caller from the kept list only.
+pub fn rank_filter_cap(
+    findings: Vec<Finding>,
+    suppressed: &HashSet<String>,
+    options: &ReviewOptions,
+) -> (Vec<Finding>, DropCounts) {
+    let mut drops = DropCounts::default();
+    let mut staged = findings;
+    rank_findings(&mut staged);
+
+    let mut kept = Vec::with_capacity(staged.len());
+    for finding in staged {
+        if suppressed.contains(&finding.identity) {
+            drops.identity_suppressed += 1;
+        } else if options
+            .min_confidence
+            .is_some_and(|floor| finding.confidence < floor)
+        {
+            drops.below_confidence += 1;
+        } else if options
+            .min_severity
+            .is_some_and(|floor| finding.severity.rank() < floor.rank())
+        {
+            drops.below_severity += 1;
+        } else if !options.kinds.is_empty()
+            && !options.kinds.iter().any(|kind| kind == &finding.kind)
+        {
+            drops.out_of_category += 1;
+        } else {
+            kept.push(finding);
+        }
+    }
+
+    if let Some(cap) = options.max_findings
+        && kept.len() > cap
+    {
+        drops.over_cap = kept.len() - cap;
+        kept.truncate(cap);
+    }
+    (kept, drops)
+}
+
 // ---------------------------------------------------------------------------
-// Provisional finding identity
+// Finding identity (PRD-REV-REQ-013)
 // ---------------------------------------------------------------------------
 
-/// Provisional finding identity: SHA-256 hex of `rule\x1ffile\x1fsymbol`.
+/// Collapse every whitespace run to a single space and trim, so re-indenting
+/// or reflowing a line leaves the identity untouched while any token change
+/// still alters it (AR-031).
+fn fold_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Stable finding identity: SHA-256 hex of
+/// `rule \x1f kind \x1f file \x1f symbol \x1f fold(anchor_text)`.
 ///
-/// No stability contract — the REQ-013 formula lands in TASK-089, which owns
-/// the suppression key space. The type stays `String` so that swap is not a
-/// breaking change.
-fn provisional_identity(rule: &str, file: &str, symbol: &str) -> String {
+/// The line number is structurally absent — the signature takes no line — so
+/// inserting or removing lines above the finding cannot change its identity.
+/// `kind` is the finding category (`breaking-change`, `coverage-gap`,
+/// `cross-repo`), `file` the repo-relative path exactly as
+/// [`Finding::file`] stores it, `symbol` the owning symbol's name. An
+/// unresolved anchor contributes no fifth component (distinct from a
+/// resolved anchor on a blank line, whose component folds to empty).
+pub fn finding_identity(
+    rule: &str,
+    kind: &str,
+    file: &str,
+    symbol: &str,
+    anchor_text: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(rule.as_bytes());
-    hasher.update([0x1f]);
-    hasher.update(file.as_bytes());
-    hasher.update([0x1f]);
-    hasher.update(symbol.as_bytes());
+    for part in [kind, file, symbol] {
+        hasher.update([0x1f]);
+        hasher.update(part.as_bytes());
+    }
+    if let Some(text) = anchor_text {
+        hasher.update([0x1f]);
+        hasher.update(fold_whitespace(text).as_bytes());
+    }
     hasher
         .finalize()
         .iter()
@@ -212,9 +391,157 @@ fn provisional_identity(rule: &str, file: &str, symbol: &str) -> String {
         .collect()
 }
 
+/// Stamp a rule-constructed finding with its identity — the ONE place
+/// identities are minted for engine output. Rules push `identity:
+/// String::new()`; the anchor text side is a run-review concern the rules
+/// never see.
+fn stamp_identity(mut finding: Finding, cs: &ChangedSymbol, anchor_text: Option<&str>) -> Finding {
+    finding.identity = finding_identity(
+        &finding.rule,
+        &finding.kind,
+        &finding.file,
+        &cs.name,
+        anchor_text,
+    );
+    finding
+}
+
+// ---------------------------------------------------------------------------
+// Suppression storage (PRD-REV-REQ-014)
+// ---------------------------------------------------------------------------
+
+/// One durable suppression row: a retired finding identity plus the display
+/// metadata that makes the list self-describing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suppression {
+    /// The suppressed finding's identity (the lookup key).
+    pub identity: String,
+    /// The finding's rule, retained for listing and bulk `--rule` removal.
+    pub rule: String,
+    /// The finding's file, retained for listing.
+    pub file: String,
+    /// Why the finding was retired, when the author said so.
+    pub note: Option<String>,
+    /// When the suppression was recorded (epoch seconds).
+    pub created_at: i64,
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Record (or refresh) a suppression. Upsert keyed on identity: re-adding
+/// refreshes the rule/file/note display fields instead of duplicating.
+pub fn add_suppression(
+    conn: &Connection,
+    identity: &str,
+    rule: &str,
+    file: &str,
+    note: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO review_suppressions (identity, rule, file, note, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(identity) DO UPDATE SET \
+         rule = excluded.rule, file = excluded.file, note = excluded.note",
+        rusqlite::params![identity, rule, file, note, now_epoch_secs()],
+    )?;
+    Ok(())
+}
+
+/// List suppressions, newest first, ordered by `created_at` then `identity`
+/// (within one second, insertion order is arbitrary — identity makes the
+/// listing deterministic). `rule` filters to one rule family.
+pub fn list_suppressions(conn: &Connection, rule: Option<&str>) -> Result<Vec<Suppression>> {
+    let mut stmt = conn.prepare(
+        "SELECT identity, rule, file, note, created_at FROM review_suppressions \
+         WHERE (?1 IS NULL OR rule = ?1) \
+         ORDER BY created_at DESC, identity",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![rule], |row| {
+        Ok(Suppression {
+            identity: row.get(0)?,
+            rule: row.get(1)?,
+            file: row.get(2)?,
+            note: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Remove suppressions by identity and/or rule (whichever is given; both is
+/// the union) and return how many rows went.
+pub fn remove_suppressions(
+    conn: &Connection,
+    identities: &[String],
+    rule: Option<&str>,
+) -> Result<usize> {
+    if identities.is_empty() && rule.is_none() {
+        return Ok(0);
+    }
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if !identities.is_empty() {
+        let placeholders = identities
+            .iter()
+            .map(|id| {
+                params.push(Box::new(id.clone()));
+                format!("?{}", params.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        conditions.push(format!("identity IN ({placeholders})"));
+    }
+    if let Some(rule) = rule {
+        params.push(Box::new(rule.to_string()));
+        conditions.push(format!("rule = ?{}", params.len()));
+    }
+    let sql = format!(
+        "DELETE FROM review_suppressions WHERE {}",
+        conditions.join(" OR ")
+    );
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    Ok(conn.execute(sql.as_str(), refs.as_slice())?)
+}
+
+/// The identities currently suppressed — the set [`run_review`] consults
+/// before keeping a finding.
+pub fn suppressed_identities(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT identity FROM review_suppressions")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<HashSet<_>, _>>()?)
+}
+
 // ---------------------------------------------------------------------------
 // Rule family A — breaking change (PRD-REV-REQ-006)
 // ---------------------------------------------------------------------------
+
+/// Fixed confidence for coverage-gap findings (rule B). Provisional value;
+/// OQ-013 owns calibration (PRD-REV-REQ-015).
+pub const COVERAGE_GAP_CONFIDENCE: f64 = 0.8;
+
+/// Fixed confidence for cross-repo findings (rule C). Provisional value;
+/// OQ-013 owns calibration (PRD-REV-REQ-015).
+pub const CROSS_REPO_CONFIDENCE: f64 = 0.8;
+
+/// Rank findings worst-first: severity desc, then confidence desc, then
+/// file, line, rule (PRD-REV-REQ-015). The rank order decides which
+/// findings a cap trims — the least severe and least confident go first.
+pub fn rank_findings(findings: &mut [Finding]) {
+    findings.sort_by(|a, b| {
+        b.severity
+            .rank()
+            .cmp(&a.severity.rank())
+            .then_with(|| b.confidence.total_cmp(&a.confidence))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule.cmp(&b.rule))
+    });
+}
 
 /// Format the caller-name list: up to three names, then ` (+k more)`.
 fn format_caller_names(names: &[&str]) -> String {
@@ -256,6 +583,12 @@ fn rule_breaking_change(
     }
 
     let names: Vec<&str> = surviving.iter().map(|s| s.name.as_str()).collect();
+    // REQ-015: data-derived confidence — the strongest surviving caller
+    // edge. (A caller deleted in the same diff never reaches `surviving`.)
+    let confidence = surviving
+        .iter()
+        .map(|s| s.confidence)
+        .fold(f64::NEG_INFINITY, f64::max);
     let (rule, message) = if cs.change_type == crate::types::ChangeType::Removed {
         (
             "breaking-change/removed-symbol-with-callers",
@@ -285,10 +618,11 @@ fn rule_breaking_change(
         line,
         anchor_method,
         severity: FindingSeverity::Blocking,
+        confidence,
         kind: "breaking-change".into(),
         rule: rule.into(),
         message,
-        identity: provisional_identity(rule, &cs.file, &cs.name),
+        identity: String::new(),
         related: surviving
             .iter()
             .map(|s| SymbolRef {
@@ -350,10 +684,11 @@ fn rule_coverage_gap(
         line,
         anchor_method,
         severity: FindingSeverity::Warning,
+        confidence: COVERAGE_GAP_CONFIDENCE,
         kind: "coverage-gap".into(),
         rule: rule.into(),
         message,
-        identity: provisional_identity(rule, &cs.file, &cs.name),
+        identity: String::new(),
         related: context
             .tiers
             .iter()
@@ -461,10 +796,11 @@ fn rule_cross_repo(
         line,
         anchor_method,
         severity: FindingSeverity::Warning,
+        confidence: CROSS_REPO_CONFIDENCE,
         kind: "cross-repo".into(),
         rule: rule.into(),
         message,
-        identity: provisional_identity(rule, &cs.file, &cs.name),
+        identity: String::new(),
         related,
     })
 }
@@ -514,6 +850,11 @@ pub fn run_review(
     let mut warnings = Vec::new();
     let mut findings = Vec::new();
 
+    // Durable suppressions (PRD-REV-REQ-014): consulted before a finding is
+    // kept. The ensure covers pre-TASK-089 indexes (a no-op otherwise).
+    crate::db::ensure_review_suppressions_table(conn)?;
+    let suppressed = suppressed_identities(conn)?;
+
     // Callers removed in this same diff are dead code, not breakage.
     let removed: HashSet<(String, crate::types::SymbolKind)> = detail
         .analysis
@@ -525,6 +866,8 @@ pub fn run_review(
 
     // Per-file cache of current-file symbols for tier-3 re-resolution.
     let mut current_cache: HashMap<String, Option<Vec<Symbol>>> = HashMap::new();
+    // Per-file cache of current-file LINES — the tier 1/3 anchor-text side.
+    let mut current_lines_cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
 
     // Outer = attempted (None until the first rule-C candidate with
     // provider contracts); inner = the resolution, None when it failed.
@@ -589,13 +932,30 @@ pub fn run_review(
             current_cache.insert(cs.file.clone(), parsed);
         }
         let current_symbols = current_cache.get(&cs.file).and_then(|opt| opt.as_deref());
+        if !current_lines_cache.contains_key(&cs.file) {
+            let lines = std::fs::read_to_string(repo_root.join(&cs.file))
+                .ok()
+                .map(|s| s.lines().map(str::to_string).collect::<Vec<_>>());
+            current_lines_cache.insert(cs.file.clone(), lines);
+        }
+        let current_lines = current_lines_cache
+            .get(&cs.file)
+            .and_then(|opt| opt.as_deref());
         let (line, anchor_method) = resolve_anchor(cs, detail.hunks.get(&cs.file), current_symbols);
+        // Anchor text is resolved once per symbol: the side the anchor
+        // resolved against, feeding the identity stamped at the push seam.
+        let anchor_text = anchored_line_text(
+            anchor_method,
+            line,
+            detail.hunks.get(&cs.file),
+            current_lines,
+        );
 
         if rule_a_candidate
             && let Some(ref context) = context
             && let Some(finding) = rule_breaking_change(cs, context, &removed, line, anchor_method)
         {
-            findings.push(finding);
+            findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
         }
 
         if rule_b_candidate && let Some(ref context) = context {
@@ -614,7 +974,7 @@ pub fn run_review(
                     if let Some(finding) =
                         rule_coverage_gap(cs, &with_tests, context, line, anchor_method)
                     {
-                        findings.push(finding);
+                        findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
                     }
                 }
                 Err(e) => warnings.push(format!(
@@ -645,7 +1005,7 @@ pub fn run_review(
                             && let Some(finding) =
                                 rule_cross_repo(cs, &ids, resolution, line, anchor_method)
                         {
-                            findings.push(finding);
+                            findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
                         }
                     }
                     Err(e) => warnings.push(format!(
@@ -666,13 +1026,11 @@ pub fn run_review(
         }
     }
 
-    findings.sort_by(|a, b| {
-        b.severity
-            .cmp(&a.severity)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.rule.cmp(&b.rule))
-    });
+    // One pure pass decides what the report contains (PRD-REV-REQ-015):
+    // suppressed identities never reach the report or the verdict — a
+    // retired false positive is not a finding of this run — and the
+    // verdict derives from what is kept.
+    let (findings, drops) = rank_filter_cap(findings, &suppressed, options);
 
     let verdict = derive_verdict(&findings);
 
@@ -680,6 +1038,7 @@ pub fn run_review(
         scope: scope.clone(),
         findings,
         verdict,
+        drops,
         warnings,
     })
 }
@@ -732,12 +1091,362 @@ mod tests {
             line: Some(1),
             anchor_method: crate::types::AnchorMethod::PostChangeFile,
             severity,
+            confidence: 0.5,
             kind: "test".into(),
             rule: "test/rule".into(),
             message: "msg".into(),
             identity: "id".into(),
             related: vec![],
         }
+    }
+
+    // -- finding identity (TASK-089, PRD-REV-REQ-013) ---------------------------
+
+    #[test]
+    fn identity_is_64_hex_characters() {
+        let id = finding_identity(
+            "breaking-change/removed-symbol-with-callers",
+            "breaking-change",
+            "src/lib.rs",
+            "used",
+            Some("pub fn used() {}"),
+        );
+        assert_eq!(id.len(), 64);
+        assert!(
+            id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "identity must be lowercase hex, got {id}"
+        );
+    }
+
+    #[test]
+    fn identity_survives_whitespace_only_reformat() {
+        // Re-indenting or reflowing the anchored line changes no token, so
+        // the folded text — and the identity — is unchanged (REQ-013).
+        let compact = finding_identity("r", "k", "src/lib.rs", "f", Some("fn f(x: i32) -> i32 {"));
+        let reindented = finding_identity(
+            "r",
+            "k",
+            "src/lib.rs",
+            "f",
+            Some("  fn  f(x: i32)\t->  i32  {\n"),
+        );
+        assert_eq!(compact, reindented);
+    }
+
+    #[test]
+    fn identity_changes_when_any_component_changes() {
+        let base = finding_identity("r", "k", "src/lib.rs", "f", Some("fn f() {}"));
+        assert_ne!(
+            finding_identity("other", "k", "src/lib.rs", "f", Some("fn f() {}")),
+            base,
+            "rule is signed"
+        );
+        assert_ne!(
+            finding_identity("r", "coverage-gap", "src/lib.rs", "f", Some("fn f() {}")),
+            base,
+            "kind is signed"
+        );
+        assert_ne!(
+            finding_identity("r", "k", "src/other.rs", "f", Some("fn f() {}")),
+            base,
+            "file is signed"
+        );
+        assert_ne!(
+            finding_identity("r", "k", "src/lib.rs", "g", Some("fn f() {}")),
+            base,
+            "symbol is signed"
+        );
+        assert_ne!(
+            finding_identity("r", "k", "src/lib.rs", "f", Some("fn f(x: u64) {}")),
+            base,
+            "any token change on the anchored line is signed (AR-031)"
+        );
+    }
+
+    #[test]
+    fn identity_unresolved_anchor_is_deterministic_and_distinct_from_blank_line() {
+        let unresolved = finding_identity("r", "k", "src/lib.rs", "f", None);
+        assert_eq!(
+            unresolved,
+            finding_identity("r", "k", "src/lib.rs", "f", None),
+            "unresolved anchors hash deterministically"
+        );
+        // A resolved anchor on a blank line folds to an empty component;
+        // an unresolved anchor contributes no component at all — the two
+        // must never collide.
+        assert_ne!(
+            unresolved,
+            finding_identity("r", "k", "src/lib.rs", "f", Some("")),
+            "unresolved must not collide with a resolved blank line"
+        );
+        // Unresolved identities still distinguish rule/file/symbol.
+        assert_ne!(
+            unresolved,
+            finding_identity("r", "k", "src/lib.rs", "g", None)
+        );
+    }
+
+    // -- confidence + ranking (TASK-089, PRD-REV-REQ-015) -----------------------
+
+    fn ranked(
+        severity: FindingSeverity,
+        confidence: f64,
+        file: &str,
+        line: Option<usize>,
+        rule: &str,
+    ) -> Finding {
+        Finding {
+            file: file.into(),
+            line,
+            anchor_method: AnchorMethod::PostChangeFile,
+            severity,
+            kind: "test".into(),
+            rule: rule.into(),
+            message: "m".into(),
+            identity: format!("id-{rule}"),
+            confidence,
+            related: vec![],
+        }
+    }
+
+    #[test]
+    fn coverage_gap_and_cross_repo_confidence_consts_are_calibrated() {
+        // The fixed confidences are provisional by design (OQ-013 owns
+        // calibration); pinning the values here makes a later re-tuning a
+        // visible, reviewed change.
+        assert_eq!(COVERAGE_GAP_CONFIDENCE, 0.8);
+        assert_eq!(CROSS_REPO_CONFIDENCE, 0.8);
+        assert!(
+            (0.0..=1.0).contains(&COVERAGE_GAP_CONFIDENCE)
+                && (0.0..=1.0).contains(&CROSS_REPO_CONFIDENCE),
+            "confidence is a [0, 1] quantity"
+        );
+    }
+
+    #[test]
+    fn ranking_is_severity_desc_then_confidence_desc_then_file_line_rule() {
+        let mut findings = vec![
+            ranked(FindingSeverity::Note, 0.99, "src/a.rs", Some(1), "r-note"),
+            ranked(FindingSeverity::Warning, 0.5, "src/a.rs", Some(9), "r-a9"),
+            ranked(FindingSeverity::Warning, 0.9, "src/b.rs", Some(2), "r-conf"),
+            ranked(FindingSeverity::Warning, 0.5, "src/a.rs", Some(2), "r-a2b"),
+            ranked(FindingSeverity::Warning, 0.5, "src/a.rs", Some(2), "r-a2a"),
+            ranked(
+                FindingSeverity::Blocking,
+                0.1,
+                "src/z.rs",
+                Some(1),
+                "r-block",
+            ),
+        ];
+        rank_findings(&mut findings);
+        let rules: Vec<&str> = findings.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(
+            rules,
+            vec!["r-block", "r-conf", "r-a2a", "r-a2b", "r-a9", "r-note"],
+            "severity desc, then confidence desc, then file, line, rule"
+        );
+    }
+
+    #[test]
+    fn ranking_unresolved_lines_sort_first_within_their_tier() {
+        let mut findings = vec![
+            ranked(
+                FindingSeverity::Warning,
+                0.5,
+                "src/a.rs",
+                Some(4),
+                "r-lined",
+            ),
+            ranked(
+                FindingSeverity::Warning,
+                0.5,
+                "src/a.rs",
+                None,
+                "r-unanchored",
+            ),
+        ];
+        rank_findings(&mut findings);
+        assert_eq!(findings[0].rule, "r-unanchored");
+    }
+
+    // -- filter + cap pipeline (TASK-089, PRD-REV-REQ-015) ----------------------
+
+    fn pipelined(severity: FindingSeverity, confidence: f64, kind: &str, rule: &str) -> Finding {
+        Finding {
+            kind: kind.into(),
+            ..ranked(severity, confidence, "src/a.rs", Some(1), rule)
+        }
+    }
+
+    #[test]
+    fn cap_trims_the_least_severe_and_counts_over_cap() {
+        let findings = vec![
+            pipelined(FindingSeverity::Note, 0.9, "test", "r-note"),
+            pipelined(FindingSeverity::Warning, 0.5, "test", "r-warn-lo"),
+            pipelined(FindingSeverity::Warning, 0.9, "test", "r-warn-hi"),
+            pipelined(FindingSeverity::Blocking, 0.1, "test", "r-block"),
+        ];
+        let options = ReviewOptions {
+            max_findings: Some(2),
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
+        let rules: Vec<&str> = kept.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, vec!["r-block", "r-warn-hi"], "cap keeps the worst");
+        assert_eq!(drops.over_cap, 2);
+        assert_eq!(
+            drops,
+            DropCounts {
+                over_cap: 2,
+                ..DropCounts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn each_stage_counts_only_its_own_drops() {
+        // One finding per stage, each dropped by exactly the first stage
+        // that rejects it — plus one that rejects on none.
+        let findings = vec![
+            pipelined(FindingSeverity::Warning, 0.3, "test", "r-conf"),
+            pipelined(FindingSeverity::Note, 0.9, "test", "r-sev"),
+            pipelined(FindingSeverity::Warning, 0.9, "other", "r-kind"),
+            pipelined(FindingSeverity::Blocking, 0.9, "test", "r-kept"),
+        ];
+        let options = ReviewOptions {
+            min_confidence: Some(0.5),
+            min_severity: Some(FindingSeverity::Warning),
+            kinds: vec!["test".into()],
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
+        assert_eq!(
+            kept.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>(),
+            vec!["r-kept"]
+        );
+        assert_eq!(drops.below_confidence, 1);
+        assert_eq!(drops.below_severity, 1);
+        assert_eq!(drops.out_of_category, 1);
+        assert_eq!(drops.over_cap, 0);
+        assert_eq!(drops.identity_suppressed, 0);
+    }
+
+    #[test]
+    fn suppressed_findings_never_count_as_any_other_drop() {
+        // The suppressed finding is also below every filter floor — the
+        // first rejecting stage is suppression, so it must be counted
+        // there and only there.
+        let findings = vec![
+            pipelined(FindingSeverity::Note, 0.1, "other", "r-sup"),
+            pipelined(FindingSeverity::Blocking, 0.9, "test", "r-kept"),
+        ];
+        let suppressed: HashSet<String> = ["id-r-sup"].into_iter().map(str::to_string).collect();
+        let options = ReviewOptions {
+            min_confidence: Some(0.5),
+            min_severity: Some(FindingSeverity::Warning),
+            kinds: vec!["test".into()],
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &suppressed, &options);
+        assert_eq!(
+            kept.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>(),
+            vec!["r-kept"]
+        );
+        assert_eq!(drops.identity_suppressed, 1);
+        assert_eq!(drops.below_confidence, 0);
+        assert_eq!(drops.below_severity, 0);
+        assert_eq!(drops.out_of_category, 0);
+    }
+
+    #[test]
+    fn kept_plus_every_drop_reason_equals_produced() {
+        let findings = vec![
+            pipelined(FindingSeverity::Note, 0.2, "other", "r-a"),
+            pipelined(FindingSeverity::Warning, 0.5, "test", "r-b"),
+            pipelined(FindingSeverity::Blocking, 0.95, "test", "r-c"),
+            pipelined(FindingSeverity::Warning, 0.9, "test", "r-d"),
+            pipelined(FindingSeverity::Warning, 0.4, "test", "r-e"),
+        ];
+        let suppressed: HashSet<String> = ["id-r-c"].into_iter().map(str::to_string).collect();
+        let options = ReviewOptions {
+            min_confidence: Some(0.45),
+            min_severity: Some(FindingSeverity::Warning),
+            kinds: vec!["test".into()],
+            max_findings: Some(1),
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &suppressed, &options);
+        let total = kept.len()
+            + drops.identity_suppressed
+            + drops.below_confidence
+            + drops.below_severity
+            + drops.out_of_category
+            + drops.over_cap;
+        assert_eq!(total, 5, "every finding is kept or dropped exactly once");
+    }
+
+    #[test]
+    fn all_filters_off_keeps_everything_with_zero_drops() {
+        let findings = vec![
+            pipelined(FindingSeverity::Note, 0.1, "other", "r-a"),
+            pipelined(FindingSeverity::Blocking, 0.9, "test", "r-b"),
+        ];
+        let expected: Vec<String> = vec!["r-b".into(), "r-a".into()];
+        let (kept, drops) =
+            rank_filter_cap(findings.clone(), &HashSet::new(), &ReviewOptions::default());
+        assert_eq!(
+            kept.iter().map(|f| f.rule.clone()).collect::<Vec<_>>(),
+            expected,
+            "defaults are today's behavior: rank only"
+        );
+        assert_eq!(drops, DropCounts::default());
+    }
+
+    #[test]
+    fn confidence_floor_is_inclusive() {
+        let findings = vec![pipelined(FindingSeverity::Warning, 0.5, "test", "r-at")];
+        let options = ReviewOptions {
+            min_confidence: Some(0.5),
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
+        assert_eq!(kept.len(), 1, "a finding AT the floor survives");
+        assert_eq!(drops.below_confidence, 0);
+    }
+
+    #[test]
+    fn drop_counts_summary_line_lists_only_nonzero_reasons() {
+        assert_eq!(DropCounts::default().summary_line(), None);
+        assert_eq!(
+            DropCounts {
+                below_confidence: 2,
+                over_cap: 1,
+                ..DropCounts::default()
+            }
+            .summary_line()
+            .as_deref(),
+            Some("review dropped 3 finding(s): below_confidence=2, over_cap=1")
+        );
+    }
+
+    #[test]
+    fn severity_floor_keeps_the_named_tier_and_above() {
+        let findings = vec![
+            pipelined(FindingSeverity::Blocking, 0.9, "test", "r-block"),
+            pipelined(FindingSeverity::Warning, 0.9, "test", "r-warn"),
+            pipelined(FindingSeverity::Note, 0.9, "test", "r-note"),
+        ];
+        let options = ReviewOptions {
+            min_severity: Some(FindingSeverity::Warning),
+            ..ReviewOptions::default()
+        };
+        let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
+        assert_eq!(
+            kept.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>(),
+            vec!["r-block", "r-warn"]
+        );
+        assert_eq!(drops.below_severity, 1);
     }
 
     // -- resolve_anchor table tests ---------------------------------------------
@@ -756,6 +1465,7 @@ mod tests {
         FileDiffHunks {
             new_ranges: new,
             removed_ranges: removed,
+            removed_lines: HashMap::new(),
         }
     }
 
@@ -900,6 +1610,178 @@ mod tests {
 
     // -- Display strings ---------------------------------------------------------
 
+    // -- anchored-line text (TASK-089, PRD-REV-REQ-013) -------------------------
+
+    fn removed_hunks(lines: &[(usize, &str)]) -> FileDiffHunks {
+        FileDiffHunks {
+            removed_lines: lines.iter().map(|&(n, t)| (n, t.to_string())).collect(),
+            ..hunks(vec![], vec![])
+        }
+    }
+
+    #[test]
+    fn anchored_line_text_new_side_reads_post_change_file() {
+        let h = hunks(vec![(2, 2)], vec![]);
+        let lines = vec!["one".to_string(), "pub fn f(x: i32) {".to_string()];
+        assert_eq!(
+            anchored_line_text(AnchorMethod::NewSideHunk, Some(2), Some(&h), Some(&lines)),
+            Some("pub fn f(x: i32) {".to_string())
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_post_change_reads_post_change_file() {
+        let lines = vec!["one".to_string(), "two".to_string(), "fn g() {".to_string()];
+        assert_eq!(
+            anchored_line_text(AnchorMethod::PostChangeFile, Some(3), None, Some(&lines)),
+            Some("fn g() {".to_string())
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_old_side_reads_removed_lines_from_diff() {
+        // Tier-2 anchors read the pre-change side: the removed `-` lines the
+        // impact diff already carries, never the post-change file (whatever
+        // now occupies that line is unrelated code).
+        let h = removed_hunks(&[(1, "pub fn used() {}")]);
+        let lines = vec!["pub fn caller() { used(); }".to_string()];
+        assert_eq!(
+            anchored_line_text(AnchorMethod::OldSideLine, Some(1), Some(&h), Some(&lines)),
+            Some("pub fn used() {}".to_string())
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_old_side_without_text_is_none() {
+        assert_eq!(
+            anchored_line_text(AnchorMethod::OldSideLine, Some(1), None, None),
+            None,
+            "no hunks, no old-side text"
+        );
+        let h = removed_hunks(&[(4, "x")]);
+        assert_eq!(
+            anchored_line_text(AnchorMethod::OldSideLine, Some(7), Some(&h), None),
+            None,
+            "line not among the removed lines"
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_unresolved_is_none() {
+        assert_eq!(
+            anchored_line_text(AnchorMethod::Unresolved, None, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn anchored_line_text_out_of_range_post_change_is_none() {
+        // The file shrank below the anchored line: honest None over a panic
+        // or a wrong line's text.
+        let lines = vec!["one".to_string()];
+        assert_eq!(
+            anchored_line_text(AnchorMethod::PostChangeFile, Some(9), None, Some(&lines)),
+            None
+        );
+    }
+
+    // -- suppression storage (TASK-089, PRD-REV-REQ-014) ------------------------
+
+    fn suppression_conn() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("index.db")).unwrap();
+        crate::db::ensure_review_suppressions_table(&conn).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn suppression_round_trip_lists_every_field() {
+        let (_dir, conn) = suppression_conn();
+        add_suppression(
+            &conn,
+            "abc123",
+            "coverage-gap/no-test-in-blast-radius",
+            "src/lib.rs",
+            Some("confirmed false positive"),
+        )
+        .unwrap();
+
+        let rows = list_suppressions(&conn, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity, "abc123");
+        assert_eq!(rows[0].rule, "coverage-gap/no-test-in-blast-radius");
+        assert_eq!(rows[0].file, "src/lib.rs");
+        assert_eq!(rows[0].note.as_deref(), Some("confirmed false positive"));
+        assert!(
+            rows[0].created_at > 0,
+            "created_at is epoch seconds, always positive"
+        );
+    }
+
+    #[test]
+    fn suppression_add_is_upsert_refreshing_rule_file_note() {
+        // Re-adding an identity refreshes its display fields rather than
+        // failing or duplicating the row.
+        let (_dir, conn) = suppression_conn();
+        add_suppression(&conn, "abc", "old-rule", "old.rs", Some("old note")).unwrap();
+        add_suppression(&conn, "abc", "new-rule", "new.rs", None).unwrap();
+
+        let rows = list_suppressions(&conn, None).unwrap();
+        assert_eq!(rows.len(), 1, "upsert, not insert: {rows:?}");
+        assert_eq!(rows[0].rule, "new-rule");
+        assert_eq!(rows[0].file, "new.rs");
+        assert_eq!(rows[0].note, None);
+    }
+
+    #[test]
+    fn suppression_remove_by_identities_empties_and_counts() {
+        let (_dir, conn) = suppression_conn();
+        add_suppression(&conn, "a", "r", "f", None).unwrap();
+        add_suppression(&conn, "b", "r", "f", None).unwrap();
+
+        let removed = remove_suppressions(&conn, &["a".to_string()], None).unwrap();
+        assert_eq!(removed, 1);
+        let expected: HashSet<String> = ["b".to_string()].into_iter().collect();
+        assert_eq!(suppressed_identities(&conn).unwrap(), expected);
+
+        // Removing a missing identity counts zero, not an error.
+        assert_eq!(remove_suppressions(&conn, &["a".into()], None).unwrap(), 0);
+    }
+
+    #[test]
+    fn suppression_bulk_remove_by_rule_counts_only_matching() {
+        let (_dir, conn) = suppression_conn();
+        add_suppression(&conn, "a", "rule-one", "f", None).unwrap();
+        add_suppression(&conn, "b", "rule-one", "f", None).unwrap();
+        add_suppression(&conn, "c", "rule-two", "f", None).unwrap();
+
+        assert_eq!(
+            remove_suppressions(&conn, &[], Some("rule-one")).unwrap(),
+            2,
+            "only the rule's rows are removed"
+        );
+        let expected: HashSet<String> = ["c".to_string()].into_iter().collect();
+        assert_eq!(suppressed_identities(&conn).unwrap(), expected);
+    }
+
+    #[test]
+    fn suppression_list_filters_by_rule_and_orders_created_at_then_identity() {
+        let (_dir, conn) = suppression_conn();
+        add_suppression(&conn, "zzz", "wanted", "f", None).unwrap();
+        add_suppression(&conn, "aaa", "wanted", "f", None).unwrap();
+        add_suppression(&conn, "other", "unwanted", "f", None).unwrap();
+
+        let rows = list_suppressions(&conn, Some("wanted")).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.identity.as_str()).collect::<Vec<_>>(),
+            vec!["aaa", "zzz"],
+            "same created_at second falls back to ascending identity order"
+        );
+
+        let all = list_suppressions(&conn, None).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
     #[test]
     fn display_strings_are_stable() {
         assert_eq!(ReviewVerdict::Block.to_string(), "BLOCK");
@@ -926,6 +1808,23 @@ mod tests {
             .arg("--version")
             .output()
             .is_ok_and(|o| o.status.success())
+    }
+
+    /// Every stamped identity is 64 lowercase hex characters.
+    fn assert_stable_identity(f: &Finding) {
+        assert_hex_identity(&f.identity);
+    }
+
+    fn assert_hex_identity(identity: &str) {
+        assert_eq!(
+            identity.len(),
+            64,
+            "identity must be sha256 hex: {identity}"
+        );
+        assert!(
+            identity.bytes().all(|b| b.is_ascii_hexdigit()),
+            "identity must be hex: {identity}"
+        );
     }
 
     /// Real git repo (diff scopes need commits) with an index reflecting the
@@ -1014,6 +1913,64 @@ mod tests {
         assert_eq!(
             f.message,
             "removed function `used` still has 1 indexed caller(s): caller"
+        );
+        assert_stable_identity(f);
+    }
+
+    #[test]
+    fn rule_a_confidence_is_max_surviving_caller_edge_confidence() {
+        // REQ-015: rule A's confidence is data-derived — the strongest
+        // surviving caller edge — never a constant. A caller deleted in the
+        // same diff is dead code and must not inflate it.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn used() {}\n\npub fn keep_a() { used(); }\npub fn keep_b() { used(); }\n\npub fn dead() { used(); }\n",
+        )]);
+        let root = dir.path();
+
+        for (caller, confidence) in [("keep_a", 0.6), ("keep_b", 0.9), ("dead", 1.0)] {
+            conn.execute(
+                "UPDATE \"references\" SET confidence = ?1 \
+                 WHERE name = 'used' AND caller_id = \
+                 (SELECT id FROM symbols WHERE name = ?2)",
+                rusqlite::params![confidence, caller],
+            )
+            .unwrap();
+        }
+
+        // Working tree deletes used() AND dead() (dead code going with it).
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn keep_a() { used(); }\npub fn keep_b() { used(); }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions {
+                // The live BFS reads the reference rows this test edits; the
+                // precomputed reach table would still hold the original
+                // confidences (ac4b: both paths yield identical findings).
+                reach_enabled: false,
+                ..ReviewOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let f = result
+            .findings
+            .iter()
+            .find(|f| f.kind == "breaking-change")
+            .expect("breaking-change finding");
+        assert_eq!(
+            f.confidence, 0.9,
+            "max SURVIVING edge confidence; dead's 1.0 must not count"
         );
     }
 
@@ -1123,6 +2080,7 @@ mod tests {
         assert_eq!(f.severity, FindingSeverity::Warning);
         assert_eq!(f.kind, "coverage-gap");
         assert_eq!(f.rule, "coverage-gap/no-test-in-blast-radius");
+        assert_eq!(f.confidence, COVERAGE_GAP_CONFIDENCE);
         assert_eq!(
             f.message,
             "function `f` changed but no test file appears in its blast radius (1 affected symbol(s), none in tests)"
@@ -1130,6 +2088,316 @@ mod tests {
         // Related context is the canonical (tests-excluded) blast radius.
         assert_eq!(f.related.len(), 1);
         assert_eq!(f.related[0].name, "g");
+    }
+
+    #[test]
+    fn suppressed_identity_retires_its_finding_and_flips_the_verdict() {
+        // REQ-014's contract: suppress the identity a first review stamped,
+        // re-run the same diff, and the finding is gone — the verdict
+        // derives from what is reported, so REVIEW becomes APPROVE.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\n",
+        )]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 2 }\npub fn g() -> i32 { f() }\n",
+        )
+        .unwrap();
+
+        let before = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(before.verdict, ReviewVerdict::Review);
+        assert_eq!(before.findings.len(), 1);
+        let gap = &before.findings[0];
+        add_suppression(&conn, &gap.identity, &gap.rule, &gap.file, None).unwrap();
+
+        let after = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            after.findings.is_empty(),
+            "suppressed finding must not be kept, got: {:?}",
+            after.findings
+        );
+        assert_eq!(after.verdict, ReviewVerdict::Approve);
+        assert_eq!(
+            after.drops,
+            DropCounts {
+                identity_suppressed: 1,
+                ..DropCounts::default()
+            },
+            "the drop is attributed to suppression alone — never also over_cap"
+        );
+        assert_eq!(before.drops, DropCounts::default());
+    }
+
+    // -- identity acceptance criteria (TASK-089, PRD-REV-REQ-013/AR-031) -------
+    //
+    // Multi-line functions so the anchor is the signature line and a body
+    // edit never touches it.
+
+    const AC_F_BASE: &str = "pub fn f() -> i32 {\n    1\n}\n\npub fn g() -> i32 {\n    f()\n}\n";
+
+    fn git_cmd(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed: {args:?}", args);
+    }
+
+    fn commit_and_reindex(root: &Path) {
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-m", "update"]);
+        crate::pipeline::build_index(root, true).unwrap();
+    }
+
+    fn coverage_gap_of(result: &ReviewResult) -> &Finding {
+        result
+            .findings
+            .iter()
+            .find(|f| f.kind == "coverage-gap")
+            .unwrap_or_else(|| panic!("expected a coverage-gap finding: {:?}", result.findings))
+    }
+
+    #[test]
+    fn ac1_reformatting_the_flagged_line_preserves_identity_and_suppression() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[("src/lib.rs", AC_F_BASE)]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 {\n    2\n}\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )
+        .unwrap();
+        let first = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let identity = coverage_gap_of(&first).identity.clone();
+        assert_stable_identity(coverage_gap_of(&first));
+        add_suppression(
+            &conn,
+            &identity,
+            "coverage-gap/no-test-in-blast-radius",
+            "src/lib.rs",
+            None,
+        )
+        .unwrap();
+
+        // Commit the edit, re-index, then re-indent f's block AND change its
+        // body again: the anchored line's tokens are identical modulo
+        // whitespace, so the identity — and with it the suppression — must
+        // survive (PRD-REV-REQ-013).
+        commit_and_reindex(root);
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "    pub fn f() -> i32 {\n        3\n    }\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )
+        .unwrap();
+
+        let second = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            second.findings.iter().all(|f| f.kind != "coverage-gap"),
+            "reformatted finding stays suppressed: {:?}",
+            second.findings
+        );
+        assert_eq!(second.drops.identity_suppressed, 1);
+
+        // Un-suppress: the reformatted finding returns with the SAME
+        // identity — proof the suppression matched by identity, not absence.
+        remove_suppressions(&conn, std::slice::from_ref(&identity), None).unwrap();
+        let third = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(coverage_gap_of(&third).identity, identity);
+    }
+
+    #[test]
+    fn ac2_inserting_lines_above_preserves_identity() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[("src/lib.rs", AC_F_BASE)]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 {\n    2\n}\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )
+        .unwrap();
+        let first = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let identity = coverage_gap_of(&first).identity.clone();
+
+        // Ten unrelated lines land above f: the anchored line moves down,
+        // the identity must not move with it (the line number is
+        // structurally absent from the signature).
+        commit_and_reindex(root);
+        let pads = "// pad line\n".repeat(10);
+        std::fs::write(
+            root.join("src/lib.rs"),
+            format!("{pads}pub fn f() -> i32 {{\n    3\n}}\n\npub fn g() -> i32 {{\n    f()\n}}\n"),
+        )
+        .unwrap();
+
+        let second = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let gap = coverage_gap_of(&second);
+        assert_eq!(gap.line, Some(11), "the anchor DID move: {:?}", gap.line);
+        assert_eq!(gap.identity, identity, "identity must not track the line");
+    }
+
+    #[test]
+    fn ac3_changing_the_flagged_code_changes_identity_and_unmasks() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[("src/lib.rs", AC_F_BASE)]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 {\n    2\n}\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )
+        .unwrap();
+        let first = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let identity = coverage_gap_of(&first).identity.clone();
+        add_suppression(
+            &conn,
+            &identity,
+            "coverage-gap/no-test-in-blast-radius",
+            "src/lib.rs",
+            None,
+        )
+        .unwrap();
+
+        // Change the anchored signature line itself: a genuinely different
+        // finding at the same site must NOT inherit the suppression (AR-031).
+        commit_and_reindex(root);
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f(x: i32) -> i32 {\n    x + 3\n}\n\npub fn g() -> i32 {\n    f(1)\n}\n",
+        )
+        .unwrap();
+
+        let second = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let gap = coverage_gap_of(&second);
+        assert_ne!(gap.identity, identity, "token change must re-key");
+        assert_stable_identity(gap);
+        assert_eq!(
+            second.drops.identity_suppressed, 0,
+            "the stale suppression masks nothing: {:?}",
+            second.drops
+        );
+    }
+
+    #[test]
+    fn old_side_deletion_identity_comes_from_the_removed_line_text() {
+        if !git_available() {
+            return;
+        }
+        // Two bases differing ONLY in f's signature line text; deleting f
+        // from each must yield different identities — the pre-change text
+        // feeds the hash (the line no longer exists post-change).
+        let (dir_a, conn_a) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 {\n    1\n}\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )]);
+        let (dir_b, conn_b) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f(x: i32) -> i32 {\n    x\n}\n\npub fn g() -> i32 {\n    f(1)\n}\n",
+        )]);
+
+        let deleted = "pub fn g() -> i32 {\n    f()\n}\n";
+        std::fs::write(dir_a.path().join("src/lib.rs"), deleted).unwrap();
+        std::fs::write(dir_b.path().join("src/lib.rs"), deleted).unwrap();
+
+        let find = |dir: &TempDir, conn: &Connection| {
+            let result = run_review(
+                conn,
+                &ChangeScope::Unstaged,
+                dir.path(),
+                &ReviewOptions::default(),
+                None,
+            )
+            .unwrap();
+            let f = result
+                .findings
+                .iter()
+                .find(|f| f.kind == "breaking-change")
+                .unwrap_or_else(|| panic!("expected a breaking change: {:?}", result.findings));
+            assert_eq!(f.anchor_method, AnchorMethod::OldSideLine);
+            (f.identity.clone(), f.line)
+        };
+        let (id_a, line_a) = find(&dir_a, &conn_a);
+        let (id_b, line_b) = find(&dir_b, &conn_b);
+        assert_hex_identity(&id_a);
+        assert_hex_identity(&id_b);
+        assert_eq!(line_a, line_b, "same old-side line in both repos");
+        assert_ne!(
+            id_a, id_b,
+            "identities differ only through the removed-line text"
+        );
     }
 
     #[test]
@@ -1483,6 +2751,9 @@ mod tests {
             .expect("breaking-change finding must still be emitted");
         assert_eq!(finding.anchor_method, AnchorMethod::Unresolved);
         assert_eq!(finding.line, None);
+        // Identity is stamped even when the anchor did not resolve — the
+        // suppression key space covers unanchored findings too.
+        assert_stable_identity(finding);
     }
 
     #[test]
@@ -1730,6 +3001,7 @@ mod tests {
             f.rule,
             "cross-repo/changed-provider-with-external-consumers"
         );
+        assert_eq!(f.confidence, CROSS_REPO_CONFIDENCE);
         assert_eq!(
             f.message,
             "function `registerUserRoutes` changed but provides contract(s) http::GET::/v1/users consumed by 1 other repo(s): own-api"

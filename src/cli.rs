@@ -480,7 +480,7 @@ pub struct ChangesArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ReviewArgs {
-    /// Change scope: unstaged (default), staged, all, or compare
+    /// Change scope: unstaged (default), staged, or compare
     #[arg(long, default_value = "unstaged", conflicts_with = "since")]
     pub scope: String,
 
@@ -491,6 +491,74 @@ pub struct ReviewArgs {
     /// Sugar for --scope=compare --base=<ref>: review everything since a ref
     #[arg(long)]
     pub since: Option<String>,
+
+    /// Drop findings whose confidence is below this floor (0.0-1.0)
+    #[arg(long)]
+    pub min_confidence: Option<f64>,
+
+    /// Drop findings below this severity tier (blocking|warning|note)
+    #[arg(long)]
+    pub min_severity: Option<crate::types::FindingSeverity>,
+
+    /// Keep only these finding categories; repeatable or comma-separated
+    /// (breaking-change, coverage-gap, cross-repo)
+    #[arg(long, value_delimiter = ',')]
+    pub kind: Vec<String>,
+
+    /// Keep at most this many findings (worst-first; the rest are counted
+    /// as over_cap)
+    #[arg(long)]
+    pub max_findings: Option<usize>,
+
+    /// Manage durable suppressions (PRD-REV-REQ-014); absent = a review
+    #[command(subcommand)]
+    pub suppress: Option<ReviewSuppressCommand>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ReviewSuppressCommand {
+    /// Manage durable suppressions (PRD-REV-REQ-014)
+    Suppress {
+        #[command(subcommand)]
+        action: ReviewSuppressAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ReviewSuppressAction {
+    /// List durable suppressions, newest first
+    List {
+        /// Only suppressions created by this rule
+        #[arg(long)]
+        rule: Option<String>,
+    },
+    /// Retire a finding identity permanently (upsert)
+    Add {
+        /// The finding identity to suppress (from a review's finding line)
+        identity: String,
+        /// The finding's rule, retained for listing and bulk removal
+        #[arg(long)]
+        rule: Option<String>,
+        /// The finding's file, retained for listing
+        #[arg(long)]
+        file: Option<String>,
+        /// Why the finding was retired
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Remove suppressions by identity and/or rule
+    Remove(ReviewSuppressRemoveArgs),
+}
+
+#[derive(clap::Args, Debug)]
+#[group(required = true, multiple = true)]
+pub struct ReviewSuppressRemoveArgs {
+    /// Suppression identities to remove
+    pub identities: Vec<String>,
+
+    /// Also remove every suppression created by this rule
+    #[arg(long)]
+    pub rule: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1622,6 +1690,184 @@ mod tests {
     fn parse_review_since_conflicts_with_base() {
         let result = Cli::try_parse_from(["wonk", "review", "--since", "main", "--base", "HEAD"]);
         assert!(result.is_err(), "--since and --base are mutually exclusive");
+    }
+
+    // -- Review filter flags + suppress subcommand (TASK-089) ------------------
+
+    #[test]
+    fn parse_review_filter_flags() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "review",
+            "--min-confidence",
+            "0.7",
+            "--min-severity",
+            "blocking",
+            "--max-findings",
+            "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Review(args) => {
+                assert_eq!(args.min_confidence, Some(0.7));
+                assert_eq!(
+                    args.min_severity,
+                    Some(crate::types::FindingSeverity::Blocking)
+                );
+                assert_eq!(args.max_findings, Some(5));
+                assert!(args.suppress.is_none(), "no subcommand = normal review");
+            }
+            _ => panic!("expected Command::Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_kind_is_repeatable_and_csv() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "review",
+            "--kind",
+            "breaking-change",
+            "--kind",
+            "coverage-gap,cross-repo",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Review(args) => {
+                assert_eq!(
+                    args.kind,
+                    vec!["breaking-change", "coverage-gap", "cross-repo"]
+                );
+            }
+            _ => panic!("expected Command::Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_min_severity_rejects_unknown_tier() {
+        let result = Cli::try_parse_from(["wonk", "review", "--min-severity", "fatal"]);
+        assert!(result.is_err(), "severity floor is blocking|warning|note");
+    }
+
+    #[test]
+    fn parse_review_suppress_list_optional_rule() {
+        let cli = Cli::try_parse_from(["wonk", "review", "suppress", "list"]).unwrap();
+        match cli.command {
+            Command::Review(args) => match args.suppress {
+                Some(ReviewSuppressCommand::Suppress {
+                    action: ReviewSuppressAction::List { rule },
+                }) => assert!(rule.is_none()),
+                other => panic!("expected Suppress/List, got {other:?}"),
+            },
+            _ => panic!("expected Command::Review"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "review",
+            "suppress",
+            "list",
+            "--rule",
+            "coverage-gap/no-test-in-blast-radius",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Review(args) => match args.suppress {
+                Some(ReviewSuppressCommand::Suppress {
+                    action: ReviewSuppressAction::List { rule },
+                }) => {
+                    assert_eq!(
+                        rule.as_deref(),
+                        Some("coverage-gap/no-test-in-blast-radius")
+                    );
+                }
+                other => panic!("expected Suppress/List, got {other:?}"),
+            },
+            _ => panic!("expected Command::Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_suppress_add_flags() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "review",
+            "suppress",
+            "add",
+            "abc123",
+            "--rule",
+            "coverage-gap/no-test-in-blast-radius",
+            "--file",
+            "src/lib.rs",
+            "--note",
+            "test-only helper",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Review(args) => match args.suppress {
+                Some(ReviewSuppressCommand::Suppress {
+                    action:
+                        ReviewSuppressAction::Add {
+                            identity,
+                            rule,
+                            file,
+                            note,
+                        },
+                }) => {
+                    assert_eq!(identity, "abc123");
+                    assert_eq!(
+                        rule.as_deref(),
+                        Some("coverage-gap/no-test-in-blast-radius")
+                    );
+                    assert_eq!(file.as_deref(), Some("src/lib.rs"));
+                    assert_eq!(note.as_deref(), Some("test-only helper"));
+                }
+                other => panic!("expected Suppress/Add, got {other:?}"),
+            },
+            _ => panic!("expected Command::Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_suppress_remove_ids_and_rule() {
+        let cli =
+            Cli::try_parse_from(["wonk", "review", "suppress", "remove", "abc", "def"]).unwrap();
+        match cli.command {
+            Command::Review(args) => match args.suppress {
+                Some(ReviewSuppressCommand::Suppress {
+                    action: ReviewSuppressAction::Remove(args),
+                }) => {
+                    assert_eq!(args.identities, vec!["abc", "def"]);
+                    assert!(args.rule.is_none());
+                }
+                other => panic!("expected Suppress/Remove, got {other:?}"),
+            },
+            _ => panic!("expected Command::Review"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["wonk", "review", "suppress", "remove", "--rule", "r/x"]).unwrap();
+        match cli.command {
+            Command::Review(args) => match args.suppress {
+                Some(ReviewSuppressCommand::Suppress {
+                    action: ReviewSuppressAction::Remove(args),
+                }) => {
+                    assert!(args.identities.is_empty());
+                    assert_eq!(args.rule.as_deref(), Some("r/x"));
+                }
+                other => panic!("expected Suppress/Remove, got {other:?}"),
+            },
+            _ => panic!("expected Command::Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_suppress_remove_requires_identity_or_rule() {
+        let result = Cli::try_parse_from(["wonk", "review", "suppress", "remove"]);
+        assert!(
+            result.is_err(),
+            "remove with neither identities nor --rule is a usage error"
+        );
     }
 
     // -- Context tests (TASK-073) ---------------------------------------------
