@@ -155,6 +155,27 @@ CREATE TABLE IF NOT EXISTS summaries (
 );
 "#;
 
+// [V5] Service contracts published/consumed by this repo (DR-031). The
+// columns follow the architecture DDL verbatim; there is deliberately no
+// workspace column — workspace membership lives in meta.json (REQ-020,
+// written by TASK-084).
+const CONTRACTS_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS contracts (
+    id INTEGER PRIMARY KEY,
+    canonical_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    role TEXT NOT NULL,
+    symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+    file TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    UNIQUE(canonical_id, role, file, line)
+);
+CREATE INDEX IF NOT EXISTS idx_contracts_canonical ON contracts(canonical_id, role);
+CREATE INDEX IF NOT EXISTS idx_contracts_symbol ON contracts(symbol_id);
+CREATE INDEX IF NOT EXISTS idx_contracts_file ON contracts(file);
+"#;
+
 const FTS_SQL: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     name, kind, file, content=symbols, content_rowid=id
@@ -246,6 +267,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating term_stats table")?;
     conn.execute_batch(REACH_SQL)
         .context("creating reach tables")?;
+    conn.execute_batch(CONTRACTS_SQL)
+        .context("creating contracts table")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -359,6 +382,18 @@ pub fn ensure_term_stats_table(conn: &Connection) -> Result<()> {
 pub fn ensure_reach_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(REACH_SQL)
         .context("creating reach tables (migration)")?;
+    Ok(())
+}
+
+/// Ensure the `contracts` table exists, creating it if missing.
+///
+/// Handles schema migration for pre-V5 indexes created before contract
+/// storage (TASK-083) was added. Existing databases gain the empty table
+/// (plus indexes) on the next `open`; safe to call repeatedly (uses
+/// `CREATE TABLE IF NOT EXISTS`).
+pub fn ensure_contracts_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CONTRACTS_SQL)
+        .context("creating contracts table (migration)")?;
     Ok(())
 }
 
@@ -1962,6 +1997,79 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(tables.len(), 1, "open() should create term_stats");
+    }
+
+    #[test]
+    fn open_creates_contracts_table_and_indexes() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='contracts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "open() should create the contracts table");
+
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_contracts%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in [
+            "idx_contracts_canonical",
+            "idx_contracts_symbol",
+            "idx_contracts_file",
+        ] {
+            assert!(
+                indexes.contains(&expected.to_string()),
+                "{expected} should exist (got {indexes:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_contracts_table_migrates_pre_v5_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A pre-V5 index has the base schema but no contracts table.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(SCHEMA_SQL).unwrap();
+        }
+
+        let conn = open(&db_path).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='contracts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "open() should migrate the empty contracts table in"
+        );
+
+        // Idempotent: a second run on a migrated DB succeeds.
+        ensure_contracts_table(&conn).unwrap();
+        ensure_contracts_table(&conn).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='contracts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
     }
 
     #[test]
