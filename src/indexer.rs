@@ -88,13 +88,17 @@ fn grammar_for(lang: Lang) -> Language {
     }
 }
 
+/// Create a new [`Parser`] configured for the given language, or the grammar
+/// loading error — the non-panicking path used by callers that fail soft.
+pub fn try_get_parser(lang: Lang) -> Result<Parser, tree_sitter::LanguageError> {
+    let mut parser = Parser::new();
+    parser.set_language(&grammar_for(lang))?;
+    Ok(parser)
+}
+
 /// Create a new [`Parser`] configured for the given language.
 pub fn get_parser(lang: Lang) -> Parser {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar_for(lang))
-        .expect("Error loading grammar — ABI version mismatch");
-    parser
+    try_get_parser(lang).expect("Error loading grammar — ABI version mismatch")
 }
 
 /// Parse a source file, returning the syntax tree and detected language.
@@ -1865,7 +1869,10 @@ fn make_ref(
 
 /// Returns `true` if the tree-sitter node kind represents a function or method
 /// definition in the given language.
-fn is_function_node(kind: &str, lang: Lang) -> bool {
+///
+/// Shared by the call graph (caller-name resolution) and the elision engine,
+/// so both agree on what counts as a function body.
+pub fn is_function_node(kind: &str, lang: Lang) -> bool {
     match lang {
         Lang::Rust => kind == "function_item",
         Lang::Python => kind == "function_definition",

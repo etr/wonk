@@ -3803,13 +3803,13 @@ Make findings individually addressable so a confirmed false positive can be reti
 Create `elide.rs` — collect function/method body byte ranges from an already-parsed tree and rebuild the source with counted per-language stubs.
 
 **Action Items:**
-- [ ] Create `elide.rs` exposing `elide(source, language, mode) -> Result<String, NotElided>` (PRD-ELIDE-REQ-001)
-- [ ] Collect body byte ranges from the existing Tree-sitter tree — no second parse (PRD-ELIDE-REQ-010)
-- [ ] Rebuild the buffer replacing each range with a stub; preserve signatures, imports, top-level declarations, comments (PRD-ELIDE-REQ-001)
-- [ ] Every stub reports its replaced line count (PRD-ELIDE-REQ-002)
-- [ ] Per-language stub syntax: comment-in-braces for brace languages, indented comment line for indentation-sensitive languages (PRD-ELIDE-REQ-003)
-- [ ] Fail-soft: unsupported language, missing grammar, or parse failure returns original source with an explicit not-elided signal (PRD-ELIDE-REQ-006)
-- [ ] Guarantee retained lines are byte-identical to source — elision removes regions, never rewrites text (PRD-ELIDE-REQ-007)
+- [x] Create `elide.rs` exposing `elide(source, language, mode) -> Result<String, NotElided>` (PRD-ELIDE-REQ-001)
+- [x] Collect body byte ranges from the existing Tree-sitter tree — no second parse (PRD-ELIDE-REQ-010)
+- [x] Rebuild the buffer replacing each range with a stub; preserve signatures, imports, top-level declarations, comments (PRD-ELIDE-REQ-001)
+- [x] Every stub reports its replaced line count (PRD-ELIDE-REQ-002)
+- [x] Per-language stub syntax: comment-in-braces for brace languages, indented comment line for indentation-sensitive languages (PRD-ELIDE-REQ-003)
+- [x] Fail-soft: unsupported language, missing grammar, or parse failure returns original source with an explicit not-elided signal (PRD-ELIDE-REQ-006)
+- [x] Guarantee retained lines are byte-identical to source — elision removes regions, never rewrites text (PRD-ELIDE-REQ-007)
 
 **Dependencies:**
 - Blocked by: None
@@ -3826,7 +3826,7 @@ Create `elide.rs` — collect function/method body byte ranges from an already-p
 **Related Requirements:** PRD-ELIDE-REQ-001, PRD-ELIDE-REQ-002, PRD-ELIDE-REQ-003, PRD-ELIDE-REQ-006, PRD-ELIDE-REQ-007, PRD-ELIDE-REQ-010
 **Related Decisions:** DR-036
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
