@@ -23,6 +23,11 @@ pub struct SummaryOptions {
     pub depth: Option<usize>,
     /// Whether to suppress stderr hints.
     pub suppress: bool,
+    /// Elide function bodies in source output (PRD-ELIDE-REQ-008 uniform
+    /// surface). Inert on summary's signature-only payload — no source
+    /// bodies are emitted; the recorded reduction figure lives in
+    /// bench/elision-results.md.
+    pub elide: Option<crate::elide::Mode>,
 }
 
 impl SummaryOptions {
@@ -774,6 +779,7 @@ mod tests {
             detail: DetailLevel::Rich,
             depth: Some(0),
             suppress: true,
+            elide: None,
         }
     }
 

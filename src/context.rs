@@ -25,6 +25,11 @@ pub struct ContextOptions {
     pub min_confidence: Option<f64>,
     /// Restrict to symbols with this scope (e.g. class name for methods).
     pub scope: Option<String>,
+    /// Elide function bodies in source output (PRD-ELIDE-REQ-008 uniform
+    /// surface). Inert on context's signature-only payload — no source
+    /// bodies are emitted; the recorded reduction figure lives in
+    /// bench/elision-results.md.
+    pub elide: Option<crate::elide::Mode>,
 }
 
 /// Sanitize a user-provided confidence threshold to a valid [0.0, 1.0] range.

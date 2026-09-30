@@ -174,6 +174,10 @@ pub struct ReviewOptions {
     /// least severe and least confident first (PRD-REV-REQ-015). `None`
     /// keeps everything.
     pub max_findings: Option<usize>,
+    /// Elide function bodies in source output (PRD-ELIDE-REQ-008 uniform
+    /// surface). Inert on review's finding payload — no source bodies are
+    /// emitted; the recorded reduction figure lives in bench/elision-results.md.
+    pub elide: Option<crate::elide::Mode>,
 }
 
 impl Default for ReviewOptions {
@@ -188,6 +192,7 @@ impl Default for ReviewOptions {
             min_severity: None,
             kinds: Vec::new(),
             max_findings: None,
+            elide: None,
         }
     }
 }

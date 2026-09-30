@@ -118,6 +118,8 @@ wonk show "processPayment"
 wonk show --file src/billing.ts "processPayment"
 wonk show --kind function "handle"
 wonk show --shallow "MyClass"
+wonk show "handle" --elide
+wonk show "handle" --elide=bodies
 ```
 
 | Flag | Description |
@@ -126,6 +128,26 @@ wonk show --shallow "MyClass"
 | `--kind <kind>` | Filter by symbol kind (e.g. `function`, `class`) |
 | `--exact` | Require exact match on symbol name |
 | `--shallow` | Show container signature + child signatures without bodies |
+| `--elide [bodies\|salience]` | Elide function bodies from source output (default off; bare = `salience`) |
+
+#### Elision and shallow mode
+
+`--elide` collapses function bodies in extracted source: `bodies` replaces
+each body with a one-line stub reporting how many lines it replaced, and
+`salience` (the default when the flag is given bare) additionally keeps the
+control-flow skeleton — conditionals, loops, match arms — verbatim, with the
+collapsed runs in between still reporting their counts. Retained lines are
+never rewritten; output is unchanged when the flag is absent. The flag also
+exists on `summary`, `context`, and `review` for uniformity: those payloads
+are signature-only today, so it is provably inert there (the recorded
+reduction figures live in `bench/elision-results.md`).
+
+`--elide` and `--shallow` never compound (PRD-ELIDE-REQ-009, DR-017). For
+container symbols `--shallow` wins and the rendering is the shallow one —
+signature plus child signatures from the index; elision is skipped entirely
+because shallow never reads source files. For every other symbol `--elide`
+applies to the extracted span. That is the single documented rendering for
+the combination.
 
 ## Code structure
 

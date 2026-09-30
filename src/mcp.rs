@@ -261,6 +261,19 @@ fn extract_format(args: &Value) -> OutputFormat {
         .unwrap_or(OutputFormat::Json)
 }
 
+/// Extract the optional `elide` parameter (PRD-ELIDE-REQ-008). An invalid
+/// value is a tool error naming the valid ones — never a silent default.
+fn extract_elide(args: &Value) -> Result<Option<crate::elide::Mode>, String> {
+    match args.get("elide").and_then(|v| v.as_str()) {
+        None => Ok(None),
+        Some("bodies") => Ok(Some(crate::elide::Mode::Bodies)),
+        Some("salience") => Ok(Some(crate::elide::Mode::Salience)),
+        Some(other) => Err(format!(
+            "invalid 'elide' value {other:?}: expected 'bodies' or 'salience'"
+        )),
+    }
+}
+
 /// Clamp a confidence value to `[0.0, 1.0]`, mapping NaN/Inf to 0.0.
 fn clamp_confidence(c: f64) -> f64 {
     if c.is_nan() || c.is_infinite() {
@@ -679,6 +692,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "description": "Show container types in shallow mode (signature + child signatures only)",
                             "default": false
                         },
+                        "elide": {
+                            "type": "string",
+                            "enum": ["bodies", "salience"],
+                            "description": "Elide function bodies from source output: 'bodies' replaces whole bodies with counted stubs; 'salience' retains control-flow lines verbatim. Default: off."
+                        },
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
@@ -861,6 +879,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "description": "Show full recursive hierarchy (unlimited depth)",
                             "default": false
                         },
+                        "elide": {
+                            "type": "string",
+                            "enum": ["bodies", "salience"],
+                            "description": "Elide function bodies from source output: 'bodies' replaces whole bodies with counted stubs; 'salience' retains control-flow lines verbatim. Default: off."
+                        },
                         "budget": {
                             "type": "integer",
                             "description": "Limit output to approximately N tokens"
@@ -1025,6 +1048,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "min_confidence": {
                             "type": "number",
                             "description": "Minimum edge confidence (0.0-1.0) to include"
+                        },
+                        "elide": {
+                            "type": "string",
+                            "enum": ["bodies", "salience"],
+                            "description": "Elide function bodies from source output: 'bodies' replaces whole bodies with counted stubs; 'salience' retains control-flow lines verbatim. Default: off."
                         },
                         "format": {
                             "type": "string",
@@ -1212,6 +1240,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "type": "string",
                         "description": "Base git ref for compare scope (required when scope=compare)"
                     },
+                    "elide": {
+                        "type": "string",
+                        "enum": ["bodies", "salience"],
+                        "description": "Elide function bodies from source output: 'bodies' replaces whole bodies with counted stubs; 'salience' retains control-flow lines verbatim. Default: off."
+                        },
                     "since": {
                         "type": "string",
                         "description": "Sugar for scope=compare with this base ref: review everything since a ref"
@@ -2054,6 +2087,10 @@ impl McpServer {
             .get("shallow")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let elide = match extract_elide(&args) {
+            Ok(mode) => mode,
+            Err(e) => return CallToolResult::error(e),
+        };
         let budget_limit: Option<usize> = args
             .get("budget")
             .and_then(|v| v.as_u64())
@@ -2083,6 +2120,7 @@ impl McpServer {
                     suppress: true,
                     shallow: true,
                     scope: None,
+                    elide: None,
                     signatures_only: true, // auto-file-path: compact output
                 };
                 match crate::show::show_file(conn, &raw_name, &repo_root, &options) {
@@ -2109,6 +2147,7 @@ impl McpServer {
                         suppress: true,
                         shallow,
                         scope: split.scope_hint,
+                        elide,
                         signatures_only: false,
                     };
 
@@ -2139,6 +2178,7 @@ impl McpServer {
                 suppress: true,
                 shallow,
                 scope: None,
+                elide,
                 signatures_only: false,
             };
             match crate::show::show_file(conn, file_pattern, &repo_root, &options) {
@@ -2212,6 +2252,9 @@ impl McpServer {
                             suppress: true,
                             shallow: true,
                             scope: None,
+                            // Shallow replaces the payload; elision never
+                            // touches the shallow rendering.
+                            elide: None,
                             signatures_only: false,
                         };
                         if let Ok(shallow_results) =
@@ -2528,6 +2571,10 @@ impl McpServer {
             Ok(p) => p,
             Err(e) => return e,
         };
+        let elide = match extract_elide(&args) {
+            Ok(mode) => mode,
+            Err(e) => return CallToolResult::error(e),
+        };
 
         let (conn, repo_root) = match self.resolve_repo(&args) {
             Ok(r) => r,
@@ -2559,6 +2606,7 @@ impl McpServer {
             detail,
             depth,
             suppress: true,
+            elide,
         };
 
         let result = match crate::summary::summarize_path(conn, &path, &options) {
@@ -2763,6 +2811,10 @@ impl McpServer {
             Err(e) => return e,
         };
         let format = extract_format(&args);
+        let elide = match extract_elide(&args) {
+            Ok(mode) => mode,
+            Err(e) => return CallToolResult::error(e),
+        };
 
         // Scope parsing mirrors tool_changes, plus `since` as sugar for
         // compare+base (the CLI's --since).
@@ -2802,6 +2854,7 @@ impl McpServer {
             coverage_gap: config.review.coverage_gap,
             cross_repo: config.review.cross_repo,
             reach_enabled: config.reach.enabled,
+            elide,
             ..crate::review::ReviewOptions::default()
         };
         let cross_repo = config
@@ -2980,6 +3033,10 @@ impl McpServer {
             Ok(n) => n,
             Err(e) => return e,
         };
+        let elide = match extract_elide(&args) {
+            Ok(mode) => mode,
+            Err(e) => return CallToolResult::error(e),
+        };
 
         let (conn, _) = match self.resolve_repo(&args) {
             Ok(r) => r,
@@ -3006,6 +3063,7 @@ impl McpServer {
             kind,
             min_confidence,
             scope: split.scope_hint,
+            elide,
         };
 
         let include_tests = extract_include_tests(&args);
@@ -4159,6 +4217,106 @@ mod tests {
             text.contains("no index") || text.contains("[]"),
             "expected 'no index' error or empty results, got: {text}"
         );
+    }
+
+    #[test]
+    fn mcp_elide_param_schema_and_behavior() {
+        // The elide enum exists on all four source-returning tools.
+        let tools = tool_definitions();
+        for name in ["wonk_show", "wonk_summary", "wonk_context", "wonk_review"] {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            let elide = &tool.input_schema["properties"]["elide"];
+            assert_eq!(elide["type"], "string", "{name}: elide must be a string");
+            let variants: Vec<&str> = elide["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(variants, vec!["bodies", "salience"], "{name}: enum values");
+        }
+
+        // wonk_show honors elide=salience on a real indexed repo.
+        use crate::pipeline;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "fn process(n: u32) -> u32 {\n    let mut t = n;\n    while t < 10 {\n        t += 1;\n    }\n    t\n}\n",
+        )
+        .unwrap();
+        pipeline::build_index(root, true).unwrap();
+        let mut server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+            registry: RepoRegistry::new(Vec::new()),
+        };
+
+        let params = serde_json::json!({
+            "name": "wonk_show",
+            "arguments": {"name": "process", "exact": true, "elide": "salience", "budget": 100000, "format": "json"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap_or_default();
+        let results = match &parsed {
+            Value::Array(items) => items.clone(),
+            other => other["results"].as_array().cloned().unwrap_or_default(),
+        };
+        assert_eq!(results.len(), 1, "one exact match, got: {text}");
+        let source = results[0]["source"].as_str().unwrap_or_default();
+        assert!(
+            source.contains("while t < 10 {"),
+            "skeleton survives: {source}"
+        );
+        assert!(source.contains("lines elided"), "stubs present: {source}");
+
+        // Default (absent) output is unchanged.
+        let params = serde_json::json!({
+            "name": "wonk_show",
+            "arguments": {"name": "process", "exact": true, "budget": 100000, "format": "json"}
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap_or_default();
+        let results = match &parsed {
+            Value::Array(items) => items.clone(),
+            other => other["results"].as_array().cloned().unwrap_or_default(),
+        };
+        let source = results[0]["source"].as_str().unwrap_or_default();
+        assert!(source.contains("t += 1;"), "full body by default: {source}");
+        assert!(
+            !source.contains("elided"),
+            "no elision by default: {source}"
+        );
+
+        // Invalid value is a tool error naming the valid values — on every
+        // tool that accepts the parameter.
+        for tool in ["wonk_show", "wonk_summary", "wonk_context", "wonk_review"] {
+            let args = if tool == "wonk_show" {
+                serde_json::json!({"name": "process"})
+            } else if tool == "wonk_summary" {
+                serde_json::json!({"path": "src/"})
+            } else if tool == "wonk_context" {
+                serde_json::json!({"name": "process"})
+            } else {
+                serde_json::json!({"scope": "unstaged"})
+            };
+            let mut arguments = args.as_object().unwrap().clone();
+            arguments.insert("elide".into(), serde_json::json!("bogus"));
+            let params = serde_json::json!({
+                "name": tool,
+                "arguments": arguments
+            });
+            let result = server.handle_tools_call(&params);
+            let text = result["content"][0]["text"].as_str().unwrap_or("");
+            assert!(
+                text.contains("bodies") && text.contains("salience"),
+                "{tool}: invalid elide must error naming valid values, got: {text}"
+            );
+        }
     }
 
     #[test]

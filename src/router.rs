@@ -1385,6 +1385,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         suppress,
                         shallow: true,
                         scope: None,
+                        elide: args.elide.map(Into::into),
                         signatures_only: true, // auto-file-path: compact output
                     };
                     all_results.extend(crate::show::show_file(&conn, name, &repo_root, &options)?);
@@ -1417,6 +1418,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                 suppress,
                                 shallow: args.shallow,
                                 scope: split.scope_hint.clone(),
+                                elide: args.elide.map(Into::into),
                                 signatures_only: false,
                             };
 
@@ -1436,6 +1438,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         suppress,
                         shallow: args.shallow,
                         scope: None,
+                        elide: args.elide.map(Into::into),
                         signatures_only: false,
                     };
                     all_results.extend(crate::show::show_file(
@@ -1495,6 +1498,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         suppress,
                         shallow: true,
                         scope: None,
+                        // Shallow replaces the payload; elision never touches
+                        // the shallow rendering (PRD-ELIDE-REQ-009).
+                        elide: None,
                         signatures_only: false,
                     };
                     if let Ok(shallow_results) =
@@ -1732,6 +1738,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 detail,
                 depth,
                 suppress,
+                elide: args.elide.map(Into::into),
             };
 
             let result = crate::summary::summarize_path(&conn, &args.path, &options)?;
@@ -2005,6 +2012,7 @@ fn dispatch_review<W: io::Write>(
         min_severity: args.min_severity,
         kinds: args.kind,
         max_findings: args.max_findings,
+        elide: args.elide.map(Into::into),
         ..crate::review::ReviewOptions::default()
     };
 
@@ -2124,6 +2132,7 @@ fn dispatch_context<W: io::Write>(
         kind: args.kind,
         min_confidence: args.min_confidence,
         scope: split.scope_hint,
+        elide: args.elide.map(Into::into),
     };
 
     let mut contexts = crate::context::symbol_context(&conn, split.name, &options)?;
@@ -6164,6 +6173,7 @@ mod tests {
             file: None,
             kind: None,
             min_confidence: None,
+            elide: None,
         });
         assert!(is_query_command(&cmd));
     }
@@ -6185,6 +6195,7 @@ mod tests {
             kind: Vec::new(),
             max_findings: None,
             suppress: None,
+            elide: None,
         });
         assert!(!is_query_command(&cmd));
     }
