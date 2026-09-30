@@ -46,7 +46,7 @@
 | M26 | Bundled Embedding Provider | 3 | Complete |
 | M27 | Lexical BM25 Scoring | 2 | Complete |
 | M28 | Precomputed Reach Index | 2 | Complete |
-| M29 | Cross-Repo Contract Detection | 5 | In Progress |
+| M29 | Cross-Repo Contract Detection | 5 | Complete |
 | M30 | Diff-Scoped Review Workflow | 3 | Not Started |
 | M31 | Body Elision | 2 | Not Started |
 | M32 | Signal-Based Reranking | 4 | Not Started |
@@ -3624,23 +3624,23 @@ Persist detected contracts per repo and expose them through a CLI command with k
 Resolve provider↔consumer links across locally indexed repos at query time, flag orphan consumers, and surface cross-repo impact in blast radius.
 
 **Action Items:**
-- [ ] Add `[contracts] workspace` config key accepting a string or array of strings (PRD-CTR-REQ-013, PRD-CTR-REQ-018)
-- [ ] Read the key from the **repo-local** `.wonk/config.toml` only; ignore any value in global config and warn that it has no effect (PRD-CTR-REQ-017)
-- [ ] Normalize identifiers by trimming whitespace and case-folding before comparison (PRD-CTR-REQ-019)
-- [ ] Write declared workspaces into the repo's `meta.json` at index time (PRD-CTR-REQ-020)
-- [ ] Filter the repo registry on `meta.json` workspaces — intersection non-empty — before resolving links; never read another repo's working-tree config (PRD-CTR-REQ-014, PRD-CTR-REQ-020)
-- [ ] Extend `wonk status` to report declared workspaces and the indexed repos sharing them (PRD-CTR-REQ-021, AR-027)
-- [ ] Default an undeclared workspace to the repository's own name, so the matcher contains no `if unset` branch (PRD-CTR-REQ-015, AR-025)
-- [ ] Apply the workspace filter at link resolution **only** — extraction, storage, listing, filtering, and within-repo linking stay unconditional (PRD-CTR-REQ-016)
-- [ ] Resolve links by joining on canonical ID with opposite role across same-workspace repos from the `~/.wonk/repos/*/meta.json` registry (PRD-CTR-REQ-005, DR-031)
-- [ ] Reuse the DR-030 lazy-connection pattern — do not open all repo indexes eagerly
-- [ ] Implement `wonk contracts --links` listing cross-repo pairs annotated with both repo names (PRD-CTR-REQ-009)
-- [ ] Flag consumers with no matching provider in the workspace as orphans, shown by default (PRD-CTR-REQ-006)
-- [ ] Surface unscoped state with the exact config line to add; show workspace membership in `wonk status` (AR-026)
-- [ ] Gate unused-provider reporting behind an explicit flag to avoid public-API noise (PRD-CTR-REQ-007)
-- [ ] Extend `blast.rs`: when the target owns a provider contract, append consumers as a `CrossRepo` tier below the depth tiers (PRD-CTR-REQ-010)
-- [ ] Add the `wonk_contracts` MCP tool with the same filters, honoring the V4 `repo` parameter
-- [ ] Verify no cross-repo links are persisted — resolution is live (DR-031)
+- [x] Add `[contracts] workspace` config key accepting a string or array of strings (PRD-CTR-REQ-013, PRD-CTR-REQ-018)
+- [x] Read the key from the **repo-local** `.wonk/config.toml` only; ignore any value in global config and warn that it has no effect (PRD-CTR-REQ-017)
+- [x] Normalize identifiers by trimming whitespace and case-folding before comparison (PRD-CTR-REQ-019)
+- [x] Write declared workspaces into the repo's `meta.json` at index time (PRD-CTR-REQ-020)
+- [x] Filter the repo registry on `meta.json` workspaces — intersection non-empty — before resolving links; never read another repo's working-tree config (PRD-CTR-REQ-014, PRD-CTR-REQ-020)
+- [x] Extend `wonk status` to report declared workspaces and the indexed repos sharing them (PRD-CTR-REQ-021, AR-027)
+- [x] Default an undeclared workspace to the repository's own name, so the matcher contains no `if unset` branch (PRD-CTR-REQ-015, AR-025)
+- [x] Apply the workspace filter at link resolution **only** — extraction, storage, listing, filtering, and within-repo linking stay unconditional (PRD-CTR-REQ-016)
+- [x] Resolve links by joining on canonical ID with opposite role across same-workspace repos from the `~/.wonk/repos/*/meta.json` registry (PRD-CTR-REQ-005, DR-031)
+- [x] Reuse the DR-030 lazy-connection pattern — do not open all repo indexes eagerly
+- [x] Implement `wonk contracts --links` listing cross-repo pairs annotated with both repo names (PRD-CTR-REQ-009)
+- [x] Flag consumers with no matching provider in the workspace as orphans, shown by default (PRD-CTR-REQ-006)
+- [x] Surface unscoped state with the exact config line to add; show workspace membership in `wonk status` (AR-026)
+- [x] Gate unused-provider reporting behind an explicit flag to avoid public-API noise (PRD-CTR-REQ-007)
+- [x] Extend `blast.rs`: when the target owns a provider contract, append consumers as a `CrossRepo` tier below the depth tiers (PRD-CTR-REQ-010)
+- [x] Add the `wonk_contracts` MCP tool with the same filters, honoring the V4 `repo` parameter
+- [x] Verify no cross-repo links are persisted — resolution is live (DR-031)
 
 **Dependencies:**
 - Blocked by: TASK-083, TASK-074, TASK-070
@@ -3666,7 +3666,7 @@ Resolve provider↔consumer links across locally indexed repos at query time, fl
 **Related Requirements:** PRD-CTR-REQ-005, PRD-CTR-REQ-006, PRD-CTR-REQ-007, PRD-CTR-REQ-009, PRD-CTR-REQ-010, PRD-CTR-REQ-013 through PRD-CTR-REQ-021
 **Related Decisions:** DR-031, DR-030
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
