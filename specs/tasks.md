@@ -3726,12 +3726,12 @@ Create `review.rs` as pure composition over existing primitives, producing line-
 Add the cross-repo rule family, NDJSON output, and MCP exposure.
 
 **Action Items:**
-- [ ] Rule family C — cross-repo impact: changed symbol owning a provider contract with consumers in another indexed repo → warning naming the consuming repo (PRD-REV-REQ-010)
-- [ ] Implement NDJSON output for findings and verdict (PRD-REV-REQ-009)
-- [ ] Add the `wonk_review` MCP tool honoring the V4 `repo` parameter
-- [ ] Grep-compatible output format for terminal use, per PRD-OUT
-- [ ] Document that findings are emitted only — no forge posting, no auto-fix (DR-035)
-- [ ] Update README and MCP server instructions with the review workflow
+- [x] Rule family C — cross-repo impact: changed symbol owning a provider contract with consumers in another indexed repo → warning naming the consuming repo (PRD-REV-REQ-010)
+- [x] Implement NDJSON output for findings and verdict (PRD-REV-REQ-009)
+- [x] Add the `wonk_review` MCP tool honoring the V4 `repo` parameter
+- [x] Grep-compatible output format for terminal use, per PRD-OUT
+- [x] Document that findings are emitted only — no forge posting, no auto-fix (DR-035)
+- [x] Update README and MCP server instructions with the review workflow
 
 **Dependencies:**
 - Blocked by: TASK-085, TASK-084
@@ -3747,7 +3747,7 @@ Add the cross-repo rule family, NDJSON output, and MCP exposure.
 **Related Requirements:** PRD-REV-REQ-009, PRD-REV-REQ-010
 **Related Decisions:** DR-035, DR-031
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
