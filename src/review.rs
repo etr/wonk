@@ -2012,4 +2012,140 @@ mod tests {
         drop(_sib);
         drop(repos_dir);
     }
+
+    // -- rule C composition: fail-soft + once-only -------------------------------
+
+    const CROSS_REPO_ROUTES_TWO: &str = "const app = express();\nfunction registerUserRoutes() {\n  app.get('/v1/users', getUser);\n}\nfunction registerOrderRoutes() {\n  app.get('/v1/orders', getOrders);\n}\n";
+    const CROSS_REPO_ROUTES_TWO_EDITED: &str = "const app = express();\nfunction registerUserRoutes() {\n  app.get('/v1/users', getUserV2);\n}\nfunction registerOrderRoutes() {\n  app.get('/v1/orders', getOrdersV2);\n}\n";
+
+    #[test]
+    fn cross_repo_resolution_failure_fails_soft_and_warns_once() {
+        // A broken registry must never break the review: rules A/B keep
+        // their findings, rule C degrades with exactly one warning — one
+        // resolution ATTEMPT per run, so two provider symbols still warn
+        // once (per-symbol resolution would warn twice).
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES_TWO)],
+        );
+        let _sib = registered_sibling(
+            repos_dir.path(),
+            "own-api",
+            "payments",
+            &[("src/client.js", SIBLING_CLIENT)],
+        );
+        // Break the registry after registration: the sibling's entry stays
+        // discoverable (index.db exists, meta.json readable) but its index
+        // is unopenable garbage — a lazy-open failure, not a skip.
+        for entry in std::fs::read_dir(repos_dir.path()).unwrap().flatten() {
+            let index = entry.path().join("index.db");
+            if index.exists() {
+                std::fs::write(&index, b"not a sqlite database").unwrap();
+            }
+        }
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+
+        std::fs::write(root.join("src/routes.js"), CROSS_REPO_ROUTES_TWO_EDITED).unwrap();
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+
+        let cross_warnings: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|w| w.contains("cross-repo"))
+            .collect();
+        assert_eq!(
+            cross_warnings.len(),
+            1,
+            "two provider candidates, still one warning: {:?}",
+            result.warnings
+        );
+        assert!(
+            cross_warnings[0].contains("workspace resolution failed"),
+            "{}",
+            cross_warnings[0]
+        );
+        // Fail-soft is scoped to rule C: coverage gaps still computed.
+        assert_eq!(
+            result
+                .findings
+                .iter()
+                .filter(|f| f.kind == "coverage-gap")
+                .count(),
+            2,
+            "got: {:?}",
+            result.findings
+        );
+        assert!(result.findings.iter().all(|f| f.kind != "cross-repo"));
+        drop(own_dir);
+        drop(_sib);
+        drop(repos_dir);
+    }
+
+    #[test]
+    fn cross_repo_enabled_without_inputs_warns_once() {
+        // The engine never re-derives the registry from $HOME: enabled rule
+        // C without explicit inputs degrades with one warning, once, no
+        // matter how many candidates the diff has.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { 2 }\n",
+        )]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 11 }\npub fn g() -> i32 { 22 }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+
+        let cross: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|w| w.contains("cross-repo"))
+            .collect();
+        assert_eq!(
+            cross.len(),
+            1,
+            "two candidates, still one warning: {:?}",
+            result.warnings
+        );
+        assert!(cross[0].contains("no cross-repo inputs"), "{}", cross[0]);
+        assert_eq!(
+            result
+                .findings
+                .iter()
+                .filter(|f| f.kind == "coverage-gap")
+                .count(),
+            2,
+            "rules A/B unaffected: {:?}",
+            result.findings
+        );
+    }
 }
