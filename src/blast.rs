@@ -381,6 +381,111 @@ pub fn analyze_blast(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Cross-repo tier (TASK-084, PRD-CTR-REQ-010)
+// ---------------------------------------------------------------------------
+
+/// One sibling-repo consumer of a provider contract the blast target owns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossRepoConsumer {
+    /// Consuming repo's short name.
+    pub repo: String,
+    /// The consumed contract's canonical ID.
+    pub canonical_id: String,
+    /// Consuming symbol name, when stored.
+    pub symbol: Option<String>,
+    /// Path relative to the consuming repo's root.
+    pub file: String,
+    /// 1-based line of the consumer site.
+    pub line: usize,
+    /// Stored confidence.
+    pub confidence: f64,
+}
+
+/// Canonical IDs of provider contracts owned by `symbol` — the routes it
+/// registers, queues it subscribes, proto methods it implements. Rows with
+/// no owning symbol (documents, top-level sites) never match a named
+/// target and are skipped by the JOIN.
+pub fn provider_contract_ids(conn: &Connection, symbol: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT c.canonical_id FROM contracts c \
+         JOIN symbols s ON s.id = c.symbol_id \
+         WHERE s.name = ?1 AND c.role = 'provider' \
+         ORDER BY c.canonical_id",
+    )?;
+    let ids = stmt
+        .query_map(rusqlite::params![symbol], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Append the `CrossRepo` tier at the END of the tier list — below every
+/// depth tier by construction, on both the reach-table and BFS paths.
+///
+/// Each consumer becomes a [`BlastAffectedSymbol`] whose `file` folds the
+/// repo in (`<repo>:<relpath>`) so the V4 output shapes stay unchanged;
+/// `depth` is 0 (not BFS depth — placement is by contract ownership).
+/// Totals, affected files, and the risk level are recomputed. An empty
+/// `consumers` slice leaves the analysis byte-identical.
+pub fn append_cross_repo_tier(analysis: &mut BlastAnalysis, consumers: Vec<CrossRepoConsumer>) {
+    if consumers.is_empty() {
+        return;
+    }
+
+    let symbols: Vec<BlastAffectedSymbol> = consumers
+        .into_iter()
+        .map(|c| BlastAffectedSymbol {
+            name: c.symbol.unwrap_or(c.canonical_id),
+            kind: SymbolKind::Function,
+            file: format!("{}:{}", c.repo, c.file),
+            line: c.line,
+            depth: 0,
+            confidence: c.confidence,
+        })
+        .collect();
+
+    for sym in &symbols {
+        if !analysis.affected_files.contains(&sym.file) {
+            analysis.affected_files.push(sym.file.clone());
+        }
+    }
+    analysis.affected_files.sort();
+    analysis.total_affected += symbols.len();
+    analysis.risk_level = risk_level_for_count(analysis.total_affected);
+    analysis.tiers.push(BlastTier {
+        severity: BlastSeverity::CrossRepo,
+        symbols,
+    });
+}
+
+/// Resolve the sibling consumers of `provider_ids` via the workspace
+/// registry (TASK-084). Query-time only; errors are the caller's to
+/// downgrade — blast's depth tiers never depend on the registry.
+pub fn resolve_cross_repo_consumers(
+    own_root: &std::path::Path,
+    own_conn: &Connection,
+    declared: &[String],
+    repos_dir: &std::path::Path,
+    provider_ids: &[String],
+) -> Result<Vec<CrossRepoConsumer>> {
+    let rows =
+        crate::contracts::list_contracts(own_conn, &crate::contracts::ContractQuery::default())?;
+    let resolution = crate::contracts::resolve_workspace(own_root, &rows, declared, repos_dir)?;
+    Ok(resolution
+        .links
+        .iter()
+        .filter(|l| provider_ids.contains(&l.provider.canonical_id))
+        .map(|l| CrossRepoConsumer {
+            repo: l.consumer.repo.clone(),
+            canonical_id: l.consumer.canonical_id.clone(),
+            symbol: l.consumer.symbol.clone(),
+            file: l.consumer.file.clone(),
+            line: l.consumer.line,
+            confidence: l.consumer.confidence,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,5 +1185,126 @@ fn bar() { }
             !names.contains(&"deep_caller".to_string()),
             "depth-4 is beyond the built depth"
         );
+    }
+
+    // -- cross-repo tier (TASK-084) ---------------------------------------------
+
+    #[test]
+    fn provider_contract_ids_finds_route_owner() {
+        let (_dir, conn) = make_multi_file_repo(&[(
+            "src/app.js",
+            "const app = express();\nfunction setupRoutes() {\n  app.get('/v1/users', getUser);\n}\n",
+        )]);
+        let ids = provider_contract_ids(&conn, "setupRoutes").unwrap();
+        assert_eq!(ids, vec!["http::GET::/v1/users".to_string()]);
+        assert!(
+            provider_contract_ids(&conn, "noSuchSymbol")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn append_cross_repo_tier_places_tier_below_depth_tiers() {
+        let source = "pub fn leaf() {}\npub fn caller() { leaf(); }\npub fn top() { caller(); }\n";
+        let (_dir, conn) = make_indexed_repo(source);
+        let mut analysis = analyze_blast(
+            &conn,
+            "leaf",
+            &BlastOptions {
+                depth: 3,
+                direction: BlastDirection::Upstream,
+                include_tests: false,
+                min_confidence: None,
+                use_reach: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            !analysis.tiers.is_empty(),
+            "fixture must produce depth tiers first"
+        );
+
+        let consumers = vec![CrossRepoConsumer {
+            repo: "repoB".to_string(),
+            canonical_id: "http::GET::/v1/users".to_string(),
+            symbol: Some("loadUsers".to_string()),
+            file: "src/client.js".to_string(),
+            line: 4,
+            confidence: 1.0,
+        }];
+        let before = analysis.clone();
+        append_cross_repo_tier(&mut analysis, consumers);
+
+        assert_eq!(analysis.tiers.len(), before.tiers.len() + 1);
+        let last = analysis.tiers.last().unwrap();
+        assert_eq!(last.severity, BlastSeverity::CrossRepo);
+        assert_eq!(last.symbols[0].name, "loadUsers");
+        assert_eq!(last.symbols[0].file, "repoB:src/client.js");
+        // Not BFS depth: placement is by contract ownership (documented 0).
+        assert_eq!(last.symbols[0].depth, 0);
+    }
+
+    #[test]
+    fn append_cross_repo_tier_counts_in_total_and_files() {
+        let source = "pub fn leaf() {}\npub fn caller() { leaf(); }\n";
+        let (_dir, conn) = make_indexed_repo(source);
+        let mut analysis = analyze_blast(
+            &conn,
+            "leaf",
+            &BlastOptions {
+                depth: 2,
+                direction: BlastDirection::Upstream,
+                include_tests: false,
+                min_confidence: None,
+                use_reach: false,
+            },
+        )
+        .unwrap();
+        let before_total = analysis.total_affected;
+        let before_files = analysis.affected_files.clone();
+
+        let consumers = vec![CrossRepoConsumer {
+            repo: "repoB".to_string(),
+            canonical_id: "http::GET::/v1/users".to_string(),
+            symbol: None,
+            file: "src/client.js".to_string(),
+            line: 2,
+            confidence: 1.0,
+        }];
+        append_cross_repo_tier(&mut analysis, consumers);
+
+        assert_eq!(analysis.total_affected, before_total + 1);
+        assert!(
+            analysis
+                .affected_files
+                .contains(&"repoB:src/client.js".to_string())
+        );
+        assert_eq!(analysis.affected_files.len(), before_files.len() + 1);
+        assert_eq!(
+            analysis.tiers.last().unwrap().symbols[0].name,
+            "http::GET::/v1/users"
+        );
+    }
+
+    #[test]
+    fn append_cross_repo_tier_empty_is_noop() {
+        let source = "pub fn leaf() {}\npub fn caller() { leaf(); }\n";
+        let (_dir, conn) = make_indexed_repo(source);
+        let mut analysis = analyze_blast(
+            &conn,
+            "leaf",
+            &BlastOptions {
+                depth: 2,
+                direction: BlastDirection::Upstream,
+                include_tests: false,
+                min_confidence: None,
+                use_reach: false,
+            },
+        )
+        .unwrap();
+        let before = analysis.clone();
+        append_cross_repo_tier(&mut analysis, Vec::new());
+        assert_eq!(analysis, before);
     }
 }

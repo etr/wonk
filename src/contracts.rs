@@ -6416,6 +6416,21 @@ pub enum LinkBasis {
     Rpc(RpcMatchBasis),
 }
 
+impl std::fmt::Display for LinkBasis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkBasis::ExactId => write!(f, "exact"),
+            LinkBasis::Rpc(RpcMatchBasis::PackageQualifiedService) => {
+                write!(f, "rpc:package-qualified-service")
+            }
+            LinkBasis::Rpc(RpcMatchBasis::CaseFoldedMethod) => write!(f, "rpc:case-folded-method"),
+            LinkBasis::Rpc(RpcMatchBasis::ServiceLevelProvider) => {
+                write!(f, "rpc:service-level-provider")
+            }
+        }
+    }
+}
+
 /// One endpoint (side) of a cross-repo link.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkEndpoint {

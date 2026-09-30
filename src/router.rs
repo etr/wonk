@@ -872,13 +872,27 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             emit_budget_summary_with_page(&mut fmt, truncated, budget_limit, format, page)?;
         }
         Command::Status => {
-            let conn = std::env::current_dir()
+            let repo_root = std::env::current_dir()
                 .ok()
-                .and_then(|cwd| db::find_repo_root(&cwd).ok())
-                .and_then(|root| db::find_existing_index(&root))
-                .and_then(|path| db::open(&path).ok());
+                .and_then(|cwd| db::find_repo_root(&cwd).ok());
+            let index_path = repo_root
+                .as_ref()
+                .and_then(|root| db::find_existing_index(root));
+            let conn = index_path.as_ref().and_then(|path| db::open(path).ok());
 
-            let info = query_status_info(conn.as_ref(), config.embedding.provider);
+            let workspace = match (repo_root.as_ref(), index_path.as_ref()) {
+                (Some(root), Some(index)) => {
+                    let declared = crate::config::Config::load(Some(root))
+                        .map(|c| c.contracts.workspace)
+                        .unwrap_or_default();
+                    crate::contracts::default_repos_dir().map(|repos| {
+                        crate::contracts::workspace_status(&repos, root, index, &declared)
+                    })
+                }
+                _ => None,
+            };
+
+            let info = query_status_info(conn.as_ref(), config.embedding.provider, workspace);
 
             if format.is_structured() {
                 let json =
@@ -1830,7 +1844,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 use_reach: config.reach.enabled,
             };
 
-            let result = crate::blast::analyze_blast(&conn, &args.symbol, &options)?;
+            let mut result = crate::blast::analyze_blast(&conn, &args.symbol, &options)?;
+
+            // Cross-repo tier (TASK-084): when the target owns provider
+            // contracts, sibling consumers of those contracts append below
+            // the depth tiers. Registry problems never fail blast — the
+            // depth-tier result stands with a hint.
+            if let Err(e) = append_cross_repo_blast_tier(&conn, &args.symbol, &mut result) {
+                output::print_hint(&format!("cross-repo impact not resolved: {e}"), suppress);
+            }
 
             if result.total_affected == 0 {
                 output::print_hint("no affected symbols found", suppress);
@@ -1971,8 +1993,190 @@ fn dispatch_context<W: io::Write>(
 }
 
 // ---------------------------------------------------------------------------
-// `wonk contracts` dispatch (TASK-083)
+// `wonk contracts` dispatch (TASK-083, widened by TASK-084)
 // ---------------------------------------------------------------------------
+
+/// Filters for [`build_contracts_payload`] (`wonk contracts` CLI and the
+/// `wonk_contracts` MCP tool share them verbatim).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ContractsQueryFilters {
+    /// Restrict to one contract kind.
+    pub kind: Option<crate::types::ContractKind>,
+    /// Restrict to one role.
+    pub role: Option<crate::types::ContractRole>,
+    /// `--links`: list cross-repo pairs instead of stored rows.
+    pub links: bool,
+    /// `--orphans`: widen to consumers with no provider in the workspace.
+    pub orphans: bool,
+    /// `--unused-providers`: list unconsumed provider rows.
+    pub unused_providers: bool,
+}
+
+/// Everything `wonk contracts` (and its MCP twin) can display, built in
+/// one pass: the workspace context, the mode-selected rows, the per-row
+/// consumer statuses, and the resolved cross-repo links.
+#[derive(Debug, Clone)]
+pub(crate) struct ContractsPayload {
+    /// Declared/effective/stored workspaces and co-members.
+    pub workspace: crate::contracts::WorkspaceStatus,
+    /// Rows selected for the active display mode.
+    pub rows: Vec<crate::contracts::ContractRow>,
+    /// Consumer statuses for every own row, keyed `(canonical_id, file, line)`.
+    pub status:
+        std::collections::HashMap<(String, String, usize), crate::contracts::ConsumerStatus>,
+    /// Resolved cross-repo pairs involving this repo.
+    pub links: Vec<crate::contracts::CrossRepoLink>,
+    /// Own provider rows with no consumer in repo or members.
+    pub unused_providers: Vec<crate::contracts::ContractRow>,
+}
+
+impl ContractsPayload {
+    /// Grep/NDJSON token for a row: `orphan`/`unscoped` on unmatched
+    /// consumers only — linked consumers and providers stay 083-shaped.
+    pub(crate) fn status_token(&self, row: &crate::contracts::ContractRow) -> Option<&'static str> {
+        if row.role != crate::types::ContractRole::Consumer {
+            return None;
+        }
+        match self
+            .status
+            .get(&(row.canonical_id.clone(), row.file.clone(), r_line(row)))
+        {
+            Some(crate::contracts::ConsumerStatus::Linked) | None => None,
+            Some(st) => Some(st.as_str()),
+        }
+    }
+}
+
+/// Row line as the status-map key's third element.
+fn r_line(row: &crate::contracts::ContractRow) -> usize {
+    row.line
+}
+
+/// Build the contracts payload: load repo-local workspace config, run the
+/// within-repo listing, then ALWAYS resolve the workspace (REQ-012 — no
+/// members is a no-op map pass, never an error).
+pub(crate) fn build_contracts_payload(
+    conn: &Connection,
+    repo_root: &std::path::Path,
+    repos_dir: &std::path::Path,
+    filters: &ContractsQueryFilters,
+) -> Result<ContractsPayload> {
+    let declared = crate::config::Config::load(Some(repo_root))?
+        .contracts
+        .workspace;
+    let own_index = db::find_existing_index(repo_root)
+        .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
+    let workspace = crate::contracts::workspace_status(repos_dir, repo_root, &own_index, &declared);
+
+    // Within-repo pre-filter (TASK-083 behavior); `orphans` stays a
+    // within-repo notion here — the workspace widening is layered on top.
+    let query = crate::contracts::ContractQuery {
+        kind: filters.kind,
+        role: filters.role,
+        orphans: filters.orphans,
+    };
+    let rows = crate::contracts::list_contracts(conn, &query)?;
+
+    // Resolution over ALL rows: statuses and links must see the whole repo
+    // even when the display mode filters the listing.
+    let all_rows =
+        crate::contracts::list_contracts(conn, &crate::contracts::ContractQuery::default())?;
+    let resolution =
+        crate::contracts::resolve_workspace(repo_root, &all_rows, &declared, repos_dir)?;
+
+    let rows = if filters.orphans {
+        rows.into_iter()
+            .filter(|r| {
+                r.role == crate::types::ContractRole::Consumer
+                    && matches!(
+                        resolution
+                            .status
+                            .get(&(r.canonical_id.clone(), r.file.clone(), r_line(r))),
+                        Some(crate::contracts::ConsumerStatus::Orphan)
+                            | Some(crate::contracts::ConsumerStatus::Unscoped)
+                    )
+            })
+            .collect()
+    } else {
+        rows
+    };
+
+    let mut links = resolution.links.clone();
+    if let Some(kind) = filters.kind {
+        links.retain(|l| l.provider.kind == kind);
+    }
+
+    Ok(ContractsPayload {
+        workspace,
+        rows,
+        status: resolution.status,
+        links,
+        unused_providers: resolution.unused_providers,
+    })
+}
+
+/// Append the CrossRepo tier to a blast result when the target owns
+/// provider contracts with sibling consumers (PRD-CTR-REQ-010).
+fn append_cross_repo_blast_tier(
+    conn: &Connection,
+    symbol: &str,
+    result: &mut crate::types::BlastAnalysis,
+) -> Result<()> {
+    let provider_ids = crate::blast::provider_contract_ids(conn, symbol)?;
+    if provider_ids.is_empty() {
+        return Ok(());
+    }
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
+    let Some(repos_dir) = crate::contracts::default_repos_dir() else {
+        return Ok(());
+    };
+    let declared = crate::config::Config::load(Some(&repo_root))
+        .map(|c| c.contracts.workspace)
+        .unwrap_or_default();
+    let consumers = crate::blast::resolve_cross_repo_consumers(
+        &repo_root,
+        conn,
+        &declared,
+        &repos_dir,
+        &provider_ids,
+    )?;
+    crate::blast::append_cross_repo_tier(result, consumers);
+    Ok(())
+}
+
+/// Effective-workspace context hints, on stderr so stdout stays parseable.
+fn print_workspace_hints(workspace: &crate::contracts::WorkspaceStatus, suppress: bool) {
+    let comembers = if workspace.comembers.is_empty() {
+        String::new()
+    } else {
+        format!(" (co-members: {})", workspace.comembers.join(", "))
+    };
+    if !workspace.declared.is_empty() {
+        output::print_hint(
+            &format!("workspace: {}{}", workspace.effective.join(", "), comembers),
+            suppress,
+        );
+    } else {
+        // AR-026: the exact line to add, so "undeclared" is actionable.
+        output::print_hint(
+            &format!(
+                "workspace: {} (undeclared — add 'workspace = \"{}\"' under [contracts] in .wonk/config.toml to link sibling repos)",
+                workspace.effective.join(", "),
+                workspace.effective.first().cloned().unwrap_or_default()
+            ),
+            suppress,
+        );
+    }
+    if workspace.stored_diverges {
+        output::print_hint(
+            "run wonk update to publish the declared workspace",
+            suppress,
+        );
+    }
+}
 
 fn dispatch_contracts<W: io::Write>(
     args: crate::cli::ContractsArgs,
@@ -2005,24 +2209,60 @@ fn dispatch_contracts<W: io::Write>(
         None => None,
     };
 
-    // 3. Query and stream one row per line (NDJSON in structured mode).
-    let query = crate::contracts::ContractQuery {
+    // 3. Build the payload (listing + live workspace resolution).
+    let repos_dir = crate::contracts::default_repos_dir().ok_or_else(|| {
+        anyhow::anyhow!("no home directory; cannot resolve cross-repo workspaces")
+    })?;
+    let filters = ContractsQueryFilters {
         kind,
         role,
+        links: args.links,
         orphans: args.orphans,
+        unused_providers: args.unused_providers,
     };
-    let rows = crate::contracts::list_contracts(&conn, &query)?;
+    let payload = build_contracts_payload(&conn, &repo_root, &repos_dir, &filters)?;
+    print_workspace_hints(&payload.workspace, suppress);
+
+    // 4. Mode dispatch: --links rows, then flag-filtered rows, then the
+    //    default 083 row set with status tokens on unmatched consumers.
+    if filters.links {
+        if payload.links.is_empty() {
+            output::print_hint(
+                "no cross-repo links; declare matching [contracts] workspace values and index the sibling repos",
+                suppress,
+            );
+            return Ok(());
+        }
+        for link in &payload.links {
+            fmt.format_contract_link(&output::LinkOutput::from(link))?;
+        }
+        return Ok(());
+    }
+
+    let rows = if filters.unused_providers {
+        payload.unused_providers.clone()
+    } else {
+        payload.rows.clone()
+    };
 
     if rows.is_empty() {
-        output::print_hint(
-            "no contracts found; if this index predates contract storage, run `wonk update` to re-index",
-            suppress,
-        );
+        if filters.orphans {
+            output::print_hint("no orphan consumers in this workspace", suppress);
+        } else if filters.unused_providers {
+            output::print_hint("no unused providers in this workspace", suppress);
+        } else {
+            output::print_hint(
+                "no contracts found; if this index predates contract storage, run `wonk update` to re-index",
+                suppress,
+            );
+        }
         return Ok(());
     }
 
     for row in &rows {
-        fmt.format_contract(&output::ContractOutput::from(row))?;
+        let mut out = output::ContractOutput::from(row);
+        out.status = payload.status_token(row).map(str::to_string);
+        fmt.format_contract(&out)?;
     }
     Ok(())
 }
@@ -2557,6 +2797,13 @@ pub struct StatusInfo {
     /// Ollama reachability, probed only when Ollama is relevant (configured
     /// provider or stored ollama rows). `None` means "not probed".
     pub ollama_reachable: Option<bool>,
+    /// Effective workspace ids (declared, or the repo's own name) —
+    /// TASK-084, REQ-021. Empty when no repo/index context exists.
+    pub workspaces: Vec<String>,
+    /// Whether `[contracts] workspace` is declared in repo-local config.
+    pub workspace_declared: bool,
+    /// Names of other indexed repos sharing a workspace (AR-027).
+    pub workspace_comembers: Vec<String>,
 }
 
 /// Format status info as a human-readable string for stderr output.
@@ -2570,6 +2817,20 @@ pub fn format_status_info(info: &StatusInfo) -> String {
         "Index: {} files, {} symbols, {} references",
         info.file_count, info.symbol_count, info.reference_count
     ));
+
+    if !info.workspaces.is_empty() {
+        let mut ws = format!("Workspaces: {}", info.workspaces.join(", "));
+        if !info.workspace_declared {
+            ws.push_str(" (undeclared)");
+        }
+        if !info.workspace_comembers.is_empty() {
+            ws.push_str(&format!(
+                " (co-members: {})",
+                info.workspace_comembers.join(", ")
+            ));
+        }
+        lines.push(ws);
+    }
 
     if info.embedding_count > 0 {
         let mut emb_line = format!("Embeddings: {} embeddings", info.embedding_count);
@@ -2614,7 +2875,16 @@ pub fn format_status_info(info: &StatusInfo) -> String {
 pub fn query_status_info(
     conn: Option<&Connection>,
     configured: crate::embedding::EmbeddingProviderKind,
+    workspace: Option<crate::contracts::WorkspaceStatus>,
 ) -> StatusInfo {
+    let (workspaces, workspace_declared, workspace_comembers) = match &workspace {
+        Some(ws) => (
+            ws.effective.clone(),
+            !ws.declared.is_empty(),
+            ws.comembers.clone(),
+        ),
+        None => (Vec::new(), false, Vec::new()),
+    };
     let active_provider = match configured {
         crate::embedding::EmbeddingProviderKind::Bundled => "bundled",
         crate::embedding::EmbeddingProviderKind::Ollama => "ollama",
@@ -2633,6 +2903,9 @@ pub fn query_status_info(
             stored_vector_dim: None,
             ollama_reachable: (configured == crate::embedding::EmbeddingProviderKind::Ollama)
                 .then(|| crate::embedding::OllamaProvider::new().is_healthy_quick()),
+            workspaces,
+            workspace_declared,
+            workspace_comembers,
         };
     };
 
@@ -2668,6 +2941,9 @@ pub fn query_status_info(
         stored_vector_dim: dominant.map(|s| s.dim),
         ollama_reachable: probe_ollama
             .then(|| crate::embedding::OllamaProvider::new().is_healthy_quick()),
+        workspaces,
+        workspace_declared,
+        workspace_comembers,
     }
 }
 
@@ -5317,6 +5593,8 @@ mod tests {
             kind: None,
             role: None,
             orphans: false,
+            links: false,
+            unused_providers: false,
         })));
     }
 
@@ -5368,6 +5646,54 @@ mod tests {
     // -- StatusInfo tests ---------------------------------------------------
 
     #[test]
+    fn test_status_info_format_workspaces_line() {
+        let info = StatusInfo {
+            indexed: true,
+            file_count: 10,
+            symbol_count: 50,
+            reference_count: 200,
+            embedding_count: 0,
+            stale_embedding_count: 0,
+            active_provider: "bundled".to_string(),
+            stored_vector_provider: None,
+            stored_vector_dim: None,
+            ollama_reachable: None,
+            workspaces: vec!["payments".to_string(), "platform".to_string()],
+            workspace_declared: true,
+            workspace_comembers: vec!["repoB".to_string(), "repoC".to_string()],
+        };
+        let output = format_status_info(&info);
+        assert!(
+            output.contains("Workspaces: payments, platform (co-members: repoB, repoC)"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_status_info_format_undeclared_workspace_singleton_note() {
+        let info = StatusInfo {
+            indexed: true,
+            file_count: 10,
+            symbol_count: 50,
+            reference_count: 200,
+            embedding_count: 0,
+            stale_embedding_count: 0,
+            active_provider: "bundled".to_string(),
+            stored_vector_provider: None,
+            stored_vector_dim: None,
+            ollama_reachable: None,
+            workspaces: vec!["lone-api".to_string()],
+            workspace_declared: false,
+            workspace_comembers: Vec::new(),
+        };
+        let output = format_status_info(&info);
+        assert!(
+            output.contains("Workspaces: lone-api (undeclared)"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
     fn test_status_info_format_with_embeddings() {
         let info = StatusInfo {
             indexed: true,
@@ -5380,6 +5706,9 @@ mod tests {
             stored_vector_provider: Some("ollama".to_string()),
             stored_vector_dim: Some(768),
             ollama_reachable: Some(true),
+            workspaces: Vec::new(),
+            workspace_declared: false,
+            workspace_comembers: Vec::new(),
         };
         let output = format_status_info(&info);
         assert!(output.contains("100 files"));
@@ -5405,6 +5734,9 @@ mod tests {
             stored_vector_provider: None,
             stored_vector_dim: None,
             ollama_reachable: None,
+            workspaces: Vec::new(),
+            workspace_declared: false,
+            workspace_comembers: Vec::new(),
         };
         let output = format_status_info(&info);
         assert!(output.contains("No index"));
@@ -5423,6 +5755,9 @@ mod tests {
             stored_vector_provider: Some("bundled".to_string()),
             stored_vector_dim: Some(256),
             ollama_reachable: Some(false),
+            workspaces: Vec::new(),
+            workspace_declared: false,
+            workspace_comembers: Vec::new(),
         };
         let output = format_status_info(&info);
         assert!(
@@ -5446,6 +5781,9 @@ mod tests {
             stored_vector_provider: Some("bundled".to_string()),
             stored_vector_dim: Some(256),
             ollama_reachable: None,
+            workspaces: Vec::new(),
+            workspace_declared: false,
+            workspace_comembers: Vec::new(),
         };
         let output = format_status_info(&info);
         assert!(output.contains("Provider: bundled"));
@@ -5466,6 +5804,9 @@ mod tests {
             stored_vector_provider: None,
             stored_vector_dim: None,
             ollama_reachable: None,
+            workspaces: Vec::new(),
+            workspace_declared: false,
+            workspace_comembers: Vec::new(),
         };
         let output = format_status_info(&info);
         assert!(output.contains("Stored vectors: none"), "got: {output}");
@@ -5484,6 +5825,9 @@ mod tests {
             stored_vector_provider: Some("bundled".to_string()),
             stored_vector_dim: Some(256),
             ollama_reachable: None,
+            workspaces: Vec::new(),
+            workspace_declared: false,
+            workspace_comembers: Vec::new(),
         };
         let value = serde_json::to_value(&info).unwrap();
         assert_eq!(value["active_provider"], "bundled");

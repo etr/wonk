@@ -1845,6 +1845,24 @@ impl McpServer {
 
     fn tool_status(&mut self, args: Value) -> CallToolResult {
         let format = extract_format(&args);
+        // Workspace membership (TASK-084) resolves first — its inputs are
+        // plain paths, so the registry borrow below stays exclusive.
+        let repo_root = match args.get("repo").and_then(|v| v.as_str()) {
+            Some(name) => match self.registry.resolve(name) {
+                Ok(r) => r.repo_path,
+                Err(e) => return CallToolResult::error(e),
+            },
+            None => self.router.repo_root().to_path_buf(),
+        };
+        let workspace = crate::contracts::default_repos_dir().and_then(|repos| {
+            let index = db::find_existing_index(&repo_root)?;
+            let declared = crate::config::Config::load(Some(&repo_root))
+                .map(|c| c.contracts.workspace)
+                .unwrap_or_default();
+            Some(crate::contracts::workspace_status(
+                &repos, &repo_root, &index, &declared,
+            ))
+        });
         // status works even without a connection (shows "not indexed").
         let conn = if let Some(repo_name) = args.get("repo").and_then(|v| v.as_str()) {
             let resolved = match self.registry.resolve(repo_name) {
@@ -1862,7 +1880,7 @@ impl McpServer {
             Ok(kind) => kind,
             Err(error) => return CallToolResult::error(error),
         };
-        let info = crate::router::query_status_info(conn, configured);
+        let info = crate::router::query_status_info(conn, configured, workspace);
         let status = serde_json::to_value(&info).unwrap_or_default();
         format_result(&status, format)
     }

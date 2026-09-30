@@ -79,7 +79,9 @@ fn contracts_orphans_single_repo_no_error() {
     );
     assert_eq!(
         stdout.trim(),
-        "src/app.js:8:env::::DATABASE_URL role=consumer symbol=load confidence=1.0"
+        // TASK-084 widening: the repo declares no workspace, so the
+        // unmatched consumer is unscoped, not orphaned (AR-025).
+        "src/app.js:8:env::::DATABASE_URL role=consumer symbol=load confidence=1.0 status=unscoped"
     );
 }
 

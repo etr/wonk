@@ -503,9 +503,18 @@ pub struct ContractsArgs {
     #[arg(long)]
     pub role: Option<String>,
 
-    /// Only list consumers with no provider in this repository
+    /// Only list consumers with no provider within this repo's workspace
     #[arg(long)]
     pub orphans: bool,
+
+    /// List resolved cross-repo provider<->consumer pairs with both repo
+    /// names (ignores --orphans/--unused-providers)
+    #[arg(long)]
+    pub links: bool,
+
+    /// Also list providers with no consumer in this repo's workspace
+    #[arg(long)]
+    pub unused_providers: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -554,6 +563,32 @@ mod tests {
                 assert_eq!(args.kind.as_deref(), Some("http"));
                 assert_eq!(args.role.as_deref(), Some("provider"));
                 assert!(args.orphans);
+            }
+            _ => panic!("expected Command::Contracts"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_links_flag() {
+        let cli = Cli::try_parse_from(["wonk", "contracts", "--links"]).unwrap();
+        match cli.command {
+            Command::Contracts(args) => {
+                assert!(args.links);
+                assert!(!args.orphans);
+                assert!(!args.unused_providers);
+            }
+            _ => panic!("expected Command::Contracts"),
+        }
+    }
+
+    #[test]
+    fn parse_contracts_unused_providers_flag() {
+        let cli = Cli::try_parse_from(["wonk", "contracts", "--unused-providers"]).unwrap();
+        match cli.command {
+            Command::Contracts(args) => {
+                assert!(args.unused_providers);
+                assert!(!args.links);
+                assert!(!args.orphans);
             }
             _ => panic!("expected Command::Contracts"),
         }
