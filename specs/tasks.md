@@ -3747,7 +3747,7 @@ Add the cross-repo rule family, NDJSON output, and MCP exposure.
 **Related Requirements:** PRD-REV-REQ-009, PRD-REV-REQ-010
 **Related Decisions:** DR-035, DR-031
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
