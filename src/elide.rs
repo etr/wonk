@@ -936,4 +936,69 @@ public class Demo {
         let py = "def alpha(flag):\n    a = 1\n    b = 2\n    return b\n";
         assert!(elide(py, Some(Lang::Python), Mode::Bodies).is_ok());
     }
+
+    #[test]
+    fn elision_under_20ms_on_parsed_tree() {
+        let bodies: Vec<(Lang, String)> = [Lang::Rust, Lang::TypeScript, Lang::Python]
+            .iter()
+            .map(|&lang| {
+                let mut src = String::new();
+                for i in 0..400 {
+                    src.push_str(&match lang {
+                        Lang::Rust => format!(
+                            "pub fn f{i}(n: u32) -> u32 {{\n    let a = n + {i};\n    let b = a * 2;\n    let c = b + 1;\n    let d = c * 3;\n    let e = d + 2;\n    let f = e * 4;\n    let g = f + 5;\n    let h = g * 6;\n    let j = h + 7;\n    let k = j * 8;\n    let m = k + 9;\n    m\n}}\n\n"
+                        ),
+                        Lang::TypeScript => format!(
+                            "export function f{i}(n: number): number {{\n  const a = n + {i};\n  const b = a * 2;\n  const c = b + 1;\n  const d = c * 3;\n  const e = d + 2;\n  const f = e * 4;\n  const g = f + 5;\n  const h = g * 6;\n  const j = h + 7;\n  const k = j * 8;\n  const m = k + 9;\n  return m;\n}}\n\n"
+                        ),
+                        _ => format!(
+                            "def f{i}(n):\n    a = n + {i}\n    b = a * 2\n    c = b + 1\n    d = c * 3\n    e = d + 2\n    f = e * 4\n    g = f + 5\n    h = g * 6\n    j = h + 7\n    k = j * 8\n    m = k + 9\n    return m\n\n"
+                        ),
+                    });
+                }
+                (lang, src)
+            })
+            .collect();
+
+        for (lang, src) in &bodies {
+            let mut parser = get_parser(*lang);
+            let tree = parser.parse(src, None).unwrap();
+            // The budget covers the rebuild over the already-parsed tree, so
+            // the parse happens in setup and one warm-up precedes the timing.
+            let _ = elide_tree(&tree, src, *lang, Mode::Bodies).unwrap();
+            let start = std::time::Instant::now();
+            let out = elide_tree(&tree, src, *lang, Mode::Bodies).unwrap();
+            let elapsed = start.elapsed();
+            println!(
+                "{lang:?}: {} bytes, {} lines -> {} lines in {:.2?}",
+                src.len(),
+                src.lines().count(),
+                out.lines().count(),
+                elapsed
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(20),
+                "{lang:?}: elision took {elapsed:?}, budget is 20ms"
+            );
+        }
+    }
+
+    #[test]
+    fn elide_parses_source_and_matches_elide_tree() {
+        let src = "\
+// module docs
+use std::fmt;
+
+pub fn alpha(n: u32) -> u32 {
+    let m = n + 1;
+    let k = m * 2;
+    k + 3
+}
+";
+        let via_elide = elide(src, Some(Lang::Rust), Mode::Bodies).unwrap();
+        let mut parser = get_parser(Lang::Rust);
+        let tree = parser.parse(src, None).unwrap();
+        let via_tree = elide_tree(&tree, src, Lang::Rust, Mode::Bodies).unwrap();
+        assert_eq!(via_elide, via_tree);
+    }
 }
