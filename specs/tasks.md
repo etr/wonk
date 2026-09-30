@@ -48,7 +48,7 @@
 | M28 | Precomputed Reach Index | 2 | Complete |
 | M29 | Cross-Repo Contract Detection | 5 | Complete |
 | M30 | Diff-Scoped Review Workflow | 3 | Complete |
-| M31 | Body Elision | 2 | Not Started |
+| M31 | Body Elision | 2 | In Progress |
 | M32 | Signal-Based Reranking | 4 | Not Started |
 | M33 | History-Derived Signals | 2 | Not Started |
 | M34 | Graph-Topology Signals | 2 | Not Started |
@@ -3826,7 +3826,7 @@ Create `elide.rs` — collect function/method body byte ranges from an already-p
 **Related Requirements:** PRD-ELIDE-REQ-001, PRD-ELIDE-REQ-002, PRD-ELIDE-REQ-003, PRD-ELIDE-REQ-006, PRD-ELIDE-REQ-007, PRD-ELIDE-REQ-010
 **Related Decisions:** DR-036
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
