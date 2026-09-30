@@ -967,6 +967,42 @@ mod tests {
     }
 
     #[test]
+    fn show_elide_stale_index_row_renders_gracefully() {
+        // A stale or hand-edited symbols row can carry end_line < line.
+        // The non-elide path already fails soft (extract_lines returns the
+        // single line at `line`); the elide path must degrade the same
+        // way — render the empty window, never panic through
+        // render_window's window arithmetic (PRD-ELIDE-REQ-006, AR-032).
+        let source = "fn alpha() {\n    1\n}\n\nfn beta() {\n    2\n}\n\nfn gamma() {\n    3\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        // Simulate the stale row: gamma's end_line now precedes its line.
+        conn.execute(
+            "UPDATE symbols SET line = 9, end_line = 3 WHERE name = 'gamma'",
+            [],
+        )
+        .unwrap();
+
+        let opts = ShowOptions {
+            elide: Some(crate::elide::Mode::Salience),
+            exact: true,
+            ..default_options()
+        };
+        let results = show_symbol(&conn, "gamma", dir.path(), &opts).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].source, "",
+            "degenerate window renders empty, never panics"
+        );
+
+        // The non-elide fallback stays graceful on the identical row:
+        // extract_lines yields the one line at `line`.
+        let results = show_symbol(&conn, "gamma", dir.path(), &default_options()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, "fn gamma() {");
+    }
+
+    #[test]
     fn show_shallow_wins_over_elide() {
         // PRD-ELIDE-REQ-009 / DR-017: shallow + elide resolve to ONE
         // documented rendering — shallow. It is index-only (never reads

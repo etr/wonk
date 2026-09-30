@@ -479,6 +479,16 @@ fn render_window(source: &str, ranges: &[BodyRange], start_line: usize, end_line
     let starts = line_starts(source);
     let first_row = start_line.saturating_sub(1);
     let last_row = (end_line.saturating_sub(1)).min(starts.len().saturating_sub(1));
+    if first_row > last_row {
+        // Degenerate window — inverted bounds (a stale index row can hand
+        // show end_line < line) or both bounds past EOF. Fail soft to the
+        // empty window, the shape extract_lines gives an out-of-range
+        // window, instead of slicing `source[window_start..window_end]`
+        // backwards (PRD-ELIDE-REQ-006, AR-032). This also pins
+        // window_start <= window_end for the slicing below: `starts` is
+        // nondecreasing and every lookup clamps to source.len().
+        return String::new();
+    }
     let window_start = starts.get(first_row).copied().unwrap_or(source.len());
     let window_end = starts.get(last_row + 1).copied().unwrap_or(source.len());
     let mut out = String::new();
@@ -850,6 +860,96 @@ public class Demo {
         assert_eq!(
             elide_span(src, None, Mode::Salience, 1, 2).unwrap_err(),
             NotElided::UnsupportedLanguage
+        );
+    }
+
+    #[test]
+    fn elide_span_degenerate_windows_fail_soft() {
+        // A stale or hand-edited index row can hand show a window whose
+        // start_line exceeds end_line, or a bound far past the file: the
+        // render must fail soft to the empty window — the same shape
+        // extract_lines gives an out-of-range window — never panic through
+        // a backwards byte slice (PRD-ELIDE-REQ-006, AR-032).
+        let src = "fn alpha(n: u32) -> u32 {\n    let a = n + 1;\n    while a < 9 {\n        a += 1;\n    }\n    a\n}\n\nfn beta() {\n    1\n}\n";
+        for mode in [Mode::Bodies, Mode::Salience] {
+            // Inverted window: no lines selected, empty render.
+            assert_eq!(
+                elide_span(src, Some(Lang::Rust), mode, 5, 3).unwrap(),
+                "",
+                "{mode:?}: inverted window must render empty, not panic"
+            );
+            // Huge start against a real end: still the empty window.
+            assert_eq!(
+                elide_span(src, Some(Lang::Rust), mode, usize::MAX, 1).unwrap(),
+                "",
+                "{mode:?}: huge start_line must render empty, not panic"
+            );
+            assert_eq!(
+                elide_span(src, Some(Lang::Rust), mode, usize::MAX, usize::MAX).unwrap(),
+                "",
+                "{mode:?}: fully out-of-range window must render empty"
+            );
+            // Start past EOF with end past EOF: clamps to empty.
+            assert_eq!(
+                elide_span(src, Some(Lang::Rust), mode, 50, 60).unwrap(),
+                "",
+                "{mode:?}: window past EOF must render empty"
+            );
+        }
+        // A zero window saturates to line 1 — degenerate but well-defined,
+        // the same line extract_lines(content, 0, 0) returns.
+        assert_eq!(
+            elide_span(src, Some(Lang::Rust), Mode::Salience, 0, 0).unwrap(),
+            "fn alpha(n: u32) -> u32 {"
+        );
+        // Oversized end clamps to the last line (the clipping contract).
+        let out = elide_span(src, Some(Lang::Rust), Mode::Bodies, 9, usize::MAX).unwrap();
+        assert!(
+            out.starts_with("fn beta() {") && out.contains("lines elided"),
+            "clamped window still elides beta: {out:?}"
+        );
+    }
+
+    #[test]
+    fn elide_slice_boundaries_crlf_no_trailing_newline_multibyte() {
+        // Byte-offset robustness of the render path (folded from the
+        // TASK-091 validation probe, now permanent): CRLF line endings, a
+        // file with no trailing newline, and multibyte UTF-8 content must
+        // all render — full-file and windowed, both modes — without panic
+        // and without splitting a code point.
+        let crlf = "fn crlf(n: u32) -> u32 {\r\n    let a = 1;\r\n    if a > 0 {\r\n        a += 1;\r\n    }\r\n    a\r\n}\r\n";
+        let no_tail = "fn tail(n: u32) -> u32 {\n    let a = 1;\n    while a < 9 {\n        a += 1;\n    }\n    a\n}";
+        let uni = "fn uni() -> &'static str {\n    let s = \"héllo wörld ✓ 日本語\";\n    let t = \"αβγδε\";\n    if s.len() > t.len() {\n        s\n    } else {\n        t\n    }\n}\n";
+
+        for (label, src) in [
+            ("crlf", crlf),
+            ("no-trailing-newline", no_tail),
+            ("multibyte", uni),
+        ] {
+            for mode in [Mode::Bodies, Mode::Salience] {
+                let full = elide(src, Some(Lang::Rust), mode).unwrap();
+                let windowed = elide_span(src, Some(Lang::Rust), mode, 1, usize::MAX).unwrap();
+                assert!(
+                    !full.is_empty() && !windowed.is_empty(),
+                    "{label} {mode:?}: rendering must produce output"
+                );
+            }
+        }
+        // Spot checks: the control-flow skeleton survives each slicing hazard.
+        assert!(
+            elide(crlf, Some(Lang::Rust), Mode::Salience)
+                .unwrap()
+                .contains("if a > 0 {")
+        );
+        assert!(
+            elide(no_tail, Some(Lang::Rust), Mode::Salience)
+                .unwrap()
+                .contains("while a < 9 {")
+        );
+        assert!(
+            elide(uni, Some(Lang::Rust), Mode::Salience)
+                .unwrap()
+                .contains("if s.len() > t.len() {")
         );
     }
 
