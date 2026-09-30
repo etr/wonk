@@ -96,8 +96,10 @@ impl Session {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(!stdout.trim().is_empty(), "expected non-empty JSON output");
+    // NDJSON: one JSON object per line, no " ; " joining on the piped path.
     let results: Vec<Value> = stdout
-        .split(" ; ")
+        .trim_end()
+        .split('\n')
         .map(|record| {
             serde_json::from_str(record).unwrap_or_else(|error| {
                 panic!("valid JSON result ({error}): {record}");
@@ -359,8 +361,9 @@ fn validate_token(token: &str) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.trim().is_empty(), "expected non-empty output");
 
-    // Each line should be a valid JSON object with expected fields.
-    for record in stdout.split(" ; ") {
+    // Each line should be a valid JSON object with expected fields (NDJSON:
+    // one object per line, no " ; " joining on the piped path).
+    for record in stdout.trim_end().split('\n') {
         let v: Value = serde_json::from_str(record).expect("each record should be valid JSON");
         assert!(v.get("file").is_some(), "missing 'file' field");
         assert!(v.get("line").is_some(), "missing 'line' field");

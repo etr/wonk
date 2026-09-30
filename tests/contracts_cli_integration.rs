@@ -88,15 +88,23 @@ fn contracts_ndjson_rows_parse() {
     let repo = fixture_repo();
     let (code, stdout, _stderr) = run_contracts(repo.path(), &["--format", "json"]);
     assert_eq!(code, 0);
-    // Piped output follows the global single-line-per-file convention every
-    // command shares (rows from one file joined with " ; "); each segment
-    // is a complete JSON object, so consumption needs no post-processing
-    // beyond line splitting.
-    let segments: Vec<&str> = stdout.trim_end().split(" ; ").collect();
-    assert_eq!(segments.len(), 3, "one object per contract: {stdout}");
-    let parsed: Vec<Value> = segments
+    // NDJSON acceptance criterion: one JSON object per line, consumable
+    // without post-processing. The piped path must NOT collapse rows with
+    // " ; " (PRD-OUT-REQ-002): split on newlines only and require every
+    // line to parse as a standalone JSON object.
+    assert!(
+        !stdout.contains(" ; "),
+        "piped structured output must not join rows with ' ; ': {stdout}"
+    );
+    assert!(
+        stdout.ends_with('\n') && !stdout.ends_with("\n\n"),
+        "piped NDJSON must end with exactly one trailing newline: {stdout:?}"
+    );
+    let lines: Vec<&str> = stdout.trim_end().split('\n').collect();
+    assert_eq!(lines.len(), 3, "one object per contract: {stdout}");
+    let parsed: Vec<Value> = lines
         .iter()
-        .map(|s| serde_json::from_str(s).expect("each row must parse as JSON"))
+        .map(|s| serde_json::from_str(s).expect("each line must parse as JSON"))
         .collect();
     let ids: Vec<&str> = parsed
         .iter()

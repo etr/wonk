@@ -1850,9 +1850,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
     }
 
-    // In single-line (piped) mode, emit a final newline so the output is
-    // a complete line for the shell to capture.
-    if is_piped {
+    // In single-line (piped) grep mode, emit a final newline so the output is
+    // a complete line for the shell to capture (single-line emit omits the
+    // trailing newline). Structured formats are exempt: their rows are each
+    // newline-terminated already, and appending another would leave a blank
+    // line that breaks strict NDJSON consumers.
+    if is_piped && !format.is_structured() {
         writeln!(fmt.writer_mut())?;
     }
 

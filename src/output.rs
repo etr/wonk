@@ -876,7 +876,9 @@ pub struct Formatter<W: Write> {
     budget: Option<TokenBudget>,
     /// When true, collapse newlines within each file group so that piped output
     /// emits one line per file. Results from the same file are joined with
-    /// ` ; ` and results from different files get separate lines.
+    /// ` ; ` and results from different files get separate lines. Structured
+    /// formats (`json`/`toon`) are exempt: their rows always keep one
+    /// newline-terminated line each so NDJSON stays parseable when piped.
     single_line: bool,
     /// Tracks the file path from the previous `emit()` call so that same-file
     /// results can be joined on one line in single-line mode.
@@ -903,7 +905,8 @@ impl<W: Write> Formatter<W> {
 
     /// Enable single-line mode: piped output emits one line per file group.
     /// Results from the same file are joined with ` ; `, results from
-    /// different files get separate lines.
+    /// different files get separate lines. Structured formats ignore this
+    /// mode and always emit one newline-terminated line per row.
     pub fn set_single_line(&mut self, enabled: bool) {
         self.single_line = enabled;
     }
@@ -911,8 +914,13 @@ impl<W: Write> Formatter<W> {
     /// Write data to the underlying writer. In single-line mode, collapses
     /// internal newlines to ` ; ` and groups results by file path (one line
     /// per file).
+    ///
+    /// Structured formats (`json`/`toon`) are exempt from single-line
+    /// collapsing: each serialized row keeps its own newline-terminated line
+    /// even when piped, so NDJSON output stays consumable without
+    /// post-processing (PRD-OUT-REQ-002).
     fn emit(&mut self, data: &[u8]) -> std::io::Result<()> {
-        if self.single_line {
+        if self.single_line && !self.format.is_structured() {
             let s = String::from_utf8_lossy(data);
             let collapsed = s
                 .lines()
@@ -2236,6 +2244,70 @@ mod tests {
         assert_eq!(v["line"], 42);
         assert_eq!(v["col"], 1);
         assert_eq!(v["content"], "fn main() {}");
+    }
+
+    /// Helper: render two same-file search results the way the piped CLI
+    /// does (single-line mode + auto-budget), into a String.
+    fn render_piped(format: OutputFormat) -> String {
+        let results = [
+            SearchOutput {
+                file: "src/a.rs".into(),
+                line: 1,
+                col: 1,
+                content: "let x = 1;".into(),
+                annotation: None,
+                source: None,
+            },
+            SearchOutput {
+                file: "src/a.rs".into(),
+                line: 2,
+                col: 1,
+                content: "let y = 2;".into(),
+                annotation: None,
+                source: None,
+            },
+        ];
+        let mut buf = Vec::new();
+        {
+            let mut fmt = Formatter::new(&mut buf, format, false);
+            fmt.set_single_line(true); // stdout piped (router.rs)
+            fmt.set_budget(2000); // auto-budget when piped (cli.rs)
+            for r in &results {
+                fmt.format_search_result(r).unwrap();
+            }
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn piped_json_rows_stay_newline_delimited() {
+        // PRD-OUT-REQ-002: structured formats bypass single-line collapsing —
+        // each serialized row keeps its own newline-terminated line so piped
+        // NDJSON is consumable without post-processing.
+        let out = render_piped(OutputFormat::Json);
+        assert!(
+            !out.contains(" ; "),
+            "structured piped output must not join rows with ' ; ': {out:?}"
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "one JSON object per line: {out:?}");
+        for line in lines {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("each line must parse as JSON ({e}): {line}"));
+            assert_eq!(v["file"], "src/a.rs");
+        }
+    }
+
+    #[test]
+    fn piped_grep_rows_still_join_with_separator() {
+        // Unchanged grep behavior: piped output groups same-file rows onto
+        // one line joined with " ; " so `| grep "path/"` keeps working.
+        let out = render_piped(OutputFormat::Grep);
+        assert!(
+            out.contains(" ; "),
+            "piped grep output must keep same-file row joining: {out:?}"
+        );
+        assert_eq!(out.lines().count(), 1, "one line per file group: {out:?}");
     }
 
     // -- SymbolOutput --------------------------------------------------------
