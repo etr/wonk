@@ -546,6 +546,12 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
         rusqlite::params![rel_path],
     )?;
+    // Contracts carry a NULL symbol_id for file-level rows, so the symbol
+    // cascade alone would orphan them — delete by file explicitly.
+    tx.execute(
+        "DELETE FROM contracts WHERE file = ?1",
+        rusqlite::params![rel_path],
+    )?;
     tx.execute(
         "DELETE FROM symbols WHERE file = ?1",
         rusqlite::params![rel_path],
@@ -605,6 +611,12 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     // for clarity and to mirror the pattern used for references and imports.
     tx.execute(
         "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
+        rusqlite::params![result.rel_path],
+    )?;
+    // Contracts are cleared and rewritten per file on re-index; the symbol
+    // cascade misses NULL-symbol_id rows (documents, top-level sites).
+    tx.execute(
+        "DELETE FROM contracts WHERE file = ?1",
         rusqlite::params![result.rel_path],
     )?;
     tx.execute(
@@ -748,6 +760,10 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
             insert_stmt.execute(rusqlite::params![child_id, parent_id, edge.relationship,])?;
         }
     }
+
+    // Rewrite the file's contract rows (cleared above), resolving owning
+    // symbols against the same name map the reference inserts used.
+    insert_contracts(&tx, &result.rel_path, &result.contracts, Some(&caller_map))?;
 
     // Incrementally repair the reach rows this edit touched (the same
     // traversal the full build runs, over the affected source set). On
@@ -1622,6 +1638,7 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM embeddings;
          DELETE FROM type_edges;
+         DELETE FROM contracts;
          DELETE FROM symbols;
          DELETE FROM \"references\";
          DELETE FROM file_imports;
@@ -2095,6 +2112,108 @@ class Component {
             )
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn reindex_replaces_file_contracts() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let file = dir.path().join("src/app.js");
+
+        fs::write(
+            &file,
+            "const app = express();\napp.get('/v2/ping', ping);\nconst flag = process.env.FEATURE_X;\n",
+        )
+        .unwrap();
+        assert!(
+            reindex_file(
+                &conn,
+                &file,
+                dir.path(),
+                &crate::contracts::ContractOptions::default()
+            )
+            .unwrap()
+        );
+
+        let ids: Vec<String> = conn
+            .prepare("SELECT canonical_id FROM contracts WHERE file = 'src/app.js' ORDER BY canonical_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                "env::::FEATURE_X".to_string(),
+                "http::GET::/v2/ping".to_string()
+            ],
+            "re-index must leave exactly the new-content set, no stale rows"
+        );
+    }
+
+    #[test]
+    fn remove_file_deletes_contracts() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        remove_file(&conn, &dir.path().join("src/app.js"), dir.path()).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM contracts WHERE file = 'src/app.js'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "deleting a file must drop its contract rows");
+    }
+
+    #[test]
+    fn reindex_file_stale_document_contracts_removed() {
+        // A proto edited from two rpc methods down to one must not keep the
+        // vanished method's row: the document flows through the same
+        // per-file delete-and-rewrite seam as grammar files.
+        let dir = make_rpc_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let proto = dir.path().join("proto/users.proto");
+        fs::write(
+            &proto,
+            "syntax = \"proto3\";\npackage users.v1;\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);\n}\n",
+        )
+        .unwrap();
+        assert!(
+            reindex_file(
+                &conn,
+                &proto,
+                dir.path(),
+                &crate::contracts::ContractOptions::default()
+            )
+            .unwrap()
+        );
+        let ids: Vec<String> = conn
+            .prepare("SELECT canonical_id FROM contracts WHERE file = 'proto/users.proto'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["grpc::UserService::GetUser".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_index_clears_contracts() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let stats = rebuild_index(dir.path(), true).unwrap();
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM contracts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count as usize, stats.contract_count);
+        assert_eq!(stats.contract_count, 3, "rebuild must not duplicate rows");
     }
 
     #[test]
