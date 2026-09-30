@@ -126,7 +126,7 @@ and the stored dimension.
 |-----|---------|-------------|
 | `breaking_change` | `true` | Rule family A: a removed or signature-changed symbol with live indexed callers blocks |
 | `coverage_gap` | `true` | Rule family B: an added/modified non-test symbol with no test in its blast radius warns |
-| `cross_repo` | `true` | Rule family C: an added/modified symbol providing a contract consumed by another indexed repo warns |
+| `cross_repo` | `true` | Rule family C: an added/modified/removed symbol providing a contract consumed by another indexed repo warns |
 
 Each family layers independently — a noisy rule can be silenced alone without
 touching the others. `cross_repo` needs both repos indexed into the central

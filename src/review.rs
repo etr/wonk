@@ -375,11 +375,18 @@ fn rule_coverage_gap(
 /// Rule C: a changed symbol that PROVIDES a contract consumed by another
 /// indexed repo warns, naming the consuming repo.
 ///
-/// Present-tense trigger: `Added`/`Modified` only — a Removed symbol is
-/// rule A's domain. Body-only modifications DO count: sibling repos depend
-/// on behavior (routes handled, messages emitted), not on signatures.
-/// `related` folds consumer sites exactly like blast's cross-repo tier
-/// (`append_cross_repo_tier`), so review and `wonk blast` cannot disagree.
+/// All three change types are candidates — including `Removed`: the
+/// base-state index still holds the removed provider's contract rows, and
+/// its external consumers are invisible to rule A (whose callers are the
+/// in-repo WillBreak tier of `analyze_blast`), so without rule C the
+/// highest-impact cross-repo change would be silent. A Removed provider
+/// with BOTH in-repo callers and external consumers can produce both
+/// findings — the rules are independent, matching the existing A+B
+/// coexistence, and rule A remains the blocking path. Body-only
+/// modifications DO count: sibling repos depend on behavior (routes
+/// handled, messages emitted), not on signatures. `related` folds consumer
+/// sites exactly like blast's cross-repo tier (`append_cross_repo_tier`),
+/// so review and `wonk blast` cannot disagree.
 fn rule_cross_repo(
     cs: &ChangedSymbol,
     provider_ids: &[String],
@@ -429,14 +436,25 @@ fn rule_cross_repo(
     }
 
     let rule = "cross-repo/changed-provider-with-external-consumers";
-    let message = format!(
-        "{} `{}` changed but provides contract(s) {} consumed by {} other repo(s): {}",
-        cs.kind,
-        cs.name,
-        provider_ids.join(", "),
-        repos.len(),
-        format_caller_names(&repos)
-    );
+    let message = if cs.change_type == crate::types::ChangeType::Removed {
+        format!(
+            "removed {} `{}` provided contract(s) {} consumed by {} other repo(s): {}",
+            cs.kind,
+            cs.name,
+            provider_ids.join(", "),
+            repos.len(),
+            format_caller_names(&repos)
+        )
+    } else {
+        format!(
+            "{} `{}` changed but provides contract(s) {} consumed by {} other repo(s): {}",
+            cs.kind,
+            cs.name,
+            provider_ids.join(", "),
+            repos.len(),
+            format_caller_names(&repos)
+        )
+    };
 
     Some(Finding {
         file: cs.file.clone(),
@@ -529,7 +547,9 @@ pub fn run_review(
         let rule_c_candidate = options.cross_repo
             && matches!(
                 cs.change_type,
-                crate::types::ChangeType::Added | crate::types::ChangeType::Modified
+                crate::types::ChangeType::Added
+                    | crate::types::ChangeType::Modified
+                    | crate::types::ChangeType::Removed
             )
             && !crate::ranker::is_test_file(Path::new(&cs.file));
         if !rule_a_candidate && !rule_b_candidate && !rule_c_candidate {
@@ -1803,10 +1823,12 @@ mod tests {
     }
 
     #[test]
-    fn rule_c_removal_is_rule_a_domain() {
-        // REQ-010 is present tense — a symbol that still exists and
-        // changed. Removals belong to rule A; a cross-repo warning about
-        // deleted code would double-report.
+    fn rule_c_removed_provider_with_sibling_consumer_warns_cross_repo() {
+        // REQ-010's trigger is "a changed symbol providing a contract
+        // consumed by another indexed repo" — removals included. Rule A
+        // cannot see these consumers (its callers are the in-repo WillBreak
+        // tier), so rule C is the only surface that can name the sibling;
+        // without it the highest-impact cross-repo change would be silent.
         if !git_available() {
             return;
         }
@@ -1828,12 +1850,67 @@ mod tests {
             repos_dir: repos_dir.path().to_path_buf(),
         };
         // Remove registerUserRoutes entirely (no in-repo callers: rule A
-        // stays silent too, so the absence below is rule C's alone).
-        std::fs::write(
-            root.join("src/routes.js"),
-            "const app = express();\nfunction placeholder() {\n  app.get('/v1/other', h);\n}\n",
+        // stays silent too, so the finding below is rule C's alone). The
+        // base-state index still holds its provider contract rows.
+        std::fs::write(root.join("src/routes.js"), "const app = express();\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
         )
         .unwrap();
+
+        let cross: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.kind == "cross-repo")
+            .collect();
+        assert_eq!(cross.len(), 1, "got: {:?}", result.findings);
+        let f = cross[0];
+        assert_eq!(f.severity, FindingSeverity::Warning);
+        assert_eq!(
+            f.rule,
+            "cross-repo/changed-provider-with-external-consumers"
+        );
+        assert_eq!(
+            f.message,
+            "removed function `registerUserRoutes` provided contract(s) http::GET::/v1/users consumed by 1 other repo(s): own-api"
+        );
+        // Anchored to where the registrar WAS, like rule A's removals.
+        assert_eq!(f.anchor_method, AnchorMethod::OldSideLine);
+        assert_eq!(f.line, Some(2));
+        // Consumer sites fold exactly like the Added/Modified path.
+        assert_eq!(f.related.len(), 1);
+        assert_eq!(f.related[0].file, "own-api:src/client.js");
+        assert_eq!(f.related[0].name, "loadUsers");
+        // No in-repo callers means nothing blocks: one warning, REVIEW.
+        assert_eq!(result.verdict, ReviewVerdict::Review);
+    }
+
+    #[test]
+    fn rule_c_removed_provider_without_external_consumers_no_finding() {
+        // The widened gate still needs external consumers: a removed
+        // provider whose contracts nobody else consumes is ordinary
+        // dead-code deletion — rule A's in-repo question applies alone.
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES)],
+        );
+        // No sibling registered: the workspace resolves with zero links.
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+        std::fs::write(root.join("src/routes.js"), "const app = express();\n").unwrap();
 
         let result = run_review(
             &conn,
@@ -1845,9 +1922,10 @@ mod tests {
         .unwrap();
         assert!(
             result.findings.iter().all(|f| f.kind != "cross-repo"),
-            "Removed symbols must not raise rule C, got: {:?}",
+            "no external consumers, no rule C, got: {:?}",
             result.findings
         );
+        assert_eq!(result.verdict, ReviewVerdict::Approve);
     }
 
     #[test]

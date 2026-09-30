@@ -354,7 +354,7 @@ Three rule families run, each independently switchable via `[review]` in
 |-------|------|----------|------------|
 | A — breaking change | `breaking-change` | blocking | A removed or signature-changed symbol still has indexed callers |
 | B — coverage gap | `coverage-gap` | warning | An added/modified non-test symbol has no test file in its blast radius |
-| C — cross-repo impact | `cross-repo` | warning | An added/modified non-test symbol provides a contract consumed by another indexed repo |
+| C — cross-repo impact | `cross-repo` | warning | An added/modified/removed non-test symbol provides (when removed: provided) a contract consumed by another indexed repo |
 
 ```
 wonk review                       # unstaged working-tree diff
