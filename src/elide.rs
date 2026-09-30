@@ -308,4 +308,68 @@ end
 ";
         assert_eq!(out, expected);
     }
+
+    #[test]
+    fn nested_functions_collapse_to_outermost_stub() {
+        let py = "\
+# module docs
+
+def outer(n):
+    def inner(k):
+        t = k + 1
+        return t
+    x = inner(n)
+    return x * 2
+
+def solo():
+    return 7
+";
+        let mut parser = get_parser(Lang::Python);
+        let tree = parser.parse(py, None).unwrap();
+        let out = elide_tree(&tree, py, Lang::Python, Mode::Bodies).unwrap();
+        let expected = "\
+# module docs
+
+def outer(n):
+    # 5 lines elided
+
+def solo():
+    return 7
+";
+        assert_eq!(out, expected);
+        assert_eq!(out.matches("elided").count(), 1, "one stub, not one per nested def");
+
+        let js = "\
+// module docs
+import fs from 'fs';
+
+function outer(n) {
+  function inner(k) {
+    const t = k + 1;
+    return t;
+  }
+  const x = inner(n);
+  return x * 2;
+}
+
+function solo() {
+  return 7;
+}
+";
+        let mut parser = get_parser(Lang::JavaScript);
+        let tree = parser.parse(js, None).unwrap();
+        let out = elide_tree(&tree, js, Lang::JavaScript, Mode::Bodies).unwrap();
+        let expected = "\
+// module docs
+import fs from 'fs';
+
+function outer(n) { /* 8 lines elided */ }
+
+function solo() { /* 3 lines elided */ }
+";
+        assert_eq!(out, expected);
+        assert!(!out.contains("inner"));
+        // outer's stub covers its whole span including the nested def
+        assert!(out.contains("/* 8 lines elided */"));
+    }
 }
