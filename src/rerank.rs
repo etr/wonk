@@ -477,6 +477,54 @@ fn compare_scored(a: &ScoredResult, b: &ScoredResult) -> std::cmp::Ordering {
         .then_with(|| a.classified.result.line.cmp(&b.classified.result.line))
 }
 
+/// Which ranking path `rank_and_explain` takes.
+#[derive(Debug, Clone)]
+pub struct RankSettings {
+    /// `false` (the default, REQ-017) wraps the legacy lexicographic sort;
+    /// `true` runs the signal pipeline.
+    pub use_pipeline: bool,
+    /// Signal weights for the pipeline path.
+    pub weights: WeightTable,
+}
+
+impl Default for RankSettings {
+    fn default() -> Self {
+        Self {
+            use_pipeline: false,
+            weights: WeightTable::kind_dominant(),
+        }
+    }
+}
+
+/// Unified ranking entry point for search results.
+///
+/// Classification always happens in `ranker.rs`; then either the legacy
+/// lexicographic sort (wrapped as unscored `ScoredResult`s — rendering
+/// reads `.classified`, so output is byte-identical to today) or the
+/// signal pipeline, followed by the ONE shared dedup/group implementation.
+pub fn rank_and_explain(
+    results: &[crate::search::SearchResult],
+    conn: Option<&Connection>,
+    pattern: &str,
+    settings: &RankSettings,
+) -> Vec<(ResultCategory, Vec<ScoredResult>)> {
+    let classified = crate::ranker::classify_results(results, conn);
+    let ranked = if settings.use_pipeline {
+        rerank(classified, &QueryInfo { pattern }, conn, &settings.weights)
+    } else {
+        crate::ranker::rank_results(classified)
+            .into_iter()
+            .map(|classified| ScoredResult {
+                classified,
+                score: 0.0,
+                contributions: Vec::new(),
+            })
+            .collect()
+    };
+    let deduped = crate::ranker::dedup_reexports(ranked, pattern);
+    crate::ranker::group_by_category(deduped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
