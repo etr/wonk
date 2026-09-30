@@ -31,6 +31,7 @@ pub struct Config {
     pub embedding: EmbeddingConfig,
     pub reach: ReachConfig,
     pub contracts: ContractsConfig,
+    pub review: ReviewConfig,
 }
 
 /// Daemon-related settings.
@@ -117,6 +118,29 @@ impl Default for ReachConfig {
         Self {
             depth: 3,
             enabled: true,
+        }
+    }
+}
+
+/// Review rule-family switches (TASK-085, AR-022).
+///
+/// Per-family booleans rather than a rules list: each family layers
+/// independently, and a noisy rule can be silenced alone pending OQ-013
+/// calibration. Both default to enabled; TASK-086 adds the cross-repo
+/// family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewConfig {
+    /// Rule family A: breaking change.
+    pub breaking_change: bool,
+    /// Rule family B: coverage gap.
+    pub coverage_gap: bool,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            breaking_change: true,
+            coverage_gap: true,
         }
     }
 }
@@ -235,6 +259,7 @@ struct ConfigOverlay {
     embedding: Option<EmbeddingOverlay>,
     reach: Option<ReachOverlay>,
     contracts: Option<ContractsOverlay>,
+    review: Option<ReviewOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -289,6 +314,13 @@ struct EmbeddingOverlay {
 struct ReachOverlay {
     depth: Option<usize>,
     enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ReviewOverlay {
+    breaking_change: Option<bool>,
+    coverage_gap: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -406,6 +438,14 @@ impl Config {
             }
             if let Some(v) = reach.enabled {
                 self.reach.enabled = v;
+            }
+        }
+        if let Some(review) = overlay.review {
+            if let Some(v) = review.breaking_change {
+                self.review.breaking_change = v;
+            }
+            if let Some(v) = review.coverage_gap {
+                self.review.coverage_gap = v;
             }
         }
         if let Some(contracts) = overlay.contracts {
@@ -893,6 +933,75 @@ enabled = false
         let config = env.load().unwrap();
         assert_eq!(config.reach.depth, 5, "global depth survives repo layer");
         assert!(!config.reach.enabled, "repo layer wins");
+    }
+
+    #[test]
+    fn review_defaults_applied_when_no_config_exists() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert!(config.review.breaking_change);
+        assert!(config.review.coverage_gap);
+    }
+
+    #[test]
+    fn review_reads_from_config_file() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[review]
+breaking_change = false
+coverage_gap = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(!config.review.breaking_change);
+        assert!(!config.review.coverage_gap);
+    }
+
+    #[test]
+    fn review_partial_overlays_only_override_set_fields() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[review]
+coverage_gap = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(
+            config.review.breaking_change,
+            "absent breaking_change key keeps the default"
+        );
+        assert!(!config.review.coverage_gap);
+    }
+
+    #[test]
+    fn review_rules_layer_independently_across_layers() {
+        // A noisy rule can be silenced alone, in any layer, without touching
+        // the other family (AR-022).
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[review]
+coverage_gap = false
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[review]
+breaking_change = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(
+            !config.review.coverage_gap,
+            "global silencing survives the repo layer"
+        );
+        assert!(
+            !config.review.breaking_change,
+            "repo layer silences the other family alone"
+        );
     }
 
     #[test]
