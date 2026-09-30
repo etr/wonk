@@ -372,6 +372,28 @@ pub fn rank_results(mut results: Vec<ClassifiedResult>) -> Vec<ClassifiedResult>
 // Deduplication
 // ---------------------------------------------------------------------------
 
+/// Items that flow through the shared dedup/group implementation. One
+/// implementation serves both `ClassifiedResult` (legacy path) and
+/// `rerank::ScoredResult` (pipeline path), so observable dedup/group
+/// behavior cannot drift between the two.
+pub(crate) trait GroupedItem {
+    fn category(&self) -> ResultCategory;
+    fn annotation(&self) -> Option<&str>;
+    fn set_annotation(&mut self, annotation: String);
+}
+
+impl GroupedItem for ClassifiedResult {
+    fn category(&self) -> ResultCategory {
+        self.category
+    }
+    fn annotation(&self) -> Option<&str> {
+        self.annotation.as_deref()
+    }
+    fn set_annotation(&mut self, annotation: String) {
+        self.annotation = Some(annotation);
+    }
+}
+
 /// Deduplicate re-exported/aliased symbols.
 ///
 /// When the same symbol name appears as both a Definition and one or more
@@ -379,13 +401,13 @@ pub fn rank_results(mut results: Vec<ClassifiedResult>) -> Vec<ClassifiedResult>
 /// annotated with "(+N other location(s))".
 ///
 /// Non-import, non-definition results are never deduplicated.
-pub fn dedup_reexports(results: Vec<ClassifiedResult>, _pattern: &str) -> Vec<ClassifiedResult> {
+pub(crate) fn dedup_reexports<T: GroupedItem>(results: Vec<T>, _pattern: &str) -> Vec<T> {
     let has_definition = results
         .iter()
-        .any(|r| r.category == ResultCategory::Definition);
+        .any(|r| r.category() == ResultCategory::Definition);
     let import_count = results
         .iter()
-        .filter(|r| r.category == ResultCategory::Import)
+        .filter(|r| r.category() == ResultCategory::Import)
         .count();
 
     // Only collapse when there is at least one definition and at least one import
@@ -396,17 +418,17 @@ pub fn dedup_reexports(results: Vec<ClassifiedResult>, _pattern: &str) -> Vec<Cl
     let mut out = Vec::with_capacity(results.len());
 
     for mut r in results {
-        if r.category == ResultCategory::Import {
+        if r.category() == ResultCategory::Import {
             // Collapse this import (skip it)
             continue;
         }
-        if r.category == ResultCategory::Definition && r.annotation.is_none() {
+        if r.category() == ResultCategory::Definition && r.annotation().is_none() {
             let label = if import_count == 1 {
                 format!("(+{import_count} other location)")
             } else {
                 format!("(+{import_count} other locations)")
             };
-            r.annotation = Some(label);
+            r.set_annotation(label);
         }
         out.push(r);
     }
@@ -420,19 +442,17 @@ pub fn dedup_reexports(results: Vec<ClassifiedResult>, _pattern: &str) -> Vec<Cl
 
 /// Group sorted results by category, returning (category, results) pairs.
 /// Empty categories are omitted.
-pub fn group_by_category(
-    results: Vec<ClassifiedResult>,
-) -> Vec<(ResultCategory, Vec<ClassifiedResult>)> {
-    let mut groups: Vec<(ResultCategory, Vec<ClassifiedResult>)> = Vec::new();
+pub(crate) fn group_by_category<T: GroupedItem>(results: Vec<T>) -> Vec<(ResultCategory, Vec<T>)> {
+    let mut groups: Vec<(ResultCategory, Vec<T>)> = Vec::new();
 
     for r in results {
         if let Some(last) = groups.last_mut()
-            && last.0 == r.category
+            && last.0 == r.category()
         {
             last.1.push(r);
             continue;
         }
-        let cat = r.category;
+        let cat = r.category();
         groups.push((cat, vec![r]));
     }
 

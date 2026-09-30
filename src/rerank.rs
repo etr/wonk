@@ -156,6 +156,18 @@ pub struct ScoredResult {
     pub contributions: Vec<Contribution>,
 }
 
+impl crate::ranker::GroupedItem for ScoredResult {
+    fn category(&self) -> ResultCategory {
+        self.classified.category
+    }
+    fn annotation(&self) -> Option<&str> {
+        self.classified.annotation.as_deref()
+    }
+    fn set_annotation(&mut self, annotation: String) {
+        self.classified.annotation = Some(annotation);
+    }
+}
+
 /// The kind signal: ports the legacy category tier ordering into the
 /// pipeline (PRD-RANK-REQ-010). Reads the category already present on the
 /// candidate — it never re-classifies.
@@ -948,5 +960,53 @@ mod tests {
             None,
         );
         assert_eq!(ctx.terms(), &["cache".to_string(), "eviction".to_string()]);
+    }
+
+    #[test]
+    fn shared_dedup_and_group_work_over_scored_results() {
+        // The ONE dedup/group implementation (ranker.rs generics) must
+        // behave identically over pipeline output: imports collapse and
+        // the definition gets the annotation.
+        let results = vec![
+            classified(
+                "src/reexport1.rs",
+                1,
+                "pub use crate::foo;",
+                ResultCategory::Import,
+            ),
+            classified(
+                "src/lib.rs",
+                10,
+                "pub fn foo() {}",
+                ResultCategory::Definition,
+            ),
+            classified(
+                "src/reexport2.rs",
+                1,
+                "pub use crate::foo;",
+                ResultCategory::Import,
+            ),
+            classified("src/main.rs", 5, "foo();", ResultCategory::CallSite),
+        ];
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "foo" },
+            None,
+            &WeightTable::kind_dominant(),
+        );
+
+        let deduped = crate::ranker::dedup_reexports(scored, "foo");
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(
+            deduped[0].classified.annotation.as_deref(),
+            Some("(+2 other locations)")
+        );
+
+        let groups = crate::ranker::group_by_category(deduped);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, ResultCategory::Definition);
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[1].0, ResultCategory::CallSite);
+        assert_eq!(groups[1].1.len(), 1);
     }
 }
