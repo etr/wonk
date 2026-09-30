@@ -1003,4 +1003,336 @@ mod tests {
             result.findings
         );
     }
+
+    #[test]
+    fn rule_b_empty_radius_message() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[("src/lib.rs", "pub fn solo() -> i32 { 1 }\n")]);
+        let root = dir.path();
+
+        // Nobody calls solo anywhere: the radius is empty.
+        std::fs::write(root.join("src/lib.rs"), "pub fn solo() -> i32 { 2 }\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        let gaps: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.kind == "coverage-gap")
+            .collect();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(
+            gaps[0].message,
+            "function `solo` changed but no test file appears in its blast radius (no affected symbols indexed)"
+        );
+        assert!(gaps[0].related.is_empty());
+    }
+
+    // -- never-disagree (AC4) ----------------------------------------------------
+
+    fn symbol_refs_of(analysis: &crate::types::BlastAnalysis) -> Vec<SymbolRef> {
+        analysis
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter())
+            .map(|s| SymbolRef {
+                name: s.name.clone(),
+                kind: s.kind,
+                file: s.file.clone(),
+                line: s.line,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ac4a_rule_a_related_equals_standalone_blast_output() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn used() {}\n\npub fn caller() { used(); }\n",
+        )]);
+        let root = dir.path();
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn caller() { used(); }\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        // Standalone blast with wonk blast defaults, run beside the review.
+        let standalone = blast::analyze_blast(
+            &conn,
+            "used",
+            &BlastOptions {
+                depth: blast::DEFAULT_DEPTH,
+                direction: BlastDirection::Upstream,
+                include_tests: false,
+                min_confidence: None,
+                use_reach: true,
+            },
+        )
+        .unwrap();
+
+        let finding = result
+            .findings
+            .iter()
+            .find(|f| f.kind == "breaking-change")
+            .expect("breaking-change finding");
+        let will_break: Vec<SymbolRef> = standalone
+            .tiers
+            .iter()
+            .find(|t| t.severity == BlastSeverity::WillBreak)
+            .map(|t| {
+                t.symbols
+                    .iter()
+                    .map(|s| SymbolRef {
+                        name: s.name.clone(),
+                        kind: s.kind,
+                        file: s.file.clone(),
+                        line: s.line,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(finding.related, will_break);
+    }
+
+    #[test]
+    fn ac4a_rule_b_related_equals_default_blast_full_tiers() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\npub fn h() { g(); }\n",
+        )]);
+        let root = dir.path();
+
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 2 }\npub fn g() -> i32 { f() }\npub fn h() { g(); }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        let standalone = blast::analyze_blast(&conn, "f", &BlastOptions::default()).unwrap();
+
+        let finding = result
+            .findings
+            .iter()
+            .find(|f| f.kind == "coverage-gap")
+            .expect("coverage-gap finding");
+        // Related is the canonical tests-excluded radius across all tiers.
+        assert_eq!(finding.related, symbol_refs_of(&standalone));
+    }
+
+    #[test]
+    fn ac4b_reach_kill_switch_yields_identical_findings() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[
+            (
+                "src/lib.rs",
+                "pub fn f(x: i32) -> i32 { x }\npub fn g() -> i32 { f(1) }\n",
+            ),
+            ("tests/x.rs", "fn t() { let _ = g(); }\n"),
+        ]);
+        let root = dir.path();
+
+        // Signature change (rule A candidate) plus radius touching a test
+        // file, so both rule families run with survivors.
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f(x: i64) -> i64 { x }\npub fn g() -> i64 { f(1) }\n",
+        )
+        .unwrap();
+
+        let with_reach = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+        let without_reach = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions {
+                reach_enabled: false,
+                ..ReviewOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(with_reach.findings, without_reach.findings);
+        assert_eq!(with_reach.verdict, without_reach.verdict);
+        assert_eq!(with_reach.verdict, ReviewVerdict::Block);
+    }
+
+    // -- extra fixtures ----------------------------------------------------------
+
+    #[test]
+    fn stale_index_relocation_yields_unresolved_anchor_not_wrong_line() {
+        // Index built at commit A; commit B relocates the fn without
+        // re-indexing; then the fn is deleted. The stale indexed line no
+        // longer falls inside this diff's removed ranges, so the finding is
+        // emitted without a line rather than pointing at the wrong one.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn relocated() {}\n\npub fn caller() { relocated(); }\n",
+        )]);
+        let root = dir.path();
+
+        // Commit B: insert 30 lines above relocated() (index stays at A).
+        let mut content = String::new();
+        for i in 0..30 {
+            content.push_str(&format!("const PAD_{i}: i32 = {i};\n"));
+        }
+        content.push_str("\npub fn relocated() {}\n\npub fn caller() { relocated(); }\n");
+        std::fs::write(root.join("src/lib.rs"), &content).unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "relocate"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        // Delete relocated() from the working tree.
+        let without = content
+            .replace("\npub fn relocated() {}\n", "\n")
+            .replace("pub fn caller() { relocated(); }", "pub fn caller() {}");
+        std::fs::write(root.join("src/lib.rs"), without).unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        let finding = result
+            .findings
+            .iter()
+            .find(|f| f.kind == "breaking-change")
+            .expect("breaking-change finding must still be emitted");
+        assert_eq!(finding.anchor_method, AnchorMethod::Unresolved);
+        assert_eq!(finding.line, None);
+    }
+
+    #[test]
+    fn rules_independently_disableable() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn used() {}\n\npub fn caller() { used(); }\n",
+        )]);
+        let root = dir.path();
+        std::fs::write(root.join("src/lib.rs"), "pub fn caller() { used(); }\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions {
+                breaking_change: false,
+                ..ReviewOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            result.findings.is_empty(),
+            "rule A disabled must drop its findings, got: {:?}",
+            result.findings
+        );
+        assert_eq!(result.verdict, ReviewVerdict::Approve);
+    }
+
+    #[test]
+    fn staged_scope_reviews_staged_edits() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn used() {}\n\npub fn caller() { used(); }\n",
+        )]);
+        let root = dir.path();
+        std::fs::write(root.join("src/lib.rs"), "pub fn caller() { used(); }\n").unwrap();
+        Command::new("git")
+            .args(["add", "src/lib.rs"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let result =
+            run_review(&conn, &ChangeScope::Staged, root, &ReviewOptions::default()).unwrap();
+        assert_eq!(result.verdict, ReviewVerdict::Block);
+        assert_eq!(result.findings.len(), 1);
+    }
+
+    #[test]
+    fn compare_scope_reviews_against_base_ref() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn used() {}\n\npub fn caller() { used(); }\n",
+        )]);
+        let root = dir.path();
+        std::fs::write(root.join("src/lib.rs"), "pub fn caller() { used(); }\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "remove used"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Compare("HEAD~1".into()),
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.verdict, ReviewVerdict::Block);
+        assert_eq!(result.findings.len(), 1);
+    }
 }
