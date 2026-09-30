@@ -121,6 +121,9 @@ pub struct ReviewOptions {
     pub breaking_change: bool,
     /// Rule family B: coverage gap (no test in the blast radius).
     pub coverage_gap: bool,
+    /// Rule family C: cross-repo contract impact (changed symbol provides a
+    /// contract consumed by another indexed repo).
+    pub cross_repo: bool,
     /// Whether qualifying blast queries may use the precomputed reach table
     /// (`[reach] enabled`); a kill switch for speed only, never findings.
     pub reach_enabled: bool,
@@ -133,9 +136,42 @@ impl Default for ReviewOptions {
         Self {
             breaking_change: true,
             coverage_gap: true,
+            cross_repo: true,
             reach_enabled: true,
             depth: blast::DEFAULT_DEPTH,
         }
+    }
+}
+
+/// Explicit cross-repo inputs for a review run (TASK-086).
+///
+/// The registry directory is a parameter, never re-derived from `$HOME`
+/// inside the engine — a test run must never touch the caller's real
+/// `~/.wonk/repos` registry, and the CLI/MCP resolve it once via
+/// [`CrossRepoInputs::discover`].
+#[derive(Debug, Clone)]
+pub struct CrossRepoInputs {
+    /// The reviewed repo's declared workspace ids
+    /// (`[contracts] workspace`).
+    pub declared: Vec<String>,
+    /// Registry directory holding the sibling indexes to resolve against.
+    pub repos_dir: std::path::PathBuf,
+}
+
+impl CrossRepoInputs {
+    /// Discover the inputs for `repo_root`: the repo's declared workspace
+    /// plus the default registry directory. `None` when no home directory
+    /// exists — cross-repo review is then simply unavailable and
+    /// [`run_review`] degrades with one warning.
+    pub fn discover(repo_root: &Path) -> Option<Self> {
+        let repos_dir = crate::contracts::default_repos_dir()?;
+        let declared = crate::config::Config::load(Some(repo_root))
+            .map(|c| c.contracts.workspace)
+            .unwrap_or_default();
+        Some(Self {
+            declared,
+            repos_dir,
+        })
     }
 }
 
@@ -333,6 +369,120 @@ fn rule_coverage_gap(
 }
 
 // ---------------------------------------------------------------------------
+// Rule family C — cross-repo contract impact (PRD-REV-REQ-010)
+// ---------------------------------------------------------------------------
+
+/// Rule C: a changed symbol that PROVIDES a contract consumed by another
+/// indexed repo warns, naming the consuming repo.
+///
+/// All three change types are candidates — including `Removed`: the
+/// base-state index still holds the removed provider's contract rows, and
+/// its external consumers are invisible to rule A (whose callers are the
+/// in-repo WillBreak tier of `analyze_blast`), so without rule C the
+/// highest-impact cross-repo change would be silent. A Removed provider
+/// with BOTH in-repo callers and external consumers can produce both
+/// findings — the rules are independent, matching the existing A+B
+/// coexistence, and rule A remains the blocking path. Body-only
+/// modifications DO count: sibling repos depend on behavior (routes
+/// handled, messages emitted), not on signatures. `related` folds consumer
+/// sites exactly like blast's cross-repo tier (`append_cross_repo_tier`),
+/// so review and `wonk blast` cannot disagree.
+fn rule_cross_repo(
+    cs: &ChangedSymbol,
+    provider_ids: &[String],
+    resolution: &crate::contracts::WorkspaceResolution,
+    line: Option<usize>,
+    anchor_method: AnchorMethod,
+) -> Option<Finding> {
+    let own = &resolution.scope.repo_name;
+    let consumers: Vec<&crate::contracts::CrossRepoLink> = resolution
+        .links
+        .iter()
+        .filter(|l| l.provider.repo == *own && provider_ids.contains(&l.provider.canonical_id))
+        .collect();
+    if consumers.is_empty() {
+        return None;
+    }
+
+    // One SymbolRef per consumer site, folded identically to
+    // append_cross_repo_tier, deduplicated on the site.
+    let mut seen: HashSet<(String, String, usize)> = HashSet::new();
+    let related: Vec<SymbolRef> = consumers
+        .iter()
+        .filter(|l| {
+            seen.insert((
+                l.consumer.repo.clone(),
+                l.consumer.file.clone(),
+                l.consumer.line,
+            ))
+        })
+        .map(|l| {
+            let c = &l.consumer;
+            SymbolRef {
+                name: c.symbol.clone().unwrap_or_else(|| c.canonical_id.clone()),
+                kind: crate::types::SymbolKind::Function,
+                file: format!("{}:{}", c.repo, c.file),
+                line: c.line,
+            }
+        })
+        .collect();
+
+    let mut repos: Vec<&str> = Vec::new();
+    for l in &consumers {
+        let name = l.consumer.repo.as_str();
+        if !repos.contains(&name) {
+            repos.push(name);
+        }
+    }
+
+    let rule = "cross-repo/changed-provider-with-external-consumers";
+    let message = if cs.change_type == crate::types::ChangeType::Removed {
+        format!(
+            "removed {} `{}` provided contract(s) {} consumed by {} other repo(s): {}",
+            cs.kind,
+            cs.name,
+            provider_ids.join(", "),
+            repos.len(),
+            format_caller_names(&repos)
+        )
+    } else {
+        format!(
+            "{} `{}` changed but provides contract(s) {} consumed by {} other repo(s): {}",
+            cs.kind,
+            cs.name,
+            provider_ids.join(", "),
+            repos.len(),
+            format_caller_names(&repos)
+        )
+    };
+
+    Some(Finding {
+        file: cs.file.clone(),
+        line,
+        anchor_method,
+        severity: FindingSeverity::Warning,
+        kind: "cross-repo".into(),
+        rule: rule.into(),
+        message,
+        identity: provisional_identity(rule, &cs.file, &cs.name),
+        related,
+    })
+}
+
+/// The one workspace join a review run may perform (rule C): list the
+/// repo's full contract row set, then resolve links over the registry in
+/// `inputs`. Same two steps `wonk contracts --links` runs, so the surfaces
+/// share one resolution semantics.
+fn resolve_workspace_once(
+    conn: &Connection,
+    repo_root: &Path,
+    inputs: &CrossRepoInputs,
+) -> Result<crate::contracts::WorkspaceResolution> {
+    let rows = crate::contracts::list_contracts(conn, &crate::contracts::ContractQuery::default())?;
+    crate::contracts::resolve_workspace(repo_root, &rows, &inputs.declared, &inputs.repos_dir)
+}
+
+// ---------------------------------------------------------------------------
 // run_review
 // ---------------------------------------------------------------------------
 
@@ -343,11 +493,22 @@ fn rule_coverage_gap(
 /// records blast's own output and never computes impact itself, so `wonk
 /// review` and `wonk blast` cannot disagree for the same symbol. Per-symbol
 /// blast failures degrade to a warning and skip that symbol (fail-soft).
+///
+/// Rule C composition: `cross_repo` carries the explicit registry inputs
+/// (see [`CrossRepoInputs`]); the workspace is resolved AT MOST ONCE per
+/// run — lazily, at the first rule-C candidate that owns provider
+/// contracts — and every candidate filters that one shared resolution.
+/// That is both the perf bound (one registry join per run, never per
+/// symbol) and the guarantee that rule C can never disagree with the
+/// `wonk contracts --links` resolution of the same run. A resolution
+/// failure warns once and disables rule C for the run; rules A/B are
+/// unaffected.
 pub fn run_review(
     conn: &Connection,
     scope: &ChangeScope,
     repo_root: &Path,
     options: &ReviewOptions,
+    cross_repo: Option<&CrossRepoInputs>,
 ) -> Result<ReviewResult> {
     let detail = impact::detect_changes_detail(conn, scope, repo_root)?;
     let mut warnings = Vec::new();
@@ -365,6 +526,11 @@ pub fn run_review(
     // Per-file cache of current-file symbols for tier-3 re-resolution.
     let mut current_cache: HashMap<String, Option<Vec<Symbol>>> = HashMap::new();
 
+    // Outer = attempted (None until the first rule-C candidate with
+    // provider contracts); inner = the resolution, None when it failed.
+    let mut cross_repo_resolution: Option<Option<crate::contracts::WorkspaceResolution>> = None;
+    let mut cross_repo_inputs_warning = false;
+
     for cs in &detail.analysis.changed_symbols {
         let rule_a_candidate = options.breaking_change
             && (cs.change_type == crate::types::ChangeType::Removed
@@ -378,12 +544,22 @@ pub fn run_review(
                 crate::types::ChangeType::Added | crate::types::ChangeType::Modified
             )
             && !crate::ranker::is_test_file(Path::new(&cs.file));
-        if !rule_a_candidate && !rule_b_candidate {
+        let rule_c_candidate = options.cross_repo
+            && matches!(
+                cs.change_type,
+                crate::types::ChangeType::Added
+                    | crate::types::ChangeType::Modified
+                    | crate::types::ChangeType::Removed
+            )
+            && !crate::ranker::is_test_file(Path::new(&cs.file));
+        if !rule_a_candidate && !rule_b_candidate && !rule_c_candidate {
             continue;
         }
 
-        // Context blast: byte-identical options to `wonk blast` defaults,
-        // so the recorded impact can never disagree with it.
+        // Context blast (rules A/B): byte-identical options to `wonk blast`
+        // defaults, so the recorded impact can never disagree with it.
+        // Rule-C-only candidates skip it entirely — their impact evidence
+        // is contract rows, not the call graph.
         let context_options = BlastOptions {
             depth: options.depth,
             direction: BlastDirection::Upstream,
@@ -391,15 +567,19 @@ pub fn run_review(
             min_confidence: None,
             use_reach: options.reach_enabled,
         };
-        let context = match blast::analyze_blast(conn, &cs.name, &context_options) {
-            Ok(analysis) => analysis,
-            Err(e) => {
-                warnings.push(format!(
-                    "skipping {} `{}` in {}: blast failed: {e}",
-                    cs.kind, cs.name, cs.file
-                ));
-                continue;
+        let context = if rule_a_candidate || rule_b_candidate {
+            match blast::analyze_blast(conn, &cs.name, &context_options) {
+                Ok(analysis) => Some(analysis),
+                Err(e) => {
+                    warnings.push(format!(
+                        "skipping {} `{}` in {}: blast failed: {e}",
+                        cs.kind, cs.name, cs.file
+                    ));
+                    continue;
+                }
             }
+        } else {
+            None
         };
 
         if !current_cache.contains_key(&cs.file) {
@@ -412,12 +592,13 @@ pub fn run_review(
         let (line, anchor_method) = resolve_anchor(cs, detail.hunks.get(&cs.file), current_symbols);
 
         if rule_a_candidate
-            && let Some(finding) = rule_breaking_change(cs, &context, &removed, line, anchor_method)
+            && let Some(ref context) = context
+            && let Some(finding) = rule_breaking_change(cs, context, &removed, line, anchor_method)
         {
             findings.push(finding);
         }
 
-        if rule_b_candidate {
+        if rule_b_candidate && let Some(ref context) = context {
             // Same options but include_tests: reach routing correctly
             // declines this shape, so the shared live BFS answers it.
             let with_tests = blast::analyze_blast(
@@ -431,7 +612,7 @@ pub fn run_review(
             match with_tests {
                 Ok(with_tests) => {
                     if let Some(finding) =
-                        rule_coverage_gap(cs, &with_tests, &context, line, anchor_method)
+                        rule_coverage_gap(cs, &with_tests, context, line, anchor_method)
                     {
                         findings.push(finding);
                     }
@@ -440,6 +621,47 @@ pub fn run_review(
                     "coverage check skipped for {} `{}` in {}: blast failed: {e}",
                     cs.kind, cs.name, cs.file
                 )),
+            }
+        }
+
+        if rule_c_candidate {
+            match cross_repo {
+                Some(inputs) => match blast::provider_contract_ids(conn, &cs.name) {
+                    Ok(ids) if ids.is_empty() => {}
+                    Ok(ids) => {
+                        if cross_repo_resolution.is_none() {
+                            let attempted = match resolve_workspace_once(conn, repo_root, inputs) {
+                                Ok(resolution) => Some(resolution),
+                                Err(e) => {
+                                    warnings.push(format!(
+                                            "cross-repo impact skipped: workspace resolution failed: {e}"
+                                        ));
+                                    None
+                                }
+                            };
+                            cross_repo_resolution = Some(attempted);
+                        }
+                        if let Some(Some(resolution)) = &cross_repo_resolution
+                            && let Some(finding) =
+                                rule_cross_repo(cs, &ids, resolution, line, anchor_method)
+                        {
+                            findings.push(finding);
+                        }
+                    }
+                    Err(e) => warnings.push(format!(
+                        "cross-repo check skipped for {} `{}` in {}: {e}",
+                        cs.kind, cs.name, cs.file
+                    )),
+                },
+                None if !cross_repo_inputs_warning => {
+                    cross_repo_inputs_warning = true;
+                    warnings.push(
+                        "cross-repo impact skipped: no cross-repo inputs available \
+                         (no home directory found)"
+                            .into(),
+                    );
+                }
+                None => {}
             }
         }
     }
@@ -773,6 +995,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -818,6 +1041,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -848,6 +1072,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -883,6 +1108,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -931,6 +1157,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -962,6 +1189,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -994,6 +1222,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -1020,6 +1249,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -1070,6 +1300,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -1133,6 +1364,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -1174,6 +1406,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
         let without_reach = run_review(
@@ -1184,6 +1417,7 @@ mod tests {
                 reach_enabled: false,
                 ..ReviewOptions::default()
             },
+            None,
         )
         .unwrap();
 
@@ -1238,6 +1472,7 @@ mod tests {
             &ChangeScope::Unstaged,
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
 
@@ -1270,6 +1505,7 @@ mod tests {
                 breaking_change: false,
                 ..ReviewOptions::default()
             },
+            None,
         )
         .unwrap();
         assert!(
@@ -1297,8 +1533,14 @@ mod tests {
             .output()
             .unwrap();
 
-        let result =
-            run_review(&conn, &ChangeScope::Staged, root, &ReviewOptions::default()).unwrap();
+        let result = run_review(
+            &conn,
+            &ChangeScope::Staged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(result.verdict, ReviewVerdict::Block);
         assert_eq!(result.findings.len(), 1);
     }
@@ -1330,9 +1572,635 @@ mod tests {
             &ChangeScope::Compare("HEAD~1".into()),
             root,
             &ReviewOptions::default(),
+            None,
         )
         .unwrap();
         assert_eq!(result.verdict, ReviewVerdict::Block);
         assert_eq!(result.findings.len(), 1);
+    }
+
+    // -- rule C: cross-repo impact (TASK-086, PRD-REV-REQ-010) ------------------
+
+    const CROSS_REPO_ROUTES: &str = "const app = express();\nfunction registerUserRoutes() {\n  app.get('/v1/users', getUser);\n}\n";
+    const CROSS_REPO_ROUTES_EDITED: &str = "const app = express();\nfunction registerUserRoutes() {\n  app.get('/v1/users', getUserV2);\n}\n";
+    const SIBLING_CLIENT: &str =
+        "async function loadUsers() {\n  await fetch('https://api.io/v1/users');\n}\n";
+
+    /// A registered sibling repo (blast's `registered_contract_repo`
+    /// pattern): indexed and published to `repos_dir`, no git history —
+    /// it is never the repo under review.
+    fn registered_sibling(
+        repos_dir: &Path,
+        name: &str,
+        workspace: &str,
+        files: &[(&str, &str)],
+    ) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        for (path, content) in files {
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            std::fs::write(root.join(path), content).unwrap();
+        }
+        std::fs::create_dir_all(root.join(".wonk")).unwrap();
+        std::fs::write(
+            root.join(".wonk/config.toml"),
+            format!("[contracts]\nworkspace = \"{workspace}\"\n"),
+        )
+        .unwrap();
+        crate::pipeline::build_index(&root, true).unwrap();
+        let dest = repos_dir.join(crate::db::repo_hash(&root));
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::copy(root.join(".wonk/index.db"), dest.join("index.db")).unwrap();
+        std::fs::copy(root.join(".wonk/meta.json"), dest.join("meta.json")).unwrap();
+        dir
+    }
+
+    /// The reviewed provider repo: real git history (diff scopes need
+    /// commits, `make_review_repo`'s half) PLUS central registration and a
+    /// workspace declaration (rule C's half). Returns the TempDir keeping
+    /// everything alive, the repo root, and the LOCAL index connection
+    /// review runs against.
+    fn make_cross_repo_review_repo(
+        repos_dir: &Path,
+        name: &str,
+        workspace: &str,
+        files: &[(&str, &str)],
+    ) -> (TempDir, std::path::PathBuf, Connection) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        for (path, content) in files {
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            std::fs::write(root.join(path), content).unwrap();
+        }
+        std::fs::create_dir_all(root.join(".wonk")).unwrap();
+        std::fs::write(
+            root.join(".wonk/config.toml"),
+            format!("[contracts]\nworkspace = \"{workspace}\"\n"),
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        crate::pipeline::build_index(&root, true).unwrap();
+        let dest = repos_dir.join(crate::db::repo_hash(&root));
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::copy(root.join(".wonk/index.db"), dest.join("index.db")).unwrap();
+        std::fs::copy(root.join(".wonk/meta.json"), dest.join("meta.json")).unwrap();
+        let conn = crate::db::open_existing(&root.join(".wonk/index.db")).unwrap();
+        (dir, root, conn)
+    }
+
+    #[test]
+    fn ac1_changed_provider_with_sibling_consumer_warns_cross_repo() {
+        if !git_available() {
+            return;
+        }
+        // Rebuild the setup inline: make_cross_repo_review_setup cannot
+        // return the provider repo (it owns three TempDirs), and the test
+        // must edit the provider's working tree.
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES)],
+        );
+        let _sib = registered_sibling(
+            repos_dir.path(),
+            "own-api",
+            "payments",
+            &[("src/client.js", SIBLING_CLIENT)],
+        );
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+
+        // Body edit: the route's handler argument changes, the signature
+        // does not. Siblings depend on behavior, so this must warn.
+        std::fs::write(root.join("src/routes.js"), CROSS_REPO_ROUTES_EDITED).unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+
+        let cross: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.kind == "cross-repo")
+            .collect();
+        assert_eq!(cross.len(), 1, "got: {:?}", result.findings);
+        let f = cross[0];
+        assert_eq!(f.severity, FindingSeverity::Warning);
+        assert_eq!(
+            f.rule,
+            "cross-repo/changed-provider-with-external-consumers"
+        );
+        assert_eq!(
+            f.message,
+            "function `registerUserRoutes` changed but provides contract(s) http::GET::/v1/users consumed by 1 other repo(s): own-api"
+        );
+        assert!(f.line.is_some(), "rule C reuses the loop's anchor");
+        assert_eq!(f.related.len(), 1);
+        assert_eq!(f.related[0].file, "own-api:src/client.js");
+        assert_eq!(f.related[0].name, "loadUsers");
+        assert_eq!(result.verdict, ReviewVerdict::Review);
+    }
+
+    #[test]
+    fn rule_c_disabled_by_option() {
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES)],
+        );
+        let _sib = registered_sibling(
+            repos_dir.path(),
+            "own-api",
+            "payments",
+            &[("src/client.js", SIBLING_CLIENT)],
+        );
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+        std::fs::write(root.join("src/routes.js"), CROSS_REPO_ROUTES_EDITED).unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions {
+                cross_repo: false,
+                ..ReviewOptions::default()
+            },
+            Some(&inputs),
+        )
+        .unwrap();
+        assert!(
+            result.findings.iter().all(|f| f.kind != "cross-repo"),
+            "kill switch must drop rule C, got: {:?}",
+            result.findings
+        );
+    }
+
+    #[test]
+    fn rule_c_sibling_in_other_workspace_no_finding() {
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES)],
+        );
+        let _sib = registered_sibling(
+            repos_dir.path(),
+            "own-api",
+            "billing",
+            &[("src/client.js", SIBLING_CLIENT)],
+        );
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+        std::fs::write(root.join("src/routes.js"), CROSS_REPO_ROUTES_EDITED).unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+        assert!(
+            result.findings.iter().all(|f| f.kind != "cross-repo"),
+            "workspaces must not intersect, got: {:?}",
+            result.findings
+        );
+    }
+
+    #[test]
+    fn rule_c_removed_provider_with_sibling_consumer_warns_cross_repo() {
+        // REQ-010's trigger is "a changed symbol providing a contract
+        // consumed by another indexed repo" — removals included. Rule A
+        // cannot see these consumers (its callers are the in-repo WillBreak
+        // tier), so rule C is the only surface that can name the sibling;
+        // without it the highest-impact cross-repo change would be silent.
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES)],
+        );
+        let _sib = registered_sibling(
+            repos_dir.path(),
+            "own-api",
+            "payments",
+            &[("src/client.js", SIBLING_CLIENT)],
+        );
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+        // Remove registerUserRoutes entirely (no in-repo callers: rule A
+        // stays silent too, so the finding below is rule C's alone). The
+        // base-state index still holds its provider contract rows.
+        std::fs::write(root.join("src/routes.js"), "const app = express();\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+
+        let cross: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.kind == "cross-repo")
+            .collect();
+        assert_eq!(cross.len(), 1, "got: {:?}", result.findings);
+        let f = cross[0];
+        assert_eq!(f.severity, FindingSeverity::Warning);
+        assert_eq!(
+            f.rule,
+            "cross-repo/changed-provider-with-external-consumers"
+        );
+        assert_eq!(
+            f.message,
+            "removed function `registerUserRoutes` provided contract(s) http::GET::/v1/users consumed by 1 other repo(s): own-api"
+        );
+        // Anchored to where the registrar WAS, like rule A's removals.
+        assert_eq!(f.anchor_method, AnchorMethod::OldSideLine);
+        assert_eq!(f.line, Some(2));
+        // Consumer sites fold exactly like the Added/Modified path.
+        assert_eq!(f.related.len(), 1);
+        assert_eq!(f.related[0].file, "own-api:src/client.js");
+        assert_eq!(f.related[0].name, "loadUsers");
+        // No in-repo callers means nothing blocks: one warning, REVIEW.
+        assert_eq!(result.verdict, ReviewVerdict::Review);
+    }
+
+    #[test]
+    fn rule_c_removed_provider_without_external_consumers_no_finding() {
+        // The widened gate still needs external consumers: a removed
+        // provider whose contracts nobody else consumes is ordinary
+        // dead-code deletion — rule A's in-repo question applies alone.
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES)],
+        );
+        // No sibling registered: the workspace resolves with zero links.
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+        std::fs::write(root.join("src/routes.js"), "const app = express();\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+        assert!(
+            result.findings.iter().all(|f| f.kind != "cross-repo"),
+            "no external consumers, no rule C, got: {:?}",
+            result.findings
+        );
+        assert_eq!(result.verdict, ReviewVerdict::Approve);
+    }
+
+    #[test]
+    fn rule_c_symbol_without_provider_contracts_skipped() {
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[
+                ("src/routes.js", CROSS_REPO_ROUTES),
+                ("src/util.js", "function util() { return 1; }\n"),
+            ],
+        );
+        let _sib = registered_sibling(
+            repos_dir.path(),
+            "own-api",
+            "payments",
+            &[("src/client.js", SIBLING_CLIENT)],
+        );
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+        // Edit the contract-less symbol only.
+        std::fs::write(root.join("src/util.js"), "function util() { return 2; }\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+        assert!(
+            result.findings.iter().all(|f| f.kind != "cross-repo"),
+            "no provider contracts, no rule C, got: {:?}",
+            result.findings
+        );
+    }
+
+    #[test]
+    fn rule_c_own_repo_consumer_only_no_finding() {
+        // Cross-repo impact means consumers in OTHER repos. An own-repo
+        // consumer of the own provider is never a link (084's contract).
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[
+                ("src/routes.js", CROSS_REPO_ROUTES),
+                ("src/client.js", SIBLING_CLIENT),
+            ],
+        );
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+        std::fs::write(root.join("src/routes.js"), CROSS_REPO_ROUTES_EDITED).unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+        assert!(
+            result.findings.iter().all(|f| f.kind != "cross-repo"),
+            "own consumers are not cross-repo impact, got: {:?}",
+            result.findings
+        );
+    }
+
+    #[test]
+    fn ac4c_rule_c_related_folds_like_blast_cross_repo_tier() {
+        // Never-disagree extended to rule C: the finding's related set is
+        // the same consumer folding `wonk blast` appends as its CrossRepo
+        // tier — same filter, same <repo>:<file> paths, same names.
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES)],
+        );
+        let _sib = registered_sibling(
+            repos_dir.path(),
+            "own-api",
+            "payments",
+            &[("src/client.js", SIBLING_CLIENT)],
+        );
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+        std::fs::write(root.join("src/routes.js"), CROSS_REPO_ROUTES_EDITED).unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+        let finding = result
+            .findings
+            .iter()
+            .find(|f| f.kind == "cross-repo")
+            .expect("cross-repo finding");
+
+        let provider_ids = blast::provider_contract_ids(&conn, "registerUserRoutes").unwrap();
+        let consumers = blast::resolve_cross_repo_consumers(
+            &root,
+            &conn,
+            &["payments".to_string()],
+            &inputs.repos_dir,
+            &provider_ids,
+        )
+        .unwrap();
+        let folded: Vec<SymbolRef> = consumers
+            .iter()
+            .map(|c| SymbolRef {
+                name: c.symbol.clone().unwrap_or_else(|| c.canonical_id.clone()),
+                kind: crate::types::SymbolKind::Function,
+                file: format!("{}:{}", c.repo, c.file),
+                line: c.line,
+            })
+            .collect();
+        assert_eq!(finding.related, folded);
+    }
+
+    // -- rule C composition: fail-soft + once-only -------------------------------
+
+    const CROSS_REPO_ROUTES_TWO: &str = "const app = express();\nfunction registerUserRoutes() {\n  app.get('/v1/users', getUser);\n}\nfunction registerOrderRoutes() {\n  app.get('/v1/orders', getOrders);\n}\n";
+    const CROSS_REPO_ROUTES_TWO_EDITED: &str = "const app = express();\nfunction registerUserRoutes() {\n  app.get('/v1/users', getUserV2);\n}\nfunction registerOrderRoutes() {\n  app.get('/v1/orders', getOrdersV2);\n}\n";
+
+    #[test]
+    fn cross_repo_resolution_failure_fails_soft_and_warns_once() {
+        // A broken registry must never break the review: rules A/B keep
+        // their findings, rule C degrades with exactly one warning — one
+        // resolution ATTEMPT per run, so two provider symbols still warn
+        // once (per-symbol resolution would warn twice).
+        if !git_available() {
+            return;
+        }
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[("src/routes.js", CROSS_REPO_ROUTES_TWO)],
+        );
+        let _sib = registered_sibling(
+            repos_dir.path(),
+            "own-api",
+            "payments",
+            &[("src/client.js", SIBLING_CLIENT)],
+        );
+        // Break the registry after registration: the sibling's entry stays
+        // discoverable (index.db exists, meta.json readable) but its index
+        // is unopenable garbage — a lazy-open failure, not a skip.
+        for entry in std::fs::read_dir(repos_dir.path()).unwrap().flatten() {
+            let index = entry.path().join("index.db");
+            if index.exists() {
+                std::fs::write(&index, b"not a sqlite database").unwrap();
+            }
+        }
+        let inputs = CrossRepoInputs {
+            declared: vec!["payments".to_string()],
+            repos_dir: repos_dir.path().to_path_buf(),
+        };
+
+        std::fs::write(root.join("src/routes.js"), CROSS_REPO_ROUTES_TWO_EDITED).unwrap();
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            &root,
+            &ReviewOptions::default(),
+            Some(&inputs),
+        )
+        .unwrap();
+
+        let cross_warnings: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|w| w.contains("cross-repo"))
+            .collect();
+        assert_eq!(
+            cross_warnings.len(),
+            1,
+            "two provider candidates, still one warning: {:?}",
+            result.warnings
+        );
+        assert!(
+            cross_warnings[0].contains("workspace resolution failed"),
+            "{}",
+            cross_warnings[0]
+        );
+        // Fail-soft is scoped to rule C: coverage gaps still computed.
+        assert_eq!(
+            result
+                .findings
+                .iter()
+                .filter(|f| f.kind == "coverage-gap")
+                .count(),
+            2,
+            "got: {:?}",
+            result.findings
+        );
+        assert!(result.findings.iter().all(|f| f.kind != "cross-repo"));
+    }
+
+    #[test]
+    fn cross_repo_enabled_without_inputs_warns_once() {
+        // The engine never re-derives the registry from $HOME: enabled rule
+        // C without explicit inputs degrades with one warning, once, no
+        // matter how many candidates the diff has.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { 2 }\n",
+        )]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 11 }\npub fn g() -> i32 { 22 }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+
+        let cross: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|w| w.contains("cross-repo"))
+            .collect();
+        assert_eq!(
+            cross.len(),
+            1,
+            "two candidates, still one warning: {:?}",
+            result.warnings
+        );
+        assert!(cross[0].contains("no cross-repo inputs"), "{}", cross[0]);
+        assert_eq!(
+            result
+                .findings
+                .iter()
+                .filter(|f| f.kind == "coverage-gap")
+                .count(),
+            2,
+            "rules A/B unaffected: {:?}",
+            result.findings
+        );
     }
 }

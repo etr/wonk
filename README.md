@@ -6,7 +6,7 @@
 
 **Structure-aware code search that cuts LLM token burn by 37%.**
 
-Wonk indexes your codebase with Tree-sitter to understand code structure — definitions, call graphs, imports, and scopes — then ranks search results so definitions surface first and tests sort last. A built-in MCP server exposes 23 tools for AI coding assistants, and a background daemon keeps the index fresh. Single static binary, zero runtime dependencies.
+Wonk indexes your codebase with Tree-sitter to understand code structure — definitions, call graphs, imports, and scopes — then ranks search results so definitions surface first and tests sort last. A built-in MCP server exposes 24 tools for AI coding assistants, and a background daemon keeps the index fresh. Single static binary, zero runtime dependencies.
 
 ## Before / after
 
@@ -58,7 +58,7 @@ LLM coding agents grep aggressively. A single query can stuff hundreds of noisy,
 
 ## How it works
 
-Wonk pre-indexes your codebase with Tree-sitter so it understands code structure: definitions vs. usages, symbol kinds, scopes, imports, and dependencies. When you search, results come back **ranked, deduplicated, and grouped by relevance** -- definitions first, tests last. The index stays fresh via a background file watcher, and a built-in MCP server exposes 23 tools for AI coding assistants.
+Wonk pre-indexes your codebase with Tree-sitter so it understands code structure: definitions vs. usages, symbol kinds, scopes, imports, and dependencies. When you search, results come back **ranked, deduplicated, and grouped by relevance** -- definitions first, tests last. The index stays fresh via a background file watcher, and a built-in MCP server exposes 24 tools for AI coding assistants.
 
 ```
 ┌─────────┐    ┌────────┐    ┌──────────────────────────┐    ┌────────┐    ┌────────┐
@@ -95,13 +95,14 @@ Wonk pre-indexes your codebase with Tree-sitter so it understands code structure
 - Blast radius analysis with severity tiers and risk levels
 - Execution flow tracing from entry points
 - Changed symbol detection with blast/flow chaining
+- Diff-scoped review with line-anchored findings and a mechanical verdict
 
 **Architecture**
 - Single static binary -- SQLite, tree-sitter grammars, and grep engine bundled
 - 12 languages: TypeScript/TSX, JavaScript, Python, Rust, Go, Java, C, C++, Ruby, PHP, C#
 - Background daemon keeps index fresh via filesystem watcher
 - Worktree isolation -- separate index per git worktree
-- 23 MCP tools for AI coding assistants (JSON-RPC 2.0 over stdio)
+- 24 MCP tools for AI coding assistants (JSON-RPC 2.0 over stdio)
 - Token budget (`--budget N`) caps output and preserves top-ranked results
 
 ## Benchmarks
@@ -149,6 +150,7 @@ wonk sym "UserService"            # find symbol definitions
 wonk callers "dispatch"           # who calls this?
 wonk blast "processPayment"       # what breaks if this changes?
 wonk changes --blast --flows      # changed symbols + impact analysis
+wonk review --since main          # findings + verdict for this diff
 wonk ask "error handling logic"   # semantic search
 ```
 
@@ -158,7 +160,7 @@ Indexing happens automatically on first use.
 
 Wonk's primary audience is AI coding agents. Three integration paths:
 
-**MCP server** — `wonk mcp serve` exposes 23 JSON-RPC tools over stdio. Agents call `wonk_search`, `wonk_sym`, `wonk_callers`, `wonk_blast`, etc. with structured parameters and JSON responses. See [MCP server](#mcp-server).
+**MCP server** — `wonk mcp serve` exposes 24 JSON-RPC tools over stdio. Agents call `wonk_search`, `wonk_sym`, `wonk_callers`, `wonk_blast`, `wonk_review`, etc. with structured parameters and JSON responses. See [MCP server](#mcp-server).
 
 **Claude Code plugin** — the [wonk plugin](https://github.com/etr/wonk-plugin) bundles the MCP server, a skill that teaches Claude when to prefer wonk over grep/glob, and a session hook. See [Claude Code plugin](#claude-code-plugin).
 
@@ -173,6 +175,7 @@ Wonk's primary audience is AI coding agents. Three integration paths:
 | Trace forward call graph | `wonk callees X --depth 3` |
 | Shortest path A → B | `wonk callpath A B` |
 | Impact of a change | `wonk blast X` or `wonk changes --blast` |
+| Review a diff before committing | `wonk review --since main` |
 | Module overview | `wonk summary src/api --depth 1` |
 
 ## Claude Code plugin
@@ -202,7 +205,7 @@ Wonk includes a built-in [MCP](https://modelcontextprotocol.io/) server for AI c
 }
 ```
 
-23 tools exposed: search, sym, ref, sig, show, deps, rdeps, callers, callees, callpath, summary, flows, blast, changes, context, ask, cluster, impact, init, update, status, repos, contracts (service-contract listing with kind/role/orphans/links filters). All tools accept an optional `repo` parameter for multi-repo setups.
+24 tools exposed: search, sym, ref, sig, show, deps, rdeps, callers, callees, callpath, summary, flows, blast, changes, context, ask, cluster, impact, init, update, status, repos, contracts (service-contract listing with kind/role/orphans/links filters), review (diff-scoped review: line-anchored findings plus a BLOCK/REVIEW/APPROVE verdict; findings are emitted only — nothing is posted to a forge and nothing is auto-fixed). All tools accept an optional `repo` parameter for multi-repo setups.
 
 ## Commands
 
@@ -229,6 +232,7 @@ Wonk includes a built-in [MCP](https://modelcontextprotocol.io/) server for AI c
 | `flows [entry]` | Detect entry points and trace execution flows |
 | `blast <symbol>` | Blast radius with severity tiers and risk levels |
 | `changes` | Changed symbols with optional `--blast` / `--flows` chaining |
+| `review` | Diff-scoped review: findings + BLOCK/REVIEW/APPROVE verdict |
 | `context <name>` | Full symbol context: callers, callees, flows, children |
 | `impact <file>` | Symbol-level change impact analysis |
 | **Semantic** | |
@@ -255,7 +259,7 @@ Full flag reference: [`docs/commands.md`](docs/commands.md)
 | Semantic search | Embedding similarity (bundled or Ollama) | No | No |
 | Token budget | `--budget N` caps output | No | No |
 | Setup | Single binary, auto-indexes | Single binary | Language server per language |
-| MCP server | 23 tools built-in | No | Via adapter |
+| MCP server | 24 tools built-in | No | Via adapter |
 | Output | grep-compatible + JSON + TOON | grep + JSON | Protocol-specific |
 
 ## Output formats

@@ -1992,13 +1992,24 @@ fn dispatch_review<W: io::Write>(
     let options = crate::review::ReviewOptions {
         breaking_change: config.review.breaking_change,
         coverage_gap: config.review.coverage_gap,
+        cross_repo: config.review.cross_repo,
         reach_enabled: config.reach.enabled,
         ..crate::review::ReviewOptions::default()
     };
 
-    // 4. Run the review. The verdict is data: exit code stays 0 (TASK-086
-    // revisits exit codes).
-    let result = crate::review::run_review(&conn, &scope, &repo_root, &options)?;
+    // Cross-repo inputs resolved once here — run_review never touches
+    // $HOME itself, and a disabled rule C passes no inputs at all.
+    let cross_repo = config
+        .review
+        .cross_repo
+        .then(|| crate::review::CrossRepoInputs::discover(&repo_root))
+        .flatten();
+
+    // 4. Run the review. The verdict is data: exit code stays 0 — a
+    // non-zero exit would force piping consumers to treat REVIEW (the
+    // normal outcome of a productive review) as a command failure.
+    let result =
+        crate::review::run_review(&conn, &scope, &repo_root, &options, cross_repo.as_ref())?;
     for warning in &result.warnings {
         output::print_hint(warning, suppress);
     }

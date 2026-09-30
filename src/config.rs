@@ -126,14 +126,15 @@ impl Default for ReachConfig {
 ///
 /// Per-family booleans rather than a rules list: each family layers
 /// independently, and a noisy rule can be silenced alone pending OQ-013
-/// calibration. Both default to enabled; TASK-086 adds the cross-repo
-/// family.
+/// calibration. All default to enabled (cross-repo arrives TASK-086).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewConfig {
     /// Rule family A: breaking change.
     pub breaking_change: bool,
     /// Rule family B: coverage gap.
     pub coverage_gap: bool,
+    /// Rule family C: cross-repo contract impact (TASK-086).
+    pub cross_repo: bool,
 }
 
 impl Default for ReviewConfig {
@@ -141,6 +142,7 @@ impl Default for ReviewConfig {
         Self {
             breaking_change: true,
             coverage_gap: true,
+            cross_repo: true,
         }
     }
 }
@@ -321,6 +323,7 @@ struct ReachOverlay {
 struct ReviewOverlay {
     breaking_change: Option<bool>,
     coverage_gap: Option<bool>,
+    cross_repo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -446,6 +449,9 @@ impl Config {
             }
             if let Some(v) = review.coverage_gap {
                 self.review.coverage_gap = v;
+            }
+            if let Some(v) = review.cross_repo {
+                self.review.cross_repo = v;
             }
         }
         if let Some(contracts) = overlay.contracts {
@@ -941,6 +947,7 @@ enabled = false
         let config = env.load().unwrap();
         assert!(config.review.breaking_change);
         assert!(config.review.coverage_gap);
+        assert!(config.review.cross_repo);
     }
 
     #[test]
@@ -951,11 +958,13 @@ enabled = false
 [review]
 breaking_change = false
 coverage_gap = false
+cross_repo = false
 "#,
         );
         let config = env.load().unwrap();
         assert!(!config.review.breaking_change);
         assert!(!config.review.coverage_gap);
+        assert!(!config.review.cross_repo);
     }
 
     #[test]
@@ -973,6 +982,10 @@ coverage_gap = false
             "absent breaking_change key keeps the default"
         );
         assert!(!config.review.coverage_gap);
+        assert!(
+            config.review.cross_repo,
+            "absent cross_repo key keeps the default"
+        );
     }
 
     #[test]
@@ -991,6 +1004,7 @@ coverage_gap = false
             r#"
 [review]
 breaking_change = false
+cross_repo = false
 "#,
         );
         let config = env.load().unwrap();
@@ -1001,6 +1015,10 @@ breaking_change = false
         assert!(
             !config.review.breaking_change,
             "repo layer silences the other family alone"
+        );
+        assert!(
+            !config.review.cross_repo,
+            "repo layer silences the third family alone"
         );
     }
 

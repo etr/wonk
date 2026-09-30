@@ -66,7 +66,7 @@ fn main() -> Result<()> {
 
     // Self-check: the fixture must produce the expected review before any
     // timing claim is made.
-    let check = run_review(&conn, &scope, root, &options)?;
+    let check = run_review(&conn, &scope, root, &options, None)?;
     let blocking = check
         .findings
         .iter()
@@ -111,7 +111,7 @@ fn main() -> Result<()> {
     let mut detect_ms: Vec<f64> = Vec::with_capacity(SWEEPS);
     for _ in 0..SWEEPS {
         let t = Instant::now();
-        let result = run_review(&conn, &scope, root, &options)?;
+        let result = run_review(&conn, &scope, root, &options, None)?;
         full_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         ensure!(
             result.findings.len() == check.findings.len(),
@@ -148,7 +148,7 @@ fn main() -> Result<()> {
     };
     for _ in 0..SWEEPS {
         let t = Instant::now();
-        let result = run_review(&conn, &scope, root, &bfs_options)?;
+        let result = run_review(&conn, &scope, root, &bfs_options, None)?;
         bfs_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         ensure!(
             result.findings == check.findings,

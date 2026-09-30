@@ -661,6 +661,9 @@ pub struct ReviewOutput {
     pub scope: String,
     pub findings: Vec<FindingOutput>,
     pub verdict: String,
+    /// Non-fatal engine warnings (fail-soft skips); omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 impl From<&crate::review::ReviewResult> for ReviewOutput {
@@ -669,8 +672,25 @@ impl From<&crate::review::ReviewResult> for ReviewOutput {
             scope: result.scope.to_string(),
             findings: result.findings.iter().map(FindingOutput::from).collect(),
             verdict: result.verdict.to_string(),
+            warnings: result.warnings.clone(),
         }
     }
+}
+
+/// The final line of a review run (PRD-REV-REQ-009).
+///
+/// NDJSON discrimination contract: a finding line never carries `verdict`;
+/// the verdict line is the only one that does. Consumers classify each
+/// line by key presence alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewVerdictOutput {
+    pub scope: String,
+    pub verdict: String,
+    /// How many finding lines precede this one.
+    pub finding_count: usize,
+    /// Non-fatal engine warnings; omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2074,14 +2094,32 @@ impl<W: Write> Formatter<W> {
 
     /// Shared render logic for `wonk review` output.
     ///
-    /// Toon falls back to grep lines here; its PRD-OUT treatment is
-    /// TASK-086's.
+    /// JSON is NDJSON (PRD-REV-REQ-009): one independently-parseable line
+    /// per finding, then exactly one verdict line — zero findings still
+    /// emit the verdict line. TOON renders the whole result as a single
+    /// object (the toon render precedent), since a toon document is one
+    /// value, not a stream.
     fn render_review<W2: Write>(
         fmt: &mut Formatter<W2>,
         out: &ReviewOutput,
     ) -> std::io::Result<()> {
-        if fmt.format == OutputFormat::Json {
+        if fmt.format == OutputFormat::Toon {
             let line = Self::serialize_structured(fmt.format, out)?;
+            return writeln!(fmt.writer, "{line}");
+        }
+
+        if fmt.format == OutputFormat::Json {
+            for f in &out.findings {
+                let line = Self::serialize_structured(fmt.format, f)?;
+                writeln!(fmt.writer, "{line}")?;
+            }
+            let verdict = ReviewVerdictOutput {
+                scope: out.scope.clone(),
+                verdict: out.verdict.clone(),
+                finding_count: out.findings.len(),
+                warnings: out.warnings.clone(),
+            };
+            let line = Self::serialize_structured(fmt.format, &verdict)?;
             return writeln!(fmt.writer, "{line}");
         }
 
@@ -5062,6 +5100,7 @@ mod tests {
             scope: "unstaged".into(),
             findings: vec![FindingOutput::from(&review_finding_fixture(line))],
             verdict: "BLOCK".into(),
+            warnings: Vec::new(),
         }
     }
 
@@ -5125,6 +5164,7 @@ mod tests {
                 ..review_finding_fixture(Some(4))
             })],
             verdict: "REVIEW".into(),
+            warnings: Vec::new(),
         };
         let text = render(OutputFormat::Grep, |fmt| fmt.format_review(&out));
         assert!(
@@ -5134,13 +5174,110 @@ mod tests {
         assert!(text.contains("verdict: REVIEW"));
     }
 
+    // -- NDJSON (TASK-086, PRD-REV-REQ-009) ------------------------------------
+
     #[test]
-    fn review_output_toon_falls_back_to_grep() {
-        // PRD-OUT toon treatment lands in TASK-086; 085 renders grep lines.
+    fn review_json_renders_one_line_per_finding_then_verdict() {
+        let text = render(OutputFormat::Json, |fmt| {
+            fmt.format_review(&review_output_fixture(Some(1)))
+        });
+        let lines: Vec<&str> = text.trim_end().lines().collect();
+        assert_eq!(lines.len(), 2, "1 finding + 1 verdict line: {text}");
+        // Every line parses independently — no post-processing needed.
+        let finding: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let verdict: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(finding["kind"], "breaking-change");
+        assert_eq!(finding["file"], "src/lib.rs");
+        assert!(
+            finding.get("verdict").is_none(),
+            "finding lines carry no verdict key — key presence is the line discriminator"
+        );
+        assert_eq!(verdict["verdict"], "BLOCK");
+        assert_eq!(verdict["scope"], "unstaged");
+        assert_eq!(verdict["finding_count"], 1);
+    }
+
+    #[test]
+    fn review_json_zero_findings_is_exactly_one_verdict_line() {
+        let out = ReviewOutput {
+            scope: "unstaged".into(),
+            findings: vec![],
+            verdict: "APPROVE".into(),
+            warnings: Vec::new(),
+        };
+        let text = render(OutputFormat::Json, |fmt| fmt.format_review(&out));
+        let lines: Vec<&str> = text.trim_end().lines().collect();
+        assert_eq!(lines.len(), 1, "clean diff, single line: {text}");
+        let verdict: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(verdict["verdict"], "APPROVE");
+        assert_eq!(verdict["finding_count"], 0);
+        assert!(
+            verdict.get("warnings").is_none(),
+            "a clean run omits the warnings key entirely"
+        );
+    }
+
+    #[test]
+    fn review_json_verdict_line_carries_warnings() {
+        let out = ReviewOutput {
+            scope: "unstaged".into(),
+            findings: vec![],
+            verdict: "APPROVE".into(),
+            warnings: vec!["cross-repo impact skipped: workspace resolution failed".into()],
+        };
+        let text = render(OutputFormat::Json, |fmt| fmt.format_review(&out));
+        let verdict: serde_json::Value =
+            serde_json::from_str(text.trim_end().lines().next().unwrap()).unwrap();
+        assert_eq!(
+            verdict["warnings"][0],
+            "cross-repo impact skipped: workspace resolution failed"
+        );
+    }
+
+    #[test]
+    fn review_output_serialization_omits_empty_warnings() {
+        let json = serde_json::to_string(&review_output_fixture(Some(1))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("warnings").is_none(),
+            "empty warnings must not serialize, got {json}"
+        );
+    }
+
+    #[test]
+    fn review_output_from_maps_result_warnings() {
+        let result = crate::review::ReviewResult {
+            scope: crate::types::ChangeScope::Unstaged,
+            findings: vec![],
+            verdict: crate::types::ReviewVerdict::Review,
+            warnings: vec!["cross-repo impact skipped: no cross-repo inputs".into()],
+        };
+        let out = ReviewOutput::from(&result);
+        assert_eq!(
+            out.warnings,
+            vec!["cross-repo impact skipped: no cross-repo inputs".to_string()]
+        );
+        assert_eq!(out.verdict, "REVIEW");
+    }
+
+    #[test]
+    fn review_toon_renders_single_object_not_grep_lines() {
         let text = render(OutputFormat::Toon, |fmt| {
             fmt.format_review(&review_output_fixture(Some(1)))
         });
-        assert!(text.contains("verdict: BLOCK"), "got: {text}");
-        assert!(text.contains("[BLOCKING]"));
+        // One structured toon document: object keys, nested findings list,
+        // and no grep severity tokens. (Round-trip parsing is not asserted:
+        // serde_toon2 0.1 cannot parse back a non-empty nested array inside
+        // a list item — a parser limit, not a render defect.)
+        assert!(
+            !text.contains("[BLOCKING]"),
+            "toon must not fall back to grep severity tokens: {text}"
+        );
+        assert!(
+            text.contains("scope: unstaged") && text.contains("verdict: BLOCK"),
+            "object keys present: {text}"
+        );
+        assert!(text.contains("findings[1]:"), "{text}");
+        assert!(text.contains("kind: breaking-change"), "{text}");
     }
 }
