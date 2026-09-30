@@ -23,6 +23,7 @@ pub mod pipeline;
 pub mod progress;
 pub mod ranker;
 pub mod reach;
+pub mod review;
 pub mod router;
 pub mod search;
 pub mod semantic;

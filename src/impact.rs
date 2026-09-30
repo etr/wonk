@@ -16,8 +16,8 @@ use crate::embedding;
 use crate::indexer;
 use crate::semantic;
 use crate::types::{
-    ChangeAnalysis, ChangeScope, ChangeType, ChangedSymbol, ImpactResult, SemanticResult, Symbol,
-    SymbolKind, SymbolRef,
+    ChangeAnalysis, ChangeAnalysisDetail, ChangeScope, ChangeType, ChangedSymbol, FileDiffHunks,
+    ImpactResult, SemanticResult, Symbol, SymbolKind, SymbolRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -310,21 +310,32 @@ pub fn get_diff_hunks_for_file(
     Ok(parse_diff_hunks(&stdout))
 }
 
-/// Parse a single hunk header and return `(start, end)` for the new side,
-/// or `None` if the hunk is a pure deletion (count=0).
-fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
-    let plus_pos = line.find('+')?;
-    let after_plus = &line[plus_pos + 1..];
-    let range_end = after_plus.find([' ', '@']).unwrap_or(after_plus.len());
-    let range_str = &after_plus[..range_end];
+/// Both sides of a single `@@ -old[,n] +new[,n] @@` hunk header.
+///
+/// A side is `None` when its count is 0 (e.g. the new side of a pure
+/// deletion), so pure deletions still yield their old-side range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HunkSides {
+    /// Removed-line range on the pre-change side.
+    pub old: Option<(usize, usize)>,
+    /// Added-line range on the post-change side.
+    pub new: Option<(usize, usize)>,
+}
+
+/// Parse one hunk-header side `start[,count]` into an inclusive range.
+/// `None` when the count is 0 (that side has no lines in this hunk).
+fn parse_hunk_side(range_str: &str) -> Option<(usize, usize)> {
+    // Cut at the first separator: the new side is followed by ` @@ …`.
+    let range_str = range_str.trim();
+    let range_end = range_str.find([' ', '@']).unwrap_or(range_str.len());
+    let range_str = &range_str[..range_end];
 
     let (start, count) = if let Some(comma) = range_str.find(',') {
-        let s = range_str[..comma].parse::<usize>().unwrap_or(0);
-        let c = range_str[comma + 1..].parse::<usize>().unwrap_or(1);
+        let s = range_str[..comma].parse::<usize>().ok()?;
+        let c = range_str[comma + 1..].parse::<usize>().ok()?;
         (s, c)
     } else {
-        let s = range_str.parse::<usize>().unwrap_or(0);
-        (s, 1)
+        (range_str.parse::<usize>().ok()?, 1)
     };
 
     if count == 0 {
@@ -332,6 +343,27 @@ fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
     }
 
     Some((start, start + count - 1))
+}
+
+/// Parse a single hunk header into both its old (removed) and new (added)
+/// side ranges, or `None` if the line is not a hunk header.
+fn parse_hunk_header_sides(line: &str) -> Option<HunkSides> {
+    let minus_pos = line.find('-')?;
+    let plus_pos = minus_pos + line[minus_pos..].find('+')?;
+    if plus_pos <= minus_pos {
+        return None;
+    }
+
+    Some(HunkSides {
+        old: parse_hunk_side(&line[minus_pos + 1..plus_pos]),
+        new: parse_hunk_side(&line[plus_pos + 1..]),
+    })
+}
+
+/// Parse a single hunk header and return `(start, end)` for the new side,
+/// or `None` if the hunk is a pure deletion (count=0).
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    parse_hunk_header_sides(line).and_then(|sides| sides.new)
 }
 
 /// Parse `git diff --unified=0` output and extract changed line ranges.
@@ -349,13 +381,14 @@ pub fn parse_diff_hunks(diff_output: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Parse multi-file `git diff --unified=0` output into per-file hunk maps.
+/// Parse multi-file `git diff --unified=0` output into per-file hunk maps,
+/// carrying both sides of every hunk.
 ///
-/// Returns a `HashMap<String, Vec<(usize, usize)>>` keyed by file path (from
-/// `diff --git a/... b/...` headers). This allows a single git subprocess to
-/// provide all hunk data for all changed files.
-fn parse_all_diff_hunks(diff_output: &str) -> HashMap<String, Vec<(usize, usize)>> {
-    let mut result: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+/// With `--unified=0` a hunk has no context lines, so `removed_ranges` is
+/// exactly the removed lines of the pre-change file and `new_ranges` exactly
+/// the added lines of the post-change file.
+fn parse_all_diff_hunks_sides(diff_output: &str) -> HashMap<String, FileDiffHunks> {
+    let mut result: HashMap<String, FileDiffHunks> = HashMap::new();
     let mut current_file: Option<String> = None;
 
     for line in diff_output.lines() {
@@ -365,21 +398,28 @@ fn parse_all_diff_hunks(diff_output: &str) -> HashMap<String, Vec<(usize, usize)
                 current_file = Some(rest[b_pos + 3..].to_string());
             }
         } else if line.starts_with("@@")
-            && let (Some(file), Some(hunk)) = (&current_file, parse_hunk_header(line))
+            && let (Some(file), Some(sides)) = (&current_file, parse_hunk_header_sides(line))
         {
-            result.entry(file.clone()).or_default().push(hunk);
+            let entry = result.entry(file.clone()).or_default();
+            if let Some(old) = sides.old {
+                entry.removed_ranges.push(old);
+            }
+            if let Some(new) = sides.new {
+                entry.new_ranges.push(new);
+            }
         }
     }
 
     result
 }
 
-/// Run a single `git diff --unified=0` for all files under the given scope and
-/// return per-file hunk maps via [`parse_all_diff_hunks`].
-fn get_all_diff_hunks(
+/// Run a single `git diff --unified=0` for all files under the given scope
+/// and return per-file hunk maps carrying both sides, via
+/// [`parse_all_diff_hunks_sides`].
+fn get_all_diff_hunks_sides(
     scope: &ChangeScope,
     repo_root: &Path,
-) -> Result<HashMap<String, Vec<(usize, usize)>>> {
+) -> Result<HashMap<String, FileDiffHunks>> {
     let mut cmd = Command::new("git");
     cmd.arg("diff").arg("--unified=0");
     apply_scope_args(&mut cmd, scope)?;
@@ -395,7 +435,7 @@ fn get_all_diff_hunks(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_all_diff_hunks(&stdout))
+    Ok(parse_all_diff_hunks_sides(&stdout))
 }
 
 /// Detect changed symbols using pre-loaded indexed symbols and file content.
@@ -553,15 +593,30 @@ pub fn detect_changes(
     scope: &ChangeScope,
     repo_root: &Path,
 ) -> Result<ChangeAnalysis> {
+    Ok(detect_changes_detail(conn, scope, repo_root)?.analysis)
+}
+
+/// [`detect_changes`] plus the diff detail review needs: both-side hunk
+/// ranges per file and the set of symbols whose signatures — not just bodies
+/// — changed (TASK-085, PRD-REV-REQ-012).
+///
+/// Everything comes from the same single git subprocess and symbol merge as
+/// [`detect_changes`]; `analysis` is byte-identical to what it returns.
+pub fn detect_changes_detail(
+    conn: &Connection,
+    scope: &ChangeScope,
+    repo_root: &Path,
+) -> Result<ChangeAnalysisDetail> {
     let changed_files = detect_scoped_files(scope, repo_root)?;
 
     // Single git subprocess for all hunks across all files.
-    let all_hunks = get_all_diff_hunks(scope, repo_root).unwrap_or_else(|e| {
+    let hunks = get_all_diff_hunks_sides(scope, repo_root).unwrap_or_else(|e| {
         eprintln!("wonk: warning: failed to get diff hunks: {e}");
         HashMap::new()
     });
 
     let mut all_changes: Vec<ChangedSymbol> = Vec::new();
+    let mut signature_changed: HashSet<(String, SymbolKind)> = HashSet::new();
 
     for file in &changed_files {
         // Skip files we can't parse (non-supported languages).
@@ -579,8 +634,8 @@ pub fn detect_changes(
         };
 
         // Step 1: Hunk-based detection (Modified symbols).
-        let hunks = all_hunks.get(file.as_str()).cloned().unwrap_or_default();
-        let hunk_modified = map_hunks_to_symbols(&indexed_symbols, &hunks, file);
+        let file_hunks = hunks.get(file.as_str()).cloned().unwrap_or_default();
+        let hunk_modified = map_hunks_to_symbols(&indexed_symbols, &file_hunks.new_ranges, file);
 
         // Step 2: Tree-sitter based detection (Added/Removed/Modified via signature
         // diff), reusing the already-loaded indexed symbols.
@@ -595,9 +650,14 @@ pub fn detect_changes(
         // hunk-overlap Modified, plus Added/Removed).
         let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
 
-        // Add tree-sitter results first (they have priority).
+        // Add tree-sitter results first (they have priority). A Modified here
+        // means the signature changed; record it before hunk-path results can
+        // blend in — dedup priority keeps the flag unshadowed.
         for cs in &ts_changes {
             if seen.insert((cs.name.clone(), cs.kind)) {
+                if cs.change_type == ChangeType::Modified {
+                    signature_changed.insert((cs.name.clone(), cs.kind));
+                }
                 all_changes.push(cs.clone());
             }
         }
@@ -610,9 +670,13 @@ pub fn detect_changes(
         }
     }
 
-    Ok(ChangeAnalysis {
-        scope: scope.clone(),
-        changed_symbols: all_changes,
+    Ok(ChangeAnalysisDetail {
+        analysis: ChangeAnalysis {
+            scope: scope.clone(),
+            changed_symbols: all_changes,
+        },
+        hunks,
+        signature_changed,
     })
 }
 
@@ -1607,6 +1671,8 @@ index 1234..5678 100644
     }
 
     // -- parse_all_diff_hunks tests --------------------------------------------
+    // Ported to the both-sides parser (TASK-085); assertions that previously
+    // checked the new-side-only map now check its new_ranges projection.
 
     #[test]
     fn parse_all_diff_hunks_single_file() {
@@ -1617,9 +1683,9 @@ index abc123..def456 100644
 +++ b/src/lib.rs
 @@ -1,3 +1,5 @@
 ";
-        let result = parse_all_diff_hunks(diff);
+        let result = parse_all_diff_hunks_sides(diff);
         assert_eq!(result.len(), 1);
-        assert_eq!(result["src/lib.rs"], vec![(1, 5)]);
+        assert_eq!(result["src/lib.rs"].new_ranges, vec![(1, 5)]);
     }
 
     #[test]
@@ -1635,15 +1701,15 @@ diff --git a/src/b.rs b/src/b.rs
 @@ -5,3 +5,7 @@
 @@ -20 +24 @@
 ";
-        let result = parse_all_diff_hunks(diff);
+        let result = parse_all_diff_hunks_sides(diff);
         assert_eq!(result.len(), 2);
-        assert_eq!(result["src/a.rs"], vec![(1, 1)]);
-        assert_eq!(result["src/b.rs"], vec![(5, 11), (24, 24)]);
+        assert_eq!(result["src/a.rs"].new_ranges, vec![(1, 1)]);
+        assert_eq!(result["src/b.rs"].new_ranges, vec![(5, 11), (24, 24)]);
     }
 
     #[test]
     fn parse_all_diff_hunks_empty_input() {
-        let result = parse_all_diff_hunks("");
+        let result = parse_all_diff_hunks_sides("");
         assert!(result.is_empty());
     }
 
@@ -1655,12 +1721,123 @@ diff --git a/src/lib.rs b/src/lib.rs
 +++ b/src/lib.rs
 @@ -5,3 +5,0 @@
 ";
-        let result = parse_all_diff_hunks(diff);
-        // Pure deletion produces no new-side hunks.
+        let result = parse_all_diff_hunks_sides(diff);
+        // Pure deletion produces no new-side hunks (old side keeps the range).
+        let entry = result.get("src/lib.rs");
         assert!(
-            result.is_empty() || result.get("src/lib.rs").is_none_or(|h| h.is_empty()),
-            "pure deletion should produce no hunks"
+            entry.is_none_or(|h| h.new_ranges.is_empty()),
+            "pure deletion should produce no new-side hunks"
         );
+    }
+
+    // -- parse_hunk_header_sides tests (TASK-085) ------------------------------
+
+    #[test]
+    fn parse_hunk_header_sides_mixed_change() {
+        let sides = parse_hunk_header_sides("@@ -2 +2,2 @@ fn a() {}").unwrap();
+        assert_eq!(sides.old, Some((2, 2)));
+        assert_eq!(sides.new, Some((2, 3)));
+    }
+
+    #[test]
+    fn parse_hunk_header_sides_pure_deletion_keeps_old_side() {
+        // Real shape from `git diff --unified=0` after removing line 2.
+        let sides = parse_hunk_header_sides("@@ -2 +1,0 @@ fn a() {}").unwrap();
+        assert_eq!(sides.old, Some((2, 2)));
+        assert_eq!(sides.new, None);
+    }
+
+    #[test]
+    fn parse_hunk_header_sides_pure_insertion_keeps_new_side() {
+        let sides = parse_hunk_header_sides("@@ -3,0 +3 @@ fn c() {}").unwrap();
+        assert_eq!(sides.old, None);
+        assert_eq!(sides.new, Some((3, 3)));
+    }
+
+    #[test]
+    fn parse_hunk_header_sides_single_line_shorthand() {
+        let sides = parse_hunk_header_sides("@@ -5 +5 @@").unwrap();
+        assert_eq!(sides.old, Some((5, 5)));
+        assert_eq!(sides.new, Some((5, 5)));
+    }
+
+    #[test]
+    fn parse_hunk_header_sides_deleted_file() {
+        // Whole-file deletion: every old line is a removed range, no new side.
+        let sides = parse_hunk_header_sides("@@ -1,3 +0,0 @@").unwrap();
+        assert_eq!(sides.old, Some((1, 3)));
+        assert_eq!(sides.new, None);
+    }
+
+    #[test]
+    fn parse_hunk_header_sides_rejects_non_hunk_lines() {
+        assert!(parse_hunk_header_sides("--- a/a.rs").is_none());
+        assert!(parse_hunk_header_sides("+++ b/a.rs").is_none());
+        assert!(parse_hunk_header_sides("+added line").is_none());
+    }
+
+    // -- parse_all_diff_hunks_sides tests (TASK-085) ---------------------------
+
+    #[test]
+    fn parse_all_diff_hunks_sides_multi_file_both_sides() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,3 +1,4 @@
+@@ -10,2 +12,0 @@
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -5,3 +5,3 @@
+";
+        let result = parse_all_diff_hunks_sides(diff);
+        assert_eq!(result.len(), 2);
+        // A mixed hunk contributes to both sides: `@@ -1,3 +1,4 @@` removes
+        // old lines 1-3 and adds new lines 1-4; `@@ -10,2 +12,0 @@` only
+        // removes old lines 10-11.
+        assert_eq!(result["src/a.rs"].new_ranges, vec![(1, 4)]);
+        assert_eq!(result["src/a.rs"].removed_ranges, vec![(1, 3), (10, 11)]);
+        assert_eq!(result["src/b.rs"].new_ranges, vec![(5, 7)]);
+        assert_eq!(result["src/b.rs"].removed_ranges, vec![(5, 7)]);
+    }
+
+    #[test]
+    fn parse_all_diff_hunks_sides_pure_deletion_file_has_entry() {
+        // Unlike the old new-side-only parser, a pure deletion must keep a
+        // per-file entry: the removed ranges are the anchorable old side.
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -2 +1,0 @@
+";
+        let result = parse_all_diff_hunks_sides(diff);
+        assert_eq!(result.len(), 1);
+        assert!(result["src/a.rs"].new_ranges.is_empty());
+        assert_eq!(result["src/a.rs"].removed_ranges, vec![(2, 2)]);
+    }
+
+    #[test]
+    fn parse_all_diff_hunks_sides_deleted_file_old_ranges() {
+        // Whole-file deletion: the b/ path in the diff header still names the
+        // file even though the +++ line points at /dev/null.
+        let diff = "\
+diff --git a/src/gone.rs b/src/gone.rs
+deleted file mode 100644
+--- a/src/gone.rs
++++ /dev/null
+@@ -1,4 +0,0 @@
+";
+        let result = parse_all_diff_hunks_sides(diff);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["src/gone.rs"].removed_ranges, vec![(1, 4)]);
+        assert!(result["src/gone.rs"].new_ranges.is_empty());
+    }
+
+    #[test]
+    fn parse_all_diff_hunks_sides_empty_input() {
+        assert!(parse_all_diff_hunks_sides("").is_empty());
     }
 
     // -- map_hunks_to_symbols tests -------------------------------------------
@@ -2113,6 +2290,99 @@ diff --git a/src/lib.rs b/src/lib.rs
             removed.contains(&"remove_me"),
             "remove_me should be detected as Removed, got: {:?}",
             analysis.changed_symbols
+        );
+    }
+
+    // -- detect_changes_detail tests (TASK-085) --------------------------------
+
+    #[test]
+    fn detect_changes_detail_flags_signature_modified_not_body_only() {
+        if !git_available() {
+            return;
+        }
+        let source =
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\npub fn inc(x: i32) -> i32 { x + 1 }\n";
+        let (dir, conn) = make_git_indexed_repo(source);
+        let root = dir.path();
+
+        // add: signature change (i32 -> i64); inc: body-only change.
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn add(a: i64, b: i32) -> i32 { a + b }\npub fn inc(x: i32) -> i32 { x + 2 }\n",
+        )
+        .unwrap();
+
+        let detail = detect_changes_detail(&conn, &ChangeScope::Unstaged, root).unwrap();
+
+        // Both classify as Modified, but only the signature change is flagged:
+        // a plain Modified says nothing about which path classified it.
+        let modified: Vec<&str> = detail
+            .analysis
+            .changed_symbols
+            .iter()
+            .filter(|c| c.change_type == ChangeType::Modified)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            modified.contains(&"add") && modified.contains(&"inc"),
+            "both should be Modified, got: {:?}",
+            detail.analysis.changed_symbols
+        );
+        assert!(
+            detail
+                .signature_changed
+                .contains(&("add".to_string(), SymbolKind::Function)),
+            "signature change must be flagged: {:?}",
+            detail.signature_changed
+        );
+        assert!(
+            !detail
+                .signature_changed
+                .contains(&("inc".to_string(), SymbolKind::Function)),
+            "body-only modification must not be flagged: {:?}",
+            detail.signature_changed
+        );
+    }
+
+    #[test]
+    fn detect_changes_detail_carries_removed_ranges_for_removal() {
+        if !git_available() {
+            return;
+        }
+        let source = "fn keep_me() { }\nfn remove_me() { }\n";
+        let (dir, conn) = make_git_indexed_repo(source);
+        let root = dir.path();
+
+        fs::write(root.join("src/lib.rs"), "fn keep_me() { }\n").unwrap();
+
+        let detail = detect_changes_detail(&conn, &ChangeScope::Unstaged, root).unwrap();
+        let hunks = detail
+            .hunks
+            .get("src/lib.rs")
+            .unwrap_or_else(|| panic!("hunks for src/lib.rs, got {:?}", detail.hunks));
+        assert_eq!(hunks.removed_ranges, vec![(2, 2)]);
+    }
+
+    #[test]
+    fn detect_changes_detail_analysis_equals_detect_changes() {
+        if !git_available() {
+            return;
+        }
+        let source = "pub fn add(a: i32, b: i32) -> i32 { a + b }\nfn other() { }\n";
+        let (dir, conn) = make_git_indexed_repo(source);
+        let root = dir.path();
+
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn add(a: i64, b: i32) -> i32 { a + b }\nfn other() { changed }\n",
+        )
+        .unwrap();
+
+        let detail = detect_changes_detail(&conn, &ChangeScope::Unstaged, root).unwrap();
+        let plain = detect_changes(&conn, &ChangeScope::Unstaged, root).unwrap();
+        assert_eq!(
+            detail.analysis, plain,
+            "detect_changes must remain byte-identical to detail.analysis"
         );
     }
 }

@@ -1870,6 +1870,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Contracts(args) => {
             dispatch_contracts(args, &mut fmt, suppress)?;
         }
+        Command::Review(args) => {
+            dispatch_review(args, &mut fmt, suppress)?;
+        }
     }
 
     // In single-line (piped) grep mode, emit a final newline so the output is
@@ -1888,13 +1891,27 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 // `wonk changes` dispatch (TASK-072)
 // ---------------------------------------------------------------------------
 
+/// Parse a scope string plus optional base ref into a [`ChangeScope`]
+/// (REQ-008 verbatim parsing; compare requires and validates the base ref).
+fn parse_change_scope(scope: &str, base: Option<&str>) -> Result<crate::types::ChangeScope> {
+    use crate::types::ChangeScope;
+
+    if scope == "compare" {
+        let base =
+            base.ok_or_else(|| anyhow::anyhow!("--base is required when --scope=compare"))?;
+        crate::impact::validate_git_ref(base)?;
+        return Ok(ChangeScope::Compare(base.to_string()));
+    }
+    scope
+        .parse::<ChangeScope>()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 fn dispatch_changes<W: io::Write>(
     args: crate::cli::ChangesArgs,
     fmt: &mut Formatter<W>,
     suppress: bool,
 ) -> Result<()> {
-    use crate::types::ChangeScope;
-
     // 1. Resolve repo root and open connection.
     let repo_root = std::env::current_dir()
         .ok()
@@ -1910,16 +1927,7 @@ fn dispatch_changes<W: io::Write>(
         .unwrap_or(true);
 
     // 2. Parse scope string to ChangeScope enum.
-    let scope = if args.scope == "compare" {
-        let base = args
-            .base
-            .ok_or_else(|| anyhow::anyhow!("--base is required when --scope=compare"))?;
-        ChangeScope::Compare(base)
-    } else {
-        args.scope
-            .parse::<ChangeScope>()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-    };
+    let scope = parse_change_scope(&args.scope, args.base.as_deref())?;
 
     // 3. Detect changes.
     let analysis = crate::impact::detect_changes(&conn, &scope, &repo_root)?;
@@ -1943,6 +1951,62 @@ fn dispatch_changes<W: io::Write>(
     )?;
 
     fmt.format_changes(&changes_out)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `wonk review` dispatch (TASK-085)
+// ---------------------------------------------------------------------------
+
+fn dispatch_review<W: io::Write>(
+    args: crate::cli::ReviewArgs,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+) -> Result<()> {
+    // 1. Resolve repo root. No auto-init here (deliberately): the index must
+    // reflect the diff's base state, and indexing the current tree would
+    // empty the diff and fake an APPROVE.
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
+
+    let conn = db::find_existing_index(&repo_root)
+        .and_then(|path| db::open(&path).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no index found; run `wonk init` first so the index reflects the base \
+                 state of the diff (indexing the current tree mid-diff would hide it)"
+            )
+        })?;
+
+    // 2. --since <ref> is sugar for --scope=compare --base=<ref>.
+    let (scope_str, base) = match &args.since {
+        Some(since) => ("compare".to_string(), Some(since.clone())),
+        None => (args.scope.clone(), args.base.clone()),
+    };
+    let scope = parse_change_scope(&scope_str, base.as_deref())?;
+
+    // 3. Load [review] rule switches and the [reach] kill switch.
+    let config = crate::config::Config::load(Some(&repo_root))?;
+    let options = crate::review::ReviewOptions {
+        breaking_change: config.review.breaking_change,
+        coverage_gap: config.review.coverage_gap,
+        reach_enabled: config.reach.enabled,
+        ..crate::review::ReviewOptions::default()
+    };
+
+    // 4. Run the review. The verdict is data: exit code stays 0 (TASK-086
+    // revisits exit codes).
+    let result = crate::review::run_review(&conn, &scope, &repo_root, &options)?;
+    for warning in &result.warnings {
+        output::print_hint(warning, suppress);
+    }
+    if result.findings.is_empty() {
+        output::print_hint("no findings for this scope", suppress);
+    }
+
+    fmt.format_review(&output::ReviewOutput::from(&result))?;
     Ok(())
 }
 
@@ -6012,6 +6076,62 @@ mod tests {
             min_confidence: None,
         });
         assert!(is_query_command(&cmd));
+    }
+
+    // -- Review tests (TASK-085) ----------------------------------------------
+
+    #[test]
+    fn test_is_query_command_review_is_false_no_auto_init() {
+        // Review must NOT trigger auto-init: indexing the current tree
+        // mid-diff would empty the diff and fake an APPROVE. The no-index
+        // path is an error telling the user to index the base state.
+        use crate::cli::ReviewArgs;
+        let cmd = Command::Review(ReviewArgs {
+            scope: "unstaged".into(),
+            base: None,
+            since: None,
+        });
+        assert!(!is_query_command(&cmd));
+    }
+
+    #[test]
+    fn parse_change_scope_unstaged() {
+        use crate::types::ChangeScope;
+        assert_eq!(
+            parse_change_scope("unstaged", None).unwrap(),
+            ChangeScope::Unstaged
+        );
+    }
+
+    #[test]
+    fn parse_change_scope_compare_requires_base() {
+        let err = parse_change_scope("compare", None).unwrap_err().to_string();
+        assert!(err.contains("--base"), "error must name the flag: {err}");
+    }
+
+    #[test]
+    fn parse_change_scope_compare_with_base() {
+        use crate::types::ChangeScope;
+        assert_eq!(
+            parse_change_scope("compare", Some("main")).unwrap(),
+            ChangeScope::Compare("main".into())
+        );
+    }
+
+    #[test]
+    fn parse_change_scope_rejects_injection_ref() {
+        // validate_git_ref allows `-` (legal in ref names); shell/option
+        // metacharacters like `;` are rejected.
+        let err = parse_change_scope("compare", Some("main;rm -rf"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid git reference"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_change_scope_rejects_unknown_scope() {
+        let err = parse_change_scope("bogus", None).unwrap_err().to_string();
+        assert!(!err.is_empty());
     }
 
     // -- split_qualified_name tests -------------------------------------------

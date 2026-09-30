@@ -1,5 +1,6 @@
 //! Shared types and data structures.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -833,6 +834,148 @@ pub struct ChangeAnalysis {
     pub scope: ChangeScope,
     /// All changed symbols found across the scoped files.
     pub changed_symbols: Vec<ChangedSymbol>,
+}
+
+/// Per-file changed-line ranges from a `git diff --unified=0`, carrying both
+/// sides of every hunk (TASK-085, PRD-REV-REQ-012).
+///
+/// With `--unified=0` a hunk contains no context lines, so the old-side
+/// range of each hunk is exactly its removed lines and the new-side range
+/// exactly its added lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileDiffHunks {
+    /// Added-line ranges on the new (post-change) side, `(start, end)`
+    /// inclusive, 1-based.
+    pub new_ranges: Vec<(usize, usize)>,
+    /// Removed-line ranges on the old (pre-change) side, `(start, end)`
+    /// inclusive, 1-based.
+    pub removed_ranges: Vec<(usize, usize)>,
+}
+
+/// Scoped change analysis plus the diff detail review needs: old-side hunk
+/// ranges (so findings about removed code can be anchored to where the code
+/// was) and the set of symbols whose signatures — not just bodies — changed
+/// (TASK-085).
+///
+/// Produced by the same single git subprocess as [`ChangeAnalysis`];
+/// `analysis` is byte-identical to what `detect_changes` returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeAnalysisDetail {
+    /// The standard change analysis (unchanged wire shape).
+    pub analysis: ChangeAnalysis,
+    /// Per-file diff hunks keyed by file path (b-side), carrying both sides.
+    pub hunks: HashMap<String, FileDiffHunks>,
+    /// `(name, kind)` pairs of symbols classified `Modified` because their
+    /// signature changed (tree-sitter path), as opposed to body-only
+    /// hunk-overlap modifications.
+    pub signature_changed: HashSet<(String, SymbolKind)>,
+}
+
+// ---------------------------------------------------------------------------
+// Review types (TASK-085)
+// ---------------------------------------------------------------------------
+
+/// How strongly a finding should weigh on the review verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FindingSeverity {
+    /// Must be addressed; forces a BLOCK verdict.
+    Blocking,
+    /// Should be looked at; forces at least a REVIEW verdict.
+    Warning,
+    /// Informational; never changes the verdict.
+    Note,
+}
+
+impl fmt::Display for FindingSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            FindingSeverity::Blocking => "blocking",
+            FindingSeverity::Warning => "warning",
+            FindingSeverity::Note => "note",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// The overall verdict for a reviewed diff (PRD-REV-REQ-005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    /// At least one blocking finding.
+    Block,
+    /// No blockers, but at least one warning.
+    Review,
+    /// No blocking or warning findings.
+    Approve,
+}
+
+impl fmt::Display for ReviewVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ReviewVerdict::Block => "BLOCK",
+            ReviewVerdict::Review => "REVIEW",
+            ReviewVerdict::Approve => "APPROVE",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Which anchor-resolution tier pinned a finding to its line
+/// (PRD-REV-REQ-011).
+///
+/// Line semantics: [`AnchorMethod::NewSideHunk`] and
+/// [`AnchorMethod::PostChangeFile`] lines refer to the post-change file;
+/// [`AnchorMethod::OldSideLine`] lines refer to the PRE-change file (where
+/// removed code used to live). The method disambiguates which file a line
+/// number refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorMethod {
+    /// Line is inside a new-side hunk range of the post-change file.
+    NewSideHunk,
+    /// Line is a removed-line range of the pre-change file (removed symbols).
+    OldSideLine,
+    /// Line is the symbol's current start line in the post-change file.
+    PostChangeFile,
+    /// No honest line could be determined; the finding carries no line.
+    Unresolved,
+}
+
+impl fmt::Display for AnchorMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            AnchorMethod::NewSideHunk => "new-side-hunk",
+            AnchorMethod::OldSideLine => "old-side-line",
+            AnchorMethod::PostChangeFile => "post-change-file",
+            AnchorMethod::Unresolved => "unresolved",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// One review finding about one changed symbol (PRD-REV-REQ-003/004).
+///
+/// Derives `PartialEq` but not `Eq` transitively through [`SymbolRef`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Finding {
+    /// Path of the file the finding is about (relative to repo root).
+    pub file: String,
+    /// 1-based anchor line; `None` when the anchor is unresolved (the
+    /// finding is still emitted, PRD-REV-REQ-012).
+    pub line: Option<usize>,
+    /// Which tier resolved the line (or why it could not be).
+    pub anchor_method: AnchorMethod,
+    /// How strongly the finding weighs on the verdict.
+    pub severity: FindingSeverity,
+    /// Finding category: `breaking-change` or `coverage-gap`.
+    pub kind: String,
+    /// Rule identifier (also the suppression key space, TASK-089).
+    pub rule: String,
+    /// Human-readable description.
+    pub message: String,
+    /// Stable identity for suppression/dedup (formula is provisional until
+    /// TASK-089's REQ-013 implementation).
+    pub identity: String,
+    /// Affected symbols as context for the finding (PRD-REV-REQ-002).
+    pub related: Vec<SymbolRef>,
 }
 
 // ---------------------------------------------------------------------------

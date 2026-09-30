@@ -600,6 +600,80 @@ pub struct ChangesOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Review output types (TASK-085)
+// ---------------------------------------------------------------------------
+
+/// An affected symbol attached to a finding as context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingRelatedOutput {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+}
+
+impl From<&crate::types::SymbolRef> for FindingRelatedOutput {
+    fn from(s: &crate::types::SymbolRef) -> Self {
+        Self {
+            name: s.name.clone(),
+            kind: s.kind.to_string(),
+            file: s.file.clone(),
+            line: s.line,
+        }
+    }
+}
+
+/// One review finding, wire form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingOutput {
+    pub file: String,
+    /// Absent when the anchor is unresolved (PRD-REV-REQ-012).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    pub anchor_method: String,
+    pub severity: String,
+    pub kind: String,
+    pub rule: String,
+    pub message: String,
+    pub identity: String,
+    pub related: Vec<FindingRelatedOutput>,
+}
+
+impl From<&crate::types::Finding> for FindingOutput {
+    fn from(f: &crate::types::Finding) -> Self {
+        Self {
+            file: f.file.clone(),
+            line: f.line,
+            anchor_method: f.anchor_method.to_string(),
+            severity: f.severity.to_string(),
+            kind: f.kind.clone(),
+            rule: f.rule.clone(),
+            message: f.message.clone(),
+            identity: f.identity.clone(),
+            related: f.related.iter().map(FindingRelatedOutput::from).collect(),
+        }
+    }
+}
+
+/// Complete `wonk review` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewOutput {
+    pub scope: String,
+    pub findings: Vec<FindingOutput>,
+    pub verdict: String,
+}
+
+impl From<&crate::review::ReviewResult> for ReviewOutput {
+    fn from(result: &crate::review::ReviewResult) -> Self {
+        Self {
+            scope: result.scope.to_string(),
+            findings: result.findings.iter().map(FindingOutput::from).collect(),
+            verdict: result.verdict.to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Symbol context output types (TASK-073)
 // ---------------------------------------------------------------------------
 
@@ -1986,6 +2060,53 @@ impl<W: Write> Formatter<W> {
 
             Ok(())
         }
+    }
+
+    /// Format a `wonk review` result.
+    pub fn format_review(&mut self, out: &ReviewOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_review(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_review(fmt, &out))
+    }
+
+    /// Shared render logic for `wonk review` output.
+    ///
+    /// Toon falls back to grep lines here; its PRD-OUT treatment is
+    /// TASK-086's.
+    fn render_review<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &ReviewOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format == OutputFormat::Json {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            return writeln!(fmt.writer, "{line}");
+        }
+
+        for f in &out.findings {
+            match f.line {
+                Some(line) => writeln!(
+                    fmt.writer,
+                    "{}:{} [{}] {}: {}",
+                    f.file,
+                    line,
+                    f.severity.to_uppercase(),
+                    f.kind,
+                    f.message
+                )?,
+                None => writeln!(
+                    fmt.writer,
+                    "{} [{}] [unanchored] {}: {}",
+                    f.file,
+                    f.severity.to_uppercase(),
+                    f.kind,
+                    f.message
+                )?,
+            }
+        }
+        writeln!(fmt.writer, "verdict: {}", out.verdict)
     }
 
     /// Format a `wonk context` result (one or more symbol contexts).
@@ -4908,5 +5029,118 @@ mod tests {
         assert_eq!(v["provider"]["repo"], "users-svc");
         assert_eq!(v["consumer"]["repo"], "own-api");
         assert_eq!(v["provider"]["canonical_id"], "http::GET::/v1/users");
+    }
+
+    // -- ReviewOutput (TASK-085) ----------------------------------------------
+
+    fn review_finding_fixture(line: Option<usize>) -> crate::types::Finding {
+        use crate::types::{AnchorMethod, FindingSeverity};
+        crate::types::Finding {
+            file: "src/lib.rs".into(),
+            line,
+            anchor_method: if line.is_some() {
+                AnchorMethod::OldSideLine
+            } else {
+                AnchorMethod::Unresolved
+            },
+            severity: FindingSeverity::Blocking,
+            kind: "breaking-change".into(),
+            rule: "breaking-change/removed-symbol-with-callers".into(),
+            message: "removed function `used` still has 1 indexed caller(s): caller".into(),
+            identity: "abc123".into(),
+            related: vec![crate::types::SymbolRef {
+                name: "caller".into(),
+                kind: crate::types::SymbolKind::Function,
+                file: "src/lib.rs".into(),
+                line: 3,
+            }],
+        }
+    }
+
+    fn review_output_fixture(line: Option<usize>) -> ReviewOutput {
+        ReviewOutput {
+            scope: "unstaged".into(),
+            findings: vec![FindingOutput::from(&review_finding_fixture(line))],
+            verdict: "BLOCK".into(),
+        }
+    }
+
+    #[test]
+    fn review_output_json_includes_findings_and_verdict() {
+        let json = serde_json::to_string(&review_output_fixture(Some(1))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["scope"], "unstaged");
+        assert_eq!(v["verdict"], "BLOCK");
+        assert_eq!(v["findings"][0]["kind"], "breaking-change");
+        assert_eq!(v["findings"][0]["line"], 1);
+        assert_eq!(v["findings"][0]["anchor_method"], "old-side-line");
+        assert_eq!(v["findings"][0]["related"][0]["name"], "caller");
+    }
+
+    #[test]
+    fn review_output_json_skips_line_when_unresolved() {
+        let json = serde_json::to_string(&review_output_fixture(None)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["findings"][0].get("line").is_none(),
+            "unresolved anchor must not emit a line, got {json}"
+        );
+        assert_eq!(v["findings"][0]["anchor_method"], "unresolved");
+    }
+
+    #[test]
+    fn review_output_grep_anchored_line() {
+        let text = render(OutputFormat::Grep, |fmt| {
+            fmt.format_review(&review_output_fixture(Some(1)))
+        });
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "src/lib.rs:1 [BLOCKING] breaking-change: removed function `used` still has 1 indexed caller(s): caller"
+        );
+        assert_eq!(lines[1], "verdict: BLOCK");
+    }
+
+    #[test]
+    fn review_output_grep_unanchored_marks_unresolved() {
+        let text = render(OutputFormat::Grep, |fmt| {
+            fmt.format_review(&review_output_fixture(None))
+        });
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.starts_with("src/lib.rs [BLOCKING] [unanchored] breaking-change:"),
+            "unanchored finding must render without a line and with the marker, got: {first}"
+        );
+        assert!(text.contains("verdict: BLOCK"));
+    }
+
+    #[test]
+    fn review_output_warning_severity_uppercased_in_grep() {
+        let out = ReviewOutput {
+            scope: "unstaged".into(),
+            findings: vec![FindingOutput::from(&crate::types::Finding {
+                severity: crate::types::FindingSeverity::Warning,
+                kind: "coverage-gap".into(),
+                rule: "coverage-gap/no-test-in-blast-radius".into(),
+                ..review_finding_fixture(Some(4))
+            })],
+            verdict: "REVIEW".into(),
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_review(&out));
+        assert!(
+            text.contains("src/lib.rs:4 [WARNING] coverage-gap:"),
+            "got: {text}"
+        );
+        assert!(text.contains("verdict: REVIEW"));
+    }
+
+    #[test]
+    fn review_output_toon_falls_back_to_grep() {
+        // PRD-OUT toon treatment lands in TASK-086; 085 renders grep lines.
+        let text = render(OutputFormat::Toon, |fmt| {
+            fmt.format_review(&review_output_fixture(Some(1)))
+        });
+        assert!(text.contains("verdict: BLOCK"), "got: {text}");
+        assert!(text.contains("[BLOCKING]"));
     }
 }
