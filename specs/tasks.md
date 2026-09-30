@@ -3557,11 +3557,11 @@ Add the message-oriented contract kinds on top of the normalization core.
 Add gRPC, GraphQL, and OpenAPI kinds, plus the second matching pass that RPC pairing requires.
 
 **Action Items:**
-- [ ] Detect `grpc` kind — service definitions and generated-stub call sites (PRD-CTR-REQ-001)
-- [ ] Detect `graphql` kind — resolvers as providers, queries/mutations as consumers (PRD-CTR-REQ-001)
-- [ ] Detect `openapi` kind from specification documents; record file-level contracts with a null owning symbol (PRD-CTR-REQ-001)
-- [ ] Implement the RPC canonical join: a second matching pass over canonical service/method names, tolerating package qualification, method casing, and service-level vs. method-level registration (PRD-CTR-REQ-024)
-- [ ] Verify the canonical join never pairs across workspaces — it relaxes name matching, not scope (PRD-CTR-REQ-014)
+- [x] Detect `grpc` kind — service definitions and generated-stub call sites (PRD-CTR-REQ-001)
+- [x] Detect `graphql` kind — resolvers as providers, queries/mutations as consumers (PRD-CTR-REQ-001)
+- [x] Detect `openapi` kind from specification documents; record file-level contracts with a null owning symbol (PRD-CTR-REQ-001)
+- [x] Implement the RPC canonical join: a second matching pass over canonical service/method names, tolerating package qualification, method casing, and service-level vs. method-level registration (PRD-CTR-REQ-024)
+- [x] Verify the canonical join never pairs across workspaces — it relaxes name matching, not scope (PRD-CTR-REQ-014)
 
 **Dependencies:**
 - Blocked by: TASK-082
@@ -3576,7 +3576,7 @@ Add gRPC, GraphQL, and OpenAPI kinds, plus the second matching pass that RPC pai
 **Related Requirements:** PRD-CTR-REQ-001, PRD-CTR-REQ-024
 **Related Decisions:** DR-031
 
-**Status:** Not Started
+**Status:** Complete
 
 ---
 
