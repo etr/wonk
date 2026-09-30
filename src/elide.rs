@@ -372,4 +372,85 @@ function solo() { /* 3 lines elided */ }
         // outer's stub covers its whole span including the nested def
         assert!(out.contains("/* 8 lines elided */"));
     }
+
+    fn elided(src: &str, lang: Lang) -> String {
+        let mut parser = get_parser(lang);
+        let tree = parser.parse(src, None).unwrap();
+        elide_tree(&tree, src, lang, Mode::Bodies).unwrap()
+    }
+
+    #[test]
+    fn bodyless_members_left_intact() {
+        let java = "\
+// module docs
+package com.example;
+
+public interface Greeter {
+    String greet(String name);
+    int count();
+}
+";
+        let out = elided(java, Lang::Java);
+        assert_eq!(out, java, "interface signatures carry no body to elide");
+
+        let cs = "\
+// module docs
+namespace Shapes;
+
+public abstract class Shape {
+    public abstract double Area();
+}
+";
+        let out = elided(cs, Lang::CSharp);
+        assert_eq!(out, cs, "abstract members carry no body to elide");
+
+        let go = "\
+// module docs
+package main
+
+func Add(x, y int64) int64
+";
+        let out = elided(go, Lang::Go);
+        assert_eq!(
+            out, go,
+            "a bodyless declaration leaves the signature as the whole declaration"
+        );
+    }
+
+    #[test]
+    fn single_line_bodies_left_intact() {
+        let rust = "\
+// module docs
+fn empty() {}
+fn beta() -> u32 { 7 }
+";
+        let out = elided(rust, Lang::Rust);
+        assert_eq!(out, rust, "a stub would lengthen single-line bodies");
+
+        let python = "\
+# module docs
+def b(): return 42
+";
+        let out = elided(python, Lang::Python);
+        assert_eq!(out, python);
+    }
+
+    #[test]
+    fn expression_arrow_left_intact_and_block_arrow_elided() {
+        let ts = "\
+// module docs
+const double = (n: number): number => n * 2;
+const run = (n: number): number => {
+  const m = n + 1;
+  return m * 2;
+};
+";
+        let out = elided(ts, Lang::TypeScript);
+        let expected = "\
+// module docs
+const double = (n: number): number => n * 2;
+const run = (n: number): number => { /* 4 lines elided */ };
+";
+        assert_eq!(out, expected);
+    }
 }
