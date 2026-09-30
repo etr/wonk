@@ -48,7 +48,7 @@
 | M28 | Precomputed Reach Index | 2 | Complete |
 | M29 | Cross-Repo Contract Detection | 5 | Complete |
 | M30 | Diff-Scoped Review Workflow | 3 | Complete |
-| M31 | Body Elision | 2 | In Progress |
+| M31 | Body Elision | 2 | Complete |
 | M32 | Signal-Based Reranking | 4 | Not Started |
 | M33 | History-Derived Signals | 2 | Not Started |
 | M34 | Graph-Topology Signals | 2 | Not Started |
@@ -3840,13 +3840,13 @@ Create `elide.rs` — collect function/method body byte ranges from an already-p
 Add control-flow retention and wire elision into the source-returning commands, default off.
 
 **Action Items:**
-- [ ] Build the control-flow node-kind set as a deliberate cross-grammar superset — conditionals, loops, switch/match arms (PRD-ELIDE-REQ-004, AR-032)
-- [ ] Retain matching lines verbatim inside otherwise-elided bodies (PRD-ELIDE-REQ-004)
-- [ ] Elided regions around retained lines still report their counts, so retained lines never read as the whole body (PRD-ELIDE-REQ-005)
-- [ ] Add opt-in elision to `show`, `summary`, `context`, and `review` source output, defaulting to off (PRD-ELIDE-REQ-008)
-- [ ] Resolve interaction with `show --shallow` to a single documented rendering; do not compound the two (PRD-ELIDE-REQ-009, DR-017)
-- [ ] Expose elision through the corresponding MCP tools
-- [ ] Measure and record the line-reduction figure per command for the north-star metric
+- [x] Build the control-flow node-kind set as a deliberate cross-grammar superset — conditionals, loops, switch/match arms (PRD-ELIDE-REQ-004, AR-032)
+- [x] Retain matching lines verbatim inside otherwise-elided bodies (PRD-ELIDE-REQ-004)
+- [x] Elided regions around retained lines still report their counts, so retained lines never read as the whole body (PRD-ELIDE-REQ-005)
+- [x] Add opt-in elision to `show`, `summary`, `context`, and `review` source output, defaulting to off (PRD-ELIDE-REQ-008)
+- [x] Resolve interaction with `show --shallow` to a single documented rendering; do not compound the two (PRD-ELIDE-REQ-009, DR-017)
+- [x] Expose elision through the corresponding MCP tools
+- [x] Measure and record the line-reduction figure per command for the north-star metric
 
 **Dependencies:**
 - Blocked by: TASK-090
@@ -3863,7 +3863,7 @@ Add control-flow retention and wire elision into the source-returning commands, 
 **Related Requirements:** PRD-ELIDE-REQ-004, PRD-ELIDE-REQ-005, PRD-ELIDE-REQ-008, PRD-ELIDE-REQ-009
 **Related Decisions:** DR-036, DR-017
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
