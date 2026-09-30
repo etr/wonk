@@ -41,9 +41,17 @@ impl NotElided {
 }
 
 /// Parse `source` and elide function bodies, when the language is known.
+///
+/// Convenience wrapper for callers holding raw text: an unknown language,
+/// missing grammar, or failed parse is reported through [`NotElided`] so the
+/// caller can fall back to the original source. All rendering happens in
+/// [`elide_tree`], which never parses twice.
 pub fn elide(source: &str, language: Option<Lang>, mode: Mode) -> Result<String, NotElided> {
-    let _ = (source, language, mode);
-    Ok(String::new())
+    let lang = language.ok_or(NotElided::UnsupportedLanguage)?;
+    let mut parser =
+        indexer::try_get_parser(lang).map_err(|_| NotElided::GrammarUnavailable)?;
+    let tree = parser.parse(source, None).ok_or(NotElided::ParseFailure)?;
+    elide_tree(&tree, source, lang, mode)
 }
 
 /// Elide function bodies in an already-parsed tree — no second parse.
@@ -909,5 +917,23 @@ public class Demo {
         );
         let ratio = out_lines as f64 / in_lines as f64;
         println!("body-heavy reduction: {out_lines}/{in_lines} lines retained (ratio {ratio:.3})");
+    }
+
+    #[test]
+    fn unsupported_language_signal_and_byte_identical_fallback() {
+        let src = "fn alpha() {\n    1\n}\n";
+        let err = elide(src, None, Mode::Bodies).unwrap_err();
+        assert_eq!(err, NotElided::UnsupportedLanguage);
+        assert_eq!(err.as_str(), "unsupported language");
+        // Caller fail-soft idiom: the original bytes come back untouched.
+        let fallback = elide(src, None, Mode::Bodies).unwrap_or_else(|_| src.to_string());
+        assert_eq!(fallback, src);
+
+        assert_eq!(NotElided::GrammarUnavailable.as_str(), "grammar unavailable");
+        assert_eq!(NotElided::ParseFailure.as_str(), "parse failure");
+
+        // All twelve supported languages route through elide without a signal.
+        let py = "def alpha(flag):\n    a = 1\n    b = 2\n    return b\n";
+        assert!(elide(py, Some(Lang::Python), Mode::Bodies).is_ok());
     }
 }
