@@ -49,7 +49,7 @@
 | M29 | Cross-Repo Contract Detection | 5 | Complete |
 | M30 | Diff-Scoped Review Workflow | 3 | Complete |
 | M31 | Body Elision | 2 | Complete |
-| M32 | Signal-Based Reranking | 4 | Not Started |
+| M32 | Signal-Based Reranking | 4 | In Progress |
 | M33 | History-Derived Signals | 2 | Not Started |
 | M34 | Graph-Topology Signals | 2 | Not Started |
 | M35 | Near-Duplicate Similarity | 1 | Not Started |
@@ -3908,7 +3908,7 @@ Create `rerank.rs` with the signal abstraction, weighted scoring, batched contex
 **Related Requirements:** PRD-RANK-REQ-001 through PRD-RANK-REQ-006, PRD-RANK-REQ-010, PRD-RANK-REQ-017
 **Related Decisions:** DR-037
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
