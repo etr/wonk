@@ -726,6 +726,199 @@ mod tests {
     }
 
     #[test]
+    fn per_command_line_reduction_figures() {
+        // North-star measurement (PRD-ELIDE): rendered output lines with and
+        // without `--elide salience` per command, on a body-heavy fixture in
+        // the TASK-090 generator shape. Prints the table transcribed into
+        // bench/elision-results.md. summary/context/review carry
+        // signature-only payloads, so their reduction is 0 BY CONSTRUCTION —
+        // asserted as byte-identical output, not assumed.
+        let mut source = String::from("// module docs\nuse std::fmt;\n\n");
+        for i in 0..40 {
+            source.push_str(&format!(
+                "pub fn f{i}(n: u32) -> u32 {{\n    let a = n + {i};\n    let b = a * 2;\n    let c = b + 1;\n    while c < 100 {{\n        let d = c * 3;\n        let e = d + 2;\n        let f = e * 4;\n        let g = f + 5;\n        let h = g * 6;\n        let j = h + 7;\n        let k = j * 8;\n        c += k % 3;\n    }}\n    let m = c + 9;\n    m\n}}\n\n"
+            ));
+        }
+        // A real git repo: the review leg shells out to `git diff` and needs
+        // a committed base state.
+        let git_available = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !git_available {
+            eprintln!("skipping per_command_line_reduction_figures: git unavailable");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        for (prog, args) in [
+            ("git", vec!["init".to_string()]),
+            (
+                "git",
+                vec!["config".into(), "user.email".into(), "test@test.com".into()],
+            ),
+            (
+                "git",
+                vec!["config".into(), "user.name".into(), "Test".into()],
+            ),
+        ] {
+            std::process::Command::new(prog)
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), &source).unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "initial"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+        }
+        crate::pipeline::build_index(root, true).unwrap();
+        let index_path = crate::db::local_index_path(root);
+        let conn = crate::db::open_existing(&index_path).unwrap();
+        let salience = Some(crate::elide::Mode::Salience);
+
+        // show: the only payload that carries bodies today.
+        let plain = show_file(&conn, "src/lib.rs", root, &default_options()).unwrap();
+        let elided = show_file(
+            &conn,
+            "src/lib.rs",
+            root,
+            &ShowOptions {
+                elide: salience,
+                ..default_options()
+            },
+        )
+        .unwrap();
+        let show_plain: usize = plain.iter().map(|r| r.source.lines().count()).sum();
+        let show_elided: usize = elided.iter().map(|r| r.source.lines().count()).sum();
+        assert_eq!(plain.len(), elided.len(), "elision never drops symbols");
+        assert!(
+            show_elided * 2 < show_plain,
+            "expected a majority reduction: {show_elided} of {show_plain} lines"
+        );
+
+        // summary: signature-only payload — identical either way.
+        let sum_plain = crate::summary::summarize_path(
+            &conn,
+            "src/lib.rs",
+            &crate::summary::SummaryOptions {
+                detail: crate::types::DetailLevel::Rich,
+                depth: Some(0),
+                suppress: true,
+                elide: None,
+            },
+        )
+        .unwrap();
+        let sum_elided = crate::summary::summarize_path(
+            &conn,
+            "src/lib.rs",
+            &crate::summary::SummaryOptions {
+                detail: crate::types::DetailLevel::Rich,
+                depth: Some(0),
+                suppress: true,
+                elide: salience,
+            },
+        )
+        .unwrap();
+        let sum_plain_json =
+            serde_json::to_string_pretty(&crate::output::SummaryOutput::from_result(&sum_plain))
+                .unwrap();
+        let sum_elided_json =
+            serde_json::to_string_pretty(&crate::output::SummaryOutput::from_result(&sum_elided))
+                .unwrap();
+        assert_eq!(sum_plain_json, sum_elided_json);
+
+        // context: signature + refs + children — no bodies.
+        let ctx_plain = crate::context::symbol_context(
+            &conn,
+            "f0",
+            &crate::context::ContextOptions {
+                file: None,
+                kind: None,
+                min_confidence: None,
+                scope: None,
+                elide: None,
+            },
+        )
+        .unwrap();
+        let ctx_elided = crate::context::symbol_context(
+            &conn,
+            "f0",
+            &crate::context::ContextOptions {
+                file: None,
+                kind: None,
+                min_confidence: None,
+                scope: None,
+                elide: salience,
+            },
+        )
+        .unwrap();
+        let ctx_out = |c: &Vec<crate::types::SymbolContext>| -> String {
+            serde_json::to_string_pretty(
+                &c.iter()
+                    .map(crate::output::SymbolContextOutput::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let ctx_plain_json = ctx_out(&ctx_plain);
+        let ctx_elided_json = ctx_out(&ctx_elided);
+        assert_eq!(ctx_plain_json, ctx_elided_json);
+
+        // review: findings carry message + refs — no source bodies.
+        let scope = "unstaged".parse::<crate::types::ChangeScope>().unwrap();
+        let rev_plain = crate::review::run_review(
+            &conn,
+            &scope,
+            root,
+            &crate::review::ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let rev_elided = crate::review::run_review(
+            &conn,
+            &scope,
+            root,
+            &crate::review::ReviewOptions {
+                elide: salience,
+                ..crate::review::ReviewOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        let rev_plain_json =
+            serde_json::to_string_pretty(&crate::output::ReviewOutput::from(&rev_plain)).unwrap();
+        let rev_elided_json =
+            serde_json::to_string_pretty(&crate::output::ReviewOutput::from(&rev_elided)).unwrap();
+        assert_eq!(rev_plain_json, rev_elided_json);
+
+        let json_lines = |s: &str| s.matches('\n').count() + usize::from(!s.is_empty());
+        println!("| command | without --elide | with --elide salience | reduction |");
+        println!("|---|---|---|---|");
+        println!(
+            "| show (source body lines) | {show_plain} | {show_elided} | {:.1}% |",
+            100.0 - 100.0 * show_elided as f64 / show_plain as f64
+        );
+        println!(
+            "| summary (pretty payload lines) | {} | 0 | 0 (by construction) |",
+            json_lines(&sum_plain_json)
+        );
+        println!(
+            "| context (pretty payload lines) | {} | 0 | 0 (by construction) |",
+            json_lines(&ctx_plain_json)
+        );
+        println!(
+            "| review (pretty payload lines) | {} | 0 | 0 (by construction) |",
+            json_lines(&rev_plain_json)
+        );
+    }
+
+    #[test]
     fn show_elide_returns_stubbed_span() {
         let source = "fn process(n: u32) -> u32 {\n    let mut t = n;\n    while t < 10 {\n        t += 1;\n    }\n    t\n}\n";
         let (dir, conn) = make_indexed_repo(source);
