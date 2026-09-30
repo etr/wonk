@@ -190,21 +190,43 @@ pub struct ReviewResult {
 }
 
 // ---------------------------------------------------------------------------
-// Provisional finding identity
+// Finding identity (PRD-REV-REQ-013)
 // ---------------------------------------------------------------------------
 
-/// Provisional finding identity: SHA-256 hex of `rule\x1ffile\x1fsymbol`.
+/// Collapse every whitespace run to a single space and trim, so re-indenting
+/// or reflowing a line leaves the identity untouched while any token change
+/// still alters it (AR-031).
+fn fold_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Stable finding identity: SHA-256 hex of
+/// `rule \x1f kind \x1f file \x1f symbol \x1f fold(anchor_text)`.
 ///
-/// No stability contract — the REQ-013 formula lands in TASK-089, which owns
-/// the suppression key space. The type stays `String` so that swap is not a
-/// breaking change.
-fn provisional_identity(rule: &str, file: &str, symbol: &str) -> String {
+/// The line number is structurally absent — the signature takes no line — so
+/// inserting or removing lines above the finding cannot change its identity.
+/// `kind` is the finding category (`breaking-change`, `coverage-gap`,
+/// `cross-repo`), `file` the repo-relative path exactly as
+/// [`Finding::file`] stores it, `symbol` the owning symbol's name. An
+/// unresolved anchor contributes no fifth component (distinct from a
+/// resolved anchor on a blank line, whose component folds to empty).
+pub fn finding_identity(
+    rule: &str,
+    kind: &str,
+    file: &str,
+    symbol: &str,
+    anchor_text: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(rule.as_bytes());
-    hasher.update([0x1f]);
-    hasher.update(file.as_bytes());
-    hasher.update([0x1f]);
-    hasher.update(symbol.as_bytes());
+    for part in [kind, file, symbol] {
+        hasher.update([0x1f]);
+        hasher.update(part.as_bytes());
+    }
+    if let Some(text) = anchor_text {
+        hasher.update([0x1f]);
+        hasher.update(fold_whitespace(text).as_bytes());
+    }
     hasher
         .finalize()
         .iter()
@@ -288,7 +310,7 @@ fn rule_breaking_change(
         kind: "breaking-change".into(),
         rule: rule.into(),
         message,
-        identity: provisional_identity(rule, &cs.file, &cs.name),
+        identity: finding_identity(rule, "breaking-change", &cs.file, &cs.name, None),
         related: surviving
             .iter()
             .map(|s| SymbolRef {
@@ -353,7 +375,7 @@ fn rule_coverage_gap(
         kind: "coverage-gap".into(),
         rule: rule.into(),
         message,
-        identity: provisional_identity(rule, &cs.file, &cs.name),
+        identity: finding_identity(rule, "coverage-gap", &cs.file, &cs.name, None),
         related: context
             .tiers
             .iter()
@@ -464,7 +486,7 @@ fn rule_cross_repo(
         kind: "cross-repo".into(),
         rule: rule.into(),
         message,
-        identity: provisional_identity(rule, &cs.file, &cs.name),
+        identity: finding_identity(rule, "cross-repo", &cs.file, &cs.name, None),
         related,
     })
 }
@@ -738,6 +760,92 @@ mod tests {
             identity: "id".into(),
             related: vec![],
         }
+    }
+
+    // -- finding identity (TASK-089, PRD-REV-REQ-013) ---------------------------
+
+    #[test]
+    fn identity_is_64_hex_characters() {
+        let id = finding_identity(
+            "breaking-change/removed-symbol-with-callers",
+            "breaking-change",
+            "src/lib.rs",
+            "used",
+            Some("pub fn used() {}"),
+        );
+        assert_eq!(id.len(), 64);
+        assert!(
+            id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "identity must be lowercase hex, got {id}"
+        );
+    }
+
+    #[test]
+    fn identity_survives_whitespace_only_reformat() {
+        // Re-indenting or reflowing the anchored line changes no token, so
+        // the folded text — and the identity — is unchanged (REQ-013).
+        let compact = finding_identity("r", "k", "src/lib.rs", "f", Some("fn f(x: i32) -> i32 {"));
+        let reindented = finding_identity(
+            "r",
+            "k",
+            "src/lib.rs",
+            "f",
+            Some("  fn  f(x: i32)\t->  i32  {\n"),
+        );
+        assert_eq!(compact, reindented);
+    }
+
+    #[test]
+    fn identity_changes_when_any_component_changes() {
+        let base = finding_identity("r", "k", "src/lib.rs", "f", Some("fn f() {}"));
+        assert_ne!(
+            finding_identity("other", "k", "src/lib.rs", "f", Some("fn f() {}")),
+            base,
+            "rule is signed"
+        );
+        assert_ne!(
+            finding_identity("r", "coverage-gap", "src/lib.rs", "f", Some("fn f() {}")),
+            base,
+            "kind is signed"
+        );
+        assert_ne!(
+            finding_identity("r", "k", "src/other.rs", "f", Some("fn f() {}")),
+            base,
+            "file is signed"
+        );
+        assert_ne!(
+            finding_identity("r", "k", "src/lib.rs", "g", Some("fn f() {}")),
+            base,
+            "symbol is signed"
+        );
+        assert_ne!(
+            finding_identity("r", "k", "src/lib.rs", "f", Some("fn f(x: u64) {}")),
+            base,
+            "any token change on the anchored line is signed (AR-031)"
+        );
+    }
+
+    #[test]
+    fn identity_unresolved_anchor_is_deterministic_and_distinct_from_blank_line() {
+        let unresolved = finding_identity("r", "k", "src/lib.rs", "f", None);
+        assert_eq!(
+            unresolved,
+            finding_identity("r", "k", "src/lib.rs", "f", None),
+            "unresolved anchors hash deterministically"
+        );
+        // A resolved anchor on a blank line folds to an empty component;
+        // an unresolved anchor contributes no component at all — the two
+        // must never collide.
+        assert_ne!(
+            unresolved,
+            finding_identity("r", "k", "src/lib.rs", "f", Some("")),
+            "unresolved must not collide with a resolved blank line"
+        );
+        // Unresolved identities still distinguish rule/file/symbol.
+        assert_ne!(
+            unresolved,
+            finding_identity("r", "k", "src/lib.rs", "g", None)
+        );
     }
 
     // -- resolve_anchor table tests ---------------------------------------------

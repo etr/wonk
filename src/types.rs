@@ -972,8 +972,10 @@ pub struct Finding {
     pub rule: String,
     /// Human-readable description.
     pub message: String,
-    /// Stable identity for suppression/dedup (formula is provisional until
-    /// TASK-089's REQ-013 implementation).
+    /// Stable identity for suppression/dedup: SHA-256 hex of
+    /// `rule \x1f kind \x1f file \x1f symbol \x1f fold(anchor_text)` — the
+    /// line number is deliberately absent so line shifts cannot change it
+    /// (PRD-REV-REQ-013; see [`crate::review::finding_identity`]).
     pub identity: String,
     /// Affected symbols as context for the finding (PRD-REV-REQ-002).
     pub related: Vec<SymbolRef>,
