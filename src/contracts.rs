@@ -6257,6 +6257,167 @@ pub fn list_contracts(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Cross-repo resolution (TASK-084)
+// ---------------------------------------------------------------------------
+
+/// A repo's workspace membership, with the REQ-015 default materialized
+/// once at construction so the matcher never carries an `if unset` branch.
+///
+/// `declared` is the verbatim repo-local config value; `effective` is the
+/// normalized set the matcher compares against (trimmed, case-folded) —
+/// the repo's own name when nothing is declared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceScope {
+    /// Last path component of the repo root.
+    pub repo_name: String,
+    /// Verbatim declared workspace ids (may be empty).
+    pub declared: Vec<String>,
+    /// Normalized effective set: declared when present, own name otherwise.
+    pub effective: Vec<String>,
+}
+
+/// Resolve a repo's workspace scope (PRD-CTR-REQ-015, AR-025).
+pub fn workspace_scope(declared: &[String], repo_root: &std::path::Path) -> WorkspaceScope {
+    let repo_name = repo_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+    let effective = if declared.is_empty() {
+        vec![normalize_workspace_id(&repo_name)]
+    } else {
+        declared.iter().map(|w| normalize_workspace_id(w)).collect()
+    };
+    WorkspaceScope {
+        repo_name,
+        declared: declared.to_vec(),
+        effective,
+    }
+}
+
+/// One same-workspace repo found in the central registry (DR-031: only
+/// `meta.json` is read at discovery; the index opens lazily, DR-030).
+#[derive(Debug, Clone)]
+pub struct SiblingRepo {
+    /// Short repo name (last path component).
+    pub name: String,
+    /// Absolute path to the sibling's repository root.
+    pub repo_path: std::path::PathBuf,
+    /// Absolute path to the sibling's `index.db`.
+    pub index_path: std::path::PathBuf,
+    /// Normalized effective workspaces (stored declared set, or the
+    /// sibling's own name when it stored nothing).
+    pub workspaces: Vec<String>,
+}
+
+/// Scan `repos_dir/<hash>/` for same-workspace repos, skipping `own_root`.
+///
+/// Discovery reads only each entry's `meta.json` — a sibling's working-tree
+/// config is never opened (PRD-CTR-REQ-014/020). Entries without an
+/// `index.db`, with unreadable metadata, or whose claimed root lacks a
+/// `.git`/`.wonk` marker are skipped; survivors keep a non-empty normalized
+/// workspace intersection with `own_effective`. Deterministic (sorted by
+/// name). Never opens any `index.db`.
+pub fn scan_registry(
+    repos_dir: &std::path::Path,
+    own_root: &std::path::Path,
+    own_effective: &[String],
+) -> Vec<SiblingRepo> {
+    let mut members = Vec::new();
+
+    let Ok(read_dir) = std::fs::read_dir(repos_dir) else {
+        return members;
+    };
+    for dir_entry in read_dir.flatten() {
+        let index_dir = dir_entry.path();
+        if !index_dir.is_dir() {
+            continue;
+        }
+        let index_path = index_dir.join("index.db");
+        if !index_path.exists() {
+            continue;
+        }
+        let Ok(meta) = crate::db::read_meta(&index_path) else {
+            continue;
+        };
+        let repo_path = std::path::PathBuf::from(&meta.repo_path);
+        if !repo_path.join(".git").exists() && !repo_path.join(".wonk").exists() {
+            continue;
+        }
+        if same_repo(&repo_path, own_root) {
+            continue;
+        }
+        let scope = workspace_scope(&meta.workspaces, &repo_path);
+        if !scope.effective.iter().any(|w| own_effective.contains(w)) {
+            continue;
+        }
+        members.push(SiblingRepo {
+            name: scope.repo_name,
+            repo_path,
+            index_path,
+            workspaces: scope.effective,
+        });
+    }
+
+    members.sort_by(|a, b| a.name.cmp(&b.name));
+    members
+}
+
+/// Path-identity check tolerant of symlink-vs-canonical spelling
+/// (macOS `/var` vs `/private/var`).
+fn same_repo(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+/// Lazy connections over the scanned member set (DR-030): an index is
+/// opened with `db::open_existing` on first use and cached — non-members
+/// are never opened at all, and members cost one open per resolution.
+// First production consumer is `resolve_workspace` (TASK-084 phase 4);
+// exercised by unit tests until then.
+#[allow(dead_code)]
+pub struct SiblingConnections {
+    siblings: Vec<SiblingRepo>,
+    open: std::collections::HashMap<std::path::PathBuf, rusqlite::Connection>,
+}
+
+#[allow(dead_code)]
+impl SiblingConnections {
+    fn new(siblings: Vec<SiblingRepo>) -> Self {
+        Self {
+            siblings,
+            open: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The scanned members (in deterministic order).
+    fn siblings(&self) -> &[SiblingRepo] {
+        &self.siblings
+    }
+
+    /// Get or lazily open the sibling's index connection.
+    fn connection(&mut self, sibling: &SiblingRepo) -> anyhow::Result<&rusqlite::Connection> {
+        if !self.open.contains_key(&sibling.index_path) {
+            let conn = crate::db::open_existing(&sibling.index_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to open sibling index {}: {e}",
+                    sibling.index_path.display()
+                )
+            })?;
+            self.open.insert(sibling.index_path.clone(), conn);
+        }
+        Ok(self.open.get(&sibling.index_path).expect("just inserted"))
+    }
+}
+
+/// The registry directory the CLI and MCP resolve links against:
+/// `$HOME/.wonk/repos`. `None` when no home directory exists.
+// First production consumer is the CLI/MCP wiring (TASK-084 phase 5).
+#[allow(dead_code)]
+pub(crate) fn default_repos_dir() -> Option<std::path::PathBuf> {
+    crate::config::home_dir().map(|h| h.join(".wonk").join("repos"))
+}
+
 #[cfg(test)]
 mod extract_test_helpers {
     use super::*;
@@ -10933,5 +11094,169 @@ paths:
         assert_eq!(v["kind"], "env");
         assert_eq!(v["role"], "consumer");
         assert_eq!(v["symbol"], "load", "the read sits inside load()");
+    }
+
+    // -- cross-repo resolution (TASK-084) --------------------------------------
+
+    /// Minimal JS source with one HTTP provider so registry fixtures have
+    /// at least one indexed contract row.
+    const REGISTRY_SRC: &str =
+        "const app = express();\nfunction routes() {\n  app.get('/v1/users/:id', getUser);\n}\n";
+
+    /// Build a real indexed repo named `name` declaring `workspaces`, then
+    /// place its `index.db` + `meta.json` under `repos_dir/<hash>/` exactly
+    /// as `wonk init`'s central location looks. Returns `(TempDir, root)`;
+    /// keep the TempDir alive while the registry is scanned.
+    fn registry_repo(
+        repos_dir: &std::path::Path,
+        name: &str,
+        workspaces: &[&str],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.js"), REGISTRY_SRC).unwrap();
+        if !workspaces.is_empty() {
+            std::fs::create_dir_all(root.join(".wonk")).unwrap();
+            let list = workspaces
+                .iter()
+                .map(|w| format!("{w:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            std::fs::write(
+                root.join(".wonk/config.toml"),
+                format!("[contracts]\nworkspace = [{list}]\n"),
+            )
+            .unwrap();
+        }
+        crate::pipeline::build_index(&root, true).unwrap();
+        let dest = repos_dir.join(crate::db::repo_hash(&root));
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::copy(root.join(".wonk/index.db"), dest.join("index.db")).unwrap();
+        std::fs::copy(root.join(".wonk/meta.json"), dest.join("meta.json")).unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn workspace_scope_defaults_to_repo_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("payments-api");
+
+        let undeclared = workspace_scope(&[], &root);
+        assert!(undeclared.declared.is_empty());
+        assert_eq!(undeclared.repo_name, "payments-api");
+        assert_eq!(undeclared.effective, vec!["payments-api".to_string()]);
+
+        let declared = workspace_scope(&[" Payments ".to_string(), "Platform".to_string()], &root);
+        assert_eq!(
+            declared.effective,
+            vec!["payments".to_string(), "platform".to_string()],
+            "effective workspaces are trimmed and case-folded"
+        );
+    }
+
+    #[test]
+    fn scan_registry_filters_on_workspace_intersection() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root) = registry_repo(repos_dir.path(), "own-repo", &["payments"]);
+        let (_in_dir, _in_root) =
+            registry_repo(repos_dir.path(), "sibling-in", &["payments", "platform"]);
+        let (_out_dir, _out_root) = registry_repo(repos_dir.path(), "sibling-out", &["billing"]);
+
+        let scope = workspace_scope(&["payments".to_string()], &own_root);
+        let members = scan_registry(repos_dir.path(), &own_root, &scope.effective);
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["sibling-in"], "only workspace members survive");
+    }
+
+    #[test]
+    fn skips_self_and_unindexed_dirs() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        // Leftover registry directory with no index.db.
+        std::fs::create_dir_all(repos_dir.path().join("deadbeef")).unwrap();
+        let (_own_dir, own_root) = registry_repo(repos_dir.path(), "own-repo", &["payments"]);
+        let (_sib_dir, _sib_root) = registry_repo(repos_dir.path(), "team-mate", &["payments"]);
+
+        let scope = workspace_scope(&["payments".to_string()], &own_root);
+        let members = scan_registry(repos_dir.path(), &own_root, &scope.effective);
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["team-mate"],
+            "own repo and index-less dirs are skipped"
+        );
+    }
+
+    #[test]
+    fn undeclared_sibling_defaults_to_own_name() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root) = registry_repo(repos_dir.path(), "payments-api", &["payments"]);
+        let (_sib_dir, _sib_root) = registry_repo(repos_dir.path(), "payments", &[]);
+
+        let scope = workspace_scope(&["payments".to_string()], &own_root);
+        let members = scan_registry(repos_dir.path(), &own_root, &scope.effective);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "payments");
+        assert_eq!(
+            members[0].workspaces,
+            vec!["payments".to_string()],
+            "undeclared sibling pairs through its own repo name"
+        );
+    }
+
+    #[test]
+    fn sibling_connections_open_lazily_and_read_member_rows() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root) = registry_repo(repos_dir.path(), "own-repo", &["payments"]);
+        let (_sib_dir, _sib_root) = registry_repo(repos_dir.path(), "sibling-in", &["payments"]);
+
+        let scope = workspace_scope(&["payments".to_string()], &own_root);
+        let members = scan_registry(repos_dir.path(), &own_root, &scope.effective);
+        let mut conns = SiblingConnections::new(members);
+        assert_eq!(conns.siblings().len(), 1);
+        // First use opens the member index; repeat calls reuse the cache.
+        for _ in 0..2 {
+            let member = conns.siblings()[0].clone();
+            let conn = conns.connection(&member).expect("member connection");
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM contracts", [], |r| r.get(0))
+                .unwrap();
+            assert!(n >= 1, "member connection reads the sibling's contracts");
+        }
+    }
+
+    #[test]
+    fn default_repos_dir_points_under_home() {
+        if let Some(dir) = default_repos_dir() {
+            assert!(
+                dir.ends_with(std::path::Path::new(".wonk").join("repos")),
+                "registry lives at $HOME/.wonk/repos, got {}",
+                dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn never_opens_non_member_index() {
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root) = registry_repo(repos_dir.path(), "own-repo", &["payments"]);
+        let (_in_dir, _in_root) = registry_repo(repos_dir.path(), "sibling-in", &["payments"]);
+        let (_out_dir, out_root) = registry_repo(repos_dir.path(), "sibling-out", &["billing"]);
+        // Corrupt the non-member's index: a scan that touched indexes
+        // eagerly (or opened non-members) would fail here.
+        std::fs::write(
+            repos_dir
+                .path()
+                .join(crate::db::repo_hash(&out_root))
+                .join("index.db"),
+            b"garbage bytes, not sqlite",
+        )
+        .unwrap();
+
+        let scope = workspace_scope(&["payments".to_string()], &own_root);
+        let members = scan_registry(repos_dir.path(), &own_root, &scope.effective);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "sibling-in");
     }
 }
