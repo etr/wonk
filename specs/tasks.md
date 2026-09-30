@@ -3863,7 +3863,7 @@ Add control-flow retention and wire elision into the source-returning commands, 
 **Related Requirements:** PRD-ELIDE-REQ-004, PRD-ELIDE-REQ-005, PRD-ELIDE-REQ-008, PRD-ELIDE-REQ-009
 **Related Decisions:** DR-036, DR-017
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
