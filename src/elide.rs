@@ -257,4 +257,55 @@ def beta(x):
 ";
         assert_eq!(out, expected);
     }
+
+    #[test]
+    fn ruby_methods_elided() {
+        let src = "\
+# module docs
+require 'set'
+
+def outer(items)
+  s = Set.new(items)
+  total = s.sum { |x| x * 2 }
+  total += 1
+  total
+end
+
+class Calculator
+  def compute(x)
+    y = x + 1
+    z = y * 3
+    z - 2
+  end
+
+  def self.build
+    c = Calculator.new
+    c.compute(1)
+    c
+  end
+end
+";
+        let mut parser = get_parser(Lang::Ruby);
+        let tree = parser.parse(src, None).unwrap();
+        let out = elide_tree(&tree, src, Lang::Ruby, Mode::Bodies).unwrap();
+        let expected = "\
+# module docs
+require 'set'
+
+def outer(items)
+  # 4 lines elided
+end
+
+class Calculator
+  def compute(x)
+    # 3 lines elided
+  end
+
+  def self.build
+    # 3 lines elided
+  end
+end
+";
+        assert_eq!(out, expected);
+    }
 }
