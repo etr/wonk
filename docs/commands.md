@@ -338,6 +338,77 @@ wonk impact --since HEAD~5
 |------|-------------|
 | `--since <commit>` | Analyze all files changed since this commit |
 
+## Review
+
+### `wonk review`
+
+Review a diff scope: line-anchored findings for the changed symbols plus one
+mechanically derived verdict — `BLOCK` (any blocking finding), `REVIEW` (any
+warning), or `APPROVE` (clean). The verdict is data: the exit code stays 0
+either way, so pipelines decide for themselves what to do with a `REVIEW`.
+
+Three rule families run, each independently switchable via `[review]` in
+[configuration](configuration.md):
+
+| Family | Kind | Severity | Fires when |
+|-------|------|----------|------------|
+| A — breaking change | `breaking-change` | blocking | A removed or signature-changed symbol still has indexed callers |
+| B — coverage gap | `coverage-gap` | warning | An added/modified non-test symbol has no test file in its blast radius |
+| C — cross-repo impact | `cross-repo` | warning | An added/modified non-test symbol provides a contract consumed by another indexed repo |
+
+```
+wonk review                       # unstaged working-tree diff
+wonk review --scope staged        # staged edits
+wonk review --since main          # everything since a ref (compare sugar)
+wonk review --scope compare --base main
+```
+
+| Flag | Description |
+|------|-------------|
+| `--scope <scope>` | `unstaged` (default), `staged`, `all`, or `compare` |
+| `--base <ref>` | Base git ref (required when `--scope=compare`) |
+| `--since <ref>` | Sugar for `--scope=compare --base=<ref>` |
+
+Grep output — one line per finding plus a verdict line:
+
+```
+src/lib.rs:1 [BLOCKING] breaking-change: removed function `used` still has 1 indexed caller(s): caller
+src/routes.js:2 [WARNING] cross-repo: function `registerUserRoutes` changed but provides contract(s) http::GET::/v1/users consumed by 1 other repo(s): own-api
+verdict: REVIEW
+```
+
+Unanchored findings (no honest line could be determined) print `[unanchored]`
+in place of `file:line` and are still emitted.
+
+`--format json` is NDJSON: one independently-parseable line per finding plus
+exactly one final verdict line — a clean diff still emits the verdict line.
+Discriminate lines by key presence: the verdict line is the only one carrying
+`verdict`.
+
+```
+{"file":"src/lib.rs","line":1,"anchor_method":"old-side-line","severity":"blocking","kind":"breaking-change","rule":"breaking-change/removed-symbol-with-callers","message":"...","identity":"...","related":[...]}
+{"scope":"unstaged","verdict":"BLOCK","finding_count":1}
+```
+
+`--format toon` renders the whole result as one structured document.
+
+**Boundaries (DR-035).** Findings are emitted only — nothing is posted to a
+forge (no PR comments, no statuses) and nothing is auto-fixed. Review tells
+you what the diff does; acting on it stays with you.
+
+**Index currency caveat.** The index must reflect the base state of the diff.
+Review therefore never auto-initializes an index: re-indexing the current
+tree mid-diff would empty the diff and fake an `APPROVE`. Run `wonk init`
+before starting your edits; if the index is missing, review fails loudly
+instead of silently approving.
+
+**Cross-repo prerequisites.** Rule C resolves against same-workspace repos in
+the central registry (`~/.wonk/repos`), exactly like `wonk contracts --links`:
+both repos must be indexed, and both must declare a `[contracts] workspace`
+that intersects. The workspace is resolved once per run; if resolution fails
+(review runs fail-soft), rules A/B still report and a single warning explains
+what was skipped.
+
 ## Service contracts
 
 ### `wonk contracts`

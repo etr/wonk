@@ -38,6 +38,11 @@ bm25_b = 0.75                # BM25 length-normalization strength
 [embedding]
 provider = "bundled"          # Offline default; use "ollama" for the opt-in tier
 
+[review]                       # Diff-scoped review rule switches (wonk review)
+breaking_change = true        # Family A: removed/signature-changed with callers
+coverage_gap = true           # Family B: no test in the blast radius
+cross_repo = true             # Family C: contract consumed by another indexed repo
+
 [contracts]                   # Declared in <repo>/.wonk/config.toml ONLY
 workspace = ["payments"]      # Workspace ids this repo links contracts across
 ```
@@ -114,6 +119,20 @@ disagrees with the resolved provider blocks the query with the re-embed
 command above instead of silently searching — or overwriting — the wrong
 space. `wonk status` always shows the active provider, the stored provider,
 and the stored dimension.
+
+**`[review]`**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `breaking_change` | `true` | Rule family A: a removed or signature-changed symbol with live indexed callers blocks |
+| `coverage_gap` | `true` | Rule family B: an added/modified non-test symbol with no test in its blast radius warns |
+| `cross_repo` | `true` | Rule family C: an added/modified symbol providing a contract consumed by another indexed repo warns |
+
+Each family layers independently — a noisy rule can be silenced alone without
+touching the others. `cross_repo` needs both repos indexed into the central
+registry with intersecting `[contracts] workspace` declarations; when the
+inputs are unavailable the other families still run and review degrades with
+a warning.
 
 **`[contracts]`**
 

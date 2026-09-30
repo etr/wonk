@@ -1668,7 +1668,7 @@ mod tests {
         // return the provider repo (it owns three TempDirs), and the test
         // must edit the provider's working tree.
         let repos_dir = TempDir::new().unwrap();
-        let (own_dir, root, conn) = make_cross_repo_review_repo(
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
             repos_dir.path(),
             "users-svc",
             "payments",
@@ -1719,9 +1719,6 @@ mod tests {
         assert_eq!(f.related[0].file, "own-api:src/client.js");
         assert_eq!(f.related[0].name, "loadUsers");
         assert_eq!(result.verdict, ReviewVerdict::Review);
-        drop(own_dir);
-        drop(_sib);
-        drop(repos_dir);
     }
 
     #[test]
@@ -1730,7 +1727,7 @@ mod tests {
             return;
         }
         let repos_dir = TempDir::new().unwrap();
-        let (own_dir, root, conn) = make_cross_repo_review_repo(
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
             repos_dir.path(),
             "users-svc",
             "payments",
@@ -1764,9 +1761,6 @@ mod tests {
             "kill switch must drop rule C, got: {:?}",
             result.findings
         );
-        drop(own_dir);
-        drop(_sib);
-        drop(repos_dir);
     }
 
     #[test]
@@ -1775,7 +1769,7 @@ mod tests {
             return;
         }
         let repos_dir = TempDir::new().unwrap();
-        let (own_dir, root, conn) = make_cross_repo_review_repo(
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
             repos_dir.path(),
             "users-svc",
             "payments",
@@ -1806,9 +1800,6 @@ mod tests {
             "workspaces must not intersect, got: {:?}",
             result.findings
         );
-        drop(own_dir);
-        drop(_sib);
-        drop(repos_dir);
     }
 
     #[test]
@@ -1820,7 +1811,7 @@ mod tests {
             return;
         }
         let repos_dir = TempDir::new().unwrap();
-        let (own_dir, root, conn) = make_cross_repo_review_repo(
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
             repos_dir.path(),
             "users-svc",
             "payments",
@@ -1857,9 +1848,6 @@ mod tests {
             "Removed symbols must not raise rule C, got: {:?}",
             result.findings
         );
-        drop(own_dir);
-        drop(_sib);
-        drop(repos_dir);
     }
 
     #[test]
@@ -1868,7 +1856,7 @@ mod tests {
             return;
         }
         let repos_dir = TempDir::new().unwrap();
-        let (own_dir, root, conn) = make_cross_repo_review_repo(
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
             repos_dir.path(),
             "users-svc",
             "payments",
@@ -1903,9 +1891,6 @@ mod tests {
             "no provider contracts, no rule C, got: {:?}",
             result.findings
         );
-        drop(own_dir);
-        drop(_sib);
-        drop(repos_dir);
     }
 
     #[test]
@@ -1916,7 +1901,7 @@ mod tests {
             return;
         }
         let repos_dir = TempDir::new().unwrap();
-        let (own_dir, root, conn) = make_cross_repo_review_repo(
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
             repos_dir.path(),
             "users-svc",
             "payments",
@@ -1944,8 +1929,6 @@ mod tests {
             "own consumers are not cross-repo impact, got: {:?}",
             result.findings
         );
-        drop(own_dir);
-        drop(repos_dir);
     }
 
     #[test]
@@ -1957,7 +1940,7 @@ mod tests {
             return;
         }
         let repos_dir = TempDir::new().unwrap();
-        let (own_dir, root, conn) = make_cross_repo_review_repo(
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
             repos_dir.path(),
             "users-svc",
             "payments",
@@ -2008,9 +1991,6 @@ mod tests {
             })
             .collect();
         assert_eq!(finding.related, folded);
-        drop(own_dir);
-        drop(_sib);
-        drop(repos_dir);
     }
 
     // -- rule C composition: fail-soft + once-only -------------------------------
@@ -2028,7 +2008,7 @@ mod tests {
             return;
         }
         let repos_dir = TempDir::new().unwrap();
-        let (own_dir, root, conn) = make_cross_repo_review_repo(
+        let (_own_dir, root, conn) = make_cross_repo_review_repo(
             repos_dir.path(),
             "users-svc",
             "payments",
@@ -2092,9 +2072,6 @@ mod tests {
             result.findings
         );
         assert!(result.findings.iter().all(|f| f.kind != "cross-repo"));
-        drop(own_dir);
-        drop(_sib);
-        drop(repos_dir);
     }
 
     #[test]
