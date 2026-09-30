@@ -10,7 +10,19 @@
 //! current tree) empties the diff and fakes an APPROVE, which is why the
 //! review dispatch never auto-initializes an index.
 
-use crate::types::{AnchorMethod, ChangedSymbol, FileDiffHunks, Finding, ReviewVerdict, Symbol};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use anyhow::Result;
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+
+use crate::blast::{self, BlastOptions};
+use crate::impact;
+use crate::types::{
+    AnchorMethod, BlastAffectedSymbol, BlastAnalysis, BlastDirection, BlastSeverity, ChangeScope,
+    ChangedSymbol, FileDiffHunks, Finding, FindingSeverity, ReviewVerdict, Symbol, SymbolRef,
+};
 
 // ---------------------------------------------------------------------------
 // Anchor resolution (PRD-REV-REQ-011/012)
@@ -95,6 +107,266 @@ pub fn derive_verdict(findings: &[Finding]) -> ReviewVerdict {
     } else {
         ReviewVerdict::Approve
     }
+}
+
+// ---------------------------------------------------------------------------
+// Options and result (AR-022: each rule family independently disable-able)
+// ---------------------------------------------------------------------------
+
+/// Options for [`run_review`].
+#[derive(Debug, Clone)]
+pub struct ReviewOptions {
+    /// Rule family A: breaking change (removed/signature-changed with live
+    /// indexed callers).
+    pub breaking_change: bool,
+    /// Rule family B: coverage gap (no test in the blast radius).
+    pub coverage_gap: bool,
+    /// Whether qualifying blast queries may use the precomputed reach table
+    /// (`[reach] enabled`); a kill switch for speed only, never findings.
+    pub reach_enabled: bool,
+    /// Blast traversal depth.
+    pub depth: usize,
+}
+
+impl Default for ReviewOptions {
+    fn default() -> Self {
+        Self {
+            breaking_change: true,
+            coverage_gap: true,
+            reach_enabled: true,
+            depth: blast::DEFAULT_DEPTH,
+        }
+    }
+}
+
+/// The outcome of reviewing one diff scope.
+#[derive(Debug, Clone)]
+pub struct ReviewResult {
+    /// The scope that was reviewed.
+    pub scope: ChangeScope,
+    /// All findings, sorted by severity (desc), file, line, rule.
+    pub findings: Vec<Finding>,
+    /// Mechanically derived from `findings` by [`derive_verdict`].
+    pub verdict: ReviewVerdict,
+    /// Non-fatal problems (e.g. a per-symbol blast failure) — findings the
+    /// engine could not compute are never silently dropped.
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Provisional finding identity
+// ---------------------------------------------------------------------------
+
+/// Provisional finding identity: SHA-256 hex of `rule\x1ffile\x1fsymbol`.
+///
+/// No stability contract — the REQ-013 formula lands in TASK-089, which owns
+/// the suppression key space. The type stays `String` so that swap is not a
+/// breaking change.
+fn provisional_identity(rule: &str, file: &str, symbol: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(rule.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(file.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(symbol.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Rule family A — breaking change (PRD-REV-REQ-006)
+// ---------------------------------------------------------------------------
+
+/// Format the caller-name list: up to three names, then ` (+k more)`.
+fn format_caller_names(names: &[&str]) -> String {
+    let listed = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    if names.len() > 3 {
+        format!("{listed} (+{} more)", names.len() - 3)
+    } else {
+        listed
+    }
+}
+
+/// Rule A: a removed or signature-changed symbol with live indexed direct
+/// callers blocks. Body-only modifications are never candidates.
+///
+/// Direct callers are the WillBreak tier (depth 1) of the context
+/// [`analyze_blast`] call — never re-derived here. A caller that is itself
+/// Removed in the same diff is dead code being deleted along with its
+/// helper, so it is filtered out; signature-changed callers stay.
+fn rule_breaking_change(
+    cs: &ChangedSymbol,
+    context: &BlastAnalysis,
+    removed: &HashSet<(String, crate::types::SymbolKind)>,
+    line: Option<usize>,
+    anchor_method: AnchorMethod,
+) -> Option<Finding> {
+    let surviving: Vec<&BlastAffectedSymbol> = context
+        .tiers
+        .iter()
+        .find(|t| t.severity == BlastSeverity::WillBreak)
+        .map(|t| {
+            t.symbols
+                .iter()
+                .filter(|s| !removed.contains(&(s.name.clone(), s.kind)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if surviving.is_empty() {
+        return None;
+    }
+
+    let names: Vec<&str> = surviving.iter().map(|s| s.name.as_str()).collect();
+    let (rule, message) = if cs.change_type == crate::types::ChangeType::Removed {
+        (
+            "breaking-change/removed-symbol-with-callers",
+            format!(
+                "removed {} `{}` still has {} indexed caller(s): {}",
+                cs.kind,
+                cs.name,
+                names.len(),
+                format_caller_names(&names)
+            ),
+        )
+    } else {
+        (
+            "breaking-change/signature-changed-with-callers",
+            format!(
+                "signature of {} `{}` changed but {} indexed caller(s) remain: {}",
+                cs.kind,
+                cs.name,
+                names.len(),
+                format_caller_names(&names)
+            ),
+        )
+    };
+
+    Some(Finding {
+        file: cs.file.clone(),
+        line,
+        anchor_method,
+        severity: FindingSeverity::Blocking,
+        kind: "breaking-change".into(),
+        rule: rule.into(),
+        message,
+        identity: provisional_identity(rule, &cs.file, &cs.name),
+        related: surviving
+            .iter()
+            .map(|s| SymbolRef {
+                name: s.name.clone(),
+                kind: s.kind,
+                file: s.file.clone(),
+                line: s.line,
+            })
+            .collect(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// run_review
+// ---------------------------------------------------------------------------
+
+/// Review one diff scope: detect changed symbols, run the enabled rule
+/// families over them, and derive the verdict.
+///
+/// Impact context comes exclusively from [`blast::analyze_blast`] — review
+/// records blast's own output and never computes impact itself, so `wonk
+/// review` and `wonk blast` cannot disagree for the same symbol. Per-symbol
+/// blast failures degrade to a warning and skip that symbol (fail-soft).
+pub fn run_review(
+    conn: &Connection,
+    scope: &ChangeScope,
+    repo_root: &Path,
+    options: &ReviewOptions,
+) -> Result<ReviewResult> {
+    let detail = impact::detect_changes_detail(conn, scope, repo_root)?;
+    let mut warnings = Vec::new();
+    let mut findings = Vec::new();
+
+    // Callers removed in this same diff are dead code, not breakage.
+    let removed: HashSet<(String, crate::types::SymbolKind)> = detail
+        .analysis
+        .changed_symbols
+        .iter()
+        .filter(|c| c.change_type == crate::types::ChangeType::Removed)
+        .map(|c| (c.name.clone(), c.kind))
+        .collect();
+
+    // Per-file cache of current-file symbols for tier-3 re-resolution.
+    let mut current_cache: HashMap<String, Option<Vec<Symbol>>> = HashMap::new();
+
+    for cs in &detail.analysis.changed_symbols {
+        let rule_a_candidate = options.breaking_change
+            && (cs.change_type == crate::types::ChangeType::Removed
+                || (cs.change_type == crate::types::ChangeType::Modified
+                    && detail
+                        .signature_changed
+                        .contains(&(cs.name.clone(), cs.kind))));
+        let rule_b_candidate = options.coverage_gap
+            && matches!(
+                cs.change_type,
+                crate::types::ChangeType::Added | crate::types::ChangeType::Modified
+            )
+            && !crate::ranker::is_test_file(Path::new(&cs.file));
+        if !rule_a_candidate && !rule_b_candidate {
+            continue;
+        }
+
+        // Context blast: byte-identical options to `wonk blast` defaults,
+        // so the recorded impact can never disagree with it.
+        let context_options = BlastOptions {
+            depth: options.depth,
+            direction: BlastDirection::Upstream,
+            include_tests: false,
+            min_confidence: None,
+            use_reach: options.reach_enabled,
+        };
+        let context = match blast::analyze_blast(conn, &cs.name, &context_options) {
+            Ok(analysis) => analysis,
+            Err(e) => {
+                warnings.push(format!(
+                    "skipping {} `{}` in {}: blast failed: {e}",
+                    cs.kind, cs.name, cs.file
+                ));
+                continue;
+            }
+        };
+
+        if !current_cache.contains_key(&cs.file) {
+            // A deleted file has nothing to re-resolve; Removed symbols
+            // anchor from the old side and never need this.
+            let parsed = impact::parse_current_symbols(&cs.file, repo_root).ok();
+            current_cache.insert(cs.file.clone(), parsed);
+        }
+        let current_symbols = current_cache.get(&cs.file).and_then(|opt| opt.as_deref());
+        let (line, anchor_method) = resolve_anchor(cs, detail.hunks.get(&cs.file), current_symbols);
+
+        if rule_a_candidate
+            && let Some(finding) = rule_breaking_change(cs, &context, &removed, line, anchor_method)
+        {
+            findings.push(finding);
+        }
+    }
+
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.rule.cmp(&b.rule))
+    });
+
+    let verdict = derive_verdict(&findings);
+
+    Ok(ReviewResult {
+        scope: scope.clone(),
+        findings,
+        verdict,
+        warnings,
+    })
 }
 
 #[cfg(test)]
@@ -325,5 +597,171 @@ mod tests {
         assert_eq!(AnchorMethod::OldSideLine.to_string(), "old-side-line");
         assert_eq!(AnchorMethod::PostChangeFile.to_string(), "post-change-file");
         assert_eq!(AnchorMethod::Unresolved.to_string(), "unresolved");
+    }
+
+    // -- fixture -----------------------------------------------------------------
+
+    use rusqlite::Connection;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Real git repo (diff scopes need commits) with an index reflecting the
+    /// initial commit — the base state a review diff is taken against.
+    fn make_review_repo(files: &[(&str, &str)]) -> (TempDir, Connection) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        for (path, content) in files {
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            std::fs::write(root.join(path), content).unwrap();
+        }
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        crate::pipeline::build_index(root, true).unwrap();
+        let index_path = crate::db::local_index_path(root);
+        let conn = crate::db::open_existing(&index_path).unwrap();
+        (dir, conn)
+    }
+
+    // -- rule A: breaking change (PRD-REV-REQ-006) -------------------------------
+
+    #[test]
+    fn ac1_removing_called_function_blocks_anchored_to_old_side() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn used() {}\n\npub fn caller() { used(); }\n",
+        )]);
+        let root = dir.path();
+
+        // Working tree deletes used(), keeps caller.
+        std::fs::write(root.join("src/lib.rs"), "pub fn caller() { used(); }\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.verdict, ReviewVerdict::Block);
+        assert_eq!(result.findings.len(), 1, "got: {:?}", result.findings);
+        let f = &result.findings[0];
+        assert_eq!(f.severity, FindingSeverity::Blocking);
+        assert_eq!(f.kind, "breaking-change");
+        assert_eq!(f.rule, "breaking-change/removed-symbol-with-callers");
+        // Anchored to where used() WAS (old line 1), not to whatever now
+        // occupies line 1 after the edit (AR-030).
+        assert_eq!(f.anchor_method, AnchorMethod::OldSideLine);
+        assert_eq!(f.line, Some(1));
+        assert_eq!(f.related.len(), 1);
+        assert_eq!(f.related[0].name, "caller");
+        assert_eq!(
+            f.message,
+            "removed function `used` still has 1 indexed caller(s): caller"
+        );
+    }
+
+    #[test]
+    fn rule_a_body_only_modified_with_callers_is_not_blocking() {
+        // Blocking on any body edit would make BLOCK meaningless: only
+        // removed or signature-changed symbols are candidates.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\n\npub fn caller() { f(); }\n",
+        )]);
+        let root = dir.path();
+
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 2 }\n\npub fn caller() { f(); }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            result.findings.iter().all(|f| f.kind != "breaking-change"),
+            "body-only modification must not block, got: {:?}",
+            result.findings
+        );
+    }
+
+    #[test]
+    fn rule_a_removal_with_all_callers_removed_is_not_blocking() {
+        // Deleting a helper and its only caller together is a refactor, not
+        // a breaking change.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn helper() {}\n\npub fn only_caller() { helper(); }\n",
+        )]);
+        let root = dir.path();
+
+        std::fs::write(root.join("src/lib.rs"), "\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            result.findings.iter().all(|f| f.kind != "breaking-change"),
+            "dead-code removal must not block, got: {:?}",
+            result.findings
+        );
     }
 }
