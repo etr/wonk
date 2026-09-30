@@ -195,10 +195,12 @@ pub fn extract_contracts(
         RouterContext::default()
     };
     // The RPC pre-pass binds generated stubs to their services (TASK-088);
+    // it runs only for the languages with gRPC facts — C/C++/Ruby/PHP/C#
+    // files would pay a full tree walk for a provably empty context.
     // JS/TS additionally require a file-level "grpc" marker before any
     // generated-code detection fires — `new XClient(...)` alone is not
     // evidence of gRPC.
-    let rpc = if opts.grpc {
+    let rpc = if opts.grpc && lang_collects_rpc_facts(lang) {
         collect_rpc_context(tree.root_node(), src, lang)
     } else {
         RpcContext::default()
@@ -635,20 +637,36 @@ struct RpcContext {
     stubs: HashMap<String, String>,
 }
 
+/// Languages whose generated-stub bindings the RPC pre-pass resolves.
+/// C/C++/Ruby/PHP/C# have no gRPC arms, so their files never pay the walk.
+fn lang_collects_rpc_facts(lang: Lang) -> bool {
+    matches!(
+        lang,
+        Lang::JavaScript
+            | Lang::TypeScript
+            | Lang::Tsx
+            | Lang::Python
+            | Lang::Go
+            | Lang::Rust
+            | Lang::Java
+    )
+}
+
 fn collect_rpc_context(root: Node, src: &[u8], lang: Lang) -> RpcContext {
     let mut ctx = RpcContext::default();
+    // The per-language collector is selected once, not per node; a language
+    // with no facts returns before the walk allocates anything.
+    let collect: fn(Node, &[u8], &mut RpcContext) = match lang {
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => collect_js_rpc_facts,
+        Lang::Python => collect_py_rpc_facts,
+        Lang::Go => collect_go_rpc_facts,
+        Lang::Rust => collect_rust_rpc_facts,
+        Lang::Java => collect_java_rpc_facts,
+        _ => return ctx,
+    };
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        match lang {
-            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
-                collect_js_rpc_facts(node, src, &mut ctx);
-            }
-            Lang::Python => collect_py_rpc_facts(node, src, &mut ctx),
-            Lang::Go => collect_go_rpc_facts(node, src, &mut ctx),
-            Lang::Rust => collect_rust_rpc_facts(node, src, &mut ctx),
-            Lang::Java => collect_java_rpc_facts(node, src, &mut ctx),
-            _ => {}
-        }
+        collect(node, src, &mut ctx);
         for i in (0..node.child_count()).rev() {
             if let Some(child) = node.child(i as u32) {
                 stack.push(child);
@@ -1104,11 +1122,7 @@ impl<'a> Extractor<'a> {
     fn visit_js(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "call_expression" => self.js_call(node, prefix),
-            "pair" => {
-                if self.opts.graphql {
-                    self.js_graphql_pair(node);
-                }
-            }
+            "pair" => self.js_graphql_pair(node),
             "member_expression" => {
                 self.js_env_member(node);
             }
@@ -1127,9 +1141,7 @@ impl<'a> Extractor<'a> {
         if self.grpc_hint {
             self.js_grpc_call(node);
         }
-        if self.opts.graphql {
-            self.js_graphql_call(node);
-        }
+        self.js_graphql_call(node);
         let func = node.child_by_field_name("function");
         let args = node.child_by_field_name("arguments");
         let (Some(func), Some(args)) = (func, args) else {
@@ -1506,9 +1518,7 @@ impl<'a> Extractor<'a> {
                 if self.opts.grpc {
                     self.python_grpc_call(node);
                 }
-                if self.opts.graphql {
-                    self.python_graphql_call(node);
-                }
+                self.python_graphql_call(node);
                 self.py_call(node, prefix);
             }
             "subscript" => self.py_env_subscript(node),
@@ -1536,18 +1546,16 @@ impl<'a> Extractor<'a> {
             }
             // TASK-088 graphql: @strawberry.field/@strawberry.mutation and
             // Ariadne @Query.field("name")/@Mutation.mutation declare
-            // resolvers (providers).
-            if self.opts.graphql
-                && let Some((root, field)) = py_graphql_decorator(dec, def_name, self.src)
-            {
+            // resolvers (providers) — gated at the emit_graphql choke point.
+            if let Some((root, field)) = py_graphql_decorator(dec, def_name, self.src) {
                 let anchor = def_name.unwrap_or(dec);
-                self.out.push(graphql_candidate(
+                self.emit_graphql(
+                    anchor,
                     &root,
                     &field,
                     ContractRole::Provider,
                     owning.as_deref(),
-                    anchor.start_position().row + 1,
-                ));
+                );
                 continue;
             }
             // TASK-087 job: @app.task / @app.task(name=…) / @shared_task.
@@ -3845,6 +3853,48 @@ impl<'a> Extractor<'a> {
         ));
     }
 
+    /// Emit one provider per member method of a generated service body
+    /// (Java `method_declaration`, Rust `function_item`, Python
+    /// `function_definition` — the loops differ only in the child kind).
+    fn emit_grpc_body_methods(&mut self, body: Node, service: &str, method_kind: &str) {
+        for i in 0..body.child_count() {
+            let Some(m) = body.child(i as u32) else {
+                continue;
+            };
+            if m.kind() != method_kind {
+                continue;
+            }
+            let name_node = m.child_by_field_name("name");
+            let name = node_text(name_node, self.src);
+            if let Some(anchor) = name_node.filter(|_| !name.is_empty()) {
+                self.emit_grpc(anchor, service, name, ContractRole::Provider, Some(name));
+            }
+        }
+    }
+
+    /// Emit one graphql-family contract at `node`'s line (TASK-088 emit
+    /// choke point — the single place the kind is gated). Unlike
+    /// [`Self::emit_grpc`], `owning` is not back-filled from the enclosing
+    /// function: resolver-map properties and decorated definitions carry
+    /// their own ownership semantics, and only operation call sites resolve
+    /// through [`crate::indexer::find_enclosing_function`] before calling
+    /// this.
+    fn emit_graphql(
+        &mut self,
+        node: Node,
+        root: &str,
+        field: &str,
+        role: ContractRole,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.graphql || root.is_empty() || field.is_empty() {
+            return;
+        }
+        let line = node.start_position().row + 1;
+        self.out
+            .push(graphql_candidate(root, field, role, owning, line));
+    }
+
     // -- grpc generated/server code arms (TASK-088, plan 5.1) ------------------
 
     /// Java provider: `class X extends <…><S>Grpc.<S>ImplBase` — every member
@@ -3862,19 +3912,7 @@ impl<'a> Extractor<'a> {
         let Some(body) = node.child_by_field_name("body") else {
             return;
         };
-        for i in 0..body.child_count() {
-            let Some(m) = body.child(i as u32) else {
-                continue;
-            };
-            if m.kind() != "method_declaration" {
-                continue;
-            }
-            let name_node = m.child_by_field_name("name");
-            let name = node_text(name_node, self.src);
-            if let Some(anchor) = name_node.filter(|_| !name.is_empty()) {
-                self.emit_grpc(anchor, service, name, ContractRole::Provider, Some(name));
-            }
-        }
+        self.emit_grpc_body_methods(body, service, "method_declaration");
     }
 
     /// Java call sites: `addService(XGrpc.bindService(...))` registers the
@@ -3976,19 +4014,7 @@ impl<'a> Extractor<'a> {
         let Some(body) = node.child_by_field_name("body") else {
             return;
         };
-        for i in 0..body.child_count() {
-            let Some(f) = body.child(i as u32) else {
-                continue;
-            };
-            if f.kind() != "function_item" {
-                continue;
-            }
-            let name_node = f.child_by_field_name("name");
-            let name = node_text(name_node, self.src);
-            if let Some(anchor) = name_node.filter(|_| !name.is_empty()) {
-                self.emit_grpc(anchor, service, name, ContractRole::Provider, Some(name));
-            }
-        }
+        self.emit_grpc_body_methods(body, service, "function_item");
     }
 
     /// Rust consumer: bound `client.m(req)` and inline
@@ -4045,19 +4071,7 @@ impl<'a> Extractor<'a> {
         let Some(body) = node.child_by_field_name("body") else {
             return;
         };
-        for i in 0..body.child_count() {
-            let Some(d) = body.child(i as u32) else {
-                continue;
-            };
-            if d.kind() != "function_definition" {
-                continue;
-            }
-            let name_node = d.child_by_field_name("name");
-            let name = node_text(name_node, self.src);
-            if let Some(anchor) = name_node.filter(|_| !name.is_empty()) {
-                self.emit_grpc(anchor, service, name, ContractRole::Provider, Some(name));
-            }
-        }
+        self.emit_grpc_body_methods(body, service, "function_definition");
     }
 
     /// Python sites: the free call `add_<S>Servicer_to_server(...)` (the
@@ -4147,15 +4161,7 @@ impl<'a> Extractor<'a> {
                 continue;
             }
             let field = node_text(p.child_by_field_name("key"), self.src);
-            if !field.is_empty() {
-                self.out.push(graphql_candidate(
-                    key,
-                    field,
-                    ContractRole::Provider,
-                    None,
-                    p.start_position().row + 1,
-                ));
-            }
+            self.emit_graphql(p, key, field, ContractRole::Provider, None);
         }
     }
 
@@ -4209,20 +4215,20 @@ impl<'a> Extractor<'a> {
     }
 
     /// Emit one consumer per top-level field of a parsed GraphQL operation.
+    /// Gated at the [`Self::emit_graphql`] choke point.
     fn emit_graphql_ops(&mut self, node: Node, text: &str) {
         let Some(ops) = parse_graphql_operation(text) else {
             return;
         };
         let owning = crate::indexer::find_enclosing_function(node, self.src, self.lang);
-        let line = node.start_position().row + 1;
         for (root, field) in ops {
-            self.out.push(graphql_candidate(
+            self.emit_graphql(
+                node,
                 &root,
                 &field,
                 ContractRole::Consumer,
                 owning.as_deref(),
-                line,
-            ));
+            );
         }
     }
 
@@ -5213,7 +5219,9 @@ impl DocumentKind {
 ///
 /// Extension gate only. Note this is separate from
 /// [`crate::indexer::detect_language`]: a `.yaml` file is a document kind
-/// here while remaining `None` (unparseable) to the grammar indexer.
+/// here while remaining `None` (unparseable) to the grammar indexer. The
+/// negative-case bounds (lock files, size cap) live in
+/// [`scannable_document_kind`].
 pub fn document_kind(path: &std::path::Path) -> Option<DocumentKind> {
     let ext = path.extension()?.to_str()?;
     match ext {
@@ -5222,6 +5230,47 @@ pub fn document_kind(path: &std::path::Path) -> Option<DocumentKind> {
         "yaml" | "yml" | "json" => Some(DocumentKind::OpenApi),
         _ => None,
     }
+}
+
+/// Upper bound on a document file's byte size for contract scanning:
+/// real proto/GraphQL/OpenAPI documents are at most a few hundred KB, while
+/// their larger `.json`/`.yaml` siblings (data dumps, generated files) can
+/// only produce a guaranteed-null sniff — they stay un-indexed, exactly as
+/// before the document path existed.
+pub const MAX_DOCUMENT_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Lock/data files that match a document extension (or one day will) but
+/// never carry contracts; skipped by name before any read. Several of these
+/// carry no extension today — they are listed anyway so the set stays the
+/// single answer to "which root files does the document path ignore".
+const DOCUMENT_SKIP_FILE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "Cargo.lock",
+    "poetry.lock",
+];
+
+/// Whether `path` is a document file the contract scanner should actually
+/// read: [`document_kind`]'s extension gate bounded for the negative case —
+/// known lock/data file names are skipped outright, and files above
+/// [`MAX_DOCUMENT_SCAN_BYTES`] stay un-indexed (a path whose size cannot be
+/// read classifies by extension; the subsequent read fails and the file
+/// stays un-indexed).
+pub fn scannable_document_kind(path: &std::path::Path) -> Option<DocumentKind> {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && DOCUMENT_SKIP_FILE_NAMES.contains(&name)
+    {
+        return None;
+    }
+    let oversized = std::fs::metadata(path)
+        .map(|m| m.len() > MAX_DOCUMENT_SCAN_BYTES)
+        .unwrap_or(false);
+    if oversized {
+        return None;
+    }
+    document_kind(path)
 }
 
 /// Extract contract candidates from a document file's text (TASK-088).
@@ -5475,7 +5524,7 @@ fn looks_like_openapi(content: &str) -> bool {
         if t == "---" {
             return false;
         }
-        match key_name(line).as_deref() {
+        match key_name(line) {
             Some("openapi") | Some("swagger") => version = true,
             Some("paths") => paths = true,
             _ => {}
@@ -5486,19 +5535,17 @@ fn looks_like_openapi(content: &str) -> bool {
 
 /// Key name of a YAML/JSON line (`paths:`, `"paths": {`): trimmed, quotes
 /// stripped, text before the first `:`. `None` for blank/comment/brace-only
-/// lines and empty keys.
-fn key_name(line: &str) -> Option<String> {
+/// lines and empty keys. Borrows from `line` — the OpenAPI sniff runs over
+/// every line of files that usually are not OpenAPI, so it must not
+/// allocate.
+fn key_name(line: &str) -> Option<&str> {
     let t = line.trim();
     if t.is_empty() || t.starts_with('#') || matches!(t, "{" | "}" | "[" | "]" | "," | "},") {
         return None;
     }
     let head = t.split(':').next()?;
     let name = head.trim_matches(|c| c == '"' || c == '\'').trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Leading-space count of a line (YAML forbids tab indentation).
@@ -5533,7 +5580,7 @@ fn scan_openapi_document(content: &str) -> Vec<OpenApiOperation> {
         loop {
             match state {
                 0 => {
-                    if key_name(raw).as_deref() == Some("paths") {
+                    if key_name(raw) == Some("paths") {
                         paths_indent = indent_of(raw);
                         state = 1;
                     }
@@ -5545,7 +5592,7 @@ fn scan_openapi_document(content: &str) -> Vec<OpenApiOperation> {
                         continue;
                     }
                     if let Some(key) = key_name(raw).filter(|k| k.starts_with('/')) {
-                        path = key;
+                        path = key.to_string();
                         path_indent = indent_of(raw);
                         state = 2;
                     }
@@ -5557,10 +5604,10 @@ fn scan_openapi_document(content: &str) -> Vec<OpenApiOperation> {
                         continue;
                     }
                     if let Some(key) = key_name(raw)
-                        && OPENAPI_METHODS.contains(&key.as_str())
+                        && OPENAPI_METHODS.contains(&key)
                     {
                         ops.push(OpenApiOperation {
-                            method: key,
+                            method: key.to_string(),
                             raw_path: path.clone(),
                             line: idx + 1,
                         });
@@ -6037,7 +6084,9 @@ pub fn canonical_rpc_join(scopes: &[RpcJoinScope]) -> Vec<RpcJoin> {
             let rank = u8::from(basis != RpcMatchBasis::ServiceLevelProvider);
             let better = match best {
                 None => true,
-                Some((r, _, _, _)) => rank >= r,
+                // Strictly better rank only: equal rank keeps the earlier
+                // provider (lowest (scope, candidate) index).
+                Some((r, _, _, _)) => rank > r,
             };
             if better {
                 best = Some((rank, provider, *psi, basis));
@@ -9507,6 +9556,36 @@ agenda.define('email-send', fn);
         assert_eq!(DocumentKind::OpenApi.as_str(), "OpenApi");
     }
 
+    #[test]
+    fn scannable_document_kind_bounds_the_negative_case() {
+        use crate::contracts::{DocumentKind, scannable_document_kind};
+        use std::path::Path;
+        // Lock/data file names never carry contracts — skipped by name,
+        // whatever their extension or content.
+        for name in [
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "composer.lock",
+            "Cargo.lock",
+            "poetry.lock",
+        ] {
+            assert_eq!(scannable_document_kind(Path::new(name)), None, "{name}");
+        }
+        // Ordinary documents still classify (these paths do not exist, so
+        // no size is known — the pipeline's read happens afterwards and
+        // leaves missing files un-indexed).
+        assert_eq!(
+            scannable_document_kind(Path::new("api.yaml")),
+            Some(DocumentKind::OpenApi)
+        );
+        assert_eq!(
+            scannable_document_kind(Path::new("schema.graphql")),
+            Some(DocumentKind::Graphql)
+        );
+        assert_eq!(scannable_document_kind(Path::new("README.md")), None);
+    }
+
     // -- proto document scanner (TASK-088, plan 5.2) ---------------------------
 
     #[test]
@@ -10288,6 +10367,24 @@ paths:
         assert_eq!(joins.len(), 1, "got {joins:?}");
         assert_eq!(joins[0].provider.canonical_id, method.canonical_id);
         assert_eq!(joins[0].basis, RpcMatchBasis::PackageQualifiedService);
+    }
+
+    #[test]
+    fn rpc_join_equal_rank_tie_break_prefers_first_provider() {
+        // Two method-level providers of the same service+method carry equal
+        // rank: the documented rule keeps the LOWEST (scope, candidate)
+        // index — the first provider in order wins, never the last.
+        let first = join_grpc("users.v1.UserService", "GetUser", ContractRole::Provider);
+        let second = join_grpc("UserService", "GetUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let cands = [first.clone(), second, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(
+            joins[0].provider.canonical_id, first.canonical_id,
+            "equal-rank tie must keep the first (lowest-index) provider"
+        );
     }
 
     #[test]

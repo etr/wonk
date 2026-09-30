@@ -365,8 +365,9 @@ pub fn reindex_file(
         None => {
             // Document files (.proto/.graphql/.yaml/.json) carry contracts
             // without a grammar (TASK-088); re-index them, and drop any
-            // stale row when they no longer yield candidates.
-            let doc = crate::contracts::document_kind(file_path).and_then(|kind| {
+            // stale row when they no longer yield candidates. Lock files
+            // and oversized documents are never scanned.
+            let doc = crate::contracts::scannable_document_kind(file_path).and_then(|kind| {
                 document_file_result(
                     kind,
                     rel_path.clone(),
@@ -852,7 +853,9 @@ fn parse_document_file(
     repo_root: &Path,
     contract_opts: &crate::contracts::ContractOptions,
 ) -> Option<FileResult> {
-    let kind = crate::contracts::document_kind(path)?;
+    // Lock files and oversized documents are rejected before the read: a
+    // 100 MB package-lock.json must cost nothing on a full build.
+    let kind = crate::contracts::scannable_document_kind(path)?;
     let content = std::fs::read_to_string(path).ok()?;
     let rel_path = path
         .strip_prefix(repo_root)
@@ -1820,6 +1823,67 @@ class Component {
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(total, 1, "only the proto document is indexed");
+    }
+
+    #[test]
+    fn build_index_skips_lockfile_documents() {
+        // A repo-root lock file matches a document extension (here even
+        // sniffs as OpenAPI): lock/data files never carry contracts, so the
+        // document path must skip them by name before reading anything.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("package-lock.json"),
+            "{\n  \"openapi\": \"3.0.0\",\n  \"paths\": {\n    \"/x\": {\n      \"get\": {\n        \"description\": \"sniffs positive\"\n      }\n    }\n  }\n}\n",
+        )
+        .unwrap();
+        let stats = build_index(root, true).unwrap();
+        assert_eq!(stats.file_count, 0, "got {stats:?}");
+        assert_eq!(stats.contract_count, 0, "got {stats:?}");
+    }
+
+    #[test]
+    fn build_index_skips_oversized_documents() {
+        // A document above MAX_DOCUMENT_SCAN_BYTES stays un-indexed exactly
+        // as before the document path existed: scanning tens of MB of data
+        // YAML can only produce a guaranteed-null sniff result.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        let mut spec = String::from("openapi: 3.0.0\npaths:\n");
+        while spec.len() <= crate::contracts::MAX_DOCUMENT_SCAN_BYTES as usize {
+            spec.push_str("  /pad/x:\n    get:\n      summary: pad\n");
+        }
+        fs::write(root.join("openapi.yaml"), spec).unwrap();
+        let stats = build_index(root, true).unwrap();
+        assert_eq!(stats.file_count, 0, "got {stats:?}");
+        assert_eq!(stats.contract_count, 0, "got {stats:?}");
+    }
+
+    #[test]
+    fn reindex_file_skips_lockfile_document() {
+        // The incremental path pays the same guard: a changed lock file
+        // re-hashes (TASK-083 anchor) but never gains a row.
+        let dir = make_rpc_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let lock = dir.path().join("package-lock.json");
+        fs::write(
+            &lock,
+            "{\n  \"openapi\": \"3.0.0\",\n  \"paths\": {\n    \"/x\": {\n      \"get\": {}\n    }\n  }\n}\n",
+        )
+        .unwrap();
+        let opts = crate::contracts::ContractOptions::default();
+        assert!(!reindex_file(&conn, &lock, dir.path(), &opts).unwrap());
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'package-lock.json'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "lock files must stay un-indexed");
     }
 
     #[test]
