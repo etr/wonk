@@ -965,7 +965,8 @@ pub struct Finding {
     pub anchor_method: AnchorMethod,
     /// How strongly the finding weighs on the verdict.
     pub severity: FindingSeverity,
-    /// Finding category: `breaking-change` or `coverage-gap`.
+    /// Finding category: `breaking-change`, `coverage-gap`, or
+    /// `cross-repo` (rule family C, TASK-086).
     pub kind: String,
     /// Rule identifier (also the suppression key space, TASK-089).
     pub rule: String,
