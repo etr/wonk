@@ -8,6 +8,7 @@
 //! Each layer only overrides fields it explicitly sets; absent fields
 //! are left at their previous value.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -32,6 +33,7 @@ pub struct Config {
     pub reach: ReachConfig,
     pub contracts: ContractsConfig,
     pub review: ReviewConfig,
+    pub rank: RankConfig,
 }
 
 /// Daemon-related settings.
@@ -195,6 +197,30 @@ impl Default for ContractsConfig {
     }
 }
 
+/// Signal-pipeline reranking settings (TASK-092, PRD-RANK-REQ-006/017).
+///
+/// `enabled` gates the rerank pipeline: `false` (the default) keeps the
+/// byte-identical legacy ordering; flipping the default is TASK-095's.
+/// `weights` maps signal names to f32 multipliers and is validated against
+/// the signal registry at load time — the first config key whose unknown
+/// values are a hard load error rather than a silent no-op.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankConfig {
+    /// Whether search results are reranked through the signal pipeline.
+    pub enabled: bool,
+    /// Signal name -> weight. Absent names weigh zero.
+    pub weights: HashMap<String, f32>,
+}
+
+impl Default for RankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weights: HashMap::from([("kind".to_string(), 1.0)]),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -262,6 +288,7 @@ struct ConfigOverlay {
     reach: Option<ReachOverlay>,
     contracts: Option<ContractsOverlay>,
     review: Option<ReviewOverlay>,
+    rank: Option<RankOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -328,6 +355,13 @@ struct ReviewOverlay {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
+struct RankOverlay {
+    enabled: Option<bool>,
+    weights: Option<HashMap<String, f32>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
 struct ContractsOverlay {
     http: Option<bool>,
     env: Option<bool>,
@@ -384,7 +418,7 @@ impl Config {
         overlay: ConfigOverlay,
         layer: ConfigLayer,
         warnings: &mut Vec<String>,
-    ) {
+    ) -> Result<()> {
         if let Some(d) = overlay.daemon
             && let Some(v) = d.debounce_ms
         {
@@ -490,6 +524,20 @@ impl Config {
                 self.contracts.openapi = v;
             }
         }
+        if let Some(rank) = overlay.rank {
+            if let Some(v) = rank.enabled {
+                self.rank.enabled = v;
+            }
+            if let Some(v) = rank.weights {
+                // Hard validation against the signal registry (REQ-006):
+                // building the WeightTable rejects unknown names and
+                // non-finite values as load errors.
+                crate::rerank::WeightTable::from_config(&v)?;
+                // The table replaces the previous layer's wholesale.
+                self.rank.weights = v;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -562,7 +610,7 @@ impl Config {
         if let Some(dir) = global_dir {
             let global_path = dir.join("config.toml");
             if let Some(overlay) = load_overlay(&global_path)? {
-                config.apply_overlay(overlay, ConfigLayer::Global, &mut warnings);
+                config.apply_overlay(overlay, ConfigLayer::Global, &mut warnings)?;
             }
         }
 
@@ -570,7 +618,7 @@ impl Config {
         if let Some(root) = repo_root {
             let repo_config_path = root.join(".wonk").join("config.toml");
             if let Some(overlay) = load_overlay(&repo_config_path)? {
-                config.apply_overlay(overlay, ConfigLayer::Repo, &mut warnings);
+                config.apply_overlay(overlay, ConfigLayer::Repo, &mut warnings)?;
             }
         }
 
@@ -1529,5 +1577,154 @@ rrf_k = 80.0
 
         let config = Config::load_with_global_dir(Some(&env.global_path), Some(&repo)).unwrap();
         assert!((config.search.rrf_k - 80.0).abs() < f32::EPSILON);
+    }
+
+    // -- Rank config tests --------------------------------------------------
+
+    #[test]
+    fn rank_defaults_to_disabled_with_kind_weight() {
+        // REQ-017: reranking is behind config defaulting to the current
+        // ordering. The default flip is TASK-095's, not ours.
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert!(!config.rank.enabled);
+        assert_eq!(
+            config.rank.weights,
+            HashMap::from([("kind".to_string(), 1.0)])
+        );
+    }
+
+    #[test]
+    fn rank_reads_from_config_file() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank]
+enabled = true
+
+[rank.weights]
+kind = 2.0
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(config.rank.enabled);
+        assert_eq!(
+            config.rank.weights,
+            HashMap::from([("kind".to_string(), 2.0)])
+        );
+    }
+
+    #[test]
+    fn rank_enabled_and_weights_layer_independently() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank]
+enabled = true
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[rank.weights]
+kind = 0.5
+"#,
+        );
+        let config = env.load_with_warnings().unwrap().0;
+        // Global enabled survives a repo layer that only sets weights.
+        assert!(config.rank.enabled);
+        assert_eq!(
+            config.rank.weights,
+            HashMap::from([("kind".to_string(), 0.5)])
+        );
+    }
+
+    #[test]
+    fn rank_weights_replace_wholesale_per_layer() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank.weights]
+kind = 2.0
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[rank.weights]
+kind = 0.0
+"#,
+        );
+        let config = env.load().unwrap();
+        // The repo table replaces the global one (last wins for the whole
+        // table), it does not merge per-key with defaults or prior layers.
+        assert_eq!(
+            config.rank.weights,
+            HashMap::from([("kind".to_string(), 0.0)])
+        );
+    }
+
+    #[test]
+    fn rank_unknown_signal_name_is_a_hard_error() {
+        // REQ-006: unknown names are rejected, not silently ignored.
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank.weights]
+lexical = 1.0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown signal name 'lexical' in [rank.weights]"),
+            "error names the offender and the section: {err}"
+        );
+        assert!(
+            err.contains("known: kind"),
+            "error lists valid names: {err}"
+        );
+    }
+
+    #[test]
+    fn rank_unknown_signal_name_in_repo_layer_is_a_hard_error() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[rank.weights]
+centrality = 3.0
+"#,
+        );
+        assert!(env.load().is_err());
+    }
+
+    #[test]
+    fn rank_non_finite_weight_is_a_hard_error() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank.weights]
+kind = nan
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(err.contains("non-finite weight"), "got: {err}");
+    }
+
+    #[test]
+    fn rank_section_absent_keeps_defaults() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[search]
+rrf_k = 40.0
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(!config.rank.enabled);
+        assert_eq!(
+            config.rank.weights,
+            HashMap::from([("kind".to_string(), 1.0)])
+        );
     }
 }
