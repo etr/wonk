@@ -47,7 +47,7 @@
 | M27 | Lexical BM25 Scoring | 2 | Complete |
 | M28 | Precomputed Reach Index | 2 | Complete |
 | M29 | Cross-Repo Contract Detection | 5 | Complete |
-| M30 | Diff-Scoped Review Workflow | 3 | In Progress |
+| M30 | Diff-Scoped Review Workflow | 3 | Complete |
 | M31 | Body Elision | 2 | Not Started |
 | M32 | Signal-Based Reranking | 4 | Not Started |
 | M33 | History-Derived Signals | 2 | Not Started |
@@ -3761,13 +3761,13 @@ Add the cross-repo rule family, NDJSON output, and MCP exposure.
 Make findings individually addressable so a confirmed false positive can be retired permanently, and make every suppression visible.
 
 **Action Items:**
-- [ ] Compute a stable finding identity: hash of rule, category, normalized path, symbol, and whitespace-folded anchored line — **excluding the line number** (PRD-REV-REQ-013)
-- [ ] Add the `review_suppressions` table keyed by identity, with rule and file retained for display (PRD-REV-REQ-014)
-- [ ] Consult the suppression list before a finding is kept; stamp identity even when nothing is suppressed
-- [ ] Add commands to list, add, and remove suppressions, including bulk removal by rule
-- [ ] Rank findings worst-first (severity desc, then confidence) before applying any cap (PRD-REV-REQ-015)
-- [ ] Report per-reason drop counts on every run: below confidence, below severity, out of category, over cap, identity-suppressed (PRD-REV-REQ-015)
-- [ ] Include drop counts in NDJSON output alongside findings
+- [x] Compute a stable finding identity: hash of rule, category, normalized path, symbol, and whitespace-folded anchored line — **excluding the line number** (PRD-REV-REQ-013)
+- [x] Add the `review_suppressions` table keyed by identity, with rule and file retained for display (PRD-REV-REQ-014)
+- [x] Consult the suppression list before a finding is kept; stamp identity even when nothing is suppressed
+- [x] Add commands to list, add, and remove suppressions, including bulk removal by rule
+- [x] Rank findings worst-first (severity desc, then confidence) before applying any cap (PRD-REV-REQ-015)
+- [x] Report per-reason drop counts on every run: below confidence, below severity, out of category, over cap, identity-suppressed (PRD-REV-REQ-015)
+- [x] Include drop counts in NDJSON output alongside findings
 
 **Dependencies:**
 - Blocked by: TASK-085
@@ -3784,7 +3784,7 @@ Make findings individually addressable so a confirmed false positive can be reti
 **Related Requirements:** PRD-REV-REQ-013, PRD-REV-REQ-014, PRD-REV-REQ-015
 **Related Decisions:** DR-035
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
