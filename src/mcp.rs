@@ -2083,6 +2083,7 @@ impl McpServer {
                     suppress: true,
                     shallow: true,
                     scope: None,
+                    elide: None,
                     signatures_only: true, // auto-file-path: compact output
                 };
                 match crate::show::show_file(conn, &raw_name, &repo_root, &options) {
@@ -2109,6 +2110,7 @@ impl McpServer {
                         suppress: true,
                         shallow,
                         scope: split.scope_hint,
+                        elide: None,
                         signatures_only: false,
                     };
 
@@ -2139,6 +2141,7 @@ impl McpServer {
                 suppress: true,
                 shallow,
                 scope: None,
+                elide: None,
                 signatures_only: false,
             };
             match crate::show::show_file(conn, file_pattern, &repo_root, &options) {
@@ -2212,6 +2215,9 @@ impl McpServer {
                             suppress: true,
                             shallow: true,
                             scope: None,
+                            // Shallow replaces the payload; elision never
+                            // touches the shallow rendering.
+                            elide: None,
                             signatures_only: false,
                         };
                         if let Ok(shallow_results) =
@@ -2559,6 +2565,7 @@ impl McpServer {
             detail,
             depth,
             suppress: true,
+            elide: None,
         };
 
         let result = match crate::summary::summarize_path(conn, &path, &options) {
@@ -3006,6 +3013,7 @@ impl McpServer {
             kind,
             min_confidence,
             scope: split.scope_hint,
+            elide: None,
         };
 
         let include_tests = extract_include_tests(&args);

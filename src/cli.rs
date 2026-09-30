@@ -324,9 +324,33 @@ pub struct ShowArgs {
     #[arg(long)]
     pub shallow: bool,
 
+    /// Elide function bodies from source output (default off). Bare --elide
+    /// means "salience": bodies collapse to counted stubs while
+    /// control-flow lines are retained verbatim.
+    #[arg(long, num_args = 0..=1, default_missing_value = "salience", value_enum)]
+    pub elide: Option<ElideArg>,
+
     /// Restrict results to these file paths (use -- before paths)
     #[arg(last = true)]
     pub paths: Vec<String>,
+}
+
+/// CLI surface of the elision engine (PRD-ELIDE-REQ-008).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElideArg {
+    /// Replace whole bodies with counted stubs.
+    Bodies,
+    /// Retain control-flow lines verbatim inside counted stubs.
+    Salience,
+}
+
+impl From<ElideArg> for crate::elide::Mode {
+    fn from(value: ElideArg) -> Self {
+        match value {
+            ElideArg::Bodies => crate::elide::Mode::Bodies,
+            ElideArg::Salience => crate::elide::Mode::Salience,
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -409,6 +433,12 @@ pub struct SummaryArgs {
     /// Show full recursive hierarchy (unlimited depth)
     #[arg(long, conflicts_with = "depth")]
     pub recursive: bool,
+
+    /// Elide function bodies from source output (default off); bare = salience.
+    /// Inert on summary's signature-only payload today — see
+    /// bench/elision-results.md for the recorded reduction figures.
+    #[arg(long, num_args = 0..=1, default_missing_value = "salience", value_enum)]
+    pub elide: Option<ElideArg>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -513,6 +543,12 @@ pub struct ReviewArgs {
     /// Manage durable suppressions (PRD-REV-REQ-014); absent = a review
     #[command(subcommand)]
     pub suppress: Option<ReviewSuppressCommand>,
+
+    /// Elide function bodies from source output (default off); bare = salience.
+    /// Inert on review's finding payload today — see
+    /// bench/elision-results.md for the recorded reduction figures.
+    #[arg(long, num_args = 0..=1, default_missing_value = "salience", value_enum)]
+    pub elide: Option<ElideArg>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -577,6 +613,12 @@ pub struct ContextArgs {
     /// Minimum confidence threshold (0.0-1.0) for blast/flow edges
     #[arg(long)]
     pub min_confidence: Option<f64>,
+
+    /// Elide function bodies from source output (default off); bare = salience.
+    /// Inert on context's signature-only payload today — see
+    /// bench/elision-results.md for the recorded reduction figures.
+    #[arg(long, num_args = 0..=1, default_missing_value = "salience", value_enum)]
+    pub elide: Option<ElideArg>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -897,6 +939,60 @@ mod tests {
             }
             _ => panic!("expected Command::Show"),
         }
+    }
+
+    #[test]
+    fn parse_elide_flag_variants() {
+        use super::ElideArg;
+
+        // Bare --elide = salience; explicit value; absent = off (default).
+        let cli = Cli::try_parse_from(["wonk", "show", "alpha", "--elide"]).unwrap();
+        match cli.command {
+            Command::Show(args) => assert_eq!(args.elide, Some(ElideArg::Salience)),
+            _ => panic!("expected Command::Show"),
+        }
+
+        let cli = Cli::try_parse_from(["wonk", "show", "--elide=bodies", "alpha"]).unwrap();
+        match cli.command {
+            Command::Show(args) => assert_eq!(args.elide, Some(ElideArg::Bodies)),
+            _ => panic!("expected Command::Show"),
+        }
+
+        let cli = Cli::try_parse_from(["wonk", "show", "alpha"]).unwrap();
+        match cli.command {
+            Command::Show(args) => assert_eq!(args.elide, None),
+            _ => panic!("expected Command::Show"),
+        }
+
+        // The flag exists uniformly on all four source-returning commands.
+        let cli = Cli::try_parse_from(["wonk", "summary", "src/", "--elide"]).unwrap();
+        match cli.command {
+            Command::Summary(args) => assert_eq!(args.elide, Some(ElideArg::Salience)),
+            _ => panic!("expected Command::Summary"),
+        }
+        let cli = Cli::try_parse_from(["wonk", "context", "--elide=bodies", "alpha"]).unwrap();
+        match cli.command {
+            Command::Context(args) => assert_eq!(args.elide, Some(ElideArg::Bodies)),
+            _ => panic!("expected Command::Context"),
+        }
+        let cli = Cli::try_parse_from(["wonk", "review", "--elide"]).unwrap();
+        match cli.command {
+            Command::Review(args) => assert_eq!(args.elide, Some(ElideArg::Salience)),
+            _ => panic!("expected Command::Review"),
+        }
+
+        // Invalid value is a usage error, never a silent default.
+        assert!(Cli::try_parse_from(["wonk", "show", "--elide=bogus", "a"]).is_err());
+
+        // The CLI value maps onto the engine mode.
+        assert_eq!(
+            crate::elide::Mode::from(ElideArg::Bodies),
+            crate::elide::Mode::Bodies
+        );
+        assert_eq!(
+            crate::elide::Mode::from(ElideArg::Salience),
+            crate::elide::Mode::Salience
+        );
     }
 
     #[test]

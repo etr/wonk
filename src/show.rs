@@ -10,7 +10,10 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use rusqlite::Connection;
+use tree_sitter::Tree;
 
+use crate::elide::Mode;
+use crate::indexer::Lang;
 use crate::output;
 use crate::types::{ShowResult, SymbolKind};
 
@@ -30,6 +33,11 @@ pub struct ShowOptions {
     pub scope: Option<String>,
     /// Show only signatures for all symbols (no source bodies).
     pub signatures_only: bool,
+    /// Elide function bodies in extracted source spans (default off).
+    /// Inert on the shallow and signatures-only renderings — neither
+    /// extracts bodies — and on symbols without an end line (signature
+    /// fallback).
+    pub elide: Option<Mode>,
 }
 
 /// Query all top-level symbols in a file (or directory prefix) and read their
@@ -178,6 +186,10 @@ fn collect_show_results(
     options: &ShowOptions,
 ) -> Result<Vec<ShowResult>> {
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
+    // One parse per file when elision is active (PRD-ELIDE-REQ-010: the text
+    // is already read; the tree is parsed once and shared by every span
+    // extracted from that file). A `None` entry caches the miss.
+    let mut tree_cache: HashMap<String, Option<(Tree, Lang)>> = HashMap::new();
     let canonical_root = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
@@ -198,6 +210,8 @@ fn collect_show_results(
         let end_line = end_line.map(|v| v as usize);
 
         if options.signatures_only {
+            // Signature-only rendering carries no body: elision is inert
+            // here by construction (returns before any source extraction).
             let short_sig = signature.lines().next().unwrap_or(&signature).to_string();
             results.push(ShowResult {
                 name: sym_name,
@@ -212,6 +226,11 @@ fn collect_show_results(
         }
 
         if options.shallow && kind.is_container() {
+            // Shallow wins over elision (PRD-ELIDE-REQ-009, DR-017): this
+            // branch returns before any source extraction, so the single
+            // documented rendering for `--shallow --elide` is the shallow
+            // one and the two never compound. Elision still applies to
+            // non-container symbols shown in the same request.
             let child_sigs =
                 query_child_signatures_with_stmt(child_stmt.as_mut().unwrap(), &sym_name, &file)?;
             // Use only the first line of the container signature (the
@@ -243,29 +262,14 @@ fn collect_show_results(
 
         let source = if let Some(end) = end_line {
             let suppress = options.suppress;
-            let content = file_cache.entry(file.clone()).or_insert_with(|| {
-                let abs_path = repo_root.join(&file);
-                match abs_path.canonicalize() {
-                    Ok(canonical) if canonical.starts_with(&canonical_root) => {
-                        std::fs::read_to_string(&canonical).ok()
-                    }
-                    Ok(_) => {
-                        output::print_hint(
-                            &format!("path outside repo root, skipping: {file}"),
-                            suppress,
-                        );
-                        None
-                    }
-                    Err(_) => {
-                        output::print_hint(&format!("source file not found: {file}"), suppress);
-                        None
-                    }
-                }
-            });
-            match content {
-                Some(c) => extract_lines(c, line, end),
-                None => continue,
-            }
+            let content = file_cache
+                .entry(file.clone())
+                .or_insert_with(|| read_source_file(repo_root, &canonical_root, &file, suppress));
+            let Some(c) = content.as_ref() else {
+                continue;
+            };
+            elide_window(&mut tree_cache, &file, c, line, end, options.elide)
+                .unwrap_or_else(|| extract_lines(c, line, end))
         } else {
             signature
         };
@@ -282,6 +286,57 @@ fn collect_show_results(
     }
 
     Ok(results)
+}
+
+/// Read one source file for body extraction, guarding against paths outside
+/// the repo root; `None` (with a stderr hint) when unreadable.
+fn read_source_file(
+    repo_root: &Path,
+    canonical_root: &Path,
+    file: &str,
+    suppress: bool,
+) -> Option<String> {
+    let abs_path = repo_root.join(file);
+    match abs_path.canonicalize() {
+        Ok(canonical) if canonical.starts_with(canonical_root) => {
+            std::fs::read_to_string(&canonical).ok()
+        }
+        Ok(_) => {
+            output::print_hint(
+                &format!("path outside repo root, skipping: {file}"),
+                suppress,
+            );
+            None
+        }
+        Err(_) => {
+            output::print_hint(&format!("source file not found: {file}"), suppress);
+            None
+        }
+    }
+}
+
+/// Elide the `line..=end` window of an already-read file, or `None` when
+/// elision was not requested or the file's tree is unavailable. The whole
+/// file is parsed once per request and cached (windows are fragments that do
+/// not parse standalone); `None` is the fail-soft signal for the caller to
+/// fall back to plain line extraction (PRD-ELIDE-REQ-006).
+fn elide_window(
+    tree_cache: &mut HashMap<String, Option<(Tree, Lang)>>,
+    file: &str,
+    content: &str,
+    line: usize,
+    end: usize,
+    mode: Option<Mode>,
+) -> Option<String> {
+    let mode = mode?;
+    let tree = tree_cache.entry(file.to_string()).or_insert_with(|| {
+        let lang = crate::indexer::detect_language(Path::new(file))?;
+        let mut parser = crate::indexer::try_get_parser(lang).ok()?;
+        let tree = parser.parse(content, None)?;
+        Some((tree, lang))
+    });
+    let (tree, lang) = tree.as_ref()?;
+    crate::elide::elide_span_tree(tree, content, *lang, mode, line, end).ok()
 }
 
 /// Query child symbol signatures using a pre-prepared statement.
@@ -352,6 +407,7 @@ mod tests {
             shallow: false,
             scope: None,
             signatures_only: false,
+            elide: None,
         }
     }
 
@@ -667,6 +723,88 @@ mod tests {
 
         let results = show_file(&conn, "nonexistent.rs", dir.path(), &default_options()).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn show_elide_returns_stubbed_span() {
+        let source = "fn process(n: u32) -> u32 {\n    let mut t = n;\n    while t < 10 {\n        t += 1;\n    }\n    t\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let opts = ShowOptions {
+            elide: Some(crate::elide::Mode::Salience),
+            ..default_options()
+        };
+        let results = show_symbol(&conn, "process", dir.path(), &opts).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].source.contains("while t < 10 {"),
+            "salience keeps the control-flow skeleton:\n{}",
+            results[0].source
+        );
+        assert!(
+            results[0].source.contains("/* 1 lines elided */"),
+            "collapsed runs still report their counts:\n{}",
+            results[0].source
+        );
+        assert!(
+            !results[0].source.contains("t += 1;"),
+            "the loop body itself collapses:\n{}",
+            results[0].source
+        );
+
+        // Bodies mode: whole-body stub.
+        let opts = ShowOptions {
+            elide: Some(crate::elide::Mode::Bodies),
+            ..default_options()
+        };
+        let results = show_symbol(&conn, "process", dir.path(), &opts).unwrap();
+        assert!(results[0].source.contains("/* 7 lines elided */"));
+        assert!(!results[0].source.contains("while"));
+    }
+
+    #[test]
+    fn show_default_output_unchanged_without_elide() {
+        let source = "fn process(n: u32) -> u32 {\n    let mut t = n;\n    while t < 10 {\n        t += 1;\n    }\n    t\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let results = show_symbol(&conn, "process", dir.path(), &default_options()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, source.trim_end_matches('\n'));
+        assert!(!results[0].source.contains("elided"));
+    }
+
+    #[test]
+    fn show_shallow_wins_over_elide() {
+        // PRD-ELIDE-REQ-009 / DR-017: shallow + elide resolve to ONE
+        // documented rendering — shallow. It is index-only (never reads
+        // source), so elision is skipped rather than compounded.
+        let source = "struct Foo {\n    x: i32,\n}\n\nimpl Foo {\n    fn bar(&self) -> i32 {\n        if self.x > 0 {\n            self.x\n        } else {\n            0 - self.x\n        }\n    }\n}\n";
+        let (dir, conn) = make_indexed_repo(source);
+
+        let both = ShowOptions {
+            shallow: true,
+            elide: Some(crate::elide::Mode::Salience),
+            exact: true,
+            kind: Some("struct".into()),
+            ..default_options()
+        };
+        let shallow_only = ShowOptions {
+            shallow: true,
+            exact: true,
+            kind: Some("struct".into()),
+            ..default_options()
+        };
+
+        let with_elide = show_symbol(&conn, "Foo", dir.path(), &both).unwrap();
+        let without = show_symbol(&conn, "Foo", dir.path(), &shallow_only).unwrap();
+        assert_eq!(with_elide.len(), 1);
+        assert_eq!(without.len(), 1);
+        assert_eq!(
+            with_elide[0].source, without[0].source,
+            "shallow is the single rendering; elide must not alter it"
+        );
+        assert!(!with_elide[0].source.contains("elided"));
+        assert!(with_elide[0].source.contains("bar"));
     }
 
     #[test]
