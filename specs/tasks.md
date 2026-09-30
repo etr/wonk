@@ -3610,7 +3610,7 @@ Persist detected contracts per repo and expose them through a CLI command with k
 **Related Requirements:** PRD-CTR-REQ-008, PRD-CTR-REQ-012
 **Related Decisions:** DR-031
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
