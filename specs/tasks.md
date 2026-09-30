@@ -3590,11 +3590,11 @@ Add gRPC, GraphQL, and OpenAPI kinds, plus the second matching pass that RPC pai
 Persist detected contracts per repo and expose them through a CLI command with kind/role/orphan filters.
 
 **Action Items:**
-- [ ] Add the `contracts` table with `canonical_id`/`role`, `symbol_id`, and `file` indexes (DR-031)
-- [ ] Write contracts in the existing indexing transaction; clear and rewrite per file on re-index
-- [ ] Implement `wonk contracts` with `--kind`, `--role`, and `--orphans` filters (PRD-CTR-REQ-008)
-- [ ] Support both output formats (grep-compatible and NDJSON) per PRD-OUT
-- [ ] Ensure queries return within-repo results and do not error when no sibling repos are indexed (PRD-CTR-REQ-012)
+- [x] Add the `contracts` table with `canonical_id`/`role`, `symbol_id`, and `file` indexes (DR-031)
+- [x] Write contracts in the existing indexing transaction; clear and rewrite per file on re-index
+- [x] Implement `wonk contracts` with `--kind`, `--role`, and `--orphans` filters (PRD-CTR-REQ-008)
+- [x] Support both output formats (grep-compatible and NDJSON) per PRD-OUT
+- [x] Ensure queries return within-repo results and do not error when no sibling repos are indexed (PRD-CTR-REQ-012)
 
 **Dependencies:**
 - Blocked by: TASK-082
@@ -3610,7 +3610,7 @@ Persist detected contracts per repo and expose them through a CLI command with k
 **Related Requirements:** PRD-CTR-REQ-008, PRD-CTR-REQ-012
 **Related Decisions:** DR-031
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
