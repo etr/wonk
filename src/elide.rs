@@ -48,8 +48,7 @@ impl NotElided {
 /// [`elide_tree`], which never parses twice.
 pub fn elide(source: &str, language: Option<Lang>, mode: Mode) -> Result<String, NotElided> {
     let lang = language.ok_or(NotElided::UnsupportedLanguage)?;
-    let mut parser =
-        indexer::try_get_parser(lang).map_err(|_| NotElided::GrammarUnavailable)?;
+    let mut parser = indexer::try_get_parser(lang).map_err(|_| NotElided::GrammarUnavailable)?;
     let tree = parser.parse(source, None).ok_or(NotElided::ParseFailure)?;
     elide_tree(&tree, source, lang, mode)
 }
@@ -111,14 +110,13 @@ fn collect_body_ranges(tree: &Tree, source: &str, lang: Lang) -> Vec<BodyRange> 
     loop {
         let node = cursor.node();
         let mut accepted = false;
-        if indexer::is_function_node(node.kind(), lang) {
-            if let Some(range) = body_range_for(node, bytes, class) {
-                if range.start >= last_end {
-                    last_end = range.end;
-                    ranges.push(range);
-                    accepted = true;
-                }
-            }
+        if indexer::is_function_node(node.kind(), lang)
+            && let Some(range) = body_range_for(node, bytes, class)
+            && range.start >= last_end
+        {
+            last_end = range.end;
+            ranges.push(range);
+            accepted = true;
         }
         if !accepted && cursor.goto_first_child() {
             continue;
@@ -345,7 +343,11 @@ def solo():
     return 7
 ";
         assert_eq!(out, expected);
-        assert_eq!(out.matches("elided").count(), 1, "one stub, not one per nested def");
+        assert_eq!(
+            out.matches("elided").count(),
+            1,
+            "one stub, not one per nested def"
+        );
 
         let js = "\
 // module docs
@@ -908,8 +910,10 @@ public class Demo {
         let out_lines = out.lines().count();
         assert!(out.contains("use std::fmt;"));
         for i in 0..30 {
-            assert!(out.contains(&format!("pub fn f{i}(n: u32) -> u32 {{")),
-                "signature of f{i} must survive");
+            assert!(
+                out.contains(&format!("pub fn f{i}(n: u32) -> u32 {{")),
+                "signature of f{i} must survive"
+            );
         }
         assert!(
             out_lines * 2 < in_lines,
@@ -929,7 +933,10 @@ public class Demo {
         let fallback = elide(src, None, Mode::Bodies).unwrap_or_else(|_| src.to_string());
         assert_eq!(fallback, src);
 
-        assert_eq!(NotElided::GrammarUnavailable.as_str(), "grammar unavailable");
+        assert_eq!(
+            NotElided::GrammarUnavailable.as_str(),
+            "grammar unavailable"
+        );
         assert_eq!(NotElided::ParseFailure.as_str(), "parse failure");
 
         // All twelve supported languages route through elide without a signal.
