@@ -127,7 +127,7 @@ impl Default for ReachConfig {
 /// independently, and a noisy detector can be turned off without touching
 /// the others. All kinds default to enabled; TASK-088 adds the RPC-family
 /// booleans, and workspace scoping arrives with TASK-083+.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractsConfig {
     /// HTTP route/outbound-call detection.
     pub http: bool,
@@ -145,6 +145,12 @@ pub struct ContractsConfig {
     pub graphql: bool,
     /// OpenAPI specification-document detection (TASK-088).
     pub openapi: bool,
+    /// Workspace identifiers this repo declares (TASK-084, PRD-CTR-REQ-013).
+    ///
+    /// Repo-local only — the value is read from `<repo>/.wonk/config.toml`;
+    /// a global-layer value is ignored with a warning (PRD-CTR-REQ-017).
+    /// Stored verbatim (trimming/case-folding happens at comparison).
+    pub workspace: Vec<String>,
 }
 
 impl Default for ContractsConfig {
@@ -158,6 +164,7 @@ impl Default for ContractsConfig {
             grpc: true,
             graphql: true,
             openapi: true,
+            workspace: Vec::new(),
         }
     }
 }
@@ -295,16 +302,54 @@ struct ContractsOverlay {
     grpc: Option<bool>,
     graphql: Option<bool>,
     openapi: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    workspace: Option<Vec<String>>,
+}
+
+/// Deserialize a TOML value that may be a bare string or an array of
+/// strings into `Vec<String>` (PRD-CTR-REQ-018).
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let value = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(value.map(|v| match v {
+        StringOrVec::One(s) => vec![s],
+        StringOrVec::Many(v) => v,
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // Merge helpers
 // ---------------------------------------------------------------------------
 
+/// Which config layer an overlay came from (TASK-084, PRD-CTR-REQ-017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLayer {
+    /// `~/.wonk/config.toml` — `contracts.workspace` is ignored here.
+    Global,
+    /// `<repo>/.wonk/config.toml` — the only layer `contracts.workspace`
+    /// is honored in.
+    Repo,
+}
+
 impl Config {
     /// Apply an overlay on top of this config, replacing only the fields
-    /// that are `Some` in the overlay.
-    fn apply_overlay(&mut self, overlay: ConfigOverlay) {
+    /// that are `Some` in the overlay. `layer` decides repo-local-only
+    /// keys; ignored keys push a warning instead.
+    fn apply_overlay(
+        &mut self,
+        overlay: ConfigOverlay,
+        layer: ConfigLayer,
+        warnings: &mut Vec<String>,
+    ) {
         if let Some(d) = overlay.daemon
             && let Some(v) = d.debounce_ms
         {
@@ -364,6 +409,16 @@ impl Config {
             }
         }
         if let Some(contracts) = overlay.contracts {
+            if let Some(v) = contracts.workspace {
+                match layer {
+                    ConfigLayer::Global => warnings.push(
+                        "[contracts] workspace is repo-local only; the value in global config \
+                         is ignored (declare it in <repo>/.wonk/config.toml)"
+                            .to_string(),
+                    ),
+                    ConfigLayer::Repo => self.contracts.workspace = v,
+                }
+            }
             if let Some(v) = contracts.http {
                 self.contracts.http = v;
             }
@@ -434,21 +489,34 @@ impl Config {
     /// on top of defaults.
     pub fn load(repo_root: Option<&Path>) -> Result<Config> {
         let global_dir = home_dir().map(|h| h.join(".wonk"));
-        Self::load_with_global_dir(global_dir.as_deref(), repo_root)
+        let (config, warnings) = Self::load_with_warnings(global_dir.as_deref(), repo_root)?;
+        for warning in &warnings {
+            crate::output::print_warning(warning);
+        }
+        Ok(config)
     }
 
-    /// Internal: load config with an explicit global config directory.
-    ///
-    /// This allows tests to supply a temporary directory instead of the
-    /// real `~/.wonk` without mutating environment variables.
+    /// Internal: load config with an explicit global config directory,
+    /// discarding layer warnings (kept for existing test callers).
+    #[cfg(test)]
     fn load_with_global_dir(global_dir: Option<&Path>, repo_root: Option<&Path>) -> Result<Config> {
+        Self::load_with_warnings(global_dir, repo_root).map(|(config, _)| config)
+    }
+
+    /// Internal: load config with explicit layers, collecting warnings so
+    /// callers (and tests) can surface them without capturing stderr.
+    fn load_with_warnings(
+        global_dir: Option<&Path>,
+        repo_root: Option<&Path>,
+    ) -> Result<(Config, Vec<String>)> {
         let mut config = Config::default();
+        let mut warnings = Vec::new();
 
         // Layer 2: global config
         if let Some(dir) = global_dir {
             let global_path = dir.join("config.toml");
             if let Some(overlay) = load_overlay(&global_path)? {
-                config.apply_overlay(overlay);
+                config.apply_overlay(overlay, ConfigLayer::Global, &mut warnings);
             }
         }
 
@@ -456,11 +524,11 @@ impl Config {
         if let Some(root) = repo_root {
             let repo_config_path = root.join(".wonk").join("config.toml");
             if let Some(overlay) = load_overlay(&repo_config_path)? {
-                config.apply_overlay(overlay);
+                config.apply_overlay(overlay, ConfigLayer::Repo, &mut warnings);
             }
         }
 
-        Ok(config)
+        Ok((config, warnings))
     }
 }
 
@@ -521,6 +589,129 @@ mod tests {
         fn load(&self) -> Result<Config> {
             Config::load_with_global_dir(Some(&self.global_path), self.repo_path.as_deref())
         }
+
+        /// Load config, also returning the collected layer warnings.
+        fn load_with_warnings(&self) -> Result<(Config, Vec<String>)> {
+            Config::load_with_warnings(Some(&self.global_path), self.repo_path.as_deref())
+        }
+    }
+
+    #[test]
+    fn workspace_string_parses() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[contracts]
+workspace = "payments"
+"#,
+        );
+        let (config, warnings) = env.load_with_warnings().unwrap();
+        assert_eq!(config.contracts.workspace, vec!["payments".to_string()]);
+        assert!(warnings.is_empty(), "repo-layer workspace never warns");
+    }
+
+    #[test]
+    fn workspace_array_parses() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[contracts]
+workspace = ["payments", "platform"]
+"#,
+        );
+        let (config, _warnings) = env.load_with_warnings().unwrap();
+        assert_eq!(
+            config.contracts.workspace,
+            vec!["payments".to_string(), "platform".to_string()]
+        );
+    }
+
+    #[test]
+    fn workspace_global_layer_ignored_with_warning() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[contracts]
+workspace = "payments"
+queue = false
+"#,
+        );
+        env.create_repo();
+        let (config, warnings) = env.load_with_warnings().unwrap();
+        assert!(
+            config.contracts.workspace.is_empty(),
+            "global workspace must not apply"
+        );
+        assert!(
+            !config.contracts.queue,
+            "other [contracts] keys still layer from global"
+        );
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("workspace is repo-local only"),
+            "warning explains the rule: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains(".wonk/config.toml"),
+            "warning names where to declare it: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn workspace_repo_layer_applies() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[contracts]
+workspace = "global-ws"
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[contracts]
+workspace = "payments"
+"#,
+        );
+        let (config, _warnings) = env.load_with_warnings().unwrap();
+        assert_eq!(
+            config.contracts.workspace,
+            vec!["payments".to_string()],
+            "repo layer wins over the ignored global value"
+        );
+    }
+
+    #[test]
+    fn workspace_absent_defaults_to_empty() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[contracts]
+queue = false
+"#,
+        );
+        let (config, warnings) = env.load_with_warnings().unwrap();
+        assert!(config.contracts.workspace.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn workspace_invalid_type_is_a_parse_error() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[contracts]
+workspace = 42
+"#,
+        );
+        let result = env.load_with_warnings();
+        assert!(result.is_err());
     }
 
     #[test]

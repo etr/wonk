@@ -6459,6 +6459,7 @@ mod tests {
             grpc: false,
             graphql: true,
             openapi: false,
+            workspace: Vec::new(),
         };
         let opts = ContractOptions::from(&cfg);
         assert!(opts.enabled(ContractKind::Http));
