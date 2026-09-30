@@ -632,6 +632,8 @@ pub struct FindingOutput {
     pub line: Option<usize>,
     pub anchor_method: String,
     pub severity: String,
+    /// How sure the rule is, in `[0, 1]` (PRD-REV-REQ-015).
+    pub confidence: f64,
     pub kind: String,
     pub rule: String,
     pub message: String,
@@ -646,11 +648,36 @@ impl From<&crate::types::Finding> for FindingOutput {
             line: f.line,
             anchor_method: f.anchor_method.to_string(),
             severity: f.severity.to_string(),
+            confidence: f.confidence,
             kind: f.kind.clone(),
             rule: f.rule.clone(),
             message: f.message.clone(),
             identity: f.identity.clone(),
             related: f.related.iter().map(FindingRelatedOutput::from).collect(),
+        }
+    }
+}
+
+/// Why produced findings did not make the report, wire form
+/// (PRD-REV-REQ-015). Always serialized in full — zeros included — so the
+/// contract is uniform whether or not anything was dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewDropsOutput {
+    pub below_confidence: usize,
+    pub below_severity: usize,
+    pub out_of_category: usize,
+    pub over_cap: usize,
+    pub identity_suppressed: usize,
+}
+
+impl From<crate::review::DropCounts> for ReviewDropsOutput {
+    fn from(d: crate::review::DropCounts) -> Self {
+        Self {
+            below_confidence: d.below_confidence,
+            below_severity: d.below_severity,
+            out_of_category: d.out_of_category,
+            over_cap: d.over_cap,
+            identity_suppressed: d.identity_suppressed,
         }
     }
 }
@@ -661,6 +688,7 @@ pub struct ReviewOutput {
     pub scope: String,
     pub findings: Vec<FindingOutput>,
     pub verdict: String,
+    pub drops: ReviewDropsOutput,
     /// Non-fatal engine warnings (fail-soft skips); omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
@@ -672,6 +700,7 @@ impl From<&crate::review::ReviewResult> for ReviewOutput {
             scope: result.scope.to_string(),
             findings: result.findings.iter().map(FindingOutput::from).collect(),
             verdict: result.verdict.to_string(),
+            drops: result.drops.into(),
             warnings: result.warnings.clone(),
         }
     }
@@ -688,6 +717,9 @@ pub struct ReviewVerdictOutput {
     pub verdict: String,
     /// How many finding lines precede this one.
     pub finding_count: usize,
+    /// Per-reason drop counts (PRD-REV-REQ-015) — always present, zeros
+    /// included.
+    pub drops: ReviewDropsOutput,
     /// Non-fatal engine warnings; omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
@@ -2117,6 +2149,7 @@ impl<W: Write> Formatter<W> {
                 scope: out.scope.clone(),
                 verdict: out.verdict.clone(),
                 finding_count: out.findings.len(),
+                drops: out.drops,
                 warnings: out.warnings.clone(),
             };
             let line = Self::serialize_structured(fmt.format, &verdict)?;
@@ -5101,8 +5134,96 @@ mod tests {
             scope: "unstaged".into(),
             findings: vec![FindingOutput::from(&review_finding_fixture(line))],
             verdict: "BLOCK".into(),
+            drops: ReviewDropsOutput::default(),
             warnings: Vec::new(),
         }
+    }
+
+    fn dropped_output_fixture() -> ReviewOutput {
+        ReviewOutput {
+            drops: ReviewDropsOutput {
+                below_confidence: 2,
+                below_severity: 1,
+                out_of_category: 1,
+                over_cap: 3,
+                identity_suppressed: 1,
+            },
+            ..review_output_fixture(Some(1))
+        }
+    }
+
+    #[test]
+    fn review_drops_output_maps_every_reason_and_round_trips() {
+        let counts = crate::review::DropCounts {
+            below_confidence: 2,
+            below_severity: 1,
+            out_of_category: 4,
+            over_cap: 3,
+            identity_suppressed: 5,
+        };
+        let from = ReviewDropsOutput::from(counts);
+        assert_eq!(from.below_confidence, 2);
+        assert_eq!(from.below_severity, 1);
+        assert_eq!(from.out_of_category, 4);
+        assert_eq!(from.over_cap, 3);
+        assert_eq!(from.identity_suppressed, 5);
+        assert_eq!(ReviewDropsOutput::from(counts), from);
+        assert_eq!(
+            ReviewDropsOutput::default(),
+            ReviewDropsOutput::from(crate::review::DropCounts::default())
+        );
+
+        let json = serde_json::to_string(&dropped_output_fixture()).unwrap();
+        let back: ReviewOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.drops,
+            dropped_output_fixture().drops,
+            "wire round-trip keeps every count"
+        );
+    }
+
+    #[test]
+    fn review_json_finding_line_carries_confidence() {
+        let text = render(OutputFormat::Json, |fmt| {
+            fmt.format_review(&review_output_fixture(Some(1)))
+        });
+        let finding: serde_json::Value =
+            serde_json::from_str(text.trim_end().lines().next().unwrap()).unwrap();
+        assert_eq!(finding["confidence"], 0.85);
+    }
+
+    #[test]
+    fn review_json_verdict_line_always_carries_drops_zeros_included() {
+        let text = render(OutputFormat::Json, |fmt| {
+            fmt.format_review(&review_output_fixture(Some(1)))
+        });
+        let verdict: serde_json::Value =
+            serde_json::from_str(text.trim_end().lines().last().unwrap()).unwrap();
+        let drops = &verdict["drops"];
+        assert!(
+            drops.is_object(),
+            "drops is an always-present object, got: {drops}"
+        );
+        for key in [
+            "below_confidence",
+            "below_severity",
+            "out_of_category",
+            "over_cap",
+            "identity_suppressed",
+        ] {
+            assert_eq!(drops[key], 0, "zero counts are serialized, not skipped");
+        }
+    }
+
+    #[test]
+    fn review_json_verdict_drops_report_nonzero_counts() {
+        let text = render(OutputFormat::Json, |fmt| {
+            fmt.format_review(&dropped_output_fixture())
+        });
+        let verdict: serde_json::Value =
+            serde_json::from_str(text.trim_end().lines().last().unwrap()).unwrap();
+        assert_eq!(verdict["drops"]["over_cap"], 3);
+        assert_eq!(verdict["drops"]["identity_suppressed"], 1);
     }
 
     #[test]
@@ -5165,6 +5286,7 @@ mod tests {
                 ..review_finding_fixture(Some(4))
             })],
             verdict: "REVIEW".into(),
+            drops: ReviewDropsOutput::default(),
             warnings: Vec::new(),
         };
         let text = render(OutputFormat::Grep, |fmt| fmt.format_review(&out));
@@ -5204,6 +5326,7 @@ mod tests {
             scope: "unstaged".into(),
             findings: vec![],
             verdict: "APPROVE".into(),
+            drops: ReviewDropsOutput::default(),
             warnings: Vec::new(),
         };
         let text = render(OutputFormat::Json, |fmt| fmt.format_review(&out));
@@ -5224,6 +5347,7 @@ mod tests {
             scope: "unstaged".into(),
             findings: vec![],
             verdict: "APPROVE".into(),
+            drops: ReviewDropsOutput::default(),
             warnings: vec!["cross-repo impact skipped: workspace resolution failed".into()],
         };
         let text = render(OutputFormat::Json, |fmt| fmt.format_review(&out));

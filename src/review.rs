@@ -254,6 +254,43 @@ pub struct DropCounts {
     pub identity_suppressed: usize,
 }
 
+impl DropCounts {
+    /// How many produced findings did not make the report, across every
+    /// reason.
+    pub fn total(&self) -> usize {
+        self.below_confidence
+            + self.below_severity
+            + self.out_of_category
+            + self.over_cap
+            + self.identity_suppressed
+    }
+
+    /// One-line human summary of the nonzero reasons, for the text output
+    /// path; `None` when nothing was dropped.
+    pub fn summary_line(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        let reasons = [
+            ("below_confidence", self.below_confidence),
+            ("below_severity", self.below_severity),
+            ("out_of_category", self.out_of_category),
+            ("over_cap", self.over_cap),
+            ("identity_suppressed", self.identity_suppressed),
+        ];
+        let listed: Vec<String> = reasons
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(name, n)| format!("{name}={n}"))
+            .collect();
+        Some(format!(
+            "review dropped {} finding(s): {}",
+            self.total(),
+            listed.join(", ")
+        ))
+    }
+}
+
 /// Rank, suppress, filter, and cap in one pure pass (PRD-REV-REQ-015).
 ///
 /// Order is fixed: ranking first (so a cap trims the least severe and
@@ -1371,6 +1408,21 @@ mod tests {
         let (kept, drops) = rank_filter_cap(findings, &HashSet::new(), &options);
         assert_eq!(kept.len(), 1, "a finding AT the floor survives");
         assert_eq!(drops.below_confidence, 0);
+    }
+
+    #[test]
+    fn drop_counts_summary_line_lists_only_nonzero_reasons() {
+        assert_eq!(DropCounts::default().summary_line(), None);
+        assert_eq!(
+            DropCounts {
+                below_confidence: 2,
+                over_cap: 1,
+                ..DropCounts::default()
+            }
+            .summary_line()
+            .as_deref(),
+            Some("review dropped 3 finding(s): below_confidence=2, over_cap=1")
+        );
     }
 
     #[test]

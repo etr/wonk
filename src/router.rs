@@ -2013,6 +2013,9 @@ fn dispatch_review<W: io::Write>(
     for warning in &result.warnings {
         output::print_hint(warning, suppress);
     }
+    if let Some(summary) = result.drops.summary_line() {
+        output::print_hint(&summary, suppress);
+    }
     if result.findings.is_empty() {
         output::print_hint("no findings for this scope", suppress);
     }
