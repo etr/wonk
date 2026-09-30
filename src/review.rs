@@ -1807,11 +1807,18 @@ mod tests {
 
     /// Every stamped identity is 64 lowercase hex characters.
     fn assert_stable_identity(f: &Finding) {
-        assert_eq!(f.identity.len(), 64, "identity must be sha256 hex: {:?}", f);
+        assert_hex_identity(&f.identity);
+    }
+
+    fn assert_hex_identity(identity: &str) {
+        assert_eq!(
+            identity.len(),
+            64,
+            "identity must be sha256 hex: {identity}"
+        );
         assert!(
-            f.identity.bytes().all(|b| b.is_ascii_hexdigit()),
-            "identity must be hex: {}",
-            f.identity
+            identity.bytes().all(|b| b.is_ascii_hexdigit()),
+            "identity must be hex: {identity}"
         );
     }
 
@@ -2133,6 +2140,259 @@ mod tests {
             "the drop is attributed to suppression alone — never also over_cap"
         );
         assert_eq!(before.drops, DropCounts::default());
+    }
+
+    // -- identity acceptance criteria (TASK-089, PRD-REV-REQ-013/AR-031) -------
+    //
+    // Multi-line functions so the anchor is the signature line and a body
+    // edit never touches it.
+
+    const AC_F_BASE: &str = "pub fn f() -> i32 {\n    1\n}\n\npub fn g() -> i32 {\n    f()\n}\n";
+
+    fn git_cmd(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed: {args:?}", args);
+    }
+
+    fn commit_and_reindex(root: &Path) {
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-m", "update"]);
+        crate::pipeline::build_index(root, true).unwrap();
+    }
+
+    fn coverage_gap_of(result: &ReviewResult) -> &Finding {
+        result
+            .findings
+            .iter()
+            .find(|f| f.kind == "coverage-gap")
+            .unwrap_or_else(|| panic!("expected a coverage-gap finding: {:?}", result.findings))
+    }
+
+    #[test]
+    fn ac1_reformatting_the_flagged_line_preserves_identity_and_suppression() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[("src/lib.rs", AC_F_BASE)]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 {\n    2\n}\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )
+        .unwrap();
+        let first = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let identity = coverage_gap_of(&first).identity.clone();
+        assert_stable_identity(coverage_gap_of(&first));
+        add_suppression(
+            &conn,
+            &identity,
+            "coverage-gap/no-test-in-blast-radius",
+            "src/lib.rs",
+            None,
+        )
+        .unwrap();
+
+        // Commit the edit, re-index, then re-indent f's block AND change its
+        // body again: the anchored line's tokens are identical modulo
+        // whitespace, so the identity — and with it the suppression — must
+        // survive (PRD-REV-REQ-013).
+        commit_and_reindex(root);
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "    pub fn f() -> i32 {\n        3\n    }\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )
+        .unwrap();
+
+        let second = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            second.findings.iter().all(|f| f.kind != "coverage-gap"),
+            "reformatted finding stays suppressed: {:?}",
+            second.findings
+        );
+        assert_eq!(second.drops.identity_suppressed, 1);
+
+        // Un-suppress: the reformatted finding returns with the SAME
+        // identity — proof the suppression matched by identity, not absence.
+        remove_suppressions(&conn, std::slice::from_ref(&identity), None).unwrap();
+        let third = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(coverage_gap_of(&third).identity, identity);
+    }
+
+    #[test]
+    fn ac2_inserting_lines_above_preserves_identity() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[("src/lib.rs", AC_F_BASE)]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 {\n    2\n}\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )
+        .unwrap();
+        let first = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let identity = coverage_gap_of(&first).identity.clone();
+
+        // Ten unrelated lines land above f: the anchored line moves down,
+        // the identity must not move with it (the line number is
+        // structurally absent from the signature).
+        commit_and_reindex(root);
+        let pads = "// pad line\n".repeat(10);
+        std::fs::write(
+            root.join("src/lib.rs"),
+            format!("{pads}pub fn f() -> i32 {{\n    3\n}}\n\npub fn g() -> i32 {{\n    f()\n}}\n"),
+        )
+        .unwrap();
+
+        let second = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let gap = coverage_gap_of(&second);
+        assert_eq!(gap.line, Some(11), "the anchor DID move: {:?}", gap.line);
+        assert_eq!(gap.identity, identity, "identity must not track the line");
+    }
+
+    #[test]
+    fn ac3_changing_the_flagged_code_changes_identity_and_unmasks() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[("src/lib.rs", AC_F_BASE)]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 {\n    2\n}\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )
+        .unwrap();
+        let first = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let identity = coverage_gap_of(&first).identity.clone();
+        add_suppression(
+            &conn,
+            &identity,
+            "coverage-gap/no-test-in-blast-radius",
+            "src/lib.rs",
+            None,
+        )
+        .unwrap();
+
+        // Change the anchored signature line itself: a genuinely different
+        // finding at the same site must NOT inherit the suppression (AR-031).
+        commit_and_reindex(root);
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f(x: i32) -> i32 {\n    x + 3\n}\n\npub fn g() -> i32 {\n    f(1)\n}\n",
+        )
+        .unwrap();
+
+        let second = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let gap = coverage_gap_of(&second);
+        assert_ne!(gap.identity, identity, "token change must re-key");
+        assert_stable_identity(gap);
+        assert_eq!(
+            second.drops.identity_suppressed, 0,
+            "the stale suppression masks nothing: {:?}",
+            second.drops
+        );
+    }
+
+    #[test]
+    fn old_side_deletion_identity_comes_from_the_removed_line_text() {
+        if !git_available() {
+            return;
+        }
+        // Two bases differing ONLY in f's signature line text; deleting f
+        // from each must yield different identities — the pre-change text
+        // feeds the hash (the line no longer exists post-change).
+        let (dir_a, conn_a) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 {\n    1\n}\n\npub fn g() -> i32 {\n    f()\n}\n",
+        )]);
+        let (dir_b, conn_b) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f(x: i32) -> i32 {\n    x\n}\n\npub fn g() -> i32 {\n    f(1)\n}\n",
+        )]);
+
+        let deleted = "pub fn g() -> i32 {\n    f()\n}\n";
+        std::fs::write(dir_a.path().join("src/lib.rs"), deleted).unwrap();
+        std::fs::write(dir_b.path().join("src/lib.rs"), deleted).unwrap();
+
+        let find = |dir: &TempDir, conn: &Connection| {
+            let result = run_review(
+                conn,
+                &ChangeScope::Unstaged,
+                dir.path(),
+                &ReviewOptions::default(),
+                None,
+            )
+            .unwrap();
+            let f = result
+                .findings
+                .iter()
+                .find(|f| f.kind == "breaking-change")
+                .unwrap_or_else(|| panic!("expected a breaking change: {:?}", result.findings));
+            assert_eq!(f.anchor_method, AnchorMethod::OldSideLine);
+            (f.identity.clone(), f.line)
+        };
+        let (id_a, line_a) = find(&dir_a, &conn_a);
+        let (id_b, line_b) = find(&dir_b, &conn_b);
+        assert_hex_identity(&id_a);
+        assert_hex_identity(&id_b);
+        assert_eq!(line_a, line_b, "same old-side line in both repos");
+        assert_ne!(
+            id_a, id_b,
+            "identities differ only through the removed-line text"
+        );
     }
 
     #[test]
