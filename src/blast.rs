@@ -461,6 +461,11 @@ pub fn append_cross_repo_tier(analysis: &mut BlastAnalysis, consumers: Vec<Cross
 /// Resolve the sibling consumers of `provider_ids` via the workspace
 /// registry (TASK-084). Query-time only; errors are the caller's to
 /// downgrade — blast's depth tiers never depend on the registry.
+///
+/// Only links whose PROVIDER side is the querying repo count: a sibling
+/// serving the same canonical id must not fold this repo's own consumers
+/// into the tier — [`BlastSeverity::CrossRepo`] means consumers in OTHER
+/// indexed repos.
 pub fn resolve_cross_repo_consumers(
     own_root: &std::path::Path,
     own_conn: &Connection,
@@ -471,10 +476,11 @@ pub fn resolve_cross_repo_consumers(
     let rows =
         crate::contracts::list_contracts(own_conn, &crate::contracts::ContractQuery::default())?;
     let resolution = crate::contracts::resolve_workspace(own_root, &rows, declared, repos_dir)?;
+    let own_name = &resolution.scope.repo_name;
     Ok(resolution
         .links
         .iter()
-        .filter(|l| provider_ids.contains(&l.provider.canonical_id))
+        .filter(|l| l.provider.repo == *own_name && provider_ids.contains(&l.provider.canonical_id))
         .map(|l| CrossRepoConsumer {
             repo: l.consumer.repo.clone(),
             canonical_id: l.consumer.canonical_id.clone(),
@@ -1306,5 +1312,92 @@ fn bar() { }
         let before = analysis.clone();
         append_cross_repo_tier(&mut analysis, Vec::new());
         assert_eq!(analysis, before);
+    }
+
+    /// Index a JS fixture repo declaring `workspace`, register it under
+    /// `repos_dir` the way `wonk init` does, and open its local index.
+    fn registered_contract_repo(
+        repos_dir: &Path,
+        name: &str,
+        workspace: &str,
+        files: &[(&str, &str)],
+    ) -> (TempDir, std::path::PathBuf, Connection) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join(name);
+        fs::create_dir_all(root.join(".git")).unwrap();
+        for (path, content) in files {
+            if let Some(parent) = Path::new(path).parent() {
+                fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            fs::write(root.join(path), content).unwrap();
+        }
+        fs::create_dir_all(root.join(".wonk")).unwrap();
+        fs::write(
+            root.join(".wonk/config.toml"),
+            format!("[contracts]\nworkspace = \"{workspace}\"\n"),
+        )
+        .unwrap();
+        pipeline::build_index(&root, true).unwrap();
+        let dest = repos_dir.join(db::repo_hash(&root));
+        fs::create_dir_all(&dest).unwrap();
+        fs::copy(root.join(".wonk/index.db"), dest.join("index.db")).unwrap();
+        fs::copy(root.join(".wonk/meta.json"), dest.join("meta.json")).unwrap();
+        let conn = db::open_existing(&root.join(".wonk/index.db")).unwrap();
+        (dir, root, conn)
+    }
+
+    #[test]
+    fn cross_repo_tier_excludes_own_repo_consumers() {
+        // Gateway fixture: the repo both registers GET /v1/users and calls
+        // it, while a sibling serves the same id. The own consumer must not
+        // appear in the tier — CROSS-REPO IMPACT lists consumers in OTHER
+        // repos — while the sibling's consumer of the own-provided route
+        // must.
+        let repos_dir = TempDir::new().unwrap();
+        let (_own_dir, own_root, own_conn) = registered_contract_repo(
+            repos_dir.path(),
+            "gateway",
+            "payments",
+            &[
+                (
+                    "src/routes.js",
+                    "const app = express();\nfunction registerUserRoutes() {\n  app.get('/v1/users', getUser);\n}\n",
+                ),
+                (
+                    "src/client.js",
+                    "async function loadUsers() {\n  await fetch('https://api.io/v1/users');\n}\n",
+                ),
+            ],
+        );
+        let (_sib_dir, _sib_root, _sib_conn) = registered_contract_repo(
+            repos_dir.path(),
+            "users-svc",
+            "payments",
+            &[
+                (
+                    "src/app.js",
+                    "const app = express();\napp.get('/v1/users', h);\n",
+                ),
+                (
+                    "src/client.js",
+                    "async function proxyUsers() {\n  await fetch('https://api.io/v1/users');\n}\n",
+                ),
+            ],
+        );
+
+        let provider_ids = provider_contract_ids(&own_conn, "registerUserRoutes").unwrap();
+        assert_eq!(provider_ids, vec!["http::GET::/v1/users".to_string()]);
+        let consumers = resolve_cross_repo_consumers(
+            &own_root,
+            &own_conn,
+            &["payments".to_string()],
+            repos_dir.path(),
+            &provider_ids,
+        )
+        .unwrap();
+
+        assert_eq!(consumers.len(), 1, "got {consumers:?}");
+        assert_eq!(consumers[0].repo, "users-svc");
+        assert_eq!(consumers[0].file, "src/client.js");
     }
 }

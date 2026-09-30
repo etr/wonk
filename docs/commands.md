@@ -262,6 +262,15 @@ Analyze the blast radius of a symbol change. Shows all affected symbols grouped
 by severity tier (WILL BREAK, LIKELY AFFECTED, MAY NEED TESTING) with a risk
 level assessment. Integrates inheritance edges (extends/implements).
 
+When the target symbol owns a provider contract (a route it registers, a
+queue it subscribes, a proto method it implements) that consumers in other
+indexed repos of the same `[contracts] workspace` call, a fourth tier —
+CROSS-REPO IMPACT — is appended below every depth tier. Each entry folds the
+consuming repo into the file field as `<repo>:<path>` (e.g.
+`web-client:src/client.js`), so existing output shapes stay unchanged.
+Resolution reads the central registry (`~/.wonk/repos`) at query time;
+registry problems degrade to a hint and never affect the depth tiers.
+
 ```
 wonk blast "processPayment"
 wonk blast --direction downstream "validateInput"
@@ -329,6 +338,65 @@ wonk impact --since HEAD~5
 |------|-------------|
 | `--since <commit>` | Analyze all files changed since this commit |
 
+## Service contracts
+
+### `wonk contracts`
+
+List the service contracts indexed for this repository — HTTP routes,
+environment variables, queues, gRPC methods, and the code that consumes
+them — with workspace-aware status on consumer rows. By default every row
+prints in the grep-compatible shape; unmatched consumers additionally carry
+a `status=` token: `orphan` when this repo declares a workspace but nothing
+in it serves the call, `unscoped` when no workspace is declared at all (a
+configuration gap, never a defect). Providers and matched consumers carry
+no token.
+
+```
+wonk contracts
+wonk contracts --kind http --role provider
+wonk contracts --orphans
+wonk contracts --links
+wonk contracts --unused-providers
+```
+
+Sample rows:
+
+```
+src/routes.js:2:http::GET::/v1/users role=provider confidence=1.0
+src/client.js:2:http::GET::/v1/orders role=consumer confidence=1.0 status=orphan
+```
+
+| Flag | Description |
+|------|-------------|
+| `--kind <kind>` | Filter by contract kind: `http`, `env`, `queue`, `websocket`, `job`, `grpc`, `graphql`, `openapi` |
+| `--role <role>` | Filter by role: `provider` or `consumer` |
+| `--orphans` | Only list consumers with no provider within this repo's workspace (replaces the default row list) |
+| `--links` | List resolved cross-repo provider<->consumer pairs annotated with both repo names (takes precedence over `--orphans`/`--unused-providers`) |
+| `--unused-providers` | List providers with no consumer in this repo's workspace (replaces the default row list; off by default to avoid public-API noise) |
+
+`--links` rows render both endpoints with their owning repo:
+
+```
+users-svc:src/app.js:2:http::GET::/v1/users role=provider <-> own-api:src/client.js:2 role=consumer basis=exact
+```
+
+Cross-repo rows resolve live at query time (nothing is persisted) against
+same-workspace repos in the central registry (`~/.wonk/repos`): a sibling
+repo participates only when the `[contracts] workspace` declared in its
+`.wonk/config.toml` intersects this repo's. See
+[configuration](configuration.md) for the `[contracts]` section.
+
+Every run also prints workspace context hints on stderr (suppressed by the
+global `--quiet` flag): the effective workspace set with co-members, the
+exact config line to add when the workspace is undeclared —
+
+```
+workspace: my-api (undeclared — add 'workspace = "my-api"' under [contracts] in .wonk/config.toml to link sibling repos)
+```
+
+— and a `run wonk update` nudge when the workspace stored in the index no
+longer matches the declared set.
+
 ## Semantic
 
 ### `wonk cluster <path>`
@@ -381,7 +449,7 @@ wonk update --force --provider ollama
 ### `wonk status`
 
 Show indexing status for the current repository, including the active
-embedding provider and the stored vector space.
+embedding provider, the stored vector space, and workspace membership.
 
 ```
 wonk status
@@ -391,10 +459,17 @@ Sample output:
 
 ```
 Index: 42 files, 300 symbols, 1200 references
+Workspaces: payments (co-members: users-svc, web-client)
 Embeddings: 280 embeddings (3 stale)
 Provider: bundled
 Stored vectors: bundled, 256-dim
 ```
+
+The `Workspaces:` line reports the effective workspace set — the
+`[contracts] workspace` ids declared in repo-local `.wonk/config.toml`, or
+the repository's own name when nothing is declared (shown as
+`(undeclared)`). Sibling indexed repos sharing a workspace list as
+co-members; a repo with a mistyped workspace shows as a singleton.
 
 When Ollama is configured (or ollama vectors are stored), an `Ollama:` line
 reports reachability and, when unreachable with Ollama configured, notes that
@@ -403,8 +478,11 @@ means the index has no embeddings yet.
 
 With `--format json` (or the MCP `wonk_status` tool) the same data is
 serialized, including `active_provider`, `stored_vector_provider`,
-`stored_vector_dim`, and `ollama_reachable` (`null` when Ollama was not
-probed).
+`stored_vector_dim`, `ollama_reachable` (`null` when Ollama was not
+probed), and the workspace fields: `workspaces` (effective set),
+`workspace_declared` (whether `[contracts] workspace` is set in repo-local
+config), and `workspace_comembers` (names of other indexed repos sharing a
+workspace).
 
 ### `wonk repos <list|clean>`
 

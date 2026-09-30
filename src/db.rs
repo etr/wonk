@@ -3,6 +3,7 @@
 //! Provides connection management, schema creation (including FTS5 content-sync),
 //! repo root discovery, and index path computation.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -614,6 +615,77 @@ pub fn read_meta(index_db_path: &Path) -> Result<Meta> {
         .with_context(|| format!("reading {}", meta_path.display()))?;
     let meta: Meta = serde_json::from_str(&data).context("parsing meta.json")?;
     Ok(meta)
+}
+
+// ---------------------------------------------------------------------------
+// Central registry (~/.wonk/repos)
+// ---------------------------------------------------------------------------
+
+/// Enumerate the central registry under `repos_dir`: every entry directory
+/// holding an `index.db` with a readable `meta.json` whose claimed root
+/// still carries a `.git`/`.wonk` marker. Entries failing any step are
+/// skipped; the index itself is never opened (DR-030 — callers open
+/// lazily). Each survivor yields `(repo_path, index_path, meta)`.
+pub fn registry_entries(repos_dir: &Path) -> Vec<(PathBuf, PathBuf, Meta)> {
+    let mut entries = Vec::new();
+
+    let Ok(read_dir) = fs::read_dir(repos_dir) else {
+        return entries;
+    };
+    for dir_entry in read_dir.flatten() {
+        let index_dir = dir_entry.path();
+        if !index_dir.is_dir() {
+            continue;
+        }
+        let index_path = index_dir.join("index.db");
+        if !index_path.exists() {
+            continue;
+        }
+        let Ok(meta) = read_meta(&index_path) else {
+            continue;
+        };
+        let repo_path = PathBuf::from(&meta.repo_path);
+        if !repo_path.join(".git").exists() && !repo_path.join(".wonk").exists() {
+            continue;
+        }
+        entries.push((repo_path, index_path, meta));
+    }
+
+    entries
+}
+
+/// Lazily-opened index connections cached by index path — the DR-030
+/// lazy-open pattern shared by the MCP registry and the workspace
+/// resolver: an index opens on first use and is reused thereafter;
+/// indexes never asked for are never opened.
+#[derive(Default)]
+pub struct ConnectionCache {
+    open: HashMap<PathBuf, Connection>,
+}
+
+impl ConnectionCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get or lazily open the connection for `index_path`.
+    pub fn get_or_open(&mut self, index_path: &Path) -> Result<&Connection> {
+        if !self.open.contains_key(index_path) {
+            let conn = open_existing(index_path)?;
+            self.open.insert(index_path.to_path_buf(), conn);
+        }
+        Ok(self.open.get(index_path).expect("just inserted"))
+    }
+
+    /// Number of currently open connections (cache introspection).
+    pub fn len(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Whether no connection has been opened yet (cache introspection).
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------

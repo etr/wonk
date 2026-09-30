@@ -6310,14 +6310,13 @@ pub struct SiblingRepo {
     pub workspaces: Vec<String>,
 }
 
-/// Scan `repos_dir/<hash>/` for same-workspace repos, skipping `own_root`.
+/// Scan `repos_dir` for same-workspace repos, skipping `own_root`.
 ///
 /// Discovery reads only each entry's `meta.json` — a sibling's working-tree
-/// config is never opened (PRD-CTR-REQ-014/020). Entries without an
-/// `index.db`, with unreadable metadata, or whose claimed root lacks a
-/// `.git`/`.wonk` marker are skipped; survivors keep a non-empty normalized
-/// workspace intersection with `own_effective`. Deterministic (sorted by
-/// name). Never opens any `index.db`.
+/// config is never opened (PRD-CTR-REQ-014/020). The shared walk and
+/// validation live in [`crate::db::registry_entries`]; this layers the
+/// own-repo skip and the workspace intersection on top, then sorts by name
+/// (deterministic). Never opens any `index.db`.
 pub fn scan_registry(
     repos_dir: &std::path::Path,
     own_root: &std::path::Path,
@@ -6325,25 +6324,7 @@ pub fn scan_registry(
 ) -> Vec<SiblingRepo> {
     let mut members = Vec::new();
 
-    let Ok(read_dir) = std::fs::read_dir(repos_dir) else {
-        return members;
-    };
-    for dir_entry in read_dir.flatten() {
-        let index_dir = dir_entry.path();
-        if !index_dir.is_dir() {
-            continue;
-        }
-        let index_path = index_dir.join("index.db");
-        if !index_path.exists() {
-            continue;
-        }
-        let Ok(meta) = crate::db::read_meta(&index_path) else {
-            continue;
-        };
-        let repo_path = std::path::PathBuf::from(&meta.repo_path);
-        if !repo_path.join(".git").exists() && !repo_path.join(".wonk").exists() {
-            continue;
-        }
+    for (repo_path, index_path, meta) in crate::db::registry_entries(repos_dir) {
         if same_repo(&repo_path, own_root) {
             continue;
         }
@@ -6373,29 +6354,26 @@ fn same_repo(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// Lazy connections over the scanned member set (DR-030): an index is
 /// opened with `db::open_existing` on first use and cached — non-members
 /// are never opened at all, and members cost one open per resolution.
+/// The cache itself is the shared [`crate::db::ConnectionCache`].
 pub struct SiblingConnections {
-    open: std::collections::HashMap<std::path::PathBuf, rusqlite::Connection>,
+    open: crate::db::ConnectionCache,
 }
 
 impl SiblingConnections {
     fn new() -> Self {
         Self {
-            open: std::collections::HashMap::new(),
+            open: crate::db::ConnectionCache::new(),
         }
     }
 
     /// Get or lazily open the sibling's index connection.
     fn connection(&mut self, sibling: &SiblingRepo) -> anyhow::Result<&rusqlite::Connection> {
-        if !self.open.contains_key(&sibling.index_path) {
-            let conn = crate::db::open_existing(&sibling.index_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to open sibling index {}: {e}",
-                    sibling.index_path.display()
-                )
-            })?;
-            self.open.insert(sibling.index_path.clone(), conn);
-        }
-        Ok(self.open.get(&sibling.index_path).expect("just inserted"))
+        self.open.get_or_open(&sibling.index_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open sibling index {}: {e}",
+                sibling.index_path.display()
+            )
+        })
     }
 }
 
@@ -6665,14 +6643,12 @@ pub fn resolve_workspace(
             });
         }
         let mut member_cands: Vec<Vec<ContractCandidate>> = Vec::new();
-        for sibling in &siblings {
+        // `members` is built positionally from `siblings` above, so the zip
+        // pairs each sibling with its own rows by construction.
+        for (sibling, member) in siblings.iter().zip(&members) {
             if !sibling.workspaces.contains(w) {
                 continue;
             }
-            let member = members
-                .iter()
-                .find(|m| m.name == sibling.name)
-                .expect("member built per sibling");
             let mut cands = Vec::new();
             for row in member.grpc_rows().iter() {
                 if let Some(c) = row_to_candidate(row) {
@@ -6696,11 +6672,18 @@ pub fn resolve_workspace(
             // for w holding a row with that (id, role).
             let provider_rows = sides_to_rows(&own, &members, &join.provider);
             let consumer_rows = sides_to_rows(&own, &members, &join.consumer);
-            for (_, p) in &provider_rows {
-                consumed_provider_keys.insert(row_key(p));
+            // These sets key OWN rows only (they are consulted solely for
+            // own-row status): a member row sharing a key with an own row
+            // must never satisfy — or shadow — the own row's status.
+            for (repo, p) in &provider_rows {
+                if repo == &own.name {
+                    consumed_provider_keys.insert(row_key(p));
+                }
             }
-            for (_, c) in &consumer_rows {
-                linked_consumer_keys.insert(row_key(c));
+            for (repo, c) in &consumer_rows {
+                if repo == &own.name {
+                    linked_consumer_keys.insert(row_key(c));
+                }
             }
             for (p_repo, p_row) in &provider_rows {
                 for (c_repo, c_row) in &consumer_rows {
@@ -11988,6 +11971,80 @@ paths:
                 .copied(),
             Some(ConsumerStatus::Linked),
             "a relaxed match still satisfies the consumer"
+        );
+    }
+
+    #[test]
+    fn rpc_pass_collision_identical_grpc_rows_two_repos() {
+        // Two repos hold IDENTICAL (grpc id, file, line) provider rows —
+        // the same proto copied into two services of one workspace — and
+        // the sibling additionally holds the folded client call. The join
+        // side expansion covers both repos' rows, so this pins that the
+        // own-status sets key only own rows: the sibling's member row can
+        // never satisfy an own row, and the own provider's consumed status
+        // comes from its OWN row joining the sibling's consumer.
+        let repos_dir = tempfile::tempdir().unwrap();
+        let (_own_dir, own_root, own_conn) = own_indexed_repo_files(
+            repos_dir.path(),
+            "own-api",
+            &["payments"],
+            &[("proto/user.proto", GRPC_PROTO_PROVIDER)],
+        );
+        let (_sib_dir, _sib_root) = registry_repo_files(
+            repos_dir.path(),
+            "proto-svc",
+            &["payments"],
+            &[
+                ("proto/user.proto", GRPC_PROTO_PROVIDER),
+                ("src/client.js", GRPC_JS_CONSUMER),
+            ],
+        );
+
+        let r = resolve_around(
+            &own_root,
+            &own_conn,
+            &["payments".to_string()],
+            repos_dir.path(),
+        );
+        // Own's identical copy genuinely joins the sibling's folded
+        // consumer: exactly one link, own as the serving side.
+        assert_eq!(r.links.len(), 1, "got {:?}", r.links);
+        assert_eq!(r.links[0].provider.repo, "own-api");
+        assert_eq!(r.links[0].consumer.repo, "proto-svc");
+        assert_eq!(r.links[0].provider.file, "proto/user.proto");
+        // The consumed status is owned by own's row, not the sibling's
+        // identical-key member row.
+        assert!(
+            r.unused_providers.is_empty(),
+            "the joined provider is consumed: {:?}",
+            r.unused_providers
+        );
+
+        // Control: with the sibling absent (fresh registry), the same own
+        // row has no consumer anywhere and must report as unused — the
+        // collision case above must not blur this boundary.
+        let repos2 = tempfile::tempdir().unwrap();
+        let (_own2_dir, own2_root, own2_conn) = own_indexed_repo_files(
+            repos2.path(),
+            "own-api",
+            &["payments"],
+            &[("proto/user.proto", GRPC_PROTO_PROVIDER)],
+        );
+        let r2 = resolve_around(
+            &own2_root,
+            &own2_conn,
+            &["payments".to_string()],
+            repos2.path(),
+        );
+        assert_eq!(
+            r2.unused_providers.len(),
+            1,
+            "got {:?}",
+            r2.unused_providers
+        );
+        assert_eq!(
+            r2.unused_providers[0].canonical_id,
+            "grpc::UserService::GetUser"
         );
     }
 

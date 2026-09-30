@@ -6,7 +6,6 @@
 //!
 //! Transport: NDJSON over stdin/stdout. No async runtime required.
 
-use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -1188,7 +1187,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
                     },
                     "budget": {
                         "type": "integer",
-                        "description": "Max results to return (default 200)"
+                        "description": "Limit output to approximately N tokens, applied to contracts first and then links"
                     }
                 }
             }),
@@ -1250,8 +1249,8 @@ struct RepoEntry {
 /// Registry of all discovered indexed repositories.
 struct RepoRegistry {
     entries: Vec<RepoEntry>,
-    /// Lazy-opened connections keyed by index_path string.
-    connections: HashMap<String, Connection>,
+    /// Lazy-opened connections keyed by index path (shared DR-030 cache).
+    connections: db::ConnectionCache,
 }
 
 /// Result of resolving a repo reference.
@@ -1265,7 +1264,7 @@ impl RepoRegistry {
     fn new(entries: Vec<RepoEntry>) -> Self {
         Self {
             entries,
-            connections: HashMap::new(),
+            connections: db::ConnectionCache::new(),
         }
     }
 
@@ -1312,57 +1311,33 @@ impl RepoRegistry {
 
     /// Get or lazily open a connection for the given index path.
     fn get_or_open_connection(&mut self, index_path: &Path) -> Result<&Connection, String> {
-        let key = index_path.to_string_lossy().into_owned();
-        if !self.connections.contains_key(&key) {
-            let conn = db::open_existing(index_path)
-                .map_err(|e| format!("failed to open index at {}: {e}", index_path.display()))?;
-            self.connections.insert(key.clone(), conn);
-        }
-        Ok(self.connections.get(&key).expect("just inserted"))
+        self.connections
+            .get_or_open(index_path)
+            .map_err(|e| format!("failed to open index at {}: {e}", index_path.display()))
     }
 }
 
 /// Discover all indexed repositories under a repos directory.
 ///
-/// Scans `repos_dir/*/index.db`, reads the adjacent `meta.json` for metadata,
-/// and validates that the claimed repo path contains a `.git` or `.wonk` marker.
+/// The shared walk and validation live in [`db::registry_entries`]; this
+/// layers the registry-name derivation on top.
 fn discover_repos(repos_dir: &Path) -> Vec<RepoEntry> {
-    let mut entries = Vec::new();
-
-    if repos_dir.is_dir()
-        && let Ok(read_dir) = std::fs::read_dir(repos_dir)
-    {
-        for dir_entry in read_dir.flatten() {
-            let index_dir = dir_entry.path();
-            if !index_dir.is_dir() {
-                continue;
+    db::registry_entries(repos_dir)
+        .into_iter()
+        .map(|(repo_path, index_path, meta)| {
+            let name = repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string());
+            RepoEntry {
+                repo_path,
+                index_path,
+                name,
+                languages: meta.languages,
+                created: meta.created,
             }
-            let index_path = index_dir.join("index.db");
-            if !index_path.exists() {
-                continue;
-            }
-            if let Ok(meta) = db::read_meta(&index_path) {
-                let repo_path = PathBuf::from(&meta.repo_path);
-                // Validate the claimed repo path has a git or wonk marker.
-                if !repo_path.join(".git").exists() && !repo_path.join(".wonk").exists() {
-                    continue;
-                }
-                let name = repo_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "unknown".to_string());
-                entries.push(RepoEntry {
-                    repo_path,
-                    index_path,
-                    name,
-                    languages: meta.languages,
-                    created: meta.created,
-                });
-            }
-        }
-    }
-
-    entries
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2712,11 +2687,38 @@ impl McpServer {
             "comembers": payload.workspace.comembers,
             "stored_diverges": payload.workspace.stored_diverges,
         });
-        let result = serde_json::json!({
-            "workspace": workspace,
-            "contracts": contracts,
-            "links": link_rows,
-        });
+        // Budget: the same token-budget convention the callgraph tools
+        // use, applied in-place to the contracts and links arrays
+        // (contracts first). No budget leaves both arrays unbounded.
+        let budget_limit: Option<usize> = args
+            .get("budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let result = match budget_limit {
+            None => serde_json::json!({
+                "workspace": workspace,
+                "contracts": contracts,
+                "links": link_rows,
+            }),
+            Some(limit) => {
+                let mut budget = TokenBudget::new(limit);
+                let mut truncated = 0usize;
+                let kept_contracts = keep_within_budget(&mut budget, contracts, &mut truncated);
+                let kept_links = keep_within_budget(&mut budget, link_rows, &mut truncated);
+                let mut result = serde_json::json!({
+                    "workspace": workspace,
+                    "contracts": kept_contracts,
+                    "links": kept_links,
+                });
+                if truncated > 0 {
+                    result["truncated"] = serde_json::json!(truncated);
+                    result["hint"] = serde_json::json!(format!(
+                        "Budget {limit} reached; {truncated} entries truncated. Raise budget to see more."
+                    ));
+                }
+                result
+            }
+        };
         format_result(&result, extract_format(&args))
     }
 
@@ -3445,6 +3447,28 @@ impl McpServer {
 // Budget collection helper
 // ---------------------------------------------------------------------------
 
+/// Keep the outputs that fit within `budget`, counting the dropped ones in
+/// `truncated` — the inner half of [`collect_with_budget_and_page`], usable
+/// on arrays inside a structured result (e.g. `tool_contracts`).
+fn keep_within_budget<T: serde::Serialize>(
+    budget: &mut TokenBudget,
+    outputs: Vec<T>,
+    truncated: &mut usize,
+) -> Vec<T> {
+    outputs
+        .into_iter()
+        .filter(|out| {
+            let serialized = serde_json::to_string(out).unwrap_or_default();
+            if budget.try_consume(&serialized) {
+                true
+            } else {
+                *truncated += 1;
+                false
+            }
+        })
+        .collect()
+}
+
 /// Collect serializable outputs, applying optional token budget and pagination,
 /// and format the final `CallToolResult`. Shared by tool_callers, tool_callees, etc.
 fn collect_with_budget<T: serde::Serialize>(
@@ -3728,6 +3752,46 @@ mod tests {
         });
         let result = server.handle_tools_call(&params);
         assert!(result["isError"].as_bool().unwrap_or(false), "{result}");
+    }
+
+    #[test]
+    fn tool_contracts_honors_budget() {
+        let (_dir, mut server) = contracts_server();
+        // A tiny budget cannot hold either row: the arrays are truncated
+        // and the truncation is reported instead of silently dropping rows.
+        let params = serde_json::json!({
+            "name": "wonk_contracts",
+            "arguments": {"repo": "own-api", "budget": 25}
+        });
+        let result = server.handle_tools_call(&params);
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed["contracts"].as_array().unwrap().is_empty(),
+            "budget 25 fits no row: {}",
+            parsed["contracts"]
+        );
+        assert_eq!(
+            parsed["truncated"].as_u64().unwrap_or(0),
+            2,
+            "both dropped rows are counted: {parsed}"
+        );
+
+        // A generous budget keeps every row and adds no truncation note.
+        let params = serde_json::json!({
+            "name": "wonk_contracts",
+            "arguments": {"repo": "own-api", "budget": 10000}
+        });
+        let result = server.handle_tools_call(&params);
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["contracts"].as_array().unwrap().len(), 2, "{parsed}");
+        assert!(
+            parsed.get("truncated").is_none(),
+            "nothing dropped, no note: {parsed}"
+        );
     }
 
     #[test]
