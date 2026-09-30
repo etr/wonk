@@ -524,6 +524,27 @@ impl fmt::Display for ContractKind {
     }
 }
 
+impl FromStr for ContractKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "http" => Ok(ContractKind::Http),
+            "env" => Ok(ContractKind::Env),
+            "queue" => Ok(ContractKind::Queue),
+            "websocket" => Ok(ContractKind::WebSocket),
+            "job" => Ok(ContractKind::Job),
+            "grpc" => Ok(ContractKind::Grpc),
+            "graphql" => Ok(ContractKind::Graphql),
+            "openapi" => Ok(ContractKind::Openapi),
+            other => Err(format!(
+                "unknown contract kind: {other} (expected one of: http, env, queue, websocket, \
+                 job, grpc, graphql, openapi)"
+            )),
+        }
+    }
+}
+
 /// The role a detection site plays relative to the contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContractRole {
@@ -549,6 +570,20 @@ impl fmt::Display for ContractRole {
     }
 }
 
+impl FromStr for ContractRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "provider" => Ok(ContractRole::Provider),
+            "consumer" => Ok(ContractRole::Consumer),
+            other => Err(format!(
+                "unknown contract role: {other} (expected provider or consumer)"
+            )),
+        }
+    }
+}
+
 /// One positional path parameter retained as contract metadata (PRD-CTR-REQ-022).
 ///
 /// `position` is 1-based and matches the `{p1}`, `{p2}` markers in the
@@ -561,9 +596,10 @@ pub struct PathParam {
     pub name: String,
 }
 
-/// A detected contract candidate (not yet persisted — TASK-083 adds storage).
+/// A detected contract candidate.
 ///
-/// Extracted from the same tree the symbol indexer walks (PRD-CTR-REQ-011).
+/// Extracted from the same tree the symbol indexer walks (PRD-CTR-REQ-011)
+/// and persisted by the indexing pipeline into the `contracts` table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContractCandidate {
     /// Contract kind (`http`, `env`, `queue`, `websocket`, `job`).
@@ -910,6 +946,55 @@ mod tests {
         assert_eq!(ContractKind::Grpc.as_str(), "grpc");
         assert_eq!(ContractKind::Graphql.as_str(), "graphql");
         assert_eq!(ContractKind::Openapi.as_str(), "openapi");
+    }
+
+    #[test]
+    fn contract_kind_from_str_valid() {
+        assert_eq!("http".parse::<ContractKind>().unwrap(), ContractKind::Http);
+        assert_eq!("env".parse::<ContractKind>().unwrap(), ContractKind::Env);
+        assert_eq!(
+            "queue".parse::<ContractKind>().unwrap(),
+            ContractKind::Queue
+        );
+        assert_eq!(
+            "websocket".parse::<ContractKind>().unwrap(),
+            ContractKind::WebSocket
+        );
+        assert_eq!("job".parse::<ContractKind>().unwrap(), ContractKind::Job);
+        assert_eq!("grpc".parse::<ContractKind>().unwrap(), ContractKind::Grpc);
+        assert_eq!(
+            "graphql".parse::<ContractKind>().unwrap(),
+            ContractKind::Graphql
+        );
+        assert_eq!(
+            "openapi".parse::<ContractKind>().unwrap(),
+            ContractKind::Openapi
+        );
+    }
+
+    #[test]
+    fn contract_kind_from_str_error_lists_valid_values() {
+        let err = "rest".parse::<ContractKind>().unwrap_err();
+        assert_eq!(
+            err,
+            "unknown contract kind: rest (expected one of: http, env, queue, websocket, job, grpc, graphql, openapi)"
+        );
+    }
+
+    #[test]
+    fn contract_role_from_str_valid_and_error() {
+        assert_eq!(
+            "provider".parse::<ContractRole>().unwrap(),
+            ContractRole::Provider
+        );
+        assert_eq!(
+            "consumer".parse::<ContractRole>().unwrap(),
+            ContractRole::Consumer
+        );
+        assert_eq!(
+            "server".parse::<ContractRole>().unwrap_err(),
+            "unknown contract role: server (expected provider or consumer)"
+        );
     }
 
     #[test]

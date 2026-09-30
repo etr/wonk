@@ -9,7 +9,13 @@ fn main() {
     match wonk::router::dispatch(cli) {
         Ok(()) => process::exit(wonk::errors::EXIT_SUCCESS),
         Err(err) => {
-            let wonk_err: wonk::errors::WonkError = err.into();
+            // A WonkError propagated through anyhow (e.g. a Usage error from
+            // a filter parse) must keep its specific exit code; the generic
+            // anyhow -> WonkError conversion would flatten it to Other (1).
+            let wonk_err = match err.downcast::<wonk::errors::WonkError>() {
+                Ok(specific) => specific,
+                Err(err) => err.into(),
+            };
             let code = wonk::output::format_error(&wonk_err, suppress);
             process::exit(code);
         }

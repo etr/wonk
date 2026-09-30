@@ -45,7 +45,7 @@ pub struct IndexStats {
     pub caller_count: usize,
     /// Number of type hierarchy edges (extends/implements) stored.
     pub type_edge_count: usize,
-    /// Contract candidates extracted (TASK-082; persisted in TASK-083).
+    /// Contract rows persisted in the `contracts` table (TASK-083).
     pub contract_count: usize,
     /// Wall-clock elapsed time.
     pub elapsed: std::time::Duration,
@@ -284,6 +284,11 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
             row.get::<_, i64>(0)
         })
         .unwrap_or(0) as usize;
+    let contract_count = conn
+        .query_row("SELECT COUNT(*) FROM contracts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize;
 
     Ok(IndexStats {
         file_count,
@@ -291,9 +296,7 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
         ref_count,
         caller_count,
         type_edge_count,
-        // Contracts are not persisted yet, so incremental runs report zero
-        // until TASK-083 lands storage and aggregates here.
-        contract_count: 0,
+        contract_count,
         elapsed: start.elapsed(),
     })
 }
@@ -546,6 +549,12 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
         rusqlite::params![rel_path],
     )?;
+    // Contracts carry a NULL symbol_id for file-level rows, so the symbol
+    // cascade alone would orphan them — delete by file explicitly.
+    tx.execute(
+        "DELETE FROM contracts WHERE file = ?1",
+        rusqlite::params![rel_path],
+    )?;
     tx.execute(
         "DELETE FROM symbols WHERE file = ?1",
         rusqlite::params![rel_path],
@@ -605,6 +614,12 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     // for clarity and to mirror the pattern used for references and imports.
     tx.execute(
         "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
+        rusqlite::params![result.rel_path],
+    )?;
+    // Contracts are cleared and rewritten per file on re-index; the symbol
+    // cascade misses NULL-symbol_id rows (documents, top-level sites).
+    tx.execute(
+        "DELETE FROM contracts WHERE file = ?1",
         rusqlite::params![result.rel_path],
     )?;
     tx.execute(
@@ -749,6 +764,10 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         }
     }
 
+    // Rewrite the file's contract rows (cleared above), resolving owning
+    // symbols against the same name map the reference inserts used.
+    insert_contracts(&tx, &result.rel_path, &result.contracts, Some(&caller_map))?;
+
     // Incrementally repair the reach rows this edit touched (the same
     // traversal the full build runs, over the affected source set). On
     // failure, degrade: mark the table stale in this same transaction and
@@ -870,8 +889,8 @@ fn parse_document_file(
 ///
 /// `None` when the document yields no contracts (disabled kind, failed
 /// OpenAPI sniff) — the caller leaves the file un-indexed. The row (language
-/// set to the document kind, zero symbols) is TASK-083's hash/re-index
-/// anchor for document files.
+/// set to the document kind, zero symbols) is the hash/re-index anchor for
+/// document files: their contract rows are stored with a NULL symbol_id.
 fn document_file_result(
     kind: crate::contracts::DocumentKind,
     rel_path: String,
@@ -1096,6 +1115,14 @@ fn batch_insert(
         }
     }
 
+    // Insert contracts after symbols (FK on symbol_id is satisfied) and
+    // before the reach build, in the same transaction.
+    let mut contract_count = 0usize;
+    for r in results {
+        let file_map = file_caller_maps.get(r.rel_path.as_str());
+        contract_count += insert_contracts(&tx, &r.rel_path, &r.contracts, file_map)?;
+    }
+
     // Build the reach table in the same transaction as the symbols and
     // references it derives from, so readers never observe a partially
     // published reach set (PRD-REACH-REQ-008, AR-028).
@@ -1104,9 +1131,6 @@ fn batch_insert(
     }
 
     tx.commit().context("committing transaction")?;
-    // Contracts are carried on FileResult; summing here keeps the field read
-    // until TASK-083 persists them.
-    let contract_count: usize = results.iter().map(|r| r.contracts.len()).sum();
 
     Ok((
         total_syms,
@@ -1574,11 +1598,50 @@ fn insert_term_stats(tx: &rusqlite::Transaction, rows: &[(&str, &str, i64)]) -> 
     Ok(())
 }
 
+/// Insert contract rows in the caller's transaction.
+///
+/// `symbol_id` resolves at write time against the SAME per-file name→id
+/// map the reference path builds (last-wins semantics), so a contract and
+/// the references in its owning function can never disagree about which
+/// symbol owns a name. Document files (empty symbols) and unmatched or
+/// missing owning symbols store NULL — the row keeps its file/line anchors.
+/// Returns the number of rows inserted; UNIQUE(canonical_id, role, file,
+/// line) collisions are ignored, mirroring type_edges.
+fn insert_contracts(
+    tx: &rusqlite::Transaction,
+    rel_path: &str,
+    contracts: &[ContractCandidate],
+    name_map: Option<&HashMap<&str, i64>>,
+) -> Result<usize> {
+    let mut inserted = 0usize;
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO contracts (canonical_id, kind, role, symbol_id, file, line, confidence) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for c in contracts {
+        let symbol_id = c
+            .owning_symbol
+            .as_deref()
+            .and_then(|name| name_map?.get(name).copied());
+        inserted += stmt.execute(rusqlite::params![
+            c.canonical_id,
+            c.kind.as_str(),
+            c.role.as_str(),
+            symbol_id,
+            rel_path,
+            c.line as i64,
+            c.confidence,
+        ])?;
+    }
+    Ok(inserted)
+}
+
 /// Drop all data from the main tables (used before rebuild).
 fn drop_all_data(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM embeddings;
          DELETE FROM type_edges;
+         DELETE FROM contracts;
          DELETE FROM symbols;
          DELETE FROM \"references\";
          DELETE FROM file_imports;
@@ -1752,6 +1815,104 @@ class Component {
         assert_eq!(stats.contract_count, 0, "got {stats:?}");
     }
 
+    #[test]
+    fn build_index_persists_contracts() {
+        let dir = make_contract_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+        assert_eq!(stats.contract_count, 3, "got {stats:?}");
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM contracts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "every detected candidate must be stored");
+
+        let (kind, role, file, line, confidence): (String, String, String, i64, f64) = conn
+            .query_row(
+                "SELECT kind, role, file, line, confidence FROM contracts \
+                 WHERE canonical_id = 'env::::DATABASE_URL'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("env consumer row must exist");
+        assert_eq!(kind, "env");
+        assert_eq!(role, "consumer");
+        assert_eq!(file, "src/app.js");
+        assert_eq!(line, 4);
+        assert_eq!(confidence, 1.0);
+    }
+
+    #[test]
+    fn build_index_resolves_symbol_id() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        // A route registered inside a named function, a fetch consumer
+        // inside another function, and a top-level registration.
+        fs::write(
+            root.join("src/routes.js"),
+            "const app = express();\n\nfunction registerRoutes() {\n  app.get('/v1/users/:id', getUser);\n}\n\nasync function load() {\n  const r = await fetch('https://api.io/v1/users');\n}\n\napp.post('/orders', createOrder);\n",
+        )
+        .unwrap();
+
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        let symbol_id_for = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT id FROM symbols WHERE name = ?1 AND file = 'src/routes.js'",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("symbol {name} must be indexed: {e}"))
+        };
+        let contract_symbol_id = |canonical: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT symbol_id FROM contracts WHERE canonical_id = ?1",
+                rusqlite::params![canonical],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("contract {canonical} must be stored: {e}"))
+        };
+
+        assert_eq!(
+            contract_symbol_id("http::GET::/v1/users/{p1}"),
+            Some(symbol_id_for("registerRoutes")),
+            "route registered inside registerRoutes() resolves to it"
+        );
+        assert_eq!(
+            contract_symbol_id("http::GET::/v1/users"),
+            Some(symbol_id_for("load")),
+            "fetch consumer inside load() resolves to it"
+        );
+        assert_eq!(
+            contract_symbol_id("http::POST::/orders"),
+            None,
+            "top-level registration has no owning symbol -> NULL"
+        );
+    }
+
+    #[test]
+    fn document_contracts_persist_with_null_symbol_id() {
+        let dir = make_rpc_contract_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+        assert_eq!(stats.contract_count, 2, "got {stats:?}");
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let rows: Vec<(String, String, Option<i64>)> = conn
+            .prepare("SELECT canonical_id, role, symbol_id FROM contracts ORDER BY canonical_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, _, id)| id.is_none()));
+        assert_eq!(rows[0].0, "grpc::UserService::GetUser");
+        assert_eq!(rows[0].1, "provider");
+    }
+
     // -- document files (TASK-088, DQ1) ----------------------------------------
 
     /// Repo with a contract-bearing proto document plus files that must stay
@@ -1797,7 +1958,7 @@ class Component {
         assert_eq!(language, "Proto");
         assert_eq!(symbols_count, 0);
 
-        // meta.json carries the document language (TASK-083 anchor).
+        // meta.json carries the document language.
         let meta = db::read_meta(&index_path).unwrap();
         assert!(
             meta.languages.iter().any(|l| l == "Proto"),
@@ -1864,7 +2025,7 @@ class Component {
     #[test]
     fn reindex_file_skips_lockfile_document() {
         // The incremental path pays the same guard: a changed lock file
-        // re-hashes (TASK-083 anchor) but never gains a row.
+        // re-hashes but never gains a row.
         let dir = make_rpc_contract_repo();
         build_index(dir.path(), true).unwrap();
         let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
@@ -1957,9 +2118,111 @@ class Component {
     }
 
     #[test]
+    fn reindex_replaces_file_contracts() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let file = dir.path().join("src/app.js");
+
+        fs::write(
+            &file,
+            "const app = express();\napp.get('/v2/ping', ping);\nconst flag = process.env.FEATURE_X;\n",
+        )
+        .unwrap();
+        assert!(
+            reindex_file(
+                &conn,
+                &file,
+                dir.path(),
+                &crate::contracts::ContractOptions::default()
+            )
+            .unwrap()
+        );
+
+        let ids: Vec<String> = conn
+            .prepare("SELECT canonical_id FROM contracts WHERE file = 'src/app.js' ORDER BY canonical_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                "env::::FEATURE_X".to_string(),
+                "http::GET::/v2/ping".to_string()
+            ],
+            "re-index must leave exactly the new-content set, no stale rows"
+        );
+    }
+
+    #[test]
+    fn remove_file_deletes_contracts() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        remove_file(&conn, &dir.path().join("src/app.js"), dir.path()).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM contracts WHERE file = 'src/app.js'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "deleting a file must drop its contract rows");
+    }
+
+    #[test]
+    fn reindex_file_stale_document_contracts_removed() {
+        // A proto edited from two rpc methods down to one must not keep the
+        // vanished method's row: the document flows through the same
+        // per-file delete-and-rewrite seam as grammar files.
+        let dir = make_rpc_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let proto = dir.path().join("proto/users.proto");
+        fs::write(
+            &proto,
+            "syntax = \"proto3\";\npackage users.v1;\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);\n}\n",
+        )
+        .unwrap();
+        assert!(
+            reindex_file(
+                &conn,
+                &proto,
+                dir.path(),
+                &crate::contracts::ContractOptions::default()
+            )
+            .unwrap()
+        );
+        let ids: Vec<String> = conn
+            .prepare("SELECT canonical_id FROM contracts WHERE file = 'proto/users.proto'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["grpc::UserService::GetUser".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_index_clears_contracts() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+        let stats = rebuild_index(dir.path(), true).unwrap();
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM contracts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count as usize, stats.contract_count);
+        assert_eq!(stats.contract_count, 3, "rebuild must not duplicate rows");
+    }
+
+    #[test]
     fn reindex_file_extracts_contracts() {
-        // No storage yet (TASK-083): reindex_file must run the contract
-        // extractor inline without failing, and skip unchanged content.
+        // reindex_file runs the contract extractor inline and skips
+        // unchanged content by hash.
         let dir = make_contract_repo();
         let stats = build_index(dir.path(), true).unwrap();
         assert_eq!(stats.contract_count, 3);
@@ -2324,6 +2587,28 @@ class Component {
             )
             .unwrap();
         assert_eq!(lib_rows, 0);
+    }
+
+    #[test]
+    fn incremental_update_reports_stored_contract_count() {
+        let dir = make_contract_repo();
+        build_index(dir.path(), true).unwrap();
+
+        // Change app.js: one route replaced, one added -> four stored rows.
+        let file = dir.path().join("src/app.js");
+        fs::write(
+            &file,
+            "const app = express();\napp.get('/v1/users/:id', getUser);\napp.post('/orders', createOrder);\napp.delete('/orders/:id', deleteOrder);\nconst db = process.env.DATABASE_URL;\n",
+        )
+        .unwrap();
+        let stats = incremental_update(dir.path(), true).unwrap();
+        assert_eq!(stats.contract_count, 4, "got {stats:?}");
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM contracts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 4, "stats must reflect what is in the database");
     }
 
     #[test]
