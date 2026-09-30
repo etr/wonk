@@ -461,4 +461,429 @@ const run = (n: number): number => { /* 4 lines elided */ };
 ";
         assert_eq!(out, expected);
     }
+
+    #[test]
+    fn matrix_retained_lines_byte_identical_all_languages() {
+        struct Case {
+            lang: Lang,
+            src: &'static str,
+            imports: &'static [&'static str],
+            signatures: &'static [&'static str],
+            expected_stubs: usize,
+        }
+        let cases = [
+            Case {
+                lang: Lang::Rust,
+                src: "\
+// module docs
+use std::fmt;
+
+pub fn alpha(n: u32) -> u32 {
+    let m = n + 1;
+    let k = m * 2;
+    k + 3
+}
+
+fn beta() {
+    let a = 1;
+    let b = 2;
+    let c = a + b;
+    let _ = c;
+}
+
+fn tiny() -> u32 { 7 }
+",
+                imports: &["use std::fmt;"],
+                signatures: &[
+                    "pub fn alpha(n: u32) -> u32",
+                    "fn beta()",
+                    "fn tiny() -> u32 { 7 }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::TypeScript,
+                src: "\
+// module docs
+import { readFile } from 'fs';
+
+export function alpha(n: number): number {
+  const m = n + 1;
+  const k = m * 2;
+  return k + 3;
+}
+
+function beta(): void {
+  const a = 1;
+  const b = 2;
+  console.log(a + b);
+}
+
+function tiny(): number { return 7; }
+",
+                imports: &["import { readFile } from 'fs';"],
+                signatures: &[
+                    "export function alpha(n: number): number",
+                    "function beta(): void",
+                    "function tiny(): number { return 7; }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::Tsx,
+                src: "\
+// module docs
+import React from 'react';
+
+export function alpha(n: number): number {
+  const m = n + 1;
+  const k = m * 2;
+  return k + 3;
+}
+
+export function Beta(): React.ReactNode {
+  const items = [1, 2, 3];
+  const list = items.map((i) => <li key={i}>{i}</li>);
+  return <ul>{list}</ul>;
+}
+
+function tiny(): number { return 7; }
+",
+                imports: &["import React from 'react';"],
+                signatures: &[
+                    "export function alpha(n: number): number",
+                    "export function Beta(): React.ReactNode",
+                    "function tiny(): number { return 7; }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::JavaScript,
+                src: "\
+// module docs
+import fs from 'fs';
+
+export function alpha(n) {
+  const m = n + 1;
+  const k = m * 2;
+  return k + 3;
+}
+
+function beta() {
+  const a = 1;
+  const b = 2;
+  console.log(a + b);
+}
+
+function tiny() { return 7; }
+",
+                imports: &["import fs from 'fs';"],
+                signatures: &[
+                    "export function alpha(n)",
+                    "function beta()",
+                    "function tiny() { return 7; }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::Python,
+                src: "\
+# module docs
+import os
+import sys
+
+def alpha(flag):
+    a = os.getcwd()
+    b = len(sys.argv)
+    return a if flag else b
+
+def beta(n):
+    total = 0
+    for i in range(n):
+        total += i
+    return total
+
+def tiny():
+    return 7
+",
+                imports: &["import os", "import sys"],
+                signatures: &["def alpha(flag):", "def beta(n):", "def tiny():"],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::Go,
+                src: "\
+// module docs
+package main
+
+import \"fmt\"
+
+func Alpha(n int) int {
+\tm := n + 1
+\tk := m * 2
+\treturn k + 3
+}
+
+func beta(w string) {
+\ta := len(w)
+\tb := a * 3
+\tfmt.Println(b)
+}
+
+func tiny() int { return 7 }
+",
+                imports: &["import \"fmt\""],
+                signatures: &[
+                    "func Alpha(n int) int",
+                    "func beta(w string)",
+                    "func tiny() int { return 7 }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::Java,
+                src: "\
+// module docs
+package com.example;
+
+import java.util.List;
+
+public class Demo {
+    public int alpha(int n) {
+        int m = n + 1;
+        int k = m * 2;
+        return k + 3;
+    }
+
+    public void beta(String w) {
+        int a = w.length();
+        int b = a * 3;
+        System.out.println(b);
+    }
+
+    public int tiny() { return 7; }
+}
+",
+                imports: &["import java.util.List;"],
+                signatures: &[
+                    "public int alpha(int n)",
+                    "public void beta(String w)",
+                    "public int tiny() { return 7; }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::C,
+                src: "\
+/* module docs */
+#include <stdio.h>
+#include <string.h>
+
+int alpha(int n) {
+    int m = n + 1;
+    int k = m * 2;
+    return k + 3;
+}
+
+void beta(const char *w) {
+    size_t a = strlen(w);
+    size_t b = a * 3;
+    printf(\"%zu\\n\", b);
+}
+
+int tiny(void) { return 7; }
+",
+                imports: &["#include <stdio.h>", "#include <string.h>"],
+                signatures: &[
+                    "int alpha(int n)",
+                    "void beta(const char *w)",
+                    "int tiny(void) { return 7; }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::Cpp,
+                src: "\
+// module docs
+#include <iostream>
+#include <vector>
+
+int alpha(int n) {
+    int m = n + 1;
+    int k = m * 2;
+    return k + 3;
+}
+
+void beta(const std::vector<int>& v) {
+    int total = 0;
+    for (int x : v) {
+        total += x;
+    }
+    std::cout << total << \"\\n\";
+}
+
+int tiny() { return 7; }
+",
+                imports: &["#include <iostream>", "#include <vector>"],
+                signatures: &[
+                    "int alpha(int n)",
+                    "void beta(const std::vector<int>& v)",
+                    "int tiny() { return 7; }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::Ruby,
+                src: "\
+# module docs
+require 'set'
+require 'json'
+
+def alpha(items)
+  s = Set.new(items)
+  total = s.size * 2
+  total + 1
+end
+
+def beta(w)
+  parsed = JSON.parse(w)
+  size = parsed.length
+  puts size
+end
+
+def tiny
+  7
+end
+",
+                imports: &["require 'set'", "require 'json'"],
+                signatures: &["def alpha(items)", "def beta(w)", "def tiny"],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::Php,
+                src: "\
+<?php
+// module docs
+require_once 'set.php';
+use Foo\\Bar;
+
+function alpha($n) {
+    $m = $n + 1;
+    $k = $m * 2;
+    return $k + 3;
+}
+
+function beta($w) {
+    $a = strlen($w);
+    $b = $a * 3;
+    echo $b . \"\\n\";
+}
+
+function tiny() { return 7; }
+",
+                imports: &["require_once 'set.php';", "use Foo\\Bar;"],
+                signatures: &[
+                    "function alpha($n)",
+                    "function beta($w)",
+                    "function tiny() { return 7; }",
+                ],
+                expected_stubs: 2,
+            },
+            Case {
+                lang: Lang::CSharp,
+                src: "\
+// module docs
+using System;
+using System.Collections.Generic;
+
+public class Demo {
+    public int Alpha(int n) {
+        int m = n + 1;
+        int k = m * 2;
+        return k + 3;
+    }
+
+    public void Beta(string w) {
+        int a = w.Length;
+        int b = a * 3;
+        Console.WriteLine(b);
+    }
+
+    public int Tiny() { return 7; }
+}
+",
+                imports: &["using System;", "using System.Collections.Generic;"],
+                signatures: &[
+                    "public int Alpha(int n)",
+                    "public void Beta(string w)",
+                    "public int Tiny() { return 7; }",
+                ],
+                expected_stubs: 2,
+            },
+        ];
+        assert_eq!(cases.len(), 12);
+
+        for case in cases {
+            let lang = case.lang;
+            let out = elided(case.src, lang);
+            let out_lines: Vec<&str> = out.lines().collect();
+            let in_lines: Vec<&str> = case.src.lines().collect();
+
+            let stub_lines: Vec<&str> = out_lines
+                .iter()
+                .copied()
+                .filter(|l| l.contains("lines elided"))
+                .collect();
+            assert_eq!(
+                stub_lines.len(),
+                case.expected_stubs,
+                "{lang:?}: every multi-line body must be stubbed and counted, no more, no fewer"
+            );
+
+            let indent = matches!(lang, Lang::Python | Lang::Ruby);
+            let format_ok = stub_lines.iter().any(|l| {
+                if indent {
+                    let t = l.trim();
+                    t.starts_with("# ") && t.ends_with(" elided")
+                } else {
+                    l.contains("{ /* ") && l.contains(" lines elided */ }")
+                }
+            });
+            assert!(format_ok, "{lang:?}: no stub in the language's format");
+
+            let stripped: Vec<&str> = out_lines
+                .iter()
+                .copied()
+                .filter(|l| !l.contains("lines elided"))
+                .collect();
+            let mut remaining = in_lines.iter();
+            for line in &stripped {
+                assert!(
+                    remaining.any(|original| original == line),
+                    "{lang:?}: retained line {line:?} is not an in-order byte-identical original line"
+                );
+            }
+
+            for import in case.imports {
+                assert!(
+                    stripped.contains(import),
+                    "{lang:?}: import {import:?} not retained byte-identical"
+                );
+            }
+
+            for sig in case.signatures {
+                assert!(
+                    out_lines.iter().any(|l| l.trim_start().starts_with(sig)),
+                    "{lang:?}: signature {sig:?} not preserved on its line"
+                );
+            }
+
+            let mut parser = get_parser(lang);
+            let reparsed = parser.parse(&out, None).unwrap();
+            assert!(
+                !reparsed.root_node().has_error(),
+                "{lang:?}: elided output must re-parse cleanly under its own grammar:\n{out}"
+            );
+        }
+    }
 }
