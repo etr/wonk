@@ -688,6 +688,11 @@ pub fn run_review(
     let mut warnings = Vec::new();
     let mut findings = Vec::new();
 
+    // Durable suppressions (PRD-REV-REQ-014): consulted before a finding is
+    // kept. The ensure covers pre-TASK-089 indexes (a no-op otherwise).
+    crate::db::ensure_review_suppressions_table(conn)?;
+    let suppressed = suppressed_identities(conn)?;
+
     // Callers removed in this same diff are dead code, not breakage.
     let removed: HashSet<(String, crate::types::SymbolKind)> = detail
         .analysis
@@ -858,6 +863,10 @@ pub fn run_review(
             }
         }
     }
+
+    // Suppressed identities never reach the report or the verdict: a retired
+    // false positive is not a finding of this run.
+    findings.retain(|f| !suppressed.contains(&f.identity));
 
     findings.sort_by(|a, b| {
         b.severity
@@ -1593,6 +1602,54 @@ mod tests {
         // Related context is the canonical (tests-excluded) blast radius.
         assert_eq!(f.related.len(), 1);
         assert_eq!(f.related[0].name, "g");
+    }
+
+    #[test]
+    fn suppressed_identity_retires_its_finding_and_flips_the_verdict() {
+        // REQ-014's contract: suppress the identity a first review stamped,
+        // re-run the same diff, and the finding is gone — the verdict
+        // derives from what is reported, so REVIEW becomes APPROVE.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\n",
+        )]);
+        let root = dir.path();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 2 }\npub fn g() -> i32 { f() }\n",
+        )
+        .unwrap();
+
+        let before = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(before.verdict, ReviewVerdict::Review);
+        assert_eq!(before.findings.len(), 1);
+        let gap = &before.findings[0];
+        add_suppression(&conn, &gap.identity, &gap.rule, &gap.file, None).unwrap();
+
+        let after = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            after.findings.is_empty(),
+            "suppressed finding must not be kept, got: {:?}",
+            after.findings
+        );
+        assert_eq!(after.verdict, ReviewVerdict::Approve);
     }
 
     #[test]
