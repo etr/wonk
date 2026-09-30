@@ -277,6 +277,116 @@ fn stamp_identity(mut finding: Finding, cs: &ChangedSymbol, anchor_text: Option<
 }
 
 // ---------------------------------------------------------------------------
+// Suppression storage (PRD-REV-REQ-014)
+// ---------------------------------------------------------------------------
+
+/// One durable suppression row: a retired finding identity plus the display
+/// metadata that makes the list self-describing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suppression {
+    /// The suppressed finding's identity (the lookup key).
+    pub identity: String,
+    /// The finding's rule, retained for listing and bulk `--rule` removal.
+    pub rule: String,
+    /// The finding's file, retained for listing.
+    pub file: String,
+    /// Why the finding was retired, when the author said so.
+    pub note: Option<String>,
+    /// When the suppression was recorded (epoch seconds).
+    pub created_at: i64,
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Record (or refresh) a suppression. Upsert keyed on identity: re-adding
+/// refreshes the rule/file/note display fields instead of duplicating.
+pub fn add_suppression(
+    conn: &Connection,
+    identity: &str,
+    rule: &str,
+    file: &str,
+    note: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO review_suppressions (identity, rule, file, note, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(identity) DO UPDATE SET \
+         rule = excluded.rule, file = excluded.file, note = excluded.note",
+        rusqlite::params![identity, rule, file, note, now_epoch_secs()],
+    )?;
+    Ok(())
+}
+
+/// List suppressions, newest first, ordered by `created_at` then `identity`
+/// (within one second, insertion order is arbitrary — identity makes the
+/// listing deterministic). `rule` filters to one rule family.
+pub fn list_suppressions(conn: &Connection, rule: Option<&str>) -> Result<Vec<Suppression>> {
+    let mut stmt = conn.prepare(
+        "SELECT identity, rule, file, note, created_at FROM review_suppressions \
+         WHERE (?1 IS NULL OR rule = ?1) \
+         ORDER BY created_at DESC, identity",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![rule], |row| {
+        Ok(Suppression {
+            identity: row.get(0)?,
+            rule: row.get(1)?,
+            file: row.get(2)?,
+            note: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Remove suppressions by identity and/or rule (whichever is given; both is
+/// the union) and return how many rows went.
+pub fn remove_suppressions(
+    conn: &Connection,
+    identities: &[String],
+    rule: Option<&str>,
+) -> Result<usize> {
+    if identities.is_empty() && rule.is_none() {
+        return Ok(0);
+    }
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if !identities.is_empty() {
+        let placeholders = identities
+            .iter()
+            .map(|id| {
+                params.push(Box::new(id.clone()));
+                format!("?{}", params.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        conditions.push(format!("identity IN ({placeholders})"));
+    }
+    if let Some(rule) = rule {
+        params.push(Box::new(rule.to_string()));
+        conditions.push(format!("rule = ?{}", params.len()));
+    }
+    let sql = format!(
+        "DELETE FROM review_suppressions WHERE {}",
+        conditions.join(" OR ")
+    );
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    Ok(conn.execute(sql.as_str(), refs.as_slice())?)
+}
+
+/// The identities currently suppressed — the set [`run_review`] consults
+/// before keeping a finding.
+pub fn suppressed_identities(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT identity FROM review_suppressions")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<HashSet<_>, _>>()?)
+}
+
+// ---------------------------------------------------------------------------
 // Rule family A — breaking change (PRD-REV-REQ-006)
 // ---------------------------------------------------------------------------
 
@@ -1143,6 +1253,103 @@ mod tests {
             anchored_line_text(AnchorMethod::PostChangeFile, Some(9), None, Some(&lines)),
             None
         );
+    }
+
+    // -- suppression storage (TASK-089, PRD-REV-REQ-014) ------------------------
+
+    fn suppression_conn() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = Connection::open(dir.path().join("index.db")).unwrap();
+        crate::db::ensure_review_suppressions_table(&conn).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn suppression_round_trip_lists_every_field() {
+        let (_dir, conn) = suppression_conn();
+        add_suppression(
+            &conn,
+            "abc123",
+            "coverage-gap/no-test-in-blast-radius",
+            "src/lib.rs",
+            Some("confirmed false positive"),
+        )
+        .unwrap();
+
+        let rows = list_suppressions(&conn, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity, "abc123");
+        assert_eq!(rows[0].rule, "coverage-gap/no-test-in-blast-radius");
+        assert_eq!(rows[0].file, "src/lib.rs");
+        assert_eq!(rows[0].note.as_deref(), Some("confirmed false positive"));
+        assert!(
+            rows[0].created_at > 0,
+            "created_at is epoch seconds, always positive"
+        );
+    }
+
+    #[test]
+    fn suppression_add_is_upsert_refreshing_rule_file_note() {
+        // Re-adding an identity refreshes its display fields rather than
+        // failing or duplicating the row.
+        let (_dir, conn) = suppression_conn();
+        add_suppression(&conn, "abc", "old-rule", "old.rs", Some("old note")).unwrap();
+        add_suppression(&conn, "abc", "new-rule", "new.rs", None).unwrap();
+
+        let rows = list_suppressions(&conn, None).unwrap();
+        assert_eq!(rows.len(), 1, "upsert, not insert: {rows:?}");
+        assert_eq!(rows[0].rule, "new-rule");
+        assert_eq!(rows[0].file, "new.rs");
+        assert_eq!(rows[0].note, None);
+    }
+
+    #[test]
+    fn suppression_remove_by_identities_empties_and_counts() {
+        let (_dir, conn) = suppression_conn();
+        add_suppression(&conn, "a", "r", "f", None).unwrap();
+        add_suppression(&conn, "b", "r", "f", None).unwrap();
+
+        let removed = remove_suppressions(&conn, &["a".to_string()], None).unwrap();
+        assert_eq!(removed, 1);
+        let expected: HashSet<String> = ["b".to_string()].into_iter().collect();
+        assert_eq!(suppressed_identities(&conn).unwrap(), expected);
+
+        // Removing a missing identity counts zero, not an error.
+        assert_eq!(remove_suppressions(&conn, &["a".into()], None).unwrap(), 0);
+    }
+
+    #[test]
+    fn suppression_bulk_remove_by_rule_counts_only_matching() {
+        let (_dir, conn) = suppression_conn();
+        add_suppression(&conn, "a", "rule-one", "f", None).unwrap();
+        add_suppression(&conn, "b", "rule-one", "f", None).unwrap();
+        add_suppression(&conn, "c", "rule-two", "f", None).unwrap();
+
+        assert_eq!(
+            remove_suppressions(&conn, &[], Some("rule-one")).unwrap(),
+            2,
+            "only the rule's rows are removed"
+        );
+        let expected: HashSet<String> = ["c".to_string()].into_iter().collect();
+        assert_eq!(suppressed_identities(&conn).unwrap(), expected);
+    }
+
+    #[test]
+    fn suppression_list_filters_by_rule_and_orders_created_at_then_identity() {
+        let (_dir, conn) = suppression_conn();
+        add_suppression(&conn, "zzz", "wanted", "f", None).unwrap();
+        add_suppression(&conn, "aaa", "wanted", "f", None).unwrap();
+        add_suppression(&conn, "other", "unwanted", "f", None).unwrap();
+
+        let rows = list_suppressions(&conn, Some("wanted")).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.identity.as_str()).collect::<Vec<_>>(),
+            vec!["aaa", "zzz"],
+            "same created_at second falls back to ascending identity order"
+        );
+
+        let all = list_suppressions(&conn, None).unwrap();
+        assert_eq!(all.len(), 3);
     }
 
     #[test]

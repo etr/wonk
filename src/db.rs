@@ -183,6 +183,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
 );
 "#;
 
+// Per-repo review suppressions (TASK-089, PRD-REV-REQ-014). `rule` and
+// `file` are retained display metadata: the identity is the only key a
+// lookup needs, but `wonk review suppress list` and bulk `--rule` removal
+// need the human-readable columns.
+const REVIEW_SUPPRESSIONS_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS review_suppressions (
+    identity TEXT PRIMARY KEY,
+    rule TEXT NOT NULL DEFAULT '',
+    file TEXT NOT NULL DEFAULT '',
+    note TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_suppressions_rule ON review_suppressions(rule);
+"#;
+
 const TRIGGERS_SQL: &str = r#"
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
     INSERT INTO symbols_fts(rowid, name, kind, file)
@@ -270,6 +285,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating reach tables")?;
     conn.execute_batch(CONTRACTS_SQL)
         .context("creating contracts table")?;
+    conn.execute_batch(REVIEW_SUPPRESSIONS_SQL)
+        .context("creating review_suppressions table")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -395,6 +412,17 @@ pub fn ensure_reach_table(conn: &Connection) -> Result<()> {
 pub fn ensure_contracts_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(CONTRACTS_SQL)
         .context("creating contracts table (migration)")?;
+    Ok(())
+}
+
+/// Ensure the `review_suppressions` table exists, creating it if missing.
+///
+/// Handles schema migration for indexes created before durable finding
+/// suppression (TASK-089) was added. Safe to call repeatedly (uses
+/// `CREATE TABLE IF NOT EXISTS`).
+pub fn ensure_review_suppressions_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(REVIEW_SUPPRESSIONS_SQL)
+        .context("creating review_suppressions table (migration)")?;
     Ok(())
 }
 
@@ -2188,6 +2216,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn ensure_review_suppressions_table_migrates_existing_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A pre-TASK-089 index has the base schema but no suppressions
+        // table.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(SCHEMA_SQL).unwrap();
+        }
+
+        let conn = open(&db_path).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='review_suppressions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "open() should migrate the empty review_suppressions table in"
+        );
+
+        // Idempotent: a second run on a migrated DB succeeds.
+        ensure_review_suppressions_table(&conn).unwrap();
+        ensure_review_suppressions_table(&conn).unwrap();
     }
 
     #[test]
