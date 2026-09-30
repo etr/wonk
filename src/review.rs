@@ -266,6 +266,73 @@ fn rule_breaking_change(
 }
 
 // ---------------------------------------------------------------------------
+// Rule family B — coverage gap (PRD-REV-REQ-007)
+// ---------------------------------------------------------------------------
+
+/// Rule B: an added/modified non-test symbol whose blast radius contains no
+/// test-file symbols is untested — a warning, never a block.
+///
+/// The coverage QUESTION is asked over the with-tests blast (the only way to
+/// see test callers at all), but the finding's `related` context is the
+/// tests-excluded context analysis — the canonical `wonk blast` radius.
+fn rule_coverage_gap(
+    cs: &ChangedSymbol,
+    with_tests: &BlastAnalysis,
+    context: &BlastAnalysis,
+    line: Option<usize>,
+    anchor_method: AnchorMethod,
+) -> Option<Finding> {
+    let radius: Vec<&BlastAffectedSymbol> = with_tests
+        .tiers
+        .iter()
+        .flat_map(|t| t.symbols.iter())
+        .collect();
+    if radius
+        .iter()
+        .any(|s| crate::ranker::is_test_file(Path::new(&s.file)))
+    {
+        return None;
+    }
+
+    let rule = "coverage-gap/no-test-in-blast-radius";
+    let message = if radius.is_empty() {
+        format!(
+            "{} `{}` changed but no test file appears in its blast radius (no affected symbols indexed)",
+            cs.kind, cs.name
+        )
+    } else {
+        format!(
+            "{} `{}` changed but no test file appears in its blast radius ({} affected symbol(s), none in tests)",
+            cs.kind,
+            cs.name,
+            radius.len()
+        )
+    };
+
+    Some(Finding {
+        file: cs.file.clone(),
+        line,
+        anchor_method,
+        severity: FindingSeverity::Warning,
+        kind: "coverage-gap".into(),
+        rule: rule.into(),
+        message,
+        identity: provisional_identity(rule, &cs.file, &cs.name),
+        related: context
+            .tiers
+            .iter()
+            .flat_map(|t| t.symbols.iter())
+            .map(|s| SymbolRef {
+                name: s.name.clone(),
+                kind: s.kind,
+                file: s.file.clone(),
+                line: s.line,
+            })
+            .collect(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // run_review
 // ---------------------------------------------------------------------------
 
@@ -348,6 +415,32 @@ pub fn run_review(
             && let Some(finding) = rule_breaking_change(cs, &context, &removed, line, anchor_method)
         {
             findings.push(finding);
+        }
+
+        if rule_b_candidate {
+            // Same options but include_tests: reach routing correctly
+            // declines this shape, so the shared live BFS answers it.
+            let with_tests = blast::analyze_blast(
+                conn,
+                &cs.name,
+                &BlastOptions {
+                    include_tests: true,
+                    ..context_options.clone()
+                },
+            );
+            match with_tests {
+                Ok(with_tests) => {
+                    if let Some(finding) =
+                        rule_coverage_gap(cs, &with_tests, &context, line, anchor_method)
+                    {
+                        findings.push(finding);
+                    }
+                }
+                Err(e) => warnings.push(format!(
+                    "coverage check skipped for {} `{}` in {}: blast failed: {e}",
+                    cs.kind, cs.name, cs.file
+                )),
+            }
         }
     }
 
@@ -761,6 +854,152 @@ mod tests {
         assert!(
             result.findings.iter().all(|f| f.kind != "breaking-change"),
             "dead-code removal must not block, got: {:?}",
+            result.findings
+        );
+    }
+
+    // -- rule B: coverage gap (PRD-REV-REQ-007) ----------------------------------
+
+    #[test]
+    fn ac2_changed_symbol_without_test_coverage_warns() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\n",
+        )]);
+        let root = dir.path();
+
+        // Body edit: not breaking, but nothing anywhere exercises f.
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 2 }\npub fn g() -> i32 { f() }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.verdict,
+            ReviewVerdict::Review,
+            "a warning must yield REVIEW, got {:?}",
+            result.findings
+        );
+        assert_eq!(result.findings.len(), 1, "got: {:?}", result.findings);
+        let f = &result.findings[0];
+        assert_eq!(f.severity, FindingSeverity::Warning);
+        assert_eq!(f.kind, "coverage-gap");
+        assert_eq!(f.rule, "coverage-gap/no-test-in-blast-radius");
+        assert_eq!(
+            f.message,
+            "function `f` changed but no test file appears in its blast radius (1 affected symbol(s), none in tests)"
+        );
+        // Related context is the canonical (tests-excluded) blast radius.
+        assert_eq!(f.related.len(), 1);
+        assert_eq!(f.related[0].name, "g");
+    }
+
+    #[test]
+    fn ac2_test_in_blast_radius_silences_coverage_gap() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[
+            (
+                "src/lib.rs",
+                "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\n",
+            ),
+            ("tests/x.rs", "fn t() { f(); }\n"),
+        ]);
+        let root = dir.path();
+
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 2 }\npub fn g() -> i32 { f() }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            result.findings.iter().all(|f| f.kind != "coverage-gap"),
+            "a test in the radius covers the change, got: {:?}",
+            result.findings
+        );
+        assert_eq!(result.verdict, ReviewVerdict::Approve);
+    }
+
+    #[test]
+    fn rule_b_skips_removed_symbols() {
+        // Rule A governs removals; a coverage warning about deleted code is
+        // noise.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\n",
+        )]);
+        let root = dir.path();
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn g() -> i32 { 0 }\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            result.findings.iter().all(|f| f.kind != "coverage-gap"),
+            "removed symbols must not raise coverage gaps, got: {:?}",
+            result.findings
+        );
+        assert_eq!(result.verdict, ReviewVerdict::Block);
+    }
+
+    #[test]
+    fn rule_b_skips_symbols_in_test_files() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[
+            (
+                "src/lib.rs",
+                "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\n",
+            ),
+            ("tests/x.rs", "fn t() { f(); }\n"),
+        ]);
+        let root = dir.path();
+
+        std::fs::write(root.join("tests/x.rs"), "fn t() { f(); let _ = 1; }\n").unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            result.findings.iter().all(|f| f.kind != "coverage-gap"),
+            "changes inside test files are themselves coverage, got: {:?}",
             result.findings
         );
     }
