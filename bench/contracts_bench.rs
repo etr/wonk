@@ -1,12 +1,16 @@
 //! Contract-extraction build-cost benchmark (TASK-082, PRD-CTR-REQ-004).
 //!
 //! Builds a synthetic repo (~300 files across all 12 supported languages,
-//! ordinary symbols plus 2-5 framework calls per file), then measures:
+//! ordinary symbols plus 2-5 framework calls per file, plus a TASK-088
+//! document cohort: a ~5k-line OpenAPI spec, a proto IDL, a GraphQL SDL,
+//! and one large non-OpenAPI JSON pinning the negative sniff case), then
+//! measures:
 //!   - T_build: warm `build_index` wall time (parse + extract + insert),
 //!   - E: total `extract_contracts` wall time over trees parsed exactly as
 //!     `parse_one_file` parses them (PRD-CTR-REQ-011 — same tree, no second
 //!     parse is performed at indexing time; here trees are re-parsed purely
-//!     to isolate the extractor's share of the build).
+//!     to isolate the extractor's share of the build) plus the document
+//!     scanners' `extract_document_contracts` share.
 //!
 //! Hard gate: E < 0.15 x T_build (TASK-082 acceptance: extraction adds
 //! < 15% to index build time). Per-language p50/p95 extraction times are
@@ -20,18 +24,37 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
-use wonk::contracts::{ContractOptions, extract_contracts};
+use wonk::contracts::{
+    ContractOptions, DocumentKind, extract_contracts, extract_document_contracts,
+    scannable_document_kind,
+};
 use wonk::indexer::{self, Lang};
 use wonk::pipeline::build_index;
 
 const FILES_PER_LANG: usize = 25;
 const EXTRACT_ROUNDS: usize = 5;
 
+/// One document file in the TASK-088 cohort (name for the report).
+struct DocFile {
+    path: PathBuf,
+    name: String,
+    kind: DocumentKind,
+}
+
+/// Per-document extraction timing accumulated across rounds.
+struct DocTiming {
+    name: String,
+    kind: &'static str,
+    contracts: usize,
+    times: Vec<Duration>,
+}
+
 fn main() -> Result<()> {
     let repo = tempfile::tempdir()?;
     let root = repo.path();
     fs::create_dir(root.join(".git"))?;
     fs::create_dir_all(root.join("src"))?;
+    fs::create_dir_all(root.join("docs"))?;
     fs::create_dir(root.join(".wonk"))?;
 
     generate_repo(root)?;
@@ -44,18 +67,31 @@ fn main() -> Result<()> {
 
     ensure!(
         stats.file_count >= FILES_PER_LANG * 12,
-        "expected {} files, indexed {}",
+        "expected at least {} files, indexed {}",
         FILES_PER_LANG * 12,
         stats.file_count
     );
     ensure!(stats.contract_count > 0, "no contracts extracted");
 
     // E: re-parse each file the way parse_one_file does and time the
-    // extractor alone. Averaged over rounds for a stable number.
+    // extractor alone; documents are scanned the way parse_document_file
+    // does (kind gate + line scanners). Averaged over rounds for a stable
+    // number. Reads/parses happen outside the measured window
+    // (PRD-CTR-REQ-011 means indexing never re-parses).
     let files = collect_source_files(root)?;
     ensure!(!files.is_empty(), "no source files found");
+    let docs = collect_document_files(root)?;
 
     let mut per_lang: HashMap<Lang, Vec<Duration>> = HashMap::new();
+    let mut doc_timings: Vec<DocTiming> = docs
+        .iter()
+        .map(|d| DocTiming {
+            name: d.name.clone(),
+            kind: d.kind.as_str(),
+            contracts: 0,
+            times: Vec::new(),
+        })
+        .collect();
     let mut e_total = Duration::ZERO;
     let mut total_contracts = 0usize;
     for round in 0..EXTRACT_ROUNDS {
@@ -83,6 +119,21 @@ fn main() -> Result<()> {
                 total_contracts += contracts.len();
             }
         }
+        for (i, doc) in docs.iter().enumerate() {
+            let content = fs::read_to_string(&doc.path)?;
+            let extract_start = Instant::now();
+            let contracts =
+                extract_document_contracts(doc.kind, &content, &ContractOptions::default());
+            let took = extract_start.elapsed();
+            e_total += took;
+            if round == EXTRACT_ROUNDS - 1 {
+                doc_timings[i].times.push(took);
+            }
+            if round == 0 {
+                doc_timings[i].contracts = contracts.len();
+                total_contracts += contracts.len();
+            }
+        }
     }
     let e_avg = e_total / EXTRACT_ROUNDS as u32;
 
@@ -95,14 +146,16 @@ fn main() -> Result<()> {
         t_build
     );
 
-    let report = render_report(
-        stats.contract_count,
-        total_contracts,
-        e_avg,
+    let report = render_report(&ReportInputs {
+        indexed_files: stats.file_count,
+        indexed_contracts: stats.contract_count,
+        extracted_contracts: total_contracts,
+        e: e_avg,
         t_build,
         ratio,
-        &per_lang,
-    );
+        per_lang: &per_lang,
+        doc_timings: &doc_timings,
+    });
     print!("{report}");
 
     let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/contracts-results.md");
@@ -111,22 +164,40 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn render_report(
+/// Everything the report renderer needs.
+struct ReportInputs<'a> {
+    indexed_files: usize,
     indexed_contracts: usize,
     extracted_contracts: usize,
     e: Duration,
     t_build: Duration,
     ratio: f64,
-    per_lang: &HashMap<Lang, Vec<Duration>>,
-) -> String {
+    per_lang: &'a HashMap<Lang, Vec<Duration>>,
+    doc_timings: &'a [DocTiming],
+}
+
+fn render_report(r: &ReportInputs) -> String {
+    let ReportInputs {
+        indexed_files,
+        indexed_contracts,
+        extracted_contracts,
+        e,
+        t_build,
+        ratio,
+        per_lang,
+        doc_timings,
+    } = r;
     let mut out = String::new();
-    out.push_str("# Contract extraction build-cost results (TASK-082 + TASK-087)\n\n");
+    out.push_str("# Contract extraction build-cost results (TASK-082 + TASK-087 + TASK-088)\n\n");
     out.push_str("Synthetic repo: 12 languages x 25 files, ordinary symbols plus 2-5\n");
     out.push_str("framework idioms per file (HTTP/env from TASK-082; ~2 message-kind\n");
-    out.push_str("idioms — queue/websocket/job — per file from TASK-087).\n");
+    out.push_str("idioms — queue/websocket/job — per file from TASK-087), plus a\n");
+    out.push_str("TASK-088 document cohort: ~5k-line OpenAPI spec, proto IDL, GraphQL\n");
+    out.push_str("SDL, and one large non-OpenAPI JSON (negative sniff case; stays\n");
+    out.push_str("un-indexed).\n");
     out.push_str("`cargo bench --bench contracts`.\n\n");
     out.push_str("| metric | value |\n|---|---|\n");
-    out.push_str(&format!("| files indexed | {} |\n", FILES_PER_LANG * 12));
+    out.push_str(&format!("| files indexed | {indexed_files} |\n"));
     out.push_str(&format!(
         "| contracts (build_index) | {indexed_contracts} |\n"
     ));
@@ -145,6 +216,11 @@ fn render_report(
         "| E / T_build | {:.2}% (gate: < 15%) |\n",
         ratio * 100.0
     ));
+    out.push_str("\nE covers both surfaces: per-language `extract_contracts` over the\n");
+    out.push_str("grammar files plus the document scanners' `extract_document_contracts`\n");
+    out.push_str("(see the per-document table). The grpc pre-pass tree walk runs only for\n");
+    out.push_str("the seven languages with gRPC facts, so C/C++/Ruby/PHP/C# files pay no\n");
+    out.push_str("walk at all.\n");
     out.push_str("\nPer-language extraction p50/p95 (last round):\n\n");
     out.push_str("| language | p50 | p95 | files |\n|---|---|---|---|\n");
     let mut langs: Vec<&Lang> = per_lang.keys().collect();
@@ -160,6 +236,20 @@ fn render_report(
             p50.as_secs_f64() * 1e6,
             p95.as_secs_f64() * 1e6,
             times.len()
+        ));
+    }
+    out.push_str("\nPer-document extraction p50 (last round; TASK-088 document path):\n\n");
+    out.push_str("| document | kind | p50 | contracts |\n|---|---|---|---|\n");
+    for d in *doc_timings {
+        let mut times = d.times.clone();
+        times.sort();
+        let p50 = times[times.len() / 2];
+        out.push_str(&format!(
+            "| {} | {} | {:.1} us | {} |\n",
+            d.name,
+            d.kind,
+            p50.as_secs_f64() * 1e6,
+            d.contracts
         ));
     }
     out
@@ -182,6 +272,33 @@ fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     out.sort();
+    Ok(out)
+}
+
+/// Document files the scanner would read (same gate as `parse_document_file`:
+/// extension + lock-file/size bounds via `scannable_document_kind`).
+fn collect_document_files(root: &Path) -> Result<Vec<DocFile>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                if entry.file_name() != ".git" && entry.file_name() != ".wonk" {
+                    stack.push(path);
+                }
+            } else if let Some(kind) = scannable_document_kind(&path) {
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                out.push(DocFile { path, name, kind });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 
@@ -224,7 +341,66 @@ fn generate_repo(root: &Path) -> Result<()> {
             csharp_source(i as u32),
         )?;
     }
+    // TASK-088 document cohort: contract-bearing documents plus one large
+    // negative case, so E and T_build both cover the document path.
+    fs::write(root.join("docs/openapi.yaml"), openapi_spec())?;
+    fs::write(root.join("docs/users.proto"), proto_idl())?;
+    fs::write(root.join("docs/schema.graphql"), graphql_sdl())?;
+    fs::write(root.join("docs/records.json"), large_non_openapi_json())?;
     Ok(())
+}
+
+/// ~5k-line OpenAPI spec (500 path items x get+post): the realistic upper
+/// end of the OpenAPI line scanner.
+fn openapi_spec() -> String {
+    let mut s = String::from("openapi: 3.0.0\ninfo:\n  title: bench\n  version: 1.0.0\npaths:\n");
+    for i in 0..500 {
+        s.push_str(&format!(
+            "  /resources/{i}:\n    get:\n      summary: fetch {i}\n      responses:\n        '200':\n          description: ok\n    post:\n      summary: create {i}\n      responses:\n        '201':\n          description: created\n"
+        ));
+    }
+    s
+}
+
+/// Proto IDL: 10 services x 3 rpc methods.
+fn proto_idl() -> String {
+    let mut s = String::from("syntax = \"proto3\";\npackage bench.v1;\n");
+    for i in 0..10 {
+        s.push_str(&format!(
+            "\nservice Service{i} {{\n  rpc GetItem{i}(GetItem{i}Request) returns (Item{i});\n  rpc ListItems{i}(ListItems{i}Request) returns (stream Item{i});\n  rpc DeleteItem{i}(DeleteItem{i}Request) returns (Empty);\n}}\n"
+        ));
+    }
+    s
+}
+
+/// GraphQL SDL: Query + Mutation with 50 fields each.
+fn graphql_sdl() -> String {
+    let mut s = String::from("type Query {\n");
+    for i in 0..50 {
+        s.push_str(&format!("  field{i}(id: ID!): String\n"));
+    }
+    s.push_str("}\n\ntype Mutation {\n");
+    for i in 0..50 {
+        s.push_str(&format!("  setField{i}(id: ID!, value: String): String\n"));
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// ~300 KB / ~5k-line pretty-printed JSON that is NOT OpenAPI: pins the
+/// negative sniff case — every line is scanned and the answer must still be
+/// "not OpenAPI" in linear time (the file stays un-indexed).
+fn large_non_openapi_json() -> String {
+    let mut s = String::from("{\n  \"records\": [\n");
+    for i in 0..5000 {
+        s.push_str(&format!(
+            "    {{\"id\": {i}, \"name\": \"record-{i}\", \"value\": {}.{:02}}},\n",
+            i % 97,
+            i % 891
+        ));
+    }
+    s.push_str("    {\"id\": 5000, \"name\": \"record-5000\", \"value\": 1.0}\n  ]\n}\n");
+    s
 }
 
 // Each generator emits ordinary code plus 2-5 contract sites (HTTP/env

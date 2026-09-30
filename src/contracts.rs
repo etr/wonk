@@ -1,6 +1,7 @@
-//! Contract extraction: canonical ID normalization plus the `http`, `env`,
-//! `queue`, `websocket`, and `job` contract kinds (TASK-082, TASK-087,
-//! PRD-CTR-REQ-001..004).
+//! Contract extraction: canonical ID normalization, the `http`, `env`,
+//! `queue`, `websocket`, and `job` contract kinds (TASK-082, TASK-087), the
+//! RPC-family and schema kinds `grpc`, `graphql`, and `openapi` plus the
+//! canonical join they require (TASK-088, PRD-CTR-REQ-001..004, 024).
 //!
 //! Contracts are detected by walking the tree-sitter tree that the symbol
 //! indexer already parsed — no second parse or file read (PRD-CTR-REQ-011).
@@ -26,6 +27,41 @@
 //!   handler registrations (`socket.on`, `@MessageMapping`, `app.ws`). Here
 //!   the writer serves and the reader subscribes — the mirror image of the
 //!   queue rule, per the TASK-087 specification.
+//! - **grpc:** provider = the serving side (proto `rpc` declarations,
+//!   `XGrpc.XImplBase`/Servicer method impls, `Register<S>Server`,
+//!   `addService`, `impl …::S for T`); consumer = generated-stub call sites
+//!   (`stub.getUser`, `client.GetUser`, `pb.New<S>Client(conn).M(…)`). A
+//!   service-level registration uses identifier `*` (`grpc::S::*`) and pairs
+//!   with any method-level consumer of that service.
+//! - **graphql:** provider = resolvers (SDL root-type fields, JS resolver
+//!   maps, `@strawberry.*`, Ariadne `@Query.field`); consumer = operation
+//!   call sites (`gql` tagged templates, Apollo `.query`/`.mutate` strings,
+//!   Python `gql(…)`, operation documents).
+//! - **openapi:** provider only — specification documents are file-level
+//!   contracts with a NULL owning symbol by design (§4.24); there is no
+//!   consumer side to detect.
+//!
+//! Document files (TASK-088, no-new-crates constraint): `.proto`,
+//! `.graphql`/`.gql`, and `.yaml`/`.yml`/`.json` carry no grammar, so tiny
+//! line-oriented scanners ([`extract_document_contracts`]) read them
+//! instead. Only a document that yields candidates gets a `files` row
+//! (empty symbols, language = [`DocumentKind::as_str`]) — that row is
+//! TASK-083's hash/re-index anchor; everything else stays un-indexed
+//! exactly as before. OpenAPI additionally sniffs content (a top-level
+//! `openapi:`/`swagger:` key plus `paths:`), so CI/compose/package files
+//! never index.
+//!
+//! RPC canonical join ([`canonical_rpc_join`], PRD-CTR-REQ-024): exact ID
+//! equality is the first pass and is never overridden — candidates with an
+//! opposite-role exact counterpart in their own workspace are excluded
+//! entirely. The join is the SECOND pass, pure and in-memory over
+//! workspace-scoped slices, tolerating package qualification (service
+//! compared on the last dot-segment, case-folded), method casing and
+//! snake/camel separators (`get_user` = `GetUser` = `getUser`), and
+//! service-level `*` registration (method-level providers win). Workspace
+//! equality on normalized identifiers ([`normalize_workspace_id`],
+//! PRD-CTR-REQ-019) is the REQ-014 guard — the join relaxes names, never
+//! scope. IDs keep the developer's spelling; only the comparison relaxes.
 //!
 //! RabbitMQ note: producers address exchange+routing-key while consumers
 //! address queue names; the binding between them is broker config and
@@ -36,6 +72,13 @@
 //! Verb collisions (`send`/`emit`) resolve by guard order: websocket
 //! receivers first, then the queue generic arms, and the ambiguous HTTP
 //! arm last behind its `is_path_like` gate.
+//!
+//! Out of scope by design (extraction, not validation): GraphQL servers in
+//! Java/Go/C#/PHP/Rust; untracked gRPC receiver variables; JS grpc arms
+//! without a file-level "grpc" marker; plain look-alike strings (only
+//! `gql`/`graphql` tags, Apollo option objects, and Python `gql(…)` parse);
+//! flow-style YAML maps and multi-document YAML; a GraphQL document's
+//! second operation.
 
 use std::collections::HashMap;
 
@@ -66,6 +109,12 @@ pub struct ContractOptions {
     pub websocket: bool,
     /// Scheduled and background job detection.
     pub job: bool,
+    /// gRPC IDL + generated-stub detection (RPC family, TASK-088).
+    pub grpc: bool,
+    /// GraphQL resolver + operation detection (TASK-088).
+    pub graphql: bool,
+    /// OpenAPI specification-document detection (TASK-088).
+    pub openapi: bool,
 }
 
 impl Default for ContractOptions {
@@ -76,6 +125,9 @@ impl Default for ContractOptions {
             queue: true,
             websocket: true,
             job: true,
+            grpc: true,
+            graphql: true,
+            openapi: true,
         }
     }
 }
@@ -89,6 +141,9 @@ impl ContractOptions {
             ContractKind::Queue => self.queue,
             ContractKind::WebSocket => self.websocket,
             ContractKind::Job => self.job,
+            ContractKind::Grpc => self.grpc,
+            ContractKind::Graphql => self.graphql,
+            ContractKind::Openapi => self.openapi,
         }
     }
 }
@@ -101,6 +156,9 @@ impl From<&crate::config::ContractsConfig> for ContractOptions {
             queue: cfg.queue,
             websocket: cfg.websocket,
             job: cfg.job,
+            grpc: cfg.grpc,
+            graphql: cfg.graphql,
+            openapi: cfg.openapi,
         }
     }
 }
@@ -118,7 +176,15 @@ pub fn extract_contracts(
     lang: Lang,
     opts: &ContractOptions,
 ) -> Vec<ContractCandidate> {
-    if !opts.http && !opts.env && !opts.queue && !opts.websocket && !opts.job {
+    if !opts.http
+        && !opts.env
+        && !opts.queue
+        && !opts.websocket
+        && !opts.job
+        && !opts.grpc
+        && !opts.graphql
+        && !opts.openapi
+    {
         return Vec::new();
     }
     let src = source.as_bytes();
@@ -128,10 +194,26 @@ pub fn extract_contracts(
     } else {
         RouterContext::default()
     };
+    // The RPC pre-pass binds generated stubs to their services (TASK-088);
+    // it runs only for the languages with gRPC facts — C/C++/Ruby/PHP/C#
+    // files would pay a full tree walk for a provably empty context.
+    // JS/TS additionally require a file-level "grpc" marker before any
+    // generated-code detection fires — `new XClient(...)` alone is not
+    // evidence of gRPC.
+    let rpc = if opts.grpc && lang_collects_rpc_facts(lang) {
+        collect_rpc_context(tree.root_node(), src, lang)
+    } else {
+        RpcContext::default()
+    };
+    let grpc_hint = opts.grpc
+        && matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
+        && source.to_lowercase().contains("grpc");
     let mut ex = Extractor {
         src,
         lang,
         ctx,
+        rpc,
+        grpc_hint,
         opts: *opts,
         out: Vec::new(),
     };
@@ -541,6 +623,239 @@ fn collect_ruby_queue_facts(node: Node, src: &[u8], ctx: &mut RouterContext) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RPC context (TASK-088, plan 5.1): generated-stub bindings
+// ---------------------------------------------------------------------------
+
+/// Variable-to-service knowledge for generated gRPC stubs/clients, gathered
+/// before the contract walk so `stub.GetUser(req)` call sites can resolve
+/// their service (mirrors [`RouterContext`]).
+#[derive(Default)]
+struct RpcContext {
+    /// Client variable -> service qualifier as written by the developer
+    /// (`stub` -> `UserService`, JS `client` -> `user.UserService`).
+    stubs: HashMap<String, String>,
+}
+
+/// Languages whose generated-stub bindings the RPC pre-pass resolves.
+/// C/C++/Ruby/PHP/C# have no gRPC arms, so their files never pay the walk.
+fn lang_collects_rpc_facts(lang: Lang) -> bool {
+    matches!(
+        lang,
+        Lang::JavaScript
+            | Lang::TypeScript
+            | Lang::Tsx
+            | Lang::Python
+            | Lang::Go
+            | Lang::Rust
+            | Lang::Java
+    )
+}
+
+fn collect_rpc_context(root: Node, src: &[u8], lang: Lang) -> RpcContext {
+    let mut ctx = RpcContext::default();
+    // The per-language collector is selected once, not per node; a language
+    // with no facts returns before the walk allocates anything.
+    let collect: fn(Node, &[u8], &mut RpcContext) = match lang {
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => collect_js_rpc_facts,
+        Lang::Python => collect_py_rpc_facts,
+        Lang::Go => collect_go_rpc_facts,
+        Lang::Rust => collect_rust_rpc_facts,
+        Lang::Java => collect_java_rpc_facts,
+        _ => return ctx,
+    };
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        collect(node, src, &mut ctx);
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i as u32) {
+                stack.push(child);
+            }
+        }
+    }
+    ctx
+}
+
+/// `XGrpc` receiver of a stub constructor -> service `X` (dotted
+/// qualification before `Grpc` survives).
+fn java_grpc_service_from_object(object: Option<Node>, src: &[u8]) -> Option<String> {
+    let rest = node_text(object, src).strip_suffix("Grpc")?;
+    if rest.rsplit('.').next().unwrap_or("").is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// `New<S>Client` generated constructor -> `S` (Go: always the bare service).
+fn go_service_from_new_client(func: Node, src: &[u8]) -> Option<String> {
+    let last = node_text(Some(func), src).rsplit('.').next().unwrap_or("");
+    let service = last.strip_prefix("New")?.strip_suffix("Client")?;
+    if service.is_empty() {
+        return None;
+    }
+    Some(service.to_string())
+}
+
+/// `Register<S>Server(...)` registration function -> `S`.
+fn go_service_from_register(name: &str) -> Option<String> {
+    let service = name.strip_prefix("Register")?.strip_suffix("Server")?;
+    if service.is_empty() {
+        return None;
+    }
+    Some(service.to_string())
+}
+
+/// `UserServiceGrpc.newBlockingStub(channel)` initializer binding (Java).
+fn collect_java_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "variable_declarator" {
+        return;
+    }
+    let var = node_text(node.child_by_field_name("name"), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    if value.kind() != "method_invocation"
+        || !matches!(
+            node_text(value.child_by_field_name("name"), src),
+            "newBlockingStub" | "newStub" | "newFutureStub"
+        )
+    {
+        return;
+    }
+    if let Some(service) = java_grpc_service_from_object(value.child_by_field_name("object"), src) {
+        ctx.stubs.insert(var.to_string(), service);
+    }
+}
+
+/// `client := pb.NewUserServiceClient(conn)` binding (Go).
+fn collect_go_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "short_var_declaration" {
+        return;
+    }
+    let Some(var) = node
+        .child_by_field_name("left")
+        .and_then(|l| l.named_child(0))
+        .filter(|n| n.kind() == "identifier")
+    else {
+        return;
+    };
+    let var = node_text(Some(var), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(func) = node
+        .child_by_field_name("right")
+        .and_then(|r| r.named_child(0))
+        .filter(|n| n.kind() == "call_expression")
+        .and_then(|call| call.child_by_field_name("function"))
+    else {
+        return;
+    };
+    if let Some(service) = go_service_from_new_client(func, src) {
+        ctx.stubs.insert(var.to_string(), service);
+    }
+}
+
+/// `let client = UserServiceClient::new(channel)` binding (Rust/tonic).
+fn collect_rust_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "let_declaration" {
+        return;
+    }
+    // tonic convention is `let mut client`; the pattern then wraps the
+    // identifier in a `mut_pattern`.
+    let var_node = match node.child_by_field_name("pattern") {
+        Some(p) if p.kind() == "identifier" => Some(p),
+        Some(p) if p.kind() == "mut_pattern" => {
+            p.named_child(0).filter(|c| c.kind() == "identifier")
+        }
+        _ => None,
+    };
+    let Some(var) = var_node else {
+        return;
+    };
+    let var = node_text(Some(var), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    if value.kind() != "call_expression" {
+        return;
+    }
+    let Some(func) = value.child_by_field_name("function") else {
+        return;
+    };
+    // `<path>::new` where the constructor path ends in `<S>Client`.
+    let text = node_text(Some(func), src);
+    let Some(ctor) = text.strip_suffix("::new") else {
+        return;
+    };
+    let Some(last) = ctor.rsplit("::").next() else {
+        return;
+    };
+    if let Some(service) = last.strip_suffix("Client").filter(|s| !s.is_empty()) {
+        ctx.stubs.insert(var.to_string(), service.to_string());
+    }
+}
+
+/// `stub = user_service_pb2.UserServiceStub(channel)` binding (Python).
+fn collect_py_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "assignment" {
+        return;
+    }
+    let Some(var) = node
+        .child_by_field_name("left")
+        .filter(|n| n.kind() == "identifier")
+    else {
+        return;
+    };
+    let var = node_text(Some(var), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(func) = node
+        .child_by_field_name("right")
+        .filter(|n| n.kind() == "call")
+        .and_then(|call| call.child_by_field_name("function"))
+    else {
+        return;
+    };
+    // `<module>.<S>Stub` — the pb2 module prefix is a Python import
+    // artifact, so the bare service name is kept.
+    let last = node_text(Some(func), src).rsplit('.').next().unwrap_or("");
+    if let Some(service) = last.strip_suffix("Stub").filter(|s| !s.is_empty()) {
+        ctx.stubs.insert(var.to_string(), service.to_string());
+    }
+}
+
+/// `const c = new user.UserServiceClient(host, creds)` binding (JS/TS) —
+/// the package-qualification acceptance case: the dotted prefix stays in the
+/// service qualifier, and the canonical join relaxes it at match time.
+fn collect_js_rpc_facts(node: Node, src: &[u8], ctx: &mut RpcContext) {
+    if node.kind() != "variable_declarator" {
+        return;
+    }
+    let var = node_text(node.child_by_field_name("name"), src);
+    if var.is_empty() {
+        return;
+    }
+    let Some(ctor) = node
+        .child_by_field_name("value")
+        .filter(|n| n.kind() == "new_expression")
+        .and_then(|new| new.child_by_field_name("constructor"))
+    else {
+        return;
+    };
+    let text = node_text(Some(ctor), src);
+    if let Some(service) = text.strip_suffix("Client").filter(|s| !s.is_empty()) {
+        ctx.stubs.insert(var.to_string(), service.to_string());
+    }
+}
+
 /// The i-th positional argument of an argument list (skipping keywords).
 ///
 /// Grammars that wrap each argument in an `argument` node (PHP, C#) are
@@ -705,6 +1020,9 @@ struct Extractor<'a> {
     src: &'a [u8],
     lang: Lang,
     ctx: RouterContext,
+    rpc: RpcContext,
+    /// JS/TS only: the file mentions "grpc" somewhere (TASK-088 gate).
+    grpc_hint: bool,
     opts: ContractOptions,
     out: Vec<ContractCandidate>,
 }
@@ -804,6 +1122,7 @@ impl<'a> Extractor<'a> {
     fn visit_js(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "call_expression" => self.js_call(node, prefix),
+            "pair" => self.js_graphql_pair(node),
             "member_expression" => {
                 self.js_env_member(node);
             }
@@ -819,6 +1138,10 @@ impl<'a> Extractor<'a> {
     }
 
     fn js_call(&mut self, node: Node, prefix: &str) {
+        if self.grpc_hint {
+            self.js_grpc_call(node);
+        }
+        self.js_graphql_call(node);
         let func = node.child_by_field_name("function");
         let args = node.child_by_field_name("arguments");
         let (Some(func), Some(args)) = (func, args) else {
@@ -1191,9 +1514,18 @@ impl<'a> Extractor<'a> {
     fn visit_python(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "decorated_definition" => return self.py_decorated(node, prefix),
-            "call" => self.py_call(node, prefix),
+            "call" => {
+                if self.opts.grpc {
+                    self.python_grpc_call(node);
+                }
+                self.python_graphql_call(node);
+                self.py_call(node, prefix);
+            }
             "subscript" => self.py_env_subscript(node),
             "assignment" => self.py_assignment(node, prefix),
+            "class_definition" if self.opts.grpc => {
+                self.python_grpc_class(node);
+            }
             _ => {}
         }
         prefix.to_string()
@@ -1210,6 +1542,20 @@ impl<'a> Extractor<'a> {
                 continue;
             };
             if dec.kind() != "decorator" {
+                continue;
+            }
+            // TASK-088 graphql: @strawberry.field/@strawberry.mutation and
+            // Ariadne @Query.field("name")/@Mutation.mutation declare
+            // resolvers (providers) — gated at the emit_graphql choke point.
+            if let Some((root, field)) = py_graphql_decorator(dec, def_name, self.src) {
+                let anchor = def_name.unwrap_or(dec);
+                self.emit_graphql(
+                    anchor,
+                    &root,
+                    &field,
+                    ContractRole::Provider,
+                    owning.as_deref(),
+                );
                 continue;
             }
             // TASK-087 job: @app.task / @app.task(name=…) / @shared_task.
@@ -1836,6 +2182,9 @@ impl<'a> Extractor<'a> {
 
     fn visit_go(&mut self, node: Node, prefix: &str) -> String {
         if node.kind() == "call_expression" {
+            if self.opts.grpc {
+                self.go_grpc(node);
+            }
             self.go_call(node, prefix);
         }
         prefix.to_string()
@@ -2096,7 +2445,15 @@ impl<'a> Extractor<'a> {
                 self.rust_attribute(node);
             }
             "call_expression" => {
+                if self.opts.grpc {
+                    self.rust_grpc_call(node);
+                }
                 self.rust_call(node, prefix);
+            }
+            "impl_item" => {
+                if self.opts.grpc {
+                    self.rust_grpc_impl(node);
+                }
             }
             "macro_invocation" => {
                 self.rust_macro(node);
@@ -2374,12 +2731,18 @@ impl<'a> Extractor<'a> {
     fn visit_java(&mut self, node: Node, prefix: &str) -> String {
         match node.kind() {
             "class_declaration" => {
+                if self.opts.grpc {
+                    self.java_grpc_impl_base(node);
+                }
                 return self.java_class(node, prefix);
             }
             "method_declaration" => {
                 self.java_method(node, prefix);
             }
             "method_invocation" => {
+                if self.opts.grpc {
+                    self.java_grpc_call(node);
+                }
                 self.java_call(node, prefix);
             }
             _ => {}
@@ -3463,6 +3826,429 @@ impl<'a> Extractor<'a> {
     fn is_ws_receiver(&self, func: Node) -> bool {
         WS_RECEIVERS.contains(&node_text(Some(js_chain_root(func)), self.src))
     }
+
+    /// Emit one grpc-family contract at `node`'s line (TASK-088 emit choke
+    /// point — the single place the kind is gated).
+    fn emit_grpc(
+        &mut self,
+        node: Node,
+        service: &str,
+        method: &str,
+        role: ContractRole,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.grpc || service.is_empty() || method.is_empty() {
+            return;
+        }
+        let owning = owning
+            .map(str::to_string)
+            .or_else(|| crate::indexer::find_enclosing_function(node, self.src, self.lang));
+        let line = node.start_position().row + 1;
+        self.out.push(grpc_candidate(
+            service,
+            method,
+            role,
+            owning.as_deref(),
+            line,
+        ));
+    }
+
+    /// Emit one provider per member method of a generated service body
+    /// (Java `method_declaration`, Rust `function_item`, Python
+    /// `function_definition` — the loops differ only in the child kind).
+    fn emit_grpc_body_methods(&mut self, body: Node, service: &str, method_kind: &str) {
+        for i in 0..body.child_count() {
+            let Some(m) = body.child(i as u32) else {
+                continue;
+            };
+            if m.kind() != method_kind {
+                continue;
+            }
+            let name_node = m.child_by_field_name("name");
+            let name = node_text(name_node, self.src);
+            if let Some(anchor) = name_node.filter(|_| !name.is_empty()) {
+                self.emit_grpc(anchor, service, name, ContractRole::Provider, Some(name));
+            }
+        }
+    }
+
+    /// Emit one graphql-family contract at `node`'s line (TASK-088 emit
+    /// choke point — the single place the kind is gated). Unlike
+    /// [`Self::emit_grpc`], `owning` is not back-filled from the enclosing
+    /// function: resolver-map properties and decorated definitions carry
+    /// their own ownership semantics, and only operation call sites resolve
+    /// through [`crate::indexer::find_enclosing_function`] before calling
+    /// this.
+    fn emit_graphql(
+        &mut self,
+        node: Node,
+        root: &str,
+        field: &str,
+        role: ContractRole,
+        owning: Option<&str>,
+    ) {
+        if !self.opts.graphql || root.is_empty() || field.is_empty() {
+            return;
+        }
+        let line = node.start_position().row + 1;
+        self.out
+            .push(graphql_candidate(root, field, role, owning, line));
+    }
+
+    // -- grpc generated/server code arms (TASK-088, plan 5.1) ------------------
+
+    /// Java provider: `class X extends <…><S>Grpc.<S>ImplBase` — every member
+    /// method serves one rpc.
+    fn java_grpc_impl_base(&mut self, node: Node) {
+        let sup = node_text(node.child_by_field_name("superclass"), self.src);
+        let Some(service) = sup
+            .split('.')
+            .next_back()
+            .and_then(|last| last.strip_suffix("ImplBase"))
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        self.emit_grpc_body_methods(body, service, "method_declaration");
+    }
+
+    /// Java call sites: `addService(XGrpc.bindService(...))` registers the
+    /// whole service (`*`); bound `stub.M(req)` and inline
+    /// `XGrpc.newBlockingStub(ch).M(req)` consume one method.
+    fn java_grpc_call(&mut self, node: Node) {
+        let name = node_text(node.child_by_field_name("name"), self.src);
+        if name == "addService" {
+            let bind = node
+                .child_by_field_name("arguments")
+                .and_then(|args| positional_arg(args, 0))
+                .filter(|arg| arg.kind() == "method_invocation")
+                .filter(|arg| {
+                    node_text(arg.child_by_field_name("name"), self.src) == "bindService"
+                });
+            if let Some(bind) = bind
+                && let Some(service) =
+                    java_grpc_service_from_object(bind.child_by_field_name("object"), self.src)
+            {
+                self.emit_grpc(node, &service, "*", ContractRole::Provider, None);
+            }
+            return;
+        }
+        let Some(object) = node.child_by_field_name("object") else {
+            return;
+        };
+        // Inline chain: XGrpc.newBlockingStub(ch).M(req)
+        if object.kind() == "method_invocation"
+            && matches!(
+                node_text(object.child_by_field_name("name"), self.src),
+                "newBlockingStub" | "newStub" | "newFutureStub"
+            )
+            && let Some(service) =
+                java_grpc_service_from_object(object.child_by_field_name("object"), self.src)
+        {
+            self.emit_grpc(node, &service, name, ContractRole::Consumer, None);
+            return;
+        }
+        // Bound stub: stub.M(req)
+        let recv = node_text(Some(object), self.src);
+        if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+            self.emit_grpc(node, &service, name, ContractRole::Consumer, None);
+        }
+    }
+
+    /// Go sites: `Register<S>Server(...)` registers the service (`*`);
+    /// bound `client.M(...)` and inline `pb.New<S>Client(conn).M(...)`
+    /// consume one method.
+    fn go_grpc(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        match func.kind() {
+            "identifier" => {
+                if let Some(service) = go_service_from_register(node_text(Some(func), self.src)) {
+                    self.emit_grpc(node, &service, "*", ContractRole::Provider, None);
+                }
+            }
+            "selector_expression" => {
+                let meth = node_text(func.child_by_field_name("field"), self.src);
+                if meth.is_empty() {
+                    return;
+                }
+                // pb.Register<S>Server(...) — qualified registration call.
+                if let Some(service) = go_service_from_register(meth) {
+                    self.emit_grpc(node, &service, "*", ContractRole::Provider, None);
+                    return;
+                }
+                let operand = func.child_by_field_name("operand");
+                if let Some(op) = operand.filter(|op| op.kind() == "call_expression")
+                    && let Some(inner) = op.child_by_field_name("function")
+                    && let Some(service) = go_service_from_new_client(inner, self.src)
+                {
+                    self.emit_grpc(node, &service, meth, ContractRole::Consumer, None);
+                    return;
+                }
+                let recv = node_text(operand, self.src);
+                if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+                    self.emit_grpc(node, &service, meth, ContractRole::Consumer, None);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Rust provider: `impl <path>::<S> for T` — every impl method serves one
+    /// rpc (tonic generates snake_case method names; the join folds casing).
+    /// The trait must be a qualified path: `impl UserService for T` without a
+    /// module path is indistinguishable from any std trait impl.
+    fn rust_grpc_impl(&mut self, node: Node) {
+        let trait_text = node_text(node.child_by_field_name("trait"), self.src);
+        let Some(service) = trait_text
+            .rsplit("::")
+            .next()
+            .filter(|s| trait_text.contains("::") && !s.is_empty())
+        else {
+            return;
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        self.emit_grpc_body_methods(body, service, "function_item");
+    }
+
+    /// Rust consumer: bound `client.m(req)` and inline
+    /// `<S>Client::new(ch).m(req)` (with or without `.await`).
+    fn rust_grpc_call(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() != "field_expression" {
+            return;
+        }
+        let meth = node_text(func.child_by_field_name("field"), self.src);
+        if meth.is_empty() {
+            return;
+        }
+        // This grammar names the receiver field "value" (not "object").
+        let object = func.child_by_field_name("value");
+        // Inline: UserServiceClient::new(ch).get_user(req)
+        if let Some(op) = object.filter(|op| op.kind() == "call_expression")
+            && let Some(inner) = op.child_by_field_name("function")
+            && let Some(ctor) = node_text(Some(inner), self.src).strip_suffix("::new")
+            && let Some(last) = ctor.rsplit("::").next()
+            && let Some(service) = last.strip_suffix("Client").filter(|s| !s.is_empty())
+        {
+            self.emit_grpc(node, service, meth, ContractRole::Consumer, None);
+            return;
+        }
+        let recv = node_text(object, self.src);
+        if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+            self.emit_grpc(node, &service, meth, ContractRole::Consumer, None);
+        }
+    }
+
+    /// Python provider: `class S(<pkg>.<S>Servicer)` — each member def serves
+    /// one rpc; free `add_<S>Servicer_to_server` registers the service (`*`).
+    fn python_grpc_class(&mut self, node: Node) {
+        let bases = node.child_by_field_name("superclasses");
+        let Some(bases) = bases else { return };
+        let mut service: Option<&str> = None;
+        for i in 0..bases.named_child_count() {
+            let Some(base) = bases.named_child(i as u32) else {
+                continue;
+            };
+            let last = node_text(Some(base), self.src)
+                .rsplit('.')
+                .next()
+                .unwrap_or("");
+            if let Some(s) = last.strip_suffix("Servicer").filter(|s| !s.is_empty()) {
+                service = Some(s);
+                break;
+            }
+        }
+        let Some(service) = service else { return };
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        self.emit_grpc_body_methods(body, service, "function_definition");
+    }
+
+    /// Python sites: the free call `add_<S>Servicer_to_server(...)` (the
+    /// generated registration function, imported — never defined here)
+    /// registers the service (`*`); bound `stub.M(req)` consumes a method.
+    fn python_grpc_call(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() == "identifier" {
+            let name = node_text(Some(func), self.src);
+            if let Some(service) = name
+                .strip_prefix("add_")
+                .and_then(|m| m.strip_suffix("_to_server"))
+                .and_then(|m| m.strip_suffix("Servicer"))
+                .filter(|s| !s.is_empty())
+            {
+                self.emit_grpc(node, service, "*", ContractRole::Provider, None);
+            }
+            return;
+        }
+        if func.kind() != "attribute" {
+            return;
+        }
+        let meth = node_text(func.child_by_field_name("attribute"), self.src);
+        if meth.is_empty() {
+            return;
+        }
+        let recv = node_text(func.child_by_field_name("object"), self.src);
+        if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+            self.emit_grpc(node, &service, meth, ContractRole::Consumer, None);
+        }
+    }
+
+    /// JS/TS sites (gated by the file-level grpc marker):
+    /// `addService(<x>.service, …)` registers the service (`*`); bound
+    /// `client.m(arg, cb)` consumes one method.
+    fn js_grpc_call(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() != "member_expression" {
+            return;
+        }
+        let prop = node_text(func.child_by_field_name("property"), self.src);
+        if prop.is_empty() {
+            return;
+        }
+        if prop == "addService" {
+            let svc = node
+                .child_by_field_name("arguments")
+                .and_then(|args| positional_arg(args, 0))
+                .map(|arg| node_text(Some(arg), self.src).to_string())
+                .and_then(|text| text.strip_suffix(".service").map(str::to_string))
+                .filter(|s| !s.is_empty());
+            if let Some(service) = svc {
+                self.emit_grpc(node, &service, "*", ContractRole::Provider, None);
+            }
+            return;
+        }
+        let recv = node_text(func.child_by_field_name("object"), self.src);
+        if let Some(service) = self.rpc.stubs.get(recv).cloned() {
+            self.emit_grpc(node, &service, prop, ContractRole::Consumer, None);
+        }
+    }
+
+    // -- graphql arms (TASK-088, plan 5.3) --------------------------------------
+
+    /// JS/TS resolver map: `Query: { user: (…) => … }` — each inner property
+    /// of a Query/Mutation/Subscription key declares one resolver.
+    fn js_graphql_pair(&mut self, node: Node) {
+        let key = node_text(node.child_by_field_name("key"), self.src);
+        if !matches!(key, "Query" | "Mutation" | "Subscription") {
+            return;
+        }
+        let Some(value) = node
+            .child_by_field_name("value")
+            .filter(|v| v.kind() == "object")
+        else {
+            return;
+        };
+        for i in 0..value.child_count() {
+            let Some(p) = value.child(i as u32) else {
+                continue;
+            };
+            if p.kind() != "pair" {
+                continue;
+            }
+            let field = node_text(p.child_by_field_name("key"), self.src);
+            self.emit_graphql(p, key, field, ContractRole::Provider, None);
+        }
+    }
+
+    /// JS/TS operation call sites: `gql`…`` / `graphql`…`` tagged templates
+    /// (rendered as calls with a template argument) and Apollo-style
+    /// `client.query({query: '…'})` / `.mutate(…)` / `.subscribe(…)` with
+    /// an operation string. The mini-parser is the gate — plain look-alike
+    /// strings parse to nothing and are ignored.
+    fn js_graphql_call(&mut self, node: Node) {
+        let Some(func) = node.child_by_field_name("function") else {
+            return;
+        };
+        let Some(args) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        match func.kind() {
+            "identifier" if matches!(node_text(Some(func), self.src), "gql" | "graphql") => {
+                let text = if args.kind() == "template_string" {
+                    Some(template_content(args, self.src))
+                } else {
+                    args.named_child(0)
+                        .filter(|a| a.kind() == "template_string")
+                        .map(|a| template_content(a, self.src))
+                };
+                if let Some(text) = text {
+                    self.emit_graphql_ops(node, &text);
+                }
+            }
+            "member_expression" => {
+                let prop = node_text(func.child_by_field_name("property"), self.src);
+                if !matches!(prop, "query" | "mutate" | "subscribe") {
+                    return;
+                }
+                for i in 0..args.named_child_count() {
+                    let Some(arg) = args.named_child(i as u32) else {
+                        continue;
+                    };
+                    let text = match arg.kind() {
+                        "string" => Some(string_content(arg, self.src)),
+                        "template_string" => Some(template_content(arg, self.src)),
+                        "object" => js_object_operation_string(arg, self.src),
+                        _ => None,
+                    };
+                    if let Some(text) = text {
+                        self.emit_graphql_ops(node, &text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit one consumer per top-level field of a parsed GraphQL operation.
+    /// Gated at the [`Self::emit_graphql`] choke point.
+    fn emit_graphql_ops(&mut self, node: Node, text: &str) {
+        let Some(ops) = parse_graphql_operation(text) else {
+            return;
+        };
+        let owning = crate::indexer::find_enclosing_function(node, self.src, self.lang);
+        for (root, field) in ops {
+            self.emit_graphql(
+                node,
+                &root,
+                &field,
+                ContractRole::Consumer,
+                owning.as_deref(),
+            );
+        }
+    }
+
+    /// Python `gql("query { user }")` operation call site.
+    fn python_graphql_call(&mut self, node: Node) {
+        let is_gql = node
+            .child_by_field_name("function")
+            .filter(|f| f.kind() == "identifier")
+            .is_some_and(|f| node_text(Some(f), self.src) == "gql");
+        if !is_gql {
+            return;
+        }
+        let text = node
+            .child_by_field_name("arguments")
+            .and_then(|args| positional_arg(args, 0))
+            .and_then(|arg| py_string_content(arg, self.src));
+        if let Some(text) = text {
+            self.emit_graphql_ops(node, &text);
+        }
+    }
 }
 
 /// Whether `node` is the left-hand side of an assignment of kind
@@ -4393,6 +5179,982 @@ fn stage_ensure_shape(path: &str) -> Option<String> {
     Some(shaped)
 }
 
+// ---------------------------------------------------------------------------
+// Document contracts (TASK-088, DQ1): .proto/.graphql/.yaml/.json documents
+//
+// No new crates (§4.24 constraint): these files get tiny line-oriented
+// scanners over the raw text instead of a grammar. Files that yield no
+// candidates stay un-indexed exactly as before — only contract-bearing
+// documents gain a files row, which TASK-083 uses as its re-index anchor.
+// ---------------------------------------------------------------------------
+
+/// A document file kind recognized by extension (TASK-088).
+///
+/// `Proto` covers `.proto`; `Graphql` covers `.graphql`/`.gql`; `OpenApi`
+/// covers `.yaml`/`.yml`/`.json` pending a content sniff — the extension
+/// alone never proves OpenAPI, so CI/compose/package files that fail the
+/// sniff yield no candidates and stay un-indexed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentKind {
+    /// Protocol-buffer IDL (`.proto`).
+    Proto,
+    /// GraphQL SDL or operation document (`.graphql`/`.gql`).
+    Graphql,
+    /// OpenAPI specification (`.yaml`/`.yml`/`.json`, content-sniffed).
+    OpenApi,
+}
+
+impl DocumentKind {
+    /// Language name stored in `files.language` and `meta.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocumentKind::Proto => "Proto",
+            DocumentKind::Graphql => "GraphQL",
+            DocumentKind::OpenApi => "OpenApi",
+        }
+    }
+}
+
+/// Whether `path` is a document file the contract scanner should read.
+///
+/// Extension gate only. Note this is separate from
+/// [`crate::indexer::detect_language`]: a `.yaml` file is a document kind
+/// here while remaining `None` (unparseable) to the grammar indexer. The
+/// negative-case bounds (lock files, size cap) live in
+/// [`scannable_document_kind`].
+pub fn document_kind(path: &std::path::Path) -> Option<DocumentKind> {
+    let ext = path.extension()?.to_str()?;
+    match ext {
+        "proto" => Some(DocumentKind::Proto),
+        "graphql" | "gql" => Some(DocumentKind::Graphql),
+        "yaml" | "yml" | "json" => Some(DocumentKind::OpenApi),
+        _ => None,
+    }
+}
+
+/// Upper bound on a document file's byte size for contract scanning:
+/// real proto/GraphQL/OpenAPI documents are at most a few hundred KB, while
+/// their larger `.json`/`.yaml` siblings (data dumps, generated files) can
+/// only produce a guaranteed-null sniff — they stay un-indexed, exactly as
+/// before the document path existed.
+pub const MAX_DOCUMENT_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Lock/data files that match a document extension (or one day will) but
+/// never carry contracts; skipped by name before any read. Several of these
+/// carry no extension today — they are listed anyway so the set stays the
+/// single answer to "which root files does the document path ignore".
+const DOCUMENT_SKIP_FILE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "Cargo.lock",
+    "poetry.lock",
+];
+
+/// Whether `path` is a document file the contract scanner should actually
+/// read: [`document_kind`]'s extension gate bounded for the negative case —
+/// known lock/data file names are skipped outright, and files above
+/// [`MAX_DOCUMENT_SCAN_BYTES`] stay un-indexed (a path whose size cannot be
+/// read classifies by extension; the subsequent read fails and the file
+/// stays un-indexed).
+pub fn scannable_document_kind(path: &std::path::Path) -> Option<DocumentKind> {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && DOCUMENT_SKIP_FILE_NAMES.contains(&name)
+    {
+        return None;
+    }
+    let oversized = std::fs::metadata(path)
+        .map(|m| m.len() > MAX_DOCUMENT_SCAN_BYTES)
+        .unwrap_or(false);
+    if oversized {
+        return None;
+    }
+    document_kind(path)
+}
+
+/// Extract contract candidates from a document file's text (TASK-088).
+///
+/// Each kind is gated by its `ContractOptions` flag; a document that yields
+/// no candidates returns empty and the file stays un-indexed (pipeline
+/// treats that as "no FileResult").
+pub fn extract_document_contracts(
+    kind: DocumentKind,
+    content: &str,
+    opts: &ContractOptions,
+) -> Vec<ContractCandidate> {
+    match kind {
+        DocumentKind::Proto if opts.grpc => proto_providers(content),
+        DocumentKind::Graphql if opts.graphql => graphql_document_contracts(content),
+        DocumentKind::OpenApi if opts.openapi => openapi_providers(content),
+        _ => Vec::new(),
+    }
+}
+
+/// One `service` block found by the proto scanner.
+struct ProtoService {
+    /// Service name as written (package qualification is never composed —
+    /// the canonical join relaxes it at match time instead).
+    service: String,
+    /// `(method name, 1-based line)` per `rpc` declaration.
+    methods: Vec<(String, usize)>,
+}
+
+/// Scan a proto document for `service` blocks and their `rpc` methods
+/// (plan 5.2). Line-oriented and comment-aware; `extend` blocks are not
+/// services; rpc bodies with option blocks keep the service open until its
+/// own closing brace (brace-depth tracking).
+fn parse_proto_services(content: &str) -> Vec<ProtoService> {
+    let mut services = Vec::new();
+    let mut current: Option<ProtoService> = None;
+    let mut depth: i64 = 0;
+    for (idx, raw) in strip_proto_comments(content).iter().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if depth <= 0 {
+            if let Some(name) = proto_service_opener(line) {
+                let mut svc = ProtoService {
+                    service: name,
+                    methods: Vec::new(),
+                };
+                collect_proto_rpcs(line, line_no, &mut svc.methods);
+                depth = brace_delta(line);
+                if depth <= 0 {
+                    services.push(svc);
+                } else {
+                    current = Some(svc);
+                }
+            }
+        } else if let Some(svc) = current.as_mut() {
+            collect_proto_rpcs(line, line_no, &mut svc.methods);
+            depth += brace_delta(line);
+            if depth <= 0 {
+                services.push(current.take().expect("open service"));
+            }
+        }
+    }
+    services
+}
+
+/// Provider candidates for every method of every service in a proto document.
+fn proto_providers(content: &str) -> Vec<ContractCandidate> {
+    let mut out = Vec::new();
+    for svc in parse_proto_services(content) {
+        for (method, line) in svc.methods {
+            out.push(grpc_candidate(
+                &svc.service,
+                &method,
+                ContractRole::Provider,
+                None,
+                line,
+            ));
+        }
+    }
+    out
+}
+
+/// Build one grpc-family candidate with the canonical ID
+/// `grpc::<service>::<method>` (developer spelling preserved — the join, not
+/// the ID, tolerates qualification and casing).
+fn grpc_candidate(
+    service: &str,
+    method: &str,
+    role: ContractRole,
+    owning: Option<&str>,
+    line: usize,
+) -> ContractCandidate {
+    ContractCandidate {
+        kind: ContractKind::Grpc,
+        role,
+        qualifier: service.to_string(),
+        identifier: method.to_string(),
+        canonical_id: canonical_contract_id(ContractKind::Grpc, service, method),
+        params: Vec::new(),
+        owning_symbol: owning.map(str::to_string),
+        line,
+        confidence: CONFIDENCE_FRAMEWORK,
+    }
+}
+
+/// Contracts of a `.graphql`/`.gql` document (TASK-088): an SDL document
+/// yields resolvers (providers) for the root operation types; an operation
+/// document yields consumers for its top-level fields.
+fn graphql_document_contracts(content: &str) -> Vec<ContractCandidate> {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("query")
+        || trimmed.starts_with("mutation")
+        || trimmed.starts_with("subscription")
+        || trimmed.starts_with('{')
+    {
+        let mut out = Vec::new();
+        if let Some(ops) = parse_graphql_operation(content) {
+            for (root, field) in ops {
+                out.push(graphql_candidate(
+                    &root,
+                    &field,
+                    ContractRole::Consumer,
+                    None,
+                    1,
+                ));
+            }
+        }
+        return out;
+    }
+    scan_graphql_document(content)
+        .into_iter()
+        .map(|(root, field, line)| {
+            graphql_candidate(&root, &field, ContractRole::Provider, None, line)
+        })
+        .collect()
+}
+
+/// One root-type field found by the SDL scan: `(root, field, 1-based line)`.
+type GraphqlSdlField = (String, String, usize);
+
+/// Scan an SDL document for `type Query|Mutation|Subscription {` and
+/// `extend type <Root> {` blocks; each field definition inside yields one
+/// resolver. Non-root types (`type User`) are ignored. One-line blocks
+/// (`type Query { base: String }`) scan their inline field.
+fn scan_graphql_document(content: &str) -> Vec<GraphqlSdlField> {
+    let mut out = Vec::new();
+    let mut root: Option<String> = None;
+    for (idx, raw) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if let Some(root_name) = root.as_ref() {
+            if line.starts_with('}') {
+                root = None;
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let name: String = line
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.push((root_name.clone(), name, line_no));
+            }
+            continue;
+        }
+        if let Some(root_name) = sdl_root_opener(line) {
+            // One-line block? Scan the inline field and stay outside.
+            let after_brace = line.split_once('{').map(|(_, rest)| rest).unwrap_or("");
+            if let Some(close) = after_brace.rfind('}') {
+                let inner = after_brace[..close].trim();
+                let name: String = inner
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    out.push((root_name, name, line_no));
+                }
+            } else {
+                root = Some(root_name);
+            }
+        }
+    }
+    out
+}
+
+/// `type Query {` / `extend type Mutation {` opener for a root operation
+/// type; `None` for other declarations.
+fn sdl_root_opener(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("extend type ")
+        .or_else(|| line.strip_prefix("type "))?;
+    let name: String = rest
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
+        .collect();
+    if !line.contains('{') {
+        return None;
+    }
+    match name.as_str() {
+        "Query" | "Mutation" | "Subscription" => Some(name),
+        _ => None,
+    }
+}
+
+/// Build one graphql candidate: `graphql::<Root>::<field>` with the root
+/// operation type capitalized (plan 4).
+fn graphql_candidate(
+    root: &str,
+    field: &str,
+    role: ContractRole,
+    owning: Option<&str>,
+    line: usize,
+) -> ContractCandidate {
+    ContractCandidate {
+        kind: ContractKind::Graphql,
+        role,
+        qualifier: root.to_string(),
+        identifier: field.to_string(),
+        canonical_id: canonical_contract_id(ContractKind::Graphql, root, field),
+        params: Vec::new(),
+        owning_symbol: owning.map(str::to_string),
+        line,
+        confidence: CONFIDENCE_FRAMEWORK,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI scanner (TASK-088, plan 5.4): one line-oriented scanner for YAML
+// and pretty-printed JSON documents
+// ---------------------------------------------------------------------------
+
+/// One operation found by the OpenAPI scan: `(method, raw path, 1-based
+/// line)`.
+struct OpenApiOperation {
+    method: String,
+    raw_path: String,
+    line: usize,
+}
+
+/// Whether a document carries a top-level `openapi:`/`swagger:` version key
+/// and a `paths:` block. Multi-document YAML (`---` separators) is skipped —
+/// extraction, not validation.
+fn looks_like_openapi(content: &str) -> bool {
+    let mut version = false;
+    let mut paths = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t == "---" {
+            return false;
+        }
+        match key_name(line) {
+            Some("openapi") | Some("swagger") => version = true,
+            Some("paths") => paths = true,
+            _ => {}
+        }
+    }
+    version && paths
+}
+
+/// Key name of a YAML/JSON line (`paths:`, `"paths": {`): trimmed, quotes
+/// stripped, text before the first `:`. `None` for blank/comment/brace-only
+/// lines and empty keys. Borrows from `line` — the OpenAPI sniff runs over
+/// every line of files that usually are not OpenAPI, so it must not
+/// allocate.
+fn key_name(line: &str) -> Option<&str> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') || matches!(t, "{" | "}" | "[" | "]" | "," | "},") {
+        return None;
+    }
+    let head = t.split(':').next()?;
+    let name = head.trim_matches(|c| c == '"' || c == '\'').trim();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Leading-space count of a line (YAML forbids tab indentation).
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// HTTP method tokens legal as OpenAPI path-item keys.
+const OPENAPI_METHODS: &[&str] = &[
+    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+];
+
+/// Scan an OpenAPI document's `paths:` block: path keys sit one indent deeper
+/// than `paths:`, method keys one level deeper again. Flow-style `{}` maps
+/// and multi-document YAML are skipped by construction.
+fn scan_openapi_document(content: &str) -> Vec<OpenApiOperation> {
+    if !looks_like_openapi(content) {
+        return Vec::new();
+    }
+    let mut ops = Vec::new();
+    // 0 = outside paths, 1 = inside paths, 2 = inside a path item.
+    let mut state = 0u8;
+    let mut paths_indent = 0usize;
+    let mut path = String::new();
+    let mut path_indent = 0usize;
+    for (idx, raw) in content.lines().enumerate() {
+        if raw.trim().is_empty() || raw.trim_start_matches(' ').starts_with('#') {
+            continue;
+        }
+        // Transitions re-enter the parent state on the same line, so a
+        // dedent past one level lands in the right handler.
+        loop {
+            match state {
+                0 => {
+                    if key_name(raw) == Some("paths") {
+                        paths_indent = indent_of(raw);
+                        state = 1;
+                    }
+                    break;
+                }
+                1 => {
+                    if indent_of(raw) <= paths_indent {
+                        state = 0;
+                        continue;
+                    }
+                    if let Some(key) = key_name(raw).filter(|k| k.starts_with('/')) {
+                        path = key.to_string();
+                        path_indent = indent_of(raw);
+                        state = 2;
+                    }
+                    break;
+                }
+                _ => {
+                    if indent_of(raw) <= path_indent {
+                        state = 1;
+                        continue;
+                    }
+                    if let Some(key) = key_name(raw)
+                        && OPENAPI_METHODS.contains(&key)
+                    {
+                        ops.push(OpenApiOperation {
+                            method: key.to_string(),
+                            raw_path: path.clone(),
+                            line: idx + 1,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    ops
+}
+
+/// Provider candidates for every operation of an OpenAPI document
+/// (`openapi::<METHOD>::<path>`, positional `{pN}` markers, params as
+/// metadata — the HTTP pipeline verbatim, only the kind differs).
+fn openapi_providers(content: &str) -> Vec<ContractCandidate> {
+    scan_openapi_document(content)
+        .into_iter()
+        .filter_map(|op| {
+            let norm = normalize_http_path(&op.raw_path)?;
+            let qualifier = normalize_method(&op.method);
+            Some(ContractCandidate {
+                kind: ContractKind::Openapi,
+                role: ContractRole::Provider,
+                canonical_id: canonical_contract_id(ContractKind::Openapi, &qualifier, &norm.path),
+                qualifier,
+                identifier: norm.path,
+                params: norm
+                    .params
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| PathParam {
+                        position: i + 1,
+                        name,
+                    })
+                    .collect(),
+                owning_symbol: None,
+                line: op.line,
+                confidence: CONFIDENCE_FRAMEWORK,
+            })
+        })
+        .collect()
+}
+
+/// Blank out `//` line comments and `/* */` block comments, preserving line
+/// structure so line numbers stay meaningful.
+fn strip_proto_comments(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut in_block = false;
+    for line in content.lines() {
+        let mut out = String::with_capacity(line.len());
+        let bytes: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_block {
+                if c == '*' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                    in_block = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                break;
+            } else if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == '*' {
+                in_block = true;
+                i += 2;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        lines.push(out);
+    }
+    lines
+}
+
+/// `service <Name> {` opener — returns the bare service name, or `None` for
+/// `extend` and other declarations.
+fn proto_service_opener(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("service")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name: String = rest
+        .trim()
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '{')
+        .collect();
+    if name.is_empty() || !line.contains('{') {
+        return None;
+    }
+    Some(name)
+}
+
+/// Record every `rpc <Name>(` occurrence on a line (usually one per line).
+fn collect_proto_rpcs(line: &str, line_no: usize, methods: &mut Vec<(String, usize)>) {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        if *tok == "rpc"
+            && let Some(name) = tokens.get(i + 1)
+            && !name.is_empty()
+        {
+            let method: String = name
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !method.is_empty() {
+                methods.push((method, line_no));
+            }
+        }
+    }
+}
+
+/// Net brace delta of a line (option blocks inside rpc bodies keep the
+/// service depth accurate).
+fn brace_delta(line: &str) -> i64 {
+    line.chars().fold(0i64, |d, c| match c {
+        '{' => d + 1,
+        '}' => d - 1,
+        _ => d,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GraphQL mini-parser and SDL scan (TASK-088, plan 5.3)
+// ---------------------------------------------------------------------------
+
+/// Parse one GraphQL operation, returning `(root, field)` pairs for its
+/// top-level selection set (TASK-088).
+///
+/// Recognizes `query|mutation|subscription [Name][(args)] {…}` plus the
+/// shorthand `{…}` (implicitly Query). Field arguments, aliases (`alias:`),
+/// and nested selection sets are skipped; only depth-0 field names are
+/// returned. Returns `None` when the text is not an operation — callers use
+/// that to ignore plain look-alike strings. Only the FIRST operation in the
+/// text is parsed (documents with several operations are rare; extraction,
+/// not validation).
+fn parse_graphql_operation(text: &str) -> Option<Vec<(String, String)>> {
+    let t = text.trim();
+    let (root, rest) = if let Some(r) = t.strip_prefix("query") {
+        ("Query", r)
+    } else if let Some(r) = t.strip_prefix("mutation") {
+        ("Mutation", r)
+    } else if let Some(r) = t.strip_prefix("subscription") {
+        ("Subscription", r)
+    } else if t.starts_with('{') {
+        ("Query", t)
+    } else {
+        return None;
+    };
+    if !rest.starts_with(|c: char| c.is_whitespace() || c == '(' || c == '{') {
+        // `queryx {…}` — an identifier, not the keyword.
+        return None;
+    }
+    // Skip the optional operation name and variable declarations.
+    let rest = rest.trim_start();
+    let name_len = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .count();
+    let rest = rest[name_len..].trim_start();
+    let rest = skip_balanced(rest, '(', ')')?.trim_start();
+    let body = rest.strip_prefix('{')?;
+    Some(
+        top_level_fields(body)
+            .into_iter()
+            .map(|f| (root.to_string(), f))
+            .collect(),
+    )
+}
+
+/// Skip a balanced `open…close` group at the start of `s` (whitespace
+/// trimmed); `None` when unbalanced.
+fn skip_balanced(s: &str, open: char, close: char) -> Option<&str> {
+    let s = s.trim_start();
+    if !s.starts_with(open) {
+        return Some(s);
+    }
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&s[i + c.len_utf8()..]);
+            }
+        }
+    }
+    None
+}
+
+/// Depth-0 field names of a selection-set body (the text after the opening
+/// `{`). Field arguments, nested selection sets, aliases (`alias: field`
+/// reports `field`), and spreads (`...name`) are skipped.
+fn top_level_fields(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut fields = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '{' => {
+                depth += 1;
+                i += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    break;
+                }
+                i += 1;
+            }
+            '(' => {
+                // Balanced argument group (may nest default values).
+                let mut d = 0i32;
+                while i < chars.len() {
+                    if chars[i] == '(' {
+                        d += 1;
+                    } else if chars[i] == ')' {
+                        d -= 1;
+                    }
+                    i += 1;
+                    if d == 0 {
+                        break;
+                    }
+                }
+            }
+            _ if depth == 0 && (c.is_ascii_alphanumeric() || c == '_') => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let is_spread = start > 0 && chars[start - 1] == '.';
+                if is_spread {
+                    continue;
+                }
+                let name: String = chars[start..i].iter().collect();
+                // Alias? `alias: field` — the next identifier is the field.
+                let mut j = i;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ':' {
+                    continue;
+                }
+                fields.push(name);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    fields
+}
+
+/// The `query`/`mutation`/`subscription` string property of an Apollo-style
+/// options object argument (JS).
+fn js_object_operation_string(obj: Node, src: &[u8]) -> Option<String> {
+    for i in 0..obj.named_child_count() {
+        let Some(p) = obj.named_child(i as u32) else {
+            continue;
+        };
+        if p.kind() != "pair" {
+            continue;
+        }
+        let key = node_text(p.child_by_field_name("key"), src);
+        if !matches!(key, "query" | "mutation" | "subscription") {
+            continue;
+        }
+        let v = p.child_by_field_name("value")?;
+        return match v.kind() {
+            "string" => Some(string_content(v, src)),
+            "template_string" => Some(template_content(v, src)),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// GraphQL resolver decorators (Python): `@strawberry.field` /
+/// `@strawberry.mutation` / `@strawberry.subscription` name the field after
+/// the function; Ariadne `@Query.field("name")` / `@Mutation.mutation`
+/// after the string argument. Returns `(root, field)`.
+fn py_graphql_decorator(dec: Node, def_name: Option<Node>, src: &[u8]) -> Option<(String, String)> {
+    let inner = dec.named_child(0)?;
+    let def = node_text(def_name, src);
+    match inner.kind() {
+        // @strawberry.field (no call)
+        "attribute" => {
+            let obj = node_text(inner.child_by_field_name("object"), src);
+            let attr = node_text(inner.child_by_field_name("attribute"), src);
+            let root = match (obj, attr) {
+                ("strawberry", "field") => "Query",
+                ("strawberry", "mutation") => "Mutation",
+                ("strawberry", "subscription") => "Subscription",
+                _ => return None,
+            };
+            if def.is_empty() {
+                return None;
+            }
+            Some((root.to_string(), def.to_string()))
+        }
+        // @Query.field("name") / @Mutation.mutation("name") (Ariadne)
+        "call" => {
+            let f = inner.child_by_field_name("function")?;
+            if f.kind() != "attribute" {
+                return None;
+            }
+            let root = match node_text(f.child_by_field_name("object"), src) {
+                r @ ("Query" | "Mutation" | "Subscription") => r,
+                _ => return None,
+            };
+            let arg_name = inner
+                .child_by_field_name("arguments")
+                .and_then(|args| positional_arg(args, 0))
+                .and_then(|a| py_string_content(a, src));
+            let field = match arg_name {
+                Some(name) if !name.is_empty() => name,
+                _ if !def.is_empty() => def.to_string(),
+                _ => return None,
+            };
+            Some((root.to_string(), field))
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RPC canonical join (TASK-088, DQ2/DQ3, PRD-CTR-REQ-024)
+//
+// The SECOND matching pass, after exact canonical-ID equality. IDL
+// definitions and generated stubs disagree on package qualification, method
+// casing, and service- vs method-level registration; this pure in-memory
+// join recovers those pairs. Candidates with an exact counterpart in their
+// own workspace are EXCLUDED — the first pass (equality join, TASK-084)
+// owns them and is never overridden. Workspace equality on normalized
+// identifiers is the REQ-014 guard: the join relaxes names, never scope.
+// ---------------------------------------------------------------------------
+
+/// Whether `kind` belongs to the RPC family the canonical join pairs
+/// (PRD-CTR-REQ-024): gRPC today; Thrift and tRPC flip this arm when added.
+pub fn is_rpc_family(kind: ContractKind) -> bool {
+    matches!(kind, ContractKind::Grpc)
+}
+
+/// Normalize a workspace identifier for comparison: trim surrounding
+/// whitespace and case-fold (PRD-CTR-REQ-019).
+pub fn normalize_workspace_id(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+/// One workspace's contracts offered to the canonical join.
+///
+/// `workspace` is the declared identifier (pre-normalized — the join folds
+/// it itself); the join never fabricates one (PRD-CTR-REQ-015's repo-name
+/// defaulting happens at scope construction, TASK-084).
+pub struct RpcJoinScope<'a> {
+    /// Workspace identifier as declared.
+    pub workspace: String,
+    /// Contract candidates of that workspace (mixed kinds/roles allowed).
+    pub candidates: &'a [ContractCandidate],
+}
+
+/// Which tolerance recovered a relaxed pair (PRD-CTR-REQ-024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcMatchBasis {
+    /// Service names differ only by package qualification
+    /// (`users.v1.UserService` vs `UserService` — compared on the last
+    /// dot-segment, case-folded).
+    PackageQualifiedService,
+    /// Method names differ only by casing (`get_user` vs `GetUser`).
+    CaseFoldedMethod,
+    /// The provider registered the whole service (`*` identifier) and
+    /// pairs with any method-level consumer of that service.
+    ServiceLevelProvider,
+}
+
+/// One side of a relaxed link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcJoinSide {
+    /// Canonical ID of the matched candidate (developer spelling).
+    pub canonical_id: String,
+    /// Workspace the candidate lives in (as declared).
+    pub workspace: String,
+    /// Provider or consumer.
+    pub role: ContractRole,
+}
+
+/// A provider↔consumer pair recovered by the second matching pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcJoin {
+    /// The serving side.
+    pub provider: RpcJoinSide,
+    /// The calling side.
+    pub consumer: RpcJoinSide,
+    /// Why the pair matched despite unequal canonical IDs.
+    pub basis: RpcMatchBasis,
+}
+
+/// Run the canonical join over workspace-scoped candidate slices.
+///
+/// Deterministic: consumers are visited in input order (scope order, then
+/// candidate order); the best provider is method-level before service-level,
+/// then the lowest (scope, candidate) index. Pure — no storage, no mutation.
+pub fn canonical_rpc_join(scopes: &[RpcJoinScope]) -> Vec<RpcJoin> {
+    use std::collections::{HashMap, HashSet};
+
+    // Exact ID sets per role and normalized workspace: a candidate whose
+    // canonical ID has an OPPOSITE-ROLE counterpart in its own workspace
+    // belongs to the first pass and never enters the join.
+    let mut provider_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut consumer_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    for scope in scopes {
+        let ws = normalize_workspace_id(&scope.workspace);
+        for cand in scope.candidates {
+            if !is_rpc_family(cand.kind) {
+                continue;
+            }
+            let slot = if cand.role == ContractRole::Provider {
+                &mut provider_ids
+            } else {
+                &mut consumer_ids
+            };
+            slot.entry(ws.clone())
+                .or_default()
+                .insert(cand.canonical_id.clone());
+        }
+    }
+
+    // Participants, with their scope index for deterministic tie-breaks.
+    let mut providers: Vec<(usize, usize, String, &ContractCandidate)> = Vec::new();
+    let mut consumers: Vec<(usize, usize, String, &ContractCandidate)> = Vec::new();
+    for (si, scope) in scopes.iter().enumerate() {
+        let ws = normalize_workspace_id(&scope.workspace);
+        for (ci, cand) in scope.candidates.iter().enumerate() {
+            if !is_rpc_family(cand.kind) {
+                continue;
+            }
+            // Only an opposite-role exact counterpart excludes.
+            let exact_other = match cand.role {
+                ContractRole::Provider => &consumer_ids,
+                ContractRole::Consumer => &provider_ids,
+            };
+            if exact_other
+                .get(&ws)
+                .is_some_and(|ids| ids.contains(&cand.canonical_id))
+            {
+                continue;
+            }
+            let slot = if cand.role == ContractRole::Provider {
+                &mut providers
+            } else {
+                &mut consumers
+            };
+            slot.push((si, ci, ws.clone(), cand));
+        }
+    }
+
+    let mut joins = Vec::new();
+    for (csi, _cci, cws, consumer) in &consumers {
+        // Best provider: method-level before service-level, then the lowest
+        // (scope, candidate) index.
+        let mut best: Option<(u8, &ContractCandidate, usize, RpcMatchBasis)> = None;
+        for (psi, _pci, pws, provider) in &providers {
+            if pws != cws {
+                continue;
+            }
+            let Some(basis) = rpc_relaxed_match(consumer, provider) else {
+                continue;
+            };
+            let rank = u8::from(basis != RpcMatchBasis::ServiceLevelProvider);
+            let better = match best {
+                None => true,
+                // Strictly better rank only: equal rank keeps the earlier
+                // provider (lowest (scope, candidate) index).
+                Some((r, _, _, _)) => rank > r,
+            };
+            if better {
+                best = Some((rank, provider, *psi, basis));
+            }
+        }
+        if let Some((_, provider, psi, basis)) = best {
+            joins.push(RpcJoin {
+                provider: RpcJoinSide {
+                    canonical_id: provider.canonical_id.clone(),
+                    workspace: scopes[psi].workspace.clone(),
+                    role: ContractRole::Provider,
+                },
+                consumer: RpcJoinSide {
+                    canonical_id: consumer.canonical_id.clone(),
+                    workspace: scopes[*csi].workspace.clone(),
+                    role: ContractRole::Consumer,
+                },
+                basis,
+            });
+        }
+    }
+    joins
+}
+
+/// Relaxed match of one consumer against one provider (both RPC family):
+/// service compared on the last dot-segment case-folded, method case-folded,
+/// `*` = service-level registration. IDs are never rewritten here — only
+/// compared tolerantly.
+fn rpc_relaxed_match(
+    consumer: &ContractCandidate,
+    provider: &ContractCandidate,
+) -> Option<RpcMatchBasis> {
+    let consumer_service = last_segment_folded(&consumer.qualifier)?;
+    let provider_service = last_segment_folded(&provider.qualifier)?;
+    if consumer_service != provider_service {
+        return None;
+    }
+    if provider.identifier == "*" {
+        return Some(RpcMatchBasis::ServiceLevelProvider);
+    }
+    if rpc_method_key(&provider.identifier) == rpc_method_key(&consumer.identifier) {
+        return Some(if provider.qualifier != consumer.qualifier {
+            RpcMatchBasis::PackageQualifiedService
+        } else {
+            RpcMatchBasis::CaseFoldedMethod
+        });
+    }
+    None
+}
+
+/// Match key for an RPC method name: case-folded with word separators
+/// (`_`) removed, so the proto spelling, camelCase stubs, and tonic's
+/// snake_case impls of one method compare equal
+/// (`get_user` = `GetUser` = `getUser`).
+fn rpc_method_key(method: &str) -> String {
+    method
+        .chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Last dot-segment of a service qualifier, case-folded for comparison.
+fn last_segment_folded(qualifier: &str) -> Option<String> {
+    let last = qualifier.trim().rsplit('.').next()?.trim().to_lowercase();
+    if last.is_empty() { None } else { Some(last) }
+}
+
 #[cfg(test)]
 mod extract_test_helpers {
     use super::*;
@@ -4579,6 +6341,9 @@ mod tests {
         assert!(opts.enabled(ContractKind::Queue));
         assert!(opts.enabled(ContractKind::WebSocket));
         assert!(opts.enabled(ContractKind::Job));
+        assert!(opts.enabled(ContractKind::Grpc));
+        assert!(opts.enabled(ContractKind::Graphql));
+        assert!(opts.enabled(ContractKind::Openapi));
     }
 
     #[test]
@@ -4589,6 +6354,9 @@ mod tests {
             queue: false,
             websocket: true,
             job: false,
+            grpc: false,
+            graphql: true,
+            openapi: false,
         };
         let opts = ContractOptions::from(&cfg);
         assert!(opts.enabled(ContractKind::Http));
@@ -4596,6 +6364,9 @@ mod tests {
         assert!(!opts.enabled(ContractKind::Queue));
         assert!(opts.enabled(ContractKind::WebSocket));
         assert!(!opts.enabled(ContractKind::Job));
+        assert!(!opts.enabled(ContractKind::Grpc));
+        assert!(opts.enabled(ContractKind::Graphql));
+        assert!(!opts.enabled(ContractKind::Openapi));
     }
 
     #[test]
@@ -4617,6 +6388,9 @@ mod tests {
             queue: false,
             websocket: false,
             job: false,
+            grpc: false,
+            graphql: false,
+            openapi: false,
         };
         assert!(extract_with(Lang::JavaScript, src, &opts).is_empty());
     }
@@ -7717,6 +9491,9 @@ agenda.define('email-send', fn);
             queue: false,
             websocket: false,
             job: false,
+            grpc: false,
+            graphql: false,
+            openapi: false,
         };
         assert!(extract_with(Lang::JavaScript, src, &all_off).is_empty());
     }
@@ -7732,5 +9509,1057 @@ agenda.define('email-send', fn);
         assert_eq!(http.len(), 1);
         assert_eq!(http[0].kind, ContractKind::Http);
         assert_eq!(http[0].confidence, 0.5);
+    }
+
+    // -- document kinds (TASK-088, DQ1) ----------------------------------------
+
+    #[test]
+    fn document_kind_extension_gate() {
+        use crate::contracts::{DocumentKind, document_kind};
+        use std::path::Path;
+        assert_eq!(
+            document_kind(Path::new("proto/users.proto")),
+            Some(DocumentKind::Proto)
+        );
+        assert_eq!(
+            document_kind(Path::new("schema.graphql")),
+            Some(DocumentKind::Graphql)
+        );
+        assert_eq!(
+            document_kind(Path::new("queries.gql")),
+            Some(DocumentKind::Graphql)
+        );
+        // .yaml/.yml/.json pass the extension gate; the OpenAPI content
+        // sniff inside extract_document_contracts decides their fate.
+        assert_eq!(
+            document_kind(Path::new("api.yaml")),
+            Some(DocumentKind::OpenApi)
+        );
+        assert_eq!(
+            document_kind(Path::new("api.yml")),
+            Some(DocumentKind::OpenApi)
+        );
+        assert_eq!(
+            document_kind(Path::new("openapi.json")),
+            Some(DocumentKind::OpenApi)
+        );
+        assert_eq!(document_kind(Path::new("README.md")), None);
+        assert_eq!(document_kind(Path::new("main.rs")), None);
+        assert_eq!(document_kind(Path::new("plain")), None);
+    }
+
+    #[test]
+    fn document_kind_language_names() {
+        use crate::contracts::DocumentKind;
+        assert_eq!(DocumentKind::Proto.as_str(), "Proto");
+        assert_eq!(DocumentKind::Graphql.as_str(), "GraphQL");
+        assert_eq!(DocumentKind::OpenApi.as_str(), "OpenApi");
+    }
+
+    #[test]
+    fn scannable_document_kind_bounds_the_negative_case() {
+        use crate::contracts::{DocumentKind, scannable_document_kind};
+        use std::path::Path;
+        // Lock/data file names never carry contracts — skipped by name,
+        // whatever their extension or content.
+        for name in [
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "composer.lock",
+            "Cargo.lock",
+            "poetry.lock",
+        ] {
+            assert_eq!(scannable_document_kind(Path::new(name)), None, "{name}");
+        }
+        // Ordinary documents still classify (these paths do not exist, so
+        // no size is known — the pipeline's read happens afterwards and
+        // leaves missing files un-indexed).
+        assert_eq!(
+            scannable_document_kind(Path::new("api.yaml")),
+            Some(DocumentKind::OpenApi)
+        );
+        assert_eq!(
+            scannable_document_kind(Path::new("schema.graphql")),
+            Some(DocumentKind::Graphql)
+        );
+        assert_eq!(scannable_document_kind(Path::new("README.md")), None);
+    }
+
+    // -- proto document scanner (TASK-088, plan 5.2) ---------------------------
+
+    #[test]
+    fn proto_document_services_and_methods() {
+        let src = "\
+syntax = \"proto3\";
+package users.v1;
+
+message User { string id = 1; }
+
+service UserService {
+  rpc GetUser(GetUserRequest) returns (User);
+  rpc ListUsers(ListUsersRequest) returns (stream User);
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Proto, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let get = find(&cands, "grpc::UserService::GetUser").expect("GetUser missing");
+        assert_eq!(get.kind, ContractKind::Grpc);
+        assert_eq!(get.role, ContractRole::Provider);
+        assert_eq!(get.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(get.owning_symbol, None);
+        assert_eq!(get.params, Vec::<PathParam>::new());
+        assert_eq!(get.qualifier, "UserService");
+        // Bare service name — the package declaration is NOT composed.
+        assert_eq!(get.line, 7);
+        assert!(find(&cands, "grpc::UserService::ListUsers").is_some());
+    }
+
+    #[test]
+    fn proto_document_comment_wrapped_rpc_ignored() {
+        let src = "\
+service UserService {
+  // rpc Commented(In) returns (Out);
+  /* rpc Blocked(In) returns (Out); */
+  rpc Real(In) returns (Out);
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Proto, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let real = find(&cands, "grpc::UserService::Real").expect("Real missing");
+        assert_eq!(real.line, 4);
+    }
+
+    #[test]
+    fn proto_document_rpc_with_option_block() {
+        let src = "\
+service UserService {
+  rpc ListUsers(In) returns (stream Out) {
+    option deprecated = true;
+  }
+  rpc GetUser(In) returns (Out);
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Proto, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let list = find(&cands, "grpc::UserService::ListUsers").expect("ListUsers missing");
+        assert_eq!(list.line, 2);
+        // The option block's closing brace must not end the service early.
+        let get = find(&cands, "grpc::UserService::GetUser").expect("GetUser missing");
+        assert_eq!(get.line, 5);
+    }
+
+    #[test]
+    fn proto_document_extend_is_not_service() {
+        let src = "\
+extend google.protobuf.MethodOptions {
+  string opt = 50001;
+}
+service UserService {
+  rpc GetUser(In) returns (Out);
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Proto, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert!(find(&cands, "grpc::UserService::GetUser").is_some());
+    }
+
+    #[test]
+    fn proto_document_disabled_by_option() {
+        let opts = ContractOptions {
+            grpc: false,
+            ..ContractOptions::default()
+        };
+        let cands = extract_document_contracts(
+            DocumentKind::Proto,
+            "service UserService {\n  rpc GetUser(In) returns (Out);\n}\n",
+            &opts,
+        );
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    // -- grpc generated/server code (TASK-088, plan 5.1) ------------------------
+
+    #[test]
+    fn grpc_java_impl_base_provider() {
+        let src = "\
+public class UserServiceImpl extends UserServiceGrpc.UserServiceImplBase {
+    @Override
+    public void getUser(GetUserRequest req, StreamObserver<User> obs) { }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::getUser");
+        assert_eq!(c.kind, ContractKind::Grpc);
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(c.owning_symbol.as_deref(), Some("getUser"));
+        assert_eq!(c.line, 3);
+    }
+
+    #[test]
+    fn grpc_java_stub_consumers_bound_and_inline() {
+        let src = "\
+class Client {
+    void call(Channel channel) {
+        UserServiceGrpc.UserServiceBlockingStub stub = UserServiceGrpc.newBlockingStub(channel);
+        stub.getUser(request);
+        UserServiceGrpc.newBlockingStub(channel).getUser(request);
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        for c in &cands {
+            assert_eq!(c.canonical_id, "grpc::UserService::getUser");
+            assert_eq!(c.role, ContractRole::Consumer);
+            assert_eq!(c.owning_symbol.as_deref(), Some("call"));
+            assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+        }
+        assert_eq!(cands[0].line, 4);
+        assert_eq!(cands[1].line, 5);
+    }
+
+    #[test]
+    fn grpc_java_add_service_bind_service() {
+        let src = "\
+class Server {
+    void start() {
+        ServerBuilder.forPort(50051)
+            .addService(UserServiceGrpc.bindService(new UserServiceImpl()))
+            .build();
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::*");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("start"));
+    }
+
+    #[test]
+    fn grpc_go_register_server_provider() {
+        let src = "\
+package main
+
+func serve() {
+    s := grpc.NewServer()
+    pb.RegisterUserServiceServer(s, &server{})
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::*");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("serve"));
+    }
+
+    #[test]
+    fn grpc_go_client_consumers_bound_and_inline() {
+        let src = "\
+package main
+
+func call(conn *grpc.ClientConn) error {
+    client := pb.NewUserServiceClient(conn)
+    _, err := client.GetUser(ctx, req)
+    _, err2 := pb.NewUserServiceClient(conn).GetUser(ctx, req)
+    return err
+}
+";
+        let cands = extract(Lang::Go, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        for c in &cands {
+            assert_eq!(c.canonical_id, "grpc::UserService::GetUser");
+            assert_eq!(c.role, ContractRole::Consumer);
+            assert_eq!(c.owning_symbol.as_deref(), Some("call"));
+        }
+    }
+
+    #[test]
+    fn grpc_rust_tonic_impl_provider_snake_case() {
+        let src = "\
+use tonic::{Request, Response, Status};
+
+impl user_service_server::UserService for MyService {
+    async fn get_user(&self, request: Request<GetUserRequest>)
+        -> Result<Response<User>, Status> {
+        todo!()
+    }
+}
+";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        // snake_case preserved in the ID; the canonical join folds casing.
+        assert_eq!(c.canonical_id, "grpc::UserService::get_user");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("get_user"));
+        assert_eq!(c.line, 4);
+    }
+
+    #[test]
+    fn grpc_rust_bound_client_await_consumer() {
+        let src = "\
+async fn call(channel: Channel) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = UserServiceClient::new(channel);
+    let response = client.get_user(request).await?;
+    Ok(())
+}
+";
+        let cands = extract(Lang::Rust, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::get_user");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.owning_symbol.as_deref(), Some("call"));
+    }
+
+    #[test]
+    fn grpc_python_servicer_and_add_to_server() {
+        let src = "\
+import grpc
+import user_service_pb2
+
+class UserServiceServicer(user_service_pb2.UserServiceServicer):
+    def GetUser(self, request, context):
+        return user_service_pb2.User()
+
+def serve():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    add_UserServiceServicer_to_server(UserServiceServicer(), server)
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let method = find(&cands, "grpc::UserService::GetUser").expect("method provider missing");
+        assert_eq!(method.role, ContractRole::Provider);
+        assert_eq!(method.owning_symbol.as_deref(), Some("GetUser"));
+        assert_eq!(method.line, 5);
+        let service = find(&cands, "grpc::UserService::*").expect("service provider missing");
+        assert_eq!(service.role, ContractRole::Provider);
+        assert_eq!(service.owning_symbol.as_deref(), Some("serve"));
+    }
+
+    #[test]
+    fn grpc_python_bound_stub_consumer() {
+        let src = "\
+import user_service_pb2
+
+def call(channel):
+    stub = user_service_pb2.UserServiceStub(channel)
+    return stub.GetUser(user_service_pb2.GetUserRequest())
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "grpc::UserService::GetUser");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.owning_symbol.as_deref(), Some("call"));
+    }
+
+    #[test]
+    fn grpc_js_gated_client_and_add_service() {
+        let src = "\
+const grpc = require('@grpc/grpc-js');
+const client = new user.UserServiceClient(host, creds);
+client.getUser(arg, cb);
+server.addService(user.UserService.service, { getUser: handler });
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let call = find(&cands, "grpc::user.UserService::getUser").expect("consumer missing");
+        assert_eq!(call.role, ContractRole::Consumer);
+        assert_eq!(call.confidence, CONFIDENCE_FRAMEWORK);
+        // Package qualification preserved in the ID (plan 4); the canonical
+        // join relaxes it at match time.
+        let svc = find(&cands, "grpc::user.UserService::*").expect("service provider missing");
+        assert_eq!(svc.role, ContractRole::Provider);
+    }
+
+    #[test]
+    fn grpc_js_negative_without_grpc_marker() {
+        // new XClient alone is not evidence: with no grpc marker in the file
+        // nothing is detected.
+        let src = "\
+const client = new user.UserServiceClient(host, creds);
+client.getUser(arg, cb);
+server.addService(user.UserService.service, { getUser: handler });
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn grpc_generated_code_disabled_by_option() {
+        let opts = ContractOptions {
+            grpc: false,
+            ..ContractOptions::default()
+        };
+        let src = "public class UserServiceImpl extends UserServiceGrpc.UserServiceImplBase {\n    public void getUser(GetUserRequest req, StreamObserver<User> obs) { }\n}\n";
+        assert!(extract_with(Lang::Java, src, &opts).is_empty());
+    }
+
+    // -- graphql (TASK-088, plan 5.3) -------------------------------------------
+
+    #[test]
+    fn graphql_parse_named_query_multiple_fields() {
+        let ops = parse_graphql_operation(
+            "query GetUser($id: ID!) { user(id: $id) { name } posts { title } }",
+        );
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "user".to_string()),
+                    ("Query".to_string(), "posts".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn graphql_parse_anonymous_mutation() {
+        let ops = parse_graphql_operation("mutation { deleteUser(id: 1) }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(&[("Mutation".to_string(), "deleteUser".to_string())][..])
+        );
+    }
+
+    #[test]
+    fn graphql_parse_shorthand_query() {
+        let ops = parse_graphql_operation("{ user posts }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "user".to_string()),
+                    ("Query".to_string(), "posts".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn graphql_parse_subscription() {
+        let ops = parse_graphql_operation("subscription Sub { userAdded }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(&[("Subscription".to_string(), "userAdded".to_string())][..])
+        );
+    }
+
+    #[test]
+    fn graphql_parse_nested_braces_do_not_leak() {
+        let ops = parse_graphql_operation("query Q { a { b { c } } d }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "a".to_string()),
+                    ("Query".to_string(), "d".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn graphql_parse_non_operation_rejected() {
+        assert!(parse_graphql_operation("SELECT * FROM users").is_none());
+        assert!(parse_graphql_operation("").is_none());
+        // `queryx` is an identifier, not the keyword.
+        assert!(parse_graphql_operation("queryx { a }").is_none());
+        // No selection set.
+        assert!(parse_graphql_operation("query GetUser").is_none());
+    }
+
+    #[test]
+    fn graphql_document_sdl_resolvers() {
+        let src = "\
+type Query {
+  user(id: ID!): User
+  posts: [Post]
+}
+
+type Mutation {
+  deleteUser(id: ID!): Boolean
+}
+
+type User {
+  id: ID
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Graphql, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        let user = find(&cands, "graphql::Query::user").expect("user missing");
+        assert_eq!(user.role, ContractRole::Provider);
+        assert_eq!(user.kind, ContractKind::Graphql);
+        assert_eq!(user.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(user.line, 2);
+        assert!(find(&cands, "graphql::Query::posts").is_some());
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_document_extend_type() {
+        let src = "\
+type Query { base: String }
+
+extend type Query {
+  extra: Int
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Graphql, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "graphql::Query::base").is_some());
+        let extra = find(&cands, "graphql::Query::extra").expect("extra missing");
+        assert_eq!(extra.line, 4);
+    }
+
+    #[test]
+    fn graphql_document_operation_document_consumers() {
+        let src = "\
+query GetUser {
+  user(id: 1) {
+    name
+  }
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::Graphql, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "graphql::Query::user");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.line, 1);
+    }
+
+    #[test]
+    fn graphql_js_resolver_map_providers() {
+        let src = "\
+const resolvers = {
+  Query: {
+    user: (parent, args) => db.user(),
+    posts: () => [],
+  },
+  Mutation: {
+    deleteUser: (parent, { id }) => true,
+  },
+};
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 3, "got {cands:?}");
+        let user = find(&cands, "graphql::Query::user").expect("user missing");
+        assert_eq!(user.role, ContractRole::Provider);
+        assert_eq!(user.kind, ContractKind::Graphql);
+        assert_eq!(user.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(user.line, 3);
+        assert!(find(&cands, "graphql::Query::posts").is_some());
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_js_gql_tagged_template_consumers() {
+        let src = "import { gql } from '@apollo/client';\nconst USER = gql`query { user }`;\nconst DEL = graphql`mutation { deleteUser(id: 1) }`;\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let user = find(&cands, "graphql::Query::user").expect("user missing");
+        assert_eq!(user.role, ContractRole::Consumer);
+        assert_eq!(user.line, 2);
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_js_apollo_client_call_consumers() {
+        let src = "client.query({ query: 'query { user }' });\nclient.mutate({ mutation: 'mutation { deleteUser(id: 1) }' });\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "graphql::Query::user").is_some());
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_js_plain_strings_ignored() {
+        // A plain string that merely looks like a query is not a contract
+        // site; only tagged templates and client .query/.mutate calls are.
+        let cands = extract(Lang::JavaScript, "const q = 'query { user }';\n");
+        assert!(cands.is_empty(), "got {cands:?}");
+    }
+
+    #[test]
+    fn graphql_python_gql_consumer() {
+        let src = "\
+from gql import gql
+
+def fetch(client):
+    return client.execute(gql('query { user }'))
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "graphql::Query::user");
+        assert_eq!(c.role, ContractRole::Consumer);
+        assert_eq!(c.owning_symbol.as_deref(), Some("fetch"));
+    }
+
+    #[test]
+    fn graphql_python_strawberry_providers() {
+        let src = "\
+import strawberry
+
+class Query:
+    @strawberry.field
+    def user(self) -> User:
+        return db.user()
+
+    @strawberry.mutation
+    def deleteUser(self) -> bool:
+        return True
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        let user = find(&cands, "graphql::Query::user").expect("user missing");
+        assert_eq!(user.role, ContractRole::Provider);
+        assert_eq!(user.owning_symbol.as_deref(), Some("user"));
+        assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_python_ariadne_provider() {
+        let src = "\
+from ariadne import QueryType
+Query = QueryType()
+
+@Query.field('get_user')
+def resolve_get_user(obj, info):
+    return db.user()
+";
+        let cands = extract(Lang::Python, src);
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "graphql::Query::get_user");
+        assert_eq!(c.role, ContractRole::Provider);
+        assert_eq!(c.owning_symbol.as_deref(), Some("resolve_get_user"));
+    }
+
+    #[test]
+    fn graphql_disabled_by_option() {
+        let opts = ContractOptions {
+            graphql: false,
+            ..ContractOptions::default()
+        };
+        let src = "const resolvers = {\n  Query: {\n    user: () => db.user(),\n  },\n};\n";
+        assert!(extract_with(Lang::JavaScript, src, &opts).is_empty());
+    }
+
+    // -- openapi scanner (TASK-088, plan 5.4) ------------------------------------
+
+    #[test]
+    fn openapi_yaml_two_paths() {
+        let src = "\
+openapi: 3.0.0
+info:
+  title: Users API
+  version: 1.0.0
+paths:
+  /v1/users:
+    get:
+      summary: List users
+    post:
+      summary: Create user
+  /v1/users/{id}:
+    get:
+      summary: Fetch one user
+    delete:
+      summary: Delete a user
+components: {}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::OpenApi, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 4, "got {cands:?}");
+        let get = find(&cands, "openapi::GET::/v1/users").expect("GET missing");
+        assert_eq!(get.kind, ContractKind::Openapi);
+        assert_eq!(get.role, ContractRole::Provider);
+        assert_eq!(get.confidence, CONFIDENCE_FRAMEWORK);
+        assert_eq!(get.owning_symbol, None);
+        assert_eq!(get.line, 7);
+        assert!(find(&cands, "openapi::POST::/v1/users").is_some());
+        assert!(find(&cands, "openapi::GET::/v1/users/{p1}").is_some());
+        assert!(find(&cands, "openapi::DELETE::/v1/users/{p1}").is_some());
+    }
+
+    #[test]
+    fn openapi_swagger_2() {
+        let src = "\
+swagger: \"2.0\"
+info:
+  title: Pets
+paths:
+  /pets:
+    get:
+      summary: List pets
+    post:
+      summary: Add pet
+";
+        let cands =
+            extract_document_contracts(DocumentKind::OpenApi, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "openapi::GET::/pets").is_some());
+        assert!(find(&cands, "openapi::POST::/pets").is_some());
+    }
+
+    #[test]
+    fn openapi_placeholder_becomes_positional_with_params() {
+        let src = "\
+openapi: 3.0.0
+paths:
+  /workspaces/{wid}/tags/{id}:
+    get:
+      summary: Fetch tag
+";
+        let cands =
+            extract_document_contracts(DocumentKind::OpenApi, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.canonical_id, "openapi::GET::/workspaces/{p1}/tags/{p2}");
+        // Original names retained as metadata (PRD-CTR-REQ-022 symmetry).
+        assert_eq!(
+            c.params,
+            vec![
+                PathParam {
+                    position: 1,
+                    name: "wid".to_string(),
+                },
+                PathParam {
+                    position: 2,
+                    name: "id".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn openapi_json_flavor() {
+        let src = "\
+{
+  \"openapi\": \"3.0.0\",
+  \"info\": {
+    \"title\": \"Users\"
+  },
+  \"paths\": {
+    \"/v1/users\": {
+      \"get\": {
+        \"summary\": \"List\"
+      }
+    }
+  }
+}
+";
+        let cands =
+            extract_document_contracts(DocumentKind::OpenApi, src, &ContractOptions::default());
+        assert_eq!(cands.len(), 1, "got {cands:?}");
+        assert!(find(&cands, "openapi::GET::/v1/users").is_some());
+    }
+
+    #[test]
+    fn openapi_sniff_negatives_stay_unindexed() {
+        let compose = "services:\n  app:\n    image: busybox\n";
+        assert!(
+            extract_document_contracts(DocumentKind::OpenApi, compose, &ContractOptions::default())
+                .is_empty()
+        );
+        let pkg = "{\n  \"name\": \"x\",\n  \"version\": \"1.0.0\"\n}\n";
+        assert!(
+            extract_document_contracts(DocumentKind::OpenApi, pkg, &ContractOptions::default())
+                .is_empty()
+        );
+        // Multi-document YAML is skipped (extraction, not validation).
+        let multi = "---\nopenapi: 3.0.0\npaths:\n  /x:\n    get: {}\n---\nopenapi: 3.0.1\n";
+        assert!(
+            extract_document_contracts(DocumentKind::OpenApi, multi, &ContractOptions::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn openapi_disabled_by_option() {
+        let opts = ContractOptions {
+            openapi: false,
+            ..ContractOptions::default()
+        };
+        let src = "openapi: 3.0.0\npaths:\n  /x:\n    get: {}\n";
+        assert!(extract_document_contracts(DocumentKind::OpenApi, src, &opts).is_empty());
+    }
+
+    // -- RPC canonical join (TASK-088, PRD-CTR-REQ-024) -------------------------
+
+    /// Shorthand test candidate for the join.
+    fn join_grpc(service: &str, method: &str, role: ContractRole) -> ContractCandidate {
+        grpc_candidate(service, method, role, None, 1)
+    }
+
+    fn join_scope<'a>(workspace: &str, cands: &'a [ContractCandidate]) -> RpcJoinScope<'a> {
+        RpcJoinScope {
+            workspace: workspace.to_string(),
+            candidates: cands,
+        }
+    }
+
+    #[test]
+    fn rpc_join_case_folded_method() {
+        let provider = join_grpc("UserService", "GetUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "get_user", ContractRole::Consumer);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].basis, RpcMatchBasis::CaseFoldedMethod);
+        assert_eq!(joins[0].provider.canonical_id, "grpc::UserService::GetUser");
+        assert_eq!(
+            joins[0].consumer.canonical_id,
+            "grpc::UserService::get_user"
+        );
+        assert_eq!(joins[0].provider.workspace, "alpha");
+        assert_eq!(joins[0].consumer.role, ContractRole::Consumer);
+    }
+
+    #[test]
+    fn rpc_join_package_qualified_service() {
+        let provider = join_grpc("users.v1.UserService", "GetUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "GetUser", ContractRole::Consumer);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].basis, RpcMatchBasis::PackageQualifiedService);
+    }
+
+    #[test]
+    fn rpc_join_service_level_star_pairs_with_any_method() {
+        let provider = join_grpc("UserService", "*", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "DeleteUser", ContractRole::Consumer);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].basis, RpcMatchBasis::ServiceLevelProvider);
+    }
+
+    #[test]
+    fn rpc_join_method_level_beats_service_level() {
+        let star = join_grpc("UserService", "*", ContractRole::Provider);
+        let method = join_grpc("users.v1.UserService", "GetUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        // The `*` provider comes first; the method-level one must still win.
+        let cands = [star, method.clone(), consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].provider.canonical_id, method.canonical_id);
+        assert_eq!(joins[0].basis, RpcMatchBasis::PackageQualifiedService);
+    }
+
+    #[test]
+    fn rpc_join_equal_rank_tie_break_prefers_first_provider() {
+        // Two method-level providers of the same service+method carry equal
+        // rank: the documented rule keeps the LOWEST (scope, candidate)
+        // index — the first provider in order wins, never the last.
+        let first = join_grpc("users.v1.UserService", "GetUser", ContractRole::Provider);
+        let second = join_grpc("UserService", "GetUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let cands = [first.clone(), second, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(
+            joins[0].provider.canonical_id, first.canonical_id,
+            "equal-rank tie must keep the first (lowest-index) provider"
+        );
+    }
+
+    #[test]
+    fn rpc_join_exact_id_matches_are_excluded() {
+        // The exact pair belongs to the first pass; the join must not emit a
+        // second link for that consumer (nor consume the exact provider).
+        let exact_provider = join_grpc("UserService", "getUser", ContractRole::Provider);
+        let exact_consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let relaxed_provider = join_grpc("users.v1.UserService", "getUser", ContractRole::Provider);
+        let cands = [exact_provider, relaxed_provider, exact_consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert!(
+            joins.is_empty(),
+            "exact-ID pair must never be overridden, got {joins:?}"
+        );
+    }
+
+    #[test]
+    fn rpc_join_exact_counterpart_in_other_workspace_does_not_exclude() {
+        // Exclusion is per workspace: an exact provider behind a different
+        // workspace boundary never pairs, so the consumer stays joinable
+        // within its own workspace (PRD-CTR-REQ-014).
+        let far_provider = join_grpc("UserService", "getUser", ContractRole::Provider);
+        let near_provider = join_grpc("users.v1.UserService", "getUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let cands_a = [far_provider];
+        let cands_b = [near_provider, consumer];
+        let scopes = [join_scope("beta", &cands_a), join_scope("alpha", &cands_b)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].provider.workspace, "alpha");
+    }
+
+    #[test]
+    fn rpc_join_respects_workspace_boundaries() {
+        let provider = join_grpc("users.v1.UserService", "getUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let cands_a = [consumer];
+        let cands_b = [provider];
+        let scopes = [join_scope("alpha", &cands_a), join_scope("beta", &cands_b)];
+        assert!(
+            canonical_rpc_join(&scopes).is_empty(),
+            "the join relaxes name matching, never workspace scope"
+        );
+    }
+
+    #[test]
+    fn rpc_join_workspace_comparison_trims_and_case_folds() {
+        let provider = join_grpc("users.v1.UserService", "getUser", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "getUser", ContractRole::Consumer);
+        let cands_a = [consumer];
+        let cands_b = [provider];
+        let scopes = [
+            join_scope("alpha", &cands_a),
+            join_scope("  ALPHA ", &cands_b),
+        ];
+        assert_eq!(canonical_rpc_join(&scopes).len(), 1);
+    }
+
+    #[test]
+    fn rpc_join_ignores_non_rpc_kinds() {
+        // GraphQL exact ID shape must not pair with a grpc provider here.
+        let provider = join_grpc("UserService", "getUser", ContractRole::Provider);
+        let consumer = graphql_candidate("UserService", "getUser", ContractRole::Consumer, None, 1);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        assert!(canonical_rpc_join(&scopes).is_empty());
+    }
+
+    #[test]
+    fn rpc_join_within_repo_single_scope() {
+        // REQ-016: workspace bounds pairing, never extraction — one scope
+        // with both roles links (a repo calling its own service).
+        let provider = join_grpc("UserService", "get_user", ContractRole::Provider);
+        let consumer = join_grpc("UserService", "GetUser", ContractRole::Consumer);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("solo", &cands)];
+        assert_eq!(canonical_rpc_join(&scopes).len(), 1);
+    }
+
+    #[test]
+    fn rpc_join_deterministic_consumer_order() {
+        let provider = join_grpc("UserService", "*", ContractRole::Provider);
+        let first = join_grpc("UserService", "GetUser", ContractRole::Consumer);
+        let second = join_grpc("users.v1.UserService", "DeleteUser", ContractRole::Consumer);
+        let cands = [provider, first.clone(), second.clone()];
+        let scopes = [join_scope("alpha", &cands)];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 2, "got {joins:?}");
+        assert_eq!(joins[0].consumer.canonical_id, first.canonical_id);
+        assert_eq!(joins[1].consumer.canonical_id, second.canonical_id);
+    }
+
+    #[test]
+    fn rpc_join_unpaired_consumer_emits_nothing() {
+        let consumer = join_grpc("OrderService", "PlaceOrder", ContractRole::Consumer);
+        let provider = join_grpc("UserService", "*", ContractRole::Provider);
+        let cands = [provider, consumer];
+        let scopes = [join_scope("alpha", &cands)];
+        assert!(canonical_rpc_join(&scopes).is_empty());
+    }
+
+    #[test]
+    fn rpc_family_today_is_grpc_only() {
+        assert!(is_rpc_family(ContractKind::Grpc));
+        assert!(!is_rpc_family(ContractKind::Graphql));
+        assert!(!is_rpc_family(ContractKind::Http));
+    }
+
+    #[test]
+    fn workspace_id_trims_and_case_folds() {
+        assert_eq!(normalize_workspace_id("  Payments "), "payments");
+        assert_eq!(normalize_workspace_id("PAYMENTS"), "payments");
+    }
+
+    // -- E2E acceptance (TASK-088 acceptance criterion 1) ------------------------
+
+    /// IDL definition + generated-stub call site pair despite package
+    /// qualification and casing, through both pipeline paths: the document
+    /// path for the `.proto` and the grammar path for the `.java`.
+    #[test]
+    fn acceptance_proto_idl_pairs_with_java_stub() {
+        use crate::indexer::get_parser;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("proto")).unwrap();
+        fs::create_dir_all(root.join("src/main/java")).unwrap();
+        fs::write(
+            root.join("proto/users.proto"),
+            "syntax = \"proto3\";\npackage users.v1;\n\nservice UserService {\n  rpc GetUser(GetUserRequest) returns (User);\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main/java/Client.java"),
+            "import io.grpc.ManagedChannel;\n\nclass Client {\n    void call(ManagedChannel channel) {\n        UserServiceGrpc.UserServiceBlockingStub stub = UserServiceGrpc.newBlockingStub(channel);\n        stub.getUser(request);\n    }\n}\n",
+        )
+        .unwrap();
+
+        let opts = ContractOptions::default();
+        let mut cands = Vec::new();
+
+        // Document path (pipeline's parse_one_file fallback).
+        let proto = root.join("proto/users.proto");
+        let content = fs::read_to_string(&proto).unwrap();
+        let kind = document_kind(&proto).expect("proto is a document kind");
+        cands.extend(extract_document_contracts(kind, &content, &opts));
+
+        // Grammar path.
+        let java = root.join("src/main/java/Client.java");
+        let src = fs::read_to_string(&java).unwrap();
+        let lang = crate::indexer::detect_language(&java).expect("java detected");
+        let mut parser = get_parser(lang);
+        let tree = parser.parse(&src, None).expect("parse failed");
+        cands.extend(extract_contracts(&tree, &src, lang, &opts));
+
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(
+            find(&cands, "grpc::UserService::GetUser").is_some(),
+            "proto provider (package NOT composed): {cands:?}"
+        );
+        assert!(
+            find(&cands, "grpc::UserService::getUser").is_some(),
+            "java stub consumer: {cands:?}"
+        );
+
+        let scopes = [RpcJoinScope {
+            workspace: "e2e".to_string(),
+            candidates: &cands,
+        }];
+        let joins = canonical_rpc_join(&scopes);
+        assert_eq!(joins.len(), 1, "got {joins:?}");
+        assert_eq!(joins[0].provider.canonical_id, "grpc::UserService::GetUser");
+        assert_eq!(joins[0].consumer.canonical_id, "grpc::UserService::getUser");
     }
 }
