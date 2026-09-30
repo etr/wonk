@@ -914,6 +914,21 @@ impl fmt::Display for FindingSeverity {
     }
 }
 
+impl std::str::FromStr for FindingSeverity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "blocking" => Ok(FindingSeverity::Blocking),
+            "warning" => Ok(FindingSeverity::Warning),
+            "note" => Ok(FindingSeverity::Note),
+            other => Err(format!(
+                "unknown severity: {other} (expected one of: blocking, warning, note)"
+            )),
+        }
+    }
+}
+
 /// The overall verdict for a reviewed diff (PRD-REV-REQ-005).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewVerdict {
@@ -1107,6 +1122,29 @@ pub struct CallPathHop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finding_severity_from_str_valid_tiers() {
+        assert_eq!(
+            "blocking".parse::<FindingSeverity>().unwrap(),
+            FindingSeverity::Blocking
+        );
+        assert_eq!(
+            "warning".parse::<FindingSeverity>().unwrap(),
+            FindingSeverity::Warning
+        );
+        assert_eq!(
+            "note".parse::<FindingSeverity>().unwrap(),
+            FindingSeverity::Note
+        );
+    }
+
+    #[test]
+    fn finding_severity_from_str_rejects_unknown() {
+        assert!("fatal".parse::<FindingSeverity>().is_err());
+        assert!("BLOCKING".parse::<FindingSeverity>().is_err());
+        assert!("".parse::<FindingSeverity>().is_err());
+    }
 
     #[test]
     fn contract_kind_as_str_segments() {

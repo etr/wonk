@@ -287,3 +287,257 @@ fn cross_repo_review_names_consuming_repo_end_to_end() {
     assert_eq!(cross[0]["related"][0]["file"], "own-api:src/client.js");
     assert_eq!(verdict["verdict"], "REVIEW");
 }
+
+// -- Filter, cap, and suppression lifecycle (TASK-089) ------------------------
+
+/// A repo with three independent multi-line functions (so a body edit
+/// never touches the signature line) — one diff can carry a breaking
+/// change (delete used) plus two coverage gaps (edit the bodies).
+fn indexed_repo_three_fns() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-b", "main"]);
+    git(root, &["config", "user.email", "test@test.com"]);
+    git(root, &["config", "user.name", "Test"]);
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), THREE_FNS_BASE).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "initial"]);
+
+    let out = Command::new(wonk_bin())
+        .arg("--quiet")
+        .arg("init")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "wonk init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir
+}
+
+const THREE_FNS_BASE: &str = "pub fn used() -> i32 {\n    1\n}\n\npub fn caller() -> i32 {\n    used()\n}\n\npub fn other() -> i32 {\n    7\n}\n";
+
+const THREE_FNS_USED_EDITED: &str = "pub fn used() -> i32 {\n    2\n}\n\npub fn caller() -> i32 {\n    used()\n}\n\npub fn other() -> i32 {\n    7\n}\n";
+
+const THREE_FNS_BOTH_EDITED: &str = "pub fn used() -> i32 {\n    2\n}\n\npub fn caller() -> i32 {\n    used()\n}\n\npub fn other() -> i32 {\n    8\n}\n";
+
+const THREE_FNS_USED_DELETED: &str =
+    "pub fn caller() -> i32 {\n    used()\n}\n\npub fn other() -> i32 {\n    8\n}\n";
+
+/// Run a `review suppress` subcommand without --format/--quiet so the
+/// confirmation hints land on stderr (structured formats suppress them).
+fn run_suppress(repo: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = Command::new(wonk_bin());
+    cmd.args(args).current_dir(repo);
+    let out = cmd.output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn review_max_findings_caps_worst_first_and_counts_over_cap() {
+    let repo = indexed_repo_three_fns();
+    let root = repo.path();
+
+    // BLOCK (removed used with a live caller) + WARNING (other's body edit).
+    std::fs::write(root.join("src/lib.rs"), THREE_FNS_USED_DELETED).unwrap();
+
+    let (code, stdout, stderr) = run_review(root, &["--max-findings", "1"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (findings, verdict) = parse_review_ndjson(&stdout);
+    assert_eq!(findings.len(), 1, "cap trims to one line: {stdout}");
+    assert_eq!(findings[0]["kind"], "breaking-change", "the worst survives");
+    assert_eq!(verdict["finding_count"], 1);
+    assert_eq!(verdict["drops"]["over_cap"], 1);
+    assert_eq!(verdict["drops"]["below_confidence"], 0);
+}
+
+#[test]
+fn review_verdict_line_always_carries_five_zeroed_drop_keys() {
+    let repo = indexed_repo();
+    let root = repo.path();
+
+    // No working-tree changes: a clean APPROVE still reports drops=0.
+    let (code, stdout, stderr) = run_review(root, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let (_findings, verdict) = parse_review_ndjson(&stdout);
+    let drops = &verdict["drops"];
+    assert!(drops.is_object(), "always-present object: {verdict}");
+    for key in [
+        "below_confidence",
+        "below_severity",
+        "out_of_category",
+        "over_cap",
+        "identity_suppressed",
+    ] {
+        assert_eq!(drops[key], 0, "zero counts serialize: {verdict}");
+    }
+}
+
+#[test]
+fn review_suppress_lifecycle_retires_and_restores_a_finding() {
+    let repo = indexed_repo_three_fns();
+    let root = repo.path();
+
+    // Body edit of used(): one coverage-gap warning (the signature line is
+    // untouched, so rule A stays quiet).
+    std::fs::write(root.join("src/lib.rs"), THREE_FNS_USED_EDITED).unwrap();
+
+    let (code, stdout, stderr) = run_review(root, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let (findings, verdict) = parse_review_ndjson(&stdout);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(verdict["verdict"], "REVIEW");
+    let identity = findings[0]["identity"].as_str().unwrap().to_string();
+    let rule = findings[0]["rule"].as_str().unwrap().to_string();
+
+    // Suppress it (no --quiet: the confirmation lands on stderr).
+    let (code, _stdout, stderr) = run_suppress(
+        root,
+        &[
+            "review",
+            "suppress",
+            "add",
+            &identity,
+            "--rule",
+            &rule,
+            "--file",
+            "src/lib.rs",
+            "--note",
+            "test-only helper",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains(&identity), "confirmed: {stderr}");
+
+    // Re-review: gone, counted as identity_suppressed, verdict flips.
+    let (code, stdout, stderr) = run_review(root, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let (findings, verdict) = parse_review_ndjson(&stdout);
+    assert!(findings.is_empty(), "suppressed: {stdout}");
+    assert_eq!(verdict["verdict"], "APPROVE");
+    assert_eq!(verdict["drops"]["identity_suppressed"], 1);
+    assert_eq!(verdict["drops"]["over_cap"], 0);
+
+    // List shows the row with its retained metadata.
+    let (code, stdout, stderr) =
+        run_suppress(root, &["--format", "json", "review", "suppress", "list"]);
+    assert_eq!(code, 0, "{stderr}");
+    let rows: Vec<Value> = stdout
+        .trim_end()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1, "{stdout}");
+    assert_eq!(rows[0]["identity"], identity);
+    assert_eq!(rows[0]["rule"], rule);
+    assert_eq!(rows[0]["file"], "src/lib.rs");
+    assert_eq!(rows[0]["note"], "test-only helper");
+
+    // Remove it: the finding returns on the next review.
+    let (code, _stdout, stderr) = run_suppress(root, &["review", "suppress", "remove", &identity]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("removed 1 suppression(s)"), "{stderr}");
+
+    let (code, stdout, stderr) = run_review(root, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let (findings, verdict) = parse_review_ndjson(&stdout);
+    assert_eq!(findings.len(), 1, "restored after removal: {stdout}");
+    assert_eq!(verdict["drops"]["identity_suppressed"], 0);
+}
+
+#[test]
+fn review_suppress_bulk_remove_by_rule_removes_only_matching() {
+    let repo = indexed_repo_three_fns();
+    let root = repo.path();
+
+    // Two coverage gaps: edit the bodies of used() and other().
+    std::fs::write(root.join("src/lib.rs"), THREE_FNS_BOTH_EDITED).unwrap();
+
+    let (code, stdout, stderr) = run_review(root, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let (findings, _verdict) = parse_review_ndjson(&stdout);
+    let gaps: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["kind"] == "coverage-gap")
+        .collect();
+    assert_eq!(gaps.len(), 2, "two suppressible findings: {stdout}");
+
+    // Two under rule A, one unrelated row under rule B.
+    for f in &gaps {
+        let id = f["identity"].as_str().unwrap();
+        let (code, _o, stderr) =
+            run_suppress(root, &["review", "suppress", "add", id, "--rule", "rule/a"]);
+        assert_eq!(code, 0, "{stderr}");
+    }
+    let (code, _o, stderr) = run_suppress(
+        root,
+        &[
+            "review",
+            "suppress",
+            "add",
+            "zz-unrelated",
+            "--rule",
+            "rule/b",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+
+    let (code, _o, stderr) =
+        run_suppress(root, &["review", "suppress", "remove", "--rule", "rule/a"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("removed 2 suppression(s)"),
+        "exactly the matching two: {stderr}"
+    );
+
+    let (code, stdout, stderr) =
+        run_suppress(root, &["--format", "json", "review", "suppress", "list"]);
+    assert_eq!(code, 0, "{stderr}");
+    let rows: Vec<Value> = stdout
+        .trim_end()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1, "only rule/b survives: {stdout}");
+    assert_eq!(rows[0]["rule"], "rule/b");
+}
+
+#[test]
+fn review_min_severity_blocking_drops_warnings_only() {
+    let repo = indexed_repo_three_fns();
+    let root = repo.path();
+
+    // Body edit of used() only: warnings only (no breaking change).
+    std::fs::write(root.join("src/lib.rs"), THREE_FNS_USED_EDITED).unwrap();
+
+    let (code, stdout, stderr) = run_review(root, &["--min-severity", "blocking"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (findings, verdict) = parse_review_ndjson(&stdout);
+    assert!(findings.is_empty(), "warnings dropped: {stdout}");
+    assert_eq!(verdict["finding_count"], 0);
+    assert_eq!(verdict["drops"]["below_severity"], 1);
+    assert_eq!(verdict["drops"]["over_cap"], 0);
+}
+
+#[test]
+fn review_kind_filter_drops_other_categories() {
+    let repo = indexed_repo_three_fns();
+    let root = repo.path();
+
+    // One breaking change + one coverage gap; keep neither's category.
+    std::fs::write(root.join("src/lib.rs"), THREE_FNS_USED_DELETED).unwrap();
+
+    let (code, stdout, stderr) = run_review(root, &["--kind", "cross-repo"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (findings, verdict) = parse_review_ndjson(&stdout);
+    assert!(findings.is_empty(), "out-of-category dropped: {stdout}");
+    assert_eq!(verdict["drops"]["out_of_category"], 2);
+}

@@ -960,6 +960,34 @@ pub struct ContractOutput {
     pub status: Option<String>,
 }
 
+/// One durable review suppression, wire form (PRD-REV-REQ-014).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuppressionOutput {
+    /// The suppressed finding's identity (the lookup key).
+    pub identity: String,
+    /// The finding's rule, for listing and bulk `--rule` removal.
+    pub rule: String,
+    /// The finding's file.
+    pub file: String,
+    /// Why the finding was retired, when the author said so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// When the suppression was recorded (epoch seconds).
+    pub created_at: i64,
+}
+
+impl From<&crate::review::Suppression> for SuppressionOutput {
+    fn from(s: &crate::review::Suppression) -> Self {
+        Self {
+            identity: s.identity.clone(),
+            rule: s.rule.clone(),
+            file: s.file.clone(),
+            note: s.note.clone(),
+            created_at: s.created_at,
+        }
+    }
+}
+
 impl From<&crate::contracts::ContractRow> for ContractOutput {
     fn from(row: &crate::contracts::ContractRow) -> Self {
         Self {
@@ -1657,6 +1685,37 @@ impl<W: Write> Formatter<W> {
         }
         let out = out.clone();
         self.budgeted_write(move |fmt| Self::render_contract(fmt, &out))
+    }
+
+    /// Format one suppression row (`wonk review suppress list`).
+    pub fn format_suppression(&mut self, out: &SuppressionOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            Self::render_suppression(self, out)?;
+            return Ok(BudgetStatus::Written);
+        }
+        let out = out.clone();
+        self.budgeted_write(move |fmt| Self::render_suppression(fmt, &out))
+    }
+
+    /// Shared render logic for a suppression row.
+    fn render_suppression<W2: Write>(
+        fmt: &mut Formatter<W2>,
+        out: &SuppressionOutput,
+    ) -> std::io::Result<()> {
+        if fmt.format.is_structured() {
+            let line = Self::serialize_structured(fmt.format, out)?;
+            writeln!(fmt.writer, "{line}")
+        } else {
+            write!(
+                fmt.writer,
+                "{} rule={} file={}",
+                out.identity, out.rule, out.file
+            )?;
+            if let Some(ref note) = out.note {
+                write!(fmt.writer, " note={note}")?;
+            }
+            writeln!(fmt.writer)
+        }
     }
 
     /// Shared render logic for a contract row.
@@ -5384,6 +5443,58 @@ mod tests {
             vec!["cross-repo impact skipped: no cross-repo inputs".to_string()]
         );
         assert_eq!(out.verdict, "REVIEW");
+    }
+
+    // -- SuppressionOutput (TASK-089, PRD-REV-REQ-014) --------------------------
+
+    #[test]
+    fn suppression_output_json_includes_every_field() {
+        let out = SuppressionOutput {
+            identity: "abc123".into(),
+            rule: "coverage-gap/no-test-in-blast-radius".into(),
+            file: "src/lib.rs".into(),
+            note: Some("test-only helper".into()),
+            created_at: 1_700_000_000,
+        };
+        let json = serde_json::to_string(&out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["identity"], "abc123");
+        assert_eq!(v["rule"], "coverage-gap/no-test-in-blast-radius");
+        assert_eq!(v["file"], "src/lib.rs");
+        assert_eq!(v["note"], "test-only helper");
+        assert_eq!(v["created_at"], 1_700_000_000);
+    }
+
+    #[test]
+    fn suppression_output_omits_absent_note() {
+        let out = SuppressionOutput {
+            note: None,
+            identity: "abc".into(),
+            rule: String::new(),
+            file: String::new(),
+            created_at: 0,
+        };
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("\"note\""),
+            "an absent note is omitted, got {json}"
+        );
+    }
+
+    #[test]
+    fn suppression_output_grep_line_lists_identity_rule_file() {
+        let out = SuppressionOutput {
+            identity: "abc123".into(),
+            rule: "coverage-gap/no-test-in-blast-radius".into(),
+            file: "src/lib.rs".into(),
+            note: None,
+            created_at: 1_700_000_000,
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_suppression(&out));
+        assert!(
+            text.contains("abc123 rule=coverage-gap/no-test-in-blast-radius file=src/lib.rs"),
+            "got: {text}"
+        );
     }
 
     #[test]
