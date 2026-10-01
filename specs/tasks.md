@@ -3957,11 +3957,11 @@ Add the signals grounded in data wonk already indexes: lexical score, semantic s
 Generalize wonk's existing path special-cases into one graded signal, and add the two query-shape-sensitive signals.
 
 **Action Items:**
-- [ ] Path-character signal with graded buckets: test files, compatibility shims, examples, type-declaration files, re-export barrels, module entries, and generated files shadowing a hand-written peer (PRD-RANK-REQ-011)
-- [ ] Absorb the existing `is_test_file` handling and the `.d.ts` deprioritization in symbol lookup into this one signal — remove the special cases rather than leaving both paths live
-- [ ] Confirm reduction is graded, never exclusion: a test file still appears when it is the best answer
-- [ ] Proximity signal reflecting how closely query terms co-occur in matched text (PRD-RANK-REQ-013)
-- [ ] Signature-match signal for signature-shaped queries (PRD-RANK-REQ-014)
+- [x] Path-character signal with graded buckets: test files, compatibility shims, examples, type-declaration files, re-export barrels, module entries, and generated files shadowing a hand-written peer (PRD-RANK-REQ-011)
+- [x] Absorb the existing `is_test_file` handling and the `.d.ts` deprioritization in symbol lookup into this one signal — remove the special cases rather than leaving both paths live
+- [x] Confirm reduction is graded, never exclusion: a test file still appears when it is the best answer
+- [x] Proximity signal reflecting how closely query terms co-occur in matched text (PRD-RANK-REQ-013)
+- [x] Signature-match signal for signature-shaped queries (PRD-RANK-REQ-014)
 
 **Dependencies:**
 - Blocked by: TASK-092
@@ -3977,7 +3977,7 @@ Generalize wonk's existing path special-cases into one graded signal, and add th
 **Related Requirements:** PRD-RANK-REQ-011, PRD-RANK-REQ-013, PRD-RANK-REQ-014
 **Related Decisions:** DR-037
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
@@ -3991,15 +3991,15 @@ Generalize wonk's existing path special-cases into one graded signal, and add th
 Classify queries to scale the lexical/semantic blend, tune default weights against labeled data, and flip the default only once improvement is demonstrated.
 
 **Action Items:**
-- [ ] Classify queries as symbol-shaped, path-shaped, signature-shaped, or conceptual (PRD-RANK-REQ-007)
-- [ ] Allow the caller to pin the class explicitly, bypassing detection (PRD-RANK-REQ-007)
-- [ ] Apply per-class multipliers to **lexical and semantic weights only**; leave structural signals class-independent (PRD-RANK-REQ-008)
-- [ ] Make the conceptual class the neutral 1.0 baseline (PRD-RANK-REQ-009)
-- [ ] Record the detected class on the response so a misclassification is diagnosable
-- [ ] Build the labeled query set — representative queries with expected results (OQ-015, AR-034)
-- [ ] Tune default weights against it; record the measured before/after
-- [ ] Benchmark: reranking adds < 20ms to warm queries (PRD-RANK-REQ-016)
-- [ ] **Flip the default only when the regression suite shows improvement**; leave the previous ordering available by configuration (PRD-RANK-REQ-017, AR-033)
+- [x] Classify queries as symbol-shaped, path-shaped, signature-shaped, or conceptual (PRD-RANK-REQ-007)
+- [x] Allow the caller to pin the class explicitly, bypassing detection (PRD-RANK-REQ-007)
+- [x] Apply per-class multipliers to **lexical and semantic weights only**; leave structural signals class-independent (PRD-RANK-REQ-008)
+- [x] Make the conceptual class the neutral 1.0 baseline (PRD-RANK-REQ-009)
+- [x] Record the detected class on the response so a misclassification is diagnosable
+- [x] Build the labeled query set — representative queries with expected results (OQ-015, AR-034)
+- [x] Tune default weights against it; record the measured before/after
+- [x] Benchmark: reranking adds < 20ms to warm queries (PRD-RANK-REQ-016)
+- [x] **Flip the default only when the regression suite shows improvement**; leave the previous ordering available by configuration (PRD-RANK-REQ-017, AR-033)
 
 **Dependencies:**
 - Blocked by: TASK-093, TASK-094
