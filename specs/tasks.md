@@ -4034,13 +4034,13 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Estimate:** M
 
 **Action Items:**
-- [ ] Create `history.rs`, extending the existing git CLI wrapper in `impact.rs` (PRD-HIST-REQ-001)
-- [ ] Mine a configurable bounded commit window rather than full history (PRD-HIST-REQ-002, OQ-017)
-- [ ] Weight changes by age within the window (PRD-HIST-REQ-003)
-- [ ] Add the `file_churn` table; populate at index time
-- [ ] Expose churn as a rerank signal (PRD-HIST-REQ-006)
-- [ ] Refresh incrementally when new commits land, rather than re-mining (PRD-HIST-REQ-007)
-- [ ] No git, unreadable history, or mining disabled → contribute zero, affect nothing else (PRD-HIST-REQ-008)
+- [x] Create `history.rs`, extending the existing git CLI wrapper in `impact.rs` (PRD-HIST-REQ-001)
+- [x] Mine a configurable bounded commit window rather than full history (PRD-HIST-REQ-002, OQ-017)
+- [x] Weight changes by age within the window (PRD-HIST-REQ-003)
+- [x] Add the `file_churn` table; populate at index time
+- [x] Expose churn as a rerank signal (PRD-HIST-REQ-006)
+- [x] Refresh incrementally when new commits land, rather than re-mining (PRD-HIST-REQ-007)
+- [x] No git, unreadable history, or mining disabled → contribute zero, affect nothing else (PRD-HIST-REQ-008)
 
 **Dependencies:**
 - Blocked by: TASK-092
@@ -4056,7 +4056,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-HIST-REQ-001, PRD-HIST-REQ-002, PRD-HIST-REQ-003, PRD-HIST-REQ-006, PRD-HIST-REQ-007, PRD-HIST-REQ-008
 **Related Decisions:** DR-039
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
