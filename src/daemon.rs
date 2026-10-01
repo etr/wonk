@@ -409,6 +409,7 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     let embedding_kind = config.embedding.provider;
     let contract_opts = crate::contracts::ContractOptions::from(&config.contracts);
     let history = config.history;
+    let topology = config.topology;
 
     let embed_handle = thread::Builder::new()
         .name("wonk-embed".to_string())
@@ -516,6 +517,19 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
                     )
                 {
                     eprintln!("wonk: history refresh failed: {e:#}");
+                }
+                // Topology recompute, gated by the interval since the last
+                // run (TASK-098, PRD-TOPO-REQ-006): event batches can
+                // arrive many times a second, and the pass costs a whole
+                // graph walk — never per batch, only when due.
+                if topology.enabled
+                    && let Err(e) = crate::topology::refresh_if_due(
+                        &conn,
+                        &crate::topology::TopologyOptions::from(&topology),
+                        topology.interval,
+                    )
+                {
+                    eprintln!("wonk: topology refresh failed: {e:#}");
                 }
                 update_queue_depth(&conn, 0).ok();
             }
