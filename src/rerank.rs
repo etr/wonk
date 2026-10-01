@@ -3008,6 +3008,49 @@ proximity, signature, churn, co_change, hub, authority",
     }
 
     #[test]
+    fn stale_topology_never_blocks_a_query() {
+        // PRD-TOPO-REQ-007: scores far past the staleness threshold are
+        // SERVED, and the read-only query path leaves the marker exactly
+        // where it was — recomputation belongs to the cadence pass, never
+        // to a query.
+        let (_dir, conn) = topology_seeded_conn();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT OR REPLACE INTO topology_meta (key, value) VALUES ('last_computed', ?1)",
+            rusqlite::params![(now - 90_000).to_string()],
+        )
+        .unwrap();
+        assert!(crate::topology::is_stale(&conn, 86_400), "fixture is stale");
+
+        let results = vec![classified(
+            "src/core.rs",
+            1,
+            "handler",
+            ResultCategory::Definition,
+        )];
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("authority", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(
+            scored[0].contributions[0].value, 1.0,
+            "the stale score still contributes (the set max)"
+        );
+        assert_eq!(
+            crate::topology::last_computed(&conn),
+            Some(now - 90_000),
+            "the query path must not recompute or restamp"
+        );
+    }
+
+    #[test]
     fn rerank_kind_only_reproduces_legacy_order() {
         let results = vec![
             classified("tests/t.rs", 9, "foo();", ResultCategory::Test),

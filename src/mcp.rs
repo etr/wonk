@@ -2013,7 +2013,11 @@ impl McpServer {
             Ok(kind) => kind,
             Err(error) => return CallToolResult::error(error),
         };
-        let info = crate::router::query_status_info(conn, configured, workspace);
+        // The topology config rides along for the staleness marker (TASK-098).
+        let topology = crate::config::Config::load(Some(self.router.repo_root()))
+            .map(|c| c.topology)
+            .unwrap_or_default();
+        let info = crate::router::query_status_info(conn, configured, workspace, &topology);
         let status = serde_json::to_value(&info).unwrap_or_default();
         format_result(&status, format)
     }
