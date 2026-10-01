@@ -336,9 +336,6 @@ pub fn min_max_normalize(score: f32, min: f32, max: f32) -> f32 {
 /// semantics), so two hits in one file always tie on this signal. A set
 /// with no score contrast, a missing index, or a gated-off preparation all
 /// contribute exactly 0.0.
-// Wired into builtin_signals() with the TASK-093 registry; until then only
-// the unit tests construct it.
-#[allow(dead_code)]
 pub(crate) struct LexicalSignal;
 
 impl Signal for LexicalSignal {
@@ -386,9 +383,6 @@ pub fn centrality_value(caller_count: u32, set_max: u32) -> f32 {
 /// un-called and contribute exactly 0 — a floor, never a penalty. Note the
 /// TASK-092 seam: caller counts are keyed by symbol NAME, so same-named
 /// symbols share a centrality.
-// Wired into builtin_signals() with the TASK-093 registry; until then only
-// the unit tests construct it.
-#[allow(dead_code)]
 pub(crate) struct CentralitySignal;
 
 impl Signal for CentralitySignal {
@@ -446,9 +440,6 @@ pub const PROMINENCE_TOKEN: f32 = 0.5;
 /// mention — some term occurs in the matched line as a maximal identifier
 /// run; 0.0 incidental — substring only, which grep already guarantees.
 /// No query terms means no tiers: exactly 0.
-// Wired into builtin_signals() with the TASK-093 registry; until then only
-// the unit tests construct it.
-#[allow(dead_code)]
 pub(crate) struct ProminenceSignal;
 
 impl Signal for ProminenceSignal {
@@ -512,9 +503,6 @@ pub fn semantic_value(cosine: f32) -> f32 {
 /// A missing query embedding or a candidate without a vector contributes
 /// exactly 0.0 — zero, not a penalty — so a candidate the signal knows
 /// nothing about is never demoted below its other signals' score.
-// Wired into builtin_signals() with the TASK-093 registry; until then only
-// the unit tests construct it.
-#[allow(dead_code)]
 pub(crate) struct SemanticSignal;
 
 impl Signal for SemanticSignal {
@@ -547,7 +535,13 @@ impl Signal for SemanticSignal {
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
 pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
-    vec![Box::new(KindSignal)]
+    vec![
+        Box::new(KindSignal),
+        Box::new(LexicalSignal),
+        Box::new(SemanticSignal),
+        Box::new(CentralitySignal),
+        Box::new(ProminenceSignal),
+    ]
 }
 
 /// Valid signal names, derived from the registry (single source of truth).
@@ -983,11 +977,52 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_kind_and_names_derive_from_it() {
+    fn registry_contains_five_signals_in_order() {
         let registry = builtin_signals();
-        assert_eq!(registry.len(), 1);
-        assert_eq!(registry[0].name(), "kind");
-        assert_eq!(known_signal_names(), vec!["kind"]);
+        let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
+        assert_eq!(
+            names,
+            vec!["kind", "lexical", "semantic", "centrality", "prominence"]
+        );
+        assert_eq!(known_signal_names(), names);
+    }
+
+    #[test]
+    fn weight_table_accepts_every_builtin_signal_name() {
+        let mut weights = HashMap::new();
+        for name in known_signal_names() {
+            weights.insert(name.to_string(), 0.5);
+        }
+        let table = WeightTable::from_config(&weights).unwrap();
+        for name in known_signal_names() {
+            assert_eq!(table.weight(name), 0.5, "{name}");
+        }
+    }
+
+    #[test]
+    fn new_signals_zero_weight_never_evaluated() {
+        // Kind-only weights over a fully seeded connection: the union of
+        // requirements collapses to none (no supplementary context SQL),
+        // and the breakdown carries only kind.
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![classified("a.rs", 1, "alpha", ResultCategory::Other)];
+        let weights = table(&[("kind", 1.0)]);
+
+        assert_eq!(
+            union_reqs(&builtin_signals(), &weights),
+            ContextReqs::none()
+        );
+
+        let scored = rerank_with_signals(
+            builtin_signals(),
+            results,
+            &QueryInfo { pattern: "alpha" },
+            Some(&conn),
+            &weights,
+            &ContextSources::default(),
+        );
+        assert_eq!(scored[0].contributions.len(), 1);
+        assert_eq!(scored[0].contributions[0].signal, "kind");
     }
 
     #[test]
@@ -1022,15 +1057,15 @@ mod tests {
     #[test]
     fn weight_table_rejects_unknown_name_with_valid_names() {
         let mut weights = HashMap::new();
-        weights.insert("lexical".to_string(), 1.0);
+        weights.insert("nosuch_signal".to_string(), 1.0);
         let err = WeightTable::from_config(&weights).unwrap_err().to_string();
         assert!(
-            err.contains("unknown signal name 'lexical'"),
+            err.contains("unknown signal name 'nosuch_signal'"),
             "error names the offender: {err}"
         );
         assert!(
-            err.contains("known: kind"),
-            "error lists the valid names: {err}"
+            err.contains("known: kind, lexical, semantic, centrality, prominence"),
+            "error lists every valid name: {err}"
         );
     }
 

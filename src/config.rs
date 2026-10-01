@@ -1671,12 +1671,12 @@ kind = 0.0
         env.write_global_config(
             r#"
 [rank.weights]
-lexical = 1.0
+nosuch_signal = 1.0
 "#,
         );
         let err = env.load().unwrap_err().to_string();
         assert!(
-            err.contains("unknown signal name 'lexical' in [rank.weights]"),
+            err.contains("unknown signal name 'nosuch_signal' in [rank.weights]"),
             "error names the offender and the section: {err}"
         );
         assert!(
@@ -1692,7 +1692,7 @@ lexical = 1.0
         env.write_repo_config(
             r#"
 [rank.weights]
-centrality = 3.0
+nosuch_signal = 3.0
 "#,
         );
         assert!(env.load().is_err());

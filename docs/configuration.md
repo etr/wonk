@@ -98,6 +98,10 @@ Signal-pipeline re-ranking for `wonk search` (smart ranked mode).
 |-----|---------|-------------|
 | `enabled` | `false` | Route smart-ranked search results through the signal pipeline. `false` keeps the legacy ordering byte-for-byte |
 | `weights.kind` | `1.0` | Weight of the kind signal (category tier ordering). A weight of `0` skips the signal entirely; absent names weigh zero |
+| `weights.lexical` | `0.0` | BM25 score of the candidate's file over the query terms, min-max normalized across the candidate set (files without term statistics score 0). Requires a V5+ index with `term_stats` |
+| `weights.semantic` | `0.0` | Cosine similarity between the query embedding and the candidate symbol's indexed embedding, mapped absolutely as `clamp01((cos + 1) / 2)`. Missing embeddings contribute zero, never a penalty. Requires indexed embeddings and the configured embedding provider (`[embedding] provider`, default bundled) |
+| `weights.centrality` | `0.0` | `ln(1 + callers) / ln(1 + set_max)` over the symbol's distinct indexed callers, log-damped against the candidate set so a single hub cannot dominate unrelated queries |
+| `weights.prominence` | `0.0` | `1.0` when the candidate defines a symbol named by the query (term or raw pattern), `0.5` when a query term appears as a whole identifier in the matched line, `0.0` for substring-only mentions |
 
 ```toml
 [rank]
