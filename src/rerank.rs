@@ -5454,13 +5454,15 @@ proximity, signature, churn, co_change, hub, authority, community",
     #[test]
     fn rank_settings_topology_kill_switch_restores_prior_behavior_exactly() {
         // A table that opts into topology, loaded with the kill switch on:
-        // both weights are forced to exactly 0.0 (PRD-TOPO-REQ-008).
+        // the three topology weights are forced to exactly 0.0
+        // (PRD-TOPO-REQ-008).
         let rank = crate::config::RankConfig {
             enabled: true,
             weights: std::collections::HashMap::from([
                 ("kind".to_string(), 1.0),
                 ("hub".to_string(), 2.0),
                 ("authority".to_string(), 3.0),
+                ("community".to_string(), 4.0),
             ]),
             class_multipliers: ClassMultipliers::neutral(),
         };
@@ -5475,6 +5477,7 @@ proximity, signature, churn, co_change, hub, authority, community",
         .unwrap();
         assert_eq!(disabled.weights.weight("hub"), 0.0);
         assert_eq!(disabled.weights.weight("authority"), 0.0);
+        assert_eq!(disabled.weights.weight("community"), 0.0);
         assert_eq!(disabled.weights.weight("kind"), 1.0);
 
         // The zeroed table scores a populated candidate set
@@ -5496,6 +5499,7 @@ proximity, signature, churn, co_change, hub, authority, community",
         let mut prior = rank.clone();
         prior.weights.remove("hub");
         prior.weights.remove("authority");
+        prior.weights.remove("community");
         let prior_settings = RankSettings::from_config(
             &prior,
             &search,
