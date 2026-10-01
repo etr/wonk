@@ -35,6 +35,7 @@ pub struct Config {
     pub review: ReviewConfig,
     pub rank: RankConfig,
     pub history: HistoryConfig,
+    pub topology: TopologyConfig,
 }
 
 /// Daemon-related settings.
@@ -154,6 +155,43 @@ impl Default for HistoryConfig {
             window: 500,
             enabled: true,
             max_commit_files: 50,
+        }
+    }
+}
+
+/// Graph-topology scoring settings (TASK-098, DR-040, OQ-018).
+///
+/// `iterations` is the FIXED iteration count of the hub/authority power
+/// method — the bound itself (PRD-TOPO-REQ-005), not a convergence
+/// tolerance: a fixed count is what makes the scores bitwise
+/// reproducible. `interval` is the daemon's minimum seconds between
+/// recomputes (the cadence gate of PRD-TOPO-REQ-006), and `stale_after`
+/// is when a served score earns the stale marker (PRD-TOPO-REQ-007).
+/// All numeric defaults are placeholders pending OQ-018 tuning (the
+/// `[history] window` precedent); each zero value is a hard load error —
+/// zero iterations scores nothing, a zero interval recomputes per event
+/// batch (the per-file cost REQ-006 forbids), and a zero threshold marks
+/// every score stale the moment it is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopologyConfig {
+    /// Kill switch: `false` skips the pass and zeroes both signal weights
+    /// (PRD-TOPO-REQ-008).
+    pub enabled: bool,
+    /// Exact number of power-method iterations per recompute.
+    pub iterations: usize,
+    /// Minimum seconds between daemon-triggered recomputes.
+    pub interval: u64,
+    /// Seconds after `topology_meta.last_computed` before scores are stale.
+    pub stale_after: u64,
+}
+
+impl Default for TopologyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            iterations: 20,
+            interval: 3600,
+            stale_after: 86400,
         }
     }
 }
@@ -359,6 +397,7 @@ struct ConfigOverlay {
     review: Option<ReviewOverlay>,
     rank: Option<RankOverlay>,
     history: Option<HistoryOverlay>,
+    topology: Option<TopologyOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -421,6 +460,15 @@ struct HistoryOverlay {
     window: Option<usize>,
     enabled: Option<bool>,
     max_commit_files: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct TopologyOverlay {
+    enabled: Option<bool>,
+    iterations: Option<usize>,
+    interval: Option<u64>,
+    stale_after: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -625,6 +673,39 @@ impl Config {
                     "[history] max_commit_files must be >= 2 (got {}): every commit would \
                      be bulk and no coupling could ever be derived",
                     self.history.max_commit_files
+                );
+            }
+        }
+        if let Some(topology) = overlay.topology {
+            if let Some(v) = topology.enabled {
+                self.topology.enabled = v;
+            }
+            if let Some(v) = topology.iterations {
+                self.topology.iterations = v;
+            }
+            if let Some(v) = topology.interval {
+                self.topology.interval = v;
+            }
+            if let Some(v) = topology.stale_after {
+                self.topology.stale_after = v;
+            }
+            if self.topology.iterations == 0 {
+                anyhow::bail!(
+                    "[topology] iterations must be >= 1 (got 0): zero iterations scores \
+                     nothing"
+                );
+            }
+            if self.topology.interval == 0 {
+                anyhow::bail!(
+                    "[topology] interval must be >= 1 second (got 0): a zero interval \
+                     recomputes on every daemon event batch, the per-file cost \
+                     PRD-TOPO-REQ-006 forbids"
+                );
+            }
+            if self.topology.stale_after == 0 {
+                anyhow::bail!(
+                    "[topology] stale_after must be >= 1 second (got 0): every score \
+                     would be stale the moment it is written"
                 );
             }
         }
@@ -969,6 +1050,139 @@ max_commit_files = 1
         let err = env.load().unwrap_err().to_string();
         assert!(
             err.contains("[history] max_commit_files"),
+            "error names the offending key: {err}"
+        );
+    }
+
+    // -- [topology] (TASK-098) --------------------------------------------------
+
+    #[test]
+    fn topology_defaults_when_absent() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert_eq!(
+            config.topology,
+            TopologyConfig {
+                enabled: true,
+                iterations: 20,
+                interval: 3600,
+                stale_after: 86400
+            }
+        );
+        // Placeholders pending OQ-018 tuning (the [history] window
+        // precedent), so the defaults are also the documented constants.
+        assert_eq!(
+            Config::default().topology,
+            TopologyConfig {
+                enabled: true,
+                iterations: 20,
+                interval: 3600,
+                stale_after: 86400
+            }
+        );
+    }
+
+    #[test]
+    fn topology_keys_parse() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[topology]
+enabled = false
+iterations = 7
+interval = 120
+stale_after = 60
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(
+            config.topology,
+            TopologyConfig {
+                enabled: false,
+                iterations: 7,
+                interval: 120,
+                stale_after: 60
+            }
+        );
+    }
+
+    #[test]
+    fn topology_layers_merge_per_key() {
+        // The global layer sets some keys; the repo layer overrides one and
+        // leaves the rest alone — per-key merge, not table replacement.
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[topology]
+iterations = 9
+stale_after = 300
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[topology]
+iterations = 4
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(config.topology.iterations, 4, "repo wins on conflict");
+        assert_eq!(config.topology.stale_after, 300, "global survives");
+        assert_eq!(config.topology.interval, 3600, "unset key keeps default");
+        assert!(config.topology.enabled);
+    }
+
+    #[test]
+    fn topology_iterations_zero_is_rejected() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[topology]
+iterations = 0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[topology] iterations"),
+            "error names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_interval_zero_is_rejected() {
+        // An interval of 0 would recompute on every daemon event batch —
+        // exactly the per-file cost PRD-TOPO-REQ-006 forbids — so it is a
+        // configuration error naming the requirement.
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[topology]
+interval = 0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[topology] interval") && err.contains("PRD-TOPO-REQ-006"),
+            "error names the key and the requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_stale_after_zero_is_rejected() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[topology]
+stale_after = 0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[topology] stale_after"),
             "error names the offending key: {err}"
         );
     }
