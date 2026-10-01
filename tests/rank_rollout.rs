@@ -114,9 +114,60 @@ fn ranked_files(
         .collect()
 }
 
+fn precision_at_10(ranked: &[String], relevant: &[String]) -> f32 {
+    ranked
+        .iter()
+        .take(10)
+        .filter(|f| relevant.contains(f))
+        .count() as f32
+        / 10.0
+}
+
+/// Mean precision@10 per query class and overall for `settings` over the
+/// whole labeled set.
+fn measure(root: &Path, conn: &Connection, settings: &RankSettings) -> Summary {
+    let labels = load_labels();
+    let mut by_class: HashMap<String, (f32, usize)> = HashMap::new();
+    for query in &labels.query {
+        let ranked = ranked_files(root, conn, &query.text, settings);
+        let p = precision_at_10(&ranked, &query.relevant);
+        let entry = by_class.entry(query.class.clone()).or_insert((0.0, 0));
+        entry.0 += p;
+        entry.1 += 1;
+    }
+    let mut per_class = HashMap::new();
+    for (class, (sum, count)) in by_class {
+        per_class.insert(class, sum / count as f32);
+    }
+    let overall = per_class.values().sum::<f32>() / per_class.len() as f32;
+    Summary { overall, per_class }
+}
+
+#[derive(Debug, Clone)]
+struct Summary {
+    overall: f32,
+    per_class: HashMap<String, f32>,
+}
+
 /// The legacy ordering (REQ-017's baseline): the pre-pipeline sort.
 fn legacy_settings() -> RankSettings {
     RankSettings::default()
+}
+
+/// The shipping [rank] defaults with the flip applied (enabled = true):
+/// what every search runs after REQ-017's default flip.
+fn tuned_defaults_as_shipped() -> RankSettings {
+    let rank = wonk::config::RankConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    RankSettings::from_config(
+        &rank,
+        &wonk::config::SearchConfig::default(),
+        wonk::embedding::EmbeddingProviderKind::Bundled,
+        None,
+    )
+    .unwrap()
 }
 
 fn weights_of(entries: &[(&str, f32)]) -> WeightTable {
@@ -251,12 +302,37 @@ fn previous_ordering_reachable_by_config() {
     }
 }
 
-/// The tuned [rank] defaults as they ship (Phase 8 transcribes the winner
-/// of the recorded tuning run into RankConfig::default(); this helper
-/// reads them straight from the config default so the gates measure what
-/// ships).
+/// The tuned [rank] defaults as they ship (transcribed verbatim from the
+/// recorded tuning run, bench/rank-tuning-results.md candidate K).
 fn tuned_rank_config() -> wonk::config::RankConfig {
     wonk::config::RankConfig::default()
+}
+
+#[test]
+fn tuned_defaults_beat_legacy_on_labeled_set() {
+    // REQ-017's standing flip gate: the shipping defaults (with the flip
+    // applied) must beat the legacy ordering on the labeled set — mean
+    // precision@10 strictly higher, no query class regressing. The
+    // measured numbers are recorded in bench/rank-tuning-results.md
+    // (legacy 0.5025 vs tuned 0.5175; symbol +0.05, conceptual +0.0071,
+    // path and signature unchanged).
+    let (dir, conn) = setup_labeled_corpus();
+    let legacy = measure(dir.path(), &conn, &legacy_settings());
+    let tuned = measure(dir.path(), &conn, &tuned_defaults_as_shipped());
+
+    for (class, value) in &tuned.per_class {
+        let baseline = legacy.per_class.get(class).copied().unwrap_or(0.0);
+        assert!(
+            *value >= baseline,
+            "{class} regressed: tuned {value} vs legacy {baseline}"
+        );
+    }
+    assert!(
+        tuned.overall > legacy.overall,
+        "mean precision@10 must strictly improve: tuned {} vs legacy {}",
+        tuned.overall,
+        legacy.overall
+    );
 }
 
 #[test]

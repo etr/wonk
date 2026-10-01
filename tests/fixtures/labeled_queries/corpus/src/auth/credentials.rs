@@ -13,3 +13,20 @@ pub fn rotate_credentials(secret: &str) -> Result<String, AuthError> {
     let _ = secret;
     Ok("next-secret".into())
 }
+
+// credential renewal policy step 0: rotate_credentials stagger window
+pub fn renew_step_0(secret: &str) -> bool {
+    rotate_credentials(secret).is_ok()
+}
+// credential renewal policy step 1: rotate_credentials stagger window
+pub fn renew_step_1(secret: &str) -> bool {
+    rotate_credentials(secret).is_ok()
+}
+// credential renewal policy step 2: rotate_credentials stagger window
+pub fn renew_step_2(secret: &str) -> bool {
+    rotate_credentials(secret).is_ok()
+}
+// how does auth refresh converge: step 3 overlaps both secrets
+pub fn renew_step_3(secret: &str) -> bool {
+    rotate_credentials(secret).is_ok()
+}

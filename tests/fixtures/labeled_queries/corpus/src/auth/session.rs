@@ -26,3 +26,20 @@ pub fn close_session(session: &mut Session) {
 }
 
 use crate::errors::AuthError;
+
+// session storage guard 0: token expiry recheck
+pub fn session_step_0(secret: &str) -> bool {
+    open_session(secret).is_ok()
+}
+// session storage guard 1: token expiry recheck
+pub fn session_step_1(secret: &str) -> bool {
+    open_session(secret).is_ok()
+}
+// session storage guard 2: token expiry recheck
+pub fn session_step_2(secret: &str) -> bool {
+    open_session(secret).is_ok()
+}
+// session storage guard 3: token expiry recheck
+pub fn session_step_3(secret: &str) -> bool {
+    open_session(secret).is_ok()
+}

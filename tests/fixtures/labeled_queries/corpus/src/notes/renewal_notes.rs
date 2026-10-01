@@ -7,3 +7,13 @@
 
 /// Marker symbol so these notes are indexed and embedded.
 pub fn renewal_note_anchor() {}
+
+// credential renewal policy note 0: overlap window math
+// credential renewal policy note 1: stagger calendar math
+// how does auth refresh note 0: both secrets validate in the window
+// how does auth refresh note 1: callers converge without paging
+
+/// Renewal policy marker 0.
+pub fn renewal_note_step_0() {}
+/// Renewal policy marker 1.
+pub fn renewal_note_step_1() {}

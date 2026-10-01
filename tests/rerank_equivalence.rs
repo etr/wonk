@@ -298,10 +298,13 @@ fn legacy_settings_reproduce_rank_and_dedup() {
 fn default_config_gates_to_legacy_ordering() {
     let config = Config::default();
     assert!(!config.rank.enabled, "pipeline must be disabled by default");
-    assert_eq!(
-        config.rank.weights,
-        std::collections::HashMap::from([("kind".to_string(), 1.0f32)])
-    );
+    // TASK-095: the default weights are the TUNED table (transcribed from
+    // bench/rank-tuning-results.md, candidate K) — they are inert while
+    // enabled = false (the legacy path ignores weights) and gate the
+    // pipeline once enabled. kind stays anchored at 1.0.
+    assert_eq!(config.rank.weights.get("kind"), Some(&1.0f32));
+    assert_eq!(config.rank.weights.get("lexical"), Some(&0.4f32));
+    assert_eq!(config.rank.class_multipliers.symbol.lexical, 1.8f32);
 
     // Settings derived exactly as the router derives them from a default
     // config take the legacy path and reproduce its output.
@@ -332,6 +335,14 @@ fn cli_why_stdout_is_byte_identical_to_default_smart_run() {
     // config (the local index at <root>/.wonk/index.db needs no $HOME).
     let home = TempDir::new().unwrap();
     let bin = env!("CARGO_BIN_EXE_wonk");
+
+    // TASK-095 conscious update: with the tuned default weights, --why
+    // forces the pipeline while a legacy-gated run does not, so the two
+    // differ BY DESIGN until the flip. Byte-identity is now pinned with
+    // the pipeline enabled on both sides ("both now pipelined") — which
+    // is also what the post-flip default run becomes.
+    fs::create_dir_all(root.join(".wonk")).unwrap();
+    fs::write(root.join(".wonk/config.toml"), "[rank]\nenabled = true\n").unwrap();
 
     let run = |extra: &[&str]| {
         let mut cmd = std::process::Command::new(bin);
@@ -590,6 +601,12 @@ fn cli_why_alone_implies_smart_ranked_mode() {
         );
         output
     };
+
+    // Same conscious update as the byte-identity test: pin the implication
+    // with the pipeline enabled, so --why's forced pipeline matches the
+    // smart run's config-enabled one.
+    fs::create_dir_all(root.join(".wonk")).unwrap();
+    fs::write(root.join(".wonk/config.toml"), "[rank]\nenabled = true\n").unwrap();
 
     let plain = run(&[]);
     let smart = run(&["--smart"]);

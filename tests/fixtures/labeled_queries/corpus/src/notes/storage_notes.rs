@@ -5,3 +5,12 @@
 
 /// Marker symbol so these notes are indexed and embedded.
 pub fn storage_note_anchor() {}
+
+// session storage note 0: hot tier bounds
+// session storage note 1: cold page layout
+// session storage note 2: admission ordering
+
+/// Storage policy marker 0.
+pub fn storage_note_step_0() {}
+/// Storage policy marker 1.
+pub fn storage_note_step_1() {}

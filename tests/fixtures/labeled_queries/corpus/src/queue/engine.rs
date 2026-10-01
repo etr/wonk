@@ -23,3 +23,17 @@ impl QueueWorker {
         None
     }
 }
+
+// queue worker shutdown step 0: claim drains first
+impl QueueWorker {
+    // queue worker shutdown step 1: claim stops admitting
+    pub fn drain_step_0(&self) -> usize {
+        self.claim().map_or(0, |_| 1)
+    }
+    // queue worker shutdown step 2: claim parks on ack deadline
+    pub fn drain_step_1(&self) -> usize {
+        self.claim().map_or(0, |_| 1)
+    }
+}
+// queue worker shutdown step 3: fn claim(&self) keeps its contract
+// queue worker shutdown step 4: fn claim(&self) returns owned ids

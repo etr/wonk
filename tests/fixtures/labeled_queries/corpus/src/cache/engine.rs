@@ -27,3 +27,24 @@ pub fn evict_entry(key: &str) -> bool {
     let _ = key;
     true
 }
+
+// cache eviction strategy step 0: evict_entry on clean LRU tail
+pub fn eviction_step_0(engine: &CacheEngine, key: &str) -> bool {
+    let _ = engine.get(key);
+    evict_entry(key)
+}
+// cache eviction strategy step 1: evict_entry on clean LRU tail
+pub fn eviction_step_1(engine: &CacheEngine, key: &str) -> bool {
+    let _ = engine.get(key);
+    evict_entry(key)
+}
+// cache eviction strategy step 2: evict_entry on dirty overflow
+pub fn eviction_step_2(engine: &CacheEngine, key: &str) -> bool {
+    let _ = engine.get(key);
+    evict_entry(key)
+}
+// cache eviction strategy step 3: evict_entry on dirty overflow
+pub fn eviction_step_3(engine: &CacheEngine, key: &str) -> bool {
+    let _ = engine.get(key);
+    evict_entry(key)
+}

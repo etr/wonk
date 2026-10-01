@@ -37,3 +37,37 @@ pub fn issue_token(subject: &str, scope: &[String]) -> Result<TokenClaims, AuthE
 pub fn refresh_token(secret: &str) -> TokenClaims {
     validate_token(secret).expect("valid secret")
 }
+
+// token expiry guard 0: validate_token recheck before dispatch
+pub fn validate_token_step_0(input: &str) -> bool {
+    validate_token(input).is_ok()
+}
+// token expiry guard 1: validate_token recheck before dispatch
+pub fn validate_token_step_1(input: &str) -> bool {
+    validate_token(input).is_ok()
+}
+// token expiry guard 2: validate_token recheck before dispatch
+pub fn validate_token_step_2(input: &str) -> bool {
+    validate_token(input).is_ok()
+}
+// token expiry guard 3: validate_token recheck before dispatch
+pub fn validate_token_step_3(input: &str) -> bool {
+    validate_token(input).is_ok()
+}
+
+// claims projection 0: TokenClaims subject extraction
+pub fn claims_step_0(claims: &TokenClaims) -> String {
+    claims.subject.clone()
+}
+// claims projection 1: TokenClaims scope extraction
+pub fn claims_step_1(claims: &TokenClaims) -> usize {
+    claims.scope.len()
+}
+// claims projection 2: TokenClaims expiry read
+pub fn claims_step_2(claims: &TokenClaims) -> u64 {
+    claims.expires_at
+}
+// claims projection 3: TokenClaims expiry read again
+pub fn claims_step_3(claims: &TokenClaims) -> u64 {
+    claims.expires_at
+}

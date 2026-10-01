@@ -219,9 +219,34 @@ pub struct RankConfig {
 impl Default for RankConfig {
     fn default() -> Self {
         Self {
+            // REQ-017: the flip to `true` is its own gated commit.
             enabled: false,
-            weights: HashMap::from([("kind".to_string(), 1.0)]),
-            class_multipliers: crate::rerank::ClassMultipliers::neutral(),
+            // Tuned against the labeled set (TASK-095); every number below
+            // is transcribed verbatim from bench/rank-tuning-results.md
+            // (candidate K, the mildest of the tied 0.5175 plateau).
+            weights: HashMap::from([
+                ("kind".to_string(), 1.0),
+                ("lexical".to_string(), 0.4),
+                ("semantic".to_string(), 0.3),
+                ("prominence".to_string(), 1.0),
+                ("centrality".to_string(), 0.4),
+                ("signature".to_string(), 0.8),
+                ("path_character".to_string(), 0.6),
+            ]),
+            class_multipliers: crate::rerank::ClassMultipliers {
+                symbol: crate::rerank::ChannelMultipliers {
+                    lexical: 1.8,
+                    semantic: 0.6,
+                },
+                path: crate::rerank::ChannelMultipliers {
+                    lexical: 1.3,
+                    semantic: 0.8,
+                },
+                signature: crate::rerank::ChannelMultipliers {
+                    lexical: 1.4,
+                    semantic: 0.6,
+                },
+            },
         }
     }
 }
@@ -1643,16 +1668,32 @@ rrf_k = 80.0
     // -- Rank config tests --------------------------------------------------
 
     #[test]
-    fn rank_defaults_to_disabled_with_kind_weight() {
-        // REQ-017: reranking is behind config defaulting to the current
-        // ordering. The default flip is TASK-095's, not ours.
+    fn rank_defaults_to_disabled_with_tuned_weights() {
+        // REQ-017: reranking stays behind config defaulting to the current
+        // ordering. The weights/multipliers ARE the TASK-095 tuned table,
+        // transcribed verbatim from bench/rank-tuning-results.md
+        // (candidate K; mean p@10 0.5025 -> 0.5175, no class regressed).
         let env = TestEnv::new();
         let config = env.load().unwrap();
         assert!(!config.rank.enabled);
         assert_eq!(
             config.rank.weights,
-            HashMap::from([("kind".to_string(), 1.0)])
+            HashMap::from([
+                ("kind".to_string(), 1.0),
+                ("lexical".to_string(), 0.4),
+                ("semantic".to_string(), 0.3),
+                ("prominence".to_string(), 1.0),
+                ("centrality".to_string(), 0.4),
+                ("signature".to_string(), 0.8),
+                ("path_character".to_string(), 0.6),
+            ])
         );
+        assert_eq!(config.rank.class_multipliers.symbol.lexical, 1.8);
+        assert_eq!(config.rank.class_multipliers.symbol.semantic, 0.6);
+        assert_eq!(config.rank.class_multipliers.path.lexical, 1.3);
+        assert_eq!(config.rank.class_multipliers.path.semantic, 0.8);
+        assert_eq!(config.rank.class_multipliers.signature.lexical, 1.4);
+        assert_eq!(config.rank.class_multipliers.signature.semantic, 0.6);
     }
 
     #[test]
@@ -1783,10 +1824,10 @@ rrf_k = 40.0
         );
         let config = env.load().unwrap();
         assert!(!config.rank.enabled);
-        assert_eq!(
-            config.rank.weights,
-            HashMap::from([("kind".to_string(), 1.0)])
-        );
+        // The tuned table (see rank_defaults_to_disabled_with_tuned_weights
+        // for the provenance) survives an unrelated section untouched.
+        assert_eq!(config.rank.weights.get("lexical"), Some(&0.4));
+        assert_eq!(config.rank.weights.get("kind"), Some(&1.0));
     }
 
     // -------------------------------------------------------------------
@@ -1794,12 +1835,28 @@ rrf_k = 40.0
     // -------------------------------------------------------------------
 
     #[test]
-    fn rank_class_multipliers_default_neutral() {
+    fn rank_class_multipliers_default_is_the_tuned_table() {
+        // Provenance: bench/rank-tuning-results.md candidate K. Neutral
+        // multipliers are asserted by the wholesale-replacement tests
+        // instead — the SHIPPED default is tuned, not neutral.
         let env = TestEnv::new();
         let config = env.load().unwrap();
         assert_eq!(
             config.rank.class_multipliers,
-            crate::rerank::ClassMultipliers::neutral()
+            crate::rerank::ClassMultipliers {
+                symbol: crate::rerank::ChannelMultipliers {
+                    lexical: 1.8,
+                    semantic: 0.6
+                },
+                path: crate::rerank::ChannelMultipliers {
+                    lexical: 1.3,
+                    semantic: 0.8
+                },
+                signature: crate::rerank::ChannelMultipliers {
+                    lexical: 1.4,
+                    semantic: 0.6
+                },
+            }
         );
     }
 
