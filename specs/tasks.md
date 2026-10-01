@@ -3882,15 +3882,15 @@ Add control-flow retention and wire elision into the source-returning commands, 
 Create `rerank.rs` with the signal abstraction, weighted scoring, batched context preparation, and explainability — then port the existing category ordering into it as the kind signal.
 
 **Action Items:**
-- [ ] Create `rerank.rs` with a `Signal` abstraction: name + pure function over (query, candidate, shared context) returning a normalized contribution (PRD-RANK-REQ-001, PRD-RANK-REQ-002)
-- [ ] Implement weighted summation; skip evaluation entirely for zero-weight signals (PRD-RANK-REQ-003)
-- [ ] Batch-prepare shared context (caller counts, path classification) once per candidate set, not per candidate
-- [ ] Retain each signal's unweighted contribution on the result (PRD-RANK-REQ-004)
-- [ ] Add `--why` output rendering the per-signal breakdown and final score (PRD-RANK-REQ-005)
-- [ ] Add `[rank]` config section for weights; reject unknown signal names as an error (PRD-RANK-REQ-006)
-- [ ] Port `ResultCategory` into a kind signal reproducing the existing tier ordering (PRD-RANK-REQ-010)
-- [ ] Gate the pipeline behind config defaulting to current ordering (PRD-RANK-REQ-017)
-- [ ] **Equivalence test: kind weight dominant + all others zero produces byte-identical output to the current ranker** (AR-033)
+- [x] Create `rerank.rs` with a `Signal` abstraction: name + pure function over (query, candidate, shared context) returning a normalized contribution (PRD-RANK-REQ-001, PRD-RANK-REQ-002)
+- [x] Implement weighted summation; skip evaluation entirely for zero-weight signals (PRD-RANK-REQ-003)
+- [x] Batch-prepare shared context (caller counts, path classification) once per candidate set, not per candidate
+- [x] Retain each signal's unweighted contribution on the result (PRD-RANK-REQ-004)
+- [x] Add `--why` output rendering the per-signal breakdown and final score (PRD-RANK-REQ-005)
+- [x] Add `[rank]` config section for weights; reject unknown signal names as an error (PRD-RANK-REQ-006)
+- [x] Port `ResultCategory` into a kind signal reproducing the existing tier ordering (PRD-RANK-REQ-010)
+- [x] Gate the pipeline behind config defaulting to current ordering (PRD-RANK-REQ-017)
+- [x] **Equivalence test: kind weight dominant + all others zero produces byte-identical output to the current ranker** (AR-033)
 
 **Dependencies:**
 - Blocked by: None
@@ -3908,7 +3908,7 @@ Create `rerank.rs` with the signal abstraction, weighted scoring, batched contex
 **Related Requirements:** PRD-RANK-REQ-001 through PRD-RANK-REQ-006, PRD-RANK-REQ-010, PRD-RANK-REQ-017
 **Related Decisions:** DR-037
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
