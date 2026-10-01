@@ -88,6 +88,7 @@ fn pipeline_settings(weights: &WeightTable) -> RankSettings {
         use_pipeline: true,
         weights: weights.clone(),
         sources: sources(),
+        ..Default::default()
     }
 }
 

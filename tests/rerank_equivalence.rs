@@ -295,16 +295,24 @@ fn legacy_settings_reproduce_rank_and_dedup() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_config_gates_to_legacy_ordering() {
-    let config = Config::default();
-    assert!(!config.rank.enabled, "pipeline must be disabled by default");
-    assert_eq!(
-        config.rank.weights,
-        std::collections::HashMap::from([("kind".to_string(), 1.0f32)])
-    );
+fn disabled_config_reproduces_legacy_ordering() {
+    // TASK-095 flip: the DEFAULT config now runs the tuned pipeline
+    // (earned on the labeled set; see bench/rank-tuning-results.md). The
+    // conscious update of the old default-gate test: an EXPLICIT disabled
+    // config is the escape hatch that keeps the previous ordering.
+    let default_config = Config::default();
+    assert!(default_config.rank.enabled, "the flip is pinned here");
+    assert_eq!(default_config.rank.weights.get("kind"), Some(&1.0f32));
+    assert_eq!(default_config.rank.weights.get("lexical"), Some(&0.4f32));
+    assert_eq!(default_config.rank.class_multipliers.symbol.lexical, 1.8f32);
 
-    // Settings derived exactly as the router derives them from a default
-    // config take the legacy path and reproduce its output.
+    let config = Config {
+        rank: wonk::config::RankConfig {
+            enabled: false,
+            ..default_config.rank.clone()
+        },
+        ..default_config
+    };
     let settings = RankSettings {
         use_pipeline: config.rank.enabled,
         weights: WeightTable::from_config(&config.rank.weights).unwrap(),
@@ -332,6 +340,14 @@ fn cli_why_stdout_is_byte_identical_to_default_smart_run() {
     // config (the local index at <root>/.wonk/index.db needs no $HOME).
     let home = TempDir::new().unwrap();
     let bin = env!("CARGO_BIN_EXE_wonk");
+
+    // TASK-095 conscious update: with the tuned default weights, --why
+    // forces the pipeline while a legacy-gated run does not, so the two
+    // differ BY DESIGN until the flip. Byte-identity is now pinned with
+    // the pipeline enabled on both sides ("both now pipelined") — which
+    // is also what the post-flip default run becomes.
+    fs::create_dir_all(root.join(".wonk")).unwrap();
+    fs::write(root.join(".wonk/config.toml"), "[rank]\nenabled = true\n").unwrap();
 
     let run = |extra: &[&str]| {
         let mut cmd = std::process::Command::new(bin);
@@ -389,7 +405,184 @@ fn cli_why_stdout_is_byte_identical_to_default_smart_run() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. --why without --smart implies smart ranked mode
+// 7. --query-class without --smart implies smart ranked mode (TASK-095)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_query_class_alone_implies_smart_ranked_mode() {
+    // Mirrors the --why pin: a TEXT-ONLY pattern (no symbol match) with
+    // --query-class routes through the ranked pipeline exactly as --smart
+    // does, because detect_search_mode treats a pin like --why.
+    let (dir, conn) = setup_indexed_corpus();
+    assert_eq!(
+        db::count_matching_symbols(&conn, "eviction"),
+        0,
+        "'eviction' must stay a text-only pattern for this pin to hold"
+    );
+    let root = dir.path();
+    let home = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_wonk");
+
+    let run = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.current_dir(root)
+            .env("HOME", home.path())
+            .arg("search")
+            .arg("eviction");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        let output = cmd.output().expect("wonk binary to run");
+        assert!(
+            output.status.success(),
+            "wonk search {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    let smart = run(&["--smart"]);
+    let pinned = run(&["--query-class", "symbol"]);
+    assert!(
+        !smart.stdout.is_empty(),
+        "fixture corpus must produce search output"
+    );
+    assert_eq!(
+        smart.stdout, pinned.stdout,
+        "--query-class alone must route through the same ranked pipeline as --smart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Query-class response recording (TASK-095, DR-038)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_pipeline_rows_record_query_class_and_legacy_rows_do_not() {
+    let (dir, _conn) = setup_indexed_corpus();
+    let root = dir.path();
+    let home = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_wonk");
+
+    let run = |config: Option<&str>| {
+        if let Some(text) = config {
+            fs::create_dir_all(root.join(".wonk")).unwrap();
+            fs::write(root.join(".wonk/config.toml"), text).unwrap();
+        }
+        let mut cmd = std::process::Command::new(bin);
+        cmd.current_dir(root).env("HOME", home.path()).args([
+            "--quiet", "--budget",
+            // No truncation: the --why rows are much larger serialized,
+            // and a shared budget would truncate the two runs
+            // differently.
+            "1000000", "search", "cache", "--smart", "--format", "json",
+        ]);
+        let output = cmd.output().expect("wonk binary to run");
+        assert!(
+            output.status.success(),
+            "wonk search failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    // Post-flip default: every row records the detected class.
+    let piped = run(None);
+    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&piped.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("NDJSON lines"))
+        .filter(|v: &serde_json::Value| v.get("file").is_some())
+        .collect();
+    assert!(!rows.is_empty(), "fixture corpus must produce rows");
+    for row in &rows {
+        assert_eq!(
+            row["query_class"], "symbol",
+            "default (flipped) rows record the class: {row}"
+        );
+    }
+
+    // The escape hatch: an explicit disabled config returns to legacy rows
+    // carrying no query_class key at all.
+    let legacy = run(Some("[rank]\nenabled = false\n"));
+    let legacy_stdout = String::from_utf8_lossy(&legacy.stdout).into_owned();
+    let mut legacy_rows = 0usize;
+    for line in legacy_stdout.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).expect("NDJSON lines");
+        if row.get("file").is_none() {
+            continue; // the trailing budget-summary line
+        }
+        legacy_rows += 1;
+        assert!(
+            row.get("query_class").is_none(),
+            "legacy rows must not record a class: {row}"
+        );
+    }
+    assert!(legacy_rows > 0, "fixture corpus must produce rows");
+    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&piped.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("NDJSON lines"))
+        .filter(|v: &serde_json::Value| v.get("file").is_some())
+        .collect();
+    assert!(!rows.is_empty(), "fixture corpus must produce rows");
+    for row in &rows {
+        assert_eq!(
+            row["query_class"], "symbol",
+            "pipeline rows record the detected class: {row}"
+        );
+    }
+
+    // --why: exactly one `query-class:` line on stderr BEFORE the why
+    // lines, and stdout rows unchanged apart from the why breakdown the
+    // flag asks for (structured rows have always carried it).
+    let mut cmd = std::process::Command::new(bin);
+    cmd.current_dir(root).env("HOME", home.path()).args([
+        "--quiet", "--budget", "1000000", "search", "cache", "--smart", "--why", "--format", "json",
+    ]);
+    let explained = cmd.output().expect("wonk binary to run");
+    let mut explained_rows: Vec<serde_json::Value> = String::from_utf8_lossy(&explained.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("NDJSON lines"))
+        .filter(|v: &serde_json::Value| v.get("file").is_some())
+        .collect();
+    for row in &mut explained_rows {
+        assert!(
+            row.get("why").is_some(),
+            "--why rows carry the breakdown: {row}"
+        );
+        row.as_object_mut().unwrap().remove("why");
+    }
+    assert_eq!(
+        serde_json::to_string(&explained_rows).unwrap(),
+        serde_json::to_string(&rows).unwrap(),
+        "--why must not change stdout rows apart from the breakdown"
+    );
+    let err = String::from_utf8_lossy(&explained.stderr);
+    let class_lines: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("query-class:"))
+        .collect();
+    assert_eq!(
+        class_lines,
+        vec!["query-class: symbol"],
+        "exactly one query-class stderr line: {err}"
+    );
+    let first_why = err.lines().position(|l| l.starts_with("why: "));
+    let class_pos = err.lines().position(|l| l.starts_with("query-class:"));
+    match (class_pos, first_why) {
+        (Some(c), Some(w)) => assert!(c < w, "class line precedes the why lines: {err}"),
+        _ => panic!("both class and why lines expected on stderr: {err}"),
+    }
+    // Without --why the stderr carries no class line (stdout stays clean of
+    // it by construction — it only ever goes to stderr).
+    let piped_err = String::from_utf8_lossy(&piped.stderr);
+    assert!(
+        !piped_err.contains("query-class:"),
+        "no class line without --why: {piped_err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. --why without --smart implies smart ranked mode
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -425,6 +618,12 @@ fn cli_why_alone_implies_smart_ranked_mode() {
         );
         output
     };
+
+    // Same conscious update as the byte-identity test: pin the implication
+    // with the pipeline enabled, so --why's forced pipeline matches the
+    // smart run's config-enabled one.
+    fs::create_dir_all(root.join(".wonk")).unwrap();
+    fs::write(root.join(".wonk/config.toml"), "[rank]\nenabled = true\n").unwrap();
 
     let plain = run(&[]);
     let smart = run(&["--smart"]);

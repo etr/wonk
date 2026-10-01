@@ -92,19 +92,29 @@ workspace = ["payments"]      # Workspace ids this repo links contracts across
 
 **`[rank]`**
 
-Signal-pipeline re-ranking for `wonk search` (smart ranked mode).
+Signal-pipeline re-ranking for `wonk search` (smart ranked mode). The
+default weights below are the TASK-095 tuned table, flipped on as the
+default after beating the legacy ordering on the labeled query set —
+mean precision@10 0.5025 → 0.5175 with no query class regressing, and a
+measured warm-query latency well under the 20 ms budget. The measurement
+records live in `bench/rank-tuning-results.md` and
+`bench/rank-latency-results.md`. Setting `enabled = false` keeps the
+previous (legacy) ordering byte-for-byte — the escape hatch.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `false` | Route smart-ranked search results through the signal pipeline. `false` keeps the legacy ordering byte-for-byte |
+| `enabled` | `true` | Route smart-ranked search results through the signal pipeline. `false` keeps the legacy ordering byte-for-byte |
 | `weights.kind` | `1.0` | Weight of the kind signal (category tier ordering). A weight of `0` skips the signal entirely; absent names weigh zero |
-| `weights.lexical` | `0.0` | BM25 score of the candidate's file over the query terms, min-max normalized across the candidate set (files without term statistics score 0). Requires a V5+ index with `term_stats` |
-| `weights.semantic` | `0.0` | Cosine similarity between the query embedding and the candidate symbol's indexed embedding, mapped absolutely as `clamp01((cos + 1) / 2)`. Missing embeddings contribute zero, never a penalty. Requires indexed embeddings and the configured embedding provider (`[embedding] provider`, default bundled) |
-| `weights.centrality` | `0.0` | `ln(1 + callers) / ln(1 + set_max)` over the symbol's distinct indexed callers, log-damped against the candidate set so a single hub cannot dominate unrelated queries |
-| `weights.prominence` | `0.0` | `1.0` when the candidate defines a symbol named by the query (term or raw pattern), `0.5` when a query term appears as a whole identifier in the matched line, `0.0` for substring-only mentions |
-| `weights.path_character` | `0.0` | Graded ladder value of the candidate's path: ordinary `1.0`, module entry `0.80`, barrel `0.70`, example `0.60`, shim `0.45`, type declaration `0.30`, test `0.20`, generated-shadowing-a-verified-peer `0.10`. Graded, never exclusion — a test file that is the best answer still ranks. A generated file is demoted only when a same-named hand-written peer exists in the index |
+| `weights.lexical` | `0.4` | BM25 score of the candidate's file over the query terms, min-max normalized across the candidate set (files without term statistics score 0). Requires a V5+ index with `term_stats` |
+| `weights.semantic` | `0.3` | Cosine similarity between the query embedding and the candidate symbol's indexed embedding, mapped absolutely as `clamp01((cos + 1) / 2)`. Missing embeddings contribute zero, never a penalty. Requires indexed embeddings and the configured embedding provider (`[embedding] provider`, default bundled) |
+| `weights.centrality` | `0.4` | `ln(1 + callers) / ln(1 + set_max)` over the symbol's distinct indexed callers, log-damped against the candidate set so a single hub cannot dominate unrelated queries |
+| `weights.prominence` | `1.0` | `1.0` when the candidate defines a symbol named by the query (term or raw pattern), `0.5` when a query term appears as a whole identifier in the matched line, `0.0` for substring-only mentions |
+| `weights.path_character` | `0.6` | Graded ladder value of the candidate's path: ordinary `1.0`, module entry `0.80`, barrel `0.70`, example `0.60`, shim `0.45`, type declaration `0.30`, test `0.20`, generated-shadowing-a-verified-peer `0.10`. Graded, never exclusion — a test file that is the best answer still ranks. A generated file is demoted only when a same-named hand-written peer exists in the index |
 | `weights.proximity` | `0.0` | `1 / gap` over the first-occurrence positions of the query terms present as whole identifiers in the matched line (adjacent terms `1.0`, one token between `0.5`, decaying). Fewer than two present terms contribute zero |
-| `weights.signature` | `0.0` | Answers signature-shaped queries (containing `(`, `->`, or `::`): `1.0` for the index-backed definition, `0.5` for a definition-shaped line (a parenthesis plus a definition keyword among its first three identifiers), `0.0` otherwise. Name-shaped queries are inert |
+| `weights.signature` | `0.8` | Answers signature-shaped queries (containing `(`, `->`, or `::`): `1.0` for the index-backed definition, `0.5` for a definition-shaped line (a parenthesis plus a definition keyword among its first three identifiers), `0.0` otherwise. Name-shaped queries are inert |
+| `class_multipliers.symbol` | `lexical = 1.8`, `semantic = 0.6` | Per-class scaling of the lexical and semantic weights for symbol-shaped queries (a single identifier token) |
+| `class_multipliers.path` | `lexical = 1.3`, `semantic = 0.8` | Same scaling for path-shaped queries (containing `/` or `\`) |
+| `class_multipliers.signature` | `lexical = 1.4`, `semantic = 0.6` | Same scaling for signature-shaped queries (containing `(`, `->`, or `::`) |
 
 ```toml
 [rank]
@@ -119,6 +129,22 @@ naming the offender and the valid names, not a silent no-op. The weights
 table replaces the previous layer's wholesale (per-repo over global over
 default). `wonk search --why` opts into the pipeline for a single
 invocation regardless of `enabled`, printing the per-signal breakdown.
+
+Query classification (TASK-095): every pipelined query is classified by
+shape — first-match signature (contains `(`, `->`, or `::`), then path
+(contains `/` or `\`), then symbol (a single `[A-Za-z0-9_]+` token),
+else conceptual — and the class scales ONLY the lexical and semantic
+weights by the multipliers above, so structural signals are
+class-independent. The conceptual class is the neutral 1.0/1.0 baseline
+and has NO multiplier entry: a `[rank.class_multipliers.conceptual]`
+table is a hard configuration error (its neutrality cannot be configured
+away). The detected (or pinned) class is recorded on every pipeline row
+as `query_class` and printed as one `query-class: <class>` stderr line
+under `--why`, so a misclassification is diagnosable; the class affects
+the blend only, never which signals run. `wonk search --query-class
+<symbol|path|signature|conceptual>` (and the MCP `query_class`
+parameter) pins the class explicitly, bypassing detection for that
+invocation.
 
 **`[embedding]`**
 

@@ -620,6 +620,19 @@ impl McpSession {
         }
     }
 
+    fn wonk_search_with_args(&mut self, arguments: Value) -> Value {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "wonk_search",
+                "arguments": arguments
+            }
+        });
+        send_and_recv(&mut self.stdin, &mut self.reader, &req)
+    }
+
     fn wonk_search(&mut self, query: &str) -> Value {
         let req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -704,9 +717,8 @@ fn mcp_search_rows_stable_from_default_through_enabled_pipeline() {
         );
     }
 
-    // Flip [rank] enabled=true MID-SESSION: the handler loads config per
-    // call, so the next call routes through the signal pipeline — and with
-    // the kind-only default weights the rows must stay byte-identical.
+    // The mid-session flip repurposed post-TASK-095: an explicit
+    // enabled=true is byte-identical to the (now-pipelined) default...
     fs::create_dir_all(repo.path().join(".wonk")).unwrap();
     fs::write(
         repo.path().join(".wonk/config.toml"),
@@ -723,8 +735,158 @@ fn mcp_search_rows_stable_from_default_through_enabled_pipeline() {
         .unwrap();
     assert_eq!(
         default_text, enabled_text,
-        "config.rank.enabled=true must not change wonk_search rows"
+        "explicit enabled=true must reproduce the flipped default byte-for-byte"
     );
+
+    // ...and the escape hatch: flipping enabled=false mid-session returns
+    // to the legacy path — same rows, minus the recorded query_class.
+    fs::write(
+        repo.path().join(".wonk/config.toml"),
+        "[rank]\nenabled = false\n",
+    )
+    .unwrap();
+    let disabled_resp = session.wonk_search("authenticate_user");
+    let disabled_text = disabled_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let disabled_rows: Vec<Value> = serde_json::from_str(disabled_text).unwrap();
+    assert_eq!(
+        disabled_rows.len(),
+        rows.len(),
+        "the legacy path must not change the row count"
+    );
+    for (legacy, pipelined) in disabled_rows.iter().zip(&rows) {
+        assert_eq!(legacy["file"], pipelined["file"], "ordering must hold");
+        assert_eq!(legacy["line"], pipelined["line"], "ordering must hold");
+        assert_eq!(legacy["content"], pipelined["content"], "content must hold");
+        assert!(
+            legacy.get("query_class").is_none(),
+            "legacy rows carry no class: {legacy}"
+        );
+    }
+    session.finish();
+}
+
+#[test]
+fn mcp_search_query_class_pin_and_validation() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo_search(&bin);
+    let mut session = McpSession::start(&bin, repo.path(), home.path());
+
+    // The tools/list schema advertises the enum.
+    let list_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/list"
+    });
+    let list = send_and_recv(&mut session.stdin, &mut session.reader, &list_req);
+    let tools = list["result"]["tools"].as_array().expect("tools array");
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "wonk_search")
+        .expect("wonk_search tool");
+    let prop = &search["inputSchema"]["properties"]["query_class"];
+    assert_eq!(
+        prop["type"], "string",
+        "query_class is a string enum: {prop}"
+    );
+    let variants: Vec<&str> = prop["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        variants,
+        vec!["symbol", "path", "signature", "conceptual"],
+        "query_class enum must list every class"
+    );
+
+    // A valid pin is accepted (default config: rows unchanged, no error).
+    let pinned = session.wonk_search_with_args(serde_json::json!({
+        "query": "authenticate_user",
+        "query_class": "symbol"
+    }));
+    assert!(
+        pinned["result"]["isError"].is_null(),
+        "a valid query_class pin must not fail: {pinned}"
+    );
+
+    // An invalid pin is a tool error naming the valid values.
+    let invalid = session.wonk_search_with_args(serde_json::json!({
+        "query": "authenticate_user",
+        "query_class": "troll"
+    }));
+    assert_eq!(
+        invalid["result"]["isError"], true,
+        "invalid query_class must fail the tool call: {invalid}"
+    );
+    let text = invalid["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    for valid in ["symbol", "path", "signature", "conceptual"] {
+        assert!(text.contains(valid), "error must name {valid}: {text}");
+    }
+    session.finish();
+}
+
+#[test]
+fn mcp_search_rows_record_query_class_when_pipelined() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo_search(&bin);
+    let mut session = McpSession::start(&bin, repo.path(), home.path());
+
+    // Post-flip default: every row records the detected class...
+    let piped_resp = session.wonk_search("authenticate_user");
+    let piped_text = piped_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let piped_rows: Vec<Value> = serde_json::from_str(piped_text).unwrap();
+    assert!(!piped_rows.is_empty());
+    for row in &piped_rows {
+        assert_eq!(
+            row["query_class"], "symbol",
+            "default (flipped) rows record the class: {row}"
+        );
+    }
+
+    // ...and a PIN is echoed verbatim on every row.
+    let pinned_resp = session.wonk_search_with_args(serde_json::json!({
+        "query": "authenticate_user",
+        "query_class": "conceptual"
+    }));
+    let pinned_text = pinned_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let pinned_rows: Vec<Value> = serde_json::from_str(pinned_text).unwrap();
+    assert!(!pinned_rows.is_empty());
+    for row in &pinned_rows {
+        assert_eq!(
+            row["query_class"], "conceptual",
+            "the pin is echoed on the rows: {row}"
+        );
+    }
+
+    // The escape hatch: explicit enabled = false returns to legacy rows
+    // carrying no query_class key at all.
+    fs::create_dir_all(repo.path().join(".wonk")).unwrap();
+    fs::write(
+        repo.path().join(".wonk/config.toml"),
+        "[rank]\nenabled = false\n",
+    )
+    .unwrap();
+    let legacy_resp = session.wonk_search("authenticate_user");
+    let legacy_text = legacy_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let legacy_rows: Vec<Value> = serde_json::from_str(legacy_text).unwrap();
+    assert_eq!(legacy_rows.len(), piped_rows.len());
+    for row in &legacy_rows {
+        assert!(
+            row.get("query_class").is_none(),
+            "legacy MCP rows carry no class: {row}"
+        );
+    }
     session.finish();
 }
 

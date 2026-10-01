@@ -468,6 +468,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "boolean",
                             "description": "Include results from test/doc/example files (excluded by default)",
                             "default": false
+                        },
+                        "query_class": {
+                            "type": "string",
+                            "enum": ["symbol", "path", "signature", "conceptual"],
+                            "description": "Pin the query class, bypassing detection (scales the lexical/semantic blend when reranking is enabled)"
                         }
                     },
                     "required": ["query"]
@@ -1604,6 +1609,20 @@ impl McpServer {
 
         let include_tests = extract_include_tests(&args);
 
+        // Optional query-class pin (TASK-095, REQ-007): an invalid value is
+        // a tool error naming the valid classes.
+        let pinned_class = match args.get("query_class") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_str().map(|s| s.parse::<crate::rerank::QueryClass>()) {
+                Some(Ok(class)) => Some(class),
+                _ => {
+                    return CallToolResult::error(format!(
+                        "invalid query_class '{v}' (valid: symbol, path, signature, conceptual)"
+                    ));
+                }
+            },
+        };
+
         let mut results =
             match search::text_search(&query, regex, case_insensitive, &resolved_paths) {
                 Ok(r) => r,
@@ -1621,23 +1640,17 @@ impl McpServer {
             Ok(c) => c,
             Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
         };
-        let weights = match crate::rerank::WeightTable::from_config(&config.rank.weights) {
-            Ok(w) => w,
+        let settings = match crate::rerank::RankSettings::from_config(
+            &config.rank,
+            &config.search,
+            config.embedding.provider,
+            pinned_class,
+        ) {
+            Ok(s) => s,
             Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),
         };
-        let groups = crate::rerank::rank_and_explain(
-            &results,
-            ranker_conn,
-            &query,
-            &crate::rerank::RankSettings {
-                use_pipeline: config.rank.enabled,
-                weights,
-                sources: crate::rerank::ContextSources {
-                    bm25: crate::bm25::Bm25Params::from(&config.search),
-                    embedding: config.embedding.provider,
-                },
-            },
-        );
+        let ranked =
+            crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
 
         let mut budget = budget_limit.map(|limit| {
             if let Some(p) = page {
@@ -1649,7 +1662,7 @@ impl McpServer {
         let mut outputs: Vec<SearchOutput> = Vec::new();
         let mut truncated = 0usize;
 
-        for (_category, items) in &groups {
+        for (_category, items) in &ranked.groups {
             for item in items {
                 let mut out = SearchOutput::from_search_result(
                     &item.classified.result.file,
@@ -1658,6 +1671,7 @@ impl McpServer {
                     &item.classified.result.content,
                 );
                 out.annotation = item.classified.annotation.clone();
+                out.query_class = ranked.query_class.map(|c| c.as_str().to_string());
 
                 if let Some(ref mut b) = budget {
                     let estimate = (out.file.len() + out.content.len() + 20) / 4;

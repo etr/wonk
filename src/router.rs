@@ -186,7 +186,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 .map(|c| db::count_matching_symbols(c, &args.pattern))
                 .unwrap_or(0);
 
-            let mode = detect_search_mode(args.raw, args.smart || args.why, symbol_count);
+            let mode = detect_search_mode(
+                args.raw,
+                args.smart || args.why || args.query_class.is_some(),
+                symbol_count,
+            );
 
             // Print mode indicator (skip for raw — user explicitly chose it).
             if !args.raw {
@@ -241,6 +245,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         annotation: fr.annotation.clone(),
                         source: Some(fr.source.to_string()),
                         why: None,
+                        query_class: None,
                     };
                     if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
                         truncated += 1;
@@ -258,24 +263,30 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
                         // Defense in depth: config load already rejected
                         // unknown signal names.
-                        let weights =
-                            crate::rerank::WeightTable::from_config(&config.rank.weights)?;
-                        let settings = crate::rerank::RankSettings {
-                            use_pipeline: config.rank.enabled || args.why,
-                            weights,
-                            sources: crate::rerank::ContextSources {
-                                bm25: crate::bm25::Bm25Params::from(&config.search),
-                                embedding: config.embedding.provider,
-                            },
-                        };
-                        let groups = crate::rerank::rank_and_explain(
+                        let mut settings = crate::rerank::RankSettings::from_config(
+                            &config.rank,
+                            &config.search,
+                            config.embedding.provider,
+                            args.query_class,
+                        )?;
+                        // --why opts into the pipeline for this invocation.
+                        settings.use_pipeline |= args.why;
+                        let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
                             &args.pattern,
                             &settings,
                         );
+                        // One class line per query, before any why lines
+                        // (DR-038): a misclassification is diagnosable from
+                        // the breakdown it produced.
+                        if args.why
+                            && let Some(class) = ranked.query_class
+                        {
+                            output::print_query_class_line(class);
+                        }
 
-                        for (category, items) in &groups {
+                        for (category, items) in &ranked.groups {
                             if !suppress {
                                 output::print_category_header(ranker::category_header(*category));
                             }
@@ -287,6 +298,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                     &item.classified.result.content,
                                 );
                                 out.annotation = item.classified.annotation.clone();
+                                out.query_class =
+                                    ranked.query_class.map(|c| c.as_str().to_string());
                                 if args.why {
                                     out.why = Some(crate::output::WhyOutput::from_contributions(
                                         item.score,
@@ -5767,6 +5780,7 @@ mod tests {
             smart: false,
             semantic: false,
             why: false,
+            query_class: None,
             file: None,
             paths: vec![],
         });
