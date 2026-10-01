@@ -720,21 +720,90 @@ impl Signal for CentralitySignal {
     }
 }
 
-/// Whether `term` occurs in `line` as a MAXIMAL identifier run
-/// (`[A-Za-z0-9_]+` bounded by non-identifier characters),
-/// case-insensitively.
+/// The MAXIMAL identifier runs (`[A-Za-z0-9_]+` bounded by
+/// non-identifier characters) of `line`, lowercased — the ONE shared
+/// scanner behind the prominence token tier and the proximity signal.
 ///
 /// A dedicated scanner rather than `tokenizer::tokenize`: the tokenizer
 /// splits on `_`, so it would token-match `foo` inside `foo_bar` — here the
 /// boundary is the point, because a query term appearing inside a longer
 /// identifier names a different symbol. Terms containing non-ASCII
 /// characters can never match (code identifiers are ASCII runs).
-pub fn contains_identifier_token(line: &str, term: &str) -> bool {
-    if term.is_empty() {
-        return false;
-    }
+pub fn identifier_tokens(line: &str) -> Vec<String> {
     line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|run| run.eq_ignore_ascii_case(term))
+        .filter(|run| !run.is_empty())
+        .map(|run| run.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `term` occurs in `line` as a maximal identifier run
+/// (case-insensitive) — a non-empty scan over [`identifier_tokens`].
+pub fn contains_identifier_token(line: &str, term: &str) -> bool {
+    !term.is_empty()
+        && identifier_tokens(line)
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(term))
+}
+
+/// How closely the query terms co-occur in `content` (TASK-094,
+/// PRD-RANK-REQ-013): `1 / gap` over the FIRST-OCCURRENCE token indices of
+/// the query terms present as whole identifier tokens — adjacent terms 1.0,
+/// one token between 0.5, decaying hyperbolically with distance.
+///
+/// Fewer than two present terms (single-term queries, absent terms,
+/// compound-name partials like `foo` inside `foo_bar`) contribute exactly
+/// 0.0: with nothing to co-locate the signal is inert, never a penalty.
+pub fn proximity_value(content: &str, terms: &[String]) -> f32 {
+    let tokens = identifier_tokens(content);
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut first_indices: Vec<usize> = Vec::new();
+    for term in terms {
+        if term.is_empty() || !seen.insert(term.as_str()) {
+            continue;
+        }
+        if let Some(index) = tokens.iter().position(|token| token == term) {
+            first_indices.push(index);
+        }
+    }
+    let Some(gap) = first_indices
+        .iter()
+        .copied()
+        .max()
+        .zip(first_indices.iter().copied().min())
+        .map(|(max, min)| (max - min) as f32)
+    else {
+        return 0.0;
+    };
+    // Distinct whole-token terms sit at distinct indices, so gap >= 1; the
+    // guard keeps a pathological zero gap from poisoning scores with inf.
+    if gap >= 1.0 { 1.0 / gap } else { 0.0 }
+}
+
+/// The proximity signal: how closely the query terms co-occur in the
+/// matched line. Reads only the tokenized query terms and the candidate's
+/// matched text — no new context slice, no SQL.
+pub(crate) struct ProximitySignal;
+
+impl Signal for ProximitySignal {
+    fn name(&self) -> &'static str {
+        "proximity"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_query_terms()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        proximity_value(&candidate.result.content, ctx.terms())
+    }
 }
 
 /// Prominence tier constants (TASK-093, PRD-RANK-REQ-015).
@@ -889,6 +958,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(CentralitySignal),
         Box::new(ProminenceSignal),
         Box::new(PathCharacterSignal),
+        Box::new(ProximitySignal),
     ]
 }
 
@@ -1321,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_six_signals_in_order() {
+    fn registry_contains_seven_signals_in_order() {
         let registry = builtin_signals();
         let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
         assert_eq!(
@@ -1332,7 +1402,8 @@ mod tests {
                 "semantic",
                 "centrality",
                 "prominence",
-                "path_character"
+                "path_character",
+                "proximity"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -1415,7 +1486,9 @@ mod tests {
             "error names the offender: {err}"
         );
         assert!(
-            err.contains("known: kind, lexical, semantic, centrality, prominence, path_character"),
+            err.contains(
+                "known: kind, lexical, semantic, centrality, prominence, path_character, proximity",
+            ),
             "error lists every valid name: {err}"
         );
     }
@@ -2397,6 +2470,114 @@ mod tests {
         // The call line's maximal run is the compound "my_func": neither
         // term matches it, so the mention is incidental.
         assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // ProximitySignal (TASK-094, REQ-013)
+    // -------------------------------------------------------------------
+
+    fn terms(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn identifier_tokens_scans_maximal_runs_lowercased() {
+        assert_eq!(
+            identifier_tokens("let MAP_size = call(x);"),
+            vec![
+                "let".to_string(),
+                "map_size".to_string(),
+                "call".to_string(),
+                "x".to_string()
+            ]
+        );
+        // Separator-only and empty lines produce no runs ("_" is an
+        // identifier character, so it alone would be one run).
+        assert!(identifier_tokens(":: - (!)").is_empty());
+        assert!(identifier_tokens("").is_empty());
+    }
+
+    #[test]
+    fn proximity_value_adjacent_terms_score_one() {
+        // First-occurrence token indices 0 and 1: gap 1 → 1.0.
+        assert_eq!(
+            proximity_value("alpha beta;", &terms(&["alpha", "beta"])),
+            1.0
+        );
+        // Case folding matches the scanner's lowercased tokens.
+        assert_eq!(
+            proximity_value("Alpha(BETA)", &terms(&["alpha", "beta"])),
+            1.0
+        );
+    }
+
+    #[test]
+    fn proximity_value_decays_hyperbolically_with_gap() {
+        // gap 2 → 0.5, gap 3 → 1/3.
+        assert_eq!(
+            proximity_value("alpha x beta", &terms(&["alpha", "beta"])),
+            0.5
+        );
+        let third = proximity_value("alpha x y beta", &terms(&["alpha", "beta"]));
+        assert!((third - 1.0 / 3.0).abs() < 1e-6, "{third}");
+    }
+
+    #[test]
+    fn proximity_value_inert_below_two_present_terms() {
+        // One present term: nothing to co-locate.
+        assert_eq!(
+            proximity_value("alpha other", &terms(&["alpha", "beta"])),
+            0.0
+        );
+        // None present, empty terms, empty content.
+        assert_eq!(
+            proximity_value("unrelated", &terms(&["alpha", "beta"])),
+            0.0
+        );
+        assert_eq!(proximity_value("alpha beta", &terms(&[])), 0.0);
+        assert_eq!(proximity_value("", &terms(&["alpha", "beta"])), 0.0);
+        assert_eq!(proximity_value("", &terms(&[])), 0.0);
+    }
+
+    #[test]
+    fn proximity_value_matches_whole_tokens_only() {
+        // "foo" inside foo_bar names a different identifier: not present,
+        // so no co-location is claimed.
+        assert_eq!(proximity_value("foo_bar;", &terms(&["foo", "bar"])), 0.0);
+        // Repeated QUERY terms dedup to one first occurrence: a term never
+        // co-locates with itself...
+        assert_eq!(proximity_value("alpha;", &terms(&["alpha", "alpha"])), 0.0);
+        // ...and the gap uses FIRST occurrences in the line.
+        assert_eq!(
+            proximity_value("alpha alpha beta", &terms(&["alpha", "beta"])),
+            0.5
+        );
+    }
+
+    #[test]
+    fn proximity_signal_reads_terms_from_prepared_context() {
+        let results = vec![
+            classified("src/a.rs", 1, "alpha beta;", ResultCategory::Other),
+            classified("src/b.rs", 1, "alpha filler beta;", ResultCategory::Other),
+            classified("src/c.rs", 1, "// unrelated", ResultCategory::Other),
+        ];
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms(),
+            "alpha beta",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+
+        let signal = ProximitySignal;
+        assert_eq!(signal.name(), "proximity");
+        assert_eq!(signal.requires(), ContextReqs::none().with_query_terms());
+        let query = QueryInfo {
+            pattern: "alpha beta",
+        };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        assert!((signal.contribution(&query, &results[1], &ctx) - 0.5).abs() < 1e-6);
+        assert_eq!(signal.contribution(&query, &results[2], &ctx), 0.0);
     }
 
     // -------------------------------------------------------------------
