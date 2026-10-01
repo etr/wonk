@@ -2028,6 +2028,33 @@ class Component {
     }
 
     #[test]
+    fn incremental_update_history_disabled_stays_empty() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100)]);
+        write_reach_config(dir.path(), "[history]\nenabled = false\n");
+        build_index(dir.path(), true).unwrap();
+
+        let date = "@200 +0000";
+        fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        for args in [vec!["add", "src"], vec!["commit", "-m", "new"]] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(ok.status.success());
+        }
+
+        incremental_update(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        assert_eq!(history_counts(&conn), (0, 0), "disabled never refreshes");
+    }
+
+    #[test]
     fn test_build_index_contracts_kind_disabled_by_config() {
         let dir = make_contract_repo();
         write_reach_config(dir.path(), "[contracts]\nhttp = false\n");
