@@ -1253,6 +1253,75 @@ pub fn load_embeddings_for_files(
     Ok(results)
 }
 
+/// Load embedding vectors keyed by the candidate `(file, line)` positions
+/// of the symbols they belong to (TASK-093).
+///
+/// One batched statement: `embeddings JOIN symbols ON id = symbol_id`
+/// filtered to the candidate files and the provider's vector space at the
+/// SQL level, then position-filtered in Rust. Stale rows are included — a
+/// supplementary ranking signal takes a weaker prior over an absence — and
+/// rows whose BLOB cannot decode are skipped best-effort rather than
+/// failing the load. An empty position set touches no SQL.
+pub fn load_embedding_vectors_at_positions(
+    conn: &Connection,
+    positions: &HashSet<(String, u64)>,
+    provider: &dyn EmbeddingProvider,
+) -> Result<std::collections::HashMap<(String, u64), Vec<f32>>, EmbeddingError> {
+    if positions.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let files: HashSet<&str> = positions.iter().map(|(file, _)| file.as_str()).collect();
+    let placeholders: Vec<String> = (1..=files.len()).map(|i| format!("?{i}")).collect();
+    let provider_param = files.len() + 1;
+    let dim_param = files.len() + 2;
+    let sql = format!(
+        "SELECT symbols.file, symbols.line, embeddings.vector
+         FROM embeddings JOIN symbols ON symbols.id = embeddings.symbol_id
+         WHERE symbols.file IN ({}) AND embeddings.provider = ?{} AND embeddings.dim = ?{}",
+        placeholders.join(", "),
+        provider_param,
+        dim_param,
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let file_params: Vec<&str> = files.into_iter().collect();
+    let mut params: Vec<&dyn rusqlite::types::ToSql> = file_params
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
+    let provider_name = provider.name();
+    let provider_dim = provider.dim() as i64;
+    params.push(&provider_name);
+    params.push(&provider_dim);
+
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let mut vectors = std::collections::HashMap::new();
+    for row in rows {
+        let (file, line, blob) = row.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+        let key = (file, line.max(0) as u64);
+        if !positions.contains(&key) {
+            continue;
+        }
+        if let Ok(vector) = decode_vector(&blob, provider) {
+            vectors.insert(key, vector);
+        }
+    }
+    Ok(vectors)
+}
+
 /// Delete all embeddings for a given file.
 pub fn delete_embeddings_for_file(conn: &Connection, file: &str) -> Result<(), EmbeddingError> {
     conn.execute(
@@ -3202,6 +3271,117 @@ mod tests {
         let files: HashSet<String> = HashSet::new();
         let results = load_embeddings_for_files(&conn, &files, &OneDimProvider).unwrap();
         assert!(results.is_empty());
+    }
+
+    // -- load_embedding_vectors_at_positions tests (TASK-093) -----------------
+
+    /// Insert a symbol at an explicit line plus its embedding row.
+    fn insert_symbol_at_line_with_embedding(
+        conn: &Connection,
+        sym_id: i64,
+        file: &str,
+        line: i64,
+        vec_bytes: &[u8],
+    ) {
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) \
+             VALUES (?1, ?2, 'function', ?3, ?4, 0, 'rust')",
+            rusqlite::params![sym_id, format!("sym_{sym_id}"), file, line],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings (symbol_id, file, chunk_text, vector, created_at) \
+             VALUES (?1, ?2, 'chunk', ?3, 1000)",
+            rusqlite::params![sym_id, file, vec_bytes],
+        )
+        .unwrap();
+    }
+
+    fn position_set(entries: &[(&str, u64)]) -> HashSet<(String, u64)> {
+        entries.iter().map(|(f, l)| (f.to_string(), *l)).collect()
+    }
+
+    #[test]
+    fn load_vectors_at_positions_filters_to_candidate_positions() {
+        let conn = setup_db_with_embeddings();
+        // gamma at src/a.ts:5, delta at src/a.ts:9, eps at src/b.ts:3.
+        let vec: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_at_line_with_embedding(&conn, 1, "src/a.ts", 5, &vec);
+        insert_symbol_at_line_with_embedding(&conn, 2, "src/a.ts", 9, &vec);
+        insert_symbol_at_line_with_embedding(&conn, 3, "src/b.ts", 3, &vec);
+
+        // Candidates are the gamma and eps positions only.
+        let positions = position_set(&[("src/a.ts", 5), ("src/b.ts", 3)]);
+        let loaded =
+            load_embedding_vectors_at_positions(&conn, &positions, &OneDimProvider).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains_key(&("src/a.ts".to_string(), 5)));
+        assert!(loaded.contains_key(&("src/b.ts".to_string(), 3)));
+        // The delta definition shares the file but not the line.
+        assert!(!loaded.contains_key(&("src/a.ts".to_string(), 9)));
+    }
+
+    #[test]
+    fn load_vectors_at_positions_excludes_wrong_provider_or_dim() {
+        let conn = setup_db_with_embeddings();
+        let vec: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_at_line_with_embedding(&conn, 1, "src/a.ts", 5, &vec);
+        insert_symbol_at_line_with_embedding(&conn, 2, "src/b.ts", 3, &vec);
+        // b.ts lives in a foreign vector space.
+        conn.execute(
+            "UPDATE embeddings SET provider = 'ollama', dim = 768 WHERE symbol_id = 2",
+            [],
+        )
+        .unwrap();
+
+        let positions = position_set(&[("src/a.ts", 5), ("src/b.ts", 3)]);
+        let loaded =
+            load_embedding_vectors_at_positions(&conn, &positions, &OneDimProvider).unwrap();
+
+        assert_eq!(loaded.len(), 1, "foreign-space rows are invisible");
+        assert!(loaded.contains_key(&("src/a.ts".to_string(), 5)));
+    }
+
+    #[test]
+    fn load_vectors_at_positions_includes_stale_rows() {
+        let conn = setup_db_with_embeddings();
+        let vec: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_at_line_with_embedding(&conn, 1, "src/a.ts", 5, &vec);
+        conn.execute("UPDATE embeddings SET stale = 1 WHERE symbol_id = 1", [])
+            .unwrap();
+
+        let positions = position_set(&[("src/a.ts", 5)]);
+        let loaded =
+            load_embedding_vectors_at_positions(&conn, &positions, &OneDimProvider).unwrap();
+        // Best-effort: a stale vector is a weaker prior, not an absence.
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn load_vectors_at_positions_skips_corrupt_blobs_best_effort() {
+        let conn = setup_db_with_embeddings();
+        let good: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_at_line_with_embedding(&conn, 1, "src/a.ts", 5, &good);
+        // A BLOB whose byte length is not dim * 4 cannot decode.
+        insert_symbol_at_line_with_embedding(&conn, 2, "src/b.ts", 3, &[1, 2, 3]);
+
+        let positions = position_set(&[("src/a.ts", 5), ("src/b.ts", 3)]);
+        let loaded =
+            load_embedding_vectors_at_positions(&conn, &positions, &OneDimProvider).unwrap();
+
+        assert_eq!(loaded.len(), 1, "corrupt row skipped, healthy row kept");
+        assert!(loaded.contains_key(&("src/a.ts".to_string(), 5)));
+    }
+
+    #[test]
+    fn load_vectors_at_positions_empty_positions_yield_empty_map() {
+        let conn = setup_db_with_embeddings();
+        let vec: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        insert_symbol_at_line_with_embedding(&conn, 1, "src/a.ts", 5, &vec);
+        let loaded =
+            load_embedding_vectors_at_positions(&conn, &HashSet::new(), &OneDimProvider).unwrap();
+        assert!(loaded.is_empty());
     }
 
     #[test]

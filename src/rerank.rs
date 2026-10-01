@@ -630,6 +630,52 @@ pub fn prepare_context(
             ctx.lexical = LexicalContext { scores, min, max };
         }
     }
+    if reqs.embeddings
+        && let Some(conn) = conn
+    {
+        ctx.embeddings = prepare_embeddings(conn, pattern, results, sources.embedding);
+    }
+    ctx
+}
+
+/// Prepare the semantic context: candidate vectors first, then the query
+/// embedding, exactly once (TASK-093).
+///
+/// Every failure is a zero-path, never an error — a supplementary signal
+/// must not be able to fail a search whose other sources are healthy: a
+/// provider plan error (foreign vector space) yields an empty context; no
+/// candidate vectors skips the query embed entirely; an embed failure or a
+/// corrupt row yields an empty context. Fallback warnings from the plan
+/// are swallowed here (the primary semantic path already warns); tracked
+/// for TASK-095.
+fn prepare_embeddings(
+    conn: &Connection,
+    pattern: &str,
+    results: &[ClassifiedResult],
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> EmbeddingContext {
+    let mut ctx = EmbeddingContext::default();
+    let Ok(plan) = crate::embedding::plan_query_provider(conn, configured) else {
+        return ctx;
+    };
+    let provider = plan.provider;
+    let positions: std::collections::HashSet<(String, u64)> = results
+        .iter()
+        .map(|r| (r.result.file.to_string_lossy().into_owned(), r.result.line))
+        .collect();
+    let Ok(vectors) =
+        crate::embedding::load_embedding_vectors_at_positions(conn, &positions, provider.as_ref())
+    else {
+        return ctx;
+    };
+    if vectors.is_empty() {
+        return ctx;
+    }
+    if let Ok(mut query) = provider.embed_single(pattern) {
+        crate::embedding::normalize(&mut query);
+        ctx.query = Some(query);
+        ctx.vectors = vectors;
+    }
     ctx
 }
 
@@ -1912,6 +1958,121 @@ mod tests {
         // The call line's maximal run is the compound "my_func": neither
         // term matches it, so the mention is incidental.
         assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // Embedding context preparation (TASK-093)
+    // -------------------------------------------------------------------
+
+    /// A unit vector in the bundled provider's 256-dim space.
+    fn bundled_unit_vector() -> Vec<f32> {
+        let mut vector = vec![0.0f32; 256];
+        vector[0] = 1.0;
+        vector
+    }
+
+    /// `seeded_conn` plus a bundled-space embedding row for `my_func`
+    /// (symbols.id 1 at src/main.rs:10).
+    fn embedding_seeded_conn() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = seeded_conn();
+        let vector = bundled_unit_vector();
+        conn.execute(
+            "INSERT INTO embeddings \
+             (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+             VALUES (1, 'src/main.rs', 'my_func chunk', ?1, 0, 0, 'bundled', 256)",
+            rusqlite::params![bytemuck::cast_slice(&vector)],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn prepare_context_embeddings_populate_query_and_candidate_vectors() {
+        let (_dir, conn) = embedding_seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_embeddings(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let query = ctx.query_embedding().expect("query embedded once");
+        assert_eq!(query.len(), 256, "bundled provider space");
+        let candidate = ctx
+            .embedding_at("src/main.rs", 10)
+            .expect("candidate vector at the symbol position");
+        assert_eq!(candidate.len(), 256);
+        assert_eq!(candidate[0], 1.0);
+        // The stored vector round-trips unit-normalized.
+        let norm: f32 = candidate.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn prepare_context_embeddings_degrade_to_zero_on_foreign_space() {
+        // Only ollama/768 rows exist while the configured provider is
+        // bundled: the plan blocks, and the signal context must come back
+        // empty (zero-path) instead of panicking or erroring.
+        let (_dir, conn) = seeded_conn();
+        let mut vector = vec![0.0f32; 768];
+        vector[0] = 1.0;
+        conn.execute(
+            "INSERT INTO embeddings \
+             (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+             VALUES (1, 'src/main.rs', 'my_func chunk', ?1, 0, 0, 'ollama', 768)",
+            rusqlite::params![bytemuck::cast_slice(&vector)],
+        )
+        .unwrap();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_embeddings(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert!(ctx.query_embedding().is_none());
+        assert!(ctx.embedding_at("src/main.rs", 10).is_none());
+    }
+
+    #[test]
+    fn prepare_context_embeddings_zero_when_no_rows() {
+        // No embeddings anywhere: the loader returns nothing and the query
+        // embed must never run (a successful bundled embed would otherwise
+        // populate the query vector).
+        let (_dir, conn) = seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_embeddings(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert!(ctx.query_embedding().is_none());
+        assert!(ctx.embedding_at("src/main.rs", 10).is_none());
     }
 
     #[test]
