@@ -3853,6 +3853,64 @@ fn extra() -> i32 {
             )
             .unwrap();
         assert!(authority > 0.0, "helper's authority was {authority}");
+        // TASK-099: every row carries a community — singletons included —
+        // and `main` (which calls `helper`) shares `helper`'s community.
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_topology WHERE community IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 0, "the community column is written for every symbol");
+        let communities: Vec<i64> = conn
+            .prepare(
+                "SELECT t.community FROM symbol_topology t \
+                 JOIN symbols s ON s.id = t.symbol_id \
+                 WHERE s.name IN ('main', 'helper') ORDER BY s.name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(communities.len(), 2, "main and helper are both scored");
+        assert_eq!(
+            communities[0], communities[1],
+            "a caller and its callee share one community"
+        );
+    }
+
+    #[test]
+    fn community_assignments_survive_a_full_rebuild() {
+        // PRD-TOPO-REQ-005 at the pipeline level: the update path
+        // recomputes topology unconditionally, and the same graph in the
+        // same deterministic insert order must re-derive every community
+        // id EXACTLY — stable identifiers, not just stable partitions.
+        let dir = make_test_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let mapping = |conn: &rusqlite::Connection| -> Vec<(String, i64)> {
+            conn.prepare(
+                "SELECT s.name, t.community FROM symbols s \
+                 JOIN symbol_topology t ON t.symbol_id = s.id ORDER BY s.name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let before = mapping(&conn);
+        assert!(!before.is_empty());
+
+        incremental_update(dir.path(), true).unwrap();
+        let after = mapping(&conn);
+
+        assert_eq!(
+            before, after,
+            "a rebuild re-derives identical community ids"
+        );
     }
 
     #[test]
