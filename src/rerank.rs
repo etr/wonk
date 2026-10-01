@@ -380,6 +380,35 @@ pub fn resolve_generated_shadowing(conn: Option<&Connection>, files: &[String]) 
     shadowed
 }
 
+/// Classify every unique file, resolving the Generated variant against the
+/// index — THE one path-character judgment. The signal's context seeding
+/// and every symbol-lookup sort site read it, so the ladder and its
+/// never-demote-without-a-peer rule exist exactly once.
+fn classify_paths(files: &[String], conn: Option<&Connection>) -> HashMap<String, PathClass> {
+    let shadowed = resolve_generated_shadowing(conn, files);
+    let mut classes: HashMap<String, PathClass> = HashMap::new();
+    for file in files {
+        let class = match classify_path_character(Path::new(file)) {
+            PathClass::Generated if shadowed.contains(file) => PathClass::GeneratedShadowed,
+            PathClass::Generated => PathClass::Ordinary,
+            class => class,
+        };
+        classes.entry(file.clone()).or_insert(class);
+    }
+    classes
+}
+
+/// The resolved ladder VALUES for a batch of files — the sort key the
+/// symbol-lookup sites (mcp `wonk_sym`, `wonk show`, the DB symbol query)
+/// demote by. Sort descending; a missing entry means Ordinary (1.0), never
+/// a demotion.
+pub fn path_character_values(files: &[String], conn: Option<&Connection>) -> HashMap<String, f32> {
+    classify_paths(files, conn)
+        .into_iter()
+        .map(|(file, class)| (file, path_character_value(class)))
+        .collect()
+}
+
 /// A symbol definition located at a candidate position, with the number of
 /// distinct indexed callers of that symbol name. The seam TASK-093's
 /// centrality signal consumes.
@@ -959,23 +988,11 @@ pub fn prepare_context(
         ctx.terms = crate::tokenizer::tokenize(pattern);
     }
     if reqs.path_class {
-        // TASK-094: the seeding IS the graded classifier (the one path
-        // signal); generated files are resolved against the index —
-        // GeneratedShadowed with a verified peer, Ordinary without one
-        // (never demoted without a peer).
         let files: Vec<String> = results
             .iter()
             .map(|r| r.result.file.to_string_lossy().into_owned())
             .collect();
-        let shadowed = resolve_generated_shadowing(conn, &files);
-        for file in files {
-            let class = match classify_path_character(Path::new(&file)) {
-                PathClass::Generated if shadowed.contains(&file) => PathClass::GeneratedShadowed,
-                PathClass::Generated => PathClass::Ordinary,
-                class => class,
-            };
-            ctx.path_class.entry(file).or_insert(class);
-        }
+        ctx.path_class = classify_paths(&files, conn);
     }
     if reqs.symbol_hits
         && let Some(conn) = conn

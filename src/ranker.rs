@@ -234,6 +234,14 @@ pub fn is_comment_line(line: &str) -> bool {
 /// - `*_test.*` filename suffix (e.g. `foo_test.go`)
 /// - `*.test.*` filename (e.g. `foo.test.ts`)
 /// - `*.spec.*` filename (e.g. `foo.spec.js`)
+///
+/// TASK-094 reconciliation: this heuristic stays the FROZEN kind-signal
+/// input (the ResultCategory::Test tier, DR-037) and gates the
+/// include_tests user opt-outs; the RANKING demotion of test paths is
+/// `rerank::classify_path_character`'s graded ladder, which deliberately
+/// re-derives test-ness so it survives `kind = 0` configurations.
+/// Docs/examples/fixtures/bench dirs land in the ladder's Example bucket,
+/// not its Test bucket — a documented divergence.
 pub fn is_test_file(path: &Path) -> bool {
     // Directory-based heuristics: check path components
     for component in path.components() {
@@ -325,7 +333,9 @@ fn classify_one(
     file_path: &Path,
     index: Option<&IndexLookup>,
 ) -> ResultCategory {
-    // 1. Test (highest priority - path heuristic)
+    // 1. Test (highest priority - path heuristic). TASK-094 keep: the
+    // FROZEN kind input (DR-037) — the 092 equivalence suite pins the Test
+    // tier; the graded path signal re-derives test-ness independently.
     if is_test_file(file_path) {
         return ResultCategory::Test;
     }
@@ -395,6 +405,9 @@ impl GroupedItem for ClassifiedResult {
 }
 
 /// Deduplicate re-exported/aliased symbols.
+///
+/// TASK-094 keep: this is dedup/grouping, not ranking — it collapses
+/// import re-exports regardless of any signal weight.
 ///
 /// When the same symbol name appears as both a Definition and one or more
 /// Import re-exports, the imports are collapsed and the definition is

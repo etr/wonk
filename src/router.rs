@@ -156,6 +156,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let mut results = results?;
 
             // Exclude test/doc/example files unless --include-tests.
+            // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
             if !include_tests {
                 results.retain(|r| !crate::ranker::is_test_file(&r.file));
             }
@@ -349,6 +350,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     router.query_symbols_with_file(split.name, kind_str, file_str, args.exact)?
                 };
 
+            // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
             if !include_tests {
                 results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
             }
@@ -408,6 +410,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 .and_then(|conn| query_subclasses_db(conn, &args.name).ok())
                 .unwrap_or_default();
 
+            // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
             if !include_tests {
                 results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
                 subclass_results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
@@ -1485,6 +1488,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
+            // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
             if !include_tests {
                 all_results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
             }
@@ -1497,10 +1501,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             } else if let Some(ref name) = args.name {
                 // When no exact match exists in implementation files, hint
                 // that the symbol may be dynamically assigned. Type
-                // declarations (.d.ts, .h) don't count as implementations.
-                let has_impl_exact = all_results.iter().any(|r| {
-                    r.name == *name && !r.file.ends_with(".d.ts") && !r.file.ends_with(".h")
-                });
+                // declarations (rerank::is_type_declaration — .d.ts, .h)
+                // don't count as implementations.
+                let has_impl_exact = all_results
+                    .iter()
+                    .any(|r| r.name == *name && !crate::rerank::is_type_declaration(&r.file));
                 if !has_impl_exact && !args.exact {
                     output::print_hint(
                         &format!(
@@ -1616,6 +1621,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 args.callers_file.as_deref(),
             )?;
 
+            // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
             if !include_tests {
                 results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
             }
@@ -1668,6 +1674,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 args.callees_file.as_deref(),
             )?;
 
+            // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
             if !include_tests {
                 results.retain(|r| !crate::ranker::is_test_file(Path::new(&r.file)));
             }
@@ -2169,6 +2176,7 @@ fn dispatch_context<W: io::Write>(
 
     let mut contexts = crate::context::symbol_context(&conn, split.name, &options)?;
 
+    // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
     if !include_tests {
         contexts.retain(|c| !crate::ranker::is_test_file(Path::new(&c.file)));
     }
@@ -2664,28 +2672,6 @@ fn resolve_file_for_scope(conn: &Connection, name: &str, scope: Option<&str>) ->
         row.get::<_, String>(0)
     })
     .ok()
-}
-
-/// Returns `true` for commands that query the index and should trigger
-/// auto-initialization when no index exists.
-/// Returns true if a file path looks like a test, benchmark, spec, or mock file.
-fn is_test_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("/test")
-        || lower.contains("/tests/")
-        || lower.contains("/bench")
-        || lower.contains("/benches/")
-        || lower.contains("/spec/")
-        || lower.contains("/specs/")
-        || lower.contains("_test.")
-        || lower.contains(".test.")
-        || lower.contains("_spec.")
-        || lower.contains(".spec.")
-        || lower.contains("/mock")
-        || lower.contains("/examples/")
-        || lower.starts_with("test")
-        || lower.starts_with("bench")
-        || lower.starts_with("examples/")
 }
 
 /// Parsed result from a qualified name like `Foo::bar`, `Client.get`, or
@@ -3755,11 +3741,19 @@ pub fn query_symbols_db_with_filters(
         results.push(row?);
     }
 
-    // Deprioritize test/bench/spec files: sort them after production code.
+    // TASK-094: the ONE graded path-character demotion (absorbing the old
+    // local test-path heuristic): ordinary source files sort before
+    // barrels/module entries, type declarations, shims, examples, and
+    // tests. Stable, so equal ladder values keep the row order; generated
+    // files demote only with an index-verified hand-written peer.
+    let files: Vec<String> = results.iter().map(|s| s.file.clone()).collect();
+    let values = crate::rerank::path_character_values(&files, Some(conn));
     results.sort_by(|a, b| {
-        let a_test = is_test_path(&a.file);
-        let b_test = is_test_path(&b.file);
-        a_test.cmp(&b_test)
+        let a_value = values.get(&a.file).copied().unwrap_or(1.0);
+        let b_value = values.get(&b.file).copied().unwrap_or(1.0);
+        b_value
+            .partial_cmp(&a_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     Ok(results)
@@ -3972,6 +3966,46 @@ mod tests {
     use crate::cli::{DepsArgs, InitArgs, SearchArgs, SymArgs, UpdateArgs};
     use std::fs;
     use tempfile::TempDir;
+
+    // -- query_symbols_db graded path ordering (TASK-094) ---------------------
+
+    #[test]
+    fn query_symbols_db_orders_by_graded_path_character() {
+        // Direct symbol rows in insertion order: the graded ladder orders
+        // ordinary > type declaration > test. Names merely RESEMBLING test
+        // paths under the old local heuristic (contest.rs, mock dirs,
+        // benches) are NOT demoted — the ladder's buckets are the spec'd
+        // set, nothing more.
+        let dir = TempDir::new().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for file in [
+            "tests/real.rs",
+            "src/mock_data.rs",
+            "src/alpha.d.ts",
+            "src/core.rs",
+        ] {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, file, line, col, language) \
+                 VALUES ('alpha', 'function', ?1, 1, 0, 'ts')",
+                rusqlite::params![file],
+            )
+            .unwrap();
+        }
+
+        let results =
+            query_symbols_db_with_filters(&conn, "alpha", None, None, None, true).unwrap();
+        let files: Vec<&str> = results.iter().map(|s| s.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                "src/mock_data.rs",
+                "src/core.rs",
+                "src/alpha.d.ts",
+                "tests/real.rs"
+            ],
+            "ordinary (insertion order) > .d.ts > test"
+        );
+    }
 
     // -- Pattern tests ------------------------------------------------------
 
