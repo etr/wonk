@@ -206,6 +206,11 @@ CREATE INDEX IF NOT EXISTS idx_review_suppressions_rule ON review_suppressions(r
 // records HEAD at the last successful mine (the reach_meta pattern). The
 // retained-row invariant `mined_commits <= window` keeps storage O(window)
 // regardless of repository age.
+//
+// `co_change` (TASK-097) is the age-weighted file-coupling aggregate: one
+// row per DIRECTED pair, at most top-K per `file_a`, so storage stays
+// linear in files rather than quadratic; `idx_co_change_a` serves the
+// per-file strongest-coupling lookup the rerank signal folds.
 const HISTORY_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS file_churn (
     file TEXT PRIMARY KEY,
@@ -225,6 +230,13 @@ CREATE TABLE IF NOT EXISTS history_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS co_change (
+    file_a TEXT NOT NULL,
+    file_b TEXT NOT NULL,
+    weight REAL NOT NULL,
+    PRIMARY KEY (file_a, file_b)
+);
+CREATE INDEX IF NOT EXISTS idx_co_change_a ON co_change(file_a, weight DESC);
 "#;
 
 const TRIGGERS_SQL: &str = r#"
@@ -374,8 +386,8 @@ pub fn ensure_summaries_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the TASK-096 history tables exist (`file_churn`, `mined_commits`,
-/// `commit_files`, `history_meta`).
+/// Ensure the TASK-096/097 history tables exist (`file_churn`,
+/// `mined_commits`, `commit_files`, `history_meta`, `co_change`).
 ///
 /// Handles schema migration for indexes created before history mining:
 /// safe to call on databases that already have the tables.
@@ -1881,7 +1893,7 @@ mod tests {
     // -- history tables (TASK-096) -------------------------------------------
 
     fn history_table_names(conn: &Connection) -> Vec<String> {
-        let names = "('file_churn','mined_commits','commit_files','history_meta')";
+        let names = "('file_churn','mined_commits','commit_files','history_meta','co_change')";
         conn.prepare(&format!(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN {names}"
         ))
@@ -1902,12 +1914,22 @@ mod tests {
         assert_eq!(
             tables,
             vec![
+                "co_change",
                 "commit_files",
                 "file_churn",
                 "history_meta",
                 "mined_commits"
             ]
         );
+        // The (file_a, weight DESC) index rides along with the table.
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_co_change_a'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(indexes, vec!["idx_co_change_a"]);
     }
 
     #[test]
@@ -1924,7 +1946,7 @@ mod tests {
         // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
         ensure_history_tables(&conn).unwrap();
         ensure_history_tables(&conn).unwrap();
-        assert_eq!(history_table_names(&conn).len(), 4);
+        assert_eq!(history_table_names(&conn).len(), 5);
     }
 
     // -- confidence column tests -----------------------------------------------
