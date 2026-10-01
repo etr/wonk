@@ -15,6 +15,8 @@
 //! valid weight configuration.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
 
 use rusqlite::Connection;
 
@@ -87,14 +89,295 @@ impl ContextReqs {
     }
 }
 
-/// Path classification bucket. Graded buckets arrive with TASK-094; today
-/// the choice is binary, seeded from `ranker::is_test_file`.
+/// Path classification bucket (TASK-094, PRD-RANK-REQ-011): the graded
+/// ladder a file's PATH character demotes it through. Values are absolute
+/// and strictly positive — 0.0 means "no evidence" in this codebase, and
+/// every file carries some path character.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathClass {
-    /// A regular source file.
-    Ordinary,
-    /// A file matching the test-path heuristics.
+    /// A generated file whose hand-written same-named peer is verified in
+    /// the index. The strongest demotion: the peer is the better answer.
+    GeneratedShadowed,
+    /// A generated file before shadowing is resolved against the index.
+    /// Never reaches a score directly: `prepare_context` (and every sort
+    /// site) rewrites it to [`PathClass::GeneratedShadowed`] when a peer
+    /// exists, else back to [`PathClass::Ordinary`] — a generated file is
+    /// never demoted without a peer.
+    Generated,
+    /// Test directories, `*_test` stems, `.test.`/`.spec.` names.
     Test,
+    /// Ambient type declarations: `.d.ts`/`.d.mts`/`.d.cts`, C headers.
+    TypeDeclaration,
+    /// Compatibility shims and deprecated compatibility layers.
+    Shim,
+    /// Examples, samples, fixtures, benchmarks, documentation.
+    Example,
+    /// Re-export barrels: `index.*`, `mod.rs`, `lib.rs`, `__init__.py`.
+    Barrel,
+    /// Program entry points: `main.*`, `__main__.py`.
+    ModuleEntry,
+    /// A regular source file — the default.
+    Ordinary,
+}
+
+/// The ladder's absolute constants, most-demoted first.
+pub fn path_character_value(class: PathClass) -> f32 {
+    match class {
+        PathClass::GeneratedShadowed | PathClass::Generated => 0.10,
+        PathClass::Test => 0.20,
+        PathClass::TypeDeclaration => 0.30,
+        PathClass::Shim => 0.45,
+        PathClass::Example => 0.60,
+        PathClass::Barrel => 0.70,
+        PathClass::ModuleEntry => 0.80,
+        PathClass::Ordinary => 1.00,
+    }
+}
+
+/// Whether a path is an ambient type declaration (`.d.ts`, `.d.mts`,
+/// `.d.cts`) or a C header (`.h`). THE shared heuristic — the
+/// `has_impl_exact` hints and the TypeDeclaration bucket both read it, so
+/// the ".d.ts is not an implementation" judgment exists exactly once.
+pub fn is_type_declaration(path: &str) -> bool {
+    path.ends_with(".d.ts")
+        || path.ends_with(".d.mts")
+        || path.ends_with(".d.cts")
+        || path.ends_with(".h")
+}
+
+/// Code-generation name markers: explicit `.generated.`/`.gen.` segments,
+/// protobuf `_pb2`/`_pb2_grpc` stems, `_generated` stems, and the
+/// codegen double extensions `.pb.go`/`.g.dart`/`.g.ts`.
+pub fn is_generated_name(path: &str) -> bool {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if name.contains(".generated.") || name.contains(".gen.") {
+        return true;
+    }
+    if name.ends_with(".pb.go") || name.ends_with(".g.dart") || name.ends_with(".g.ts") {
+        return true;
+    }
+    match std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+    {
+        Some(stem) => {
+            stem.ends_with("_pb2_grpc") || stem.ends_with("_pb2") || stem.ends_with("_generated")
+        }
+        None => false,
+    }
+}
+
+/// The hand-written peer's file name for a generated name: strip the
+/// generation marker and keep the extension
+/// (`user.g.dart` → `user.dart`, `foo_pb2.py` → `foo.py`). None when the
+/// name carries no marker.
+pub fn strip_generated_marker(file_name: &str) -> Option<String> {
+    let dot = file_name.rfind('.')?;
+    let (stem, ext) = file_name.split_at(dot);
+    let marker_stripped = [
+        "_pb2_grpc",
+        "_pb2",
+        "_generated",
+        ".generated",
+        ".gen",
+        ".pb",
+        ".g",
+    ]
+    .iter()
+    .find_map(|marker| stem.strip_suffix(marker))?;
+    Some(format!("{marker_stripped}{ext}"))
+}
+
+/// Classify a file's path character into the graded ladder
+/// (PRD-RANK-REQ-011). First-match precedence in ladder order: a
+/// generation marker wins first (its demotion survives only when a peer is
+/// verified), then the specific path buckets, with the more specific
+/// bucket listed earlier (Test before TypeDeclaration, Example before
+/// Barrel).
+///
+/// Deliberate divergence from `ranker::is_test_file` (which stays the
+/// FROZEN kind input per DR-037): `is_test_file` flattens
+/// docs/examples/fixtures/bench paths into its test tier, while this
+/// ladder grades them as Example — test-ness here is the three unambiguous
+/// test signals only. The path signal re-derives test-ness rather than
+/// reading the kind input so the demotion survives `kind = 0`
+/// configurations.
+pub fn classify_path_character(path: &Path) -> PathClass {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let parent = path.parent().unwrap_or(Path::new(""));
+
+    let in_dir = |dirs: &[&str]| {
+        parent
+            .components()
+            .any(|c| dirs.contains(&c.as_os_str().to_string_lossy().as_ref()))
+    };
+
+    if is_generated_name(file_name) {
+        return PathClass::Generated;
+    }
+    if in_dir(&["test", "tests", "__tests__"])
+        || stem.ends_with("_test")
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+    {
+        return PathClass::Test;
+    }
+    if is_type_declaration(file_name) {
+        return PathClass::TypeDeclaration;
+    }
+    if in_dir(&["compat", "compatibility", "shims", "deprecated", "legacy"])
+        || matches!(
+            stem,
+            "compat" | "shim" | "legacy" | "deprecated" | "polyfill"
+        )
+        || stem.ends_with("_compat")
+        || stem.ends_with("_shim")
+    {
+        return PathClass::Shim;
+    }
+    if in_dir(&[
+        "example",
+        "examples",
+        "samples",
+        "demos",
+        "fixtures",
+        "bench",
+        "benchmarks",
+        "docs",
+        "doc",
+    ]) || file_name.contains(".example.")
+    {
+        return PathClass::Example;
+    }
+    const BARRELS: &[&str] = &[
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.jsx",
+        "index.mjs",
+        "index.cjs",
+        "mod.rs",
+        "lib.rs",
+        "__init__.py",
+        "exports.ts",
+        "exports.js",
+    ];
+    if BARRELS.contains(&file_name) {
+        return PathClass::Barrel;
+    }
+    const MODULE_ENTRIES: &[&str] = &[
+        "main.rs",
+        "main.go",
+        "main.py",
+        "main.js",
+        "main.ts",
+        "__main__.py",
+    ];
+    if MODULE_ENTRIES.contains(&file_name) {
+        return PathClass::ModuleEntry;
+    }
+    PathClass::Ordinary
+}
+
+/// Escape a literal for a SQLite `LIKE ... ESCAPE '\'` pattern.
+fn escape_like_pattern(literal: &str) -> String {
+    let mut escaped = String::with_capacity(literal.len());
+    for c in literal.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// Which of `files` are generated names shadowing a hand-written peer
+/// VERIFIED IN THE INDEX (the `files` table) — never the candidate set:
+/// the peer may simply not match the query.
+///
+/// A peer is a file with the marker-stripped name in the same directory
+/// (`src/user.g.dart` ← `src/user.dart`) that is not itself generated.
+/// Resolution costs ONE prepared query per unique parent directory
+/// (LIKE-escaped directory prefix); a failing prepare degrades to ONE full
+/// `files` scan. No connection or no generated candidates → no demotion
+/// (the conservative branch of AC-2).
+pub fn resolve_generated_shadowing(conn: Option<&Connection>, files: &[String]) -> HashSet<String> {
+    let mut shadowed = HashSet::new();
+    let Some(conn) = conn else {
+        return shadowed;
+    };
+
+    // (candidate, expected peer path) for every unique Generated file.
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    let mut seen = HashSet::new();
+    for file in files {
+        if !seen.insert(file.clone())
+            || classify_path_character(Path::new(file)) != PathClass::Generated
+        {
+            continue;
+        }
+        let path = Path::new(file);
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(peer_name) = strip_generated_marker(name) else {
+            continue;
+        };
+        let prefix = match path.parent().and_then(|p| p.to_str()) {
+            Some(dir) if !dir.is_empty() => format!("{dir}/"),
+            _ => String::new(),
+        };
+        wanted.push((file.clone(), format!("{prefix}{peer_name}")));
+    }
+    if wanted.is_empty() {
+        return shadowed;
+    }
+
+    // One statement per unique parent directory; on any failure, one full
+    // scan instead — either way the resolution is O(1) queries.
+    let mut found: HashSet<String> = HashSet::new();
+    let mut dirs: Vec<String> = Vec::new();
+    for (_, peer) in &wanted {
+        let dir = match peer.rfind('/') {
+            Some(idx) => peer[..idx].to_string(),
+            None => String::new(),
+        };
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    let mut resolved = false;
+    for dir in &dirs {
+        let pattern = format!("{}%", escape_like_pattern(dir));
+        if let Ok(mut stmt) = conn.prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")
+            && let Ok(rows) =
+                stmt.query_map(rusqlite::params![pattern], |row| row.get::<_, String>(0))
+        {
+            found.extend(rows.flatten());
+            resolved = true;
+        }
+    }
+    if !resolved
+        && let Ok(mut stmt) = conn.prepare("SELECT path FROM files")
+        && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+    {
+        found.extend(rows.flatten());
+    }
+
+    for (file, peer) in wanted {
+        // The peer must be indexed, and must itself be hand-written.
+        if found.contains(&peer) && !is_generated_name(&peer) {
+            shadowed.insert(file);
+        }
+    }
+    shadowed
 }
 
 /// A symbol definition located at a candidate position, with the number of
@@ -640,12 +923,20 @@ pub fn prepare_context(
         ctx.terms = crate::tokenizer::tokenize(pattern);
     }
     if reqs.path_class {
-        for r in results {
-            let file = r.result.file.to_string_lossy().into_owned();
-            let class = if crate::ranker::is_test_file(&r.result.file) {
-                PathClass::Test
-            } else {
-                PathClass::Ordinary
+        // TASK-094: the seeding IS the graded classifier (the one path
+        // signal); generated files are resolved against the index —
+        // GeneratedShadowed with a verified peer, Ordinary without one
+        // (never demoted without a peer).
+        let files: Vec<String> = results
+            .iter()
+            .map(|r| r.result.file.to_string_lossy().into_owned())
+            .collect();
+        let shadowed = resolve_generated_shadowing(conn, &files);
+        for file in files {
+            let class = match classify_path_character(Path::new(&file)) {
+                PathClass::Generated if shadowed.contains(&file) => PathClass::GeneratedShadowed,
+                PathClass::Generated => PathClass::Ordinary,
+                class => class,
             };
             ctx.path_class.entry(file).or_insert(class);
         }
@@ -1094,6 +1385,7 @@ mod tests {
     // Pipeline tests
     // -------------------------------------------------------------------
 
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -2045,6 +2337,387 @@ mod tests {
         // The call line's maximal run is the compound "my_func": neither
         // term matches it, so the mention is incidental.
         assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // Path-character ladder (TASK-094)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn path_character_value_nine_exact_constants() {
+        assert_eq!(path_character_value(PathClass::GeneratedShadowed), 0.10);
+        assert_eq!(path_character_value(PathClass::Generated), 0.10);
+        assert_eq!(path_character_value(PathClass::Test), 0.20);
+        assert_eq!(path_character_value(PathClass::TypeDeclaration), 0.30);
+        assert_eq!(path_character_value(PathClass::Shim), 0.45);
+        assert_eq!(path_character_value(PathClass::Example), 0.60);
+        assert_eq!(path_character_value(PathClass::Barrel), 0.70);
+        assert_eq!(path_character_value(PathClass::ModuleEntry), 0.80);
+        assert_eq!(path_character_value(PathClass::Ordinary), 1.00);
+    }
+
+    #[test]
+    fn path_character_value_strictly_positive_ladder() {
+        // 0.0 means "no evidence" in this codebase (zero-weight = inert),
+        // so every bucket is strictly positive; walking the ladder from the
+        // strongest demotion to Ordinary the value never decreases, and
+        // every distinct bucket strictly increases.
+        let ladder = [
+            PathClass::GeneratedShadowed,
+            PathClass::Generated,
+            PathClass::Test,
+            PathClass::TypeDeclaration,
+            PathClass::Shim,
+            PathClass::Example,
+            PathClass::Barrel,
+            PathClass::ModuleEntry,
+            PathClass::Ordinary,
+        ];
+        for class in ladder {
+            assert!(
+                path_character_value(class) > 0.0,
+                "{class:?} must be strictly positive"
+            );
+        }
+        let distinct: Vec<f32> = ladder.map(path_character_value).to_vec();
+        let deduped: Vec<f32> = {
+            let mut v = distinct.clone();
+            v.dedup();
+            v
+        };
+        for pair in deduped.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "distinct ladder values must strictly increase"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_path_character_bucket_positives() {
+        let cases: &[(&str, PathClass)] = &[
+            // Test: directories, *_test stems, .test./.spec. names.
+            ("tests/foo.rs", PathClass::Test),
+            ("test/foo.js", PathClass::Test),
+            ("__tests__/foo.js", PathClass::Test),
+            ("src/foo_test.go", PathClass::Test),
+            ("src/foo.test.ts", PathClass::Test),
+            ("src/foo.spec.js", PathClass::Test),
+            // TypeDeclaration: ambient declaration and C header extensions.
+            ("src/foo.d.ts", PathClass::TypeDeclaration),
+            ("types/foo.d.mts", PathClass::TypeDeclaration),
+            ("src/foo.d.cts", PathClass::TypeDeclaration),
+            ("include/foo.h", PathClass::TypeDeclaration),
+            // Shim: compatibility directories and stems.
+            ("compat/foo.ts", PathClass::Shim),
+            ("src/compatibility/foo.js", PathClass::Shim),
+            ("shims/polyfill.js", PathClass::Shim),
+            ("deprecated/a.js", PathClass::Shim),
+            ("src/legacy/b.ts", PathClass::Shim),
+            ("src/compat.ts", PathClass::Shim),
+            ("src/shim.js", PathClass::Shim),
+            ("src/deprecated.rs", PathClass::Shim),
+            ("src/foo_compat.ts", PathClass::Shim),
+            ("src/foo_shim.js", PathClass::Shim),
+            // Example: documentation and sample directories, .example. names.
+            ("example/a.ts", PathClass::Example),
+            ("examples/b.js", PathClass::Example),
+            ("samples/c.py", PathClass::Example),
+            ("demos/d.rs", PathClass::Example),
+            ("fixtures/e.json", PathClass::Example),
+            ("bench/f.ts", PathClass::Example),
+            ("benchmarks/g.js", PathClass::Example),
+            ("docs/h.md", PathClass::Example),
+            ("doc/i.txt", PathClass::Example),
+            ("src/foo.example.ts", PathClass::Example),
+            // Barrel: re-export entry points.
+            ("src/index.ts", PathClass::Barrel),
+            ("src/index.tsx", PathClass::Barrel),
+            ("web/index.js", PathClass::Barrel),
+            ("src/index.jsx", PathClass::Barrel),
+            ("src/index.mjs", PathClass::Barrel),
+            ("src/index.cjs", PathClass::Barrel),
+            ("src/mod.rs", PathClass::Barrel),
+            ("src/lib.rs", PathClass::Barrel),
+            ("pkg/__init__.py", PathClass::Barrel),
+            ("src/exports.ts", PathClass::Barrel),
+            ("src/exports.js", PathClass::Barrel),
+            // ModuleEntry: program entry points.
+            ("src/main.rs", PathClass::ModuleEntry),
+            ("cmd/app/main.go", PathClass::ModuleEntry),
+            ("scripts/main.py", PathClass::ModuleEntry),
+            ("src/main.js", PathClass::ModuleEntry),
+            ("src/main.ts", PathClass::ModuleEntry),
+            ("pkg/__main__.py", PathClass::ModuleEntry),
+            // Generated: markers, protobuf conventions, codegen double
+            // extensions. Pre-resolution variant; shadowing is resolved
+            // against the index in prepare_context.
+            ("src/foo.g.dart", PathClass::Generated),
+            ("src/user.g.ts", PathClass::Generated),
+            ("src/foo.pb.go", PathClass::Generated),
+            ("src/api.generated.ts", PathClass::Generated),
+            ("src/foo.gen.ts", PathClass::Generated),
+            ("python/foo_pb2.py", PathClass::Generated),
+            ("python/foo_pb2_grpc.py", PathClass::Generated),
+            ("src/svc_generated.rs", PathClass::Generated),
+            // Ordinary: everything else.
+            ("src/wonk.rs", PathClass::Ordinary),
+            ("src/parser.rs", PathClass::Ordinary),
+            ("lib/core/service.py", PathClass::Ordinary),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                classify_path_character(std::path::Path::new(path)),
+                *expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_path_character_first_match_precedence() {
+        // The ladder matches first-come in value order: a marker wins over
+        // every other bucket (its demotion is only kept when a peer is
+        // verified, else prepare_context restores Ordinary); the specific
+        // path buckets win over the generic later ones.
+        let cases: &[(&str, PathClass)] = &[
+            ("tests/foo.d.ts", PathClass::Test),
+            ("examples/index.ts", PathClass::Example),
+            ("src/foo.g.dart", PathClass::Generated),
+            ("tests/foo.pb.go", PathClass::Generated),
+            ("src/index.g.ts", PathClass::Generated),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                classify_path_character(std::path::Path::new(path)),
+                *expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_path_character_dir_checks_match_directories_not_filenames() {
+        // A directory named "testing" or a file named "compat" is not a
+        // bucket: the dir checks read path components of the PARENT.
+        assert_eq!(
+            classify_path_character(std::path::Path::new("src/testing/foo.rs")),
+            PathClass::Ordinary
+        );
+        assert_eq!(
+            classify_path_character(std::path::Path::new("src/contest.rs")),
+            PathClass::Ordinary
+        );
+        assert_eq!(
+            classify_path_character(std::path::Path::new("src/spec.rs")),
+            PathClass::Ordinary
+        );
+    }
+
+    #[test]
+    fn is_type_declaration_extension_set() {
+        for path in ["src/foo.d.ts", "foo.d.mts", "foo.d.cts", "include/ffi.h"] {
+            assert!(is_type_declaration(path), "{path}");
+        }
+        for path in [
+            "src/foo.ts",
+            "src/foo.hx",
+            "src/dts.ts",
+            "src/foo.htaccess",
+            "src/foo",
+        ] {
+            assert!(!is_type_declaration(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn is_generated_name_marker_set() {
+        for path in [
+            "src/api.generated.ts",
+            "src/foo.gen.ts",
+            "src/foo.pb.go",
+            "src/user.g.dart",
+            "src/user.g.ts",
+            "python/foo_pb2.py",
+            "python/foo_pb2_grpc.py",
+            "src/svc_generated.rs",
+        ] {
+            assert!(is_generated_name(path), "{path}");
+        }
+        for path in [
+            "src/foo.ts",
+            "src/foo_pb.rs",
+            "src/general.ts",
+            "src/foo.go",
+            "src/g.dart",
+        ] {
+            assert!(!is_generated_name(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn strip_generated_marker_yields_the_peer_name() {
+        assert_eq!(
+            strip_generated_marker("user.g.dart").as_deref(),
+            Some("user.dart")
+        );
+        assert_eq!(
+            strip_generated_marker("api.generated.ts").as_deref(),
+            Some("api.ts")
+        );
+        assert_eq!(
+            strip_generated_marker("foo_pb2.py").as_deref(),
+            Some("foo.py")
+        );
+        assert_eq!(
+            strip_generated_marker("foo_pb2_grpc.py").as_deref(),
+            Some("foo.py")
+        );
+        assert_eq!(
+            strip_generated_marker("foo.pb.go").as_deref(),
+            Some("foo.go")
+        );
+        assert_eq!(
+            strip_generated_marker("foo.gen.ts").as_deref(),
+            Some("foo.ts")
+        );
+        // No marker: no peer name.
+        assert_eq!(strip_generated_marker("foo.ts"), None);
+    }
+
+    #[test]
+    fn prepare_context_seeds_the_graded_classifier() {
+        let results = vec![
+            classified("src/a.rs", 1, "x", ResultCategory::Other),
+            classified("tests/b.rs", 1, "x", ResultCategory::Other),
+            classified("src/c.d.ts", 1, "x", ResultCategory::Other),
+        ];
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.path_class("src/a.rs"), Some(PathClass::Ordinary));
+        assert_eq!(ctx.path_class("tests/b.rs"), Some(PathClass::Test));
+        assert_eq!(
+            ctx.path_class("src/c.d.ts"),
+            Some(PathClass::TypeDeclaration)
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Generated-peer shadowing (TASK-094, AC-2)
+    // -------------------------------------------------------------------
+
+    /// Seed the `files` table with the given paths (the index side of peer
+    /// verification — candidates alone never verify a peer).
+    fn seed_files(conn: &Connection, paths: &[&str]) {
+        for path in paths {
+            conn.execute(
+                "INSERT INTO files (path, language, hash, last_indexed, line_count) \
+                 VALUES (?1, 'rust', 'h', 0, 10)",
+                rusqlite::params![path],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn resolve_generated_shadowing_with_verified_peer() {
+        let (dir, conn) = seeded_conn();
+        seed_files(&conn, &["src/user.g.dart", "src/user.dart"]);
+        let shadowed = resolve_generated_shadowing(Some(&conn), &["src/user.g.dart".to_string()]);
+        assert_eq!(shadowed, HashSet::from(["src/user.g.dart".to_string()]));
+        drop(dir);
+    }
+
+    #[test]
+    fn resolve_generated_shadowing_without_peer_is_empty() {
+        let (dir, conn) = seeded_conn();
+        // No peer anywhere in the index.
+        seed_files(&conn, &["src/user.g.dart"]);
+        assert!(
+            resolve_generated_shadowing(Some(&conn), &["src/user.g.dart".to_string()]).is_empty()
+        );
+
+        // A peer in a DIFFERENT directory is not a peer: same-named
+        // hand-written files elsewhere say nothing about this one.
+        seed_files(&conn, &["other/user.dart"]);
+        assert!(
+            resolve_generated_shadowing(Some(&conn), &["src/user.g.dart".to_string()]).is_empty()
+        );
+
+        // A peer that is itself generated is not hand-written.
+        seed_files(&conn, &["src/a.gen.gen.ts", "src/a.gen.ts"]);
+        assert!(
+            resolve_generated_shadowing(Some(&conn), &["src/a.gen.gen.ts".to_string()]).is_empty()
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn resolve_generated_shadowing_requires_the_index_not_the_candidate_set() {
+        let (dir, conn) = seeded_conn();
+        // The peer exists only among the CANDIDATES, not in the files
+        // table: unverified — no demotion (AC-2 conservative read).
+        seed_files(&conn, &["src/user.g.dart"]);
+        let candidates = vec!["src/user.g.dart".to_string(), "src/user.dart".to_string()];
+        assert!(resolve_generated_shadowing(Some(&conn), &candidates).is_empty());
+        drop(dir);
+    }
+
+    #[test]
+    fn resolve_generated_shadowing_without_conn_is_empty() {
+        assert!(resolve_generated_shadowing(None, &["src/user.g.dart".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn prepare_context_rewrites_generated_by_verified_peer() {
+        let (dir, conn) = seeded_conn();
+        // Peer present: GeneratedShadowed (0.10).
+        seed_files(&conn, &["src/user.g.dart", "src/user.dart"]);
+        let results = vec![classified("src/user.g.dart", 1, "x", ResultCategory::Other)];
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        assert_eq!(
+            ctx.path_class("src/user.g.dart"),
+            Some(PathClass::GeneratedShadowed)
+        );
+
+        // Peer absent from the index: back to Ordinary — never demoted
+        // without a peer.
+        let (dir2, conn2) = seeded_conn();
+        seed_files(&conn2, &["src/user.g.dart"]);
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            Some(&conn2),
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.path_class("src/user.g.dart"), Some(PathClass::Ordinary));
+        drop(dir);
+        drop(dir2);
+    }
+
+    #[test]
+    fn prepare_context_generated_without_conn_stays_ordinary() {
+        let results = vec![classified("src/user.g.dart", 1, "x", ResultCategory::Other)];
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.path_class("src/user.g.dart"), Some(PathClass::Ordinary));
     }
 
     // -------------------------------------------------------------------
