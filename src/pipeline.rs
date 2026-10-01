@@ -1679,6 +1679,8 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
         "DELETE FROM embeddings;
          DELETE FROM type_edges;
          DELETE FROM contracts;
+         DELETE FROM symbol_topology;
+         DELETE FROM topology_meta;
          DELETE FROM symbols;
          DELETE FROM \"references\";
          DELETE FROM file_imports;
@@ -3793,6 +3795,57 @@ fn extra() -> i32 {
         assert_eq!(reach_row_count(&conn), 0);
         assert!(reach_meta_value(&conn, "built_depth").is_none());
         assert!(reach_meta_value(&conn, "stale").is_none());
+    }
+
+    #[test]
+    fn test_drop_all_data_clears_topology() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("lib.rs"),
+            "fn hello() { world(); }\nfn world() { 2 }",
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        // Seed scored rows plus the meta stamp directly (the pass that
+        // writes them lands in this task's cadence wiring); drop_all_data
+        // must clear both ahead of the symbols delete.
+        conn.execute(
+            "INSERT INTO symbol_topology(symbol_id, hub, authority) VALUES (1, 0.5, 0.5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO topology_meta(key, value) VALUES ('last_computed', '123')",
+            [],
+        )
+        .unwrap();
+        let topology_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_topology", [], |row| row.get(0))
+            .unwrap();
+        assert!(topology_rows >= 1);
+        assert!(
+            conn.query_row(
+                "SELECT value FROM topology_meta WHERE key = 'last_computed'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .is_ok()
+        );
+
+        drop_all_data(&conn).unwrap();
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_topology", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "drop_all_data must clear symbol_topology");
+        let meta: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topology_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(meta, 0, "drop_all_data must clear topology_meta");
     }
 
     #[test]
