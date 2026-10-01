@@ -4193,4 +4193,187 @@ proximity, signature",
         };
         assert_eq!(scores(&symbol), scores(&as_pinned));
     }
+
+    // -------------------------------------------------------------------
+    // TASK-095: headline AC pair + conceptual neutrality (unit level)
+    // -------------------------------------------------------------------
+
+    /// The conceptual query whose text b.rs's embedding carries.
+    const AC_CONCEPTUAL_QUERY: &str = "how does auth refresh";
+
+    /// The AC-pair fixture: `a.rs` is the exact-token match (dominant tf for
+    /// every shared term; its stored embedding is the symbol text), `b.rs`
+    /// is the semantically related doc note (set-minimum tf; its stored
+    /// embedding IS the conceptual query — the file only a semantic channel
+    /// can prefer).
+    fn ac_pair_conn() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for (path, lines) in [("a.rs", 40i64), ("b.rs", 60i64)] {
+            conn.execute(
+                "INSERT INTO files (path, language, hash, last_indexed, line_count) \
+                 VALUES (?1, 'rust', 'h', 0, ?2)",
+                rusqlite::params![path, lines],
+            )
+            .unwrap();
+        }
+        // Symbol rows at the candidate positions — the embedding loader
+        // joins embeddings against them.
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('validate_token', 'function', 'a.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('refresh_note', 'comment', 'b.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+        // Lexical: a.rs dominates every shared term, b.rs holds the set
+        // minimum, so min-max normalization gives a.rs 1.0 and b.rs 0.0 for
+        // BOTH queries (a degenerate one-file set would zero the signal).
+        for (term, a_tf, b_tf) in [
+            ("validate", 8i64, 1i64),
+            ("token", 8, 1),
+            ("auth", 6, 1),
+            ("refresh", 6, 1),
+            ("how", 2, 1),
+            ("does", 2, 1),
+        ] {
+            conn.execute(
+                "INSERT INTO term_stats (term, file, tf) VALUES (?1, 'a.rs', ?2)",
+                rusqlite::params![term, a_tf],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO term_stats (term, file, tf) VALUES (?1, 'b.rs', ?2)",
+                rusqlite::params![term, b_tf],
+            )
+            .unwrap();
+        }
+        // Embeddings in the bundled provider's own space.
+        let provider = crate::bundled_embedding::BundledProvider;
+        use crate::embedding::EmbeddingProvider as _;
+        let mut a_vec = provider.embed_single("validate_token").unwrap();
+        let mut b_vec = provider.embed_single(AC_CONCEPTUAL_QUERY).unwrap();
+        crate::embedding::normalize(&mut a_vec);
+        crate::embedding::normalize(&mut b_vec);
+        conn.execute(
+            "INSERT INTO embeddings \
+             (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim) \
+             VALUES (1, 'a.rs', 'validate_token', ?1, 0, 0, 'bundled', 256)",
+            rusqlite::params![bytemuck::cast_slice(&a_vec)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings \
+             (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim) \
+             VALUES (2, 'b.rs', 'refresh note', ?1, 0, 0, 'bundled', 256)",
+            rusqlite::params![bytemuck::cast_slice(&b_vec)],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn ac_pair_candidates() -> Vec<crate::search::SearchResult> {
+        vec![
+            raw("a.rs", 1, "fn validate_token() {}"),
+            raw("b.rs", 1, "/// refreshes access credentials periodically"),
+        ]
+    }
+
+    /// The tuned-blend test table: semantic-dominant base (the conceptual
+    /// intent), symbol multipliers flipping the blend lexical-dominant.
+    fn ac_tuned_settings() -> RankSettings {
+        RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("lexical", 0.3), ("semantic", 1.5)]),
+            class_multipliers: ClassMultipliers {
+                symbol: channel(2.0, 0.2),
+                ..ClassMultipliers::neutral()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn symbol_query_ranks_exact_token_above_semantically_related() {
+        let (_dir, conn) = ac_pair_conn();
+        let results = ac_pair_candidates();
+        let ranked = rank_and_explain_classed(
+            &results,
+            Some(&conn),
+            "validate_token",
+            &ac_tuned_settings(),
+        );
+        assert_eq!(ranked.query_class, Some(QueryClass::Symbol));
+        let files: Vec<String> = ranked
+            .groups
+            .iter()
+            .flat_map(|(_, items)| items.iter())
+            .map(|s| s.classified.result.file.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            "exact-token match must outrank the semantic note for a symbol query"
+        );
+    }
+
+    #[test]
+    fn conceptual_query_ranks_semantically_related_above_exact_token() {
+        let (_dir, conn) = ac_pair_conn();
+        let results = ac_pair_candidates();
+        let ranked = rank_and_explain_classed(
+            &results,
+            Some(&conn),
+            AC_CONCEPTUAL_QUERY,
+            &ac_tuned_settings(),
+        );
+        assert_eq!(ranked.query_class, Some(QueryClass::Conceptual));
+        let files: Vec<String> = ranked
+            .groups
+            .iter()
+            .flat_map(|(_, items)| items.iter())
+            .map(|s| s.classified.result.file.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["b.rs".to_string(), "a.rs".to_string()],
+            "the semantic note must outrank the exact-token file for a conceptual query"
+        );
+    }
+
+    #[test]
+    fn conceptual_query_scores_identically_with_and_without_classification() {
+        // REQ-009's AC: a conceptual query under the tuned (skewed) table
+        // scores BIT-IDENTICALLY to the same query under neutral
+        // multipliers — classification cannot move a conceptual query.
+        let (_dir, conn) = ac_pair_conn();
+        let results = ac_pair_candidates();
+        let tuned = ac_tuned_settings();
+        let neutral = RankSettings {
+            class_multipliers: ClassMultipliers::neutral(),
+            ..tuned.clone()
+        };
+        let with = rank_and_explain_classed(&results, Some(&conn), AC_CONCEPTUAL_QUERY, &tuned);
+        let without =
+            rank_and_explain_classed(&results, Some(&conn), AC_CONCEPTUAL_QUERY, &neutral);
+        let scores = |r: &RankedSearch| {
+            r.groups
+                .iter()
+                .flat_map(|(_, items)| items.iter())
+                .map(|s| {
+                    (
+                        s.classified.result.file.clone(),
+                        s.score,
+                        s.contributions.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scores(&with), scores(&without));
+    }
 }
