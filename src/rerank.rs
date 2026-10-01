@@ -41,6 +41,7 @@ pub struct ContextReqs {
     pub(crate) lexical_scores: bool,
     pub(crate) embeddings: bool,
     pub(crate) file_churn: bool,
+    pub(crate) co_change: bool,
 }
 
 impl ContextReqs {
@@ -85,6 +86,13 @@ impl ContextReqs {
         self
     }
 
+    /// Require the mined co-change couplings between candidate files
+    /// (TASK-097).
+    pub fn with_co_change(mut self) -> Self {
+        self.co_change = true;
+        self
+    }
+
     fn union(self, other: Self) -> Self {
         Self {
             query_terms: self.query_terms || other.query_terms,
@@ -93,6 +101,7 @@ impl ContextReqs {
             lexical_scores: self.lexical_scores || other.lexical_scores,
             embeddings: self.embeddings || other.embeddings,
             file_churn: self.file_churn || other.file_churn,
+            co_change: self.co_change || other.co_change,
         }
     }
 }
@@ -447,6 +456,17 @@ pub struct ChurnContext {
     pub(crate) max: f32,
 }
 
+/// Set-relative co-change coupling for the candidate set (TASK-097): each
+/// candidate's STRONGEST retained coupling to a file that is ALSO in the
+/// response set, with the set max folded once at preparation time. Pairs
+/// whose partner did not match the query are ignored — the signal reads
+/// co-motion WITHIN the response, not absolute coupling.
+#[derive(Debug, Default, Clone)]
+pub struct CoChangeContext {
+    pub(crate) best: HashMap<String, f32>,
+    pub(crate) max: f32,
+}
+
 /// The query sources the pipeline prepares context against: the BM25
 /// constants and the embedding provider kind from the loaded configuration.
 /// Carrying them in one struct keeps `rank_and_explain`'s signature stable
@@ -478,6 +498,7 @@ pub struct SharedContext {
     pub(crate) max_caller_count: u32,
     pub(crate) embeddings: EmbeddingContext,
     pub(crate) churn: ChurnContext,
+    pub(crate) co_change: CoChangeContext,
 }
 
 impl SharedContext {
@@ -538,6 +559,17 @@ impl SharedContext {
     /// The largest churn score across the candidate set; 0 when none.
     pub fn max_churn(&self) -> f32 {
         self.churn.max
+    }
+
+    /// The candidate's strongest retained coupling to another file IN THE
+    /// RESPONSE SET (None unless prepared, or when it has none).
+    pub fn co_change_coupling(&self, file: &str) -> Option<f32> {
+        self.co_change.best.get(file).copied()
+    }
+
+    /// The strongest candidate-set coupling; 0 when none.
+    pub fn max_co_change(&self) -> f32 {
+        self.co_change.max
     }
 }
 
@@ -751,6 +783,23 @@ pub fn churn_value(score: f32, set_max: f32) -> f32 {
         return 0.0;
     }
     (1.0 + score).ln() / (1.0 + set_max).ln()
+}
+
+/// Log-damped co-change coupling against the candidate-set maximum
+/// (TASK-097, PRD-HIST-REQ-006): `ln(1 + weight) / ln(1 + set_max)` over
+/// the stored age-weighted co-occurrence — the same damper as
+/// [`churn_value`], so one intensely-coupled pair cannot crush the rest
+/// of the set. The signal is SET-RELATIVE: rerank only reorders matched
+/// files, so "the query target" is the response set itself, and a
+/// candidate scores by its strongest coupling to another file IN that
+/// set. An uncoupled set (`set_max <= 0`), a single-file set, and
+/// non-finite inputs score exactly 0.0 — a loner is never penalized
+/// beyond its missing evidence.
+pub fn co_change_value(weight: f32, set_max: f32) -> f32 {
+    if !weight.is_finite() || !set_max.is_finite() || set_max <= 0.0 {
+        return 0.0;
+    }
+    (1.0 + weight).ln() / (1.0 + set_max).ln()
 }
 
 /// The churn signal: how actively the candidate file was modified within
@@ -1344,6 +1393,15 @@ pub fn prepare_context(
             .collect();
         ctx.churn = load_churn_scores(conn, &files);
     }
+    if reqs.co_change
+        && let Some(conn) = conn
+    {
+        let files: std::collections::HashSet<String> = results
+            .iter()
+            .map(|r| r.result.file.to_string_lossy().into_owned())
+            .collect();
+        ctx.co_change = load_co_change_scores(conn, &files);
+    }
     ctx
 }
 
@@ -1387,6 +1445,67 @@ fn load_churn_scores(conn: &Connection, files: &std::collections::HashSet<String
         .values()
         .copied()
         .filter(|s| s.is_finite())
+        .fold(0.0f32, f32::max);
+    ctx
+}
+
+/// Load the set-relative couplings for exactly the candidate files, in
+/// IN_CHUNK batches against the `co_change` primary key. Only rows whose
+/// `file_b` is ALSO a candidate are kept, folding each `file_a`'s maximum
+/// and the set maximum once — the response set is the "query target" the
+/// signal reads (PRD-HIST-REQ-006).
+///
+/// A presence probe (the bm25/file_churn precedent) degrades to an empty
+/// context on a pre-TASK-097 index whose `co_change` table does not exist;
+/// every prepare failure is the same zero-path, never an error.
+fn load_co_change_scores(
+    conn: &Connection,
+    files: &std::collections::HashSet<String>,
+) -> CoChangeContext {
+    let mut ctx = CoChangeContext::default();
+    if files.is_empty() {
+        return ctx;
+    }
+    if conn
+        .query_row("SELECT 1 FROM co_change LIMIT 1", [], |_| Ok(()))
+        .is_err()
+    {
+        return ctx;
+    }
+
+    let mut wanted: Vec<&String> = files.iter().collect();
+    wanted.sort_unstable();
+    for chunk in wanted.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql =
+            format!("SELECT file_a, file_b, weight FROM co_change WHERE file_a IN ({placeholders})");
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f32>(2)?,
+            ))
+        }) else {
+            continue;
+        };
+        for (file_a, file_b, weight) in rows.flatten() {
+            if !files.contains(&file_b) || !weight.is_finite() {
+                continue;
+            }
+            ctx.best
+                .entry(file_a)
+                .and_modify(|best| *best = best.max(weight))
+                .or_insert(weight);
+        }
+    }
+    ctx.max = ctx
+        .best
+        .values()
+        .copied()
+        .filter(|w| w.is_finite())
         .fold(0.0f32, f32::max);
     ctx
 }
@@ -2267,6 +2386,111 @@ proximity, signature, churn",
             "absent is zero, not a penalty"
         );
         assert!(hot.score > gone.score);
+    }
+
+    // -- co-change signal (TASK-097) ------------------------------------------
+
+    /// handler and serializer change together (3.0); handler and migration
+    /// change together more weakly (1.0); handler's coupling to other.rs
+    /// (99.0) is stored but other.rs is never a candidate in these tests.
+    fn co_change_seeded_conn() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = seeded_conn();
+        for (a, b, w) in [
+            ("src/handler.rs", "src/serializer.rs", 3.0f32),
+            ("src/serializer.rs", "src/handler.rs", 3.0),
+            ("src/handler.rs", "src/migration.rs", 1.0),
+            ("src/migration.rs", "src/handler.rs", 1.0),
+            ("src/handler.rs", "src/other.rs", 99.0),
+        ] {
+            conn.execute(
+                "INSERT INTO co_change (file_a, file_b, weight) VALUES (?1, ?2, ?3)",
+                rusqlite::params![a, b, w],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    fn co_change_candidates() -> Vec<ClassifiedResult> {
+        vec![
+            classified("src/handler.rs", 1, "x", ResultCategory::Other),
+            classified("src/serializer.rs", 1, "x", ResultCategory::Other),
+            classified("src/migration.rs", 1, "x", ResultCategory::Other),
+            classified("src/loner.rs", 1, "x", ResultCategory::Other),
+        ]
+    }
+
+    #[test]
+    fn co_change_value_log_damped_monotone_and_zero_paths() {
+        // Monotone in the weight, and the set max maps to exactly 1.0.
+        assert!(co_change_value(5.0, 100.0) > co_change_value(1.0, 100.0));
+        assert_eq!(co_change_value(100.0, 100.0), 1.0);
+        // Log damping keeps weak coupling alive against a strong max.
+        assert!(co_change_value(5.0, 500.0) > 0.25);
+        // An uncoupled set is inert, and absent is exactly zero.
+        assert_eq!(co_change_value(0.0, 0.0), 0.0);
+        assert_eq!(co_change_value(1.0, 0.0), 0.0);
+        assert_eq!(co_change_value(0.0, 4.0), 0.0);
+        // Non-finite inputs never propagate NaN.
+        assert_eq!(co_change_value(f32::NAN, 4.0), 0.0);
+        assert_eq!(co_change_value(2.0, f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn co_change_context_loads_only_candidate_pairs_with_folded_max() {
+        let (_dir, conn) = co_change_seeded_conn();
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_co_change(),
+            "x",
+            &co_change_candidates(),
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        // Each candidate's STRONGEST coupling to another candidate: the
+        // 99.0 row pairs handler with a non-candidate and must be ignored.
+        assert_eq!(ctx.co_change_coupling("src/handler.rs"), Some(3.0));
+        assert_eq!(ctx.co_change_coupling("src/serializer.rs"), Some(3.0));
+        assert_eq!(ctx.co_change_coupling("src/migration.rs"), Some(1.0));
+        assert_eq!(
+            ctx.co_change_coupling("src/loner.rs"),
+            None,
+            "no retained coupling at all"
+        );
+        assert_eq!(
+            ctx.co_change_coupling("src/other.rs"),
+            None,
+            "not a candidate"
+        );
+        assert_eq!(ctx.max_co_change(), 3.0, "max folds over candidate pairs");
+    }
+
+    #[test]
+    fn co_change_context_empty_without_table_or_connection() {
+        // A pre-TASK-097 index has no co_change table: the presence probe
+        // degrades to an empty slice, never an error.
+        let raw = Connection::open_in_memory().unwrap();
+        let results = vec![classified("src/a.rs", 1, "x", ResultCategory::Other)];
+        let ctx = prepare_context(
+            ContextReqs::none().with_co_change(),
+            "x",
+            &results,
+            Some(&raw),
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.co_change_coupling("src/a.rs"), None);
+        assert_eq!(ctx.max_co_change(), 0.0);
+
+        // No connection at all: same zero-path.
+        let ctx = prepare_context(
+            ContextReqs::none().with_co_change(),
+            "x",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.co_change_coupling("src/a.rs"), None);
     }
 
     #[test]
