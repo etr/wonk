@@ -1510,8 +1510,9 @@ fn load_co_change_scores(
     wanted.sort_unstable();
     for chunk in wanted.chunks(IN_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql =
-            format!("SELECT file_a, file_b, weight FROM co_change WHERE file_a IN ({placeholders})");
+        let sql = format!(
+            "SELECT file_a, file_b, weight FROM co_change WHERE file_a IN ({placeholders})"
+        );
         let Ok(mut stmt) = conn.prepare(&sql) else {
             continue;
         };
@@ -2545,8 +2546,7 @@ proximity, signature, churn, co_change",
                 .unwrap()
         };
         assert_eq!(
-            scored[0].contributions[0].signal,
-            "co_change",
+            scored[0].contributions[0].signal, "co_change",
             "the registry's newest signal breaks the kind tie"
         );
         // Set-relative: the strongest in-set pair maps to 1.0, the weaker
@@ -2559,7 +2559,8 @@ proximity, signature, churn, co_change",
             "weak pair log-damps against the set max"
         );
         assert_eq!(
-            by_file("src/loner.rs").contributions[0].value, 0.0,
+            by_file("src/loner.rs").contributions[0].value,
+            0.0,
             "no coupling is zero, not a penalty"
         );
         assert!(by_file("src/loner.rs").score < by_file("src/migration.rs").score);

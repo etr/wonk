@@ -1035,9 +1035,8 @@ mod tests {
     /// The reformatting-sweep shape: `[a.rs, b.rs]@100` then a commit
     /// sweeping `a.rs` plus `f000..f499` at 200.
     fn make_reformat_repo(with_pair_commit: bool) -> (TempDir, Connection) {
-        let mut sweep: Vec<&str> = vec!["a.rs"];
         let owned: Vec<String> = (0..500).map(|i| format!("f{i:03}.rs")).collect();
-        let mut sweep = sweep;
+        let mut sweep: Vec<&str> = vec!["a.rs"];
         sweep.extend(owned.iter().map(String::as_str));
         let groups: Vec<(&[&str], i64)> = if with_pair_commit {
             vec![(&["a.rs", "b.rs"], 100), (&sweep, 200)]
@@ -1090,7 +1089,10 @@ mod tests {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM co_change", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 0, "a repo whose only commit is a sweep has no coupling");
+        assert_eq!(
+            total, 0,
+            "a repo whose only commit is a sweep has no coupling"
+        );
         // The sweep itself was still mined.
         assert_eq!(mined_count(&conn), 1);
     }
@@ -1160,10 +1162,19 @@ mod tests {
         };
         assert_eq!(per_file.len(), 12);
         assert!(per_file.iter().all(|(_, n)| *n == 10));
-        assert!(coupling(&conn, "f00.rs", "f11.rs").is_none(), "largest dropped");
-        assert!(coupling(&conn, "f11.rs", "f10.rs").is_none(), "largest dropped");
+        assert!(
+            coupling(&conn, "f00.rs", "f11.rs").is_none(),
+            "largest dropped"
+        );
+        assert!(
+            coupling(&conn, "f11.rs", "f10.rs").is_none(),
+            "largest dropped"
+        );
         assert!(coupling(&conn, "f11.rs", "f09.rs").is_some(), "rest kept");
-        assert!(coupling(&conn, "f05.rs", "f11.rs").is_none(), "largest dropped");
+        assert!(
+            coupling(&conn, "f05.rs", "f11.rs").is_none(),
+            "largest dropped"
+        );
     }
 
     #[test]
@@ -1187,21 +1198,18 @@ mod tests {
         // only the co-change signal separates them.
         let hits = ["handler.rs", "serializer.rs", "loner.rs"]
             .into_iter()
-            .map(|file| {
-                crate::search::SearchResult {
-                    file: Path::new(file).to_path_buf(),
-                    line: 1,
-                    col: 1,
-                    content: format!("{file} target"),
-                }
+            .map(|file| crate::search::SearchResult {
+                file: Path::new(file).to_path_buf(),
+                line: 1,
+                col: 1,
+                content: format!("{file} target"),
             })
             .collect::<Vec<_>>();
         let scored = crate::rerank::rerank(
             crate::ranker::classify_results(&hits, None),
             &crate::rerank::QueryInfo { pattern: "target" },
             Some(&conn),
-            &crate::rerank::WeightTable::from_pairs([("co_change".to_string(), 1.0f32)])
-                .unwrap(),
+            &crate::rerank::WeightTable::from_pairs([("co_change".to_string(), 1.0f32)]).unwrap(),
             &crate::rerank::ContextSources::default(),
         );
 
