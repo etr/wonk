@@ -1,0 +1,259 @@
+# Labeled query set for signal-based ranking (TASK-095, OQ-015, AR-034).
+#
+# Provenance: every query and label is BY CONSTRUCTION against the corpus
+# in `corpus/` — the query text occurs literally in the labeled files (a
+# topic phrase in module docs, a signature line, a path reference), and
+# each `relevant` list names exactly the files a developer wants for that
+# query, justified by the corpus role recorded in the per-query `because`
+# field. Nothing here was labeled by running the ranker under test.
+#
+# Quotas: 10 symbol, 8 path, 8 signature, 14 conceptual queries. The
+# classifier labels double as the classify_query regression suite.
+
+# --- symbol-shaped (10) -----------------------------------------------------
+
+[[query]]
+text = "validate_token"
+class = "symbol"
+because = "defined in the auth token module; the definition, its regression test, and its primary caller are the answers"
+relevant = ["src/auth/token.rs", "tests/token_test.rs", "src/auth/session.rs"]
+
+[[query]]
+text = "CacheEngine"
+class = "symbol"
+because = "the cache engine type; its definition is the answer"
+relevant = ["src/cache/engine.rs"]
+
+[[query]]
+text = "open_session"
+class = "symbol"
+because = "same-named definitions in the current session module and the compat layer are both answers"
+relevant = ["src/auth/session.rs", "src/compat/legacy_auth.rs"]
+
+[[query]]
+text = "retry_backoff"
+class = "symbol"
+because = "the backoff computation; its definition is the answer"
+relevant = ["src/retry/engine.rs"]
+
+[[query]]
+text = "parse_header"
+class = "symbol"
+because = "the header parser; its definition is the answer"
+relevant = ["src/parser/engine.rs"]
+
+[[query]]
+text = "QueueWorker"
+class = "symbol"
+because = "the queue worker type; its definition is the answer"
+relevant = ["src/queue/engine.rs"]
+
+[[query]]
+text = "rotate_credentials"
+class = "symbol"
+because = "the rotation entrypoint; its definition is the answer"
+relevant = ["src/auth/credentials.rs"]
+
+[[query]]
+text = "evict_entry"
+class = "symbol"
+because = "the eviction entrypoint; definition and regression test are the answers"
+relevant = ["src/cache/engine.rs", "tests/cache_engine_test.rs"]
+
+[[query]]
+text = "TokenClaims"
+class = "symbol"
+because = "the claims record; its definition is the answer"
+relevant = ["src/auth/token.rs"]
+
+[[query]]
+text = "shard_key"
+class = "symbol"
+because = "the shard selector; its definition is the answer"
+relevant = ["src/shard/shard.rs"]
+
+# --- path-shaped (8) --------------------------------------------------------
+
+[[query]]
+text = "src/auth/token.rs"
+class = "path"
+because = "files referencing the token module path are the answers"
+relevant = ["src/auth/mod.rs", "docs/architecture.md", "README.md"]
+
+[[query]]
+text = "src/compat/legacy_auth.rs"
+class = "path"
+because = "files referencing the compat module path are the answers"
+relevant = ["src/auth/mod.rs", "docs/architecture.md", "docs/migration.md"]
+
+[[query]]
+text = "cache/engine.rs"
+class = "path"
+because = "files referencing the cache engine path are the answers"
+relevant = ["tests/cache_engine_test.rs", "docs/architecture.md", "README.md"]
+
+[[query]]
+text = "src/user.dart"
+class = "path"
+because = "the generated banner citing its source and the architecture map are the answers"
+relevant = ["src/generated/user.g.dart", "docs/architecture.md"]
+
+[[query]]
+text = "src/types.d.ts"
+class = "path"
+because = "the ambient declaration file itself and the map referencing it are the answers"
+relevant = ["src/types.d.ts", "docs/architecture.md"]
+
+[[query]]
+text = "examples/basic.rs"
+class = "path"
+because = "the example itself and the files pointing at it are the answers"
+relevant = ["examples/basic.rs", "README.md", "docs/architecture.md"]
+
+[[query]]
+text = "docs/migration.md"
+class = "path"
+because = "files referencing the migration guide are the answers"
+relevant = ["src/compat/legacy_auth.rs", "docs/architecture.md"]
+
+[[query]]
+text = "tests/token_test.rs"
+class = "path"
+because = "the test itself and the map referencing it are the answers"
+relevant = ["tests/token_test.rs", "docs/architecture.md"]
+
+# --- signature-shaped (8) ---------------------------------------------------
+
+[[query]]
+text = "validate_token(secret: &str)"
+class = "signature"
+because = "the exact signature line in the definition and its test double"
+relevant = ["src/auth/token.rs", "tests/token_test.rs"]
+
+[[query]]
+text = "fn open_session("
+class = "signature"
+because = "both definitions of the session opener"
+relevant = ["src/auth/session.rs", "src/compat/legacy_auth.rs"]
+
+[[query]]
+text = "CacheEngine::new"
+class = "signature"
+because = "the constructor call site in the wiring"
+relevant = ["src/main.rs"]
+
+[[query]]
+text = "-> TokenClaims"
+class = "signature"
+because = "the refresh signature returning claims directly"
+relevant = ["src/auth/token.rs"]
+
+[[query]]
+text = "parse_header(input: &str)"
+class = "signature"
+because = "the parser signature"
+relevant = ["src/parser/engine.rs"]
+
+[[query]]
+text = "fn claim(&self)"
+class = "signature"
+because = "the worker's claim signature"
+relevant = ["src/queue/engine.rs"]
+
+[[query]]
+text = "evict_entry(key: &str)"
+class = "signature"
+because = "the eviction signature in the definition and its test double"
+relevant = ["src/cache/engine.rs", "tests/cache_engine_test.rs"]
+
+[[query]]
+text = "rotate_credentials(secret: &str)"
+class = "signature"
+because = "the rotation signature"
+relevant = ["src/auth/credentials.rs"]
+
+# --- conceptual (14) --------------------------------------------------------
+
+[[query]]
+text = "how does auth refresh"
+class = "conceptual"
+because = "the module doc answering the question and the design note elaborating it"
+relevant = ["src/auth/credentials.rs", "src/notes/renewal_notes.rs"]
+
+[[query]]
+text = "credential renewal policy"
+class = "conceptual"
+because = "the policy definition and its design note"
+relevant = ["src/auth/credentials.rs", "src/notes/renewal_notes.rs"]
+
+[[query]]
+text = "cache eviction strategy"
+class = "conceptual"
+because = "the engine module doc describing the strategy"
+relevant = ["src/cache/engine.rs"]
+
+[[query]]
+text = "retry with backoff"
+class = "conceptual"
+because = "the retry module doc"
+relevant = ["src/retry/engine.rs"]
+
+[[query]]
+text = "parse request headers"
+class = "conceptual"
+because = "the parser module doc"
+relevant = ["src/parser/engine.rs"]
+
+[[query]]
+text = "queue worker shutdown"
+class = "conceptual"
+because = "the queue module doc"
+relevant = ["src/queue/engine.rs"]
+
+[[query]]
+text = "shard selection"
+class = "conceptual"
+because = "the shard module doc"
+relevant = ["src/shard/shard.rs"]
+
+[[query]]
+text = "cursor pagination"
+class = "conceptual"
+because = "the cursor module doc"
+relevant = ["src/cursor.rs"]
+
+[[query]]
+text = "token expiry"
+class = "conceptual"
+because = "both module docs discussing expiry handling"
+relevant = ["src/auth/token.rs", "src/auth/session.rs"]
+
+[[query]]
+text = "session storage"
+class = "conceptual"
+because = "the session module doc and its storage design note"
+relevant = ["src/auth/session.rs", "src/notes/storage_notes.rs"]
+
+[[query]]
+text = "rate limiting"
+class = "conceptual"
+because = "the rate limit module doc"
+relevant = ["src/ratelimit.rs"]
+
+[[query]]
+text = "observability hooks"
+class = "conceptual"
+because = "the telemetry module doc"
+relevant = ["src/telemetry.rs"]
+
+[[query]]
+text = "error taxonomy"
+class = "conceptual"
+because = "the errors module doc"
+relevant = ["src/errors.rs"]
+
+[[query]]
+text = "pre-2.0"
+class = "conceptual"
+because = "the compat layer, the migration guide, and the auth module doc all discuss the pre-2.0 flow"
+relevant = ["src/compat/legacy_auth.rs", "docs/migration.md", "src/auth/mod.rs"]
