@@ -73,6 +73,7 @@ fn main() -> Result<()> {
             wonk::embedding::EmbeddingProviderKind::Bundled,
             None,
             true,
+            0.85,
         )?
     };
 

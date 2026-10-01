@@ -43,6 +43,7 @@ pub struct ContextReqs {
     pub(crate) file_churn: bool,
     pub(crate) co_change: bool,
     pub(crate) symbol_topology: bool,
+    pub(crate) shingles: bool,
 }
 
 impl ContextReqs {
@@ -101,6 +102,13 @@ impl ContextReqs {
         self
     }
 
+    /// Require the shingle sketches at candidate positions (TASK-100) —
+    /// the only input the novelty pass reads; no symbol body is fetched.
+    pub fn with_shingles(mut self) -> Self {
+        self.shingles = true;
+        self
+    }
+
     fn union(self, other: Self) -> Self {
         Self {
             query_terms: self.query_terms || other.query_terms,
@@ -111,6 +119,7 @@ impl ContextReqs {
             file_churn: self.file_churn || other.file_churn,
             co_change: self.co_change || other.co_change,
             symbol_topology: self.symbol_topology || other.symbol_topology,
+            shingles: self.shingles || other.shingles,
         }
     }
 }
@@ -491,16 +500,28 @@ pub struct TopologyContext {
     pub(crate) modal_fraction: f32,
 }
 
+/// Bottom-k shingle sketches at the candidate positions (TASK-100),
+/// decoded from `symbol_shingles`. The ONLY duplicate-detection input —
+/// no symbol body is ever read at query time (PRD-DUP-REQ-002).
+#[derive(Debug, Default, Clone)]
+pub struct ShingleContext {
+    pub(crate) sketches: HashMap<(String, u64), Vec<u32>>,
+}
+
 /// The query sources the pipeline prepares context against: the BM25
-/// constants and the embedding provider kind from the loaded configuration.
-/// Carrying them in one struct keeps `rank_and_explain`'s signature stable
-/// while signals read whatever the user configured.
+/// constants, the embedding provider, and the near-duplicate threshold
+/// from the loaded configuration. Carrying them in one struct keeps
+/// `rank_and_explain`'s signature stable while signals read whatever the
+/// user configured.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContextSources {
     /// BM25 constants (`[search] bm25_k1` / `bm25_b`).
     pub bm25: crate::bm25::Bm25Params,
     /// The configured embedding provider for the semantic signal.
     pub embedding: crate::embedding::EmbeddingProviderKind,
+    /// Sketch-Jaccard level at which two symbols are near-duplicates
+    /// (`[duplicate] threshold`, TASK-100).
+    pub duplicate_threshold: f32,
 }
 
 impl Default for ContextSources {
@@ -508,6 +529,7 @@ impl Default for ContextSources {
         Self {
             bm25: crate::bm25::Bm25Params::from(&crate::config::SearchConfig::default()),
             embedding: crate::embedding::EmbeddingProviderKind::Bundled,
+            duplicate_threshold: 0.85,
         }
     }
 }
@@ -524,6 +546,7 @@ pub struct SharedContext {
     pub(crate) churn: ChurnContext,
     pub(crate) co_change: CoChangeContext,
     pub(crate) topology: TopologyContext,
+    pub(crate) shingles: ShingleContext,
 }
 
 impl SharedContext {
@@ -634,6 +657,16 @@ impl SharedContext {
     /// concentrated the results are (0.0 when there is no modal).
     pub fn modal_community_fraction(&self) -> f32 {
         self.topology.modal_fraction
+    }
+
+    /// The shingle sketch at a candidate position (None unless prepared,
+    /// or when the position carries no signature row — a call site, a
+    /// comment hit, or a pre-TASK-100 index).
+    pub fn sketch_at(&self, file: &str, line: u64) -> Option<&[u32]> {
+        self.shingles
+            .sketches
+            .get(&(file.to_string(), line))
+            .map(|v| v.as_slice())
     }
 }
 
@@ -1450,6 +1483,35 @@ impl Signal for SignatureSignal {
     }
 }
 
+/// The novelty signal (TASK-100, PRD-DUP-REQ-004/005). NOT additive: its
+/// value depends on the ranking, which depends on the scores — circular —
+/// so the pipeline's post-sort pass (`apply_novelty`) appends the real
+/// contribution rows. This member exists so `[rank.weights]` validation,
+/// `known_signal_names`, and the requirements union accept `novelty`
+/// uniformly; `contribution` is dead by design and is never evaluated
+/// (the pipeline excludes the name from the additive phase).
+pub(crate) struct NoveltySignal;
+
+impl Signal for NoveltySignal {
+    fn name(&self) -> &'static str {
+        "novelty"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_shingles()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        _candidate: &ClassifiedResult,
+        _ctx: &SharedContext,
+    ) -> f32 {
+        // Dead by design — see the type doc. The pass appends real rows.
+        0.0
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -1468,6 +1530,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(HubSignal),
         Box::new(AuthoritySignal),
         Box::new(CommunitySignal),
+        Box::new(NoveltySignal),
     ]
 }
 
@@ -1626,6 +1689,11 @@ pub fn prepare_context(
         && let Some(conn) = conn
     {
         ctx.topology = load_topology_scores(conn, results);
+    }
+    if reqs.shingles
+        && let Some(conn) = conn
+    {
+        ctx.shingles = load_shingle_sketches(conn, results);
     }
     ctx
 }
@@ -1834,6 +1902,69 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
     ctx
 }
 
+/// Load the shingle sketches for exactly the candidate positions, in
+/// IN_CHUNK batches over the candidate FILES, joined through `symbols`
+/// so each row lands at its definition position (TASK-100).
+///
+/// A presence probe (the topology precedent) degrades to an empty
+/// context on a pre-TASK-100 index whose `symbol_shingles` table does not
+/// exist or has no rows; every prepare failure is the same zero-path,
+/// never an error. `ORDER BY s.id ASC` picks deterministically when two
+/// symbols share a position. This loader reads ONLY `symbols` and
+/// `symbol_shingles` — never a body (PRD-DUP-REQ-002).
+fn load_shingle_sketches(conn: &Connection, results: &[ClassifiedResult]) -> ShingleContext {
+    let mut ctx = ShingleContext::default();
+    let positions: std::collections::HashSet<(String, u64)> = results
+        .iter()
+        .map(|r| (r.result.file.to_string_lossy().into_owned(), r.result.line))
+        .collect();
+    if positions.is_empty() {
+        return ctx;
+    }
+    let mut wanted: Vec<&String> = positions.iter().map(|(file, _)| file).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if conn
+        .query_row("SELECT 1 FROM symbol_shingles LIMIT 1", [], |_| Ok(()))
+        .is_err()
+    {
+        return ctx;
+    }
+
+    for chunk in wanted.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT s.file, s.line, ss.signature \
+             FROM symbols s JOIN symbol_shingles ss ON ss.symbol_id = s.id \
+             WHERE s.file IN ({placeholders}) ORDER BY s.id ASC"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        }) else {
+            continue;
+        };
+        for (file, line, blob) in rows.flatten() {
+            let key = (file, line as u64);
+            if !positions.contains(&key) {
+                continue;
+            }
+            let sketch = crate::shingles::decode_sketch(&blob);
+            if sketch.is_empty() {
+                continue;
+            }
+            ctx.sketches.entry(key).or_insert(sketch);
+        }
+    }
+    ctx
+}
+
 /// Prepare the semantic context: candidate vectors first, then the query
 /// embedding, exactly once (TASK-093).
 ///
@@ -1958,31 +2089,121 @@ fn load_symbol_hits(
     hits
 }
 
-/// Score and sort classified results with the built-in signal registry.
-pub fn rerank(
-    results: Vec<ClassifiedResult>,
-    query: &QueryInfo<'_>,
-    conn: Option<&Connection>,
-    weights: &WeightTable,
-    sources: &ContextSources,
-) -> Vec<ScoredResult> {
-    rerank_with_signals(builtin_signals(), results, query, conn, weights, sources)
+/// How deep into the pre-novelty ordering the novelty pass examines:
+/// n²/2 × 64-merge ≈ 2M ops worst case; candidates beyond the window —
+/// far past any response budget — get novelty value 1.0 (undemoted).
+pub const NOVELTY_WINDOW: usize = 256;
+
+/// The novelty demotion pass (TASK-100, PRD-DUP-REQ-004/005). NOT an
+/// additive signal: its value depends on the ranking, which depends on
+/// the scores — circular — so it runs as a post-sort pass here.
+///
+/// `scored` arrives in pre-novelty order (score desc, then file asc,
+/// line asc). For each candidate inside `window` that carries a sketch,
+/// the maximum sketch-Jaccard against every earlier sketch-carrying
+/// candidate maps through the [`crate::shingles::novelty_redundancy`]
+/// ramp into a novelty value `1 - r`; every result then gets a
+/// `novelty` contribution appended and `score += value * weight`
+/// (1.0 for novel/representative/beyond-window candidates), and the
+/// caller re-sorts. Sketchless candidates are outside the duplicate
+/// universe: never demoted, never shielding.
+///
+/// Representative guarantee (REQ-005): the earliest member of any
+/// duplicate group has no earlier duplicate, so its redundancy is 0 and
+/// it earns the full `+weight` — its rank can only improve. Demotion is
+/// a bounded score reduction; nothing is removed.
+///
+/// Returns every compared pair with similarity strictly above
+/// `threshold`, in deterministic (i asc, j asc) loop order, for the
+/// dispatch layer to record (PRD-DUP-REQ-003).
+fn apply_novelty(
+    scored: &mut [ScoredResult],
+    ctx: &SharedContext,
+    weight: f32,
+    threshold: f32,
+    window: usize,
+) -> Vec<crate::shingles::NearDuplicatePair> {
+    let window_end = window.min(scored.len());
+
+    // Sketches of the examined candidates, in pre-novelty rank order —
+    // a copy (<= 256 x 64 u32) so the borrow below is free.
+    let sketches: Vec<Option<Vec<u32>>> = scored[..window_end]
+        .iter()
+        .map(|result| {
+            let file = result.classified.result.file.to_string_lossy().into_owned();
+            ctx.sketch_at(&file, result.classified.result.line)
+                .map(|sketch| sketch.to_vec())
+        })
+        .collect();
+
+    let mut values = vec![1.0f32; scored.len()];
+    let mut pairs = Vec::new();
+    for i in 0..window_end {
+        let Some(sketch_i) = &sketches[i] else {
+            continue;
+        };
+        let mut max_sim = 0.0f32;
+        for j in 0..i {
+            let Some(sketch_j) = &sketches[j] else {
+                continue;
+            };
+            let sim = crate::shingles::sketch_jaccard(sketch_i, sketch_j);
+            if sim > threshold {
+                pairs.push(crate::shingles::NearDuplicatePair {
+                    a: position_of(&scored[j]),
+                    b: position_of(&scored[i]),
+                    similarity: sim,
+                });
+            }
+            max_sim = max_sim.max(sim);
+        }
+        values[i] = 1.0 - crate::shingles::novelty_redundancy(max_sim, threshold);
+    }
+
+    for (result, value) in scored.iter_mut().zip(values) {
+        let weighted = value * weight;
+        result.score += weighted;
+        result.contributions.push(Contribution {
+            signal: "novelty",
+            value,
+            weight,
+            weighted,
+        });
+    }
+    pairs
 }
 
-/// `rerank` over an explicit signal list (the test seam for spy signals).
-pub(crate) fn rerank_with_signals(
+/// A scored result's `(file, line)` position, the identity pairs carry.
+fn position_of(result: &ScoredResult) -> (String, u64) {
+    (
+        result.classified.result.file.to_string_lossy().into_owned(),
+        result.classified.result.line,
+    )
+}
+
+/// Score, sort, and (when `novelty` weighs nonzero) run the novelty
+/// demotion pass, returning the surfaced near-duplicate pairs alongside
+/// the scored results.
+pub fn rerank_with_pairs(
     signals: Vec<Box<dyn Signal>>,
     results: Vec<ClassifiedResult>,
     query: &QueryInfo<'_>,
     conn: Option<&Connection>,
     weights: &WeightTable,
     sources: &ContextSources,
-) -> Vec<ScoredResult> {
+) -> (Vec<ScoredResult>, Vec<crate::shingles::NearDuplicatePair>) {
+    // The additive phase excludes novelty: its rows come from the
+    // post-sort pass, not from per-candidate evaluation.
     let active: Vec<&Box<dyn Signal>> = signals
         .iter()
-        .filter(|s| weights.weight(s.name()) != 0.0)
+        .filter(|s| weights.weight(s.name()) != 0.0 && s.name() != "novelty")
         .collect();
-    let reqs = union_reqs(&signals, weights);
+    // Belt-and-suspenders: even a spy-signal list without NoveltySignal
+    // prepares shingles when novelty weighs in.
+    let mut reqs = union_reqs(&signals, weights);
+    if weights.weight("novelty") != 0.0 {
+        reqs = reqs.with_shingles();
+    }
     let ctx = prepare_context(reqs, query.pattern, &results, conn, sources);
 
     let mut scored: Vec<ScoredResult> = results
@@ -2010,7 +2231,45 @@ pub(crate) fn rerank_with_signals(
         })
         .collect();
     scored.sort_by(compare_scored);
-    scored
+
+    let novelty_weight = weights.weight("novelty");
+    let pairs = if novelty_weight != 0.0 {
+        let pairs = apply_novelty(
+            &mut scored,
+            &ctx,
+            novelty_weight,
+            sources.duplicate_threshold,
+            NOVELTY_WINDOW,
+        );
+        scored.sort_by(compare_scored);
+        pairs
+    } else {
+        Vec::new()
+    };
+    (scored, pairs)
+}
+
+/// Score and sort classified results with the built-in signal registry.
+pub fn rerank(
+    results: Vec<ClassifiedResult>,
+    query: &QueryInfo<'_>,
+    conn: Option<&Connection>,
+    weights: &WeightTable,
+    sources: &ContextSources,
+) -> Vec<ScoredResult> {
+    rerank_with_signals(builtin_signals(), results, query, conn, weights, sources)
+}
+
+/// `rerank` over an explicit signal list (the test seam for spy signals).
+pub(crate) fn rerank_with_signals(
+    signals: Vec<Box<dyn Signal>>,
+    results: Vec<ClassifiedResult>,
+    query: &QueryInfo<'_>,
+    conn: Option<&Connection>,
+    weights: &WeightTable,
+    sources: &ContextSources,
+) -> Vec<ScoredResult> {
+    rerank_with_pairs(signals, results, query, conn, weights, sources).0
 }
 
 /// Order scored results: score descending, then `(file, line)` ascending.
@@ -2151,12 +2410,15 @@ impl RankSettings {
     /// (PRD-TOPO-REQ-008): when off, both topology weights are forced to
     /// exactly 0.0, so the signals are skipped and no topology context is
     /// prepared — ranking returns to its prior behavior bitwise.
+    /// `duplicate_threshold` threads `[duplicate] threshold` (TASK-100)
+    /// into the novelty pass.
     pub fn from_config(
         rank: &crate::config::RankConfig,
         search: &crate::config::SearchConfig,
         embedding: crate::embedding::EmbeddingProviderKind,
         pinned: Option<QueryClass>,
         topology_enabled: bool,
+        duplicate_threshold: f32,
     ) -> anyhow::Result<Self> {
         let mut weights = WeightTable::from_config(&rank.weights)?;
         if !topology_enabled {
@@ -2170,6 +2432,7 @@ impl RankSettings {
             sources: ContextSources {
                 bm25: crate::bm25::Bm25Params::from(search),
                 embedding,
+                duplicate_threshold,
             },
             class_multipliers: rank.class_multipliers,
             pinned_class: pinned,
@@ -2180,6 +2443,9 @@ impl RankSettings {
 /// A ranked search with its detected (or pinned) query class recorded
 /// (TASK-095, DR-038): a misclassification is diagnosable from the
 /// response. `query_class` is `Some` only when the pipeline path ran.
+/// `near_duplicates` carries the pairs the novelty pass surfaced
+/// (TASK-100) for the dispatch layer to record — empty when novelty
+/// weighs zero or the legacy path ran.
 #[derive(Debug, Clone)]
 pub struct RankedSearch {
     /// Ranked, deduplicated, grouped results.
@@ -2187,6 +2453,9 @@ pub struct RankedSearch {
     /// The query class the pipeline classified or the caller pinned;
     /// `None` on the legacy path, which never classifies.
     pub query_class: Option<QueryClass>,
+    /// Near-duplicate pairs above `[duplicate] threshold` among the
+    /// ranked candidates (PRD-DUP-REQ-003).
+    pub near_duplicates: Vec<crate::shingles::NearDuplicatePair>,
 }
 
 /// Unified ranking entry point for search results, recording the query
@@ -2207,12 +2476,13 @@ pub fn rank_and_explain_classed(
     settings: &RankSettings,
 ) -> RankedSearch {
     let classified = crate::ranker::classify_results(results, conn);
-    let ranked_and_class = if settings.use_pipeline {
+    let ranked_class_pairs = if settings.use_pipeline {
         let class = settings
             .pinned_class
             .unwrap_or_else(|| classify_query(pattern));
         let effective = settings.class_multipliers.apply(&settings.weights, class);
-        let scored = rerank(
+        let (scored, near_duplicates) = rerank_with_pairs(
+            builtin_signals(),
             classified,
             &QueryInfo { pattern },
             conn,
@@ -2224,7 +2494,11 @@ pub fn rank_and_explain_classed(
         // into tier order first so every category is emitted exactly
         // once. For kind-only positive weights this is the identity
         // permutation, so equivalence with the legacy output is exact.
-        (crate::ranker::bucket_by_category(scored), Some(class))
+        (
+            crate::ranker::bucket_by_category(scored),
+            Some(class),
+            near_duplicates,
+        )
     } else {
         let legacy = crate::ranker::rank_results(classified)
             .into_iter()
@@ -2234,13 +2508,14 @@ pub fn rank_and_explain_classed(
                 contributions: Vec::new(),
             })
             .collect();
-        (legacy, None)
+        (legacy, None, Vec::new())
     };
-    let (ranked, query_class) = ranked_and_class;
+    let (ranked, query_class, near_duplicates) = ranked_class_pairs;
     let deduped = crate::ranker::dedup_reexports(ranked, pattern);
     RankedSearch {
         groups: crate::ranker::group_by_category(deduped),
         query_class,
+        near_duplicates,
     }
 }
 
@@ -2294,7 +2569,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_ten_signals_in_order() {
+    fn registry_contains_builtin_signals_in_order() {
         let registry = builtin_signals();
         let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
         assert_eq!(
@@ -2312,7 +2587,8 @@ mod tests {
                 "co_change",
                 "hub",
                 "authority",
-                "community"
+                "community",
+                "novelty"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -5473,6 +5749,7 @@ proximity, signature, churn, co_change, hub, authority, community",
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
             false,
+            0.85,
         )
         .unwrap();
         assert_eq!(disabled.weights.weight("hub"), 0.0);
@@ -5506,6 +5783,7 @@ proximity, signature, churn, co_change, hub, authority, community",
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
             true,
+            0.85,
         )
         .unwrap();
         let scored_prior = rerank(
@@ -5547,6 +5825,7 @@ proximity, signature, churn, co_change, hub, authority, community",
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
             true,
+            0.85,
         )
         .unwrap();
         assert!(settings.use_pipeline);
@@ -5562,6 +5841,7 @@ proximity, signature, churn, co_change, hub, authority, community",
             crate::embedding::EmbeddingProviderKind::Bundled,
             Some(QueryClass::Path),
             true,
+            0.85,
         )
         .unwrap();
         assert_eq!(pinned.pinned_class, Some(QueryClass::Path));
@@ -5574,6 +5854,7 @@ proximity, signature, churn, co_change, hub, authority, community",
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
             true,
+            0.85,
         )
         .unwrap();
         assert!(!legacy.use_pipeline);
@@ -5586,7 +5867,8 @@ proximity, signature, churn, co_change, hub, authority, community",
                 &search,
                 crate::embedding::EmbeddingProviderKind::Bundled,
                 None,
-                true
+                true,
+                0.85
             )
             .is_err()
         );
@@ -5963,5 +6245,569 @@ proximity, signature, churn, co_change, hub, authority, community",
                 .collect::<Vec<_>>()
         };
         assert_eq!(scores(&with), scores(&without));
+    }
+
+    // -------------------------------------------------------------------
+    // Novelty / near-duplicates (TASK-100)
+    // -------------------------------------------------------------------
+
+    /// A copy-paste handler archetype: validation, dedup, persistence,
+    /// billing, metrics, notification, audit (~88 tokens).
+    const DUP_HANDLER_BODY: &str = "pub fn handle_user_created(event: &CreateEvent, store: &mut Store) -> Result<(), Error> {\n    let user = event.payload_user();\n    if user.email.is_empty() {\n        return Err(Error::Validation(\"email required\"));\n    }\n    let existing = store.find_by_email(&user.email)?;\n    if existing.is_some() {\n        return Err(Error::Conflict(\"email already registered\"));\n    }\n    let record = store.insert(&user)?;\n    let quota = store.quota_for(record.plan)?;\n    billing::reserve(&record.id, quota.remaining)?;\n    metrics::count(\"user_created\", 1);\n    notifier::welcome(&record.email)?;\n    audit::log(\"user_created\", record.id);\n    Ok(())\n}";
+
+    /// The same handler renamed in the header only — the PRD's
+    /// "identical modulo a rename" copy-paste case.
+    const DUP_HANDLER_RENAMED: &str = "pub fn handle_account_created(event: &CreateEvent, store: &mut Store) -> Result<(), Error> {\n    let user = event.payload_user();\n    if user.email.is_empty() {\n        return Err(Error::Validation(\"email required\"));\n    }\n    let existing = store.find_by_email(&user.email)?;\n    if existing.is_some() {\n        return Err(Error::Conflict(\"email already registered\"));\n    }\n    let record = store.insert(&user)?;\n    let quota = store.quota_for(record.plan)?;\n    billing::reserve(&record.id, quota.remaining)?;\n    metrics::count(\"user_created\", 1);\n    notifier::welcome(&record.email)?;\n    audit::log(\"user_created\", record.id);\n    Ok(())\n}";
+
+    /// A genuinely different function — shares near-zero 5-grams.
+    const DISTINCT_BODY: &str = "fn sort_records(items: &mut [Record]) {\n    items.sort_by_key(|r| r.priority);\n    items.dedup_by(|x, y| x.id == y.id);\n    for item in items.iter() {\n        trace::write(item.offset);\n    }\n}";
+
+    /// Similar-but-distinct: renamed header plus three changed body
+    /// identifiers — boilerplate-adjacent, J in (0.5, 0.85).
+    const SIMILAR_BODY: &str = "pub fn handle_account_created(event: &CreateEvent, store: &mut Store) -> Result<(), Error> {\n    let user = event.payload_user();\n    if user.email.is_empty() {\n        return Err(Error::Validation(\"email required\"));\n    }\n    let existing = store.lookup_email(&user.email)?;\n    if existing.is_some() {\n        return Err(Error::Conflict(\"email already registered\"));\n    }\n    let record = store.insert(&user)?;\n    let quota = store.quota_for(record.plan)?;\n    billing::reserve(&record.id, quota.remaining)?;\n    metrics::increment(\"user_created\", 1);\n    notifier::greet(&record.email)?;\n    audit::write(\"user_created\", record.id);\n    Ok(())\n}";
+
+    fn dup_conn() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        (dir, conn)
+    }
+
+    fn seed_sketch(conn: &Connection, file: &str, line: u64, body: &str) {
+        seed_raw_sketch(conn, file, line, &crate::shingles::body_signature(body));
+    }
+
+    fn seed_raw_sketch(conn: &Connection, file: &str, line: u64, sketch: &[u32]) {
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES (?1, 'function', ?2, ?3, 0, 'rust')",
+            rusqlite::params![format!("sym_{file}"), file, line as i64],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO symbol_shingles (symbol_id, signature) VALUES (?1, ?2)",
+            rusqlite::params![id, crate::shingles::encode_sketch(sketch)],
+        )
+        .unwrap();
+    }
+
+    fn novelty_value(scored: &ScoredResult) -> f32 {
+        scored
+            .contributions
+            .iter()
+            .find(|c| c.signal == "novelty")
+            .map(|c| c.value)
+            .unwrap_or(f32::NAN)
+    }
+
+    fn positions(scored: &[ScoredResult]) -> Vec<(String, u64)> {
+        scored
+            .iter()
+            .map(|s| {
+                (
+                    s.classified.result.file.to_string_lossy().into_owned(),
+                    s.classified.result.line,
+                )
+            })
+            .collect()
+    }
+
+    /// A spy additive signal with a per-file fixed value — crafts base
+    /// score spreads the novelty pass then has to respect.
+    struct PerFileSignal(HashMap<String, f32>);
+
+    impl Signal for PerFileSignal {
+        fn name(&self) -> &'static str {
+            "base"
+        }
+        fn requires(&self) -> ContextReqs {
+            ContextReqs::none()
+        }
+        fn contribution(
+            &self,
+            _query: &QueryInfo<'_>,
+            candidate: &ClassifiedResult,
+            _ctx: &SharedContext,
+        ) -> f32 {
+            *self
+                .0
+                .get(candidate.result.file.to_string_lossy().as_ref())
+                .unwrap_or(&0.0)
+        }
+    }
+
+    #[test]
+    fn novelty_representative_undemoted_copies_demoted() {
+        let (_dir, conn) = dup_conn();
+        for file in ["c1.rs", "c2.rs", "c3.rs", "c4.rs", "c5.rs"] {
+            seed_sketch(&conn, file, 1, DUP_HANDLER_BODY);
+        }
+        seed_sketch(&conn, "d.rs", 1, DISTINCT_BODY);
+
+        let results: Vec<ClassifiedResult> = ["c1.rs", "c2.rs", "c3.rs", "c4.rs", "c5.rs", "d.rs"]
+            .into_iter()
+            .map(|f| classified(f, 1, "fn handle", ResultCategory::Other))
+            .collect();
+        let weights = table(&[("kind", 1.0), ("novelty", 0.8)]);
+
+        let scored = rerank_with_signals(
+            builtin_signals(),
+            results,
+            &QueryInfo { pattern: "handle" },
+            Some(&conn),
+            &weights,
+            &ContextSources::default(),
+        );
+
+        // The AC in miniature: representative, distinct content, then the
+        // four demoted copies.
+        assert_eq!(
+            positions(&scored),
+            vec![
+                ("c1.rs".to_string(), 1),
+                ("d.rs".to_string(), 1),
+                ("c2.rs".to_string(), 1),
+                ("c3.rs".to_string(), 1),
+                ("c4.rs".to_string(), 1),
+                ("c5.rs".to_string(), 1),
+            ]
+        );
+        assert_eq!(novelty_value(&scored[0]), 1.0, "representative undemoted");
+        assert_eq!(novelty_value(&scored[1]), 1.0, "distinct content undemoted");
+        for copy in &scored[2..] {
+            assert_eq!(novelty_value(copy), 0.0, "identical copy fully redundant");
+            assert!(
+                copy.contributions.iter().any(|c| c.signal == "novelty"),
+                "every scored result carries a novelty why row"
+            );
+        }
+    }
+
+    #[test]
+    fn representative_never_drops() {
+        let (_dir, conn) = dup_conn();
+        for file in ["c1.rs", "c2.rs", "c3.rs", "c4.rs", "c5.rs"] {
+            seed_sketch(&conn, file, 1, DUP_HANDLER_BODY);
+        }
+        seed_sketch(&conn, "d1.rs", 1, DISTINCT_BODY);
+        seed_sketch(&conn, "d2.rs", 1, SIMILAR_BODY);
+
+        let mut base = HashMap::new();
+        base.insert("d1.rs".to_string(), 2.0);
+        for file in ["c1.rs", "c2.rs", "c3.rs", "c4.rs", "c5.rs"] {
+            base.insert(file.to_string(), 1.0);
+        }
+        base.insert("d2.rs".to_string(), 0.5);
+        let results: Vec<ClassifiedResult> = [
+            "d1.rs", "c1.rs", "c2.rs", "c3.rs", "c4.rs", "c5.rs", "d2.rs",
+        ]
+        .into_iter()
+        .map(|f| classified(f, 1, "fn handle", ResultCategory::Other))
+        .collect();
+        let weights = table(&[("base", 1.0), ("novelty", 0.8)]);
+
+        let scored = rerank_with_signals(
+            vec![Box::new(PerFileSignal(base))],
+            results,
+            &QueryInfo { pattern: "handle" },
+            Some(&conn),
+            &weights,
+            &ContextSources::default(),
+        );
+
+        // Pre-novelty order: d1(2.0), c1..c5(1.0), d2(0.5) — c1 is the
+        // group's earliest member at rank 1 (0-based). After the pass it
+        // must not rank lower, and nothing is removed.
+        let order = positions(&scored);
+        assert_eq!(order.len(), 7);
+        let rep_rank = order
+            .iter()
+            .position(|(file, _)| file == "c1.rs")
+            .expect("representative present");
+        assert!(
+            rep_rank <= 1,
+            "representative rank {rep_rank} must not drop"
+        );
+        assert_eq!(order[0].0, "d1.rs");
+        // The demoted copies sink below the distinct low scorer.
+        let d2_rank = order.iter().position(|(file, _)| file == "d2.rs").unwrap();
+        let c2_rank = order.iter().position(|(file, _)| file == "c2.rs").unwrap();
+        assert!(d2_rank < c2_rank, "demotion must sink copies below d2");
+    }
+
+    #[test]
+    fn below_threshold_no_effect() {
+        // Fixture sanity: SIMILAR sits strictly between 0.5 and the
+        // default 0.85 threshold.
+        let a = crate::shingles::body_signature(DUP_HANDLER_BODY);
+        let b = crate::shingles::body_signature(SIMILAR_BODY);
+        let sim = crate::shingles::sketch_jaccard(&a, &b);
+        assert!((0.5..0.85).contains(&sim), "fixture out of range: {sim}");
+
+        let (_dir, conn) = dup_conn();
+        seed_sketch(&conn, "c1.rs", 1, DUP_HANDLER_BODY);
+        seed_sketch(&conn, "c2.rs", 1, SIMILAR_BODY);
+        seed_sketch(&conn, "d.rs", 1, DISTINCT_BODY);
+
+        let results: Vec<ClassifiedResult> = ["c1.rs", "c2.rs", "d.rs"]
+            .into_iter()
+            .map(|f| classified(f, 1, "fn handle", ResultCategory::Other))
+            .collect();
+        let weights = table(&[("kind", 1.0), ("novelty", 0.8)]);
+
+        let scored = rerank_with_signals(
+            builtin_signals(),
+            results,
+            &QueryInfo { pattern: "handle" },
+            Some(&conn),
+            &weights,
+            &ContextSources::default(),
+        );
+
+        assert_eq!(
+            positions(&scored),
+            vec![
+                ("c1.rs".to_string(), 1),
+                ("c2.rs".to_string(), 1),
+                ("d.rs".to_string(), 1),
+            ],
+            "sub-threshold pairs keep the pre-novelty order"
+        );
+        for result in &scored {
+            assert_eq!(novelty_value(result), 1.0);
+        }
+    }
+
+    #[test]
+    fn ramp_bounds_demotion_near_threshold() {
+        // Hand-built sketches: 60 shared of 68 union (J = 0.8824) — just
+        // over the 0.85 threshold. The ramp demotes only slightly
+        // (r = 0.216), unlike the full 0.0 an identical copy earns.
+        let shared: Vec<u32> = (1..=60u32).collect();
+        let mut sketch_a = shared.clone();
+        sketch_a.extend([61, 62, 63, 64]);
+        sketch_a.sort_unstable();
+        let mut sketch_b = shared;
+        sketch_b.extend([101, 102, 103, 104]);
+        sketch_b.sort_unstable();
+
+        let (_dir, conn) = dup_conn();
+        seed_raw_sketch(&conn, "a.rs", 1, &sketch_a);
+        seed_raw_sketch(&conn, "b.rs", 1, &sketch_b);
+        seed_sketch(&conn, "c.rs", 1, DUP_HANDLER_BODY);
+        seed_sketch(&conn, "e.rs", 1, DUP_HANDLER_BODY);
+
+        let results: Vec<ClassifiedResult> = ["a.rs", "b.rs", "c.rs", "e.rs"]
+            .into_iter()
+            .map(|f| classified(f, 1, "fn", ResultCategory::Other))
+            .collect();
+        let weights = table(&[("kind", 1.0), ("novelty", 0.8)]);
+
+        let scored = rerank_with_signals(
+            builtin_signals(),
+            results,
+            &QueryInfo { pattern: "fn" },
+            Some(&conn),
+            &weights,
+            &ContextSources::default(),
+        );
+
+        let by_file = |file: &str| {
+            scored
+                .iter()
+                .find(|s| s.classified.result.file.to_string_lossy() == file)
+                .unwrap()
+        };
+        let near = novelty_value(by_file("b.rs"));
+        assert!(
+            (0.6..1.0).contains(&near),
+            "borderline pair dips slightly, got {near}"
+        );
+        let identical = novelty_value(by_file("e.rs"));
+        assert_eq!(identical, 0.0, "identical copy demotes fully");
+    }
+
+    #[test]
+    fn zero_weight_bitwise_unchanged() {
+        let (_dir, conn) = dup_conn();
+        for file in ["c1.rs", "c2.rs"] {
+            seed_sketch(&conn, file, 1, DUP_HANDLER_BODY);
+        }
+        let mk_results = || {
+            vec![
+                classified("c1.rs", 1, "fn handle", ResultCategory::Other),
+                classified("c2.rs", 1, "fn handle", ResultCategory::Other),
+            ]
+        };
+
+        let off = rerank_with_signals(
+            builtin_signals(),
+            mk_results(),
+            &QueryInfo { pattern: "handle" },
+            Some(&conn),
+            &table(&[("kind", 1.0)]),
+            &ContextSources::default(),
+        );
+        let zero = rerank_with_signals(
+            builtin_signals(),
+            mk_results(),
+            &QueryInfo { pattern: "handle" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("novelty", 0.0)]),
+            &ContextSources::default(),
+        );
+
+        // Zero novelty weight: no rows, no score change, no reordering —
+        // bitwise identical to a pre-feature weight table run.
+        assert_eq!(format!("{off:?}"), format!("{zero:?}"));
+        assert!(off[0].contributions.iter().all(|c| c.signal != "novelty"));
+    }
+
+    #[test]
+    fn missing_table_degrades() {
+        let (_dir, conn) = dup_conn();
+        conn.execute("DROP TABLE symbol_shingles", []).unwrap();
+        // Symbols still exist; only the signature table is gone (a
+        // pre-TASK-100 index).
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('handler', 'function', 'c1.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+        let results = vec![
+            classified("c1.rs", 1, "fn handle", ResultCategory::Other),
+            classified("c2.rs", 1, "fn handle", ResultCategory::Other),
+        ];
+
+        let scored = rerank_with_signals(
+            builtin_signals(),
+            results,
+            &QueryInfo { pattern: "handle" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("novelty", 0.8)]),
+            &ContextSources::default(),
+        );
+
+        for result in &scored {
+            assert_eq!(novelty_value(result), 1.0, "no sketches, no demotion");
+        }
+    }
+
+    #[test]
+    fn pairs_surfaced_on_ranked_search() {
+        let (_dir, conn) = dup_conn();
+        for file in ["c1.rs", "c2.rs", "c3.rs", "c4.rs", "c5.rs"] {
+            seed_sketch(&conn, file, 1, DUP_HANDLER_BODY);
+        }
+        seed_sketch(&conn, "d.rs", 1, DISTINCT_BODY);
+
+        let results: Vec<crate::search::SearchResult> =
+            ["c1.rs", "c2.rs", "c3.rs", "c4.rs", "c5.rs", "d.rs"]
+                .into_iter()
+                .map(|f| classified(f, 1, "fn handle", ResultCategory::Other).result)
+                .collect();
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("novelty", 0.8)]),
+            sources: ContextSources::default(),
+            class_multipliers: ClassMultipliers::neutral(),
+            pinned_class: None,
+        };
+
+        let ranked = rank_and_explain_classed(&results, Some(&conn), "handle", &settings);
+
+        // C(5, 2) qualifying pairs among the identical copies, each with
+        // similarity 1.0; the distinct body pairs with nothing.
+        assert_eq!(ranked.near_duplicates.len(), 10);
+        assert!(
+            ranked
+                .near_duplicates
+                .iter()
+                .all(|p| (p.similarity - 1.0).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn pairs_strictly_above_threshold() {
+        // Exact-boundary fixture: 34 shared of 40 union = 0.85 exactly —
+        // NOT a pair ("exceed" is strict).
+        let shared: Vec<u32> = (1..=34u32).collect();
+        let mut at_threshold = shared.clone();
+        at_threshold.extend([51, 52, 53]);
+        at_threshold.sort_unstable();
+        let mut at_threshold_b = shared;
+        at_threshold_b.extend([61, 62, 63]);
+        at_threshold_b.sort_unstable();
+        let j = crate::shingles::sketch_jaccard(&at_threshold, &at_threshold_b);
+        assert!((j - 0.85).abs() < 1e-6, "fixture must sit at 0.85: {j}");
+
+        // Just above: 60 shared of 68 = 0.8824.
+        let shared60: Vec<u32> = (1..=60u32).collect();
+        let mut above = shared60.clone();
+        above.extend([71, 72, 73, 74]);
+        above.sort_unstable();
+        let mut above_b = shared60;
+        above_b.extend([81, 82, 83, 84]);
+        above_b.sort_unstable();
+
+        let (_dir, conn) = dup_conn();
+        seed_raw_sketch(&conn, "a.rs", 1, &at_threshold);
+        seed_raw_sketch(&conn, "b.rs", 1, &at_threshold_b);
+        seed_raw_sketch(&conn, "c.rs", 1, &above);
+        seed_raw_sketch(&conn, "e.rs", 1, &above_b);
+
+        let results: Vec<ClassifiedResult> = ["a.rs", "b.rs", "c.rs", "e.rs"]
+            .into_iter()
+            .map(|f| classified(f, 1, "fn", ResultCategory::Other))
+            .collect();
+
+        let (scored, pairs) = rerank_with_pairs(
+            builtin_signals(),
+            results,
+            &QueryInfo { pattern: "fn" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("novelty", 0.8)]),
+            &ContextSources::default(),
+        );
+        assert_eq!(scored.len(), 4);
+
+        let mut names: Vec<(String, String)> = pairs
+            .iter()
+            .map(|p| (p.a.0.clone(), p.b.0.clone()))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![("c.rs".to_string(), "e.rs".to_string())],
+            "only strictly-above-threshold pairs surface"
+        );
+    }
+
+    #[test]
+    fn deterministic_repeat_run() {
+        let (_dir, conn) = dup_conn();
+        for file in ["c1.rs", "c2.rs", "c3.rs"] {
+            seed_sketch(&conn, file, 1, DUP_HANDLER_BODY);
+        }
+        seed_sketch(&conn, "r.rs", 1, DUP_HANDLER_RENAMED);
+        seed_sketch(&conn, "d.rs", 1, DISTINCT_BODY);
+
+        let mk = || {
+            rerank_with_pairs(
+                builtin_signals(),
+                vec![
+                    classified("c1.rs", 1, "fn handle", ResultCategory::Other),
+                    classified("c2.rs", 1, "fn handle", ResultCategory::Other),
+                    classified("c3.rs", 1, "fn handle", ResultCategory::Other),
+                    classified("r.rs", 1, "fn handle", ResultCategory::Other),
+                    classified("d.rs", 1, "fn handle", ResultCategory::Other),
+                ],
+                &QueryInfo { pattern: "handle" },
+                Some(&conn),
+                &table(&[("kind", 1.0), ("novelty", 0.8)]),
+                &ContextSources::default(),
+            )
+        };
+
+        let first = mk();
+        let second = mk();
+        assert_eq!(
+            format!("{:?}, {:?}", first.0, first.1),
+            format!("{:?}, {:?}", second.0, second.1)
+        );
+    }
+
+    #[test]
+    fn window_cap_unexamined_are_novel() {
+        let sketch = crate::shingles::body_signature(DUP_HANDLER_BODY);
+        let mut ctx = SharedContext::default();
+        let mut scored: Vec<ScoredResult> = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]
+            .into_iter()
+            .map(|f| {
+                ctx.shingles
+                    .sketches
+                    .insert((f.to_string(), 1), sketch.clone());
+                ScoredResult {
+                    classified: classified(f, 1, "fn", ResultCategory::Other),
+                    score: 1.0,
+                    contributions: Vec::new(),
+                }
+            })
+            .collect();
+
+        // Window 2: only a.rs and b.rs are examined; c..e are beyond the
+        // window and stay novel even though they are identical copies.
+        let pairs = apply_novelty(&mut scored, &ctx, 0.8, 0.85, 2);
+
+        let values: Vec<f32> = scored.iter().map(novelty_value).collect();
+        assert_eq!(values, vec![1.0, 0.0, 1.0, 1.0, 1.0]);
+        // Only the one examined pair surfaced.
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].a.0, "a.rs");
+        assert_eq!(pairs[0].b.0, "b.rs");
+    }
+
+    #[test]
+    fn sketchless_candidates_never_demoted() {
+        let (_dir, conn) = dup_conn();
+        // a1.rs carries no signature; b2/b3 are identical copies ranked
+        // after it.
+        seed_sketch(&conn, "b2.rs", 1, DUP_HANDLER_BODY);
+        seed_sketch(&conn, "b3.rs", 1, DUP_HANDLER_BODY);
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('plain', 'function', 'a1.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+
+        let results: Vec<ClassifiedResult> = ["a1.rs", "b2.rs", "b3.rs"]
+            .into_iter()
+            .map(|f| classified(f, 1, "fn handle", ResultCategory::Other))
+            .collect();
+
+        let scored = rerank_with_signals(
+            builtin_signals(),
+            results,
+            &QueryInfo { pattern: "handle" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("novelty", 0.8)]),
+            &ContextSources::default(),
+        );
+
+        // a1: no sketch -> never demoted (1.0). b2: the sketchless a1
+        // does not shield it, but nothing sketch-carrying precedes it, so
+        // 1.0 as the group representative. b3: demoted.
+        let values: Vec<(String, f32)> = scored
+            .iter()
+            .map(|s| {
+                (
+                    s.classified.result.file.to_string_lossy().into_owned(),
+                    novelty_value(s),
+                )
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                ("a1.rs".to_string(), 1.0),
+                ("b2.rs".to_string(), 1.0),
+                ("b3.rs".to_string(), 0.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_accepts_novelty_weight() {
+        let mut weights = HashMap::new();
+        weights.insert("novelty".to_string(), 0.5);
+        let table = WeightTable::from_config(&weights).unwrap();
+        assert_eq!(table.weight("novelty"), 0.5);
+        assert!(known_signal_names().contains(&"novelty"));
+
+        let mut unknown = HashMap::new();
+        unknown.insert("not_a_signal".to_string(), 0.5);
+        assert!(WeightTable::from_config(&unknown).is_err());
     }
 }

@@ -180,6 +180,7 @@ fn tuned_defaults_as_shipped() -> RankSettings {
         wonk::embedding::EmbeddingProviderKind::Bundled,
         None,
         true,
+        0.85,
     )
     .unwrap()
 }
@@ -303,6 +304,7 @@ fn previous_ordering_reachable_by_config() {
         wonk::embedding::EmbeddingProviderKind::Bundled,
         None,
         true,
+        0.85,
     )
     .unwrap();
     for query in &labels.query {
