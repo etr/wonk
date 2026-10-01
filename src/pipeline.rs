@@ -155,7 +155,11 @@ pub fn build_index_with_progress(
     // (PRD-HIST-REQ-008) — never an error.
     if config.history.enabled
         && crate::history::has_git(repo_root)
-        && let Err(e) = crate::history::mine_full(&conn, repo_root, config.history.window)
+        && let Err(e) = crate::history::mine_full(
+            &conn,
+            repo_root,
+            &crate::history::MiningOptions::from(&config.history),
+        )
     {
         eprintln!("wonk: history mining skipped: {e:#}");
     }
@@ -268,7 +272,11 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
     // Failed already warned inside refresh; Skipped/Unchanged stay silent
     // (PRD-HIST-REQ-007/008).
     if config.history.enabled
-        && let Err(e) = crate::history::refresh(&conn, repo_root, config.history.window)
+        && let Err(e) = crate::history::refresh(
+            &conn,
+            repo_root,
+            &crate::history::MiningOptions::from(&config.history),
+        )
     {
         eprintln!("wonk: history refresh failed: {e:#}");
     }
@@ -2230,6 +2238,36 @@ class Component {
         incremental_update(dir.path(), true).unwrap();
         let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
         assert_eq!(history_counts(&conn), (0, 0), "disabled never refreshes");
+    }
+
+    #[test]
+    fn rebuild_with_history_disabled_clears_stale_co_change() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100)]);
+        build_index(dir.path(), true).unwrap();
+        {
+            let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+            // A stale coupling a previous mine would have written.
+            conn.execute(
+                "INSERT INTO co_change (file_a, file_b, weight) \
+                 VALUES ('src/a.rs', 'src/b.rs', 1.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Rebuild with mining off: drop_all_data must clear the derived
+        // table, and no re-mine happens to repopulate it.
+        write_reach_config(dir.path(), "[history]\nenabled = false\n");
+        build_index(dir.path(), true).unwrap();
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let stale: i64 = conn
+            .query_row("SELECT COUNT(*) FROM co_change", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale, 0, "a rebuild drops stale co_change rows");
     }
 
     #[test]

@@ -1,8 +1,9 @@
-//! Bounded git-history mining and the file-churn aggregate (TASK-096).
+//! Bounded git-history mining and its rerank aggregates (TASK-096/097).
 //!
 //! One `git log -n <window>` pass mines a commit-count-bounded window of
 //! HEAD history: per-commit detail (`mined_commits` + `commit_files`) plus
-//! the age-weighted `file_churn` aggregate the rerank signal reads. Cost
+//! the age-weighted `file_churn` aggregate the churn signal reads and the
+//! top-K-per-file `co_change` coupling the co-change signal reads. Cost
 //! scales with the window, never with repository age (PRD-HIST-REQ-002).
 
 use std::collections::HashMap;
@@ -255,6 +256,33 @@ pub fn top_k_per_file(
     rows
 }
 
+/// Retained co-change couplings per file (TASK-097): at most this many
+/// rows per `file_a`, each direction independently, keeping storage linear
+/// in files. A fixed retention constant, not configuration — it bounds
+/// storage, not behavior (the bulk-exclusion threshold is the tunable).
+pub const CO_CHANGE_TOP_K: usize = 10;
+
+/// The mining knobs a caller passes through `mine_full`/`refresh`,
+/// carried as one struct so adding a knob never touches the call sites
+/// again (built from `[history]` via `From<&HistoryConfig>`).
+#[derive(Debug, Clone, Copy)]
+pub struct MiningOptions {
+    /// Number of newest commits to mine.
+    pub window: usize,
+    /// Bulk-commit exclusion threshold for co-change derivation
+    /// (PRD-HIST-REQ-005).
+    pub max_commit_files: usize,
+}
+
+impl From<&crate::config::HistoryConfig> for MiningOptions {
+    fn from(config: &crate::config::HistoryConfig) -> Self {
+        Self {
+            window: config.window,
+            max_commit_files: config.max_commit_files,
+        }
+    }
+}
+
 /// Whether `repo_root` looks like a git work tree (a `.git` entry exists).
 pub fn has_git(repo_root: &Path) -> bool {
     repo_root.join(".git").exists()
@@ -294,22 +322,23 @@ fn current_head(repo_root: &Path) -> Option<String> {
         .map(|out| out.trim().to_string())
 }
 
-/// Mine the newest `window` commits of HEAD history into the history
+/// Mine the newest `opts.window` commits of HEAD history into the history
 /// tables, replacing any previous mine.
-pub fn mine_full(conn: &Connection, repo_root: &Path, window: usize) -> Result<()> {
+pub fn mine_full(conn: &Connection, repo_root: &Path, opts: &MiningOptions) -> Result<()> {
     let head = current_head(repo_root);
-    let commits = parse_git_log(&git_log(repo_root, window, None)?);
+    let commits = parse_git_log(&git_log(repo_root, opts.window, None)?);
 
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
         "DELETE FROM commit_files;
          DELETE FROM mined_commits;
          DELETE FROM file_churn;
+         DELETE FROM co_change;
          DELETE FROM history_meta;",
     )?;
     insert_commits(&tx, &commits)?;
-    trim_to_window(&tx, window)?;
-    recompute_file_churn(&tx)?;
+    trim_to_window(&tx, opts.window)?;
+    recompute_history_aggregates(&tx, opts)?;
     if let Some(head) = head
         && !head.is_empty()
     {
@@ -325,18 +354,22 @@ pub fn mine_full(conn: &Connection, repo_root: &Path, window: usize) -> Result<(
 /// (1) No `.git` → [`RefreshOutcome::Skipped`], nothing spawned.
 /// (2) `HEAD` still the mined head → [`RefreshOutcome::Unchanged`] (a
 ///     millisecond probe). (3) Otherwise the new commits are folded into
-///     the retained detail, trimmed to the window, and the aggregate is
+///     the retained detail, trimmed to the window, and the aggregates are
 ///     RECOMPUTED from that detail — which rescales every retained
 ///     commit's age weight to the new window bounds exactly, without
 ///     re-reading git. A history rewrite that invalidates the stored head
 ///     falls back to ONE full re-mine; any git failure warns and returns
 ///     [`RefreshOutcome::Failed`] with the previous data retained
 ///     (PRD-HIST-REQ-008) — never an error.
-pub fn refresh(conn: &Connection, repo_root: &Path, window: usize) -> Result<RefreshOutcome> {
+pub fn refresh(
+    conn: &Connection,
+    repo_root: &Path,
+    opts: &MiningOptions,
+) -> Result<RefreshOutcome> {
     if !has_git(repo_root) {
         return Ok(RefreshOutcome::Skipped);
     }
-    match refresh_inner(conn, repo_root, window) {
+    match refresh_inner(conn, repo_root, opts) {
         Ok(outcome) => Ok(outcome),
         Err(e) => {
             eprintln!("wonk: history refresh failed, keeping previous data: {e:#}");
@@ -345,10 +378,14 @@ pub fn refresh(conn: &Connection, repo_root: &Path, window: usize) -> Result<Ref
     }
 }
 
-fn refresh_inner(conn: &Connection, repo_root: &Path, window: usize) -> Result<RefreshOutcome> {
+fn refresh_inner(
+    conn: &Connection,
+    repo_root: &Path,
+    opts: &MiningOptions,
+) -> Result<RefreshOutcome> {
     // The shared tail of every full-re-mine path below.
     let full_remine = |conn: &Connection| -> Result<RefreshOutcome> {
-        mine_full(conn, repo_root, window)?;
+        mine_full(conn, repo_root, opts)?;
         Ok(RefreshOutcome::Refreshed(mined_count(conn)))
     };
 
@@ -365,7 +402,7 @@ fn refresh_inner(conn: &Connection, repo_root: &Path, window: usize) -> Result<R
     // A rewritten history (rebased-away mined_head) makes the ranged log
     // fail or the stored head invalid: fall back to ONE full re-mine.
     let log = if crate::impact::validate_git_ref(&mined_head).is_ok() {
-        match git_log(repo_root, window, Some(&format!("{mined_head}..HEAD"))) {
+        match git_log(repo_root, opts.window, Some(&format!("{mined_head}..HEAD"))) {
             Ok(log) => log,
             Err(e) => {
                 eprintln!("wonk: incremental history mine failed, re-mining in full: {e:#}");
@@ -380,8 +417,8 @@ fn refresh_inner(conn: &Connection, repo_root: &Path, window: usize) -> Result<R
 
     let tx = conn.unchecked_transaction()?;
     insert_commits(&tx, &commits)?;
-    trim_to_window(&tx, window)?;
-    recompute_file_churn(&tx)?;
+    trim_to_window(&tx, opts.window)?;
+    recompute_history_aggregates(&tx, opts)?;
     set_mined_head(&tx, &head)?;
     tx.commit()?;
     Ok(RefreshOutcome::Refreshed(commits.len()))
@@ -449,14 +486,17 @@ fn trim_to_window(conn: &Connection, window: usize) -> Result<()> {
     Ok(())
 }
 
-/// Recompute `file_churn` from the retained detail — the one aggregate
-/// implementation. Rows are read newest-first (`commit_ts DESC,
-/// commit_id DESC`) so the sum order — and therefore the stored scores —
-/// is deterministic regardless of git's log order. Bounds come from ALL
-/// retained commits (a file-less commit still bounds the window), and
-/// weights are derived from the RETAINED window's own bounds, so folding
-/// in new commits rescales every retained commit's weight exactly.
-fn recompute_file_churn(conn: &Connection) -> Result<()> {
+/// Recompute `file_churn` AND `co_change` from the retained detail — the
+/// one aggregate implementation. Rows are read newest-first (`commit_ts
+/// DESC, commit_id DESC`) so the sum order — and therefore the stored
+/// scores — is deterministic regardless of git's log order. Bounds come
+/// from ALL retained commits (a file-less commit still bounds the window),
+/// and weights are derived from the RETAINED window's own bounds, so
+/// folding in new commits rescales every retained commit's weight exactly.
+/// The co-change side additionally drops commits over
+/// `opts.max_commit_files` (PRD-HIST-REQ-005) and keeps at most
+/// [`CO_CHANGE_TOP_K`] partners per file (PRD-HIST-REQ-004).
+fn recompute_history_aggregates(conn: &Connection, opts: &MiningOptions) -> Result<()> {
     let mut commits: Vec<MinedCommit> = {
         let mut stmt = conn.prepare(
             "SELECT commit_id, commit_ts FROM mined_commits \
@@ -490,12 +530,23 @@ fn recompute_file_churn(conn: &Connection) -> Result<()> {
     }
 
     let (head_ts, span) = window_bounds(&commits);
-    let scores = aggregate_churn(&commits, head_ts, span);
+    let churn = aggregate_churn(&commits, head_ts, span);
+    let co_change = top_k_per_file(
+        &aggregate_co_change(&commits, head_ts, span, opts.max_commit_files),
+        CO_CHANGE_TOP_K,
+    );
 
     conn.execute("DELETE FROM file_churn", [])?;
-    let mut insert = conn.prepare("INSERT INTO file_churn(file, score) VALUES (?1, ?2)")?;
-    for (file, score) in &scores {
-        insert.execute(rusqlite::params![file, score])?;
+    let mut churn_insert = conn.prepare("INSERT INTO file_churn(file, score) VALUES (?1, ?2)")?;
+    for (file, score) in &churn {
+        churn_insert.execute(rusqlite::params![file, score])?;
+    }
+
+    conn.execute("DELETE FROM co_change", [])?;
+    let mut co_insert =
+        conn.prepare("INSERT INTO co_change(file_a, file_b, weight) VALUES (?1, ?2, ?3)")?;
+    for row in &co_change {
+        co_insert.execute(rusqlite::params![row.file_a, row.file_b, row.weight])?;
     }
     Ok(())
 }
@@ -524,6 +575,15 @@ mod tests {
             .arg("--version")
             .output()
             .is_ok_and(|o| o.status.success())
+    }
+
+    /// Mining options at the default bulk threshold, for tests that only
+    /// care about the window.
+    fn opts(window: usize) -> MiningOptions {
+        MiningOptions {
+            window,
+            max_commit_files: 50,
+        }
     }
 
     /// An in-memory-index connection over a real git repo with scripted
@@ -600,10 +660,10 @@ mod tests {
         let commits: Vec<(&str, i64)> = (0..5).map(|i| ("src/lib.rs", 100 + i)).collect();
         let (dir, conn) = make_history_repo(&commits);
 
-        mine_full(&conn, dir.path(), 3).unwrap();
+        mine_full(&conn, dir.path(), &opts(3)).unwrap();
         assert_eq!(mined_count(&conn), 3, "window smaller than history");
 
-        mine_full(&conn, dir.path(), 10).unwrap();
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
         assert_eq!(mined_count(&conn), 5, "history smaller than window");
     }
 
@@ -618,7 +678,7 @@ mod tests {
             ("hot.rs", 300),
             ("hot.rs", 400),
         ]);
-        mine_full(&conn, dir.path(), 4).unwrap();
+        mine_full(&conn, dir.path(), &opts(4)).unwrap();
 
         let dormant = churn_score(&conn, "dormant.rs").unwrap();
         let hot = churn_score(&conn, "hot.rs").unwrap();
@@ -643,7 +703,7 @@ mod tests {
         // file_churn under its REAL name — the churn signal looks up
         // `candidate.result.file`, never a quoted form.
         let (dir, conn) = make_history_repo(&[("src/café.rs", 100), ("src/wei\"rd\\name.rs", 200)]);
-        mine_full(&conn, dir.path(), 10).unwrap();
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
 
         assert!(
             churn_score(&conn, "src/café.rs").is_some(),
@@ -670,13 +730,13 @@ mod tests {
             return;
         }
         let (dir, conn) = make_history_repo(&[("src/lib.rs", 100), ("src/lib.rs", 200)]);
-        mine_full(&conn, dir.path(), 10).unwrap();
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
         let before = churn_score(&conn, "src/lib.rs").unwrap();
         let rows = mined_count(&conn);
         let head = mined_head(&conn);
 
         assert_eq!(
-            refresh(&conn, dir.path(), 10).unwrap(),
+            refresh(&conn, dir.path(), &opts(10)).unwrap(),
             RefreshOutcome::Unchanged
         );
         assert_eq!(mined_count(&conn), rows);
@@ -690,7 +750,7 @@ mod tests {
             return;
         }
         let (dir, conn) = make_history_repo(&[("old.rs", 100), ("old.rs", 110), ("old.rs", 120)]);
-        mine_full(&conn, dir.path(), 3).unwrap();
+        mine_full(&conn, dir.path(), &opts(3)).unwrap();
         // span 20: old.rs = 0 + 0.5 + 1.0 = 1.5.
         assert!((churn_score(&conn, "old.rs").unwrap() - 1.5).abs() < 1e-6);
 
@@ -711,7 +771,7 @@ mod tests {
         assert!(ok.status.success());
 
         assert_eq!(
-            refresh(&conn, dir.path(), 3).unwrap(),
+            refresh(&conn, dir.path(), &opts(3)).unwrap(),
             RefreshOutcome::Refreshed(1)
         );
 
@@ -729,7 +789,7 @@ mod tests {
             return;
         }
         let (dir, conn) = make_history_repo(&[("a.rs", 100)]);
-        mine_full(&conn, dir.path(), 3).unwrap();
+        mine_full(&conn, dir.path(), &opts(3)).unwrap();
 
         for (i, ts) in (110..130).enumerate() {
             let file = format!("f{i}.rs");
@@ -750,7 +810,7 @@ mod tests {
             assert!(ok.status.success());
         }
 
-        let outcome = refresh(&conn, dir.path(), 3).unwrap();
+        let outcome = refresh(&conn, dir.path(), &opts(3)).unwrap();
         assert!(matches!(outcome, RefreshOutcome::Refreshed(_)));
         assert_eq!(mined_count(&conn), 3, "retained rows must equal the window");
         // Only the newest three commits' files remain in the aggregate.
@@ -765,13 +825,13 @@ mod tests {
             return;
         }
         let (dir, conn) = make_history_repo(&[("src/lib.rs", 100)]);
-        mine_full(&conn, dir.path(), 10).unwrap();
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
         let before = churn_score(&conn, "src/lib.rs").unwrap();
 
         // Corrupt the repository after a good mine.
         std::fs::write(dir.path().join(".git/HEAD"), "garbage\n").unwrap();
         assert_eq!(
-            refresh(&conn, dir.path(), 10).unwrap(),
+            refresh(&conn, dir.path(), &opts(10)).unwrap(),
             RefreshOutcome::Failed
         );
         assert_eq!(churn_score(&conn, "src/lib.rs"), Some(before));
@@ -784,7 +844,7 @@ mod tests {
             return;
         }
         let (dir, conn) = make_history_repo(&[("a.rs", 100), ("b.rs", 200), ("c.rs", 300)]);
-        mine_full(&conn, dir.path(), 1).unwrap();
+        mine_full(&conn, dir.path(), &opts(1)).unwrap();
 
         assert_eq!(mined_count(&conn), 1);
         // Degenerate span: the single retained commit weighs 1.0.
@@ -801,10 +861,175 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
         assert_eq!(
-            refresh(&conn, dir.path(), 10).unwrap(),
+            refresh(&conn, dir.path(), &opts(10)).unwrap(),
             RefreshOutcome::Skipped
         );
         assert_eq!(mined_count(&conn), 0);
+    }
+
+    // -- co-change persistence (TASK-097) --------------------------------------
+
+    /// A grouped fixture: each `(&files, ts)` group becomes ONE dated commit
+    /// touching every file in the group (the co-occurrence shape the
+    /// single-file `make_history_repo` cannot express).
+    fn make_history_repo_groups(groups: &[(&[&str], i64)]) -> (TempDir, Connection) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for arg in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let ok = Command::new("git")
+                .args(&arg)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {:?} failed", arg);
+        }
+        for (i, (files, ts)) in groups.iter().enumerate() {
+            for file in *files {
+                if let Some(parent) = Path::new(file).parent() {
+                    std::fs::create_dir_all(root.join(parent)).unwrap();
+                }
+                std::fs::write(root.join(file), format!("content {i}\n")).unwrap();
+            }
+            let date = format!("@{ts} +0000");
+            let ok = Command::new("git")
+                .args(["add", "."])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(ok.status.success());
+            let ok = Command::new("git")
+                .args(["commit", "-m", &format!("c{i}")])
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "commit {i} failed");
+        }
+        let conn = crate::db::open(&dir.path().join("history.db")).unwrap();
+        (dir, conn)
+    }
+
+    fn coupling(conn: &Connection, file_a: &str, file_b: &str) -> Option<f64> {
+        conn.query_row(
+            "SELECT weight FROM co_change WHERE file_a = ?1 AND file_b = ?2",
+            rusqlite::params![file_a, file_b],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    fn co_change_rows(conn: &Connection) -> Vec<(String, String, f64)> {
+        let mut stmt = conn
+            .prepare("SELECT file_a, file_b, weight FROM co_change ORDER BY file_a, file_b")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn mine_full_populates_symmetric_exact_co_change_weights() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_history_repo_groups(&[
+            (&["handler.rs", "serializer.rs"], 100),
+            (&["handler.rs", "serializer.rs", "third.rs"], 50),
+        ]);
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
+
+        // head 100, span 50: the ts=100 pair weighs 1.0, the ts=50 one 0.0.
+        let w = coupling(&conn, "handler.rs", "serializer.rs").unwrap();
+        assert!((w - 1.0).abs() < 1e-6, "got {w}");
+        assert_eq!(
+            coupling(&conn, "serializer.rs", "handler.rs"),
+            Some(w),
+            "both directions carry the same weight"
+        );
+        assert!(
+            coupling(&conn, "handler.rs", "third.rs").is_some(),
+            "zero-weight pairs are retained like churn's zero scores"
+        );
+    }
+
+    #[test]
+    fn refresh_rescales_retained_co_change_weights() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_history_repo_groups(&[
+            (&["a.rs", "b.rs"], 100),
+            (&["a.rs", "b.rs"], 110),
+            (&["a.rs", "b.rs"], 120),
+        ]);
+        mine_full(&conn, dir.path(), &opts(3)).unwrap();
+        // span 20: (a,b) = 0 + 0.5 + 1.0 = 1.5.
+        assert!((coupling(&conn, "a.rs", "b.rs").unwrap() - 1.5).abs() < 1e-6);
+
+        let date = "@130 +0000";
+        std::fs::write(dir.path().join("c.rs"), "new\n").unwrap();
+        // Add exactly the new file: the fixture's own history.db lives in
+        // the working tree, and `git add .` would swallow it into the
+        // commit, coupling c.rs to the index file.
+        Command::new("git")
+            .args(["add", "c.rs"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let ok = Command::new("git")
+            .args(["commit", "-m", "c3"])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(ok.status.success());
+
+        assert_eq!(
+            refresh(&conn, dir.path(), &opts(3)).unwrap(),
+            RefreshOutcome::Refreshed(1)
+        );
+
+        // Retained window {110, 120, 130}: (a,b) RESCALED to 0 + 0.5 = 0.5
+        // (an append-only weight would still read 1.5); c.rs is a loner.
+        assert!((coupling(&conn, "a.rs", "b.rs").unwrap() - 0.5).abs() < 1e-6);
+        assert!(
+            co_change_rows(&conn)
+                .iter()
+                .all(|(a, b, _)| a != "c.rs" && b != "c.rs")
+        );
+    }
+
+    #[test]
+    fn refresh_unchanged_leaves_co_change_byte_identical() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_history_repo_groups(&[
+            (&["a.rs", "b.rs"], 100),
+            (&["a.rs", "c.rs"], 150),
+            (&["b.rs", "c.rs", "d.rs"], 200),
+        ]);
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
+        let before = co_change_rows(&conn);
+        assert!(!before.is_empty());
+
+        assert_eq!(
+            refresh(&conn, dir.path(), &opts(10)).unwrap(),
+            RefreshOutcome::Unchanged
+        );
+        assert_eq!(co_change_rows(&conn), before);
+    }
+
+    #[test]
+    fn co_change_top_k_constant_is_ten() {
+        assert_eq!(CO_CHANGE_TOP_K, 10);
     }
 
     // -- parse_git_log ---------------------------------------------------------
@@ -1279,7 +1504,7 @@ mod tests {
         let dir = make_dated_repo(500, 1_000_000_000);
         let conn = crate::db::open(&dir.path().join("ac2.db")).unwrap();
         let start = std::time::Instant::now();
-        mine_full(&conn, dir.path(), 500).unwrap();
+        mine_full(&conn, dir.path(), &opts(500)).unwrap();
         let elapsed = start.elapsed();
         assert_eq!(mined_count(&conn), 500, "whole history within the window");
         assert!(
@@ -1290,7 +1515,7 @@ mod tests {
         // The structural bound: cost is proportional to the window because
         // git reads at most `window` commits — window=50 retains EXACTLY 50
         // rows of the same 500-commit history.
-        mine_full(&conn, dir.path(), 50).unwrap();
+        mine_full(&conn, dir.path(), &opts(50)).unwrap();
         assert_eq!(mined_count(&conn), 50);
         let short_map = full_churn_map(&conn);
 
@@ -1299,7 +1524,7 @@ mod tests {
         // rows and the identical aggregate.
         let longer = make_dated_repo(550, 999_999_950);
         let conn_long = crate::db::open(&longer.path().join("ac2b.db")).unwrap();
-        mine_full(&conn_long, longer.path(), 50).unwrap();
+        mine_full(&conn_long, longer.path(), &opts(50)).unwrap();
         assert_eq!(mined_count(&conn_long), 50);
         assert_eq!(
             full_churn_map(&conn_long),
@@ -1316,11 +1541,11 @@ mod tests {
         let dir = make_dated_repo(60, 1_000_000_000);
         let conn = crate::db::open(&dir.path().join("ac4.db")).unwrap();
 
-        mine_full(&conn, dir.path(), 3).unwrap();
+        mine_full(&conn, dir.path(), &opts(3)).unwrap();
         assert_eq!(mined_count(&conn), 3);
         let tight = full_churn_map(&conn);
 
-        mine_full(&conn, dir.path(), 50).unwrap();
+        mine_full(&conn, dir.path(), &opts(50)).unwrap();
         assert_eq!(mined_count(&conn), 50);
         let wide = full_churn_map(&conn);
 

@@ -509,7 +509,11 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
                 // commit-only change refreshes on the NEXT observed batch;
                 // `wonk update` remains the authoritative refresh path.
                 if history.enabled
-                    && let Err(e) = crate::history::refresh(&conn, &repo_root_buf, history.window)
+                    && let Err(e) = crate::history::refresh(
+                        &conn,
+                        &repo_root_buf,
+                        &crate::history::MiningOptions::from(&history),
+                    )
                 {
                     eprintln!("wonk: history refresh failed: {e:#}");
                 }
