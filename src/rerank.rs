@@ -947,6 +947,95 @@ pub fn is_signature_query(pattern: &str) -> bool {
     trimmed.contains('(') || trimmed.contains("->") || trimmed.contains("::")
 }
 
+/// The query classes TASK-095 detects (PRD-RANK-REQ-007): which shape a
+/// query has, deciding how the lexical/semantic blend is scaled.
+///
+/// Misclassification blast radius is one wrong blend — never a wrong signal
+/// set (DR-038): classification only scales the two content channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
+pub enum QueryClass {
+    /// A single identifier-shaped token: a name lookup
+    /// (`validateToken`, `my_func`, `cache`).
+    Symbol,
+    /// A file-path-shaped fragment (`internal/auth/token.go`).
+    Path,
+    /// Signature-shaped: carries `(`, `->`, or `::`
+    /// (`parse(input: &str)`, `Foo::bar`).
+    Signature,
+    /// Everything else: multi-word natural language, empty, punctuation
+    /// prose. The neutral 1.0 baseline (REQ-009).
+    Conceptual,
+}
+
+impl QueryClass {
+    /// The stable kebab-case name used by `--query-class`, MCP, and output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueryClass::Symbol => "symbol",
+            QueryClass::Path => "path",
+            QueryClass::Signature => "signature",
+            QueryClass::Conceptual => "conceptual",
+        }
+    }
+}
+
+impl std::fmt::Display for QueryClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for QueryClass {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        for class in [
+            QueryClass::Symbol,
+            QueryClass::Path,
+            QueryClass::Signature,
+            QueryClass::Conceptual,
+        ] {
+            if class.as_str() == s {
+                return Ok(class);
+            }
+        }
+        Err(format!(
+            "unknown query class '{s}' (known: symbol, path, signature, conceptual)"
+        ))
+    }
+}
+
+/// Whether the pattern is one identifier-shaped token: non-empty and every
+/// character `[A-Za-z0-9_]` (camelCase, snake_case, PascalCase, SCREAMING,
+/// and bare lowercase words alike — a no-space single token is a name
+/// lookup, not prose).
+pub fn is_identifier_shaped(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Classify a query by shape (PRD-RANK-REQ-007), first-match:
+///
+/// 1. **Signature** — [`is_signature_query`] verbatim;
+/// 2. **Path** — contains `/` or `\`;
+/// 3. **Symbol** — [`is_identifier_shaped`] single token;
+/// 4. **Conceptual** — everything else (the default, REQ-009's neutral).
+pub fn classify_query(pattern: &str) -> QueryClass {
+    let trimmed = pattern.trim();
+    if is_signature_query(trimmed) {
+        return QueryClass::Signature;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return QueryClass::Path;
+    }
+    if is_identifier_shaped(trimmed) {
+        return QueryClass::Symbol;
+    }
+    QueryClass::Conceptual
+}
+
 /// Keywords a definition line opens with, across the indexed languages.
 const DEFINITION_KEYWORDS: &[&str] = &[
     "fn",
@@ -1368,6 +1457,93 @@ fn compare_scored(a: &ScoredResult, b: &ScoredResult) -> std::cmp::Ordering {
         .then_with(|| a.classified.result.line.cmp(&b.classified.result.line))
 }
 
+/// Scaling of the two content channels for one query class
+/// (TASK-095, PRD-RANK-REQ-008). Multipliers adjust an ALREADY-CONFIGURED
+/// weight — `0 × m = 0` — adjustment, not creation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelMultipliers {
+    /// Multiplier applied to the `lexical` signal's weight.
+    pub lexical: f32,
+    /// Multiplier applied to the `semantic` signal's weight.
+    pub semantic: f32,
+}
+
+impl Default for ChannelMultipliers {
+    fn default() -> Self {
+        Self::neutral()
+    }
+}
+
+impl ChannelMultipliers {
+    /// The neutral 1.0/1.0 scaling.
+    pub fn neutral() -> Self {
+        Self {
+            lexical: 1.0,
+            semantic: 1.0,
+        }
+    }
+}
+
+/// Per-class channel multipliers (TASK-095, PRD-RANK-REQ-008/009).
+///
+/// There is deliberately NO entry for the conceptual class: it is the
+/// neutral 1.0 baseline, unconditionally, so neutrality cannot be
+/// configured away (REQ-009) — the config parser hard-rejects a
+/// `[rank.class_multipliers.conceptual]` table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClassMultipliers {
+    /// Multipliers for symbol-shaped queries.
+    pub symbol: ChannelMultipliers,
+    /// Multipliers for path-shaped queries.
+    pub path: ChannelMultipliers,
+    /// Multipliers for signature-shaped queries.
+    pub signature: ChannelMultipliers,
+}
+
+impl Default for ClassMultipliers {
+    fn default() -> Self {
+        Self::neutral()
+    }
+}
+
+impl ClassMultipliers {
+    /// All classes at 1.0/1.0: classification then changes nothing.
+    pub fn neutral() -> Self {
+        Self {
+            symbol: ChannelMultipliers::neutral(),
+            path: ChannelMultipliers::neutral(),
+            signature: ChannelMultipliers::neutral(),
+        }
+    }
+
+    /// The multipliers for a class. Conceptual is pinned to 1.0/1.0
+    /// unconditionally (REQ-009).
+    pub fn for_class(&self, class: QueryClass) -> ChannelMultipliers {
+        match class {
+            QueryClass::Symbol => self.symbol,
+            QueryClass::Path => self.path,
+            QueryClass::Signature => self.signature,
+            QueryClass::Conceptual => ChannelMultipliers::neutral(),
+        }
+    }
+
+    /// The effective weight table for a class: a copy of `weights` with the
+    /// `lexical` and `semantic` entries scaled by the class multipliers.
+    /// Every other signal passes through untouched — structural signals are
+    /// class-independent (REQ-008). Absent channels stay absent.
+    pub fn apply(&self, weights: &WeightTable, class: QueryClass) -> WeightTable {
+        let scaling = self.for_class(class);
+        let mut effective = weights.clone();
+        if let Some(lexical) = effective.weights.get_mut("lexical") {
+            *lexical *= scaling.lexical;
+        }
+        if let Some(semantic) = effective.weights.get_mut("semantic") {
+            *semantic *= scaling.semantic;
+        }
+        effective
+    }
+}
+
 /// Which ranking path `rank_and_explain` takes.
 #[derive(Debug, Clone)]
 pub struct RankSettings {
@@ -1379,6 +1555,12 @@ pub struct RankSettings {
     /// Query sources for shared-context preparation (BM25 constants and the
     /// embedding provider kind).
     pub sources: ContextSources,
+    /// Per-class scaling of the lexical/semantic weights (TASK-095,
+    /// REQ-008). Applied only on the pipeline path; neutral by default.
+    pub class_multipliers: ClassMultipliers,
+    /// A caller-pinned query class bypassing detection (REQ-007). `None`
+    /// means detect from the pattern.
+    pub pinned_class: Option<QueryClass>,
 }
 
 impl Default for RankSettings {
@@ -1387,29 +1569,52 @@ impl Default for RankSettings {
             use_pipeline: false,
             weights: WeightTable::kind_dominant(),
             sources: ContextSources::default(),
+            class_multipliers: ClassMultipliers::neutral(),
+            pinned_class: None,
         }
     }
 }
 
-/// Unified ranking entry point for search results.
+/// A ranked search with its detected (or pinned) query class recorded
+/// (TASK-095, DR-038): a misclassification is diagnosable from the
+/// response. `query_class` is `Some` only when the pipeline path ran.
+#[derive(Debug, Clone)]
+pub struct RankedSearch {
+    /// Ranked, deduplicated, grouped results.
+    pub groups: Vec<(ResultCategory, Vec<ScoredResult>)>,
+    /// The query class the pipeline classified or the caller pinned;
+    /// `None` on the legacy path, which never classifies.
+    pub query_class: Option<QueryClass>,
+}
+
+/// Unified ranking entry point for search results, recording the query
+/// class (TASK-095, PRD-RANK-REQ-007).
 ///
-/// Classification always happens in `ranker.rs`; then either the legacy
+/// Classification happens ONCE per query here. Then either the legacy
 /// lexicographic sort (wrapped as unscored `ScoredResult`s — rendering
-/// reads `.classified`, so output is byte-identical to today) or the
-/// signal pipeline, followed by the ONE shared dedup/group implementation.
-pub fn rank_and_explain(
+/// reads `.classified`, so output is byte-identical to today; never
+/// classifies, never multiplies) or the signal pipeline — whose effective
+/// weights are the configured table with the lexical/semantic channels
+/// scaled by the query class BEFORE anything else runs, so zero-weight
+/// skipping and the `--why` breakdown both see the effective weights —
+/// followed by the ONE shared dedup/group implementation.
+pub fn rank_and_explain_classed(
     results: &[crate::search::SearchResult],
     conn: Option<&Connection>,
     pattern: &str,
     settings: &RankSettings,
-) -> Vec<(ResultCategory, Vec<ScoredResult>)> {
+) -> RankedSearch {
     let classified = crate::ranker::classify_results(results, conn);
-    let ranked = if settings.use_pipeline {
+    let ranked_and_class = if settings.use_pipeline {
+        let class = settings
+            .pinned_class
+            .unwrap_or_else(|| classify_query(pattern));
+        let effective = settings.class_multipliers.apply(&settings.weights, class);
         let scored = rerank(
             classified,
             &QueryInfo { pattern },
             conn,
-            &settings.weights,
+            &effective,
             &settings.sources,
         );
         // Score order interleaves categories under any non-kind-only
@@ -1417,19 +1622,35 @@ pub fn rank_and_explain(
         // into tier order first so every category is emitted exactly
         // once. For kind-only positive weights this is the identity
         // permutation, so equivalence with the legacy output is exact.
-        crate::ranker::bucket_by_category(scored)
+        (crate::ranker::bucket_by_category(scored), Some(class))
     } else {
-        crate::ranker::rank_results(classified)
+        let legacy = crate::ranker::rank_results(classified)
             .into_iter()
             .map(|classified| ScoredResult {
                 classified,
                 score: 0.0,
                 contributions: Vec::new(),
             })
-            .collect()
+            .collect();
+        (legacy, None)
     };
+    let (ranked, query_class) = ranked_and_class;
     let deduped = crate::ranker::dedup_reexports(ranked, pattern);
-    crate::ranker::group_by_category(deduped)
+    RankedSearch {
+        groups: crate::ranker::group_by_category(deduped),
+        query_class,
+    }
+}
+
+/// The groups-only view of [`rank_and_explain_classed`]; the pre-TASK-095
+/// call sites keep their signature unchanged.
+pub fn rank_and_explain(
+    results: &[crate::search::SearchResult],
+    conn: Option<&Connection>,
+    pattern: &str,
+    settings: &RankSettings,
+) -> Vec<(ResultCategory, Vec<ScoredResult>)> {
+    rank_and_explain_classed(results, conn, pattern, settings).groups
 }
 
 #[cfg(test)]
@@ -3612,5 +3833,364 @@ proximity, signature",
         assert_eq!(groups[0].1.len(), 1);
         assert_eq!(groups[1].0, ResultCategory::CallSite);
         assert_eq!(groups[1].1.len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // TASK-095: query classification (PRD-RANK-REQ-007)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn classify_query_worked_table() {
+        let cases = [
+            ("validateToken", QueryClass::Symbol),
+            ("my_func", QueryClass::Symbol),
+            ("cache", QueryClass::Symbol),
+            ("internal/auth/token.go", QueryClass::Path),
+            ("src\\lib.rs", QueryClass::Path),
+            ("parse(input: &str)", QueryClass::Signature),
+            ("Foo::bar", QueryClass::Signature),
+            ("fn foo() -> u8", QueryClass::Signature),
+            ("cache eviction", QueryClass::Conceptual),
+            ("how does auth refresh", QueryClass::Conceptual),
+            ("", QueryClass::Conceptual),
+            ("query-class", QueryClass::Conceptual),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(
+                classify_query(query),
+                expected,
+                "query {query:?} must classify as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_query_trims_surrounding_whitespace() {
+        assert_eq!(classify_query("  my_func  "), QueryClass::Symbol);
+        assert_eq!(classify_query("\tcache eviction\n"), QueryClass::Conceptual);
+        assert_eq!(classify_query("   "), QueryClass::Conceptual);
+    }
+
+    #[test]
+    fn classify_query_first_match_precedence() {
+        // Signature outranks path: a path-shaped fragment carrying a `::`
+        // separator names a qualified symbol with its definition context.
+        assert_eq!(classify_query("src/lib.rs::main"), QueryClass::Signature);
+        // Path outranks symbol: `a/b` is not an identifier shape.
+        assert_eq!(classify_query("a/b"), QueryClass::Path);
+        // A bare lowercase word with no separators is a name lookup.
+        assert_eq!(classify_query("refresh"), QueryClass::Symbol);
+    }
+
+    #[test]
+    fn query_class_as_str_round_trips() {
+        for class in [
+            QueryClass::Symbol,
+            QueryClass::Path,
+            QueryClass::Signature,
+            QueryClass::Conceptual,
+        ] {
+            let s = class.as_str();
+            assert_eq!(s.parse::<QueryClass>().unwrap(), class, "{s} round-trips");
+        }
+    }
+
+    #[test]
+    fn query_class_from_str_rejects_unknown() {
+        assert!("troll".parse::<QueryClass>().is_err());
+        assert!("".parse::<QueryClass>().is_err());
+        assert!("Symbol".parse::<QueryClass>().is_err(), "case-sensitive");
+    }
+
+    #[test]
+    fn query_class_clap_value_enum_kebab_names() {
+        for class in [
+            QueryClass::Symbol,
+            QueryClass::Path,
+            QueryClass::Signature,
+            QueryClass::Conceptual,
+        ] {
+            let value =
+                clap::ValueEnum::to_possible_value(&class).expect("every variant has a clap value");
+            assert_eq!(
+                value.get_name(),
+                class.as_str(),
+                "clap name must equal as_str (kebab-case)"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // TASK-095: per-class channel multipliers (PRD-RANK-REQ-008/009)
+    // -------------------------------------------------------------------
+
+    fn channel(lexical: f32, semantic: f32) -> ChannelMultipliers {
+        ChannelMultipliers { lexical, semantic }
+    }
+
+    /// A raw search hit for the classed-entry tests (pre-classification).
+    fn raw(file: &str, line: u64, content: &str) -> crate::search::SearchResult {
+        crate::search::SearchResult {
+            file: PathBuf::from(file),
+            line,
+            col: 1,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn class_multipliers_neutral_is_all_ones() {
+        let neutral = ClassMultipliers::neutral();
+        assert_eq!(neutral.for_class(QueryClass::Symbol), channel(1.0, 1.0));
+        assert_eq!(neutral.for_class(QueryClass::Path), channel(1.0, 1.0));
+        assert_eq!(neutral.for_class(QueryClass::Signature), channel(1.0, 1.0));
+        assert_eq!(ClassMultipliers::default(), neutral);
+    }
+
+    #[test]
+    fn class_multipliers_conceptual_is_unconditionally_neutral() {
+        // REQ-009: conceptual is the 1.0 baseline. There is no config entry
+        // for it, so however the other classes are tuned, conceptual stays
+        // pinned at 1.0/1.0.
+        let skewed = ClassMultipliers {
+            symbol: channel(3.0, 0.1),
+            path: channel(0.0, 2.0),
+            signature: channel(4.0, 0.5),
+        };
+        assert_eq!(skewed.for_class(QueryClass::Conceptual), channel(1.0, 1.0));
+        assert_eq!(
+            ClassMultipliers::neutral().for_class(QueryClass::Conceptual),
+            channel(1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn class_multipliers_scale_only_lexical_and_semantic() {
+        let weights = table(&[
+            ("kind", 1.0),
+            ("lexical", 0.8),
+            ("semantic", 0.4),
+            ("prominence", 0.6),
+            ("centrality", 0.25),
+            ("path_character", 0.3),
+            ("proximity", 0.2),
+            ("signature", 0.5),
+        ]);
+        let multipliers = ClassMultipliers {
+            symbol: channel(1.5, 2.5),
+            ..ClassMultipliers::neutral()
+        };
+        let effective = multipliers.apply(&weights, QueryClass::Symbol);
+        assert_eq!(effective.weight("lexical"), 0.8 * 1.5);
+        assert_eq!(effective.weight("semantic"), 0.4 * 2.5);
+        // Structural signals are class-independent (REQ-008).
+        assert_eq!(effective.weight("kind"), 1.0);
+        assert_eq!(effective.weight("prominence"), 0.6);
+        assert_eq!(effective.weight("centrality"), 0.25);
+        assert_eq!(effective.weight("path_character"), 0.3);
+        assert_eq!(effective.weight("proximity"), 0.2);
+        assert_eq!(effective.weight("signature"), 0.5);
+    }
+
+    #[test]
+    fn class_multipliers_conceptual_apply_is_bitwise_neutral() {
+        let weights = table(&[("kind", 1.0), ("lexical", 0.8), ("semantic", 0.4)]);
+        let skewed = ClassMultipliers {
+            symbol: channel(9.0, 0.0),
+            path: channel(0.0, 9.0),
+            signature: channel(4.0, 4.0),
+        };
+        // Even a fully skewed table cannot move a conceptual query.
+        assert_eq!(skewed.apply(&weights, QueryClass::Conceptual), weights);
+    }
+
+    #[test]
+    fn class_multipliers_absent_channels_stay_absent() {
+        // A 0.0 multiplier on an absent channel inserts nothing: adjustment,
+        // not creation (REQ-008's wording).
+        let weights = table(&[("kind", 1.0)]);
+        let zeroing = ClassMultipliers {
+            symbol: channel(0.0, 0.0),
+            ..ClassMultipliers::neutral()
+        };
+        let effective = zeroing.apply(&weights, QueryClass::Symbol);
+        assert_eq!(effective, table(&[("kind", 1.0)]));
+    }
+
+    #[test]
+    fn zero_multiplier_disables_the_channel_including_context_prep() {
+        // lexical*0 must leave the lexical signal inactive: no contribution
+        // row is produced (the pipeline filters on EFFECTIVE weights, so
+        // zeroing the channel also skips its context preparation).
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![raw("a.rs", 1, "alpha"), raw("b.rs", 1, "alpha")];
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("lexical", 0.5), ("semantic", 0.5)]),
+            class_multipliers: ClassMultipliers {
+                symbol: channel(0.0, 1.0),
+                ..ClassMultipliers::neutral()
+            },
+            ..Default::default()
+        };
+        let ranked = rank_and_explain_classed(&results, Some(&conn), "alpha", &settings);
+        let scored = &ranked.groups[0].1;
+        assert!(
+            scored
+                .iter()
+                .all(|s| !s.contributions.iter().any(|c| c.signal == "lexical"))
+        );
+    }
+
+    #[test]
+    fn contribution_weight_records_the_effective_value() {
+        // --why transparency: the weight shown is the applied (effective)
+        // one — base weight scaled by the class multiplier.
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![raw("a.rs", 1, "alpha"), raw("b.rs", 1, "alpha")];
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("lexical", 0.8)]),
+            class_multipliers: ClassMultipliers {
+                symbol: channel(1.5, 1.0),
+                ..ClassMultipliers::neutral()
+            },
+            ..Default::default()
+        };
+        let ranked = rank_and_explain_classed(&results, Some(&conn), "alpha", &settings);
+        let lexical = ranked.groups[0].1[0]
+            .contributions
+            .iter()
+            .find(|c| c.signal == "lexical")
+            .expect("lexical active");
+        assert!(
+            (lexical.weight - 0.8f32 * 1.5f32).abs() < 1e-6,
+            "effective weight recorded: {}",
+            lexical.weight
+        );
+        assert!(
+            (lexical.weighted - lexical.value * 0.8f32 * 1.5f32).abs() < 1e-6,
+            "weighted uses the effective weight"
+        );
+    }
+
+    #[test]
+    fn rank_and_explain_classed_reports_detected_and_pinned_class() {
+        let results = vec![raw("src/a.rs", 1, "alpha")];
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: WeightTable::kind_dominant(),
+            ..Default::default()
+        };
+        // Detected.
+        let detected = rank_and_explain_classed(&results, None, "alpha", &settings);
+        assert_eq!(detected.query_class, Some(QueryClass::Symbol));
+        // Pinned — detection bypassed even for a conceptual-shaped query.
+        let pinned_settings = RankSettings {
+            pinned_class: Some(QueryClass::Symbol),
+            ..settings.clone()
+        };
+        let pinned =
+            rank_and_explain_classed(&results, None, "how does alpha work", &pinned_settings);
+        assert_eq!(pinned.query_class, Some(QueryClass::Symbol));
+        // Legacy path never classifies.
+        let legacy_settings = RankSettings {
+            use_pipeline: false,
+            ..settings
+        };
+        let legacy = rank_and_explain_classed(&results, None, "alpha", &legacy_settings);
+        assert_eq!(legacy.query_class, None);
+    }
+
+    #[test]
+    fn rank_and_explain_delegates_to_the_classed_entry_groups() {
+        let results = vec![raw("src/a.rs", 1, "alpha")];
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: WeightTable::kind_dominant(),
+            ..Default::default()
+        };
+        let classed = rank_and_explain_classed(&results, None, "alpha", &settings);
+        let delegated = rank_and_explain(&results, None, "alpha", &settings);
+        let key = |groups: &Vec<(ResultCategory, Vec<ScoredResult>)>| {
+            groups
+                .iter()
+                .flat_map(|(_, items)| items.iter())
+                .map(|s| {
+                    (
+                        s.classified.result.file.clone(),
+                        s.classified.result.line,
+                        s.score,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&delegated), key(&classed.groups));
+    }
+
+    #[test]
+    fn legacy_path_never_applies_multipliers() {
+        // Byte-identical legacy ordering under any multiplier configuration:
+        // the legacy branch must not even classify.
+        let results = vec![
+            raw("tests/t.rs", 9, "foo();"),
+            raw("src/b.rs", 7, "use foo;"),
+            raw("src/a.rs", 3, "fn foo() {}"),
+            raw("src/a.rs", 12, "foo();"),
+        ];
+        let legacy = crate::ranker::rank_and_dedup(&results, None, "foo");
+        let settings = RankSettings {
+            use_pipeline: false,
+            weights: WeightTable::kind_dominant(),
+            class_multipliers: ClassMultipliers {
+                symbol: channel(7.0, 0.0),
+                path: channel(0.0, 7.0),
+                signature: channel(5.0, 5.0),
+            },
+            ..Default::default()
+        };
+        let ranked = rank_and_explain_classed(&results, None, "foo", &settings);
+        let flat: Vec<_> = ranked
+            .groups
+            .iter()
+            .flat_map(|(_, items)| items.iter().map(|s| s.classified.clone()))
+            .collect();
+        let expected: Vec<_> = legacy.iter().flat_map(|(_, v)| v.clone()).collect();
+        assert_eq!(flat, expected);
+    }
+
+    #[test]
+    fn pinned_class_selects_the_multiplier_set() {
+        // A pinned Symbol on an otherwise conceptual-shaped query must
+        // behave exactly like a symbol-shaped query under the same
+        // multipliers — the pin bypasses detection for scaling too.
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![raw("a.rs", 1, "alpha"), raw("b.rs", 1, "alpha")];
+        let base = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("lexical", 0.8)]),
+            class_multipliers: ClassMultipliers {
+                symbol: channel(1.5, 1.0),
+                ..ClassMultipliers::neutral()
+            },
+            ..Default::default()
+        };
+        // Symbol-shaped query, no pin.
+        let symbol = rank_and_explain_classed(&results, Some(&conn), "alpha", &base);
+        // Conceptual-shaped query, pinned Symbol.
+        let pinned = RankSettings {
+            pinned_class: Some(QueryClass::Symbol),
+            ..base.clone()
+        };
+        let as_pinned =
+            rank_and_explain_classed(&results, Some(&conn), "how does alpha work", &pinned);
+        let scores = |r: &RankedSearch| {
+            r.groups
+                .iter()
+                .flat_map(|(_, items)| items.iter())
+                .map(|s| s.score)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scores(&symbol), scores(&as_pinned));
     }
 }

@@ -267,6 +267,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                 bm25: crate::bm25::Bm25Params::from(&config.search),
                                 embedding: config.embedding.provider,
                             },
+                            // TASK-095 surfaces land in the config/pin phases.
+                            ..Default::default()
                         };
                         let groups = crate::rerank::rank_and_explain(
                             &results,

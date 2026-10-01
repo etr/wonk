@@ -1636,6 +1636,8 @@ impl McpServer {
                     bm25: crate::bm25::Bm25Params::from(&config.search),
                     embedding: config.embedding.provider,
                 },
+                // TASK-095 surfaces land in the config/pin phases.
+                ..Default::default()
             },
         );
 
