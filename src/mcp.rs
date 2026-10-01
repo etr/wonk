@@ -1621,25 +1621,16 @@ impl McpServer {
             Ok(c) => c,
             Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
         };
-        let weights = match crate::rerank::WeightTable::from_config(&config.rank.weights) {
-            Ok(w) => w,
+        let settings = match crate::rerank::RankSettings::from_config(
+            &config.rank,
+            &config.search,
+            config.embedding.provider,
+            None, // the query_class pin lands with the pin surfaces
+        ) {
+            Ok(s) => s,
             Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),
         };
-        let groups = crate::rerank::rank_and_explain(
-            &results,
-            ranker_conn,
-            &query,
-            &crate::rerank::RankSettings {
-                use_pipeline: config.rank.enabled,
-                weights,
-                sources: crate::rerank::ContextSources {
-                    bm25: crate::bm25::Bm25Params::from(&config.search),
-                    embedding: config.embedding.provider,
-                },
-                // TASK-095 surfaces land in the config/pin phases.
-                ..Default::default()
-            },
-        );
+        let groups = crate::rerank::rank_and_explain(&results, ranker_conn, &query, &settings);
 
         let mut budget = budget_limit.map(|limit| {
             if let Some(p) = page {

@@ -210,6 +210,10 @@ pub struct RankConfig {
     pub enabled: bool,
     /// Signal name -> weight. Absent names weigh zero.
     pub weights: HashMap<String, f32>,
+    /// Per-class scaling of the lexical/semantic channels (TASK-095,
+    /// REQ-008). Neutral by default; the conceptual class has NO entry and
+    /// cannot acquire one (REQ-009 — the parser hard-rejects it).
+    pub class_multipliers: crate::rerank::ClassMultipliers,
 }
 
 impl Default for RankConfig {
@@ -217,6 +221,7 @@ impl Default for RankConfig {
         Self {
             enabled: false,
             weights: HashMap::from([("kind".to_string(), 1.0)]),
+            class_multipliers: crate::rerank::ClassMultipliers::neutral(),
         }
     }
 }
@@ -358,6 +363,56 @@ struct ReviewOverlay {
 struct RankOverlay {
     enabled: Option<bool>,
     weights: Option<HashMap<String, f32>>,
+    class_multipliers: Option<HashMap<String, ChannelMultipliersOverlay>>,
+}
+
+/// One `[rank.class_multipliers.<class>]` table; absent channels default
+/// to the neutral 1.0.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ChannelMultipliersOverlay {
+    lexical: Option<f32>,
+    semantic: Option<f32>,
+}
+
+/// Validate a parsed `[rank.class_multipliers]` map (TASK-095). Unknown
+/// classes and the deliberately-absent `conceptual` class are hard errors
+/// (REQ-009); multipliers must be finite and >= 0.
+fn validate_class_multipliers(
+    raw: &HashMap<String, ChannelMultipliersOverlay>,
+) -> Result<crate::rerank::ClassMultipliers> {
+    let mut out = crate::rerank::ClassMultipliers::neutral();
+    for (class, channel) in raw {
+        let target = match class.as_str() {
+            "symbol" => &mut out.symbol,
+            "path" => &mut out.path,
+            "signature" => &mut out.signature,
+            "conceptual" => anyhow::bail!(
+                "[rank.class_multipliers.conceptual] is rejected: the conceptual \
+                 class is the neutral 1.0 baseline (PRD-RANK-REQ-009) and cannot \
+                 be configured"
+            ),
+            other => anyhow::bail!(
+                "unknown query class '{other}' in [rank.class_multipliers] \
+                 (known: symbol, path, signature)"
+            ),
+        };
+        for (name, value) in [("lexical", channel.lexical), ("semantic", channel.semantic)] {
+            if let Some(v) = value
+                && (!v.is_finite() || v < 0.0)
+            {
+                anyhow::bail!(
+                    "class multiplier {v} for '{class}.{name}' in \
+                     [rank.class_multipliers] must be finite and >= 0"
+                );
+            }
+            match name {
+                "lexical" => target.lexical = channel.lexical.unwrap_or(1.0),
+                _ => target.semantic = channel.semantic.unwrap_or(1.0),
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -535,6 +590,12 @@ impl Config {
                 crate::rerank::WeightTable::from_config(&v)?;
                 // The table replaces the previous layer's wholesale.
                 self.rank.weights = v;
+            }
+            if let Some(v) = rank.class_multipliers {
+                // Hard validation (REQ-008/009): unknown classes, the
+                // unconfigurable conceptual class, and negative or
+                // non-finite multipliers are load errors.
+                self.rank.class_multipliers = validate_class_multipliers(&v)?;
             }
         }
         Ok(())
@@ -1725,6 +1786,153 @@ rrf_k = 40.0
         assert_eq!(
             config.rank.weights,
             HashMap::from([("kind".to_string(), 1.0)])
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // TASK-095: [rank.class_multipliers]
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn rank_class_multipliers_default_neutral() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert_eq!(
+            config.rank.class_multipliers,
+            crate::rerank::ClassMultipliers::neutral()
+        );
+    }
+
+    #[test]
+    fn rank_class_multipliers_read_from_config_file() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank]
+enabled = true
+
+[rank.class_multipliers.symbol]
+lexical = 1.5
+semantic = 0.5
+
+[rank.class_multipliers.path]
+lexical = 0.8
+
+[rank.class_multipliers.signature]
+semantic = 0.9
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(config.rank.enabled);
+        let m = &config.rank.class_multipliers;
+        assert_eq!(
+            m.symbol,
+            crate::rerank::ChannelMultipliers {
+                lexical: 1.5,
+                semantic: 0.5
+            }
+        );
+        // A channel absent from the table defaults to neutral 1.0.
+        assert_eq!(m.path.lexical, 0.8);
+        assert_eq!(m.path.semantic, 1.0);
+        assert_eq!(m.signature.lexical, 1.0);
+        assert_eq!(m.signature.semantic, 0.9);
+    }
+
+    #[test]
+    fn rank_class_multipliers_replace_wholesale_per_layer() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank.class_multipliers.symbol]
+lexical = 2.0
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[rank.class_multipliers.symbol]
+lexical = 0.5
+"#,
+        );
+        let config = env.load().unwrap();
+        // The repo table replaces the global one for the classes it names;
+        // classes it omits fall back to the DEFAULT (neutral), not the
+        // global layer — same wholesale semantics as [rank.weights].
+        assert_eq!(config.rank.class_multipliers.symbol.lexical, 0.5);
+        assert_eq!(config.rank.class_multipliers.path.lexical, 1.0);
+    }
+
+    #[test]
+    fn rank_class_multipliers_unknown_class_is_a_hard_error() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank.class_multipliers.troll]
+lexical = 1.0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("unknown query class 'troll' in [rank.class_multipliers]"),
+            "error names the offender and the section: {err}"
+        );
+        assert!(
+            err.contains("known: symbol, path, signature"),
+            "error lists the valid classes: {err}"
+        );
+    }
+
+    #[test]
+    fn rank_class_multipliers_conceptual_is_rejected_citing_req009() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank.class_multipliers.conceptual]
+lexical = 1.0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[rank.class_multipliers.conceptual]"),
+            "error names the rejected table: {err}"
+        );
+        assert!(
+            err.contains("REQ-009"),
+            "error cites the requirement pinning neutrality: {err}"
+        );
+    }
+
+    #[test]
+    fn rank_class_multipliers_negative_is_a_hard_error() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank.class_multipliers.symbol]
+lexical = -0.5
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("class multiplier"),
+            "error names the field: {err}"
+        );
+        assert!(err.contains("-0.5"), "error names the value: {err}");
+    }
+
+    #[test]
+    fn rank_class_multipliers_non_finite_is_a_hard_error() {
+        let env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[rank.class_multipliers.path]
+semantic = nan
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("class multiplier"),
+            "error names the field: {err}"
         );
     }
 }

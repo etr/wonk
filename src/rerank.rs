@@ -1575,6 +1575,30 @@ impl Default for RankSettings {
     }
 }
 
+impl RankSettings {
+    /// Derive settings from the loaded configuration (TASK-095): the ONE
+    /// place the `[rank]` section becomes pipeline settings, so flipping
+    /// the default is a one-line change. `pinned` is the caller's explicit
+    /// class pin (`--query-class` / MCP `query_class`), `None` = detect.
+    pub fn from_config(
+        rank: &crate::config::RankConfig,
+        search: &crate::config::SearchConfig,
+        embedding: crate::embedding::EmbeddingProviderKind,
+        pinned: Option<QueryClass>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            use_pipeline: rank.enabled,
+            weights: WeightTable::from_config(&rank.weights)?,
+            sources: ContextSources {
+                bm25: crate::bm25::Bm25Params::from(search),
+                embedding,
+            },
+            class_multipliers: rank.class_multipliers,
+            pinned_class: pinned,
+        })
+    }
+}
+
 /// A ranked search with its detected (or pinned) query class recorded
 /// (TASK-095, DR-038): a misclassification is diagnosable from the
 /// response. `query_class` is `Some` only when the pipeline path ran.
@@ -4002,6 +4026,68 @@ proximity, signature",
         };
         // Even a fully skewed table cannot move a conceptual query.
         assert_eq!(skewed.apply(&weights, QueryClass::Conceptual), weights);
+    }
+
+    #[test]
+    fn rank_settings_from_config_maps_every_surface() {
+        let mut rank = crate::config::RankConfig {
+            enabled: true,
+            weights: std::collections::HashMap::from([("kind".to_string(), 1.2)]),
+            class_multipliers: ClassMultipliers {
+                symbol: channel(1.5, 0.5),
+                ..ClassMultipliers::neutral()
+            },
+        };
+        let search = crate::config::SearchConfig {
+            bm25_k1: 2.0,
+            ..Default::default()
+        };
+
+        let settings = RankSettings::from_config(
+            &rank,
+            &search,
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+        )
+        .unwrap();
+        assert!(settings.use_pipeline);
+        assert_eq!(settings.weights.weight("kind"), 1.2);
+        assert_eq!(settings.sources.bm25.k1, 2.0);
+        assert_eq!(settings.class_multipliers.symbol.lexical, 1.5);
+        assert_eq!(settings.pinned_class, None);
+
+        // The pin threads through unchanged.
+        let pinned = RankSettings::from_config(
+            &rank,
+            &search,
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            Some(QueryClass::Path),
+        )
+        .unwrap();
+        assert_eq!(pinned.pinned_class, Some(QueryClass::Path));
+
+        // A disabled config stays on the legacy path.
+        rank.enabled = false;
+        let legacy = RankSettings::from_config(
+            &rank,
+            &search,
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+        )
+        .unwrap();
+        assert!(!legacy.use_pipeline);
+
+        // Invalid weights surface as errors from the same call.
+        rank.weights.insert("nosuch_signal".to_string(), 1.0);
+        assert!(
+            RankSettings::from_config(
+                &rank,
+                &search,
+                crate::embedding::EmbeddingProviderKind::Bundled,
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

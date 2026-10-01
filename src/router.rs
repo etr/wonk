@@ -258,18 +258,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
                         // Defense in depth: config load already rejected
                         // unknown signal names.
-                        let weights =
-                            crate::rerank::WeightTable::from_config(&config.rank.weights)?;
-                        let settings = crate::rerank::RankSettings {
-                            use_pipeline: config.rank.enabled || args.why,
-                            weights,
-                            sources: crate::rerank::ContextSources {
-                                bm25: crate::bm25::Bm25Params::from(&config.search),
-                                embedding: config.embedding.provider,
-                            },
-                            // TASK-095 surfaces land in the config/pin phases.
-                            ..Default::default()
-                        };
+                        let mut settings = crate::rerank::RankSettings::from_config(
+                            &config.rank,
+                            &config.search,
+                            config.embedding.provider,
+                            None, // the --query-class pin lands with the pin surfaces
+                        )?;
+                        // --why opts into the pipeline for this invocation.
+                        settings.use_pipeline |= args.why;
                         let groups = crate::rerank::rank_and_explain(
                             &results,
                             conn.as_ref(),
