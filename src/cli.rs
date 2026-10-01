@@ -143,6 +143,11 @@ pub struct SearchArgs {
     #[arg(long, conflicts_with_all = ["raw", "semantic"])]
     pub why: bool,
 
+    /// Pin the query class, bypassing detection (implies smart ranked
+    /// mode; the pin scales the lexical/semantic blend for this query)
+    #[arg(long, value_enum, conflicts_with_all = ["raw", "semantic"])]
+    pub query_class: Option<crate::rerank::QueryClass>,
+
     /// Restrict search to files matching this path (substring match)
     #[arg(short = 'f', long)]
     pub file: Option<String>,
@@ -678,6 +683,78 @@ pub fn parse() -> Cli {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn parse_search_query_class_all_values() {
+        for (value, expected) in [
+            ("symbol", crate::rerank::QueryClass::Symbol),
+            ("path", crate::rerank::QueryClass::Path),
+            ("signature", crate::rerank::QueryClass::Signature),
+            ("conceptual", crate::rerank::QueryClass::Conceptual),
+        ] {
+            let cli =
+                Cli::try_parse_from(["wonk", "search", "foo", "--query-class", value]).unwrap();
+            match cli.command {
+                Command::Search(args) => assert_eq!(args.query_class, Some(expected)),
+                _ => panic!("expected Command::Search"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_search_query_class_defaults_to_none() {
+        let cli = Cli::try_parse_from(["wonk", "search", "foo"]).unwrap();
+        match cli.command {
+            Command::Search(args) => assert_eq!(args.query_class, None),
+            _ => panic!("expected Command::Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_query_class_conflicts_with_raw_and_semantic() {
+        for conflict in ["--raw", "--semantic"] {
+            let err =
+                Cli::try_parse_from(["wonk", "search", "foo", conflict, "--query-class", "symbol"])
+                    .unwrap_err();
+            assert!(
+                !err.to_string().is_empty(),
+                "{conflict} must conflict with --query-class"
+            );
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn parse_search_query_class_rejects_unknown_value() {
+        let err =
+            Cli::try_parse_from(["wonk", "search", "foo", "--query-class", "troll"]).unwrap_err();
+        let text = err.to_string();
+        for valid in ["symbol", "path", "signature", "conceptual"] {
+            assert!(text.contains(valid), "error must list {valid}: {text}");
+        }
+    }
+
+    #[test]
+    fn parse_search_query_class_coexists_with_why_and_smart() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "search",
+            "foo",
+            "--smart",
+            "--why",
+            "--query-class",
+            "signature",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Search(args) => {
+                assert!(args.smart);
+                assert!(args.why);
+                assert_eq!(args.query_class, Some(crate::rerank::QueryClass::Signature));
+            }
+            _ => panic!("expected Command::Search"),
+        }
+    }
 
     #[test]
     fn parse_contracts_filters() {

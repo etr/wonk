@@ -389,7 +389,56 @@ fn cli_why_stdout_is_byte_identical_to_default_smart_run() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. --why without --smart implies smart ranked mode
+// 7. --query-class without --smart implies smart ranked mode (TASK-095)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_query_class_alone_implies_smart_ranked_mode() {
+    // Mirrors the --why pin: a TEXT-ONLY pattern (no symbol match) with
+    // --query-class routes through the ranked pipeline exactly as --smart
+    // does, because detect_search_mode treats a pin like --why.
+    let (dir, conn) = setup_indexed_corpus();
+    assert_eq!(
+        db::count_matching_symbols(&conn, "eviction"),
+        0,
+        "'eviction' must stay a text-only pattern for this pin to hold"
+    );
+    let root = dir.path();
+    let home = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_wonk");
+
+    let run = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.current_dir(root)
+            .env("HOME", home.path())
+            .arg("search")
+            .arg("eviction");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        let output = cmd.output().expect("wonk binary to run");
+        assert!(
+            output.status.success(),
+            "wonk search {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    let smart = run(&["--smart"]);
+    let pinned = run(&["--query-class", "symbol"]);
+    assert!(
+        !smart.stdout.is_empty(),
+        "fixture corpus must produce search output"
+    );
+    assert_eq!(
+        smart.stdout, pinned.stdout,
+        "--query-class alone must route through the same ranked pipeline as --smart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. --why without --smart implies smart ranked mode
 // ---------------------------------------------------------------------------
 
 #[test]

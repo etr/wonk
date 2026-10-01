@@ -186,7 +186,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 .map(|c| db::count_matching_symbols(c, &args.pattern))
                 .unwrap_or(0);
 
-            let mode = detect_search_mode(args.raw, args.smart || args.why, symbol_count);
+            let mode = detect_search_mode(
+                args.raw,
+                args.smart || args.why || args.query_class.is_some(),
+                symbol_count,
+            );
 
             // Print mode indicator (skip for raw — user explicitly chose it).
             if !args.raw {
@@ -262,7 +266,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             &config.rank,
                             &config.search,
                             config.embedding.provider,
-                            None, // the --query-class pin lands with the pin surfaces
+                            args.query_class,
                         )?;
                         // --why opts into the pipeline for this invocation.
                         settings.use_pipeline |= args.why;
@@ -5765,6 +5769,7 @@ mod tests {
             smart: false,
             semantic: false,
             why: false,
+            query_class: None,
             file: None,
             paths: vec![],
         });

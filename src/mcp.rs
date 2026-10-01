@@ -468,6 +468,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "boolean",
                             "description": "Include results from test/doc/example files (excluded by default)",
                             "default": false
+                        },
+                        "query_class": {
+                            "type": "string",
+                            "enum": ["symbol", "path", "signature", "conceptual"],
+                            "description": "Pin the query class, bypassing detection (scales the lexical/semantic blend when reranking is enabled)"
                         }
                     },
                     "required": ["query"]
@@ -1604,6 +1609,20 @@ impl McpServer {
 
         let include_tests = extract_include_tests(&args);
 
+        // Optional query-class pin (TASK-095, REQ-007): an invalid value is
+        // a tool error naming the valid classes.
+        let pinned_class = match args.get("query_class") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_str().map(|s| s.parse::<crate::rerank::QueryClass>()) {
+                Some(Ok(class)) => Some(class),
+                _ => {
+                    return CallToolResult::error(format!(
+                        "invalid query_class '{v}' (valid: symbol, path, signature, conceptual)"
+                    ));
+                }
+            },
+        };
+
         let mut results =
             match search::text_search(&query, regex, case_insensitive, &resolved_paths) {
                 Ok(r) => r,
@@ -1625,7 +1644,7 @@ impl McpServer {
             &config.rank,
             &config.search,
             config.embedding.provider,
-            None, // the query_class pin lands with the pin surfaces
+            pinned_class,
         ) {
             Ok(s) => s,
             Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),

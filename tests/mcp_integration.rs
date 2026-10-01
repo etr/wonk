@@ -620,6 +620,19 @@ impl McpSession {
         }
     }
 
+    fn wonk_search_with_args(&mut self, arguments: Value) -> Value {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "wonk_search",
+                "arguments": arguments
+            }
+        });
+        send_and_recv(&mut self.stdin, &mut self.reader, &req)
+    }
+
     fn wonk_search(&mut self, query: &str) -> Value {
         let req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -725,6 +738,70 @@ fn mcp_search_rows_stable_from_default_through_enabled_pipeline() {
         default_text, enabled_text,
         "config.rank.enabled=true must not change wonk_search rows"
     );
+    session.finish();
+}
+
+#[test]
+fn mcp_search_query_class_pin_and_validation() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo_search(&bin);
+    let mut session = McpSession::start(&bin, repo.path(), home.path());
+
+    // The tools/list schema advertises the enum.
+    let list_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/list"
+    });
+    let list = send_and_recv(&mut session.stdin, &mut session.reader, &list_req);
+    let tools = list["result"]["tools"].as_array().expect("tools array");
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "wonk_search")
+        .expect("wonk_search tool");
+    let prop = &search["inputSchema"]["properties"]["query_class"];
+    assert_eq!(
+        prop["type"], "string",
+        "query_class is a string enum: {prop}"
+    );
+    let variants: Vec<&str> = prop["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        variants,
+        vec!["symbol", "path", "signature", "conceptual"],
+        "query_class enum must list every class"
+    );
+
+    // A valid pin is accepted (default config: rows unchanged, no error).
+    let pinned = session.wonk_search_with_args(serde_json::json!({
+        "query": "authenticate_user",
+        "query_class": "symbol"
+    }));
+    assert!(
+        pinned["result"]["isError"].is_null(),
+        "a valid query_class pin must not fail: {pinned}"
+    );
+
+    // An invalid pin is a tool error naming the valid values.
+    let invalid = session.wonk_search_with_args(serde_json::json!({
+        "query": "authenticate_user",
+        "query_class": "troll"
+    }));
+    assert_eq!(
+        invalid["result"]["isError"], true,
+        "invalid query_class must fail the tool call: {invalid}"
+    );
+    let text = invalid["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    for valid in ["symbol", "path", "signature", "conceptual"] {
+        assert!(text.contains(valid), "error must name {valid}: {text}");
+    }
     session.finish();
 }
 
