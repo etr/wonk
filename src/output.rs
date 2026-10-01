@@ -68,6 +68,10 @@ pub struct SearchOutput {
     /// Optional per-signal scoring breakdown (`wonk search --why`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<WhyOutput>,
+    /// The query class the pipeline classified or the caller pinned
+    /// (TASK-095, DR-038); absent on legacy rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_class: Option<String>,
 }
 
 /// The per-result scoring breakdown shown by `wonk search --why`
@@ -136,6 +140,20 @@ pub fn format_why_line(
 /// into stdout, so piping and `grep` over search output stay clean.
 pub fn print_why_line(file: &str, line: u64, why: &WhyOutput) {
     eprintln!("{}", format_why_line(file, line, why.total, &why.signals));
+}
+
+/// Render the query-class line (pure; pinned by test):
+/// `query-class: {class}` — one line per query, emitted before the why
+/// lines so a misclassification is diagnosable from the breakdown it
+/// produced (TASK-095, DR-038).
+pub fn format_query_class_line(class: crate::rerank::QueryClass) -> String {
+    format!("query-class: {}", class.as_str())
+}
+
+/// Emit the query-class line to stderr. Never stdout — the same piping
+/// contract as the why lines.
+pub fn print_query_class_line(class: crate::rerank::QueryClass) {
+    eprintln!("{}", format_query_class_line(class));
 }
 
 /// A symbol definition result.
@@ -1130,6 +1148,7 @@ impl SearchOutput {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         }
     }
 }
@@ -2672,6 +2691,44 @@ mod tests {
     }
 
     #[test]
+    fn format_query_class_line_pinned() {
+        use crate::rerank::QueryClass;
+        assert_eq!(
+            format_query_class_line(QueryClass::Symbol),
+            "query-class: symbol"
+        );
+        assert_eq!(
+            format_query_class_line(QueryClass::Path),
+            "query-class: path"
+        );
+        assert_eq!(
+            format_query_class_line(QueryClass::Signature),
+            "query-class: signature"
+        );
+        assert_eq!(
+            format_query_class_line(QueryClass::Conceptual),
+            "query-class: conceptual"
+        );
+    }
+
+    #[test]
+    fn search_output_query_class_serializes_skip_none() {
+        let mut result =
+            SearchOutput::from_search_result(std::path::Path::new("src/a.rs"), 1, 1, "x");
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            !json.contains("query_class"),
+            "legacy rows carry no query_class key: {json}"
+        );
+        result.query_class = Some("symbol".to_string());
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.contains("\"query_class\":\"symbol\""),
+            "pipeline rows record the class: {json}"
+        );
+    }
+
+    #[test]
     fn why_output_serializes_and_round_trips() {
         let result = SearchOutput {
             file: "src/main.rs".into(),
@@ -2689,6 +2746,7 @@ mod tests {
                     weighted: 0.8,
                 }],
             }),
+            query_class: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(
@@ -2733,6 +2791,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -2748,6 +2807,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -2769,6 +2829,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             },
             SearchOutput {
                 file: "src/a.rs".into(),
@@ -2778,6 +2839,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             },
         ];
         let mut buf = Vec::new();
@@ -3012,6 +3074,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
@@ -3021,6 +3084,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             },
         ];
         let out = render(OutputFormat::Json, |fmt| {
@@ -3048,6 +3112,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
@@ -3057,6 +3122,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             },
         ];
         let out = render(OutputFormat::Grep, |fmt| {
@@ -3095,6 +3161,7 @@ mod tests {
             annotation: Some("(+3 other locations)".into()),
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}  (+3 other locations)\n");
@@ -3110,6 +3177,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}\n");
@@ -3125,6 +3193,7 @@ mod tests {
             annotation: Some("(+2 other locations)".into()),
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -3141,6 +3210,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         assert!(!out.contains("annotation"));
@@ -3158,6 +3228,7 @@ mod tests {
             annotation: None,
             source: Some("structural".into()),
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -3174,6 +3245,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         assert!(!out.contains("source"));
@@ -3198,6 +3270,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         // Grep format: file:line:content (colons in content are fine)
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
@@ -3214,6 +3287,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -3261,6 +3335,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -3276,6 +3351,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // File path should be wrapped in magenta+bold
@@ -3299,6 +3375,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Line number should be wrapped in green
@@ -3322,6 +3399,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Separator should be wrapped in cyan
@@ -3341,6 +3419,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let mut buf = Vec::new();
         {
@@ -3364,6 +3443,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let mut buf = Vec::new();
         {
@@ -3389,6 +3469,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let mut buf = Vec::new();
         {
@@ -3414,6 +3495,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let mut buf = Vec::new();
         {
@@ -3532,6 +3614,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             })
             .collect();
 
@@ -3572,6 +3655,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             })
             .collect();
 
@@ -3621,6 +3705,7 @@ mod tests {
                 annotation: None,
                 source: None,
                 why: None,
+                query_class: None,
             })
             .collect();
 
@@ -3655,6 +3740,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         fmt.format_search_result(&r).unwrap();
         assert!(fmt.budget_used() > 0);
@@ -3705,6 +3791,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let mut buf = Vec::new();
         {
@@ -3758,6 +3845,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let out = render(OutputFormat::Toon, |fmt| fmt.format_search_result(&result));
         assert!(!out.is_empty());
@@ -3849,6 +3937,7 @@ mod tests {
             annotation: None,
             source: None,
             why: None,
+            query_class: None,
         };
         let mut buf = Vec::new();
         {

@@ -438,7 +438,123 @@ fn cli_query_class_alone_implies_smart_ranked_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. --why without --smart implies smart ranked mode
+// 8. Query-class response recording (TASK-095, DR-038)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_pipeline_rows_record_query_class_and_legacy_rows_do_not() {
+    let (dir, _conn) = setup_indexed_corpus();
+    let root = dir.path();
+    let home = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_wonk");
+
+    let run = |config: Option<&str>| {
+        if let Some(text) = config {
+            fs::create_dir_all(root.join(".wonk")).unwrap();
+            fs::write(root.join(".wonk/config.toml"), text).unwrap();
+        }
+        let mut cmd = std::process::Command::new(bin);
+        cmd.current_dir(root).env("HOME", home.path()).args([
+            "--quiet", "--budget",
+            // No truncation: the --why rows are much larger serialized,
+            // and a shared budget would truncate the two runs
+            // differently.
+            "1000000", "search", "cache", "--smart", "--format", "json",
+        ]);
+        let output = cmd.output().expect("wonk binary to run");
+        assert!(
+            output.status.success(),
+            "wonk search failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    // Legacy (default config): rows carry no query_class key at all.
+    let legacy = run(None);
+    let legacy_stdout = String::from_utf8_lossy(&legacy.stdout).into_owned();
+    let mut legacy_rows = 0usize;
+    for line in legacy_stdout.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).expect("NDJSON lines");
+        if row.get("file").is_none() {
+            continue; // the trailing budget-summary line
+        }
+        legacy_rows += 1;
+        assert!(
+            row.get("query_class").is_none(),
+            "legacy rows must not record a class: {row}"
+        );
+    }
+    assert!(legacy_rows > 0, "fixture corpus must produce rows");
+
+    // Pipeline enabled: every row records the detected class, and stdout
+    // stays byte-identical to --why (the class line goes to stderr only).
+    let piped = run(Some("[rank]\nenabled = true\n"));
+    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&piped.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("NDJSON lines"))
+        .filter(|v: &serde_json::Value| v.get("file").is_some())
+        .collect();
+    assert!(!rows.is_empty(), "fixture corpus must produce rows");
+    for row in &rows {
+        assert_eq!(
+            row["query_class"], "symbol",
+            "pipeline rows record the detected class: {row}"
+        );
+    }
+
+    // --why: exactly one `query-class:` line on stderr BEFORE the why
+    // lines, and stdout rows unchanged apart from the why breakdown the
+    // flag asks for (structured rows have always carried it).
+    let mut cmd = std::process::Command::new(bin);
+    cmd.current_dir(root).env("HOME", home.path()).args([
+        "--quiet", "--budget", "1000000", "search", "cache", "--smart", "--why", "--format", "json",
+    ]);
+    let explained = cmd.output().expect("wonk binary to run");
+    let mut explained_rows: Vec<serde_json::Value> = String::from_utf8_lossy(&explained.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("NDJSON lines"))
+        .filter(|v: &serde_json::Value| v.get("file").is_some())
+        .collect();
+    for row in &mut explained_rows {
+        assert!(
+            row.get("why").is_some(),
+            "--why rows carry the breakdown: {row}"
+        );
+        row.as_object_mut().unwrap().remove("why");
+    }
+    assert_eq!(
+        serde_json::to_string(&explained_rows).unwrap(),
+        serde_json::to_string(&rows).unwrap(),
+        "--why must not change stdout rows apart from the breakdown"
+    );
+    let err = String::from_utf8_lossy(&explained.stderr);
+    let class_lines: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("query-class:"))
+        .collect();
+    assert_eq!(
+        class_lines,
+        vec!["query-class: symbol"],
+        "exactly one query-class stderr line: {err}"
+    );
+    let first_why = err.lines().position(|l| l.starts_with("why: "));
+    let class_pos = err.lines().position(|l| l.starts_with("query-class:"));
+    match (class_pos, first_why) {
+        (Some(c), Some(w)) => assert!(c < w, "class line precedes the why lines: {err}"),
+        _ => panic!("both class and why lines expected on stderr: {err}"),
+    }
+    // Without --why the stderr carries no class line (stdout stays clean of
+    // it by construction — it only ever goes to stderr).
+    let piped_err = String::from_utf8_lossy(&piped.stderr);
+    assert!(
+        !piped_err.contains("query-class:"),
+        "no class line without --why: {piped_err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. --why without --smart implies smart ranked mode
 // ---------------------------------------------------------------------------
 
 #[test]

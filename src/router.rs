@@ -245,6 +245,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         annotation: fr.annotation.clone(),
                         source: Some(fr.source.to_string()),
                         why: None,
+                        query_class: None,
                     };
                     if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
                         truncated += 1;
@@ -270,14 +271,22 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         )?;
                         // --why opts into the pipeline for this invocation.
                         settings.use_pipeline |= args.why;
-                        let groups = crate::rerank::rank_and_explain(
+                        let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
                             &args.pattern,
                             &settings,
                         );
+                        // One class line per query, before any why lines
+                        // (DR-038): a misclassification is diagnosable from
+                        // the breakdown it produced.
+                        if args.why
+                            && let Some(class) = ranked.query_class
+                        {
+                            output::print_query_class_line(class);
+                        }
 
-                        for (category, items) in &groups {
+                        for (category, items) in &ranked.groups {
                             if !suppress {
                                 output::print_category_header(ranker::category_header(*category));
                             }
@@ -289,6 +298,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                     &item.classified.result.content,
                                 );
                                 out.annotation = item.classified.annotation.clone();
+                                out.query_class =
+                                    ranked.query_class.map(|c| c.as_str().to_string());
                                 if args.why {
                                     out.why = Some(crate::output::WhyOutput::from_contributions(
                                         item.score,

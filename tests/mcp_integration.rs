@@ -718,8 +718,10 @@ fn mcp_search_rows_stable_from_default_through_enabled_pipeline() {
     }
 
     // Flip [rank] enabled=true MID-SESSION: the handler loads config per
-    // call, so the next call routes through the signal pipeline — and with
-    // the kind-only default weights the rows must stay byte-identical.
+    // call, so the next call routes through the signal pipeline. TASK-095
+    // conscious update: pipeline rows now RECORD the query class (DR-038),
+    // so byte-identity is no longer the contract — ordering and content
+    // must stay identical, with exactly the query_class key added.
     fs::create_dir_all(repo.path().join(".wonk")).unwrap();
     fs::write(
         repo.path().join(".wonk/config.toml"),
@@ -734,9 +736,45 @@ fn mcp_search_rows_stable_from_default_through_enabled_pipeline() {
     let enabled_text = enabled_resp["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
+    let enabled_rows: Vec<Value> = serde_json::from_str(enabled_text).unwrap();
     assert_eq!(
-        default_text, enabled_text,
-        "config.rank.enabled=true must not change wonk_search rows"
+        enabled_rows.len(),
+        rows.len(),
+        "pipeline must not change the row count"
+    );
+    for (pipelined, legacy) in enabled_rows.iter().zip(&rows) {
+        assert_eq!(
+            pipelined["file"], legacy["file"],
+            "pipeline must not reorder rows"
+        );
+        assert_eq!(
+            pipelined["line"], legacy["line"],
+            "pipeline must not reorder rows"
+        );
+        assert_eq!(
+            pipelined["content"], legacy["content"],
+            "pipeline must not change row content"
+        );
+        assert_eq!(
+            pipelined["query_class"], "symbol",
+            "pipeline rows record the detected class: {pipelined}"
+        );
+    }
+
+    // The escape hatch, pinned mid-session: flipping enabled=false returns
+    // to the legacy path and reproduces the default capture BYTE-FOR-BYTE.
+    fs::write(
+        repo.path().join(".wonk/config.toml"),
+        "[rank]\nenabled = false\n",
+    )
+    .unwrap();
+    let disabled_resp = session.wonk_search("authenticate_user");
+    let disabled_text = disabled_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        default_text, disabled_text,
+        "enabled=false must reproduce legacy rows byte-for-byte"
     );
     session.finish();
 }
@@ -801,6 +839,63 @@ fn mcp_search_query_class_pin_and_validation() {
         .unwrap_or("");
     for valid in ["symbol", "path", "signature", "conceptual"] {
         assert!(text.contains(valid), "error must name {valid}: {text}");
+    }
+    session.finish();
+}
+
+#[test]
+fn mcp_search_rows_record_query_class_when_pipelined() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo_search(&bin);
+    let mut session = McpSession::start(&bin, repo.path(), home.path());
+
+    // Default (legacy) rows: no query_class key.
+    let default_resp = session.wonk_search("authenticate_user");
+    let default_text = default_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let default_rows: Vec<Value> = serde_json::from_str(default_text).unwrap();
+    assert!(!default_rows.is_empty());
+    for row in &default_rows {
+        assert!(
+            row.get("query_class").is_none(),
+            "legacy MCP rows carry no class: {row}"
+        );
+    }
+
+    // Enabled pipeline: every row records the detected class...
+    fs::create_dir_all(repo.path().join(".wonk")).unwrap();
+    fs::write(
+        repo.path().join(".wonk/config.toml"),
+        "[rank]\nenabled = true\n",
+    )
+    .unwrap();
+    let piped_resp = session.wonk_search("authenticate_user");
+    let piped_text = piped_resp["result"]["content"][0]["text"].as_str().unwrap();
+    let piped_rows: Vec<Value> = serde_json::from_str(piped_text).unwrap();
+    for row in &piped_rows {
+        assert_eq!(
+            row["query_class"], "symbol",
+            "pipeline rows record the class: {row}"
+        );
+    }
+
+    // ...and a PIN is echoed verbatim on every row.
+    let pinned_resp = session.wonk_search_with_args(serde_json::json!({
+        "query": "authenticate_user",
+        "query_class": "conceptual"
+    }));
+    let pinned_text = pinned_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let pinned_rows: Vec<Value> = serde_json::from_str(pinned_text).unwrap();
+    assert!(!pinned_rows.is_empty());
+    for row in &pinned_rows {
+        assert_eq!(
+            row["query_class"], "conceptual",
+            "the pin is echoed on the rows: {row}"
+        );
     }
     session.finish();
 }

@@ -1649,7 +1649,8 @@ impl McpServer {
             Ok(s) => s,
             Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),
         };
-        let groups = crate::rerank::rank_and_explain(&results, ranker_conn, &query, &settings);
+        let ranked =
+            crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
 
         let mut budget = budget_limit.map(|limit| {
             if let Some(p) = page {
@@ -1661,7 +1662,7 @@ impl McpServer {
         let mut outputs: Vec<SearchOutput> = Vec::new();
         let mut truncated = 0usize;
 
-        for (_category, items) in &groups {
+        for (_category, items) in &ranked.groups {
             for item in items {
                 let mut out = SearchOutput::from_search_result(
                     &item.classified.result.file,
@@ -1670,6 +1671,7 @@ impl McpServer {
                     &item.classified.result.content,
                 );
                 out.annotation = item.classified.annotation.clone();
+                out.query_class = ranked.query_class.map(|c| c.as_str().to_string());
 
                 if let Some(ref mut b) = budget {
                     let estimate = (out.file.len() + out.content.len() + 20) / 4;
