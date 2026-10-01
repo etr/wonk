@@ -72,6 +72,7 @@ fn main() -> Result<()> {
             &wonk::config::SearchConfig::default(),
             wonk::embedding::EmbeddingProviderKind::Bundled,
             None,
+            true,
         )?
     };
 

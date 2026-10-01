@@ -164,6 +164,21 @@ pub fn build_index_with_progress(
         eprintln!("wonk: history mining skipped: {e:#}");
     }
 
+    // 5c. Recompute graph topology (TASK-098). A distinct pass after the
+    // whole graph is in place, never part of per-file indexing
+    // (PRD-TOPO-REQ-006): hub/authority are global properties, so the
+    // full build recomputes unconditionally when enabled. Best-effort —
+    // a failure warns and the build proceeds unscored
+    // (PRD-TOPO-REQ-008's absent-topology degradation).
+    if config.topology.enabled
+        && let Err(e) = crate::topology::recompute(
+            &conn,
+            &crate::topology::TopologyOptions::from(&config.topology),
+        )
+    {
+        eprintln!("wonk: topology scoring skipped: {e:#}");
+    }
+
     // 6. Collect languages seen and write meta.json.
     let languages: Vec<String> = {
         let mut set = HashSet::new();
@@ -279,6 +294,19 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
         )
     {
         eprintln!("wonk: history refresh failed: {e:#}");
+    }
+
+    // Recompute graph topology after the file loop (TASK-098). `wonk
+    // update` is an authoritative refresh path, so this recomputes
+    // unconditionally when enabled — the interval gate belongs to the
+    // daemon hook alone.
+    if config.topology.enabled
+        && let Err(e) = crate::topology::recompute(
+            &conn,
+            &crate::topology::TopologyOptions::from(&config.topology),
+        )
+    {
+        eprintln!("wonk: topology scoring skipped: {e:#}");
     }
 
     // Collect languages and rewrite meta.json.
@@ -1679,6 +1707,8 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
         "DELETE FROM embeddings;
          DELETE FROM type_edges;
          DELETE FROM contracts;
+         DELETE FROM symbol_topology;
+         DELETE FROM topology_meta;
          DELETE FROM symbols;
          DELETE FROM \"references\";
          DELETE FROM file_imports;
@@ -3793,6 +3823,125 @@ fn extra() -> i32 {
         assert_eq!(reach_row_count(&conn), 0);
         assert!(reach_meta_value(&conn, "built_depth").is_none());
         assert!(reach_meta_value(&conn, "stale").is_none());
+    }
+
+    #[test]
+    fn build_index_runs_topology_pass_when_enabled() {
+        let dir = make_test_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        let scored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_topology", [], |row| row.get(0))
+            .unwrap();
+        let symbols: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(scored, symbols, "every symbol carries topology scores");
+        assert!(
+            crate::topology::last_computed(&conn).is_some(),
+            "the pass stamps its cadence marker"
+        );
+        // The pass is real, not zero-filled: `helper` is referenced with a
+        // caller (`main` calls it), so its authority is positive.
+        let authority: f64 = conn
+            .query_row(
+                "SELECT t.authority FROM symbol_topology t \
+                 JOIN symbols s ON s.id = t.symbol_id WHERE s.name = 'helper'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(authority > 0.0, "helper's authority was {authority}");
+    }
+
+    #[test]
+    fn build_index_topology_disabled_writes_nothing() {
+        let dir = make_test_repo();
+        write_reach_config(dir.path(), "[topology]\nenabled = false\n");
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        let scored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_topology", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(scored, 0, "disabled skips the pass entirely");
+        assert!(
+            crate::topology::last_computed(&conn).is_none(),
+            "no stamp without a run"
+        );
+    }
+
+    #[test]
+    fn incremental_update_recomputes_topology() {
+        let dir = make_test_repo();
+        build_index(dir.path(), true).unwrap();
+
+        // A new module whose `used` helper is called with a caller: the
+        // update pass must score it without a full rebuild.
+        fs::write(
+            dir.path().join("src/extra.rs"),
+            "pub fn caller() { used(); }\npub fn used() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        incremental_update(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        let authority: f64 = conn
+            .query_row(
+                "SELECT t.authority FROM symbol_topology t \
+                 JOIN symbols s ON s.id = t.symbol_id \
+                 WHERE s.name = 'used' AND s.file = 'src/extra.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        assert!(authority > 0.0, "used's authority was {authority}");
+        assert!(
+            crate::topology::last_computed(&conn).is_some(),
+            "the update path stamps the marker too"
+        );
+    }
+
+    #[test]
+    fn test_drop_all_data_clears_topology() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("lib.rs"),
+            "fn hello() { world(); }\nfn world() { 2 }",
+        )
+        .unwrap();
+        build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+
+        // The build's topology pass writes scored rows plus the meta
+        // stamp; drop_all_data must clear both ahead of the symbols
+        // delete.
+        let topology_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_topology", [], |row| row.get(0))
+            .unwrap();
+        assert!(topology_rows >= 1);
+        assert!(
+            conn.query_row(
+                "SELECT value FROM topology_meta WHERE key = 'last_computed'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .is_ok()
+        );
+
+        drop_all_data(&conn).unwrap();
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_topology", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "drop_all_data must clear symbol_topology");
+        let meta: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topology_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(meta, 0, "drop_all_data must clear topology_meta");
     }
 
     #[test]

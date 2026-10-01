@@ -179,6 +179,7 @@ fn tuned_defaults_as_shipped() -> RankSettings {
         &wonk::config::SearchConfig::default(),
         wonk::embedding::EmbeddingProviderKind::Bundled,
         None,
+        true,
     )
     .unwrap()
 }
@@ -301,6 +302,7 @@ fn previous_ordering_reachable_by_config() {
         &wonk::config::SearchConfig::default(),
         wonk::embedding::EmbeddingProviderKind::Bundled,
         None,
+        true,
     )
     .unwrap();
     for query in &labels.query {

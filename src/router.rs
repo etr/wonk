@@ -268,6 +268,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             &config.search,
                             config.embedding.provider,
                             args.query_class,
+                            config.topology.enabled,
                         )?;
                         // --why opts into the pipeline for this invocation.
                         settings.use_pipeline |= args.why;
@@ -940,7 +941,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 _ => None,
             };
 
-            let info = query_status_info(conn.as_ref(), config.embedding.provider, workspace);
+            let info = query_status_info(
+                conn.as_ref(),
+                config.embedding.provider,
+                workspace,
+                &config.topology,
+            );
 
             if format.is_structured() {
                 let json =
@@ -2998,6 +3004,23 @@ pub struct StatusInfo {
     pub workspace_declared: bool,
     /// Names of other indexed repos sharing a workspace (AR-027).
     pub workspace_comembers: Vec<String>,
+    /// Graph-topology scoring state (TASK-098): the staleness marker is
+    /// visible here because a stale score is served, never awaited on
+    /// (PRD-TOPO-REQ-007).
+    pub topology: TopologyStatus,
+}
+
+/// The topology pass's state as `wonk status` reports it (TASK-098).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopologyStatus {
+    /// Symbols carrying hub/authority scores.
+    pub scored: i64,
+    /// Epoch seconds of the last recompute; `None` when never run.
+    pub last_computed: Option<i64>,
+    /// Whether the stored scores are older than `[topology] stale_after`.
+    pub stale: bool,
+    /// Whether the `[topology]` pass is enabled.
+    pub enabled: bool,
 }
 
 /// Format status info as a human-readable string for stderr output.
@@ -3036,6 +3059,8 @@ pub fn format_status_info(info: &StatusInfo) -> String {
         lines.push("Embeddings: none".to_string());
     }
 
+    lines.push(topology_status_line(&info.topology));
+
     lines.push(format!("Provider: {}", info.active_provider));
 
     match (&info.stored_vector_provider, info.stored_vector_dim) {
@@ -3061,6 +3086,35 @@ pub fn format_status_info(info: &StatusInfo) -> String {
     lines.join("\n")
 }
 
+/// The `Topology:` line of `wonk status` (TASK-098): one of `disabled`,
+/// `none` (never scored), `N symbols scored`, or — when the scores are
+/// past `[topology] stale_after` — the same count with the staleness
+/// marker and its age, so the user knows to expect drift, not silence
+/// (PRD-TOPO-REQ-007).
+fn topology_status_line(status: &TopologyStatus) -> String {
+    if !status.enabled {
+        return "Topology: disabled".to_string();
+    }
+    if status.scored == 0 {
+        return "Topology: none".to_string();
+    }
+    let mut line = format!("Topology: {} symbols scored", status.scored);
+    if status.stale {
+        let age = status
+            .last_computed
+            .map(|stamp| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+                    .saturating_sub(stamp)
+            })
+            .unwrap_or(0);
+        line.push_str(&format!(" (stale, computed {age}s ago)"));
+    }
+    line
+}
+
 /// Query status from the database and the embedding-provider state.
 ///
 /// Ollama is probed (quick 500 ms check) only when it is relevant — the
@@ -3070,6 +3124,7 @@ pub fn query_status_info(
     conn: Option<&Connection>,
     configured: crate::embedding::EmbeddingProviderKind,
     workspace: Option<crate::contracts::WorkspaceStatus>,
+    topology_config: &crate::config::TopologyConfig,
 ) -> StatusInfo {
     let (workspaces, workspace_declared, workspace_comembers) = match &workspace {
         Some(ws) => (
@@ -3100,6 +3155,12 @@ pub fn query_status_info(
             workspaces,
             workspace_declared,
             workspace_comembers,
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: topology_config.enabled,
+            },
         };
     };
 
@@ -3123,6 +3184,15 @@ pub fn query_status_info(
     let probe_ollama =
         configured == crate::embedding::EmbeddingProviderKind::Ollama || stored_ollama;
 
+    let topology = TopologyStatus {
+        scored: conn
+            .query_row("SELECT COUNT(*) FROM symbol_topology", [], |row| row.get(0))
+            .unwrap_or(0),
+        last_computed: crate::topology::last_computed(conn),
+        stale: crate::topology::is_stale(conn, topology_config.stale_after),
+        enabled: topology_config.enabled,
+    };
+
     StatusInfo {
         indexed: true,
         file_count,
@@ -3138,6 +3208,7 @@ pub fn query_status_info(
         workspaces,
         workspace_declared,
         workspace_comembers,
+        topology,
     }
 }
 
@@ -5905,6 +5976,12 @@ mod tests {
             workspaces: vec!["payments".to_string(), "platform".to_string()],
             workspace_declared: true,
             workspace_comembers: vec!["repoB".to_string(), "repoC".to_string()],
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: true,
+            },
         };
         let output = format_status_info(&info);
         assert!(
@@ -5929,6 +6006,12 @@ mod tests {
             workspaces: vec!["lone-api".to_string()],
             workspace_declared: false,
             workspace_comembers: Vec::new(),
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: true,
+            },
         };
         let output = format_status_info(&info);
         assert!(
@@ -5953,6 +6036,12 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: true,
+            },
         };
         let output = format_status_info(&info);
         assert!(output.contains("100 files"));
@@ -5981,6 +6070,12 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: true,
+            },
         };
         let output = format_status_info(&info);
         assert!(output.contains("No index"));
@@ -6002,6 +6097,12 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: true,
+            },
         };
         let output = format_status_info(&info);
         assert!(
@@ -6028,6 +6129,12 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: true,
+            },
         };
         let output = format_status_info(&info);
         assert!(output.contains("Provider: bundled"));
@@ -6051,6 +6158,12 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: true,
+            },
         };
         let output = format_status_info(&info);
         assert!(output.contains("Stored vectors: none"), "got: {output}");
@@ -6072,12 +6185,140 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
+            topology: TopologyStatus {
+                scored: 0,
+                last_computed: None,
+                stale: false,
+                enabled: true,
+            },
         };
         let value = serde_json::to_value(&info).unwrap();
         assert_eq!(value["active_provider"], "bundled");
         assert_eq!(value["stored_vector_provider"], "bundled");
         assert_eq!(value["stored_vector_dim"], 256);
         assert_eq!(value["ollama_reachable"], serde_json::Value::Null);
+    }
+
+    // -- topology status line (TASK-098) --------------------------------------
+
+    fn topology_status_info(
+        scored: i64,
+        last_computed: Option<i64>,
+        stale: bool,
+        enabled: bool,
+    ) -> StatusInfo {
+        StatusInfo {
+            indexed: true,
+            file_count: 1,
+            symbol_count: 1,
+            reference_count: 0,
+            embedding_count: 0,
+            stale_embedding_count: 0,
+            active_provider: "bundled".to_string(),
+            stored_vector_provider: None,
+            stored_vector_dim: None,
+            ollama_reachable: None,
+            workspaces: Vec::new(),
+            workspace_declared: false,
+            workspace_comembers: Vec::new(),
+            topology: TopologyStatus {
+                scored,
+                last_computed,
+                stale,
+                enabled,
+            },
+        }
+    }
+
+    #[test]
+    fn test_status_topology_line_disabled_none_and_fresh() {
+        // The kill switch says so.
+        let out = format_status_info(&topology_status_info(0, None, false, false));
+        assert!(out.contains("Topology: disabled"), "got: {out}");
+
+        // Never scored: absent data reads as none.
+        let out = format_status_info(&topology_status_info(0, None, false, true));
+        assert!(out.contains("Topology: none"), "got: {out}");
+
+        // Scored and fresh: just the count.
+        let out = format_status_info(&topology_status_info(4321, Some(1_000_000), false, true));
+        assert!(out.contains("Topology: 4321 symbols scored"), "got: {out}");
+        assert!(!out.contains("stale"), "fresh is unmarked: {out}");
+    }
+
+    #[test]
+    fn test_status_topology_line_stale_names_the_age() {
+        let out = format_status_info(&topology_status_info(12, Some(1_000_000), true, true));
+        assert!(
+            out.contains("Topology: 12 symbols scored (stale, computed "),
+            "got: {out}"
+        );
+        assert!(out.contains("s ago)"), "the age renders in seconds: {out}");
+    }
+
+    #[test]
+    fn test_query_status_info_populates_topology_status() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('core', 'class', 'src/a.rs', 1, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_topology (symbol_id, hub, authority) VALUES (1, 0.5, 0.5)",
+            [],
+        )
+        .unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 10;
+        conn.execute(
+            "INSERT INTO topology_meta (key, value) VALUES ('last_computed', ?1)",
+            [stamp.to_string()],
+        )
+        .unwrap();
+
+        // Fresh against a generous threshold.
+        let info = query_status_info(
+            Some(&conn),
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            &crate::config::TopologyConfig::default(),
+        );
+        assert_eq!(info.topology.scored, 1);
+        assert_eq!(info.topology.last_computed, Some(stamp));
+        assert!(!info.topology.stale);
+        assert!(info.topology.enabled);
+
+        // Aged past the threshold: the marker flips.
+        let aged = crate::config::TopologyConfig {
+            stale_after: 1,
+            ..Default::default()
+        };
+        let info = query_status_info(
+            Some(&conn),
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            &aged,
+        );
+        assert!(info.topology.stale, "age >> 1s must read as stale");
+
+        // The kill switch reflects through.
+        let off = crate::config::TopologyConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let info = query_status_info(
+            Some(&conn),
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            &off,
+        );
+        assert!(!info.topology.enabled);
     }
 
     // -- Semantic fetch + RRF helpers -----------------------------------------

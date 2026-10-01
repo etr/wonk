@@ -42,6 +42,7 @@ pub struct ContextReqs {
     pub(crate) embeddings: bool,
     pub(crate) file_churn: bool,
     pub(crate) co_change: bool,
+    pub(crate) symbol_topology: bool,
 }
 
 impl ContextReqs {
@@ -93,6 +94,13 @@ impl ContextReqs {
         self
     }
 
+    /// Require the computed hub/authority scores at candidate positions
+    /// (TASK-098).
+    pub fn with_symbol_topology(mut self) -> Self {
+        self.symbol_topology = true;
+        self
+    }
+
     fn union(self, other: Self) -> Self {
         Self {
             query_terms: self.query_terms || other.query_terms,
@@ -102,6 +110,7 @@ impl ContextReqs {
             embeddings: self.embeddings || other.embeddings,
             file_churn: self.file_churn || other.file_churn,
             co_change: self.co_change || other.co_change,
+            symbol_topology: self.symbol_topology || other.symbol_topology,
         }
     }
 }
@@ -467,6 +476,16 @@ pub struct CoChangeContext {
     pub(crate) max: f32,
 }
 
+/// Computed topology scores at the candidate positions (TASK-098):
+/// `(hub, authority)` per (file, line), with the two set maxes folded once
+/// at preparation time.
+#[derive(Debug, Default, Clone)]
+pub struct TopologyContext {
+    pub(crate) scores: HashMap<(String, u64), (f32, f32)>,
+    pub(crate) max_hub: f32,
+    pub(crate) max_authority: f32,
+}
+
 /// The query sources the pipeline prepares context against: the BM25
 /// constants and the embedding provider kind from the loaded configuration.
 /// Carrying them in one struct keeps `rank_and_explain`'s signature stable
@@ -499,6 +518,7 @@ pub struct SharedContext {
     pub(crate) embeddings: EmbeddingContext,
     pub(crate) churn: ChurnContext,
     pub(crate) co_change: CoChangeContext,
+    pub(crate) topology: TopologyContext,
 }
 
 impl SharedContext {
@@ -570,6 +590,22 @@ impl SharedContext {
     /// The strongest candidate-set coupling; 0 when none.
     pub fn max_co_change(&self) -> f32 {
         self.co_change.max
+    }
+
+    /// Computed `(hub, authority)` at a candidate position (None unless
+    /// prepared, or when the position carries no topology row).
+    pub fn topology_scores(&self, file: &str, line: u64) -> Option<(f32, f32)> {
+        self.topology.scores.get(&(file.to_string(), line)).copied()
+    }
+
+    /// The largest hub score across the candidate set; 0 when none.
+    pub fn max_hub(&self) -> f32 {
+        self.topology.max_hub
+    }
+
+    /// The largest authority score across the candidate set; 0 when none.
+    pub fn max_authority(&self) -> f32 {
+        self.topology.max_authority
     }
 }
 
@@ -802,6 +838,20 @@ pub fn co_change_value(weight: f32, set_max: f32) -> f32 {
     (1.0 + weight).ln() / (1.0 + set_max).ln()
 }
 
+/// Topology score against the candidate-set maximum (TASK-098,
+/// PRD-TOPO-REQ-003): a pure `score / set_max` ratio clamped to `[0, 1]` —
+/// deliberately NOT the log damper of [`churn_value`], because HITS
+/// output is already globally L1-normalized and damped relative to the
+/// set; another damper would double-attenuate. An all-zero set
+/// (`set_max <= 0`) and non-finite inputs score exactly 0.0 — absent is
+/// zero, never a penalty.
+pub fn topology_value(score: f32, set_max: f32) -> f32 {
+    if !score.is_finite() || !set_max.is_finite() || set_max <= 0.0 {
+        return 0.0;
+    }
+    (score / set_max).clamp(0.0, 1.0)
+}
+
 /// The churn signal: how actively the candidate file was modified within
 /// the mined commit window. Reads the `file_churn` aggregate prepared for
 /// the candidate set; a file absent from the table (never touched in the
@@ -858,6 +908,65 @@ impl Signal for CoChangeSignal {
         let file = candidate.result.file.to_string_lossy();
         match ctx.co_change_coupling(&file) {
             Some(weight) => co_change_value(weight, ctx.max_co_change()),
+            None => 0.0,
+        }
+    }
+}
+
+/// The hub signal (TASK-098, PRD-TOPO-REQ-003): how much the symbol at
+/// the candidate position routes through the graph's authoritative
+/// nodes — a good entry point to explore from, normalized against the
+/// candidate-set maximum. Positions without topology scores contribute
+/// exactly 0.0.
+pub(crate) struct HubSignal;
+
+impl Signal for HubSignal {
+    fn name(&self) -> &'static str {
+        "hub"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_symbol_topology()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        match ctx.topology_scores(&file, candidate.result.line) {
+            Some((hub, _)) => topology_value(hub, ctx.max_hub()),
+            None => 0.0,
+        }
+    }
+}
+
+/// The authority signal (TASK-098, PRD-TOPO-REQ-003): how widely the
+/// symbol at the candidate position is depended on — the core-type
+/// evidence, normalized against the candidate-set maximum. Positions
+/// without topology scores contribute exactly 0.0.
+pub(crate) struct AuthoritySignal;
+
+impl Signal for AuthoritySignal {
+    fn name(&self) -> &'static str {
+        "authority"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_symbol_topology()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        match ctx.topology_scores(&file, candidate.result.line) {
+            Some((_, authority)) => topology_value(authority, ctx.max_authority()),
             None => 0.0,
         }
     }
@@ -1281,6 +1390,8 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(SignatureSignal),
         Box::new(ChurnSignal),
         Box::new(CoChangeSignal),
+        Box::new(HubSignal),
+        Box::new(AuthoritySignal),
     ]
 }
 
@@ -1435,6 +1546,11 @@ pub fn prepare_context(
             .collect();
         ctx.co_change = load_co_change_scores(conn, &files);
     }
+    if reqs.symbol_topology
+        && let Some(conn) = conn
+    {
+        ctx.topology = load_topology_scores(conn, results);
+    }
     ctx
 }
 
@@ -1540,6 +1656,80 @@ fn load_co_change_scores(
         .values()
         .copied()
         .filter(|w| w.is_finite())
+        .fold(0.0f32, f32::max);
+    ctx
+}
+
+/// Load the topology scores for exactly the candidate positions, in
+/// IN_CHUNK batches over the candidate FILES, joined through `symbols`
+/// so each row lands at its definition position. Rows at non-candidate
+/// (file, line) positions are dropped; the stored f64 scores narrow to
+/// f32; the two set maxes fold once over the finite candidates.
+///
+/// A presence probe (the file_churn/co_change precedent) degrades to an
+/// empty context on a pre-TASK-098 index whose `symbol_topology` table
+/// does not exist (PRD-TOPO-REQ-008); every prepare failure is the same
+/// zero-path, never an error.
+fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> TopologyContext {
+    let mut ctx = TopologyContext::default();
+    let positions: std::collections::HashSet<(String, u64)> = results
+        .iter()
+        .map(|r| (r.result.file.to_string_lossy().into_owned(), r.result.line))
+        .collect();
+    if positions.is_empty() {
+        return ctx;
+    }
+    let mut wanted: Vec<&String> = positions.iter().map(|(file, _)| file).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if conn
+        .query_row("SELECT 1 FROM symbol_topology LIMIT 1", [], |_| Ok(()))
+        .is_err()
+    {
+        return ctx;
+    }
+
+    for chunk in wanted.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT s.file, s.line, t.hub, t.authority \
+             FROM symbols s JOIN symbol_topology t ON t.symbol_id = s.id \
+             WHERE s.file IN ({placeholders})"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+            ))
+        }) else {
+            continue;
+        };
+        for (file, line, hub, authority) in rows.flatten() {
+            let key = (file, line as u64);
+            if !positions.contains(&key) {
+                continue;
+            }
+            ctx.scores
+                .entry(key)
+                .or_insert((hub as f32, authority as f32));
+        }
+    }
+    ctx.max_hub = ctx
+        .scores
+        .values()
+        .map(|(hub, _)| *hub)
+        .filter(|s| s.is_finite())
+        .fold(0.0f32, f32::max);
+    ctx.max_authority = ctx
+        .scores
+        .values()
+        .map(|(_, authority)| *authority)
+        .filter(|s| s.is_finite())
         .fold(0.0f32, f32::max);
     ctx
 }
@@ -1857,15 +2047,25 @@ impl RankSettings {
     /// place the `[rank]` section becomes pipeline settings, so flipping
     /// the default is a one-line change. `pinned` is the caller's explicit
     /// class pin (`--query-class` / MCP `query_class`), `None` = detect.
+    /// `topology_enabled` is the `[topology] enabled` kill switch
+    /// (PRD-TOPO-REQ-008): when off, both topology weights are forced to
+    /// exactly 0.0, so the signals are skipped and no topology context is
+    /// prepared — ranking returns to its prior behavior bitwise.
     pub fn from_config(
         rank: &crate::config::RankConfig,
         search: &crate::config::SearchConfig,
         embedding: crate::embedding::EmbeddingProviderKind,
         pinned: Option<QueryClass>,
+        topology_enabled: bool,
     ) -> anyhow::Result<Self> {
+        let mut weights = WeightTable::from_config(&rank.weights)?;
+        if !topology_enabled {
+            weights.weights.insert("hub".to_string(), 0.0);
+            weights.weights.insert("authority".to_string(), 0.0);
+        }
         Ok(Self {
             use_pipeline: rank.enabled,
-            weights: WeightTable::from_config(&rank.weights)?,
+            weights,
             sources: ContextSources {
                 bm25: crate::bm25::Bm25Params::from(search),
                 embedding,
@@ -2008,7 +2208,9 @@ mod tests {
                 "proximity",
                 "signature",
                 "churn",
-                "co_change"
+                "co_change",
+                "hub",
+                "authority"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -2093,7 +2295,7 @@ mod tests {
         assert!(
             err.contains(
                 "known: kind, lexical, semantic, centrality, prominence, path_character, \
-proximity, signature, churn, co_change",
+proximity, signature, churn, co_change, hub, authority",
             ),
             "error lists every valid name: {err}"
         );
@@ -2587,6 +2789,265 @@ proximity, signature, churn, co_change",
             ContextReqs::none().with_co_change()
         );
         assert_eq!(CoChangeSignal.name(), "co_change");
+    }
+
+    // -- hub/authority signals (TASK-098) -----------------------------------
+
+    /// Seed topology rows at candidate positions: `core` (src/core.rs:1)
+    /// carries the set's top scores, `mid` (src/mid.rs:5) half that, and
+    /// `unscored.rs` has a symbol with NO topology row at all.
+    fn topology_seeded_conn() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for (name, kind, file, line) in [
+            ("core", "class", "src/core.rs", 1),
+            ("mid", "function", "src/mid.rs", 5),
+            ("naked", "function", "src/unscored.rs", 9),
+            ("not_a_candidate", "function", "src/other.rs", 3),
+        ] {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, file, line, col, language) \
+                 VALUES (?1, ?2, ?3, ?4, 1, 'rust')",
+                rusqlite::params![name, kind, file, line],
+            )
+            .unwrap();
+        }
+        for (name, hub, authority) in [
+            ("core", 0.8f64, 0.9f64),
+            ("mid", 0.4, 0.45),
+            ("not_a_candidate", 99.0, 99.0),
+        ] {
+            conn.execute(
+                "INSERT INTO symbol_topology (symbol_id, hub, authority) \
+                 SELECT id, ?2, ?3 FROM symbols WHERE name = ?1",
+                rusqlite::params![name, hub, authority],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    #[test]
+    fn topology_value_ratio_clamped_and_zero_paths() {
+        // Pure ratio against the set max — NO log damper: HITS is already
+        // globally L1-normalized, so damping would double-attenuate.
+        assert_eq!(topology_value(0.4, 0.8), 0.5);
+        assert_eq!(topology_value(0.8, 0.8), 1.0, "the set max maps to 1.0");
+        assert!(topology_value(0.6, 0.8) > topology_value(0.2, 0.8));
+        // Clamped, not extrapolated.
+        assert_eq!(topology_value(1.6, 0.8), 1.0);
+        // Absent, degenerate, and non-finite inputs are exactly zero.
+        assert_eq!(topology_value(0.0, 0.8), 0.0);
+        assert_eq!(topology_value(0.4, 0.0), 0.0);
+        assert_eq!(topology_value(f32::NAN, 0.8), 0.0);
+        assert_eq!(topology_value(0.4, f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn hub_authority_absent_from_default_weights_but_configurable() {
+        // Absent = weight 0: rankings are unchanged until a user opts in.
+        let defaults =
+            WeightTable::from_config(&crate::config::RankConfig::default().weights).unwrap();
+        assert_eq!(defaults.weight("hub"), 0.0);
+        assert_eq!(defaults.weight("authority"), 0.0);
+
+        // Registered: both names are accepted by [rank.weights].
+        let mut weights = HashMap::new();
+        weights.insert("hub".to_string(), 1.0);
+        weights.insert("authority".to_string(), 1.0);
+        let table = WeightTable::from_config(&weights).unwrap();
+        assert_eq!(table.weight("hub"), 1.0);
+        assert_eq!(table.weight("authority"), 1.0);
+    }
+
+    #[test]
+    fn hub_and_authority_require_their_context_slice() {
+        assert_eq!(
+            HubSignal.requires(),
+            ContextReqs::none().with_symbol_topology()
+        );
+        assert_eq!(HubSignal.name(), "hub");
+        assert_eq!(
+            AuthoritySignal.requires(),
+            ContextReqs::none().with_symbol_topology()
+        );
+        assert_eq!(AuthoritySignal.name(), "authority");
+    }
+
+    #[test]
+    fn topology_context_loads_candidate_positions_with_folded_maxes() {
+        let (_dir, conn) = topology_seeded_conn();
+        let results = vec![
+            classified("src/core.rs", 1, "x", ResultCategory::Other),
+            classified("src/mid.rs", 5, "x", ResultCategory::Other),
+            classified("src/unscored.rs", 9, "x", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(ctx.topology_scores("src/core.rs", 1), Some((0.8, 0.9)));
+        assert_eq!(ctx.topology_scores("src/mid.rs", 5), Some((0.4, 0.45)));
+        assert_eq!(
+            ctx.topology_scores("src/core.rs", 2),
+            None,
+            "position must match exactly"
+        );
+        assert_eq!(
+            ctx.topology_scores("src/other.rs", 3),
+            None,
+            "a scored symbol outside the candidate set stays out"
+        );
+        // Maxes fold over the CANDIDATE set only (99.0 ignored).
+        assert_eq!(ctx.max_hub(), 0.8);
+        assert_eq!(ctx.max_authority(), 0.9);
+    }
+
+    #[test]
+    fn topology_context_empty_without_table_or_connection() {
+        // A pre-TASK-098 index has no symbol_topology table: the presence
+        // probe degrades to an empty slice, never an error.
+        let raw = Connection::open_in_memory().unwrap();
+        let results = vec![classified("src/a.rs", 1, "x", ResultCategory::Other)];
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "x",
+            &results,
+            Some(&raw),
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.topology_scores("src/a.rs", 1), None);
+        assert_eq!(ctx.max_hub(), 0.0);
+        assert_eq!(ctx.max_authority(), 0.0);
+
+        // No connection at all: same zero-path.
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "x",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.topology_scores("src/a.rs", 1), None);
+    }
+
+    #[test]
+    fn topology_signals_score_missing_or_unscored_positions_exactly_zero() {
+        let (_dir, conn) = topology_seeded_conn();
+        let results = vec![
+            classified("src/core.rs", 1, "x", ResultCategory::Other),
+            classified("src/unscored.rs", 9, "x", ResultCategory::Other),
+        ];
+
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "x" },
+            Some(&conn),
+            &table(&[("hub", 1.0), ("authority", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        let by_file = |f: &str| {
+            scored
+                .iter()
+                .find(|s| s.classified.result.file == *f)
+                .unwrap()
+        };
+        let value = |f: &str, signal: &str| {
+            by_file(f)
+                .contributions
+                .iter()
+                .find(|c| c.signal == signal)
+                .unwrap()
+                .value
+        };
+        // The set max maps to 1.0, half of it to 0.5 — a pure ratio.
+        assert_eq!(value("src/core.rs", "hub"), 1.0);
+        assert_eq!(value("src/core.rs", "authority"), 1.0);
+        assert_eq!(value("src/unscored.rs", "hub"), 0.0, "absent is zero");
+        assert_eq!(value("src/unscored.rs", "authority"), 0.0);
+        // ... and never a penalty: the unscored position still outranks
+        // nothing it did not already outrank.
+        assert!(by_file("src/core.rs").score > by_file("src/unscored.rs").score);
+    }
+
+    #[test]
+    fn widely_depended_upon_core_type_outranks_equally_matched_leaf_helper() {
+        // AC1 end-to-end: two candidates identical on EVERY other signal —
+        // same category, same file shape, same content — separated only by
+        // topology. An explicit authority weight must break the tie.
+        let (_dir, conn) = topology_seeded_conn();
+        let results = vec![
+            classified("src/core.rs", 1, "handler", ResultCategory::Definition),
+            classified("src/unscored.rs", 9, "handler", ResultCategory::Definition),
+        ];
+
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("authority", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(
+            scored[0].classified.result.file,
+            PathBuf::from("src/core.rs"),
+            "the widely-depended-upon core type wins"
+        );
+        assert_eq!(
+            scored[1].classified.result.file,
+            PathBuf::from("src/unscored.rs"),
+            "the equally-matched leaf helper follows"
+        );
+    }
+
+    #[test]
+    fn stale_topology_never_blocks_a_query() {
+        // PRD-TOPO-REQ-007: scores far past the staleness threshold are
+        // SERVED, and the read-only query path leaves the marker exactly
+        // where it was — recomputation belongs to the cadence pass, never
+        // to a query.
+        let (_dir, conn) = topology_seeded_conn();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT OR REPLACE INTO topology_meta (key, value) VALUES ('last_computed', ?1)",
+            rusqlite::params![(now - 90_000).to_string()],
+        )
+        .unwrap();
+        assert!(crate::topology::is_stale(&conn, 86_400), "fixture is stale");
+
+        let results = vec![classified(
+            "src/core.rs",
+            1,
+            "handler",
+            ResultCategory::Definition,
+        )];
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("authority", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(
+            scored[0].contributions[0].value, 1.0,
+            "the stale score still contributes (the set max)"
+        );
+        assert_eq!(
+            crate::topology::last_computed(&conn),
+            Some(now - 90_000),
+            "the query path must not recompute or restamp"
+        );
     }
 
     #[test]
@@ -4607,6 +5068,77 @@ proximity, signature, churn, co_change",
     }
 
     #[test]
+    fn rank_settings_topology_kill_switch_restores_prior_behavior_exactly() {
+        // A table that opts into topology, loaded with the kill switch on:
+        // both weights are forced to exactly 0.0 (PRD-TOPO-REQ-008).
+        let rank = crate::config::RankConfig {
+            enabled: true,
+            weights: std::collections::HashMap::from([
+                ("kind".to_string(), 1.0),
+                ("hub".to_string(), 2.0),
+                ("authority".to_string(), 3.0),
+            ]),
+            class_multipliers: ClassMultipliers::neutral(),
+        };
+        let search = crate::config::SearchConfig::default();
+        let disabled = RankSettings::from_config(
+            &rank,
+            &search,
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(disabled.weights.weight("hub"), 0.0);
+        assert_eq!(disabled.weights.weight("authority"), 0.0);
+        assert_eq!(disabled.weights.weight("kind"), 1.0);
+
+        // The zeroed table scores a populated candidate set
+        // bitwise-identically to a table that never named topology:
+        // zero-weight signals are skipped and no topology context is
+        // prepared, so ranking returns to its prior behavior EXACTLY.
+        let (_dir, conn) = topology_seeded_conn();
+        let results = vec![
+            classified("src/core.rs", 1, "handler", ResultCategory::Definition),
+            classified("src/mid.rs", 5, "handler", ResultCategory::Definition),
+        ];
+        let scored_disabled = rerank(
+            results.clone(),
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &disabled.weights,
+            &ContextSources::default(),
+        );
+        let mut prior = rank.clone();
+        prior.weights.remove("hub");
+        prior.weights.remove("authority");
+        let prior_settings = RankSettings::from_config(
+            &prior,
+            &search,
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            true,
+        )
+        .unwrap();
+        let scored_prior = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &prior_settings.weights,
+            &ContextSources::default(),
+        );
+        assert_eq!(scored_disabled.len(), scored_prior.len());
+        for (with_switch, without_names) in scored_disabled.iter().zip(&scored_prior) {
+            assert_eq!(
+                with_switch.score.to_bits(),
+                without_names.score.to_bits(),
+                "scores must be bitwise-identical"
+            );
+            assert_eq!(with_switch.contributions, without_names.contributions);
+        }
+    }
+
+    #[test]
     fn rank_settings_from_config_maps_every_surface() {
         let mut rank = crate::config::RankConfig {
             enabled: true,
@@ -4626,6 +5158,7 @@ proximity, signature, churn, co_change",
             &search,
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
+            true,
         )
         .unwrap();
         assert!(settings.use_pipeline);
@@ -4640,6 +5173,7 @@ proximity, signature, churn, co_change",
             &search,
             crate::embedding::EmbeddingProviderKind::Bundled,
             Some(QueryClass::Path),
+            true,
         )
         .unwrap();
         assert_eq!(pinned.pinned_class, Some(QueryClass::Path));
@@ -4651,6 +5185,7 @@ proximity, signature, churn, co_change",
             &search,
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
+            true,
         )
         .unwrap();
         assert!(!legacy.use_pipeline);
@@ -4662,7 +5197,8 @@ proximity, signature, churn, co_change",
                 &rank,
                 &search,
                 crate::embedding::EmbeddingProviderKind::Bundled,
-                None
+                None,
+                true
             )
             .is_err()
         );

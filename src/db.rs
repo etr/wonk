@@ -239,6 +239,27 @@ CREATE TABLE IF NOT EXISTS co_change (
 CREATE INDEX IF NOT EXISTS idx_co_change_a ON co_change(file_a, weight DESC);
 "#;
 
+// Global graph topology (TASK-098, DR-040): hub and authority scores per
+// symbol, recomputed as a distinct pass on a cadence and NEVER
+// incrementally per file (PRD-TOPO-REQ-006) — the scores are global
+// graph properties, so a file edit cannot update them locally. `community`
+// and its index are created now but stay NULL-filled/unread until
+// TASK-099 owns them. `topology_meta.last_computed` drives the cadence
+// gate and the staleness marker (PRD-TOPO-REQ-007).
+const TOPOLOGY_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS symbol_topology (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    hub REAL NOT NULL,
+    authority REAL NOT NULL,
+    community INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_topology_community ON symbol_topology(community);
+CREATE TABLE IF NOT EXISTS topology_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#;
+
 const TRIGGERS_SQL: &str = r#"
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
     INSERT INTO symbols_fts(rowid, name, kind, file)
@@ -330,6 +351,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating review_suppressions table")?;
     conn.execute_batch(HISTORY_SQL)
         .context("creating history tables")?;
+    conn.execute_batch(TOPOLOGY_SQL)
+        .context("creating topology tables")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -394,6 +417,17 @@ pub fn ensure_summaries_table(conn: &Connection) -> Result<()> {
 pub fn ensure_history_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(HISTORY_SQL)
         .context("creating history tables (migration)")?;
+    Ok(())
+}
+
+/// Ensure the TASK-098 topology tables exist (`symbol_topology`,
+/// `topology_meta`).
+///
+/// Handles schema migration for indexes created before graph-topology
+/// scoring: safe to call on databases that already have the tables.
+pub fn ensure_topology_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(TOPOLOGY_SQL)
+        .context("creating topology tables (migration)")?;
     Ok(())
 }
 
@@ -1947,6 +1981,59 @@ mod tests {
         ensure_history_tables(&conn).unwrap();
         ensure_history_tables(&conn).unwrap();
         assert_eq!(history_table_names(&conn).len(), 5);
+    }
+
+    // -- topology tables (TASK-098) -------------------------------------------
+
+    fn topology_table_names(conn: &Connection) -> Vec<String> {
+        let names = "('symbol_topology','topology_meta')";
+        conn.prepare(&format!(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN {names}"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    #[test]
+    fn test_open_creates_topology_tables() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        let mut tables = topology_table_names(&conn);
+        tables.sort();
+        assert_eq!(tables, vec!["symbol_topology", "topology_meta"]);
+        // The community-membership index rides along with the table; the
+        // column it covers stays NULL-filled until TASK-099 owns it.
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_topology_community'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(indexes, vec!["idx_topology_community"]);
+    }
+
+    #[test]
+    fn test_ensure_topology_tables_on_pre098_db_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A pre-TASK-098 index: base schema only, no topology tables.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        assert!(topology_table_names(&conn).is_empty());
+
+        // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
+        ensure_topology_tables(&conn).unwrap();
+        ensure_topology_tables(&conn).unwrap();
+        assert_eq!(topology_table_names(&conn).len(), 2);
     }
 
     // -- confidence column tests -----------------------------------------------
