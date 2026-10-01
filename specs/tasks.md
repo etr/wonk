@@ -4087,7 +4087,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-HIST-REQ-004, PRD-HIST-REQ-005, PRD-HIST-REQ-006, PRD-HIST-REQ-007
 **Related Decisions:** DR-039
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
