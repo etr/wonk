@@ -185,7 +185,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 .map(|c| db::count_matching_symbols(c, &args.pattern))
                 .unwrap_or(0);
 
-            let mode = detect_search_mode(args.raw, args.smart, symbol_count);
+            let mode = detect_search_mode(args.raw, args.smart || args.why, symbol_count);
 
             // Print mode indicator (skip for raw — user explicitly chose it).
             if !args.raw {
@@ -239,6 +239,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         content: fr.content.clone(),
                         annotation: fr.annotation.clone(),
                         source: Some(fr.source.to_string()),
+                        why: None,
                     };
                     if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
                         truncated += 1;
@@ -247,10 +248,27 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 match mode {
                     SearchMode::Smart(_) => {
-                        // Ranked mode: classify, sort, dedup, and group with headers.
+                        // Ranked mode: classify, then either the legacy
+                        // lexicographic sort or the signal pipeline, then the
+                        // shared dedup/group with headers. REQ-017: the
+                        // pipeline is config-gated and off by default;
+                        // --why opts in for this invocation.
                         use crate::ranker;
 
-                        let groups = ranker::rank_and_dedup(&results, conn.as_ref(), &args.pattern);
+                        // Defense in depth: config load already rejected
+                        // unknown signal names.
+                        let weights =
+                            crate::rerank::WeightTable::from_config(&config.rank.weights)?;
+                        let settings = crate::rerank::RankSettings {
+                            use_pipeline: config.rank.enabled || args.why,
+                            weights,
+                        };
+                        let groups = crate::rerank::rank_and_explain(
+                            &results,
+                            conn.as_ref(),
+                            &args.pattern,
+                            &settings,
+                        );
 
                         for (category, items) in &groups {
                             if !suppress {
@@ -258,14 +276,24 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             }
                             for item in items {
                                 let mut out = SearchOutput::from_search_result(
-                                    &item.result.file,
-                                    item.result.line,
-                                    item.result.col,
-                                    &item.result.content,
+                                    &item.classified.result.file,
+                                    item.classified.result.line,
+                                    item.classified.result.col,
+                                    &item.classified.result.content,
                                 );
-                                out.annotation = item.annotation.clone();
-                                if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
+                                out.annotation = item.classified.annotation.clone();
+                                if args.why {
+                                    out.why = Some(crate::output::WhyOutput::from_contributions(
+                                        item.score,
+                                        &item.contributions,
+                                    ));
+                                }
+                                let status = fmt.format_search_result(&out)?;
+                                if status == BudgetStatus::Skipped {
                                     truncated += 1;
+                                } else if args.why {
+                                    let why = out.why.as_ref().expect("set above");
+                                    output::print_why_line(&out.file, out.line, why);
                                 }
                             }
                         }
@@ -5700,6 +5728,7 @@ mod tests {
             raw: false,
             smart: false,
             semantic: false,
+            why: false,
             file: None,
             paths: vec![],
         });

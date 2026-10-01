@@ -33,6 +33,7 @@ wonk search "render" -- src/components/
 | `--raw` | Skip ranking, deduplication, and category headers |
 | `--smart` | Force smart ranking even if pattern does not match known symbols |
 | `--semantic` | Blend structural results with embedding-based semantic results (RRF fusion) |
+| `--why` | Explain each result's ranking: per-signal contributions and the final score. Implies smart ranked mode through the signal pipeline; conflicts with `--raw` and `--semantic`. The breakdown is printed to stderr (one `why:` line per result, so stdout stays pipe-clean) and embedded as a `why` object per row in `--format json` |
 | `-- <paths>` | Restrict search to specific paths |
 
 ### `wonk ask <query>`

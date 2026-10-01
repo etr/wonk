@@ -527,3 +527,238 @@ fn mcp_ask_fuses_bm25_ranked_lexical_input() {
         seen.join(", ")
     );
 }
+
+// -- rank-config-gated wonk_search (TASK-092) --------------------------------
+//
+// The rewired tool_search loads config per call: [rank.weights] is
+// validated against the signal registry (unknown names are a hard error)
+// and config.rank.enabled gates the rerank pipeline. Rows must stay
+// identical either way under the default kind-only weights (AR-033).
+
+/// Fixture like [`indexed_central_repo`], with a corpus whose
+/// "authenticate_user" hits produce a deterministic ranked row set: an
+/// import line, a definition-looking line, and a call line. (The MCP
+/// search path passes absolute roots, so index-based Definition/CallSite
+/// classification does not fire — rows come from the content heuristics,
+/// exactly as before the rerank rewire.)
+fn indexed_central_repo_search(bin: &Path) -> (tempfile::TempDir, tempfile::TempDir) {
+    let repo = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(repo.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    let src_dir = repo.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(
+        src_dir.join("auth.rs"),
+        "use crate::session::Session;\n\npub fn authenticate_user(token: &str) -> Session {\n    Session::from_token(token)\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        src_dir.join("caller.rs"),
+        "use crate::auth::authenticate_user;\n\npub fn login() {\n    authenticate_user(\"t\");\n}\n",
+    )
+    .unwrap();
+
+    let home = tempfile::tempdir().unwrap();
+    let init = offline_command(bin, repo.path())
+        .env("HOME", home.path())
+        .args(["init"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "wonk init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    (repo, home)
+}
+
+/// One live MCP server session with the handshake completed, ready for
+/// tool calls. `finish` closes stdin, drains stderr, and asserts a clean
+/// exit.
+struct McpSession {
+    child: Child,
+    stdin: Box<dyn Write>,
+    reader: Box<dyn BufRead>,
+}
+
+impl McpSession {
+    fn start(bin: &Path, repo: &Path, home: &Path) -> Self {
+        let mut child = spawn_offline_mcp_server(bin, repo, home);
+        let mut stdin: Box<dyn Write> = Box::new(child.stdin.take().unwrap());
+        let mut reader: Box<dyn BufRead> = Box::new(BufReader::new(child.stdout.take().unwrap()));
+
+        let init_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0.1"}
+            }
+        });
+        let init_resp = send_and_recv(&mut stdin, &mut reader, &init_req);
+        assert!(
+            init_resp["error"].is_null(),
+            "initialize failed: {init_resp}"
+        );
+        send_notification(
+            &mut stdin,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        );
+        Self {
+            child,
+            stdin,
+            reader,
+        }
+    }
+
+    fn wonk_search(&mut self, query: &str) -> Value {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "wonk_search",
+                "arguments": {"query": query}
+            }
+        });
+        send_and_recv(&mut self.stdin, &mut self.reader, &req)
+    }
+
+    fn finish(mut self) {
+        // Close stdin so the server exits; keep the stdout reader open
+        // through wait() (dropping it early EPIPEs the server's final
+        // writes), mirroring the mcp_wonk_ask close sequence.
+        drop(self.stdin);
+        let mut stderr_text = String::new();
+        if let Some(mut stderr) = self.child.stderr.take() {
+            let _ = stderr.read_to_string(&mut stderr_text);
+        }
+        let status = self.child.wait().unwrap();
+        assert!(
+            status.success(),
+            "server exited with status {status} (stderr: {stderr_text})"
+        );
+        drop(self.reader);
+    }
+}
+
+#[test]
+fn mcp_search_rows_stable_from_default_through_enabled_pipeline() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo_search(&bin);
+
+    // Default config (pipeline disabled, REQ-017): rows render in the
+    // pre-change format — tier-ordered (import first, then the remaining
+    // lines by (file, line)), each row carrying exactly file/line/col/
+    // content.
+    let mut session = McpSession::start(&bin, repo.path(), home.path());
+    let default_resp = session.wonk_search("authenticate_user");
+    assert!(
+        default_resp["result"]["isError"].is_null(),
+        "default config must keep wonk_search working: {default_resp}"
+    );
+    let default_text = default_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let rows: Vec<Value> =
+        serde_json::from_str(default_text).expect("wonk_search returns a JSON row array");
+
+    let expected: [(&str, u64, &str); 3] = [
+        ("src/caller.rs", 1, "use crate::auth::authenticate_user;"),
+        (
+            "src/auth.rs",
+            3,
+            "pub fn authenticate_user(token: &str) -> Session {",
+        ),
+        ("src/caller.rs", 4, "    authenticate_user(\"t\");"),
+    ];
+    assert_eq!(rows.len(), expected.len(), "row set: {default_text}");
+    for (row, (file, line, content)) in rows.iter().zip(&expected) {
+        assert_eq!(row["line"], *line, "row line mismatch: {row}");
+        assert_eq!(row["col"], 1, "row col mismatch: {row}");
+        assert_eq!(
+            row["content"].as_str().unwrap(),
+            *content,
+            "row content mismatch: {row}"
+        );
+        let got_file = row["file"].as_str().unwrap();
+        assert!(
+            got_file.ends_with(file),
+            "row file {got_file} must end with {file}"
+        );
+        // The annotation field renders only when dedup fires; it must stay
+        // absent otherwise (pre-change serde shape).
+        assert!(
+            row.get("annotation").is_none(),
+            "annotation key must be omitted when None: {row}"
+        );
+    }
+
+    // Flip [rank] enabled=true MID-SESSION: the handler loads config per
+    // call, so the next call routes through the signal pipeline — and with
+    // the kind-only default weights the rows must stay byte-identical.
+    fs::create_dir_all(repo.path().join(".wonk")).unwrap();
+    fs::write(
+        repo.path().join(".wonk/config.toml"),
+        "[rank]\nenabled = true\n",
+    )
+    .unwrap();
+    let enabled_resp = session.wonk_search("authenticate_user");
+    assert!(
+        enabled_resp["result"]["isError"].is_null(),
+        "enabled pipeline must keep wonk_search working: {enabled_resp}"
+    );
+    let enabled_text = enabled_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        default_text, enabled_text,
+        "config.rank.enabled=true must not change wonk_search rows"
+    );
+    session.finish();
+}
+
+#[test]
+fn mcp_search_invalid_rank_weights_is_tool_error() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let (repo, home) = indexed_central_repo_search(&bin);
+
+    // Start the server while the config is still valid, then poison
+    // [rank.weights]: the handler's per-call config load rejects unknown
+    // signal names, surfacing as an isError CallToolResult naming the
+    // offender (a server started with this config would exit earlier, in
+    // CLI dispatch).
+    let mut session = McpSession::start(&bin, repo.path(), home.path());
+    fs::create_dir_all(repo.path().join(".wonk")).unwrap();
+    fs::write(
+        repo.path().join(".wonk/config.toml"),
+        "[rank.weights]\nbogus = 1.0\n",
+    )
+    .unwrap();
+    let resp = session.wonk_search("authenticate_user");
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "unknown signal name must fail the tool call: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("unknown signal name 'bogus'"),
+        "error must name the offending signal: {text}"
+    );
+    assert!(
+        text.contains("known: kind"),
+        "error must list the valid signal names: {text}"
+    );
+    session.finish();
+}

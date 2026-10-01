@@ -138,6 +138,11 @@ pub struct SearchArgs {
     #[arg(long, conflicts_with = "raw")]
     pub semantic: bool,
 
+    /// Explain each result's ranking: per-signal contributions and final
+    /// score (implies smart ranked mode via the signal pipeline)
+    #[arg(long, conflicts_with_all = ["raw", "semantic"])]
+    pub why: bool,
+
     /// Restrict search to files matching this path (substring match)
     #[arg(short = 'f', long)]
     pub file: Option<String>,
@@ -808,6 +813,55 @@ mod tests {
     fn parse_search_semantic_conflicts_with_raw() {
         let result = Cli::try_parse_from(["wonk", "search", "--semantic", "--raw", "pattern"]);
         assert!(result.is_err(), "--semantic and --raw should conflict");
+    }
+
+    #[test]
+    fn parse_search_why_flag() {
+        let cli = Cli::try_parse_from(["wonk", "search", "--why", "verifyToken"]).unwrap();
+        match cli.command {
+            Command::Search(args) => {
+                assert_eq!(args.pattern, "verifyToken");
+                assert!(args.why);
+                assert!(!args.raw);
+                assert!(!args.semantic);
+            }
+            _ => panic!("expected Command::Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_why_default_false() {
+        let cli = Cli::try_parse_from(["wonk", "search", "verifyToken"]).unwrap();
+        match cli.command {
+            Command::Search(args) => {
+                assert!(!args.why);
+            }
+            _ => panic!("expected Command::Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_why_conflicts_with_raw() {
+        let result = Cli::try_parse_from(["wonk", "search", "--why", "--raw", "pattern"]);
+        assert!(result.is_err(), "--why and --raw should conflict");
+    }
+
+    #[test]
+    fn parse_search_why_conflicts_with_semantic() {
+        let result = Cli::try_parse_from(["wonk", "search", "--why", "--semantic", "pattern"]);
+        assert!(result.is_err(), "--why and --semantic should conflict");
+    }
+
+    #[test]
+    fn parse_search_why_combines_with_smart() {
+        let cli = Cli::try_parse_from(["wonk", "search", "--smart", "--why", "pattern"]).unwrap();
+        match cli.command {
+            Command::Search(args) => {
+                assert!(args.why);
+                assert!(args.smart);
+            }
+            _ => panic!("expected Command::Search"),
+        }
     }
 
     #[test]
