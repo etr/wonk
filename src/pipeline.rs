@@ -77,6 +77,9 @@ struct FileResult {
     term_freqs: HashMap<String, u32>,
     /// Contract candidates extracted on the same tree walk (TASK-082).
     contracts: Vec<ContractCandidate>,
+    /// Per-symbol shingle signatures (TASK-100), correlated to `symbols`
+    /// by start line (unique within a file).
+    shingles: Vec<crate::shingles::ShingleSignature>,
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +490,9 @@ pub fn reindex_file(
     let line_count = content.lines().count();
     let term_freqs = crate::tokenizer::term_frequencies(&content);
 
+    // Shingle signatures over the parsed spans (TASK-100).
+    let shingles = compute_symbol_shingles(&parse_source, &symbols);
+
     // Single transaction: delete old data, insert new data.
     upsert_file_data(
         conn,
@@ -501,6 +507,7 @@ pub fn reindex_file(
             type_edges,
             term_freqs,
             contracts,
+            shingles,
         },
     )?;
 
@@ -720,11 +727,14 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
 
     // Insert new symbols and build a name -> id map for caller_id resolution.
     let mut caller_map: HashMap<&str, i64> = HashMap::new();
+    let shingles_by_line = shingle_blobs_by_line(&result.shingles);
     {
         let mut stmt = tx.prepare(
             "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language, doc_comment) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
+        let mut shingle_stmt =
+            tx.prepare("INSERT INTO symbol_shingles (symbol_id, signature) VALUES (?1, ?2)")?;
         for sym in &result.symbols {
             stmt.execute(rusqlite::params![
                 sym.name,
@@ -738,7 +748,11 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
                 sym.language,
                 sym.doc_comment,
             ])?;
-            caller_map.insert(&sym.name, tx.last_insert_rowid());
+            let symbol_id = tx.last_insert_rowid();
+            caller_map.insert(&sym.name, symbol_id);
+            if let Some(blob) = shingles_by_line.get(&sym.line) {
+                shingle_stmt.execute(rusqlite::params![symbol_id, blob])?;
+            }
         }
     }
 
@@ -855,6 +869,50 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
 // Internals
 // ---------------------------------------------------------------------------
 
+/// Compute the shingle signature of every symbol with a valid span
+/// (TASK-100, PRD-DUP-REQ-001): lines `line..=end_line` of `parse_source`
+/// — the exact text the tree-sitter tree was parsed over — sketched by
+/// [`crate::shingles::body_signature`]. Symbols with `end_line: None`, an
+/// inverted span, or a body too short for one shingle produce no entry.
+fn compute_symbol_shingles(
+    parse_source: &str,
+    symbols: &[Symbol],
+) -> Vec<crate::shingles::ShingleSignature> {
+    let lines: Vec<&str> = parse_source.lines().collect();
+    symbols
+        .iter()
+        .filter_map(|sym| {
+            let end = sym.end_line?;
+            if sym.line == 0 || end < sym.line {
+                return None;
+            }
+            let span = lines.get(sym.line - 1..end)?;
+            let body = span.join("\n");
+            let sketch = crate::shingles::body_signature(&body);
+            if sketch.is_empty() {
+                None
+            } else {
+                Some(crate::shingles::ShingleSignature {
+                    line: sym.line,
+                    sketch,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Encode a file's signatures as `start line -> blob`, the correlation the
+/// insert loops consume right after each symbol insert (the fresh
+/// `last_insert_rowid()` is the row's symbol id).
+fn shingle_blobs_by_line(
+    shingles: &[crate::shingles::ShingleSignature],
+) -> HashMap<usize, Vec<u8>> {
+    shingles
+        .iter()
+        .map(|sig| (sig.line, crate::shingles::encode_sketch(&sig.sketch)))
+        .collect()
+}
+
 /// Parse a single file and extract everything we need.
 ///
 /// Returns `None` if the file is not a supported language or cannot be read.
@@ -914,6 +972,9 @@ fn parse_one_file(
     let line_count = content.lines().count();
     let term_freqs = crate::tokenizer::term_frequencies(&content);
 
+    // Shingle signatures over the parsed spans (TASK-100).
+    let shingles = compute_symbol_shingles(&parse_source, &symbols);
+
     Some(FileResult {
         rel_path,
         language: lang.name().to_string(),
@@ -925,6 +986,7 @@ fn parse_one_file(
         type_edges,
         term_freqs,
         contracts,
+        shingles,
     })
 }
 
@@ -978,6 +1040,8 @@ fn document_file_result(
         type_edges: Vec::new(),
         term_freqs: crate::tokenizer::term_frequencies(content),
         contracts,
+        // Documents carry no symbols, hence no signatures.
+        shingles: Vec::new(),
     })
 }
 
@@ -1028,8 +1092,11 @@ fn batch_insert(
             "INSERT INTO symbols (name, kind, file, line, col, end_line, scope, signature, language, doc_comment) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
+        let mut shingle_stmt =
+            tx.prepare("INSERT INTO symbol_shingles (symbol_id, signature) VALUES (?1, ?2)")?;
         for r in results {
             let file_map = file_caller_maps.entry(&r.rel_path).or_default();
+            let shingles_by_line = shingle_blobs_by_line(&r.shingles);
             for sym in &r.symbols {
                 stmt.execute(rusqlite::params![
                     sym.name,
@@ -1043,7 +1110,11 @@ fn batch_insert(
                     sym.language,
                     sym.doc_comment,
                 ])?;
-                file_map.insert(&sym.name, tx.last_insert_rowid());
+                let symbol_id = tx.last_insert_rowid();
+                file_map.insert(&sym.name, symbol_id);
+                if let Some(blob) = shingles_by_line.get(&sym.line) {
+                    shingle_stmt.execute(rusqlite::params![symbol_id, blob])?;
+                }
                 total_syms += 1;
             }
         }
@@ -1865,6 +1936,105 @@ class Component {
         let stats = build_index(dir.path(), true).unwrap();
         // 2 HTTP providers + 1 env consumer; util.txt contributes nothing.
         assert_eq!(stats.contract_count, 3, "got {stats:?}");
+    }
+
+    // -- shingle signatures (TASK-100) -----------------------------------------
+
+    /// `rich_body` spans lines 1-4 (>= 5 body tokens); `tiny` spans lines
+    /// 6-8 (4 tokens — below one shingle, so no signature row).
+    const SHINGLES_SOURCE: &str = "pub fn rich_body(left: u32, right: u32) -> u32 {\n    let combined = left + right;\n    combined * combined\n}\n\npub fn tiny() {\n    1\n}\n";
+
+    fn make_shingles_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), SHINGLES_SOURCE).unwrap();
+        dir
+    }
+
+    fn shingles_for_file(conn: &Connection, file: &str) -> Vec<(i64, Vec<u8>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.line, ss.signature FROM symbol_shingles ss \
+                 JOIN symbols s ON s.id = ss.symbol_id WHERE s.file = ?1 \
+                 ORDER BY s.line",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![file], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .unwrap()
+        .flatten()
+        .collect()
+    }
+
+    #[test]
+    fn shingles_written_per_symbol() {
+        let dir = make_shingles_repo();
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open(&db::local_index_path(dir.path())).unwrap();
+
+        let rows = shingles_for_file(&conn, "src/lib.rs");
+        assert_eq!(rows.len(), 1, "only rich_body has a shingle-bearing body");
+        let (line, blob) = &rows[0];
+        assert_eq!(*line, 1);
+
+        // The blob is the bottom-k sketch of the exact indexed span.
+        let expected = crate::shingles::encode_sketch(&crate::shingles::body_signature(
+            "pub fn rich_body(left: u32, right: u32) -> u32 {\n    let combined = left + right;\n    combined * combined\n}",
+        ));
+        assert_eq!(blob, &expected);
+    }
+
+    #[test]
+    fn reindex_rewrites_shingles() {
+        let dir = make_shingles_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let conn = db::open(&db::local_index_path(root)).unwrap();
+        let before = shingles_for_file(&conn, "src/lib.rs")[0].1.clone();
+
+        // Edit the body: the span content changes, so the sketch must
+        // change even though the symbol keeps its line.
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn rich_body(left: u32, right: u32) -> u32 {\n    let shifted = right.wrapping_sub(left);\n    shifted ^ shifted\n}\n\npub fn tiny() {\n    1\n}\n",
+        )
+        .unwrap();
+        reindex_file(
+            &conn,
+            &root.join("src/lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
+
+        let rows = shingles_for_file(&conn, "src/lib.rs");
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].1, before, "edited body must rewrite the blob");
+        // And the rewrite is the incremental path's exact new signature.
+        let expected = crate::shingles::encode_sketch(&crate::shingles::body_signature(
+            "pub fn rich_body(left: u32, right: u32) -> u32 {\n    let shifted = right.wrapping_sub(left);\n    shifted ^ shifted\n}",
+        ));
+        assert_eq!(rows[0].1, expected);
+    }
+
+    #[test]
+    fn delete_file_cascades_shingles() {
+        let dir = make_shingles_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let conn = db::open(&db::local_index_path(root)).unwrap();
+        assert_eq!(shingles_for_file(&conn, "src/lib.rs").len(), 1);
+
+        remove_file(&conn, &root.join("src/lib.rs"), root).unwrap();
+
+        assert_eq!(
+            shingles_for_file(&conn, "src/lib.rs").len(),
+            0,
+            "signature rows cascade with the file's symbols"
+        );
     }
 
     #[test]
