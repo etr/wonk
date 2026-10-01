@@ -478,12 +478,17 @@ pub struct CoChangeContext {
 
 /// Computed topology scores at the candidate positions (TASK-098):
 /// `(hub, authority)` per (file, line), with the two set maxes folded once
-/// at preparation time.
+/// at preparation time. TASK-099 adds the community assignment per
+/// position plus the candidate set's modal community and its
+/// concentration fraction — the two halves of the REQ-004 signal.
 #[derive(Debug, Default, Clone)]
 pub struct TopologyContext {
     pub(crate) scores: HashMap<(String, u64), (f32, f32)>,
     pub(crate) max_hub: f32,
     pub(crate) max_authority: f32,
+    pub(crate) communities: HashMap<(String, u64), i64>,
+    pub(crate) modal: Option<i64>,
+    pub(crate) modal_fraction: f32,
 }
 
 /// The query sources the pipeline prepares context against: the BM25
@@ -606,6 +611,29 @@ impl SharedContext {
     /// The largest authority score across the candidate set; 0 when none.
     pub fn max_authority(&self) -> f32 {
         self.topology.max_authority
+    }
+
+    /// Community assignment at a candidate position (None unless
+    /// prepared, or when the position carries no topology row — a call
+    /// site, a comment, or a TASK-098-scored index with NULL communities).
+    pub fn community_at(&self, file: &str, line: u64) -> Option<i64> {
+        self.topology
+            .communities
+            .get(&(file.to_string(), line))
+            .copied()
+    }
+
+    /// The candidate set's modal community — the largest histogram entry,
+    /// ties to the smallest community id; `None` when no carrying
+    /// candidate exists.
+    pub fn modal_community(&self) -> Option<i64> {
+        self.topology.modal
+    }
+
+    /// Fraction of carrying candidates in the modal community: how
+    /// concentrated the results are (0.0 when there is no modal).
+    pub fn modal_community_fraction(&self) -> f32 {
+        self.topology.modal_fraction
     }
 }
 
@@ -850,6 +878,20 @@ pub fn topology_value(score: f32, set_max: f32) -> f32 {
         return 0.0;
     }
     (score / set_max).clamp(0.0, 1.0)
+}
+
+/// The community-membership value (TASK-099, PRD-TOPO-REQ-004): a member
+/// of the candidate set's modal community scores exactly the
+/// concentration `fraction` — full weight at 100% concentration, 0.4 of
+/// it at 40%, vanishing as results scatter — and EVERY other candidate
+/// (another community, no community, or no modal at all) scores exactly
+/// 0.0: membership is a bonus, never a penalty. A non-finite fraction is
+/// a corrupt context, not a score.
+pub fn community_value(mine: Option<i64>, modal: Option<i64>, fraction: f32) -> f32 {
+    if mine.is_none() || mine != modal || !fraction.is_finite() {
+        return 0.0;
+    }
+    fraction.clamp(0.0, 1.0)
 }
 
 /// The churn signal: how actively the candidate file was modified within
@@ -1692,7 +1734,7 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
     for chunk in wanted.chunks(IN_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!(
-            "SELECT s.file, s.line, t.hub, t.authority \
+            "SELECT s.file, s.line, t.hub, t.authority, t.community \
              FROM symbols s JOIN symbol_topology t ON t.symbol_id = s.id \
              WHERE s.file IN ({placeholders})"
         );
@@ -1705,18 +1747,22 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
                 row.get::<_, i64>(1)?,
                 row.get::<_, f64>(2)?,
                 row.get::<_, f64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         }) else {
             continue;
         };
-        for (file, line, hub, authority) in rows.flatten() {
+        for (file, line, hub, authority, community) in rows.flatten() {
             let key = (file, line as u64);
             if !positions.contains(&key) {
                 continue;
             }
             ctx.scores
-                .entry(key)
+                .entry(key.clone())
                 .or_insert((hub as f32, authority as f32));
+            if let Some(community) = community {
+                ctx.communities.entry(key).or_insert(community);
+            }
         }
     }
     ctx.max_hub = ctx
@@ -1731,6 +1777,26 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
         .map(|(_, authority)| *authority)
         .filter(|s| s.is_finite())
         .fold(0.0f32, f32::max);
+
+    // The REQ-004 fold: a UNIFORM histogram over the carrying candidates
+    // — scores do not exist at preparation time, so any score weighting
+    // would be circular. Modal is a max under (count desc, id asc), a
+    // total order, so HashMap iteration order cannot leak in. Candidates
+    // without a topology row are outside the histogram AND the
+    // denominator: they are not evidence about concentration.
+    let mut histogram: HashMap<i64, usize> = HashMap::new();
+    for key in &positions {
+        if let Some(&community) = ctx.communities.get(key) {
+            *histogram.entry(community).or_insert(0) += 1;
+        }
+    }
+    if let Some((&modal, &count)) = histogram
+        .iter()
+        .max_by(|&(id_a, count_a), &(id_b, count_b)| count_a.cmp(count_b).then(id_b.cmp(id_a)))
+    {
+        ctx.modal = Some(modal);
+        ctx.modal_fraction = count as f32 / histogram.values().sum::<usize>() as f32;
+    }
     ctx
 }
 
@@ -2795,7 +2861,9 @@ proximity, signature, churn, co_change, hub, authority",
 
     /// Seed topology rows at candidate positions: `core` (src/core.rs:1)
     /// carries the set's top scores, `mid` (src/mid.rs:5) half that, and
-    /// `unscored.rs` has a symbol with NO topology row at all.
+    /// `unscored.rs` has a symbol with NO topology row at all. `core` and
+    /// `mid` share community 7 (TASK-099); `not_a_candidate` sits alone in
+    /// community 99 to prove non-candidates stay out of the histogram.
     fn topology_seeded_conn() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
@@ -2812,15 +2880,15 @@ proximity, signature, churn, co_change, hub, authority",
             )
             .unwrap();
         }
-        for (name, hub, authority) in [
-            ("core", 0.8f64, 0.9f64),
-            ("mid", 0.4, 0.45),
-            ("not_a_candidate", 99.0, 99.0),
+        for (name, hub, authority, community) in [
+            ("core", 0.8f64, 0.9f64, 7i64),
+            ("mid", 0.4, 0.45, 7),
+            ("not_a_candidate", 99.0, 99.0, 99),
         ] {
             conn.execute(
-                "INSERT INTO symbol_topology (symbol_id, hub, authority) \
-                 SELECT id, ?2, ?3 FROM symbols WHERE name = ?1",
-                rusqlite::params![name, hub, authority],
+                "INSERT INTO symbol_topology (symbol_id, hub, authority, community) \
+                 SELECT id, ?2, ?3, ?4 FROM symbols WHERE name = ?1",
+                rusqlite::params![name, hub, authority, community],
             )
             .unwrap();
         }
@@ -2841,6 +2909,22 @@ proximity, signature, churn, co_change, hub, authority",
         assert_eq!(topology_value(0.4, 0.0), 0.0);
         assert_eq!(topology_value(f32::NAN, 0.8), 0.0);
         assert_eq!(topology_value(0.4, f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn community_value_exact_constants_and_zero_paths() {
+        // A modal member scores exactly the concentration fraction...
+        assert_eq!(community_value(Some(7), Some(7), 0.75), 0.75);
+        // ...clamped, never extrapolated.
+        assert_eq!(community_value(Some(7), Some(7), 1.4), 1.0);
+        // Every other path — another community, no community, no modal
+        // (an empty or all-NULL candidate set) — is exactly 0.0.
+        assert_eq!(community_value(Some(12), Some(7), 0.75), 0.0);
+        assert_eq!(community_value(None, Some(7), 0.75), 0.0);
+        assert_eq!(community_value(Some(7), None, 0.75), 0.0);
+        assert_eq!(community_value(None, None, 0.0), 0.0);
+        // A non-finite fraction must not leak into a score.
+        assert_eq!(community_value(Some(7), Some(7), f32::NAN), 0.0);
     }
 
     #[test]
@@ -2909,6 +2993,42 @@ proximity, signature, churn, co_change, hub, authority",
     }
 
     #[test]
+    fn topology_context_folds_the_modal_community_and_fraction() {
+        let (_dir, conn) = topology_seeded_conn();
+        let results = vec![
+            classified("src/core.rs", 1, "x", ResultCategory::Other),
+            classified("src/mid.rs", 5, "x", ResultCategory::Other),
+            classified("src/unscored.rs", 9, "x", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(ctx.community_at("src/core.rs", 1), Some(7));
+        assert_eq!(ctx.community_at("src/mid.rs", 5), Some(7));
+        assert_eq!(
+            ctx.community_at("src/unscored.rs", 9),
+            None,
+            "a position without a topology row is absent"
+        );
+        assert_eq!(
+            ctx.community_at("src/other.rs", 3),
+            None,
+            "a scored symbol outside the candidate set stays out"
+        );
+        // Both carrying candidates are community 7: modal 7, and the
+        // fraction is exactly 2/2 — `naked` (no row) and community 99
+        // (not a candidate) are outside the denominator.
+        assert_eq!(ctx.modal_community(), Some(7));
+        assert_eq!(ctx.modal_community_fraction(), 1.0);
+    }
+
+    #[test]
     fn topology_context_empty_without_table_or_connection() {
         // A pre-TASK-098 index has no symbol_topology table: the presence
         // probe degrades to an empty slice, never an error.
@@ -2934,6 +3054,38 @@ proximity, signature, churn, co_change, hub, authority",
             &ContextSources::default(),
         );
         assert_eq!(ctx.topology_scores("src/a.rs", 1), None);
+
+        // A TASK-098-scored index has topology rows but NULL communities:
+        // the per-position lookup and the modal fold both see absence.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('legacy', 'function', 'src/a.rs', 1, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_topology (symbol_id, hub, authority) \
+             SELECT id, 0.5, 0.5 FROM symbols WHERE name = 'legacy'",
+            [],
+        )
+        .unwrap();
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        assert_eq!(
+            ctx.topology_scores("src/a.rs", 1),
+            Some((0.5, 0.5)),
+            "hub and authority still serve"
+        );
+        assert_eq!(ctx.community_at("src/a.rs", 1), None);
+        assert_eq!(ctx.modal_community(), None);
+        assert_eq!(ctx.modal_community_fraction(), 0.0);
     }
 
     #[test]
