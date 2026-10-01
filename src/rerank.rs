@@ -306,6 +306,65 @@ pub fn kind_value(category: ResultCategory) -> f32 {
     }
 }
 
+/// Min-max normalize `score` against the set bounds `[min, max]`.
+///
+/// A degenerate range (`max <= min` — an all-equal or all-zero set) yields
+/// 0.0 for every member: with no contrast in the set there is no signal to
+/// add. Out-of-range inputs clamp to `[0, 1]`; non-finite scores, bounds,
+/// or results normalize to 0.0 rather than propagating NaN.
+pub fn min_max_normalize(score: f32, min: f32, max: f32) -> f32 {
+    if !score.is_finite() {
+        return 0.0;
+    }
+    let range = max - min;
+    if !range.is_finite() || range <= 0.0 {
+        return 0.0;
+    }
+    let normalized = (score - min) / range;
+    if normalized.is_finite() {
+        normalized.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// The lexical signal (TASK-093, PRD-RANK-REQ-001): the candidate file's
+/// BM25 score over the tokenized query, min-max normalized across the
+/// candidate set to maximize in-set contrast.
+///
+/// Line results inherit their file's score (the `rerank_lexical`
+/// semantics), so two hits in one file always tie on this signal. A set
+/// with no score contrast, a missing index, or a gated-off preparation all
+/// contribute exactly 0.0.
+// Wired into builtin_signals() with the TASK-093 registry; until then only
+// the unit tests construct it.
+#[allow(dead_code)]
+pub(crate) struct LexicalSignal;
+
+impl Signal for LexicalSignal {
+    fn name(&self) -> &'static str {
+        "lexical"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_lexical_scores()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        let (Some(score), Some((min, max))) = (ctx.lexical_score(&file), ctx.lexical_bounds())
+        else {
+            return 0.0;
+        };
+        min_max_normalize(score, min, max)
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -1336,6 +1395,119 @@ mod tests {
         );
         assert_eq!(min, score_b);
         assert_eq!(max, score_a);
+    }
+
+    // -------------------------------------------------------------------
+    // LexicalSignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn min_max_normalize_exact_and_clamped() {
+        assert!((min_max_normalize(0.5, 0.0, 1.0) - 0.5).abs() < 1e-6);
+        assert_eq!(min_max_normalize(0.0, 0.0, 1.0), 0.0);
+        assert_eq!(min_max_normalize(1.0, 0.0, 1.0), 1.0);
+        // Out-of-range inputs clamp instead of amplifying.
+        assert_eq!(min_max_normalize(-1.0, 0.0, 1.0), 0.0);
+        assert_eq!(min_max_normalize(2.0, 0.0, 1.0), 1.0);
+        assert_eq!(min_max_normalize(3.0, 1.0, 2.0), 1.0);
+    }
+
+    #[test]
+    fn min_max_normalize_degenerate_range_and_nan_are_zero() {
+        // An all-equal set (max == min) has no contrast: everyone gets 0.
+        assert_eq!(min_max_normalize(3.0, 3.0, 3.0), 0.0);
+        // An inverted range (max < min) is degenerate, not an error.
+        assert_eq!(min_max_normalize(0.0, 2.0, 1.0), 0.0);
+        // NaN and non-finite bounds normalize to 0, never propagate.
+        assert_eq!(min_max_normalize(f32::NAN, 0.0, 1.0), 0.0);
+        assert_eq!(
+            min_max_normalize(0.5, f32::NEG_INFINITY, f32::INFINITY),
+            0.0
+        );
+    }
+
+    #[test]
+    fn lexical_signal_inherits_file_score_and_set_normalizes() {
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![
+            classified("a.rs", 1, "alpha", ResultCategory::Other),
+            classified("a.rs", 7, "alpha", ResultCategory::Other),
+            classified("b.rs", 3, "alpha", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_lexical_scores(),
+            "alpha",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = LexicalSignal;
+        assert_eq!(signal.name(), "lexical");
+        assert_eq!(signal.requires(), ContextReqs::none().with_lexical_scores());
+        let query = QueryInfo { pattern: "alpha" };
+        // a.rs holds the set max (tf 5), b.rs the min (tf 1); lines in the
+        // same file share the file's score.
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 1.0);
+        assert_eq!(signal.contribution(&query, &results[2], &ctx), 0.0);
+    }
+
+    #[test]
+    fn lexical_signal_zero_when_context_missing() {
+        // No term_stats rows in seeded_conn: scoring is unavailable and the
+        // signal contributes exactly zero rather than erroring.
+        let (_dir, conn) = seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+        let ctx = prepare_context(
+            ContextReqs::none().with_lexical_scores(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        let signal = LexicalSignal;
+        let query = QueryInfo { pattern: "my_func" };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 0.0);
+
+        // Gated-off preparation leaves the same zero contribution.
+        let gated = prepare_context(
+            ContextReqs::none(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        assert_eq!(signal.contribution(&query, &results[0], &gated), 0.0);
+    }
+
+    #[test]
+    fn lexical_signal_zero_when_set_is_uniform() {
+        let (_dir, conn) = lexical_seeded_conn();
+        // Same tf for both files: the raw scores tie, the range is zero, and
+        // every member contributes 0 (no contrast to amplify).
+        conn.execute("UPDATE term_stats SET tf = 3", []).unwrap();
+        let results = vec![
+            classified("a.rs", 1, "alpha", ResultCategory::Other),
+            classified("b.rs", 1, "alpha", ResultCategory::Other),
+        ];
+        let ctx = prepare_context(
+            ContextReqs::none().with_lexical_scores(),
+            "alpha",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        let signal = LexicalSignal;
+        let query = QueryInfo { pattern: "alpha" };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 0.0);
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
     }
 
     #[test]
