@@ -3922,12 +3922,12 @@ Create `rerank.rs` with the signal abstraction, weighted scoring, batched contex
 Add the signals grounded in data wonk already indexes: lexical score, semantic similarity, caller centrality, and name prominence.
 
 **Action Items:**
-- [ ] Lexical signal consuming the BM25 score, normalized across the candidate set (PRD-RANK-REQ-001)
-- [ ] Semantic signal consuming cosine similarity where embeddings exist; contribute zero, not a penalty, when absent
-- [ ] Structural-centrality signal from indexed caller count, normalized to damp hub dominance (PRD-RANK-REQ-012)
-- [ ] Prominence signal distinguishing symbols that share a queried name (PRD-RANK-REQ-015)
-- [ ] Ensure every signal is a pure function and unit-testable in isolation (PRD-RANK-REQ-002)
-- [ ] Verify signals reusing prepared context add no additional queries
+- [x] Lexical signal consuming the BM25 score, normalized across the candidate set (PRD-RANK-REQ-001)
+- [x] Semantic signal consuming cosine similarity where embeddings exist; contribute zero, not a penalty, when absent
+- [x] Structural-centrality signal from indexed caller count, normalized to damp hub dominance (PRD-RANK-REQ-012)
+- [x] Prominence signal distinguishing symbols that share a queried name (PRD-RANK-REQ-015)
+- [x] Ensure every signal is a pure function and unit-testable in isolation (PRD-RANK-REQ-002)
+- [x] Verify signals reusing prepared context add no additional queries
 
 **Dependencies:**
 - Blocked by: TASK-092, TASK-079
@@ -3943,7 +3943,7 @@ Add the signals grounded in data wonk already indexes: lexical score, semantic s
 **Related Requirements:** PRD-RANK-REQ-001, PRD-RANK-REQ-002, PRD-RANK-REQ-012, PRD-RANK-REQ-015
 **Related Decisions:** DR-037
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
