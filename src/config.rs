@@ -137,6 +137,15 @@ pub struct HistoryConfig {
     pub window: usize,
     /// Kill switch: `false` skips mining entirely (PRD-HIST-REQ-008).
     pub enabled: bool,
+    /// Bulk-commit exclusion threshold for co-change derivation
+    /// (TASK-097, PRD-HIST-REQ-005): a commit touching STRICTLY more files
+    /// than this contributes no coupling (reformatting sweeps and vendored
+    /// imports would otherwise dominate). It still counts for churn and
+    /// still bounds the mined window. The default is a placeholder pending
+    /// OQ-017 tuning (the `window` precedent); values under 2 are a hard
+    /// load error — every commit would be bulk, which is mining-off in
+    /// disguise.
+    pub max_commit_files: usize,
 }
 
 impl Default for HistoryConfig {
@@ -144,6 +153,7 @@ impl Default for HistoryConfig {
         Self {
             window: 500,
             enabled: true,
+            max_commit_files: 50,
         }
     }
 }
@@ -410,6 +420,7 @@ struct ReachOverlay {
 struct HistoryOverlay {
     window: Option<usize>,
     enabled: Option<bool>,
+    max_commit_files: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -601,9 +612,19 @@ impl Config {
             if let Some(v) = history.enabled {
                 self.history.enabled = v;
             }
+            if let Some(v) = history.max_commit_files {
+                self.history.max_commit_files = v;
+            }
             if self.history.window == 0 {
                 anyhow::bail!(
                     "[history] window must be >= 1 (got 0): an empty window mines nothing"
+                );
+            }
+            if self.history.max_commit_files < 2 {
+                anyhow::bail!(
+                    "[history] max_commit_files must be >= 2 (got {}): every commit would \
+                     be bulk and no coupling could ever be derived",
+                    self.history.max_commit_files
                 );
             }
         }
@@ -868,14 +889,16 @@ workspace = ["payments", "platform"]
             config.history,
             HistoryConfig {
                 enabled: true,
-                window: 500
+                window: 500,
+                max_commit_files: 50
             }
         );
         assert_eq!(
             Config::default().history,
             HistoryConfig {
                 enabled: true,
-                window: 500
+                window: 500,
+                max_commit_files: 50
             }
         );
     }
@@ -897,6 +920,23 @@ enabled = false
     }
 
     #[test]
+    fn history_max_commit_files_parses() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[history]
+max_commit_files = 3
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(config.history.max_commit_files, 3);
+        // The other keys keep their defaults.
+        assert_eq!(config.history.window, 500);
+        assert!(config.history.enabled);
+    }
+
+    #[test]
     fn history_window_zero_is_rejected() {
         let mut env = TestEnv::new();
         env.create_repo();
@@ -909,6 +949,26 @@ window = 0
         let err = env.load().unwrap_err().to_string();
         assert!(
             err.contains("[history] window"),
+            "error names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn history_max_commit_files_below_two_is_rejected() {
+        // A threshold under 2 would classify every commit as bulk and
+        // derive no coupling at all — indistinguishable from off, so it is
+        // a configuration error, not a silent zero.
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[history]
+max_commit_files = 1
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[history] max_commit_files"),
             "error names the offending key: {err}"
         );
     }
