@@ -408,6 +408,7 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
     let embedding_kind = config.embedding.provider;
     let contract_opts = crate::contracts::ContractOptions::from(&config.contracts);
+    let history = config.history;
 
     let embed_handle = thread::Builder::new()
         .name("wonk-embed".to_string())
@@ -502,6 +503,15 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
                 // Send changed files to embedding worker (non-blocking).
                 if !result.changed_files.is_empty() {
                     let _ = embed_tx.send(result.changed_files);
+                }
+                // Best-effort history refresh after the batch (TASK-096).
+                // Caveat: a bare `git commit` emits no file events, so a
+                // commit-only change refreshes on the NEXT observed batch;
+                // `wonk update` remains the authoritative refresh path.
+                if history.enabled
+                    && let Err(e) = crate::history::refresh(&conn, &repo_root_buf, history.window)
+                {
+                    eprintln!("wonk: history refresh failed: {e:#}");
                 }
                 update_queue_depth(&conn, 0).ok();
             }
