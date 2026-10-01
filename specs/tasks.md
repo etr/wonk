@@ -4155,7 +4155,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-TOPO-REQ-002, PRD-TOPO-REQ-003, PRD-TOPO-REQ-004, PRD-TOPO-REQ-005
 **Related Decisions:** DR-040
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
