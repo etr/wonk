@@ -3943,7 +3943,7 @@ Add the signals grounded in data wonk already indexes: lexical score, semantic s
 **Related Requirements:** PRD-RANK-REQ-001, PRD-RANK-REQ-002, PRD-RANK-REQ-012, PRD-RANK-REQ-015
 **Related Decisions:** DR-037
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
