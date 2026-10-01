@@ -754,4 +754,188 @@ mod tests {
         let plain = tempfile::TempDir::new().unwrap();
         assert!(!has_git(plain.path()));
     }
+
+    // -- acceptance criteria (TASK-096) ----------------------------------------
+
+    /// A candidate result for the rerank seam, same category for every
+    /// candidate so the churn signal alone decides the order.
+    fn churn_candidate(file: &str) -> crate::ranker::ClassifiedResult {
+        crate::ranker::ClassifiedResult {
+            result: crate::search::SearchResult {
+                file: std::path::PathBuf::from(file),
+                line: 1,
+                col: 1,
+                content: "fn target() {}".to_string(),
+            },
+            category: crate::ranker::ResultCategory::Definition,
+            annotation: None,
+        }
+    }
+
+    fn churn_only_weights() -> crate::rerank::WeightTable {
+        crate::rerank::WeightTable::from_pairs([("churn".to_string(), 1.0)]).unwrap()
+    }
+
+    #[test]
+    fn ac1_frequently_modified_file_outranks_dormant_one() {
+        if !git_available() {
+            return;
+        }
+        // A filler commit anchors the window's oldest edge so dormant.rs
+        // sits mid-window with a positive (but lower) weight; hot.rs is
+        // touched by the five newest commits.
+        let mut commits = vec![
+            ("filler.rs", 1_000_000_000i64),
+            ("dormant.rs", 1_000_000_050),
+        ];
+        for k in 0..5 {
+            commits.push(("hot.rs", 1_000_000_100 + k));
+        }
+        let (dir, _seed) = make_history_repo(&commits);
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+        let conn = crate::db::open_existing(&crate::db::local_index_path(dir.path())).unwrap();
+
+        let scored = crate::rerank::rerank(
+            vec![churn_candidate("dormant.rs"), churn_candidate("hot.rs")],
+            &crate::rerank::QueryInfo { pattern: "target" },
+            Some(&conn),
+            &churn_only_weights(),
+            &crate::rerank::ContextSources::default(),
+        );
+
+        assert_eq!(
+            scored[0].classified.result.file,
+            std::path::PathBuf::from("hot.rs"),
+            "hot file must rank first: {scored:?}"
+        );
+        let value = |f: &str| {
+            scored
+                .iter()
+                .find(|s| s.classified.result.file == *f)
+                .unwrap()
+                .contributions[0]
+                .value
+        };
+        assert!(value("hot.rs") > 0.0 && value("dormant.rs") > 0.0);
+        assert!(value("hot.rs") > value("dormant.rs"));
+    }
+
+    /// A repo with `n` dated commits, one per second, rotating five files
+    /// (`i % 5`); a single git spawn per commit keeps big fixtures fast.
+    /// The newest `k` commits of `make_dated_repo(n, base)` and
+    /// `make_dated_repo(m, base - (m - n))` are IDENTICAL whenever the
+    /// offset makes the timestamps line up — the identical-tail pair the
+    /// cost-not-age check needs.
+    fn make_dated_repo(n: usize, base_ts: i64) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let ok = Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?} failed");
+        }
+        for i in 0..n {
+            std::fs::write(root.join(format!("f{}.rs", i % 5)), format!("c{i}\n")).unwrap();
+            let date = format!("@{} +0000", base_ts + i as i64);
+            let message = format!("c{i}");
+            if i == 0 {
+                // Track the files once; -a carries every later change so the
+                // loop stays at one git spawn per commit.
+                let ok = Command::new("git")
+                    .args(["add", "."])
+                    .current_dir(root)
+                    .output()
+                    .unwrap();
+                assert!(ok.status.success());
+            }
+            let args: Vec<&str> = vec!["commit", "-m", &message, "--allow-empty", "-a"];
+            let ok = Command::new("git")
+                .args(&args)
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "commit {i} failed");
+        }
+        dir
+    }
+
+    fn full_churn_map(conn: &Connection) -> Vec<(String, f64)> {
+        let mut stmt = conn
+            .prepare("SELECT file, score FROM file_churn ORDER BY file")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn ac2_window_is_the_structural_cost_bound_not_repo_age() {
+        if !git_available() {
+            return;
+        }
+        // ~500-commit repository, mined at the default window: the mine
+        // completes well inside the index build budget.
+        let dir = make_dated_repo(500, 1_000_000_000);
+        let conn = crate::db::open(&dir.path().join("ac2.db")).unwrap();
+        let start = std::time::Instant::now();
+        mine_full(&conn, dir.path(), 500).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(mined_count(&conn), 500, "whole history within the window");
+        assert!(
+            elapsed.as_secs_f64() < 10.0,
+            "window=500 mine exceeded the smoke budget: {elapsed:?}"
+        );
+
+        // The structural bound: cost is proportional to the window because
+        // git reads at most `window` commits — window=50 retains EXACTLY 50
+        // rows of the same 500-commit history.
+        mine_full(&conn, dir.path(), 50).unwrap();
+        assert_eq!(mined_count(&conn), 50);
+        let short_map = full_churn_map(&conn);
+
+        // Cost is not repo age: a LONGER history whose newest 50 commits
+        // are identical (same timestamps, same files) retains the identical
+        // rows and the identical aggregate.
+        let longer = make_dated_repo(550, 999_999_950);
+        let conn_long = crate::db::open(&longer.path().join("ac2b.db")).unwrap();
+        mine_full(&conn_long, longer.path(), 50).unwrap();
+        assert_eq!(mined_count(&conn_long), 50);
+        assert_eq!(
+            full_churn_map(&conn_long),
+            short_map,
+            "identical tail at the same window must give the identical aggregate"
+        );
+    }
+
+    #[test]
+    fn ac4_window_size_is_configurable_and_changes_the_result() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_dated_repo(60, 1_000_000_000);
+        let conn = crate::db::open(&dir.path().join("ac4.db")).unwrap();
+
+        mine_full(&conn, dir.path(), 3).unwrap();
+        assert_eq!(mined_count(&conn), 3);
+        let tight = full_churn_map(&conn);
+
+        mine_full(&conn, dir.path(), 50).unwrap();
+        assert_eq!(mined_count(&conn), 50);
+        let wide = full_churn_map(&conn);
+
+        assert_ne!(
+            tight, wide,
+            "the window size must change the mined aggregate"
+        );
+    }
 }
