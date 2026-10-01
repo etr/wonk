@@ -34,6 +34,7 @@ wonk search "render" -- src/components/
 | `--smart` | Force smart ranking even if pattern does not match known symbols |
 | `--semantic` | Blend structural results with embedding-based semantic results (RRF fusion) |
 | `--why` | Explain each result's ranking: per-signal contributions and the final score. Implies smart ranked mode through the signal pipeline; conflicts with `--raw` and `--semantic`. The breakdown is printed to stderr (one `why:` line per result, so stdout stays pipe-clean) and embedded as a `why` object per row in `--format json` |
+| `--query-class <class>` | Pin the query class (`symbol`, `path`, `signature`, `conceptual`), bypassing detection for this invocation. Implies smart ranked mode; conflicts with `--raw` and `--semantic`. The class scales the lexical/semantic blend (see `[rank] class_multipliers`) |
 | `-- <paths>` | Restrict search to specific paths |
 
 ### `wonk ask <query>`
@@ -652,6 +653,19 @@ own `-- imports --` header.
 
 Use `--raw` to disable all ranking, deduplication, and headers. Use `--smart`
 to force smart mode even when the pattern does not match known symbols.
+
+Smart mode ranks through the signal pipeline by default: each result's
+score is a weighted sum of per-signal contributions (kind tier, BM25
+lexical, embedding semantic, caller centrality, name prominence, path
+character, term proximity, signature match). The weights and the
+per-query-class scaling of the lexical/semantic blend are configurable
+via `[rank]` (see `docs/configuration.md`); the default table is tuned
+against a labeled query set. Every pipelined query is classified by
+shape — signature, path, symbol, or conceptual — and the class is
+recorded as a `query_class` field on every JSON row so a
+misclassification is diagnosable. `--query-class <class>` pins the class
+explicitly. Setting `[rank] enabled = false` restores the pre-pipeline
+tier ordering byte-for-byte.
 
 ## Semantic search
 
