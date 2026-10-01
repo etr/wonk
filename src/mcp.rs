@@ -1646,7 +1646,7 @@ impl McpServer {
             config.embedding.provider,
             pinned_class,
             config.topology.enabled,
-            0.85,
+            config.duplicate.threshold,
         ) {
             Ok(s) => s,
             Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),

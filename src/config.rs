@@ -36,6 +36,7 @@ pub struct Config {
     pub rank: RankConfig,
     pub history: HistoryConfig,
     pub topology: TopologyConfig,
+    pub duplicate: DuplicateConfig,
 }
 
 /// Daemon-related settings.
@@ -200,6 +201,27 @@ impl Default for TopologyConfig {
             interval: 3600,
             stale_after: 86400,
         }
+    }
+}
+
+/// Near-duplicate similarity settings (TASK-100, DR-041).
+///
+/// A feature section (not `[rank]`) because the threshold is consumed by
+/// three places — ranking, recording, and reporting — while `[rank]`
+/// owns only signal weights; the novelty signal's WEIGHT (default 0,
+/// like every untuned history/topology signal) is the on/off switch.
+/// `threshold` is the sketch-Jaccard level at which two symbols are
+/// near-duplicates: finite and in `(0, 1]`, else a hard load error
+/// naming the key (the `[topology]` zero-value pattern).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DuplicateConfig {
+    /// Sketch Jaccard strictly above this marks a near-duplicate pair.
+    pub threshold: f32,
+}
+
+impl Default for DuplicateConfig {
+    fn default() -> Self {
+        Self { threshold: 0.85 }
     }
 }
 
@@ -405,6 +427,7 @@ struct ConfigOverlay {
     rank: Option<RankOverlay>,
     history: Option<HistoryOverlay>,
     topology: Option<TopologyOverlay>,
+    duplicate: Option<DuplicateOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -477,6 +500,12 @@ struct TopologyOverlay {
     community_passes: Option<usize>,
     interval: Option<u64>,
     stale_after: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct DuplicateOverlay {
+    threshold: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -723,6 +752,18 @@ impl Config {
                 anyhow::bail!(
                     "[topology] stale_after must be >= 1 second (got 0): every score \
                      would be stale the moment it is written"
+                );
+            }
+        }
+        if let Some(duplicate) = overlay.duplicate {
+            if let Some(v) = duplicate.threshold {
+                self.duplicate.threshold = v;
+            }
+            let t = self.duplicate.threshold;
+            if !t.is_finite() || t <= 0.0 || t > 1.0 {
+                anyhow::bail!(
+                    "[duplicate] threshold must be finite and in (0, 1] (got {t}): \
+                     zero flags everything, above one flags nothing"
                 );
             }
         }
@@ -1225,6 +1266,98 @@ stale_after = 0
             err.contains("[topology] stale_after"),
             "error names the offending key: {err}"
         );
+    }
+
+    // -- [duplicate] (TASK-100) -----------------------------------------------
+
+    #[test]
+    fn duplicate_default_threshold() {
+        assert_eq!(
+            Config::default().duplicate,
+            DuplicateConfig { threshold: 0.85 }
+        );
+        let mut env = TestEnv::new();
+        env.create_repo();
+        let config = env.load().unwrap();
+        assert_eq!(config.duplicate.threshold, 0.85);
+    }
+
+    #[test]
+    fn duplicate_threshold_parsed() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[duplicate]
+threshold = 0.7
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(config.duplicate, DuplicateConfig { threshold: 0.7 });
+    }
+
+    #[test]
+    fn duplicate_threshold_zero_rejected() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[duplicate]
+threshold = 0.0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[duplicate] threshold"),
+            "error names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_threshold_above_one_rejected() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[duplicate]
+threshold = 1.2
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[duplicate] threshold"),
+            "error names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_threshold_nonfinite_rejected() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[duplicate]
+threshold = nan
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[duplicate] threshold"),
+            "error names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_threshold_one_is_valid() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[duplicate]
+threshold = 1.0
+"#,
+        );
+        assert_eq!(env.load().unwrap().duplicate.threshold, 1.0);
     }
 
     #[test]
