@@ -365,6 +365,55 @@ impl Signal for LexicalSignal {
     }
 }
 
+/// Log-damped caller-count centrality (TASK-093, PRD-RANK-REQ-012):
+/// `ln(1 + caller_count) / ln(1 + set_max)`.
+///
+/// The logarithm is the hub-dominance damper: 5 callers against a 500-caller
+/// hub retain ~0.288 of the range where a linear ratio would crush them to
+/// 0.010. An all-zero set has no denominator and scores 0.
+pub fn centrality_value(caller_count: u32, set_max: u32) -> f32 {
+    if set_max == 0 {
+        return 0.0;
+    }
+    (1.0 + caller_count as f32).ln() / (1.0 + set_max as f32).ln()
+}
+
+/// The structural-centrality signal: how many distinct indexed callers
+/// reference the symbol defined at the candidate position, log-damped
+/// against the set maximum.
+///
+/// Candidates without a symbol hit (call sites, comments) are genuinely
+/// un-called and contribute exactly 0 — a floor, never a penalty. Note the
+/// TASK-092 seam: caller counts are keyed by symbol NAME, so same-named
+/// symbols share a centrality.
+// Wired into builtin_signals() with the TASK-093 registry; until then only
+// the unit tests construct it.
+#[allow(dead_code)]
+pub(crate) struct CentralitySignal;
+
+impl Signal for CentralitySignal {
+    fn name(&self) -> &'static str {
+        "centrality"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_symbol_hits()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        let Some(hit) = ctx.symbol_hit(&file, candidate.result.line) else {
+            return 0.0;
+        };
+        centrality_value(hit.caller_count, ctx.max_caller_count())
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -1548,6 +1597,81 @@ mod tests {
         );
 
         assert_eq!(ctx.max_caller_count(), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // CentralitySignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn centrality_value_exact_log_formula() {
+        let expected = (1.0f32 + 5.0).ln() / (1.0f32 + 500.0).ln();
+        assert!((centrality_value(5, 500) - expected).abs() < 1e-4);
+        // The hub itself saturates at exactly 1.0.
+        assert_eq!(centrality_value(500, 500), 1.0);
+        assert_eq!(centrality_value(2, 2), 1.0);
+    }
+
+    #[test]
+    fn centrality_value_zero_floor_and_all_zero_set() {
+        // No callers: a floor, not a penalty.
+        assert_eq!(centrality_value(0, 500), 0.0);
+        // An all-zero set has no denominator: everything is 0.
+        assert_eq!(centrality_value(0, 0), 0.0);
+        assert_eq!(centrality_value(3, 0), 0.0);
+    }
+
+    #[test]
+    fn centrality_value_monotone_and_log_damped() {
+        let mut prev = centrality_value(0, 500);
+        for count in [1u32, 5, 20, 100, 500] {
+            let value = centrality_value(count, 500);
+            assert!(value > prev, "more callers must score higher");
+            prev = value;
+        }
+        // Log damping is the point: 5-of-500 callers retains ~0.288 of the
+        // range where a linear ratio keeps 1% — a mid-tier symbol stays
+        // competitive with the hub instead of being crushed to zero.
+        let log_ratio = centrality_value(5, 500);
+        let linear_ratio = 5.0f32 / 500.0f32;
+        assert!(
+            log_ratio > 0.28,
+            "log ratio must stay substantial: {log_ratio}"
+        );
+        assert!((linear_ratio - 0.01).abs() < 1e-6);
+        assert!(log_ratio > linear_ratio * 20.0);
+    }
+
+    #[test]
+    fn centrality_signal_reads_hit_and_set_max_from_prepared_context() {
+        let (_dir, conn) = seeded_conn();
+        let results = vec![
+            classified(
+                "src/main.rs",
+                10,
+                "fn my_func() {}",
+                ResultCategory::Definition,
+            ),
+            classified("src/main.rs", 11, "my_func();", ResultCategory::CallSite),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_hits(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = CentralitySignal;
+        assert_eq!(signal.name(), "centrality");
+        assert_eq!(signal.requires(), ContextReqs::none().with_symbol_hits());
+        let query = QueryInfo { pattern: "my_func" };
+        // The definition carries caller_count 2, the set max: ln(3)/ln(3).
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        // A candidate with no symbol hit (a call site line) is genuinely
+        // un-called: exactly 0.
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
     }
 
     #[test]
