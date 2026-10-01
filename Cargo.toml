@@ -43,8 +43,8 @@ harness = false
 # CLI parsing
 clap = { version = "4.5", features = ["derive"] }
 
-# SQLite
-rusqlite = { version = "0.38", features = ["bundled"] }
+# SQLite ("trace" enables Connection::trace_v2 for the query-cost tests)
+rusqlite = { version = "0.38", features = ["bundled", "trace"] }
 
 # Tree-sitter core
 tree-sitter = "0.26"

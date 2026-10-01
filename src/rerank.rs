@@ -2314,6 +2314,71 @@ mod tests {
         assert!(with_semantic[0].score > kind_only[0].score);
     }
 
+    // -------------------------------------------------------------------
+    // Query-cost gate (PRD-RANK action: no additional queries per candidate)
+    // -------------------------------------------------------------------
+
+    static TRACE_STATEMENT_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn trace_stmt(event: rusqlite::trace::TraceEvent<'_>) {
+        // trace_v2 takes a plain fn, so the counter lives in a static; only
+        // the counting test installs a tracer, so there is no cross-talk.
+        // The mask admits only SQLITE_TRACE_STMT, so every event counts.
+        if matches!(event, rusqlite::trace::TraceEvent::Stmt(..)) {
+            TRACE_STATEMENT_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn count_context_statements(conn: &Connection, results: &[ClassifiedResult]) -> usize {
+        TRACE_STATEMENT_COUNT.store(0, AtomicOrdering::SeqCst);
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_stmt),
+        );
+        let reqs = ContextReqs::none()
+            .with_query_terms()
+            .with_path_class()
+            .with_symbol_hits()
+            .with_lexical_scores()
+            .with_embeddings();
+        let _ = prepare_context(
+            reqs,
+            "alpha",
+            results,
+            Some(conn),
+            &ContextSources::default(),
+        );
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+        TRACE_STATEMENT_COUNT.load(AtomicOrdering::SeqCst)
+    }
+
+    #[test]
+    fn prepare_context_statement_count_independent_of_candidate_count() {
+        // Signals take no Connection (structurally impossible to issue
+        // per-candidate SQL); this gate proves it empirically. Accounting
+        // for the one-term query "alpha" over lexical_seeded_conn (no
+        // embedding rows): 8 statements total — 2 symbol-hit lookups
+        // (symbols IN, references GROUP BY) + 4 lexical (presence probe,
+        // corpus stats, 1 postings scan, document lengths) + 2 embedding
+        // (stored vector spaces, position loader; the query embed itself
+        // is in-process and SQL-free). query_terms and path_class touch
+        // no SQL. The count must not move when the candidate set grows.
+        let (_dir, conn) = lexical_seeded_conn();
+        let make = |n: u64| -> Vec<ClassifiedResult> {
+            (0..n)
+                .map(|i| classified("a.rs", i + 1, "alpha", ResultCategory::Other))
+                .collect()
+        };
+
+        let small = count_context_statements(&conn, &make(3));
+        let large = count_context_statements(&conn, &make(30));
+
+        assert_eq!(small, large, "statement count must be O(1) in candidates");
+        assert!(large <= 10, "unexpected statements: {large}");
+        assert_eq!(large, 8, "documented statement accounting (see comment)");
+    }
+
     #[test]
     fn shared_dedup_and_group_work_over_scored_results() {
         // The ONE dedup/group implementation (ranker.rs generics) must
