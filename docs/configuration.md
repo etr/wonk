@@ -102,6 +102,9 @@ Signal-pipeline re-ranking for `wonk search` (smart ranked mode).
 | `weights.semantic` | `0.0` | Cosine similarity between the query embedding and the candidate symbol's indexed embedding, mapped absolutely as `clamp01((cos + 1) / 2)`. Missing embeddings contribute zero, never a penalty. Requires indexed embeddings and the configured embedding provider (`[embedding] provider`, default bundled) |
 | `weights.centrality` | `0.0` | `ln(1 + callers) / ln(1 + set_max)` over the symbol's distinct indexed callers, log-damped against the candidate set so a single hub cannot dominate unrelated queries |
 | `weights.prominence` | `0.0` | `1.0` when the candidate defines a symbol named by the query (term or raw pattern), `0.5` when a query term appears as a whole identifier in the matched line, `0.0` for substring-only mentions |
+| `weights.path_character` | `0.0` | Graded ladder value of the candidate's path: ordinary `1.0`, module entry `0.80`, barrel `0.70`, example `0.60`, shim `0.45`, type declaration `0.30`, test `0.20`, generated-shadowing-a-verified-peer `0.10`. Graded, never exclusion — a test file that is the best answer still ranks. A generated file is demoted only when a same-named hand-written peer exists in the index |
+| `weights.proximity` | `0.0` | `1 / gap` over the first-occurrence positions of the query terms present as whole identifiers in the matched line (adjacent terms `1.0`, one token between `0.5`, decaying). Fewer than two present terms contribute zero |
+| `weights.signature` | `0.0` | Answers signature-shaped queries (containing `(`, `->`, or `::`): `1.0` for the index-backed definition, `0.5` for a definition-shaped line (a parenthesis plus a definition keyword among its first three identifiers), `0.0` otherwise. Name-shaped queries are inert |
 
 ```toml
 [rank]
