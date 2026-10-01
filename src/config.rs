@@ -164,14 +164,18 @@ impl Default for HistoryConfig {
 /// `iterations` is the FIXED iteration count of the hub/authority power
 /// method — the bound itself (PRD-TOPO-REQ-005), not a convergence
 /// tolerance: a fixed count is what makes the scores bitwise
-/// reproducible. `interval` is the daemon's minimum seconds between
-/// recomputes (the cadence gate of PRD-TOPO-REQ-006), and `stale_after`
-/// is when a served score earns the stale marker (PRD-TOPO-REQ-007).
-/// All numeric defaults are placeholders pending OQ-018 tuning (the
-/// `[history] window` precedent); each zero value is a hard load error —
-/// zero iterations scores nothing, a zero interval recomputes per event
-/// batch (the per-file cost REQ-006 forbids), and a zero threshold marks
-/// every score stale the moment it is written.
+/// reproducible. `community_passes` is the sweep cap of the label
+/// propagation behind the `community` signal (TASK-099) — a bound, not
+/// a target, since a converged graph stops early and produces identical
+/// assignments at any higher cap. `interval` is the daemon's minimum
+/// seconds between recomputes (the cadence gate of PRD-TOPO-REQ-006),
+/// and `stale_after` is when a served score earns the stale marker
+/// (PRD-TOPO-REQ-007). All numeric defaults are placeholders pending
+/// OQ-018 tuning (the `[history] window` precedent); each zero value is
+/// a hard load error — zero iterations scores nothing, zero passes
+/// assigns every symbol to its own community, a zero interval
+/// recomputes per event batch (the per-file cost REQ-006 forbids), and
+/// a zero threshold marks every score stale the moment it is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopologyConfig {
     /// Kill switch: `false` skips the pass and zeroes both signal weights
@@ -179,6 +183,8 @@ pub struct TopologyConfig {
     pub enabled: bool,
     /// Exact number of power-method iterations per recompute.
     pub iterations: usize,
+    /// Sweep cap for label-propagation community detection.
+    pub community_passes: usize,
     /// Minimum seconds between daemon-triggered recomputes.
     pub interval: u64,
     /// Seconds after `topology_meta.last_computed` before scores are stale.
@@ -190,6 +196,7 @@ impl Default for TopologyConfig {
         Self {
             enabled: true,
             iterations: 20,
+            community_passes: 30,
             interval: 3600,
             stale_after: 86400,
         }
@@ -467,6 +474,7 @@ struct HistoryOverlay {
 struct TopologyOverlay {
     enabled: Option<bool>,
     iterations: Option<usize>,
+    community_passes: Option<usize>,
     interval: Option<u64>,
     stale_after: Option<u64>,
 }
@@ -683,6 +691,9 @@ impl Config {
             if let Some(v) = topology.iterations {
                 self.topology.iterations = v;
             }
+            if let Some(v) = topology.community_passes {
+                self.topology.community_passes = v;
+            }
             if let Some(v) = topology.interval {
                 self.topology.interval = v;
             }
@@ -693,6 +704,12 @@ impl Config {
                 anyhow::bail!(
                     "[topology] iterations must be >= 1 (got 0): zero iterations scores \
                      nothing"
+                );
+            }
+            if self.topology.community_passes == 0 {
+                anyhow::bail!(
+                    "[topology] community_passes must be >= 1 (got 0): zero passes \
+                     assigns every symbol to its own community"
                 );
             }
             if self.topology.interval == 0 {
@@ -1065,6 +1082,7 @@ max_commit_files = 1
             TopologyConfig {
                 enabled: true,
                 iterations: 20,
+                community_passes: 30,
                 interval: 3600,
                 stale_after: 86400
             }
@@ -1076,6 +1094,7 @@ max_commit_files = 1
             TopologyConfig {
                 enabled: true,
                 iterations: 20,
+                community_passes: 30,
                 interval: 3600,
                 stale_after: 86400
             }
@@ -1091,6 +1110,7 @@ max_commit_files = 1
 [topology]
 enabled = false
 iterations = 7
+community_passes = 11
 interval = 120
 stale_after = 60
 "#,
@@ -1101,6 +1121,7 @@ stale_after = 60
             TopologyConfig {
                 enabled: false,
                 iterations: 7,
+                community_passes: 11,
                 interval: 120,
                 stale_after: 60
             }
@@ -1116,6 +1137,7 @@ stale_after = 60
             r#"
 [topology]
 iterations = 9
+community_passes = 8
 stale_after = 300
 "#,
         );
@@ -1128,6 +1150,7 @@ iterations = 4
         );
         let config = env.load().unwrap();
         assert_eq!(config.topology.iterations, 4, "repo wins on conflict");
+        assert_eq!(config.topology.community_passes, 8, "global survives");
         assert_eq!(config.topology.stale_after, 300, "global survives");
         assert_eq!(config.topology.interval, 3600, "unset key keeps default");
         assert!(config.topology.enabled);
@@ -1146,6 +1169,23 @@ iterations = 0
         let err = env.load().unwrap_err().to_string();
         assert!(
             err.contains("[topology] iterations"),
+            "error names the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_community_passes_zero_is_rejected() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[topology]
+community_passes = 0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[topology] community_passes"),
             "error names the offending key: {err}"
         );
     }
