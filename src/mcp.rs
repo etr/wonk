@@ -1653,6 +1653,9 @@ impl McpServer {
         };
         let ranked =
             crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
+        // Best-effort REQ-003 memo: persist the pairs the novelty pass
+        // compared anyway; a failure degrades, never fails the tool call.
+        crate::shingles::record_pairs_best_effort(ranker_conn, &ranked.near_duplicates);
 
         let mut budget = budget_limit.map(|limit| {
             if let Some(p) = page {

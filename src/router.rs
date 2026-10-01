@@ -279,6 +279,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             &args.pattern,
                             &settings,
                         );
+                        // Best-effort REQ-003 memo: the novelty pass
+                        // compared these pairs anyway; persisting them
+                        // never fails the search.
+                        crate::shingles::record_pairs_best_effort(
+                            conn.as_ref(),
+                            &ranked.near_duplicates,
+                        );
                         // One class line per query, before any why lines
                         // (DR-038): a misclassification is diagnosable from
                         // the breakdown it produced.
@@ -1936,6 +1943,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Contracts(args) => {
             dispatch_contracts(args, &mut fmt, suppress)?;
         }
+        Command::Duplicates(args) => {
+            dispatch_duplicates(args, &mut fmt, suppress)?;
+        }
         Command::Review(args) => {
             dispatch_review(args, &mut fmt, suppress)?;
         }
@@ -2490,6 +2500,89 @@ fn dispatch_contracts<W: io::Write>(
     Ok(())
 }
 
+/// Handle `wonk duplicates` dispatch (TASK-100, PRD-DUP-REQ-006): resolve
+/// the repo's index, pick the threshold (CLI override > `[duplicate]`
+/// threshold > 0.85), and print the sweep's groups.
+fn dispatch_duplicates<W: io::Write>(
+    args: crate::cli::DuplicatesArgs,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+) -> Result<()> {
+    // 1. Resolve repo root and open connection (the contracts error path).
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
+
+    let conn = db::find_existing_index(&repo_root)
+        .and_then(|path| db::open(&path).ok())
+        .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
+
+    // 2. Threshold: CLI override > loaded [duplicate] threshold > default.
+    let threshold = args.threshold.unwrap_or_else(|| {
+        crate::config::Config::load(Some(&repo_root))
+            .map(|config| config.duplicate.threshold)
+            .unwrap_or(0.85)
+    });
+    if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+        anyhow::bail!("--threshold must be finite and in (0, 1] (got {threshold})");
+    }
+
+    run_duplicates(&conn, threshold, fmt, suppress)
+}
+
+/// Sweep and print the near-duplicate groups. Split from
+/// [`dispatch_duplicates`] so tests drive it with a seeded connection
+/// instead of the process working directory.
+///
+/// Text output only in this task — the grep-shaped lines are
+/// machine-cuttable; JSON output is a follow-up.
+fn run_duplicates<W: io::Write>(
+    conn: &Connection,
+    threshold: f32,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+) -> Result<()> {
+    let report = crate::shingles::sweep_near_duplicates(conn, threshold)?;
+    if report.groups.is_empty() {
+        output::print_hint(
+            &format!("no near-duplicate groups above threshold {threshold:.2}"),
+            suppress,
+        );
+        return Ok(());
+    }
+    if report.truncated_buckets > 0 {
+        output::print_hint(
+            &format!(
+                "{} oversized buckets truncated to {} members; more duplicates may exist",
+                report.truncated_buckets,
+                crate::shingles::MAX_BUCKET_MEMBERS
+            ),
+            suppress,
+        );
+    }
+    for (n, group) in report.groups.iter().enumerate() {
+        writeln!(
+            fmt.writer_mut(),
+            "dup-group {} size={} mean-sim={:.2}",
+            n + 1,
+            group.members.len(),
+            group.mean_similarity
+        )?;
+        for member in &group.members {
+            writeln!(
+                fmt.writer_mut(),
+                "  {}:{} {} {}",
+                member.file,
+                member.line,
+                member.kind,
+                member.name
+            )?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Shared changes output builder (used by CLI dispatch and MCP tool)
 // ---------------------------------------------------------------------------
@@ -2863,6 +2956,7 @@ fn is_query_command(cmd: &Command) -> bool {
             | Command::Changes(_)
             | Command::Context(_)
             | Command::Contracts(_)
+            | Command::Duplicates(_)
     )
 }
 
@@ -6698,5 +6792,91 @@ mod tests {
         assert_eq!(split.name, "method");
         assert_eq!(split.file_hint.as_deref(), Some("module"));
         assert_eq!(split.scope_hint.as_deref(), Some("Class"));
+    }
+
+    // -- `wonk duplicates` (TASK-100) -----------------------------------------
+
+    const DUP_HANDLER: &str = "pub fn handle_user_created(event: &CreateEvent, store: &mut Store) -> Result<(), Error> {\n    let user = event.payload_user();\n    if user.email.is_empty() {\n        return Err(Error::Validation(\"email required\"));\n    }\n    let existing = store.find_by_email(&user.email)?;\n    if existing.is_some() {\n        return Err(Error::Conflict(\"email already registered\"));\n    }\n    let record = store.insert(&user)?;\n    metrics::count(\"user_created\", 1);\n    notifier::welcome(&record.email)?;\n    audit::log(\"user_created\", record.id);\n    Ok(())\n}";
+
+    fn duplicates_conn() -> (TempDir, Connection) {
+        let dir = TempDir::new().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        (dir, conn)
+    }
+
+    fn seed_dup_symbol(conn: &Connection, name: &str, file: &str, body: &str) {
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES (?1, 'function', ?2, 1, 0, 'rust')",
+            rusqlite::params![name, file],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_shingles (symbol_id, signature) VALUES (?1, ?2)",
+            rusqlite::params![
+                conn.last_insert_rowid(),
+                crate::shingles::encode_sketch(&crate::shingles::body_signature(body))
+            ],
+        )
+        .unwrap();
+    }
+
+    fn run_dups(conn: &Connection, threshold: f32) -> String {
+        let mut buf = Vec::new();
+        let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
+        run_duplicates(conn, threshold, &mut fmt, true).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn duplicates_dispatch_prints_groups() {
+        let (_dir, conn) = duplicates_conn();
+        seed_dup_symbol(&conn, "handler_a", "src/a.rs", DUP_HANDLER);
+        seed_dup_symbol(&conn, "handler_b", "src/b.rs", DUP_HANDLER);
+        seed_dup_symbol(
+            &conn,
+            "sort_records",
+            "src/c.rs",
+            "fn sort_records(items: &mut [Record]) {\n    items.sort_by_key(|r| r.priority);\n}\n",
+        );
+
+        let text = run_dups(&conn, 0.85);
+        assert!(
+            text.contains("dup-group 1 size=2 mean-sim=1.00"),
+            "one pair group header: {text}"
+        );
+        assert!(text.contains("  src/a.rs:1 function handler_a"), "{text}");
+        assert!(text.contains("  src/b.rs:1 function handler_b"), "{text}");
+        assert!(!text.contains("src/c.rs"), "singleton dropped: {text}");
+    }
+
+    #[test]
+    fn duplicates_empty_index_hints() {
+        let (_dir, conn) = duplicates_conn();
+        let text = run_dups(&conn, 0.85);
+        assert!(text.trim().is_empty(), "no groups, no stdout noise: {text}");
+    }
+
+    #[test]
+    fn search_records_near_duplicates() {
+        let (_dir, conn) = duplicates_conn();
+        seed_dup_symbol(&conn, "handler_a", "a.rs", DUP_HANDLER);
+        seed_dup_symbol(&conn, "handler_b", "b.rs", DUP_HANDLER);
+        let pairs = vec![crate::shingles::NearDuplicatePair {
+            a: ("a.rs".to_string(), 1),
+            b: ("b.rs".to_string(), 1),
+            similarity: 1.0,
+        }];
+        crate::shingles::record_pairs_best_effort(Some(&conn), &pairs);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM near_duplicates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // No connection (grep fallback search) and empty pairs degrade
+        // silently.
+        crate::shingles::record_pairs_best_effort(None, &pairs);
+        crate::shingles::record_pairs_best_effort(Some(&conn), &[]);
     }
 }

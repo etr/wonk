@@ -113,6 +113,9 @@ pub enum Command {
     /// List service contracts detected in this repository (routes, env vars, topics)
     Contracts(ContractsArgs),
 
+    /// Report groups of near-duplicate symbols (copy-pasted code)
+    Duplicates(DuplicatesArgs),
+
     /// Review the current diff for breaking changes and coverage gaps
     Review(ReviewArgs),
 }
@@ -657,6 +660,15 @@ pub struct ContractsArgs {
     /// Also list providers with no consumer in this repo's workspace
     #[arg(long)]
     pub unused_providers: bool,
+}
+
+/// Arguments for `wonk duplicates` (TASK-100, PRD-DUP-REQ-006).
+#[derive(clap::Args, Debug)]
+pub struct DuplicatesArgs {
+    /// Near-duplicate similarity threshold override (sketch Jaccard,
+    /// in (0, 1]); default from [duplicate] threshold
+    #[arg(long)]
+    pub threshold: Option<f32>,
 }
 
 #[derive(clap::Args, Debug)]

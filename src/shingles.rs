@@ -259,6 +259,22 @@ pub fn record_near_duplicate_pairs(
     Ok(())
 }
 
+/// The dispatch-layer memo policy (REQ-003): persist the pairs the
+/// novelty pass surfaced, best-effort — a missing connection (grep
+/// fallback search) is a no-op and a write failure degrades with a
+/// stderr warning, never failing the search.
+pub fn record_pairs_best_effort(conn: Option<&Connection>, pairs: &[NearDuplicatePair]) {
+    let Some(conn) = conn else {
+        return;
+    };
+    if pairs.is_empty() {
+        return;
+    }
+    if let Err(e) = record_near_duplicate_pairs(conn, pairs) {
+        eprintln!("warn: could not record near-duplicate pairs: {e:#}");
+    }
+}
+
 /// One indexed signature joined to its symbol metadata.
 struct SweepEntry {
     symbol_id: i64,
