@@ -4103,13 +4103,13 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Estimate:** M
 
 **Action Items:**
-- [ ] Create `topology.rs`; compute hub and authority scores over `references.caller_id` edges (PRD-TOPO-REQ-001)
-- [ ] Add the `symbol_topology` table
-- [ ] Bound iterations by configuration; terminate deterministically with deterministic tie-breaking (PRD-TOPO-REQ-005)
-- [ ] Run as a distinct pass on a cadence, **not** as part of per-file re-indexing (PRD-TOPO-REQ-006)
-- [ ] Record last-computed time; serve stale data with a marker rather than blocking a query (PRD-TOPO-REQ-007)
-- [ ] Expose hub and authority as rerank signals (PRD-TOPO-REQ-003)
-- [ ] Absent or disabled topology contributes nothing (PRD-TOPO-REQ-008)
+- [x] Create `topology.rs`; compute hub and authority scores over `references.caller_id` edges (PRD-TOPO-REQ-001)
+- [x] Add the `symbol_topology` table
+- [x] Bound iterations by configuration; terminate deterministically with deterministic tie-breaking (PRD-TOPO-REQ-005)
+- [x] Run as a distinct pass on a cadence, **not** as part of per-file re-indexing (PRD-TOPO-REQ-006)
+- [x] Record last-computed time; serve stale data with a marker rather than blocking a query (PRD-TOPO-REQ-007)
+- [x] Expose hub and authority as rerank signals (PRD-TOPO-REQ-003)
+- [x] Absent or disabled topology contributes nothing (PRD-TOPO-REQ-008)
 
 **Dependencies:**
 - Blocked by: TASK-092
@@ -4125,7 +4125,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-TOPO-REQ-001, PRD-TOPO-REQ-003, PRD-TOPO-REQ-005, PRD-TOPO-REQ-006, PRD-TOPO-REQ-007, PRD-TOPO-REQ-008
 **Related Decisions:** DR-040
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
