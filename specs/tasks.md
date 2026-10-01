@@ -49,7 +49,7 @@
 | M29 | Cross-Repo Contract Detection | 5 | Complete |
 | M30 | Diff-Scoped Review Workflow | 3 | Complete |
 | M31 | Body Elision | 2 | Complete |
-| M32 | Signal-Based Reranking | 4 | In Progress |
+| M32 | Signal-Based Reranking | 4 | Complete |
 | M33 | History-Derived Signals | 2 | Not Started |
 | M34 | Graph-Topology Signals | 2 | Not Started |
 | M35 | Near-Duplicate Similarity | 1 | Not Started |
@@ -4018,7 +4018,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-RANK-REQ-007, PRD-RANK-REQ-008, PRD-RANK-REQ-009, PRD-RANK-REQ-016, PRD-RANK-REQ-017
 **Related Decisions:** DR-038, DR-037
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
