@@ -4193,7 +4193,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-DUP-REQ-001 through PRD-DUP-REQ-006
 **Related Decisions:** DR-041
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
