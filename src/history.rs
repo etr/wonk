@@ -73,16 +73,8 @@ pub fn age_weight(ts: i64, head_ts: i64, span: i64) -> f32 {
 /// `(head_ts, span)` of the mined window: the newest commit timestamp and
 /// its distance to the oldest. An empty window is `(0, 0)`.
 pub fn window_bounds(commits: &[MinedCommit]) -> (i64, i64) {
-    let mut head_ts = 0;
-    let mut tail_ts = 0;
-    for (i, commit) in commits.iter().enumerate() {
-        if i == 0 || commit.ts > head_ts {
-            head_ts = commit.ts;
-        }
-        if i == 0 || commit.ts < tail_ts {
-            tail_ts = commit.ts;
-        }
-    }
+    let head_ts = commits.iter().map(|c| c.ts).max().unwrap_or(0);
+    let tail_ts = commits.iter().map(|c| c.ts).min().unwrap_or(0);
     (head_ts, head_ts.saturating_sub(tail_ts))
 }
 
@@ -184,11 +176,16 @@ pub fn refresh(conn: &Connection, repo_root: &Path, window: usize) -> Result<Ref
 }
 
 fn refresh_inner(conn: &Connection, repo_root: &Path, window: usize) -> Result<RefreshOutcome> {
+    // The shared tail of every full-re-mine path below.
+    let full_remine = |conn: &Connection| -> Result<RefreshOutcome> {
+        mine_full(conn, repo_root, window)?;
+        Ok(RefreshOutcome::Refreshed(mined_count(conn)))
+    };
+
     let head = current_head(repo_root).unwrap_or_default();
     let Some(mined_head) = get_mined_head(conn) else {
         // Never mined (e.g. a pre-TASK-096 index): mine in full.
-        mine_full(conn, repo_root, window)?;
-        return Ok(RefreshOutcome::Refreshed(mined_count(conn)));
+        return full_remine(conn);
     };
     if head == mined_head {
         return Ok(RefreshOutcome::Unchanged);
@@ -196,20 +193,18 @@ fn refresh_inner(conn: &Connection, repo_root: &Path, window: usize) -> Result<R
 
     // Incremental mine of mined_head..HEAD, still -n-capped by the window.
     // A rewritten history (rebased-away mined_head) makes the ranged log
-    // fail: fall back to ONE full re-mine before giving up.
+    // fail or the stored head invalid: fall back to ONE full re-mine.
     let log = if crate::impact::validate_git_ref(&mined_head).is_ok() {
         match git_log(repo_root, window, Some(&format!("{mined_head}..HEAD"))) {
             Ok(log) => log,
             Err(e) => {
                 eprintln!("wonk: incremental history mine failed, re-mining in full: {e:#}");
-                mine_full(conn, repo_root, window)?;
-                return Ok(RefreshOutcome::Refreshed(mined_count(conn)));
+                return full_remine(conn);
             }
         }
     } else {
         eprintln!("wonk: stored mined head {mined_head:?} is not a valid ref, re-mining in full");
-        mine_full(conn, repo_root, window)?;
-        return Ok(RefreshOutcome::Refreshed(mined_count(conn)));
+        return full_remine(conn);
     };
     let commits = parse_git_log(&log);
 
