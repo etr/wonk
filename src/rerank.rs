@@ -1014,6 +1014,39 @@ impl Signal for AuthoritySignal {
     }
 }
 
+/// The community-membership signal (TASK-099, PRD-TOPO-REQ-003/004):
+/// when a query's results concentrate in one connectivity community, the
+/// members of that modal community earn a bonus scaled by the
+/// concentration — full weight at 100%, vanishing as results scatter.
+/// Membership is computed from the candidate set itself (the modal fold),
+/// never from an absolute per-symbol score; non-members and candidates
+/// without a community contribute exactly 0.0.
+pub(crate) struct CommunitySignal;
+
+impl Signal for CommunitySignal {
+    fn name(&self) -> &'static str {
+        "community"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_symbol_topology()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        community_value(
+            ctx.community_at(&file, candidate.result.line),
+            ctx.modal_community(),
+            ctx.modal_community_fraction(),
+        )
+    }
+}
+
 /// The MAXIMAL identifier runs (`[A-Za-z0-9_]+` bounded by
 /// non-identifier characters) of `line`, lowercased — the ONE shared
 /// scanner behind the prominence token tier and the proximity signal.
@@ -1434,6 +1467,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(CoChangeSignal),
         Box::new(HubSignal),
         Box::new(AuthoritySignal),
+        Box::new(CommunitySignal),
     ]
 }
 
@@ -2128,6 +2162,7 @@ impl RankSettings {
         if !topology_enabled {
             weights.weights.insert("hub".to_string(), 0.0);
             weights.weights.insert("authority".to_string(), 0.0);
+            weights.weights.insert("community".to_string(), 0.0);
         }
         Ok(Self {
             use_pipeline: rank.enabled,
@@ -2276,7 +2311,8 @@ mod tests {
                 "churn",
                 "co_change",
                 "hub",
-                "authority"
+                "authority",
+                "community"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -2361,7 +2397,7 @@ mod tests {
         assert!(
             err.contains(
                 "known: kind, lexical, semantic, centrality, prominence, path_character, \
-proximity, signature, churn, co_change, hub, authority",
+proximity, signature, churn, co_change, hub, authority, community",
             ),
             "error lists every valid name: {err}"
         );
@@ -2934,14 +2970,17 @@ proximity, signature, churn, co_change, hub, authority",
             WeightTable::from_config(&crate::config::RankConfig::default().weights).unwrap();
         assert_eq!(defaults.weight("hub"), 0.0);
         assert_eq!(defaults.weight("authority"), 0.0);
+        assert_eq!(defaults.weight("community"), 0.0);
 
-        // Registered: both names are accepted by [rank.weights].
+        // Registered: the names are accepted by [rank.weights].
         let mut weights = HashMap::new();
         weights.insert("hub".to_string(), 1.0);
         weights.insert("authority".to_string(), 1.0);
+        weights.insert("community".to_string(), 1.0);
         let table = WeightTable::from_config(&weights).unwrap();
         assert_eq!(table.weight("hub"), 1.0);
         assert_eq!(table.weight("authority"), 1.0);
+        assert_eq!(table.weight("community"), 1.0);
     }
 
     #[test]
@@ -2956,6 +2995,12 @@ proximity, signature, churn, co_change, hub, authority",
             ContextReqs::none().with_symbol_topology()
         );
         assert_eq!(AuthoritySignal.name(), "authority");
+        assert_eq!(
+            CommunitySignal.requires(),
+            ContextReqs::none().with_symbol_topology(),
+            "community shares the topology slice — no new context flag"
+        );
+        assert_eq!(CommunitySignal.name(), "community");
     }
 
     #[test]
@@ -3157,6 +3202,193 @@ proximity, signature, churn, co_change, hub, authority",
             PathBuf::from("src/unscored.rs"),
             "the equally-matched leaf helper follows"
         );
+    }
+
+    /// Symbols + topology rows at explicit `(file, line, community)`
+    /// positions, with uniform hub/authority — community is the only
+    /// signal that differs between candidates.
+    fn community_seeded_conn(entries: &[(&str, i64, i64)]) -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for (i, (file, line, community)) in entries.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, file, line, col, language) \
+                 VALUES (?1, 'function', ?2, ?3, 1, 'rust')",
+                rusqlite::params![format!("sym{i}"), file, line],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_topology (symbol_id, hub, authority, community) \
+                 SELECT id, 0.5, 0.5, ?1 FROM symbols WHERE file = ?2 AND line = ?3",
+                rusqlite::params![community, file, line],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    #[test]
+    fn community_signal_favors_the_modal_communitys_members() {
+        // REQ-004 end-to-end: five equally-matched Definition candidates,
+        // three in community 7 and two in community 12. Concentration is
+        // exactly 3/5: the modal members' bonus is exactly 3/5, the
+        // others' exactly 0.0, and that bonus alone reorders results no
+        // ordinal signal could.
+        let entries = [
+            ("src/a1.rs", 1i64, 7i64),
+            ("src/a2.rs", 1, 7),
+            ("src/a3.rs", 1, 7),
+            ("src/b1.rs", 1, 12),
+            ("src/b2.rs", 1, 12),
+        ];
+        let (_dir, conn) = community_seeded_conn(&entries);
+        let results: Vec<ClassifiedResult> = entries
+            .iter()
+            .map(|(file, line, _)| {
+                classified(file, *line as u64, "handler", ResultCategory::Definition)
+            })
+            .collect();
+
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("community", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        let community_of = |file: &str| entries.iter().find(|(f, _, _)| *f == file).unwrap().2;
+        for s in &scored {
+            let file = s.classified.result.file.to_str().unwrap();
+            let value = s
+                .contributions
+                .iter()
+                .find(|c| c.signal == "community")
+                .unwrap()
+                .value;
+            if community_of(file) == 7 {
+                assert_eq!(value, 3.0f32 / 5.0f32, "modal member: {file}");
+            } else {
+                assert_eq!(
+                    value, 0.0,
+                    "non-member is never penalized, just unbuilt: {file}"
+                );
+            }
+        }
+        let best_of = |community: i64| {
+            scored
+                .iter()
+                .filter(|s| community_of(s.classified.result.file.to_str().unwrap()) == community)
+                .map(|s| s.score)
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        assert!(
+            best_of(7) > best_of(12),
+            "the modal community's members outrank equally-matched outsiders"
+        );
+        assert_eq!(
+            community_of(scored[0].classified.result.file.to_str().unwrap()),
+            7,
+            "the winner is a modal-community member"
+        );
+    }
+
+    #[test]
+    fn scattered_communities_scale_the_bonus_down() {
+        // "Predominantly" is continuous: a 2-2-1 scatter makes the modal
+        // community (7, the tie-break winner) exactly 40% concentrated,
+        // so its members' bonus is exactly 0.4 — not the full weight.
+        let entries = [
+            ("src/a1.rs", 1i64, 7i64),
+            ("src/a2.rs", 1, 7),
+            ("src/b1.rs", 1, 12),
+            ("src/b2.rs", 1, 12),
+            ("src/c1.rs", 1, 30),
+        ];
+        let (_dir, conn) = community_seeded_conn(&entries);
+        let results: Vec<ClassifiedResult> = entries
+            .iter()
+            .map(|(file, line, _)| {
+                classified(file, *line as u64, "handler", ResultCategory::Definition)
+            })
+            .collect();
+
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("community", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        for s in &scored {
+            let file = s.classified.result.file.to_str().unwrap();
+            let value = s
+                .contributions
+                .iter()
+                .find(|c| c.signal == "community")
+                .unwrap()
+                .value;
+            let community = entries.iter().find(|(f, _, _)| *f == file).unwrap().2;
+            if community == 7 {
+                assert_eq!(value, 2.0f32 / 5.0f32, "40% concentration: {file}");
+            } else {
+                assert_eq!(value, 0.0, "{file}");
+            }
+        }
+    }
+
+    #[test]
+    fn community_histogram_ties_pick_the_smallest_community_id() {
+        // A 2-vs-2 split: the SMALLER community id is the modal one, so
+        // its members carry the 0.5 bonus while the larger id's members
+        // carry 0.0 — determinism independent of HashMap iteration order.
+        let entries = [
+            ("src/a1.rs", 1i64, 12i64),
+            ("src/a2.rs", 1, 12),
+            ("src/b1.rs", 1, 7),
+            ("src/b2.rs", 1, 7),
+        ];
+        let (_dir, conn) = community_seeded_conn(&entries);
+        let results: Vec<ClassifiedResult> = entries
+            .iter()
+            .map(|(file, line, _)| {
+                classified(file, *line as u64, "handler", ResultCategory::Definition)
+            })
+            .collect();
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "handler",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        assert_eq!(
+            ctx.modal_community(),
+            Some(7),
+            "ties break to the smallest id"
+        );
+        assert_eq!(ctx.modal_community_fraction(), 0.5);
+
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("community", 1.0)]),
+            &ContextSources::default(),
+        );
+        for s in &scored {
+            let file = s.classified.result.file.to_str().unwrap();
+            let community = entries.iter().find(|(f, _, _)| *f == file).unwrap().2;
+            let value = s
+                .contributions
+                .iter()
+                .find(|c| c.signal == "community")
+                .unwrap()
+                .value;
+            assert_eq!(value, if community == 7 { 0.5 } else { 0.0 }, "{file}");
+        }
     }
 
     #[test]
