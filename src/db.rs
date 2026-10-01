@@ -260,6 +260,27 @@ CREATE TABLE IF NOT EXISTS topology_meta (
 );
 "#;
 
+// Near-duplicate similarity (TASK-100, DR-041): bottom-k shingle sketches
+// per symbol, written at index time (PRD-DUP-REQ-001), plus the additive
+// `near_duplicates` pair store for REQ-003 — pairs are recorded by the
+// query-time memo and the `wonk duplicates` sweep, never by an index-time
+// all-pairs pass. Both tables cascade from the per-file symbol deletes
+// that `upsert_file_data`/`batch_insert` already issue, so no new DELETE
+// statements exist for them.
+const DUPLICATES_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS symbol_shingles (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+    signature BLOB NOT NULL        -- bottom-k sorted u32 LE shingle hashes (TASK-100, DR-041)
+);
+CREATE TABLE IF NOT EXISTS near_duplicates (
+    symbol_id_a INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    symbol_id_b INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    similarity REAL NOT NULL,      -- sketch Jaccard at detection time
+    PRIMARY KEY (symbol_id_a, symbol_id_b)   -- canonical: symbol_id_a < symbol_id_b
+);
+CREATE INDEX IF NOT EXISTS idx_near_duplicates_b ON near_duplicates(symbol_id_b);
+"#;
+
 const TRIGGERS_SQL: &str = r#"
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
     INSERT INTO symbols_fts(rowid, name, kind, file)
@@ -353,6 +374,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating history tables")?;
     conn.execute_batch(TOPOLOGY_SQL)
         .context("creating topology tables")?;
+    conn.execute_batch(DUPLICATES_SQL)
+        .context("creating duplicate tables")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -428,6 +451,17 @@ pub fn ensure_history_tables(conn: &Connection) -> Result<()> {
 pub fn ensure_topology_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(TOPOLOGY_SQL)
         .context("creating topology tables (migration)")?;
+    Ok(())
+}
+
+/// Ensure the TASK-100 duplicate tables exist (`symbol_shingles`,
+/// `near_duplicates`).
+///
+/// Handles schema migration for indexes created before shingle
+/// signatures: safe to call on databases that already have the tables.
+pub fn ensure_duplicate_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(DUPLICATES_SQL)
+        .context("creating duplicate tables (migration)")?;
     Ok(())
 }
 
@@ -2034,6 +2068,125 @@ mod tests {
         ensure_topology_tables(&conn).unwrap();
         ensure_topology_tables(&conn).unwrap();
         assert_eq!(topology_table_names(&conn).len(), 2);
+    }
+
+    // -- duplicate tables (TASK-100) -------------------------------------------
+
+    fn duplicate_table_names(conn: &Connection) -> Vec<String> {
+        let names = "('symbol_shingles','near_duplicates')";
+        conn.prepare(&format!(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN {names}"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    #[test]
+    fn test_open_creates_duplicate_tables() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        let mut tables = duplicate_table_names(&conn);
+        tables.sort();
+        assert_eq!(tables, vec!["near_duplicates", "symbol_shingles"]);
+        // The reverse-lookup index on the pair table's second column.
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_near_duplicates_b'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(indexes, vec!["idx_near_duplicates_b"]);
+    }
+
+    #[test]
+    fn test_ensure_duplicate_tables_on_pre100_db_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A pre-TASK-100 index: base schema only, no duplicate tables.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        assert!(duplicate_table_names(&conn).is_empty());
+
+        ensure_duplicate_tables(&conn).unwrap();
+        ensure_duplicate_tables(&conn).unwrap();
+        assert_eq!(duplicate_table_names(&conn).len(), 2);
+    }
+
+    #[test]
+    fn test_shingles_cascade_on_symbol_delete() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbols (id, name, kind, file, line, col, language) VALUES (1, 'f', 'function', 'a.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_shingles (symbol_id, signature) VALUES (1, x'01020304')",
+            [],
+        )
+        .unwrap();
+
+        // The re-index path deletes a file's symbols wholesale; the
+        // signature row must follow (no new DELETE statements anywhere).
+        conn.execute("DELETE FROM symbols WHERE file = 'a.rs'", [])
+            .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_shingles", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_near_duplicates_cascade_both_sides() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = open(&db_path).unwrap();
+
+        for id in 1..=2 {
+            conn.execute(
+                "INSERT INTO symbols (id, name, kind, file, line, col, language) \
+                 VALUES (?1, 'f', 'function', 'a.rs', ?1, 0, 'rust')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO near_duplicates (symbol_id_a, symbol_id_b, similarity) VALUES (1, 2, 0.9)",
+            [],
+        )
+        .unwrap();
+
+        // Deleting either endpoint removes the pair row.
+        conn.execute("DELETE FROM symbols WHERE id = 1", [])
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM near_duplicates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        conn.execute(
+            "INSERT INTO near_duplicates (symbol_id_a, symbol_id_b, similarity) VALUES (2, 2, 1.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM symbols WHERE id = 2", [])
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM near_duplicates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     // -- confidence column tests -----------------------------------------------

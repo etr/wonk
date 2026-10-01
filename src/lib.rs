@@ -30,6 +30,7 @@ pub mod review;
 pub mod router;
 pub mod search;
 pub mod semantic;
+pub mod shingles;
 pub mod show;
 pub mod summary;
 pub mod tokenizer;
