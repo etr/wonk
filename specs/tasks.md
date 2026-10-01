@@ -50,7 +50,7 @@
 | M30 | Diff-Scoped Review Workflow | 3 | Complete |
 | M31 | Body Elision | 2 | Complete |
 | M32 | Signal-Based Reranking | 4 | Complete |
-| M33 | History-Derived Signals | 2 | In Progress |
+| M33 | History-Derived Signals | 2 | Complete |
 | M34 | Graph-Topology Signals | 2 | Not Started |
 | M35 | Near-Duplicate Similarity | 1 | Not Started |
 | M36 | Usage Feedback Loop | 5 | Not Started |
@@ -4067,12 +4067,12 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Estimate:** M
 
 **Action Items:**
-- [ ] Derive file co-occurrence within commits (PRD-HIST-REQ-004)
-- [ ] **Exclude commits touching more than a configurable file count** — reformatting sweeps and vendored imports would otherwise dominate all coupling (PRD-HIST-REQ-005)
-- [ ] Retain only top-K couplings per file, keeping storage linear (PRD-HIST-REQ-004)
-- [ ] Add the `co_change` table with a `(file_a, weight DESC)` index
-- [ ] Expose co-change as a rerank signal (PRD-HIST-REQ-006)
-- [ ] Refresh incrementally alongside churn (PRD-HIST-REQ-007)
+- [x] Derive file co-occurrence within commits (PRD-HIST-REQ-004)
+- [x] **Exclude commits touching more than a configurable file count** — reformatting sweeps and vendored imports would otherwise dominate all coupling (PRD-HIST-REQ-005)
+- [x] Retain only top-K couplings per file, keeping storage linear (PRD-HIST-REQ-004)
+- [x] Add the `co_change` table with a `(file_a, weight DESC)` index
+- [x] Expose co-change as a rerank signal (PRD-HIST-REQ-006)
+- [x] Refresh incrementally alongside churn (PRD-HIST-REQ-007)
 
 **Dependencies:**
 - Blocked by: TASK-096
@@ -4087,7 +4087,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-HIST-REQ-004, PRD-HIST-REQ-005, PRD-HIST-REQ-006, PRD-HIST-REQ-007
 **Related Decisions:** DR-039
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
