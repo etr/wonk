@@ -947,6 +947,93 @@ impl Signal for PathCharacterSignal {
     }
 }
 
+/// Whether the query resembles a type or function signature
+/// (TASK-094, PRD-RANK-REQ-014): a parenthesis, an arrow, or a
+/// path-separator — punctuation a name-shaped query would not carry.
+pub fn is_signature_query(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    trimmed.contains('(') || trimmed.contains("->") || trimmed.contains("::")
+}
+
+/// Keywords a definition line opens with, across the indexed languages.
+const DEFINITION_KEYWORDS: &[&str] = &[
+    "fn",
+    "def",
+    "func",
+    "function",
+    "class",
+    "struct",
+    "enum",
+    "interface",
+    "trait",
+    "impl",
+    "type",
+    "pub",
+    "async",
+    "const",
+    "static",
+    "export",
+    "module",
+    "namespace",
+];
+
+/// The signature-match contribution (TASK-094, PRD-RANK-REQ-014):
+///
+/// - 1.0 the candidate's category is Definition (index-backed);
+/// - 0.5 the matched line is definition-SHAPED — it contains a
+///   parenthesis AND a definition keyword among its first three
+///   identifier tokens (definitions announce themselves);
+/// - 0.0 otherwise.
+///
+/// Inert unless the query itself is signature-shaped: a name query must
+/// not reorder through this signal at all, so [`is_signature_query`] gates
+/// everything.
+pub fn signature_value(query_shaped: bool, category: ResultCategory, content: &str) -> f32 {
+    if !query_shaped {
+        return 0.0;
+    }
+    if category == ResultCategory::Definition {
+        return 1.0;
+    }
+    if content.contains('(')
+        && identifier_tokens(content)
+            .iter()
+            .take(3)
+            .any(|token| DEFINITION_KEYWORDS.contains(&token.as_str()))
+    {
+        return 0.5;
+    }
+    0.0
+}
+
+/// The signature-match signal: definition lines answer signature-shaped
+/// queries. Reads only the raw pattern, the candidate's category, and its
+/// matched text — no context, no SQL.
+pub(crate) struct SignatureSignal;
+
+impl Signal for SignatureSignal {
+    fn name(&self) -> &'static str {
+        "signature"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none()
+    }
+
+    fn contribution(
+        &self,
+        query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        _ctx: &SharedContext,
+    ) -> f32 {
+        signature_value(
+            is_signature_query(query.pattern),
+            candidate.category,
+            &candidate.result.content,
+        )
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -959,6 +1046,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(ProminenceSignal),
         Box::new(PathCharacterSignal),
         Box::new(ProximitySignal),
+        Box::new(SignatureSignal),
     ]
 }
 
@@ -1391,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_seven_signals_in_order() {
+    fn registry_contains_eight_signals_in_order() {
         let registry = builtin_signals();
         let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
         assert_eq!(
@@ -1403,7 +1491,8 @@ mod tests {
                 "centrality",
                 "prominence",
                 "path_character",
-                "proximity"
+                "proximity",
+                "signature"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -1487,7 +1576,8 @@ mod tests {
         );
         assert!(
             err.contains(
-                "known: kind, lexical, semantic, centrality, prominence, path_character, proximity",
+                "known: kind, lexical, semantic, centrality, prominence, path_character, \
+proximity, signature",
             ),
             "error lists every valid name: {err}"
         );
@@ -2578,6 +2668,122 @@ mod tests {
         assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
         assert!((signal.contribution(&query, &results[1], &ctx) - 0.5).abs() < 1e-6);
         assert_eq!(signal.contribution(&query, &results[2], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // SignatureSignal (TASK-094, REQ-014)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_signature_query_detects_signature_punctuation() {
+        for pattern in [
+            "foo(a, b)",
+            "fn foo() -> Result<T>",
+            "Foo::bar",
+            "  foo(x)  ",
+            "(x)",
+        ] {
+            assert!(is_signature_query(pattern), "{pattern:?}");
+        }
+        for pattern in ["foo", "my_func", "error handling", ""] {
+            assert!(!is_signature_query(pattern), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn signature_value_inert_when_query_not_shaped() {
+        // A name-shaped query must not reorder anything through this
+        // signal — not even an index-backed Definition.
+        assert_eq!(
+            signature_value(
+                false,
+                ResultCategory::Definition,
+                "pub fn parse(input: &str) {}"
+            ),
+            0.0
+        );
+        assert_eq!(
+            signature_value(false, ResultCategory::CallSite, "parse(x);"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn signature_value_definition_category_scores_one() {
+        assert_eq!(
+            signature_value(true, ResultCategory::Definition, "anything"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn signature_value_definition_shaped_line_scores_half() {
+        for line in [
+            "pub fn parse(input: &str) -> Vec<Token> {",
+            "    fn helper(x: u32) {}",
+            "def process(data):",
+            "export function alpha(x: number) { return x; }",
+            "class Client { constructor(opts) {} }",
+            "struct Config(String);",
+        ] {
+            assert_eq!(
+                signature_value(true, ResultCategory::Other, line),
+                0.5,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_value_call_sites_and_late_keywords_score_zero() {
+        // A call line carries the parenthesis but no definition keyword in
+        // its first three identifier tokens.
+        assert_eq!(
+            signature_value(true, ResultCategory::CallSite, "parse(data);"),
+            0.0
+        );
+        assert_eq!(
+            signature_value(true, ResultCategory::Other, "std::mem::swap(a, b);"),
+            0.0
+        );
+        // A definition keyword BEYOND the first three tokens is not a
+        // definition line.
+        assert_eq!(
+            signature_value(
+                true,
+                ResultCategory::Other,
+                "// the constructor foo(x) fn later"
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn signature_signal_needs_no_context_and_reads_the_query_shape() {
+        let signal = SignatureSignal;
+        assert_eq!(signal.name(), "signature");
+        assert_eq!(signal.requires(), ContextReqs::none());
+
+        let definition = classified(
+            "src/parse.rs",
+            3,
+            "fn parse(input: &str) {}",
+            ResultCategory::Definition,
+        );
+        let call = classified("src/main.rs", 9, "parse(data);", ResultCategory::CallSite);
+        let ctx = SharedContext::default();
+
+        // Shaped query: definition 1.0, call site 0.0.
+        let shaped = QueryInfo {
+            pattern: "parse(input: &str)",
+        };
+        assert_eq!(signal.contribution(&shaped, &definition, &ctx), 1.0);
+        assert_eq!(signal.contribution(&shaped, &call, &ctx), 0.0);
+
+        // Same candidates, name-shaped query: inert everywhere.
+        let plain = QueryInfo { pattern: "parse" };
+        assert_eq!(signal.contribution(&plain, &definition, &ctx), 0.0);
+        assert_eq!(signal.contribution(&plain, &call, &ctx), 0.0);
     }
 
     // -------------------------------------------------------------------
