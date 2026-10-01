@@ -168,26 +168,14 @@ pub fn detect_changed_symbols(
 pub fn detect_changed_files_since(commit: &str, repo_root: &Path) -> Result<Vec<String>> {
     validate_git_ref(commit)?;
 
-    let output = Command::new("git")
-        .args(["diff", "--name-only", commit])
-        .current_dir(repo_root)
-        .output()
-        .context("failed to run git — is git installed? (--since requires git)")?;
+    let stdout = run_git_output(repo_root, &["diff", "--name-only", commit])?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git diff failed: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<String> = stdout
+    Ok(stdout
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .map(|line| line.to_string())
-        .collect();
-
-    Ok(files)
+        .collect())
 }
 
 /// Apply [`ChangeScope`] flags to a `git diff` command, validating refs.
@@ -566,6 +554,27 @@ pub fn validate_git_ref(git_ref: &str) -> Result<()> {
         bail!("invalid git reference: {git_ref}");
     }
     Ok(())
+}
+
+/// Run `git <args>` in `repo_root` and return its stdout.
+///
+/// The shared spawn convention for every git-reading call site: a nonzero
+/// exit fails with git's stderr, a failed spawn fails with an install hint.
+pub(crate) fn run_git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+        .context("failed to run git — is git installed?")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            stderr.trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Validate that a file path is safe: no `..` components and no absolute paths.
@@ -1065,6 +1074,34 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let result = detect_changed_files_since("", dir.path());
         assert!(result.is_err(), "empty commit ref should be rejected");
+    }
+
+    // -- run_git_output tests --------------------------------------------------
+
+    #[test]
+    fn run_git_output_returns_stdout_on_success() {
+        if !git_available() {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let out = run_git_output(dir.path(), &["--version"]).unwrap();
+        assert!(out.starts_with("git version"), "got: {out}");
+    }
+
+    #[test]
+    fn run_git_output_errors_with_stderr_on_nonzero_exit() {
+        if !git_available() {
+            return;
+        }
+        // A temp dir with no .git: `git log` exits nonzero.
+        let dir = TempDir::new().unwrap();
+        let err = run_git_output(dir.path(), &["log", "-n", "1"])
+            .expect_err("git log outside a repo must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fatal: not a git repository"),
+            "error carries git's stderr: {msg}"
+        );
     }
 
     #[test]

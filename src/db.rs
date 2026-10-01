@@ -198,6 +198,35 @@ CREATE TABLE IF NOT EXISTS review_suppressions (
 CREATE INDEX IF NOT EXISTS idx_review_suppressions_rule ON review_suppressions(rule);
 "#;
 
+// Bounded history mining (TASK-096, DR-039). `file_churn` is the
+// age-weighted aggregate the churn signal reads; `mined_commits` +
+// `commit_files` retain the per-commit detail TASK-097's co-change needs
+// and make the incremental refresh exact (weights are recomputed against
+// the new window bounds without re-reading git); `history_meta.mined_head`
+// records HEAD at the last successful mine (the reach_meta pattern). The
+// retained-row invariant `mined_commits <= window` keeps storage O(window)
+// regardless of repository age.
+const HISTORY_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS file_churn (
+    file TEXT PRIMARY KEY,
+    score REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mined_commits (
+    commit_id TEXT PRIMARY KEY,
+    commit_ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS commit_files (
+    commit_id TEXT NOT NULL REFERENCES mined_commits(commit_id) ON DELETE CASCADE,
+    file TEXT NOT NULL,
+    PRIMARY KEY (commit_id, file)
+);
+CREATE INDEX IF NOT EXISTS idx_commit_files_file ON commit_files(file);
+CREATE TABLE IF NOT EXISTS history_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#;
+
 const TRIGGERS_SQL: &str = r#"
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
     INSERT INTO symbols_fts(rowid, name, kind, file)
@@ -287,6 +316,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating contracts table")?;
     conn.execute_batch(REVIEW_SUPPRESSIONS_SQL)
         .context("creating review_suppressions table")?;
+    conn.execute_batch(HISTORY_SQL)
+        .context("creating history tables")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -340,6 +371,17 @@ fn ensure_embedding_metadata_columns(conn: &Connection) -> Result<()> {
 pub fn ensure_summaries_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table (migration)")?;
+    Ok(())
+}
+
+/// Ensure the TASK-096 history tables exist (`file_churn`, `mined_commits`,
+/// `commit_files`, `history_meta`).
+///
+/// Handles schema migration for indexes created before history mining:
+/// safe to call on databases that already have the tables.
+pub fn ensure_history_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(HISTORY_SQL)
+        .context("creating history tables (migration)")?;
     Ok(())
 }
 
@@ -1834,6 +1876,55 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(tables.len(), 1);
+    }
+
+    // -- history tables (TASK-096) -------------------------------------------
+
+    fn history_table_names(conn: &Connection) -> Vec<String> {
+        let names = "('file_churn','mined_commits','commit_files','history_meta')";
+        conn.prepare(&format!(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN {names}"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    #[test]
+    fn test_open_creates_history_tables() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        let mut tables = history_table_names(&conn);
+        tables.sort();
+        assert_eq!(
+            tables,
+            vec![
+                "commit_files",
+                "file_churn",
+                "history_meta",
+                "mined_commits"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ensure_history_tables_on_pre096_db_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A pre-TASK-096 index: base schema only, no history tables.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        assert!(history_table_names(&conn).is_empty());
+
+        // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
+        ensure_history_tables(&conn).unwrap();
+        ensure_history_tables(&conn).unwrap();
+        assert_eq!(history_table_names(&conn).len(), 4);
     }
 
     // -- confidence column tests -----------------------------------------------

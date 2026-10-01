@@ -40,6 +40,7 @@ pub struct ContextReqs {
     pub(crate) symbol_hits: bool,
     pub(crate) lexical_scores: bool,
     pub(crate) embeddings: bool,
+    pub(crate) file_churn: bool,
 }
 
 impl ContextReqs {
@@ -78,6 +79,12 @@ impl ContextReqs {
         self
     }
 
+    /// Require the mined per-file churn scores (TASK-096).
+    pub fn with_file_churn(mut self) -> Self {
+        self.file_churn = true;
+        self
+    }
+
     fn union(self, other: Self) -> Self {
         Self {
             query_terms: self.query_terms || other.query_terms,
@@ -85,6 +92,7 @@ impl ContextReqs {
             symbol_hits: self.symbol_hits || other.symbol_hits,
             lexical_scores: self.lexical_scores || other.lexical_scores,
             embeddings: self.embeddings || other.embeddings,
+            file_churn: self.file_churn || other.file_churn,
         }
     }
 }
@@ -431,6 +439,14 @@ pub struct EmbeddingContext {
     pub(crate) vectors: HashMap<(String, u64), Vec<f32>>,
 }
 
+/// Mined per-file churn scores for the candidate set, with the set max
+/// folded once at preparation time (TASK-096).
+#[derive(Debug, Default, Clone)]
+pub struct ChurnContext {
+    pub(crate) scores: HashMap<String, f32>,
+    pub(crate) max: f32,
+}
+
 /// The query sources the pipeline prepares context against: the BM25
 /// constants and the embedding provider kind from the loaded configuration.
 /// Carrying them in one struct keeps `rank_and_explain`'s signature stable
@@ -461,6 +477,7 @@ pub struct SharedContext {
     pub(crate) lexical: LexicalContext,
     pub(crate) max_caller_count: u32,
     pub(crate) embeddings: EmbeddingContext,
+    pub(crate) churn: ChurnContext,
 }
 
 impl SharedContext {
@@ -511,6 +528,16 @@ impl SharedContext {
             .vectors
             .get(&(file.to_string(), line))
             .map(|v| v.as_slice())
+    }
+
+    /// Mined churn score for a candidate file (None unless prepared).
+    pub fn churn_score(&self, file: &str) -> Option<f32> {
+        self.churn.scores.get(file).copied()
+    }
+
+    /// The largest churn score across the candidate set; 0 when none.
+    pub fn max_churn(&self) -> f32 {
+        self.churn.max
     }
 }
 
@@ -709,6 +736,49 @@ impl Signal for CentralitySignal {
             return 0.0;
         };
         centrality_value(hit.caller_count, ctx.max_caller_count())
+    }
+}
+
+/// Log-damped churn against the candidate-set maximum (TASK-096,
+/// PRD-HIST-REQ-006): `ln(1 + score) / ln(1 + set_max)` over the stored
+/// age-weighted score — the same damper as [`centrality_value`], so a
+/// hyper-active file cannot crush the rest of the set. The weighting
+/// itself is baked at index time by `history::aggregate_churn`; the query
+/// only normalizes. An all-dormant set (`set_max <= 0`) and non-finite
+/// inputs score exactly 0.0 — absent is zero, never a penalty.
+pub fn churn_value(score: f32, set_max: f32) -> f32 {
+    if !score.is_finite() || !set_max.is_finite() || set_max <= 0.0 {
+        return 0.0;
+    }
+    (1.0 + score).ln() / (1.0 + set_max).ln()
+}
+
+/// The churn signal: how actively the candidate file was modified within
+/// the mined commit window. Reads the `file_churn` aggregate prepared for
+/// the candidate set; a file absent from the table (never touched in the
+/// window, or no git history) contributes exactly 0.0.
+pub(crate) struct ChurnSignal;
+
+impl Signal for ChurnSignal {
+    fn name(&self) -> &'static str {
+        "churn"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_file_churn()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        match ctx.churn_score(&file) {
+            Some(score) => churn_value(score, ctx.max_churn()),
+            None => 0.0,
+        }
     }
 }
 
@@ -1128,6 +1198,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(PathCharacterSignal),
         Box::new(ProximitySignal),
         Box::new(SignatureSignal),
+        Box::new(ChurnSignal),
     ]
 }
 
@@ -1264,6 +1335,59 @@ pub fn prepare_context(
     {
         ctx.embeddings = prepare_embeddings(conn, pattern, results, sources.embedding);
     }
+    if reqs.file_churn
+        && let Some(conn) = conn
+    {
+        let files: std::collections::HashSet<String> = results
+            .iter()
+            .map(|r| r.result.file.to_string_lossy().into_owned())
+            .collect();
+        ctx.churn = load_churn_scores(conn, &files);
+    }
+    ctx
+}
+
+/// Load the churn scores for exactly the candidate files, in IN_CHUNK
+/// batches against the `file_churn` primary key, folding the set max once.
+///
+/// A presence probe (the bm25 precedent) degrades to an empty context on a
+/// pre-TASK-096 index whose `file_churn` table does not exist; every
+/// prepare failure is the same zero-path, never an error.
+fn load_churn_scores(conn: &Connection, files: &std::collections::HashSet<String>) -> ChurnContext {
+    let mut ctx = ChurnContext::default();
+    if files.is_empty() {
+        return ctx;
+    }
+    if conn
+        .query_row("SELECT 1 FROM file_churn LIMIT 1", [], |_| Ok(()))
+        .is_err()
+    {
+        return ctx;
+    }
+
+    let mut wanted: Vec<&String> = files.iter().collect();
+    wanted.sort_unstable();
+    for chunk in wanted.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("SELECT file, score FROM file_churn WHERE file IN ({placeholders})");
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+        }) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            ctx.scores.insert(row.0, row.1);
+        }
+    }
+    ctx.max = ctx
+        .scores
+        .values()
+        .copied()
+        .filter(|s| s.is_finite())
+        .fold(0.0f32, f32::max);
     ctx
 }
 
@@ -1716,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_eight_signals_in_order() {
+    fn registry_contains_nine_signals_in_order() {
         let registry = builtin_signals();
         let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
         assert_eq!(
@@ -1729,7 +1853,8 @@ mod tests {
                 "prominence",
                 "path_character",
                 "proximity",
-                "signature"
+                "signature",
+                "churn"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -1754,7 +1879,7 @@ mod tests {
         // and the breakdown carries only kind.
         let (_dir, conn) = lexical_seeded_conn();
         let results = vec![classified("a.rs", 1, "alpha", ResultCategory::Other)];
-        let weights = table(&[("kind", 1.0)]);
+        let weights = table(&[("kind", 1.0), ("churn", 0.0)]);
 
         assert_eq!(
             union_reqs(&builtin_signals(), &weights),
@@ -1814,7 +1939,7 @@ mod tests {
         assert!(
             err.contains(
                 "known: kind, lexical, semantic, centrality, prominence, path_character, \
-proximity, signature",
+proximity, signature, churn",
             ),
             "error lists every valid name: {err}"
         );
@@ -2009,6 +2134,139 @@ proximity, signature",
 
         let on = union_reqs(&signals, &table(&[("kind", 1.0), ("counting", 0.5)]));
         assert_eq!(on, ContextReqs::none().with_symbol_hits());
+    }
+
+    // -- churn signal (TASK-096) ---------------------------------------------
+
+    fn churn_seeded_conn() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = seeded_conn();
+        for (file, score) in [("src/a.rs", 4.0), ("src/b.rs", 1.0), ("src/other.rs", 99.0)] {
+            conn.execute(
+                "INSERT INTO file_churn (file, score) VALUES (?1, ?2)",
+                rusqlite::params![file, score],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    #[test]
+    fn churn_value_log_damped_monotone_and_zero_paths() {
+        // Monotone in the score, and the set max maps to exactly 1.0.
+        assert!(churn_value(5.0, 100.0) > churn_value(1.0, 100.0));
+        assert_eq!(churn_value(100.0, 100.0), 1.0);
+        // Log damping keeps small scores alive against a hot max.
+        assert!(churn_value(5.0, 500.0) > 0.25);
+        // An all-dormant set is inert, and absent is exactly zero.
+        assert_eq!(churn_value(0.0, 0.0), 0.0);
+        assert_eq!(churn_value(1.0, 0.0), 0.0);
+        assert_eq!(churn_value(0.0, 4.0), 0.0);
+        // Non-finite inputs never propagate NaN.
+        assert_eq!(churn_value(f32::NAN, 4.0), 0.0);
+        assert_eq!(churn_value(2.0, f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn churn_absent_from_default_weights_but_configurable() {
+        // Absent = weight 0: rankings are unchanged until a user opts in.
+        let defaults =
+            WeightTable::from_config(&crate::config::RankConfig::default().weights).unwrap();
+        assert_eq!(defaults.weight("churn"), 0.0);
+
+        // Registered: the name is accepted by [rank.weights].
+        let mut weights = HashMap::new();
+        weights.insert("churn".to_string(), 1.0);
+        let table = WeightTable::from_config(&weights).unwrap();
+        assert_eq!(table.weight("churn"), 1.0);
+    }
+
+    #[test]
+    fn churn_requires_its_context_slice() {
+        assert_eq!(
+            ChurnSignal.requires(),
+            ContextReqs::none().with_file_churn()
+        );
+        assert_eq!(ChurnSignal.name(), "churn");
+    }
+
+    #[test]
+    fn churn_context_loads_only_candidate_files_with_folded_max() {
+        let (_dir, conn) = churn_seeded_conn();
+        let results = vec![
+            classified("src/a.rs", 1, "x", ResultCategory::Other),
+            classified("src/b.rs", 1, "x", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_file_churn(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(ctx.churn_score("src/a.rs"), Some(4.0));
+        assert_eq!(ctx.churn_score("src/b.rs"), Some(1.0));
+        assert_eq!(ctx.churn_score("src/other.rs"), None, "not a candidate");
+        assert_eq!(ctx.max_churn(), 4.0, "max folds over the candidate set");
+    }
+
+    #[test]
+    fn churn_context_empty_without_table_or_connection() {
+        // A pre-TASK-096 index has no file_churn table: the presence probe
+        // degrades to an empty slice, never an error.
+        let raw = Connection::open_in_memory().unwrap();
+        let results = vec![classified("src/a.rs", 1, "x", ResultCategory::Other)];
+        let ctx = prepare_context(
+            ContextReqs::none().with_file_churn(),
+            "x",
+            &results,
+            Some(&raw),
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.churn_score("src/a.rs"), None);
+        assert_eq!(ctx.max_churn(), 0.0);
+
+        // No connection at all: same zero-path.
+        let ctx = prepare_context(
+            ContextReqs::none().with_file_churn(),
+            "x",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.churn_score("src/a.rs"), None);
+    }
+
+    #[test]
+    fn churn_signal_scores_missing_file_exactly_zero() {
+        let (_dir, conn) = churn_seeded_conn();
+        let results = vec![
+            classified("src/a.rs", 1, "x", ResultCategory::Other),
+            classified("src/gone.rs", 1, "x", ResultCategory::Other),
+        ];
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "x" },
+            Some(&conn),
+            &table(&[("churn", 1.0)]),
+            &ContextSources::default(),
+        );
+        let by_file = |f: &str| {
+            scored
+                .iter()
+                .find(|s| s.classified.result.file == *f)
+                .unwrap()
+        };
+        let hot = by_file("src/a.rs");
+        let gone = by_file("src/gone.rs");
+        assert_eq!(hot.contributions[0].signal, "churn");
+        assert_eq!(hot.contributions[0].value, 1.0, "set max maps to 1.0");
+        assert_eq!(
+            gone.contributions[0].value, 0.0,
+            "absent is zero, not a penalty"
+        );
+        assert!(hot.score > gone.score);
     }
 
     #[test]

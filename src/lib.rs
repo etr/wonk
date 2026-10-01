@@ -15,6 +15,7 @@ pub mod elide;
 pub mod embedding;
 pub mod errors;
 pub mod flows;
+pub mod history;
 pub mod impact;
 pub mod indexer;
 pub mod llm;

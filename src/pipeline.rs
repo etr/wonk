@@ -150,6 +150,16 @@ pub fn build_index_with_progress(
     let (sym_count, ref_count, caller_count, type_edge_count, contract_count) =
         batch_insert(&conn, &results, reach_opts.as_ref())?;
 
+    // 5b. Mine the bounded history window (TASK-096). Best-effort: a git
+    // failure warns and the build proceeds with empty history tables
+    // (PRD-HIST-REQ-008) — never an error.
+    if config.history.enabled
+        && crate::history::has_git(repo_root)
+        && let Err(e) = crate::history::mine_full(&conn, repo_root, config.history.window)
+    {
+        eprintln!("wonk: history mining skipped: {e:#}");
+    }
+
     // 6. Collect languages seen and write meta.json.
     let languages: Vec<String> = {
         let mut set = HashSet::new();
@@ -252,6 +262,15 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
     for rel in &on_disk {
         let abs = repo_root.join(rel);
         let _ = reindex_file(&conn, &abs, repo_root, &contract_opts);
+    }
+
+    // Refresh the history window after the file loop (TASK-096). Best-effort:
+    // Failed already warned inside refresh; Skipped/Unchanged stay silent
+    // (PRD-HIST-REQ-007/008).
+    if config.history.enabled
+        && let Err(e) = crate::history::refresh(&conn, repo_root, config.history.window)
+    {
+        eprintln!("wonk: history refresh failed: {e:#}");
     }
 
     // Collect languages and rewrite meta.json.
@@ -1659,7 +1678,11 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM reach;
          DELETE FROM reach_truncated;
          DELETE FROM reach_meta;
-         DELETE FROM files;",
+         DELETE FROM files;
+         DELETE FROM file_churn;
+         DELETE FROM commit_files;
+         DELETE FROM mined_commits;
+         DELETE FROM history_meta;",
     )
     .context("clearing index data")?;
     Ok(())
@@ -1829,6 +1852,383 @@ class Component {
 
         let meta = db::read_meta(&db::local_index_path(dir.path())).unwrap();
         assert!(meta.workspaces.is_empty());
+    }
+
+    // -- history mining (TASK-096) ---------------------------------------------
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// A real git repo with one dated commit per `(file, ts)` pair.
+    fn make_git_history_repo(commits: &[(&str, i64)]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?} failed");
+        }
+        for (i, (file, ts)) in commits.iter().enumerate() {
+            if let Some(parent) = Path::new(file).parent() {
+                fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            fs::write(root.join(file), format!("fn f{i}() {{}}\n")).unwrap();
+            let date = format!("@{ts} +0000");
+            for args in [vec!["add", "."], vec!["commit", "-m", &format!("c{i}")]] {
+                let ok = std::process::Command::new("git")
+                    .args(&args)
+                    .env("GIT_AUTHOR_DATE", &date)
+                    .env("GIT_COMMITTER_DATE", &date)
+                    .current_dir(root)
+                    .output()
+                    .unwrap();
+                assert!(ok.status.success(), "git {args:?} failed");
+            }
+        }
+        dir
+    }
+
+    fn history_counts(conn: &rusqlite::Connection) -> (i64, i64) {
+        let commits: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mined_commits", [], |r| r.get(0))
+            .unwrap();
+        let churn: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_churn", [], |r| r.get(0))
+            .unwrap();
+        (commits, churn)
+    }
+
+    #[test]
+    fn build_index_mines_history_in_git_repo() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100), ("src/b.rs", 200)]);
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        let (commits, churn) = history_counts(&conn);
+        assert_eq!(commits, 2, "every repo commit is mined (window 500)");
+        assert_eq!(churn, 2, "each touched file has a churn row");
+        let head: String = conn
+            .query_row(
+                "SELECT value FROM history_meta WHERE key = 'mined_head'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(head.len(), 40, "mined_head is a full sha");
+    }
+
+    /// A comparable `files` row: every column except `last_indexed` (a
+    /// wall-clock stamp per build) — deterministic across builds of the
+    /// same tree.
+    type FileRow = (String, Option<String>, String, Option<i64>, Option<i64>);
+
+    /// The index's comparable `files` rows, ordered by path.
+    fn indexed_files(conn: &rusqlite::Connection) -> Vec<FileRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, language, hash, line_count, symbols_count \
+                 FROM files ORDER BY path",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// A comparable `symbols` row: every column except the rowid (an
+    /// insertion-order implementation detail).
+    type SymbolRow = (
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+
+    /// The index's comparable `symbols` rows, deterministically ordered.
+    fn indexed_symbols(conn: &rusqlite::Connection) -> Vec<SymbolRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, kind, file, line, col, end_line, scope, signature, language \
+                 FROM symbols ORDER BY name, kind, file, line, col",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })
+            .unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// An AC-3 rerank candidate: a fixed file/category pair — kind and
+    /// churn are the only signals under test.
+    fn ac3_candidate(
+        file: &str,
+        category: crate::ranker::ResultCategory,
+    ) -> crate::ranker::ClassifiedResult {
+        crate::ranker::ClassifiedResult {
+            result: crate::search::SearchResult {
+                file: std::path::PathBuf::from(file),
+                line: 1,
+                col: 1,
+                content: "fn target() {}".to_string(),
+            },
+            category,
+            annotation: None,
+        }
+    }
+
+    #[test]
+    fn build_index_without_git_behaves_as_today() {
+        if !git_available() {
+            return;
+        }
+        // AC-3 identity: the SAME tree built twice — once with no .git at
+        // all, once inside a git repository with [history] disabled (the
+        // pre-TASK-096 shape) — must index IDENTICALLY (files and symbols
+        // equal; only the per-build timestamp and rowids may differ), with
+        // the history tables empty in both.
+        let no_git = TempDir::new().unwrap();
+        fs::create_dir_all(no_git.path().join("src")).unwrap();
+        fs::write(no_git.path().join("src/lib.rs"), "fn f0() {}\n").unwrap();
+        write_reach_config(no_git.path(), "[history]\nenabled = false\n");
+
+        let git_repo = make_git_history_repo(&[("src/lib.rs", 100)]);
+        write_reach_config(git_repo.path(), "[history]\nenabled = false\n");
+
+        let stats = build_index(no_git.path(), true).unwrap();
+        assert_eq!(stats.file_count, 1, "indexing is unaffected");
+        build_index(git_repo.path(), true).unwrap();
+
+        let conn_no_git = db::open_existing(&db::local_index_path(no_git.path())).unwrap();
+        let conn_disabled = db::open_existing(&db::local_index_path(git_repo.path())).unwrap();
+        assert_eq!(
+            history_counts(&conn_no_git),
+            (0, 0),
+            "no-.git history tables stay empty"
+        );
+        assert_eq!(
+            history_counts(&conn_disabled),
+            (0, 0),
+            "disabled-history history tables stay empty"
+        );
+        assert_eq!(
+            indexed_files(&conn_no_git),
+            indexed_files(&conn_disabled),
+            "no-.git must index the same files as pre-TASK-096 behavior"
+        );
+        assert_eq!(
+            indexed_symbols(&conn_no_git),
+            indexed_symbols(&conn_disabled),
+            "no-.git must index the same symbols as pre-TASK-096 behavior"
+        );
+
+        // The ranking identity: on a no-git connection the churn signal
+        // contributes exactly zero, so churn weight 1.0 must produce the
+        // same scores and order as churn weight 0.0 (AC-3: no other
+        // feature is affected). Candidates are ordered worst-first so the
+        // rerank's kind ordering is actually exercised.
+        let candidates = || {
+            vec![
+                ac3_candidate("src/imp.rs", crate::ranker::ResultCategory::Import),
+                ac3_candidate("src/call.rs", crate::ranker::ResultCategory::CallSite),
+                ac3_candidate("src/def.rs", crate::ranker::ResultCategory::Definition),
+            ]
+        };
+        let churn_heavy = crate::rerank::WeightTable::from_pairs([
+            ("kind".to_string(), 1.0),
+            ("churn".to_string(), 1.0),
+        ])
+        .unwrap();
+        let churn_free = crate::rerank::WeightTable::from_pairs([
+            ("kind".to_string(), 1.0),
+            ("churn".to_string(), 0.0),
+        ])
+        .unwrap();
+        let query = crate::rerank::QueryInfo { pattern: "target" };
+        let sources = crate::rerank::ContextSources::default();
+
+        let heavy = crate::rerank::rerank(
+            candidates(),
+            &query,
+            Some(&conn_no_git),
+            &churn_heavy,
+            &sources,
+        );
+        let free = crate::rerank::rerank(
+            candidates(),
+            &query,
+            Some(&conn_no_git),
+            &churn_free,
+            &sources,
+        );
+
+        let order = |scored: &[crate::rerank::ScoredResult]| {
+            scored
+                .iter()
+                .map(|s| (s.classified.result.file.clone(), s.classified.result.line))
+                .collect::<Vec<_>>()
+        };
+        let scores = |scored: &[crate::rerank::ScoredResult]| {
+            scored.iter().map(|s| s.score).collect::<Vec<f32>>()
+        };
+        // The fixture is non-degenerate: kind alone strictly reorders it.
+        assert_eq!(
+            order(&heavy)[0],
+            (std::path::PathBuf::from("src/def.rs"), 1),
+            "definition must rank first: {heavy:?}"
+        );
+        assert_eq!(order(&heavy), order(&free), "identical group order");
+        assert_eq!(scores(&heavy), scores(&free), "identical scores");
+
+        // WHY they are identical: every churn contribution on a no-git
+        // connection is exactly zero, weight and all.
+        for scored in &heavy {
+            let churn = scored
+                .contributions
+                .iter()
+                .find(|c| c.signal == "churn")
+                .expect("churn weight 1.0 keeps the signal active");
+            assert_eq!(churn.value, 0.0, "no churn rows: value is exactly 0.0");
+            assert_eq!(churn.weighted, 0.0, "0.0 * 1.0 is exactly 0.0");
+        }
+    }
+
+    #[test]
+    fn build_index_history_disabled_leaves_tables_empty() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100)]);
+        write_reach_config(dir.path(), "[history]\nenabled = false\n");
+        build_index(dir.path(), true).unwrap();
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        assert_eq!(history_counts(&conn), (0, 0));
+    }
+
+    #[test]
+    fn build_index_on_fake_git_dir_warns_and_indexes() {
+        if !git_available() {
+            return;
+        }
+        // make_test_repo's .git is an empty directory, not a repository:
+        // mining fails, warns, and the build still succeeds (REQ-008).
+        let dir = make_test_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+        assert!(stats.file_count > 0, "build survives a failing mine");
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        assert_eq!(history_counts(&conn), (0, 0));
+    }
+
+    #[test]
+    fn rebuild_index_keeps_exactly_one_window() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[
+            ("src/a.rs", 100),
+            ("src/b.rs", 200),
+            ("src/c.rs", 300),
+            ("src/d.rs", 400),
+        ]);
+        write_reach_config(dir.path(), "[history]\nwindow = 2\n");
+        rebuild_index(dir.path(), true).unwrap();
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let (commits, churn) = history_counts(&conn);
+        assert_eq!(commits, 2, "a rebuild retains exactly one window");
+        assert_eq!(churn, 2, "only the newest two commits' files remain");
+    }
+
+    #[test]
+    fn incremental_update_refreshes_history_after_new_commit() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100)]);
+        build_index(dir.path(), true).unwrap();
+
+        let date = "@200 +0000";
+        fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        // Scope the add: `git add .` would swallow the .wonk index db the
+        // build just created inside the repo.
+        for args in [vec!["add", "src"], vec!["commit", "-m", "new"]] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(ok.status.success());
+        }
+
+        incremental_update(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let (commits, churn) = history_counts(&conn);
+        assert_eq!(commits, 2, "the new commit is folded in");
+        assert_eq!(churn, 2, "both files carry churn scores");
+    }
+
+    #[test]
+    fn incremental_update_history_disabled_stays_empty() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100)]);
+        write_reach_config(dir.path(), "[history]\nenabled = false\n");
+        build_index(dir.path(), true).unwrap();
+
+        let date = "@200 +0000";
+        fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        for args in [vec!["add", "src"], vec!["commit", "-m", "new"]] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(ok.status.success());
+        }
+
+        incremental_update(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        assert_eq!(history_counts(&conn), (0, 0), "disabled never refreshes");
     }
 
     #[test]

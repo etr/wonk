@@ -34,6 +34,7 @@ pub struct Config {
     pub contracts: ContractsConfig,
     pub review: ReviewConfig,
     pub rank: RankConfig,
+    pub history: HistoryConfig,
 }
 
 /// Daemon-related settings.
@@ -119,6 +120,29 @@ impl Default for ReachConfig {
     fn default() -> Self {
         Self {
             depth: 3,
+            enabled: true,
+        }
+    }
+}
+
+/// Bounded history-mining settings (TASK-096, OQ-017).
+///
+/// `window` is the number of newest commits mined; its cost scales with
+/// the window, never with repository age. The default is a placeholder
+/// pending OQ-017 tuning. `window = 0` is a hard load error — an empty
+/// window can never rank anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryConfig {
+    /// Number of newest commits to mine.
+    pub window: usize,
+    /// Kill switch: `false` skips mining entirely (PRD-HIST-REQ-008).
+    pub enabled: bool,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            window: 500,
             enabled: true,
         }
     }
@@ -324,6 +348,7 @@ struct ConfigOverlay {
     contracts: Option<ContractsOverlay>,
     review: Option<ReviewOverlay>,
     rank: Option<RankOverlay>,
+    history: Option<HistoryOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -377,6 +402,13 @@ struct EmbeddingOverlay {
 #[serde(default)]
 struct ReachOverlay {
     depth: Option<usize>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct HistoryOverlay {
+    window: Option<usize>,
     enabled: Option<bool>,
 }
 
@@ -560,6 +592,19 @@ impl Config {
             }
             if let Some(v) = reach.enabled {
                 self.reach.enabled = v;
+            }
+        }
+        if let Some(history) = overlay.history {
+            if let Some(v) = history.window {
+                self.history.window = v;
+            }
+            if let Some(v) = history.enabled {
+                self.history.enabled = v;
+            }
+            if self.history.window == 0 {
+                anyhow::bail!(
+                    "[history] window must be >= 1 (got 0): an empty window mines nothing"
+                );
             }
         }
         if let Some(review) = overlay.review {
@@ -810,6 +855,61 @@ workspace = ["payments", "platform"]
         assert_eq!(
             config.contracts.workspace,
             vec!["payments".to_string(), "platform".to_string()]
+        );
+    }
+
+    // -- [history] (TASK-096) ---------------------------------------------------
+
+    #[test]
+    fn history_defaults_when_absent() {
+        let env = TestEnv::new();
+        let config = env.load().unwrap();
+        assert_eq!(
+            config.history,
+            HistoryConfig {
+                enabled: true,
+                window: 500
+            }
+        );
+        assert_eq!(
+            Config::default().history,
+            HistoryConfig {
+                enabled: true,
+                window: 500
+            }
+        );
+    }
+
+    #[test]
+    fn history_window_and_enabled_parse() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[history]
+window = 3
+enabled = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(config.history.window, 3);
+        assert!(!config.history.enabled);
+    }
+
+    #[test]
+    fn history_window_zero_is_rejected() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[history]
+window = 0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[history] window"),
+            "error names the offending key: {err}"
         );
     }
 
