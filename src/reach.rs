@@ -88,6 +88,8 @@ pub fn edge_eligible(discovered_file: &str, confidence: f64, filter: &EdgeFilter
     if confidence < filter.min_confidence {
         return false;
     }
+    // TASK-094 keep: the include_tests user opt-out — edge eligibility
+    // exclusion, never a ranking demotion.
     if !filter.include_tests && crate::ranker::is_test_file(Path::new(discovered_file)) {
         return false;
     }

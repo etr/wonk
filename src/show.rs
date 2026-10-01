@@ -154,26 +154,29 @@ pub fn show_symbol(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Prioritize exact name matches over substring matches, and deprioritize
-    // test files, so the most relevant result appears first within budget.
+    // Prioritize exact name matches over substring matches, then demote by
+    // the ONE graded path-character ladder (TASK-094) so the most relevant
+    // result appears first within budget. The old local substring heuristic
+    // (which demoted any path containing "test" — including contest.rs) is
+    // absorbed into rerank::path_character_values.
     if !options.exact {
         let query_name = name.to_string();
+        let files: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+        let values = crate::rerank::path_character_values(&files, Some(conn));
         rows.sort_by(|a, b| {
             let a_exact = a.0.eq_ignore_ascii_case(&query_name);
             let b_exact = b.0.eq_ignore_ascii_case(&query_name);
-            let a_test = is_test_path(&a.2);
-            let b_test = is_test_path(&b.2);
-            b_exact.cmp(&a_exact).then(a_test.cmp(&b_test))
+            let a_value = values.get(&a.2).copied().unwrap_or(1.0);
+            let b_value = values.get(&b.2).copied().unwrap_or(1.0);
+            b_exact.cmp(&a_exact).then_with(|| {
+                b_value
+                    .partial_cmp(&a_value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
     }
 
     collect_show_results(conn, rows, repo_root, options)
-}
-
-/// Returns `true` for test/bench/spec file paths.
-fn is_test_path(path: &str) -> bool {
-    let p = path.to_lowercase();
-    p.contains("test") || p.contains("spec") || p.contains("bench") || p.contains("example")
 }
 
 /// Shared logic: given queried rows, read source bodies and build `ShowResult`s.
@@ -559,6 +562,66 @@ mod tests {
         assert_eq!(escape_like("foo_bar"), "foo\\_bar");
         assert_eq!(escape_like("a\\b"), "a\\\\b");
         assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
+    }
+
+    /// Multi-file indexed repo for path-ordering tests.
+    fn make_indexed_files_repo(files: &[(&str, &str)]) -> (TempDir, Connection) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        for (path, source) in files {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            fs::write(root.join(path), source).unwrap();
+        }
+        pipeline::build_index(root, true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(root)).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn non_exact_sort_demotes_by_graded_path_value() {
+        // TASK-094: the !exact sort demotes by the ONE shared path-character
+        // ladder. Regression pin: `src/contest.rs` merely CONTAINS "test" —
+        // the old local heuristic demoted it; the ladder keeps it ordinary,
+        // above the real test file.
+        let files = [
+            ("a_test.rs", "pub fn alpha() {}\n"),
+            ("src/contest.rs", "pub fn alpha() {}\n"),
+            ("src/core.rs", "pub fn alpha() {}\n"),
+        ];
+        let (dir, conn) = make_indexed_files_repo(&files);
+
+        let results = show_symbol(&conn, "alpha", dir.path(), &default_options()).unwrap();
+
+        let paths: Vec<&str> = results.iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["src/contest.rs", "src/core.rs", "a_test.rs"],
+            "ordinary files (SQL file order) first, test file last"
+        );
+    }
+
+    #[test]
+    fn non_exact_sort_keeps_exact_name_first() {
+        // The exact-name key outranks the path key: an exact match in a
+        // test file still sorts before a substring match in an ordinary
+        // file.
+        let files = [
+            ("src/core.rs", "pub fn alpha_core() {}\n"),
+            ("tests/z.rs", "pub fn alpha() {}\n"),
+        ];
+        let (dir, conn) = make_indexed_files_repo(&files);
+
+        let results = show_symbol(&conn, "alpha", dir.path(), &default_options()).unwrap();
+
+        let paths: Vec<&str> = results.iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tests/z.rs", "src/core.rs"],
+            "exact-name-first key unchanged by the graded demotion"
+        );
     }
 
     #[test]

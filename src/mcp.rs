@@ -1610,6 +1610,7 @@ impl McpServer {
                 Err(e) => return CallToolResult::error(format!("search failed: {e}")),
             };
 
+        // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
         if !include_tests {
             results.retain(|r| !ranker::is_test_file(&r.file));
         }
@@ -1740,17 +1741,22 @@ impl McpServer {
                 format_result(&wrapper, format)
             }
             Ok(mut r) => {
+                // TASK-094 keep: include_tests=false is the user's explicit
+                // exclusion opt-out, not the graded path signal (which only
+                // orders, never filters).
                 if !include_tests {
                     r.retain(|s| !crate::ranker::is_test_file(std::path::Path::new(&s.file)));
                 }
-                // Deprioritize .d.ts files — push them to the end so
-                // actual source definitions appear first within budget.
-                r.sort_by(|a, b| {
-                    let a_dts = a.file.ends_with(".d.ts");
-                    let b_dts = b.file.ends_with(".d.ts");
-                    a_dts.cmp(&b_dts)
-                });
-                // Apply limit after sorting.
+                // The graded path-character order (ordinary source first,
+                // then barrels/module entries, type declarations, shims,
+                // examples, tests; generated files demoted only with an
+                // index-verified hand-written peer) is already established by
+                // query_symbols_db_with_filters — one classification and one
+                // stable sort per query. This retain only removes rows, so it
+                // preserves that order; re-sorting here with the same keys
+                // would be a no-op paid in a second classifier pass and a
+                // second resolver query.
+                // Apply limit after that graded order.
                 if let Some(limit) = limit {
                     r.truncate(limit);
                 }
@@ -1813,6 +1819,7 @@ impl McpServer {
             subclass_results.retain(|s| paths.iter().any(|p| s.file.starts_with(p)));
         }
         let include_tests = extract_include_tests(&args);
+        // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
         if !include_tests {
             results.retain(|r| !crate::ranker::is_test_file(std::path::Path::new(&r.file)));
             subclass_results
@@ -2218,6 +2225,7 @@ impl McpServer {
         }
 
         let include_tests = extract_include_tests(&args);
+        // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
         if !include_tests {
             all_results.retain(|r| !crate::ranker::is_test_file(std::path::Path::new(&r.file)));
         }
@@ -2239,7 +2247,7 @@ impl McpServer {
         {
             let has_impl_exact = all_results
                 .iter()
-                .any(|r| r.name == *raw && !r.file.ends_with(".d.ts") && !r.file.ends_with(".h"));
+                .any(|r| r.name == *raw && !crate::rerank::is_type_declaration(&r.file));
             if !has_impl_exact && !exact {
                 Some(format!(
                     "No implementation of '{}' found — results are substring or type-only matches. \
@@ -2437,6 +2445,7 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("callers query failed: {e}")),
         };
         let include_tests = extract_include_tests(&args);
+        // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
         if !include_tests {
             results.retain(|r| !crate::ranker::is_test_file(std::path::Path::new(&r.file)));
         }
@@ -2508,6 +2517,7 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("callees query failed: {e}")),
         };
         let include_tests = extract_include_tests(&args);
+        // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
         if !include_tests {
             results.retain(|r| !crate::ranker::is_test_file(std::path::Path::new(&r.file)));
         }
@@ -3091,6 +3101,7 @@ impl McpServer {
         let include_tests = extract_include_tests(&args);
         match crate::context::symbol_context(conn, split.name, &options) {
             Ok(mut contexts) => {
+                // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
                 if !include_tests {
                     contexts
                         .retain(|c| !crate::ranker::is_test_file(std::path::Path::new(&c.file)));
@@ -5330,6 +5341,109 @@ mod tests {
         assert!(
             text.contains("unknown repo"),
             "error should mention unknown repo"
+        );
+    }
+
+    // -- wonk_sym graded path ordering (TASK-094) ------------------------------
+
+    /// Indexed TS repo whose `alpha` symbol is defined in an ordinary file,
+    /// a `.d.ts` type declaration, and a test file — the three ladder
+    /// tiers the symbol lookup orders by.
+    fn graded_path_server() -> (tempfile::TempDir, McpServer) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("src/core.ts"), "export function alpha() {}\n").unwrap();
+        // A bodied function: the ambient `declare` form is not extracted by
+        // the indexer, and the ordering only needs the symbol row.
+        std::fs::write(
+            root.join("src/alpha.d.ts"),
+            "export function alpha(x: number): number { return x; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/alpha.test.ts"),
+            "export function alpha() { return 42; }\n",
+        )
+        .unwrap();
+        pipeline::build_index(root, true).unwrap();
+        let server = McpServer {
+            router: QueryRouter::new(Some(root.to_path_buf()), true),
+            registry: RepoRegistry::new(Vec::new()),
+        };
+        (dir, server)
+    }
+
+    fn sym_call(server: &mut McpServer, arguments: Value) -> Vec<String> {
+        let params = serde_json::json!({
+            "name": "wonk_sym",
+            "arguments": arguments
+        });
+        let result = server.handle_tools_call(&params);
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["file"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tool_sym_orders_by_graded_path_character() {
+        // TASK-094: the one graded path-character sort (absorbing the old
+        // .d.ts-only push-to-end): ordinary 1.0 > type declaration 0.30 >
+        // test 0.20 — under include_tests=true the .d.ts now orders BEFORE
+        // the test file.
+        let (_dir, mut server) = graded_path_server();
+        let files = sym_call(
+            &mut server,
+            serde_json::json!({"name": "alpha", "exact": true, "include_tests": true}),
+        );
+        assert_eq!(
+            files,
+            vec![
+                "src/core.ts".to_string(),
+                "src/alpha.d.ts".to_string(),
+                "tests/alpha.test.ts".to_string(),
+            ],
+            "graded ladder must order the three tiers"
+        );
+    }
+
+    #[test]
+    fn tool_sym_limit_truncates_after_the_graded_sort() {
+        let (_dir, mut server) = graded_path_server();
+        let files = sym_call(
+            &mut server,
+            serde_json::json!({
+                "name": "alpha",
+                "exact": true,
+                "include_tests": true,
+                "limit": 2
+            }),
+        );
+        assert_eq!(
+            files,
+            vec!["src/core.ts".to_string(), "src/alpha.d.ts".to_string()],
+            "the limit must cut AFTER the graded sort"
+        );
+    }
+
+    #[test]
+    fn tool_sym_default_excludes_tests_and_keeps_graded_order() {
+        let (_dir, mut server) = graded_path_server();
+        let files = sym_call(
+            &mut server,
+            serde_json::json!({"name": "alpha", "exact": true}),
+        );
+        assert_eq!(
+            files,
+            vec!["src/core.ts".to_string(), "src/alpha.d.ts".to_string()],
+            "include_tests=false excludes the test file; the graded order holds"
         );
     }
 

@@ -15,6 +15,8 @@
 //! valid weight configuration.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
 
 use rusqlite::Connection;
 
@@ -87,14 +89,316 @@ impl ContextReqs {
     }
 }
 
-/// Path classification bucket. Graded buckets arrive with TASK-094; today
-/// the choice is binary, seeded from `ranker::is_test_file`.
+/// Path classification bucket (TASK-094, PRD-RANK-REQ-011): the graded
+/// ladder a file's PATH character demotes it through. Values are absolute
+/// and strictly positive — 0.0 means "no evidence" in this codebase, and
+/// every file carries some path character.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathClass {
-    /// A regular source file.
-    Ordinary,
-    /// A file matching the test-path heuristics.
+    /// A generated file whose hand-written same-named peer is verified in
+    /// the index. The strongest demotion: the peer is the better answer.
+    GeneratedShadowed,
+    /// A generated file before shadowing is resolved against the index.
+    /// Never reaches a score directly: `prepare_context` (and every sort
+    /// site) rewrites it to [`PathClass::GeneratedShadowed`] when a peer
+    /// exists, else back to [`PathClass::Ordinary`] — a generated file is
+    /// never demoted without a peer.
+    Generated,
+    /// Test directories, `*_test` stems, `.test.`/`.spec.` names.
     Test,
+    /// Ambient type declarations: `.d.ts`/`.d.mts`/`.d.cts`, C headers.
+    TypeDeclaration,
+    /// Compatibility shims and deprecated compatibility layers.
+    Shim,
+    /// Examples, samples, fixtures, benchmarks, documentation.
+    Example,
+    /// Re-export barrels: `index.*`, `mod.rs`, `lib.rs`, `__init__.py`.
+    Barrel,
+    /// Program entry points: `main.*`, `__main__.py`.
+    ModuleEntry,
+    /// A regular source file — the default.
+    Ordinary,
+}
+
+/// The ladder's absolute constants, most-demoted first.
+pub fn path_character_value(class: PathClass) -> f32 {
+    match class {
+        PathClass::GeneratedShadowed | PathClass::Generated => 0.10,
+        PathClass::Test => 0.20,
+        PathClass::TypeDeclaration => 0.30,
+        PathClass::Shim => 0.45,
+        PathClass::Example => 0.60,
+        PathClass::Barrel => 0.70,
+        PathClass::ModuleEntry => 0.80,
+        PathClass::Ordinary => 1.00,
+    }
+}
+
+/// Whether a path is an ambient type declaration (`.d.ts`, `.d.mts`,
+/// `.d.cts`) or a C header (`.h`). THE shared heuristic — the
+/// `has_impl_exact` hints and the TypeDeclaration bucket both read it, so
+/// the ".d.ts is not an implementation" judgment exists exactly once.
+pub fn is_type_declaration(path: &str) -> bool {
+    path.ends_with(".d.ts")
+        || path.ends_with(".d.mts")
+        || path.ends_with(".d.cts")
+        || path.ends_with(".h")
+}
+
+/// Code-generation name markers: explicit `.generated.`/`.gen.` segments,
+/// protobuf `_pb2`/`_pb2_grpc` stems, `_generated` stems, and the
+/// codegen double extensions `.pb.go`/`.g.dart`/`.g.ts`.
+pub fn is_generated_name(path: &str) -> bool {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if name.contains(".generated.") || name.contains(".gen.") {
+        return true;
+    }
+    if name.ends_with(".pb.go") || name.ends_with(".g.dart") || name.ends_with(".g.ts") {
+        return true;
+    }
+    match std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+    {
+        Some(stem) => {
+            stem.ends_with("_pb2_grpc") || stem.ends_with("_pb2") || stem.ends_with("_generated")
+        }
+        None => false,
+    }
+}
+
+/// The hand-written peer's file name for a generated name: strip the
+/// generation marker and keep the extension
+/// (`user.g.dart` → `user.dart`, `foo_pb2.py` → `foo.py`). None when the
+/// name carries no marker.
+pub fn strip_generated_marker(file_name: &str) -> Option<String> {
+    let dot = file_name.rfind('.')?;
+    let (stem, ext) = file_name.split_at(dot);
+    let marker_stripped = [
+        "_pb2_grpc",
+        "_pb2",
+        "_generated",
+        ".generated",
+        ".gen",
+        ".pb",
+        ".g",
+    ]
+    .iter()
+    .find_map(|marker| stem.strip_suffix(marker))?;
+    Some(format!("{marker_stripped}{ext}"))
+}
+
+/// Classify a file's path character into the graded ladder
+/// (PRD-RANK-REQ-011). First-match precedence in ladder order: a
+/// generation marker wins first (its demotion survives only when a peer is
+/// verified), then the specific path buckets, with the more specific
+/// bucket listed earlier (Test before TypeDeclaration, Example before
+/// Barrel).
+///
+/// Deliberate divergence from `ranker::is_test_file` (which stays the
+/// FROZEN kind input per DR-037): `is_test_file` flattens
+/// docs/examples/fixtures/bench paths into its test tier, while this
+/// ladder grades them as Example — test-ness here is the three unambiguous
+/// test signals only. The path signal re-derives test-ness rather than
+/// reading the kind input so the demotion survives `kind = 0`
+/// configurations.
+pub fn classify_path_character(path: &Path) -> PathClass {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let parent = path.parent().unwrap_or(Path::new(""));
+
+    let in_dir = |dirs: &[&str]| {
+        parent
+            .components()
+            .any(|c| dirs.contains(&c.as_os_str().to_string_lossy().as_ref()))
+    };
+
+    if is_generated_name(file_name) {
+        return PathClass::Generated;
+    }
+    if in_dir(&["test", "tests", "__tests__"])
+        || stem.ends_with("_test")
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+    {
+        return PathClass::Test;
+    }
+    if is_type_declaration(file_name) {
+        return PathClass::TypeDeclaration;
+    }
+    if in_dir(&["compat", "compatibility", "shims", "deprecated", "legacy"])
+        || matches!(
+            stem,
+            "compat" | "shim" | "legacy" | "deprecated" | "polyfill"
+        )
+        || stem.ends_with("_compat")
+        || stem.ends_with("_shim")
+    {
+        return PathClass::Shim;
+    }
+    if in_dir(&[
+        "example",
+        "examples",
+        "samples",
+        "demos",
+        "fixtures",
+        "bench",
+        "benchmarks",
+        "docs",
+        "doc",
+    ]) || file_name.contains(".example.")
+    {
+        return PathClass::Example;
+    }
+    const BARRELS: &[&str] = &[
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.jsx",
+        "index.mjs",
+        "index.cjs",
+        "mod.rs",
+        "lib.rs",
+        "__init__.py",
+        "exports.ts",
+        "exports.js",
+    ];
+    if BARRELS.contains(&file_name) {
+        return PathClass::Barrel;
+    }
+    const MODULE_ENTRIES: &[&str] = &[
+        "main.rs",
+        "main.go",
+        "main.py",
+        "main.js",
+        "main.ts",
+        "__main__.py",
+    ];
+    if MODULE_ENTRIES.contains(&file_name) {
+        return PathClass::ModuleEntry;
+    }
+    PathClass::Ordinary
+}
+
+/// Bound parameters per IN-list statement (the repo's chunking convention,
+/// as in reach.rs). Bundled SQLite allows 32766; 900 keeps every statement
+/// well under any build's limit.
+const IN_CHUNK: usize = 900;
+
+/// Which of `files` are generated names shadowing a hand-written peer
+/// VERIFIED IN THE INDEX (the `files` table) — never the candidate set:
+/// the peer may simply not match the query.
+///
+/// A peer is a file with the marker-stripped name in the same directory
+/// (`src/user.g.dart` ← `src/user.dart`) that is not itself generated.
+/// Resolution queries exactly the wanted peer paths in IN_CHUNK-sized
+/// batches against the `files` PRIMARY KEY — an indexed point lookup per
+/// peer, no directory over-fetch (a LIKE-prefix scan cannot use the
+/// BINARY-collated path index and reads the whole table per directory). A
+/// failing prepare degrades to ONE full `files` scan. No connection or no
+/// generated candidates → no demotion (the conservative branch of AC-2).
+pub fn resolve_generated_shadowing(conn: Option<&Connection>, files: &[String]) -> HashSet<String> {
+    let mut shadowed = HashSet::new();
+    let Some(conn) = conn else {
+        return shadowed;
+    };
+
+    // (candidate, expected peer path) for every unique Generated file.
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    let mut seen = HashSet::new();
+    for file in files {
+        if !seen.insert(file.clone())
+            || classify_path_character(Path::new(file)) != PathClass::Generated
+        {
+            continue;
+        }
+        let path = Path::new(file);
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(peer_name) = strip_generated_marker(name) else {
+            continue;
+        };
+        let prefix = match path.parent().and_then(|p| p.to_str()) {
+            Some(dir) if !dir.is_empty() => format!("{dir}/"),
+            _ => String::new(),
+        };
+        wanted.push((file.clone(), format!("{prefix}{peer_name}")));
+    }
+    if wanted.is_empty() {
+        return shadowed;
+    }
+
+    // The exact wanted peer paths, in chunks, against the `files` primary
+    // key: an indexed point lookup per peer, fetching nothing else.
+    let peers: Vec<&String> = wanted.iter().map(|(_, peer)| peer).collect();
+    let mut found: HashSet<String> = HashSet::new();
+    let mut resolved = false;
+    for chunk in peers.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("SELECT path FROM files WHERE path IN ({placeholders})");
+        if let Ok(mut stmt) = conn.prepare(&sql)
+            && let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+        {
+            found.extend(rows.flatten());
+            resolved = true;
+        }
+    }
+    // Schema-mismatch fallback (kept from the LIKE form): an index whose
+    // schema rejects the chunked statement still gets ONE full `files`
+    // scan, so verification degrades the same conservative way instead of
+    // silently demoting nothing.
+    if !resolved
+        && let Ok(mut stmt) = conn.prepare("SELECT path FROM files")
+        && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+    {
+        found.extend(rows.flatten());
+    }
+
+    for (file, peer) in wanted {
+        // The peer must be indexed, and must itself be hand-written.
+        if found.contains(&peer) && !is_generated_name(&peer) {
+            shadowed.insert(file);
+        }
+    }
+    shadowed
+}
+
+/// Classify every unique file, resolving the Generated variant against the
+/// index — THE one path-character judgment. The signal's context seeding
+/// and every symbol-lookup sort site read it, so the ladder and its
+/// never-demote-without-a-peer rule exist exactly once.
+fn classify_paths(files: &[String], conn: Option<&Connection>) -> HashMap<String, PathClass> {
+    let shadowed = resolve_generated_shadowing(conn, files);
+    let mut classes: HashMap<String, PathClass> = HashMap::new();
+    for file in files {
+        let class = match classify_path_character(Path::new(file)) {
+            PathClass::Generated if shadowed.contains(file) => PathClass::GeneratedShadowed,
+            PathClass::Generated => PathClass::Ordinary,
+            class => class,
+        };
+        classes.entry(file.clone()).or_insert(class);
+    }
+    classes
+}
+
+/// The resolved ladder VALUES for a batch of files — the sort key the
+/// symbol-lookup sites (mcp `wonk_sym`, `wonk show`, the DB symbol query)
+/// demote by. Sort descending; a missing entry means Ordinary (1.0), never
+/// a demotion.
+pub fn path_character_values(files: &[String], conn: Option<&Connection>) -> HashMap<String, f32> {
+    classify_paths(files, conn)
+        .into_iter()
+        .map(|(file, class)| (file, path_character_value(class)))
+        .collect()
 }
 
 /// A symbol definition located at a candidate position, with the number of
@@ -408,21 +712,90 @@ impl Signal for CentralitySignal {
     }
 }
 
-/// Whether `term` occurs in `line` as a MAXIMAL identifier run
-/// (`[A-Za-z0-9_]+` bounded by non-identifier characters),
-/// case-insensitively.
+/// The MAXIMAL identifier runs (`[A-Za-z0-9_]+` bounded by
+/// non-identifier characters) of `line`, lowercased — the ONE shared
+/// scanner behind the prominence token tier and the proximity signal.
 ///
 /// A dedicated scanner rather than `tokenizer::tokenize`: the tokenizer
 /// splits on `_`, so it would token-match `foo` inside `foo_bar` — here the
 /// boundary is the point, because a query term appearing inside a longer
 /// identifier names a different symbol. Terms containing non-ASCII
 /// characters can never match (code identifiers are ASCII runs).
-pub fn contains_identifier_token(line: &str, term: &str) -> bool {
-    if term.is_empty() {
-        return false;
-    }
+pub fn identifier_tokens(line: &str) -> Vec<String> {
     line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|run| run.eq_ignore_ascii_case(term))
+        .filter(|run| !run.is_empty())
+        .map(|run| run.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `term` occurs in `line` as a maximal identifier run
+/// (case-insensitive) — a non-empty scan over [`identifier_tokens`].
+pub fn contains_identifier_token(line: &str, term: &str) -> bool {
+    !term.is_empty()
+        && identifier_tokens(line)
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(term))
+}
+
+/// How closely the query terms co-occur in `content` (TASK-094,
+/// PRD-RANK-REQ-013): `1 / gap` over the FIRST-OCCURRENCE token indices of
+/// the query terms present as whole identifier tokens — adjacent terms 1.0,
+/// one token between 0.5, decaying hyperbolically with distance.
+///
+/// Fewer than two present terms (single-term queries, absent terms,
+/// compound-name partials like `foo` inside `foo_bar`) contribute exactly
+/// 0.0: with nothing to co-locate the signal is inert, never a penalty.
+pub fn proximity_value(content: &str, terms: &[String]) -> f32 {
+    let tokens = identifier_tokens(content);
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut first_indices: Vec<usize> = Vec::new();
+    for term in terms {
+        if term.is_empty() || !seen.insert(term.as_str()) {
+            continue;
+        }
+        if let Some(index) = tokens.iter().position(|token| token == term) {
+            first_indices.push(index);
+        }
+    }
+    let Some(gap) = first_indices
+        .iter()
+        .copied()
+        .max()
+        .zip(first_indices.iter().copied().min())
+        .map(|(max, min)| (max - min) as f32)
+    else {
+        return 0.0;
+    };
+    // Distinct whole-token terms sit at distinct indices, so gap >= 1; the
+    // guard keeps a pathological zero gap from poisoning scores with inf.
+    if gap >= 1.0 { 1.0 / gap } else { 0.0 }
+}
+
+/// The proximity signal: how closely the query terms co-occur in the
+/// matched line. Reads only the tokenized query terms and the candidate's
+/// matched text — no new context slice, no SQL.
+pub(crate) struct ProximitySignal;
+
+impl Signal for ProximitySignal {
+    fn name(&self) -> &'static str {
+        "proximity"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_query_terms()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        proximity_value(&candidate.result.content, ctx.terms())
+    }
 }
 
 /// Prominence tier constants (TASK-093, PRD-RANK-REQ-015).
@@ -531,6 +904,128 @@ impl Signal for SemanticSignal {
     }
 }
 
+/// The path-character signal (TASK-094, PRD-RANK-REQ-011): the candidate
+/// file's graded ladder value — generated-shadowed < test < type
+/// declaration < shim < example < barrel < module entry < ordinary.
+///
+/// Graded, never exclusion: a test file still scores strictly above zero,
+/// so a test file that is the best answer on the other signals still
+/// ranks. The signal re-derives test-ness from the path (it does not read
+/// the kind input) so the demotion survives `kind = 0` configurations;
+/// under `kind > 0` both signals demote test files and agree.
+pub(crate) struct PathCharacterSignal;
+
+impl Signal for PathCharacterSignal {
+    fn name(&self) -> &'static str {
+        "path_character"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_path_class()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        match ctx.path_class(&file) {
+            Some(class) => path_character_value(class),
+            // No classification, no demotion.
+            None => path_character_value(PathClass::Ordinary),
+        }
+    }
+}
+
+/// Whether the query resembles a type or function signature
+/// (TASK-094, PRD-RANK-REQ-014): a parenthesis, an arrow, or a
+/// path-separator — punctuation a name-shaped query would not carry.
+pub fn is_signature_query(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    trimmed.contains('(') || trimmed.contains("->") || trimmed.contains("::")
+}
+
+/// Keywords a definition line opens with, across the indexed languages.
+const DEFINITION_KEYWORDS: &[&str] = &[
+    "fn",
+    "def",
+    "func",
+    "function",
+    "class",
+    "struct",
+    "enum",
+    "interface",
+    "trait",
+    "impl",
+    "type",
+    "pub",
+    "async",
+    "const",
+    "static",
+    "export",
+    "module",
+    "namespace",
+];
+
+/// The signature-match contribution (TASK-094, PRD-RANK-REQ-014):
+///
+/// - 1.0 the candidate's category is Definition (index-backed);
+/// - 0.5 the matched line is definition-SHAPED — it contains a
+///   parenthesis AND a definition keyword among its first three
+///   identifier tokens (definitions announce themselves);
+/// - 0.0 otherwise.
+///
+/// Inert unless the query itself is signature-shaped: a name query must
+/// not reorder through this signal at all, so [`is_signature_query`] gates
+/// everything.
+pub fn signature_value(query_shaped: bool, category: ResultCategory, content: &str) -> f32 {
+    if !query_shaped {
+        return 0.0;
+    }
+    if category == ResultCategory::Definition {
+        return 1.0;
+    }
+    if content.contains('(')
+        && identifier_tokens(content)
+            .iter()
+            .take(3)
+            .any(|token| DEFINITION_KEYWORDS.contains(&token.as_str()))
+    {
+        return 0.5;
+    }
+    0.0
+}
+
+/// The signature-match signal: definition lines answer signature-shaped
+/// queries. Reads only the raw pattern, the candidate's category, and its
+/// matched text — no context, no SQL.
+pub(crate) struct SignatureSignal;
+
+impl Signal for SignatureSignal {
+    fn name(&self) -> &'static str {
+        "signature"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none()
+    }
+
+    fn contribution(
+        &self,
+        query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        _ctx: &SharedContext,
+    ) -> f32 {
+        signature_value(
+            is_signature_query(query.pattern),
+            candidate.category,
+            &candidate.result.content,
+        )
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -541,6 +1036,9 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(SemanticSignal),
         Box::new(CentralitySignal),
         Box::new(ProminenceSignal),
+        Box::new(PathCharacterSignal),
+        Box::new(ProximitySignal),
+        Box::new(SignatureSignal),
     ]
 }
 
@@ -640,15 +1138,11 @@ pub fn prepare_context(
         ctx.terms = crate::tokenizer::tokenize(pattern);
     }
     if reqs.path_class {
-        for r in results {
-            let file = r.result.file.to_string_lossy().into_owned();
-            let class = if crate::ranker::is_test_file(&r.result.file) {
-                PathClass::Test
-            } else {
-                PathClass::Ordinary
-            };
-            ctx.path_class.entry(file).or_insert(class);
-        }
+        let files: Vec<String> = results
+            .iter()
+            .map(|r| r.result.file.to_string_lossy().into_owned())
+            .collect();
+        ctx.path_class = classify_paths(&files, conn);
     }
     if reqs.symbol_hits
         && let Some(conn) = conn
@@ -977,12 +1471,21 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_five_signals_in_order() {
+    fn registry_contains_eight_signals_in_order() {
         let registry = builtin_signals();
         let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
-            vec!["kind", "lexical", "semantic", "centrality", "prominence"]
+            vec![
+                "kind",
+                "lexical",
+                "semantic",
+                "centrality",
+                "prominence",
+                "path_character",
+                "proximity",
+                "signature"
+            ]
         );
         assert_eq!(known_signal_names(), names);
     }
@@ -1064,7 +1567,10 @@ mod tests {
             "error names the offender: {err}"
         );
         assert!(
-            err.contains("known: kind, lexical, semantic, centrality, prominence"),
+            err.contains(
+                "known: kind, lexical, semantic, centrality, prominence, path_character, \
+proximity, signature",
+            ),
             "error lists every valid name: {err}"
         );
     }
@@ -1094,6 +1600,7 @@ mod tests {
     // Pipeline tests
     // -------------------------------------------------------------------
 
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -2045,6 +2552,685 @@ mod tests {
         // The call line's maximal run is the compound "my_func": neither
         // term matches it, so the mention is incidental.
         assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // ProximitySignal (TASK-094, REQ-013)
+    // -------------------------------------------------------------------
+
+    fn terms(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn identifier_tokens_scans_maximal_runs_lowercased() {
+        assert_eq!(
+            identifier_tokens("let MAP_size = call(x);"),
+            vec![
+                "let".to_string(),
+                "map_size".to_string(),
+                "call".to_string(),
+                "x".to_string()
+            ]
+        );
+        // Separator-only and empty lines produce no runs ("_" is an
+        // identifier character, so it alone would be one run).
+        assert!(identifier_tokens(":: - (!)").is_empty());
+        assert!(identifier_tokens("").is_empty());
+    }
+
+    #[test]
+    fn proximity_value_adjacent_terms_score_one() {
+        // First-occurrence token indices 0 and 1: gap 1 → 1.0.
+        assert_eq!(
+            proximity_value("alpha beta;", &terms(&["alpha", "beta"])),
+            1.0
+        );
+        // Case folding matches the scanner's lowercased tokens.
+        assert_eq!(
+            proximity_value("Alpha(BETA)", &terms(&["alpha", "beta"])),
+            1.0
+        );
+    }
+
+    #[test]
+    fn proximity_value_decays_hyperbolically_with_gap() {
+        // gap 2 → 0.5, gap 3 → 1/3.
+        assert_eq!(
+            proximity_value("alpha x beta", &terms(&["alpha", "beta"])),
+            0.5
+        );
+        let third = proximity_value("alpha x y beta", &terms(&["alpha", "beta"]));
+        assert!((third - 1.0 / 3.0).abs() < 1e-6, "{third}");
+    }
+
+    #[test]
+    fn proximity_value_inert_below_two_present_terms() {
+        // One present term: nothing to co-locate.
+        assert_eq!(
+            proximity_value("alpha other", &terms(&["alpha", "beta"])),
+            0.0
+        );
+        // None present, empty terms, empty content.
+        assert_eq!(
+            proximity_value("unrelated", &terms(&["alpha", "beta"])),
+            0.0
+        );
+        assert_eq!(proximity_value("alpha beta", &terms(&[])), 0.0);
+        assert_eq!(proximity_value("", &terms(&["alpha", "beta"])), 0.0);
+        assert_eq!(proximity_value("", &terms(&[])), 0.0);
+    }
+
+    #[test]
+    fn proximity_value_matches_whole_tokens_only() {
+        // "foo" inside foo_bar names a different identifier: not present,
+        // so no co-location is claimed.
+        assert_eq!(proximity_value("foo_bar;", &terms(&["foo", "bar"])), 0.0);
+        // Repeated QUERY terms dedup to one first occurrence: a term never
+        // co-locates with itself...
+        assert_eq!(proximity_value("alpha;", &terms(&["alpha", "alpha"])), 0.0);
+        // ...and the gap uses FIRST occurrences in the line.
+        assert_eq!(
+            proximity_value("alpha alpha beta", &terms(&["alpha", "beta"])),
+            0.5
+        );
+    }
+
+    #[test]
+    fn proximity_signal_reads_terms_from_prepared_context() {
+        let results = vec![
+            classified("src/a.rs", 1, "alpha beta;", ResultCategory::Other),
+            classified("src/b.rs", 1, "alpha filler beta;", ResultCategory::Other),
+            classified("src/c.rs", 1, "// unrelated", ResultCategory::Other),
+        ];
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms(),
+            "alpha beta",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+
+        let signal = ProximitySignal;
+        assert_eq!(signal.name(), "proximity");
+        assert_eq!(signal.requires(), ContextReqs::none().with_query_terms());
+        let query = QueryInfo {
+            pattern: "alpha beta",
+        };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        assert!((signal.contribution(&query, &results[1], &ctx) - 0.5).abs() < 1e-6);
+        assert_eq!(signal.contribution(&query, &results[2], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // SignatureSignal (TASK-094, REQ-014)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn is_signature_query_detects_signature_punctuation() {
+        for pattern in [
+            "foo(a, b)",
+            "fn foo() -> Result<T>",
+            "Foo::bar",
+            "  foo(x)  ",
+            "(x)",
+        ] {
+            assert!(is_signature_query(pattern), "{pattern:?}");
+        }
+        for pattern in ["foo", "my_func", "error handling", ""] {
+            assert!(!is_signature_query(pattern), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn signature_value_inert_when_query_not_shaped() {
+        // A name-shaped query must not reorder anything through this
+        // signal — not even an index-backed Definition.
+        assert_eq!(
+            signature_value(
+                false,
+                ResultCategory::Definition,
+                "pub fn parse(input: &str) {}"
+            ),
+            0.0
+        );
+        assert_eq!(
+            signature_value(false, ResultCategory::CallSite, "parse(x);"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn signature_value_definition_category_scores_one() {
+        assert_eq!(
+            signature_value(true, ResultCategory::Definition, "anything"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn signature_value_definition_shaped_line_scores_half() {
+        for line in [
+            "pub fn parse(input: &str) -> Vec<Token> {",
+            "    fn helper(x: u32) {}",
+            "def process(data):",
+            "export function alpha(x: number) { return x; }",
+            "class Client { constructor(opts) {} }",
+            "struct Config(String);",
+        ] {
+            assert_eq!(
+                signature_value(true, ResultCategory::Other, line),
+                0.5,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_value_call_sites_and_late_keywords_score_zero() {
+        // A call line carries the parenthesis but no definition keyword in
+        // its first three identifier tokens.
+        assert_eq!(
+            signature_value(true, ResultCategory::CallSite, "parse(data);"),
+            0.0
+        );
+        assert_eq!(
+            signature_value(true, ResultCategory::Other, "std::mem::swap(a, b);"),
+            0.0
+        );
+        // A definition keyword BEYOND the first three tokens is not a
+        // definition line.
+        assert_eq!(
+            signature_value(
+                true,
+                ResultCategory::Other,
+                "// the constructor foo(x) fn later"
+            ),
+            0.0
+        );
+    }
+
+    #[test]
+    fn signature_signal_needs_no_context_and_reads_the_query_shape() {
+        let signal = SignatureSignal;
+        assert_eq!(signal.name(), "signature");
+        assert_eq!(signal.requires(), ContextReqs::none());
+
+        let definition = classified(
+            "src/parse.rs",
+            3,
+            "fn parse(input: &str) {}",
+            ResultCategory::Definition,
+        );
+        let call = classified("src/main.rs", 9, "parse(data);", ResultCategory::CallSite);
+        let ctx = SharedContext::default();
+
+        // Shaped query: definition 1.0, call site 0.0.
+        let shaped = QueryInfo {
+            pattern: "parse(input: &str)",
+        };
+        assert_eq!(signal.contribution(&shaped, &definition, &ctx), 1.0);
+        assert_eq!(signal.contribution(&shaped, &call, &ctx), 0.0);
+
+        // Same candidates, name-shaped query: inert everywhere.
+        let plain = QueryInfo { pattern: "parse" };
+        assert_eq!(signal.contribution(&plain, &definition, &ctx), 0.0);
+        assert_eq!(signal.contribution(&plain, &call, &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // Path-character ladder (TASK-094)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn path_character_value_nine_exact_constants() {
+        assert_eq!(path_character_value(PathClass::GeneratedShadowed), 0.10);
+        assert_eq!(path_character_value(PathClass::Generated), 0.10);
+        assert_eq!(path_character_value(PathClass::Test), 0.20);
+        assert_eq!(path_character_value(PathClass::TypeDeclaration), 0.30);
+        assert_eq!(path_character_value(PathClass::Shim), 0.45);
+        assert_eq!(path_character_value(PathClass::Example), 0.60);
+        assert_eq!(path_character_value(PathClass::Barrel), 0.70);
+        assert_eq!(path_character_value(PathClass::ModuleEntry), 0.80);
+        assert_eq!(path_character_value(PathClass::Ordinary), 1.00);
+    }
+
+    #[test]
+    fn path_character_value_strictly_positive_ladder() {
+        // 0.0 means "no evidence" in this codebase (zero-weight = inert),
+        // so every bucket is strictly positive; walking the ladder from the
+        // strongest demotion to Ordinary the value never decreases, and
+        // every distinct bucket strictly increases.
+        let ladder = [
+            PathClass::GeneratedShadowed,
+            PathClass::Generated,
+            PathClass::Test,
+            PathClass::TypeDeclaration,
+            PathClass::Shim,
+            PathClass::Example,
+            PathClass::Barrel,
+            PathClass::ModuleEntry,
+            PathClass::Ordinary,
+        ];
+        for class in ladder {
+            assert!(
+                path_character_value(class) > 0.0,
+                "{class:?} must be strictly positive"
+            );
+        }
+        let distinct: Vec<f32> = ladder.map(path_character_value).to_vec();
+        let deduped: Vec<f32> = {
+            let mut v = distinct.clone();
+            v.dedup();
+            v
+        };
+        for pair in deduped.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "distinct ladder values must strictly increase"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_path_character_bucket_positives() {
+        let cases: &[(&str, PathClass)] = &[
+            // Test: directories, *_test stems, .test./.spec. names.
+            ("tests/foo.rs", PathClass::Test),
+            ("test/foo.js", PathClass::Test),
+            ("__tests__/foo.js", PathClass::Test),
+            ("src/foo_test.go", PathClass::Test),
+            ("src/foo.test.ts", PathClass::Test),
+            ("src/foo.spec.js", PathClass::Test),
+            // TypeDeclaration: ambient declaration and C header extensions.
+            ("src/foo.d.ts", PathClass::TypeDeclaration),
+            ("types/foo.d.mts", PathClass::TypeDeclaration),
+            ("src/foo.d.cts", PathClass::TypeDeclaration),
+            ("include/foo.h", PathClass::TypeDeclaration),
+            // Shim: compatibility directories and stems.
+            ("compat/foo.ts", PathClass::Shim),
+            ("src/compatibility/foo.js", PathClass::Shim),
+            ("shims/polyfill.js", PathClass::Shim),
+            ("deprecated/a.js", PathClass::Shim),
+            ("src/legacy/b.ts", PathClass::Shim),
+            ("src/compat.ts", PathClass::Shim),
+            ("src/shim.js", PathClass::Shim),
+            ("src/deprecated.rs", PathClass::Shim),
+            ("src/foo_compat.ts", PathClass::Shim),
+            ("src/foo_shim.js", PathClass::Shim),
+            // Example: documentation and sample directories, .example. names.
+            ("example/a.ts", PathClass::Example),
+            ("examples/b.js", PathClass::Example),
+            ("samples/c.py", PathClass::Example),
+            ("demos/d.rs", PathClass::Example),
+            ("fixtures/e.json", PathClass::Example),
+            ("bench/f.ts", PathClass::Example),
+            ("benchmarks/g.js", PathClass::Example),
+            ("docs/h.md", PathClass::Example),
+            ("doc/i.txt", PathClass::Example),
+            ("src/foo.example.ts", PathClass::Example),
+            // Barrel: re-export entry points.
+            ("src/index.ts", PathClass::Barrel),
+            ("src/index.tsx", PathClass::Barrel),
+            ("web/index.js", PathClass::Barrel),
+            ("src/index.jsx", PathClass::Barrel),
+            ("src/index.mjs", PathClass::Barrel),
+            ("src/index.cjs", PathClass::Barrel),
+            ("src/mod.rs", PathClass::Barrel),
+            ("src/lib.rs", PathClass::Barrel),
+            ("pkg/__init__.py", PathClass::Barrel),
+            ("src/exports.ts", PathClass::Barrel),
+            ("src/exports.js", PathClass::Barrel),
+            // ModuleEntry: program entry points.
+            ("src/main.rs", PathClass::ModuleEntry),
+            ("cmd/app/main.go", PathClass::ModuleEntry),
+            ("scripts/main.py", PathClass::ModuleEntry),
+            ("src/main.js", PathClass::ModuleEntry),
+            ("src/main.ts", PathClass::ModuleEntry),
+            ("pkg/__main__.py", PathClass::ModuleEntry),
+            // Generated: markers, protobuf conventions, codegen double
+            // extensions. Pre-resolution variant; shadowing is resolved
+            // against the index in prepare_context.
+            ("src/foo.g.dart", PathClass::Generated),
+            ("src/user.g.ts", PathClass::Generated),
+            ("src/foo.pb.go", PathClass::Generated),
+            ("src/api.generated.ts", PathClass::Generated),
+            ("src/foo.gen.ts", PathClass::Generated),
+            ("python/foo_pb2.py", PathClass::Generated),
+            ("python/foo_pb2_grpc.py", PathClass::Generated),
+            ("src/svc_generated.rs", PathClass::Generated),
+            // Ordinary: everything else.
+            ("src/wonk.rs", PathClass::Ordinary),
+            ("src/parser.rs", PathClass::Ordinary),
+            ("lib/core/service.py", PathClass::Ordinary),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                classify_path_character(std::path::Path::new(path)),
+                *expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_path_character_first_match_precedence() {
+        // The ladder matches first-come in value order: a marker wins over
+        // every other bucket (its demotion is only kept when a peer is
+        // verified, else prepare_context restores Ordinary); the specific
+        // path buckets win over the generic later ones.
+        let cases: &[(&str, PathClass)] = &[
+            ("tests/foo.d.ts", PathClass::Test),
+            ("examples/index.ts", PathClass::Example),
+            ("src/foo.g.dart", PathClass::Generated),
+            ("tests/foo.pb.go", PathClass::Generated),
+            ("src/index.g.ts", PathClass::Generated),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                classify_path_character(std::path::Path::new(path)),
+                *expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_path_character_dir_checks_match_directories_not_filenames() {
+        // A directory named "testing" or a file named "compat" is not a
+        // bucket: the dir checks read path components of the PARENT.
+        assert_eq!(
+            classify_path_character(std::path::Path::new("src/testing/foo.rs")),
+            PathClass::Ordinary
+        );
+        assert_eq!(
+            classify_path_character(std::path::Path::new("src/contest.rs")),
+            PathClass::Ordinary
+        );
+        assert_eq!(
+            classify_path_character(std::path::Path::new("src/spec.rs")),
+            PathClass::Ordinary
+        );
+    }
+
+    #[test]
+    fn is_type_declaration_extension_set() {
+        for path in ["src/foo.d.ts", "foo.d.mts", "foo.d.cts", "include/ffi.h"] {
+            assert!(is_type_declaration(path), "{path}");
+        }
+        for path in [
+            "src/foo.ts",
+            "src/foo.hx",
+            "src/dts.ts",
+            "src/foo.htaccess",
+            "src/foo",
+        ] {
+            assert!(!is_type_declaration(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn is_generated_name_marker_set() {
+        for path in [
+            "src/api.generated.ts",
+            "src/foo.gen.ts",
+            "src/foo.pb.go",
+            "src/user.g.dart",
+            "src/user.g.ts",
+            "python/foo_pb2.py",
+            "python/foo_pb2_grpc.py",
+            "src/svc_generated.rs",
+        ] {
+            assert!(is_generated_name(path), "{path}");
+        }
+        for path in [
+            "src/foo.ts",
+            "src/foo_pb.rs",
+            "src/general.ts",
+            "src/foo.go",
+            "src/g.dart",
+        ] {
+            assert!(!is_generated_name(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn strip_generated_marker_yields_the_peer_name() {
+        assert_eq!(
+            strip_generated_marker("user.g.dart").as_deref(),
+            Some("user.dart")
+        );
+        assert_eq!(
+            strip_generated_marker("api.generated.ts").as_deref(),
+            Some("api.ts")
+        );
+        assert_eq!(
+            strip_generated_marker("foo_pb2.py").as_deref(),
+            Some("foo.py")
+        );
+        assert_eq!(
+            strip_generated_marker("foo_pb2_grpc.py").as_deref(),
+            Some("foo.py")
+        );
+        assert_eq!(
+            strip_generated_marker("foo.pb.go").as_deref(),
+            Some("foo.go")
+        );
+        assert_eq!(
+            strip_generated_marker("foo.gen.ts").as_deref(),
+            Some("foo.ts")
+        );
+        // No marker: no peer name.
+        assert_eq!(strip_generated_marker("foo.ts"), None);
+    }
+
+    #[test]
+    fn prepare_context_seeds_the_graded_classifier() {
+        let results = vec![
+            classified("src/a.rs", 1, "x", ResultCategory::Other),
+            classified("tests/b.rs", 1, "x", ResultCategory::Other),
+            classified("src/c.d.ts", 1, "x", ResultCategory::Other),
+        ];
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.path_class("src/a.rs"), Some(PathClass::Ordinary));
+        assert_eq!(ctx.path_class("tests/b.rs"), Some(PathClass::Test));
+        assert_eq!(
+            ctx.path_class("src/c.d.ts"),
+            Some(PathClass::TypeDeclaration)
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Generated-peer shadowing (TASK-094, AC-2)
+    // -------------------------------------------------------------------
+
+    /// Seed the `files` table with the given paths (the index side of peer
+    /// verification — candidates alone never verify a peer).
+    fn seed_files(conn: &Connection, paths: &[&str]) {
+        for path in paths {
+            conn.execute(
+                "INSERT INTO files (path, language, hash, last_indexed, line_count) \
+                 VALUES (?1, 'rust', 'h', 0, 10)",
+                rusqlite::params![path],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn resolve_generated_shadowing_with_verified_peer() {
+        let (dir, conn) = seeded_conn();
+        seed_files(&conn, &["src/user.g.dart", "src/user.dart"]);
+        let shadowed = resolve_generated_shadowing(Some(&conn), &["src/user.g.dart".to_string()]);
+        assert_eq!(shadowed, HashSet::from(["src/user.g.dart".to_string()]));
+        drop(dir);
+    }
+
+    #[test]
+    fn resolve_generated_shadowing_without_peer_is_empty() {
+        let (dir, conn) = seeded_conn();
+        // No peer anywhere in the index.
+        seed_files(&conn, &["src/user.g.dart"]);
+        assert!(
+            resolve_generated_shadowing(Some(&conn), &["src/user.g.dart".to_string()]).is_empty()
+        );
+
+        // A peer in a DIFFERENT directory is not a peer: same-named
+        // hand-written files elsewhere say nothing about this one.
+        seed_files(&conn, &["other/user.dart"]);
+        assert!(
+            resolve_generated_shadowing(Some(&conn), &["src/user.g.dart".to_string()]).is_empty()
+        );
+
+        // A peer that is itself generated is not hand-written.
+        seed_files(&conn, &["src/a.gen.gen.ts", "src/a.gen.ts"]);
+        assert!(
+            resolve_generated_shadowing(Some(&conn), &["src/a.gen.gen.ts".to_string()]).is_empty()
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn resolve_generated_shadowing_requires_the_index_not_the_candidate_set() {
+        let (dir, conn) = seeded_conn();
+        // The peer exists only among the CANDIDATES, not in the files
+        // table: unverified — no demotion (AC-2 conservative read).
+        seed_files(&conn, &["src/user.g.dart"]);
+        let candidates = vec!["src/user.g.dart".to_string(), "src/user.dart".to_string()];
+        assert!(resolve_generated_shadowing(Some(&conn), &candidates).is_empty());
+        drop(dir);
+    }
+
+    #[test]
+    fn resolve_generated_shadowing_without_conn_is_empty() {
+        assert!(resolve_generated_shadowing(None, &["src/user.g.dart".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn prepare_context_rewrites_generated_by_verified_peer() {
+        let (dir, conn) = seeded_conn();
+        // Peer present: GeneratedShadowed (0.10).
+        seed_files(&conn, &["src/user.g.dart", "src/user.dart"]);
+        let results = vec![classified("src/user.g.dart", 1, "x", ResultCategory::Other)];
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        assert_eq!(
+            ctx.path_class("src/user.g.dart"),
+            Some(PathClass::GeneratedShadowed)
+        );
+
+        // Peer absent from the index: back to Ordinary — never demoted
+        // without a peer.
+        let (dir2, conn2) = seeded_conn();
+        seed_files(&conn2, &["src/user.g.dart"]);
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            Some(&conn2),
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.path_class("src/user.g.dart"), Some(PathClass::Ordinary));
+        drop(dir);
+        drop(dir2);
+    }
+
+    #[test]
+    fn prepare_context_generated_without_conn_stays_ordinary() {
+        let results = vec![classified("src/user.g.dart", 1, "x", ResultCategory::Other)];
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        assert_eq!(ctx.path_class("src/user.g.dart"), Some(PathClass::Ordinary));
+    }
+
+    // -------------------------------------------------------------------
+    // PathCharacterSignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn path_character_signal_reads_the_graded_ladder_from_context() {
+        // One peer-verified generated file plus one peerless one, so the
+        // prepared context carries the full range of rewritten classes.
+        let (dir, conn) = seeded_conn();
+        seed_files(
+            &conn,
+            &["src/user.g.dart", "src/user.dart", "src/orphan.g.dart"],
+        );
+        let results = vec![
+            classified("src/plain.rs", 1, "x", ResultCategory::Other),
+            classified("tests/t.rs", 1, "x", ResultCategory::Other),
+            classified("src/foo.d.ts", 1, "x", ResultCategory::Other),
+            classified("compat/shim.ts", 1, "x", ResultCategory::Other),
+            classified("examples/demo.ts", 1, "x", ResultCategory::Other),
+            classified("src/index.ts", 1, "x", ResultCategory::Other),
+            classified("src/main.rs", 1, "x", ResultCategory::Other),
+            classified("src/user.g.dart", 1, "x", ResultCategory::Other),
+            classified("src/orphan.g.dart", 1, "x", ResultCategory::Other),
+        ];
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        drop(dir);
+
+        let signal = PathCharacterSignal;
+        assert_eq!(signal.name(), "path_character");
+        assert_eq!(signal.requires(), ContextReqs::none().with_path_class());
+        let query = QueryInfo { pattern: "x" };
+        let expected = [
+            ("src/plain.rs", 1.00),
+            ("tests/t.rs", 0.20),
+            ("src/foo.d.ts", 0.30),
+            ("compat/shim.ts", 0.45),
+            ("examples/demo.ts", 0.60),
+            ("src/index.ts", 0.70),
+            ("src/main.rs", 0.80),
+            ("src/user.g.dart", 0.10),
+            ("src/orphan.g.dart", 1.00),
+        ];
+        for (file, value) in expected {
+            let candidate = results
+                .iter()
+                .find(|r| r.result.file == Path::new(file))
+                .unwrap();
+            assert_eq!(
+                signal.contribution(&query, candidate, &ctx),
+                value,
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_character_signal_unclassified_file_contributes_ordinary() {
+        // Defensive branch: a candidate the context never classified is
+        // never demoted (no evidence → the ordinary value).
+        let signal = PathCharacterSignal;
+        let candidate = classified("tests/t.rs", 1, "x", ResultCategory::Other);
+        let query = QueryInfo { pattern: "x" };
+        assert_eq!(
+            signal.contribution(&query, &candidate, &SharedContext::default()),
+            path_character_value(PathClass::Ordinary)
+        );
     }
 
     // -------------------------------------------------------------------

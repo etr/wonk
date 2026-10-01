@@ -662,6 +662,8 @@ fn rule_coverage_gap(
         .iter()
         .flat_map(|t| t.symbols.iter())
         .collect();
+    // TASK-094 keep: review semantics — test symbols sit outside review
+    // scope; this is not a ranking demotion.
     if radius
         .iter()
         .any(|s| crate::ranker::is_test_file(Path::new(&s.file)))
@@ -886,6 +888,8 @@ pub fn run_review(
                     && detail
                         .signature_changed
                         .contains(&(cs.name.clone(), cs.kind))));
+        // TASK-094 keep: review semantics — test symbols sit outside review
+        // scope; this is not a ranking demotion.
         let rule_b_candidate = options.coverage_gap
             && matches!(
                 cs.change_type,
