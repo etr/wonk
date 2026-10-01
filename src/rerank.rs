@@ -814,6 +814,41 @@ impl Signal for SemanticSignal {
     }
 }
 
+/// The path-character signal (TASK-094, PRD-RANK-REQ-011): the candidate
+/// file's graded ladder value — generated-shadowed < test < type
+/// declaration < shim < example < barrel < module entry < ordinary.
+///
+/// Graded, never exclusion: a test file still scores strictly above zero,
+/// so a test file that is the best answer on the other signals still
+/// ranks. The signal re-derives test-ness from the path (it does not read
+/// the kind input) so the demotion survives `kind = 0` configurations;
+/// under `kind > 0` both signals demote test files and agree.
+pub(crate) struct PathCharacterSignal;
+
+impl Signal for PathCharacterSignal {
+    fn name(&self) -> &'static str {
+        "path_character"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_path_class()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        match ctx.path_class(&file) {
+            Some(class) => path_character_value(class),
+            // No classification, no demotion.
+            None => path_character_value(PathClass::Ordinary),
+        }
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -824,6 +859,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(SemanticSignal),
         Box::new(CentralitySignal),
         Box::new(ProminenceSignal),
+        Box::new(PathCharacterSignal),
     ]
 }
 
@@ -1268,12 +1304,19 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_five_signals_in_order() {
+    fn registry_contains_six_signals_in_order() {
         let registry = builtin_signals();
         let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
-            vec!["kind", "lexical", "semantic", "centrality", "prominence"]
+            vec![
+                "kind",
+                "lexical",
+                "semantic",
+                "centrality",
+                "prominence",
+                "path_character"
+            ]
         );
         assert_eq!(known_signal_names(), names);
     }
@@ -1355,7 +1398,7 @@ mod tests {
             "error names the offender: {err}"
         );
         assert!(
-            err.contains("known: kind, lexical, semantic, centrality, prominence"),
+            err.contains("known: kind, lexical, semantic, centrality, prominence, path_character"),
             "error lists every valid name: {err}"
         );
     }
@@ -2718,6 +2761,80 @@ mod tests {
             &ContextSources::default(),
         );
         assert_eq!(ctx.path_class("src/user.g.dart"), Some(PathClass::Ordinary));
+    }
+
+    // -------------------------------------------------------------------
+    // PathCharacterSignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn path_character_signal_reads_the_graded_ladder_from_context() {
+        // One peer-verified generated file plus one peerless one, so the
+        // prepared context carries the full range of rewritten classes.
+        let (dir, conn) = seeded_conn();
+        seed_files(
+            &conn,
+            &["src/user.g.dart", "src/user.dart", "src/orphan.g.dart"],
+        );
+        let results = vec![
+            classified("src/plain.rs", 1, "x", ResultCategory::Other),
+            classified("tests/t.rs", 1, "x", ResultCategory::Other),
+            classified("src/foo.d.ts", 1, "x", ResultCategory::Other),
+            classified("compat/shim.ts", 1, "x", ResultCategory::Other),
+            classified("examples/demo.ts", 1, "x", ResultCategory::Other),
+            classified("src/index.ts", 1, "x", ResultCategory::Other),
+            classified("src/main.rs", 1, "x", ResultCategory::Other),
+            classified("src/user.g.dart", 1, "x", ResultCategory::Other),
+            classified("src/orphan.g.dart", 1, "x", ResultCategory::Other),
+        ];
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        drop(dir);
+
+        let signal = PathCharacterSignal;
+        assert_eq!(signal.name(), "path_character");
+        assert_eq!(signal.requires(), ContextReqs::none().with_path_class());
+        let query = QueryInfo { pattern: "x" };
+        let expected = [
+            ("src/plain.rs", 1.00),
+            ("tests/t.rs", 0.20),
+            ("src/foo.d.ts", 0.30),
+            ("compat/shim.ts", 0.45),
+            ("examples/demo.ts", 0.60),
+            ("src/index.ts", 0.70),
+            ("src/main.rs", 0.80),
+            ("src/user.g.dart", 0.10),
+            ("src/orphan.g.dart", 1.00),
+        ];
+        for (file, value) in expected {
+            let candidate = results
+                .iter()
+                .find(|r| r.result.file == Path::new(file))
+                .unwrap();
+            assert_eq!(
+                signal.contribution(&query, candidate, &ctx),
+                value,
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_character_signal_unclassified_file_contributes_ordinary() {
+        // Defensive branch: a candidate the context never classified is
+        // never demoted (no evidence → the ordinary value).
+        let signal = PathCharacterSignal;
+        let candidate = classified("tests/t.rs", 1, "x", ResultCategory::Other);
+        let query = QueryInfo { pattern: "x" };
+        assert_eq!(
+            signal.contribution(&query, &candidate, &SharedContext::default()),
+            path_character_value(PathClass::Ordinary)
+        );
     }
 
     // -------------------------------------------------------------------
