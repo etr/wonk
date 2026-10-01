@@ -491,6 +491,58 @@ impl Signal for ProminenceSignal {
     }
 }
 
+/// Absolute cosine-to-contribution mapping (TASK-093):
+/// `clamp01((cosine + 1) * 0.5)`.
+///
+/// Deliberately NOT set-relative: an absent embedding must stay strictly
+/// below every present candidate, and min-max normalization would tie the
+/// absent candidates with the worst present one — inverting the
+/// zero-not-penalty contract. Non-finite input maps to 0.
+pub fn semantic_value(cosine: f32) -> f32 {
+    if !cosine.is_finite() {
+        return 0.0;
+    }
+    ((cosine + 1.0) * 0.5).clamp(0.0, 1.0)
+}
+
+/// The semantic signal (PRD-RANK-REQ-001): cosine similarity between the
+/// query embedding and the candidate's indexed embedding, both
+/// L2-normalized, mapped absolutely per [`semantic_value`].
+///
+/// A missing query embedding or a candidate without a vector contributes
+/// exactly 0.0 — zero, not a penalty — so a candidate the signal knows
+/// nothing about is never demoted below its other signals' score.
+// Wired into builtin_signals() with the TASK-093 registry; until then only
+// the unit tests construct it.
+#[allow(dead_code)]
+pub(crate) struct SemanticSignal;
+
+impl Signal for SemanticSignal {
+    fn name(&self) -> &'static str {
+        "semantic"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_embeddings()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let Some(query) = ctx.query_embedding() else {
+            return 0.0;
+        };
+        let file = candidate.result.file.to_string_lossy();
+        let Some(vector) = ctx.embedding_at(&file, candidate.result.line) else {
+            return 0.0;
+        };
+        semantic_value(crate::semantic::dot_product(query, vector))
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -2073,6 +2125,158 @@ mod tests {
 
         assert!(ctx.query_embedding().is_none());
         assert!(ctx.embedding_at("src/main.rs", 10).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // SemanticSignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn semantic_value_maps_cosine_range_absolutely() {
+        assert_eq!(semantic_value(1.0), 1.0, "parallel");
+        assert_eq!(semantic_value(0.0), 0.5, "orthogonal");
+        assert_eq!(semantic_value(-1.0), 0.0, "anti-parallel");
+        assert!((semantic_value(0.6) - 0.8).abs() < 1e-6);
+        // Clamped, never extrapolated.
+        assert_eq!(semantic_value(2.0), 1.0);
+        assert_eq!(semantic_value(-2.0), 0.0);
+        assert_eq!(semantic_value(f32::NAN), 0.0);
+    }
+
+    fn embed_ctx(query: Option<Vec<f32>>, vectors: Vec<(&str, u64, Vec<f32>)>) -> SharedContext {
+        let mut ctx = SharedContext::default();
+        ctx.embeddings.query = query;
+        for (file, line, vector) in vectors {
+            ctx.embeddings
+                .vectors
+                .insert((file.to_string(), line), vector);
+        }
+        ctx
+    }
+
+    #[test]
+    fn semantic_signal_reads_direction_from_prepared_vectors() {
+        let ctx = embed_ctx(
+            Some(vec![1.0, 0.0]),
+            vec![
+                ("src/a.rs", 1, vec![1.0, 0.0]),
+                ("src/b.rs", 1, vec![0.0, 1.0]),
+                ("src/c.rs", 1, vec![-1.0, 0.0]),
+            ],
+        );
+
+        let signal = SemanticSignal;
+        assert_eq!(signal.name(), "semantic");
+        assert_eq!(signal.requires(), ContextReqs::none().with_embeddings());
+        let query = QueryInfo { pattern: "x" };
+        for (file, expected) in [("src/a.rs", 1.0), ("src/b.rs", 0.5), ("src/c.rs", 0.0)] {
+            let candidate = classified(file, 1, "x", ResultCategory::Definition);
+            let value = signal.contribution(&query, &candidate, &ctx);
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "{file}: {value} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_signal_zero_when_query_missing_or_candidate_absent() {
+        let signal = SemanticSignal;
+        let query = QueryInfo { pattern: "x" };
+
+        // Query present, candidate position carries no vector.
+        let ctx = embed_ctx(Some(vec![1.0, 0.0]), vec![("src/a.rs", 1, vec![1.0, 0.0])]);
+        let absent = classified("src/b.rs", 1, "x", ResultCategory::Definition);
+        assert_eq!(signal.contribution(&query, &absent, &ctx), 0.0);
+
+        // Query absent entirely (no embeddable source): still zero, never
+        // an error.
+        let no_query = embed_ctx(None, vec![("src/a.rs", 1, vec![1.0, 0.0])]);
+        let present = classified("src/a.rs", 1, "x", ResultCategory::Definition);
+        assert_eq!(signal.contribution(&query, &present, &no_query), 0.0);
+    }
+
+    #[test]
+    fn semantic_signal_positive_for_embedded_definition() {
+        // Full preparation path: the bundled provider embeds the query
+        // in-process and the stored vector lives in the same space.
+        let (_dir, conn) = embedding_seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+        let ctx = prepare_context(
+            ContextReqs::none().with_embeddings(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        let signal = SemanticSignal;
+        let query = QueryInfo { pattern: "my_func" };
+        let value = signal.contribution(&query, &results[0], &ctx);
+        assert!(
+            value > 0.0,
+            "same-space similarity must be positive: {value}"
+        );
+    }
+
+    #[test]
+    fn semantic_signal_absence_is_zero_not_penalty() {
+        let (_dir, conn) = embedding_seeded_conn();
+        let results = vec![
+            classified(
+                "src/main.rs",
+                10,
+                "fn my_func() {}",
+                ResultCategory::Definition,
+            ),
+            classified("src/call.rs", 5, "my_func();", ResultCategory::CallSite),
+            classified("src/note.rs", 2, "// my_func", ResultCategory::Comment),
+        ];
+        let query = QueryInfo { pattern: "my_func" };
+
+        let kind_only = rerank_with_signals(
+            vec![Box::new(KindSignal)],
+            results.clone(),
+            &query,
+            Some(&conn),
+            &table(&[("kind", 1.0)]),
+            &ContextSources::default(),
+        );
+        let with_semantic = rerank_with_signals(
+            vec![Box::new(KindSignal), Box::new(SemanticSignal)],
+            results,
+            &query,
+            Some(&conn),
+            &table(&[("kind", 1.0), ("semantic", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        let key = |s: &ScoredResult| {
+            (
+                s.classified.result.file.to_string_lossy().into_owned(),
+                s.classified.result.line,
+            )
+        };
+        let kind_keys: Vec<_> = kind_only.iter().map(key).collect();
+        let semantic_keys: Vec<_> = with_semantic.iter().map(key).collect();
+        // Absent candidates contribute exactly 0, so they cannot be
+        // reordered past each other: the kind order survives intact.
+        assert_eq!(semantic_keys, kind_keys);
+        for scored in &with_semantic {
+            if scored.classified.result.file != std::path::Path::new("src/main.rs") {
+                assert_eq!(
+                    scored.score,
+                    kind_value(scored.classified.category),
+                    "absent candidate must score its kind value exactly"
+                );
+            }
+        }
+        // The one embedded candidate only gained.
+        assert!(with_semantic[0].score > kind_only[0].score);
     }
 
     #[test]
