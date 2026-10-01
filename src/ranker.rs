@@ -459,6 +459,50 @@ pub(crate) fn group_by_category<T: GroupedItem>(results: Vec<T>) -> Vec<(ResultC
     groups
 }
 
+/// Reorder items into category-major (tier) order while preserving each
+/// category's internal order: Definition, CallSite, Import, Other,
+/// Comment, Test; empty categories drop out.
+///
+/// [`group_by_category`] groups by ADJACENCY, a precondition the legacy
+/// lexicographic sort satisfies by construction. The rerank pipeline
+/// sorts by score, which interleaves categories under any non-kind-only
+/// weight configuration (e.g. `kind = 0.0`), so the pipeline path funnels
+/// its output through this bucketing first — keeping grouping in ONE
+/// shared implementation while emitting each category exactly once.
+pub(crate) fn bucket_by_category<T: GroupedItem>(results: Vec<T>) -> Vec<T> {
+    let mut definitions = Vec::new();
+    let mut call_sites = Vec::new();
+    let mut imports = Vec::new();
+    let mut others = Vec::new();
+    let mut comments = Vec::new();
+    let mut tests = Vec::new();
+    for r in results {
+        match r.category() {
+            ResultCategory::Definition => definitions.push(r),
+            ResultCategory::CallSite => call_sites.push(r),
+            ResultCategory::Import => imports.push(r),
+            ResultCategory::Other => others.push(r),
+            ResultCategory::Comment => comments.push(r),
+            ResultCategory::Test => tests.push(r),
+        }
+    }
+    let mut out = Vec::with_capacity(
+        definitions.len()
+            + call_sites.len()
+            + imports.len()
+            + others.len()
+            + comments.len()
+            + tests.len(),
+    );
+    out.append(&mut definitions);
+    out.append(&mut call_sites);
+    out.append(&mut imports);
+    out.append(&mut others);
+    out.append(&mut comments);
+    out.append(&mut tests);
+    out
+}
+
 /// Map a category to its display header string.
 pub fn category_header(cat: ResultCategory) -> &'static str {
     match cat {

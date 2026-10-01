@@ -8,6 +8,11 @@
 //! Cost contract (PRD-RANK-REQ-003): a signal whose weight is zero is
 //! SKIPPED entirely — it is never evaluated and it contributes nothing to
 //! the shared-context requirements, so zero-weight signals cost nothing.
+//!
+//! Grouping decision: the pipeline path buckets scored results by category
+//! in tier order (`ranker::bucket_by_category`) before the ONE shared
+//! dedup/group pass, so each category is emitted exactly once under any
+//! valid weight configuration.
 
 use std::collections::HashMap;
 
@@ -510,7 +515,13 @@ pub fn rank_and_explain(
 ) -> Vec<(ResultCategory, Vec<ScoredResult>)> {
     let classified = crate::ranker::classify_results(results, conn);
     let ranked = if settings.use_pipeline {
-        rerank(classified, &QueryInfo { pattern }, conn, &settings.weights)
+        let scored = rerank(classified, &QueryInfo { pattern }, conn, &settings.weights);
+        // Score order interleaves categories under any non-kind-only
+        // weight table (group_by_category groups by adjacency); bucket
+        // into tier order first so every category is emitted exactly
+        // once. For kind-only positive weights this is the identity
+        // permutation, so equivalence with the legacy output is exact.
+        crate::ranker::bucket_by_category(scored)
     } else {
         crate::ranker::rank_results(classified)
             .into_iter()
@@ -1008,6 +1019,72 @@ mod tests {
             None,
         );
         assert_eq!(ctx.terms(), &["cache".to_string(), "eviction".to_string()]);
+    }
+
+    #[test]
+    fn rank_and_explain_emits_each_category_once_under_interleaved_scores() {
+        // kind = 0.0 is a documented, valid config ("A weight of 0 skips
+        // the signal entirely", docs/configuration.md): the kind signal is
+        // never evaluated, every score is 0.0, and pipeline ordering falls
+        // to the (file, line) tie-breaks — interleaving categories. The
+        // grouped output must still emit each category EXACTLY once (tier
+        // order), never one group per adjacent run.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for file in ["src/a.rs", "src/c.rs"] {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params!["my_func", "function", file, 1, 0, "rust"],
+            )
+            .unwrap();
+        }
+        for file in ["src/b.rs", "src/d.rs"] {
+            conn.execute(
+                "INSERT INTO \"references\" (name, file, line, col, context) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["my_func", file, 1, 4, "my_func();"],
+            )
+            .unwrap();
+        }
+        let mk = |file: &str, content: &str| SearchResult {
+            file: PathBuf::from(file),
+            line: 1,
+            col: 1,
+            content: content.to_string(),
+        };
+        let results = vec![
+            mk("src/a.rs", "pub fn my_func() {}"), // Definition (index)
+            mk("src/b.rs", "my_func();"),          // CallSite (index)
+            mk("src/c.rs", "pub fn my_func() {}"), // Definition (index)
+            mk("src/d.rs", "my_func();"),          // CallSite (index)
+            mk("src/e.rs", "// my_func note"),     // Comment (content)
+        ];
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 0.0)]),
+        };
+
+        let groups = rank_and_explain(&results, Some(&conn), "my_func", &settings);
+
+        let cats: Vec<ResultCategory> = groups.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            cats,
+            vec![
+                ResultCategory::Definition,
+                ResultCategory::CallSite,
+                ResultCategory::Comment,
+            ],
+            "interleaved score order must not fragment category groups: {cats:?}"
+        );
+        // Within each bucket the score tie-break ((file, line)) order is
+        // preserved, not re-sorted.
+        let files = |items: &Vec<ScoredResult>| -> Vec<String> {
+            items
+                .iter()
+                .map(|s| s.classified.result.file.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(files(&groups[0].1), vec!["src/a.rs", "src/c.rs"]);
+        assert_eq!(files(&groups[1].1), vec!["src/b.rs", "src/d.rs"]);
     }
 
     #[test]

@@ -382,3 +382,78 @@ fn cli_why_stdout_is_byte_identical_to_default_smart_run() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 7. --why without --smart implies smart ranked mode
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_why_alone_implies_smart_ranked_mode() {
+    // `--why` implies smart ranked mode via the router's
+    // detect_search_mode(raw, smart || why, symbol_count). The pattern must
+    // be TEXT-ONLY (no symbol match), since a symbol-matching pattern would
+    // select Smart mode on its own and the implication would go unpinned.
+    let (dir, conn) = setup_indexed_corpus();
+    assert_eq!(
+        db::count_matching_symbols(&conn, "eviction"),
+        0,
+        "'eviction' must stay a text-only pattern for this pin to hold"
+    );
+    let root = dir.path();
+    let home = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_wonk");
+
+    let run = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.current_dir(root)
+            .env("HOME", home.path())
+            .arg("search")
+            .arg("eviction");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        let output = cmd.output().expect("wonk binary to run");
+        assert!(
+            output.status.success(),
+            "wonk search {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    let plain = run(&[]);
+    let smart = run(&["--smart"]);
+    let why_alone = run(&["--why"]);
+
+    assert!(
+        !smart.stdout.is_empty(),
+        "fixture corpus must produce search output"
+    );
+    // Without flags the text-only pattern takes Plain mode, so the two
+    // modes are observably different outputs (anti-vacuity).
+    assert_ne!(
+        plain.stdout, smart.stdout,
+        "plain and smart runs must differ for this pin to be meaningful"
+    );
+    assert_eq!(
+        smart.stdout, why_alone.stdout,
+        "--why alone must route through the same ranked pipeline as --smart"
+    );
+
+    let why_err = String::from_utf8_lossy(&why_alone.stderr);
+    let why_lines: Vec<&str> = why_err.lines().filter(|l| l.starts_with("why: ")).collect();
+    assert!(
+        !why_lines.is_empty(),
+        "--why alone must print breakdown lines to stderr: {why_err}"
+    );
+    for line in why_lines {
+        assert!(
+            line.contains("kind "),
+            "why line names the kind signal: {line}"
+        );
+        assert!(
+            line.contains("total="),
+            "why line shows the final score: {line}"
+        );
+    }
+}
