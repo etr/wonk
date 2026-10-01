@@ -15,9 +15,12 @@ summed over all 40 labeled queries per iteration.
 
 ## Measurement
 
-- Mean ADDED latency, 40 queries per iteration: **10.451 ms**
-  (~0.26 ms per query)
-- p95: **12.829 ms**
+- Mean ADDED latency, 40 queries per iteration: **8.309 ms**
+  (~0.21 ms per query)
+- p95: **11.131 ms**
+- Run-to-run variance on this machine: repeated runs measured 10.451 ms /
+  12.829 ms and 7.376 ms / 9.581 ms — comfortably inside the gate every
+  time.
 - Gate: mean < 20 ms per warm query — satisfied with an order of magnitude
   of headroom even on the aggregate sum.
 

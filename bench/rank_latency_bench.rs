@@ -13,7 +13,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
-use rusqlite::Connection;
 use serde::Deserialize;
 use tempfile::TempDir;
 use wonk::db;
@@ -33,8 +32,6 @@ struct Labels {
 #[derive(Debug, Deserialize)]
 struct LabeledQuery {
     text: String,
-    #[serde(default)]
-    relevant: Vec<String>,
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -84,7 +81,7 @@ fn main() -> Result<()> {
     let root_str = root.display().to_string();
     let mut candidate_sets = Vec::with_capacity(queries.len());
     for query in &queries {
-        let mut found = search::text_search(query, false, false, &[root_str.clone()])?;
+        let mut found = search::text_search(query, false, false, std::slice::from_ref(&root_str))?;
         for result in &mut found {
             if let Ok(rel) = result.file.strip_prefix(root) {
                 result.file = rel.to_path_buf();
