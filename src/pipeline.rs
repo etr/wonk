@@ -150,6 +150,16 @@ pub fn build_index_with_progress(
     let (sym_count, ref_count, caller_count, type_edge_count, contract_count) =
         batch_insert(&conn, &results, reach_opts.as_ref())?;
 
+    // 5b. Mine the bounded history window (TASK-096). Best-effort: a git
+    // failure warns and the build proceeds with empty history tables
+    // (PRD-HIST-REQ-008) — never an error.
+    if config.history.enabled
+        && crate::history::has_git(repo_root)
+        && let Err(e) = crate::history::mine_full(&conn, repo_root, config.history.window)
+    {
+        eprintln!("wonk: history mining skipped: {e:#}");
+    }
+
     // 6. Collect languages seen and write meta.json.
     let languages: Vec<String> = {
         let mut set = HashSet::new();
@@ -252,6 +262,15 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
     for rel in &on_disk {
         let abs = repo_root.join(rel);
         let _ = reindex_file(&conn, &abs, repo_root, &contract_opts);
+    }
+
+    // Refresh the history window after the file loop (TASK-096). Best-effort:
+    // Failed already warned inside refresh; Skipped/Unchanged stay silent
+    // (PRD-HIST-REQ-007/008).
+    if config.history.enabled
+        && let Err(e) = crate::history::refresh(&conn, repo_root, config.history.window)
+    {
+        eprintln!("wonk: history refresh failed: {e:#}");
     }
 
     // Collect languages and rewrite meta.json.
@@ -1659,7 +1678,11 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM reach;
          DELETE FROM reach_truncated;
          DELETE FROM reach_meta;
-         DELETE FROM files;",
+         DELETE FROM files;
+         DELETE FROM file_churn;
+         DELETE FROM commit_files;
+         DELETE FROM mined_commits;
+         DELETE FROM history_meta;",
     )
     .context("clearing index data")?;
     Ok(())
@@ -1829,6 +1852,179 @@ class Component {
 
         let meta = db::read_meta(&db::local_index_path(dir.path())).unwrap();
         assert!(meta.workspaces.is_empty());
+    }
+
+    // -- history mining (TASK-096) ---------------------------------------------
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// A real git repo with one dated commit per `(file, ts)` pair.
+    fn make_git_history_repo(commits: &[(&str, i64)]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?} failed");
+        }
+        for (i, (file, ts)) in commits.iter().enumerate() {
+            if let Some(parent) = Path::new(file).parent() {
+                fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            fs::write(root.join(file), format!("fn f{i}() {{}}\n")).unwrap();
+            let date = format!("@{ts} +0000");
+            for args in [vec!["add", "."], vec!["commit", "-m", &format!("c{i}")]] {
+                let ok = std::process::Command::new("git")
+                    .args(&args)
+                    .env("GIT_AUTHOR_DATE", &date)
+                    .env("GIT_COMMITTER_DATE", &date)
+                    .current_dir(root)
+                    .output()
+                    .unwrap();
+                assert!(ok.status.success(), "git {args:?} failed");
+            }
+        }
+        dir
+    }
+
+    fn history_counts(conn: &rusqlite::Connection) -> (i64, i64) {
+        let commits: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mined_commits", [], |r| r.get(0))
+            .unwrap();
+        let churn: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_churn", [], |r| r.get(0))
+            .unwrap();
+        (commits, churn)
+    }
+
+    #[test]
+    fn build_index_mines_history_in_git_repo() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100), ("src/b.rs", 200)]);
+        build_index(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+
+        let (commits, churn) = history_counts(&conn);
+        assert_eq!(commits, 2, "every repo commit is mined (window 500)");
+        assert_eq!(churn, 2, "each touched file has a churn row");
+        let head: String = conn
+            .query_row(
+                "SELECT value FROM history_meta WHERE key = 'mined_head'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(head.len(), 40, "mined_head is a full sha");
+    }
+
+    #[test]
+    fn build_index_without_git_behaves_as_today() {
+        if !git_available() {
+            return;
+        }
+        // No .git at all: the build succeeds, indexes as before, and the
+        // history tables exist but stay empty (AC-3).
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "fn a() {}\n").unwrap();
+
+        let stats = build_index(dir.path(), true).unwrap();
+        assert_eq!(stats.file_count, 1, "indexing is unaffected");
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        assert_eq!(history_counts(&conn), (0, 0));
+    }
+
+    #[test]
+    fn build_index_history_disabled_leaves_tables_empty() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100)]);
+        write_reach_config(dir.path(), "[history]\nenabled = false\n");
+        build_index(dir.path(), true).unwrap();
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        assert_eq!(history_counts(&conn), (0, 0));
+    }
+
+    #[test]
+    fn build_index_on_fake_git_dir_warns_and_indexes() {
+        if !git_available() {
+            return;
+        }
+        // make_test_repo's .git is an empty directory, not a repository:
+        // mining fails, warns, and the build still succeeds (REQ-008).
+        let dir = make_test_repo();
+        let stats = build_index(dir.path(), true).unwrap();
+        assert!(stats.file_count > 0, "build survives a failing mine");
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        assert_eq!(history_counts(&conn), (0, 0));
+    }
+
+    #[test]
+    fn rebuild_index_keeps_exactly_one_window() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[
+            ("src/a.rs", 100),
+            ("src/b.rs", 200),
+            ("src/c.rs", 300),
+            ("src/d.rs", 400),
+        ]);
+        write_reach_config(dir.path(), "[history]\nwindow = 2\n");
+        rebuild_index(dir.path(), true).unwrap();
+
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let (commits, churn) = history_counts(&conn);
+        assert_eq!(commits, 2, "a rebuild retains exactly one window");
+        assert_eq!(churn, 2, "only the newest two commits' files remain");
+    }
+
+    #[test]
+    fn incremental_update_refreshes_history_after_new_commit() {
+        if !git_available() {
+            return;
+        }
+        let dir = make_git_history_repo(&[("src/a.rs", 100)]);
+        build_index(dir.path(), true).unwrap();
+
+        let date = "@200 +0000";
+        fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+        // Scope the add: `git add .` would swallow the .wonk index db the
+        // build just created inside the repo.
+        for args in [vec!["add", "src"], vec!["commit", "-m", "new"]] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(ok.status.success());
+        }
+
+        incremental_update(dir.path(), true).unwrap();
+        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
+        let (commits, churn) = history_counts(&conn);
+        assert_eq!(commits, 2, "the new commit is folded in");
+        assert_eq!(churn, 2, "both files carry churn scores");
     }
 
     #[test]
