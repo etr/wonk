@@ -83,6 +83,7 @@ fn pipeline_groups(
         &RankSettings {
             use_pipeline: true,
             weights: WeightTable::kind_dominant(),
+            ..Default::default()
         },
     )
 }
@@ -142,6 +143,7 @@ fn kind_only_pipeline_matches_legacy_over_corpus() {
     let settings = RankSettings {
         use_pipeline: true,
         weights: WeightTable::kind_dominant(),
+        ..Default::default()
     };
     for &query in QUERIES {
         let found = candidates(root, query);
@@ -169,6 +171,7 @@ fn kind_weight_scaling_does_not_change_ordering() {
                     weight,
                 )]))
                 .unwrap(),
+                ..Default::default()
             };
             assert_equivalent(&found, Some(&conn), query, &settings);
             assert_equivalent(&found, None, query, &settings);
@@ -227,6 +230,7 @@ fn hand_built_matrix_matches_legacy_including_dedup() {
     let settings = RankSettings {
         use_pipeline: true,
         weights: WeightTable::kind_dominant(),
+        ..Default::default()
     };
     assert_equivalent(&found, Some(&conn), "my_func", &settings);
     assert_equivalent(&found, None, "my_func", &settings);
@@ -304,6 +308,7 @@ fn default_config_gates_to_legacy_ordering() {
     let settings = RankSettings {
         use_pipeline: config.rank.enabled,
         weights: WeightTable::from_config(&config.rank.weights).unwrap(),
+        ..Default::default()
     };
 
     let (dir, conn) = setup_indexed_corpus();

@@ -262,6 +262,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         let settings = crate::rerank::RankSettings {
                             use_pipeline: config.rank.enabled || args.why,
                             weights,
+                            sources: crate::rerank::ContextSources {
+                                bm25: crate::bm25::Bm25Params::from(&config.search),
+                                embedding: config.embedding.provider,
+                            },
                         };
                         let groups = crate::rerank::rank_and_explain(
                             &results,
