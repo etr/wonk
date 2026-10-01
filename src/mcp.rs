@@ -1631,6 +1631,10 @@ impl McpServer {
             &crate::rerank::RankSettings {
                 use_pipeline: config.rank.enabled,
                 weights,
+                sources: crate::rerank::ContextSources {
+                    bm25: crate::bm25::Bm25Params::from(&config.search),
+                    embedding: config.embedding.provider,
+                },
             },
         );
 

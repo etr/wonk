@@ -36,6 +36,8 @@ pub struct ContextReqs {
     pub(crate) query_terms: bool,
     pub(crate) path_class: bool,
     pub(crate) symbol_hits: bool,
+    pub(crate) lexical_scores: bool,
+    pub(crate) embeddings: bool,
 }
 
 impl ContextReqs {
@@ -62,11 +64,25 @@ impl ContextReqs {
         self
     }
 
+    /// Require per-file BM25 scores normalized against the candidate set.
+    pub fn with_lexical_scores(mut self) -> Self {
+        self.lexical_scores = true;
+        self
+    }
+
+    /// Require the query and candidate embedding vectors.
+    pub fn with_embeddings(mut self) -> Self {
+        self.embeddings = true;
+        self
+    }
+
     fn union(self, other: Self) -> Self {
         Self {
             query_terms: self.query_terms || other.query_terms,
             path_class: self.path_class || other.path_class,
             symbol_hits: self.symbol_hits || other.symbol_hits,
+            lexical_scores: self.lexical_scores || other.lexical_scores,
+            embeddings: self.embeddings || other.embeddings,
         }
     }
 }
@@ -94,12 +110,53 @@ pub struct SymbolHit {
     pub caller_count: u32,
 }
 
+/// Per-file BM25 scores for the candidate set, with the set-level bounds
+/// folded once at preparation time so the lexical signal is O(1) per
+/// candidate.
+#[derive(Debug, Default, Clone)]
+pub struct LexicalContext {
+    pub(crate) scores: HashMap<String, f32>,
+    pub(crate) min: f32,
+    pub(crate) max: f32,
+}
+
+/// Embedding vectors for the query and the candidate positions.
+#[derive(Debug, Default, Clone)]
+pub struct EmbeddingContext {
+    pub(crate) query: Option<Vec<f32>>,
+    pub(crate) vectors: HashMap<(String, u64), Vec<f32>>,
+}
+
+/// The query sources the pipeline prepares context against: the BM25
+/// constants and the embedding provider kind from the loaded configuration.
+/// Carrying them in one struct keeps `rank_and_explain`'s signature stable
+/// while signals read whatever the user configured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextSources {
+    /// BM25 constants (`[search] bm25_k1` / `bm25_b`).
+    pub bm25: crate::bm25::Bm25Params,
+    /// The configured embedding provider for the semantic signal.
+    pub embedding: crate::embedding::EmbeddingProviderKind,
+}
+
+impl Default for ContextSources {
+    fn default() -> Self {
+        Self {
+            bm25: crate::bm25::Bm25Params::from(&crate::config::SearchConfig::default()),
+            embedding: crate::embedding::EmbeddingProviderKind::Bundled,
+        }
+    }
+}
+
 /// Context prepared once per candidate set and shared by all signals.
 #[derive(Debug, Default, Clone)]
 pub struct SharedContext {
     pub(crate) terms: Vec<String>,
     pub(crate) path_class: HashMap<String, PathClass>,
     pub(crate) symbol_hits: HashMap<(String, u64), SymbolHit>,
+    pub(crate) lexical: LexicalContext,
+    pub(crate) max_caller_count: u32,
+    pub(crate) embeddings: EmbeddingContext,
 }
 
 impl SharedContext {
@@ -116,6 +173,40 @@ impl SharedContext {
     /// Symbol hit at a candidate position (None unless requested).
     pub fn symbol_hit(&self, file: &str, line: u64) -> Option<&SymbolHit> {
         self.symbol_hits.get(&(file.to_string(), line))
+    }
+
+    /// Raw BM25 score for a candidate file (None unless lexical scores were
+    /// requested and the index could produce them).
+    pub fn lexical_score(&self, file: &str) -> Option<f32> {
+        self.lexical.scores.get(file).copied()
+    }
+
+    /// `(min, max)` of the lexical scores across the candidate set; None
+    /// when no scores were prepared.
+    pub fn lexical_bounds(&self) -> Option<(f32, f32)> {
+        if self.lexical.scores.is_empty() {
+            None
+        } else {
+            Some((self.lexical.min, self.lexical.max))
+        }
+    }
+
+    /// Largest caller count among the prepared symbol hits; 0 when none.
+    pub fn max_caller_count(&self) -> u32 {
+        self.max_caller_count
+    }
+
+    /// The embedded query vector, when semantic context was prepared.
+    pub fn query_embedding(&self) -> Option<&[f32]> {
+        self.embeddings.query.as_deref()
+    }
+
+    /// Candidate vector at a position (None unless prepared).
+    pub fn embedding_at(&self, file: &str, line: u64) -> Option<&[f32]> {
+        self.embeddings
+            .vectors
+            .get(&(file.to_string(), line))
+            .map(|v| v.as_slice())
     }
 }
 
@@ -215,11 +306,242 @@ pub fn kind_value(category: ResultCategory) -> f32 {
     }
 }
 
+/// Min-max normalize `score` against the set bounds `[min, max]`.
+///
+/// A degenerate range (`max <= min` — an all-equal or all-zero set) yields
+/// 0.0 for every member: with no contrast in the set there is no signal to
+/// add. Out-of-range inputs clamp to `[0, 1]`; non-finite scores, bounds,
+/// or results normalize to 0.0 rather than propagating NaN.
+pub fn min_max_normalize(score: f32, min: f32, max: f32) -> f32 {
+    if !score.is_finite() {
+        return 0.0;
+    }
+    let range = max - min;
+    if !range.is_finite() || range <= 0.0 {
+        return 0.0;
+    }
+    let normalized = (score - min) / range;
+    if normalized.is_finite() {
+        normalized.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// The lexical signal (TASK-093, PRD-RANK-REQ-001): the candidate file's
+/// BM25 score over the tokenized query, min-max normalized across the
+/// candidate set to maximize in-set contrast.
+///
+/// Line results inherit their file's score (the `rerank_lexical`
+/// semantics), so two hits in one file always tie on this signal. A set
+/// with no score contrast, a missing index, or a gated-off preparation all
+/// contribute exactly 0.0.
+pub(crate) struct LexicalSignal;
+
+impl Signal for LexicalSignal {
+    fn name(&self) -> &'static str {
+        "lexical"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_lexical_scores()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        let (Some(score), Some((min, max))) = (ctx.lexical_score(&file), ctx.lexical_bounds())
+        else {
+            return 0.0;
+        };
+        min_max_normalize(score, min, max)
+    }
+}
+
+/// Log-damped caller-count centrality (TASK-093, PRD-RANK-REQ-012):
+/// `ln(1 + caller_count) / ln(1 + set_max)`.
+///
+/// The logarithm is the hub-dominance damper: 5 callers against a 500-caller
+/// hub retain ~0.288 of the range where a linear ratio would crush them to
+/// 0.010. An all-zero set has no denominator and scores 0.
+pub fn centrality_value(caller_count: u32, set_max: u32) -> f32 {
+    if set_max == 0 {
+        return 0.0;
+    }
+    (1.0 + caller_count as f32).ln() / (1.0 + set_max as f32).ln()
+}
+
+/// The structural-centrality signal: how many distinct indexed callers
+/// reference the symbol defined at the candidate position, log-damped
+/// against the set maximum.
+///
+/// Candidates without a symbol hit (call sites, comments) are genuinely
+/// un-called and contribute exactly 0 — a floor, never a penalty. Note the
+/// TASK-092 seam: caller counts are keyed by symbol NAME, so same-named
+/// symbols share a centrality.
+pub(crate) struct CentralitySignal;
+
+impl Signal for CentralitySignal {
+    fn name(&self) -> &'static str {
+        "centrality"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_symbol_hits()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        let Some(hit) = ctx.symbol_hit(&file, candidate.result.line) else {
+            return 0.0;
+        };
+        centrality_value(hit.caller_count, ctx.max_caller_count())
+    }
+}
+
+/// Whether `term` occurs in `line` as a MAXIMAL identifier run
+/// (`[A-Za-z0-9_]+` bounded by non-identifier characters),
+/// case-insensitively.
+///
+/// A dedicated scanner rather than `tokenizer::tokenize`: the tokenizer
+/// splits on `_`, so it would token-match `foo` inside `foo_bar` — here the
+/// boundary is the point, because a query term appearing inside a longer
+/// identifier names a different symbol. Terms containing non-ASCII
+/// characters can never match (code identifiers are ASCII runs).
+pub fn contains_identifier_token(line: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|run| run.eq_ignore_ascii_case(term))
+}
+
+/// Prominence tier constants (TASK-093, PRD-RANK-REQ-015).
+pub const PROMINENCE_EXACT: f32 = 1.0;
+/// A query term mentioned as a whole identifier in the matched line.
+pub const PROMINENCE_TOKEN: f32 = 0.5;
+
+/// The prominence signal: does this candidate DEFINE (or merely mention,
+/// or merely contain) the queried name?
+///
+/// Tiers, best one wins: 1.0 exact definition — the symbol indexed at this
+/// position has a name equal to a query term or to the trimmed raw pattern
+/// (the raw pattern is required because tokenization splits `my_func` into
+/// `[my, func]`, neither of which equals the indexed name); 0.5 token
+/// mention — some term occurs in the matched line as a maximal identifier
+/// run; 0.0 incidental — substring only, which grep already guarantees.
+/// No query terms means no tiers: exactly 0.
+pub(crate) struct ProminenceSignal;
+
+impl Signal for ProminenceSignal {
+    fn name(&self) -> &'static str {
+        "prominence"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_query_terms().with_symbol_hits()
+    }
+
+    fn contribution(
+        &self,
+        query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let terms = ctx.terms();
+        if terms.is_empty() {
+            return 0.0;
+        }
+        let file = candidate.result.file.to_string_lossy();
+        if let Some(hit) = ctx.symbol_hit(&file, candidate.result.line) {
+            let raw = query.pattern.trim();
+            let name_matches_term = terms
+                .iter()
+                .any(|term| term.eq_ignore_ascii_case(&hit.name));
+            let name_matches_pattern = !raw.is_empty() && hit.name.eq_ignore_ascii_case(raw);
+            if name_matches_term || name_matches_pattern {
+                return PROMINENCE_EXACT;
+            }
+        }
+        if terms
+            .iter()
+            .any(|term| contains_identifier_token(&candidate.result.content, term))
+        {
+            return PROMINENCE_TOKEN;
+        }
+        0.0
+    }
+}
+
+/// Absolute cosine-to-contribution mapping (TASK-093):
+/// `clamp01((cosine + 1) * 0.5)`.
+///
+/// Deliberately NOT set-relative: an absent embedding must stay strictly
+/// below every present candidate, and min-max normalization would tie the
+/// absent candidates with the worst present one — inverting the
+/// zero-not-penalty contract. Non-finite input maps to 0.
+pub fn semantic_value(cosine: f32) -> f32 {
+    if !cosine.is_finite() {
+        return 0.0;
+    }
+    ((cosine + 1.0) * 0.5).clamp(0.0, 1.0)
+}
+
+/// The semantic signal (PRD-RANK-REQ-001): cosine similarity between the
+/// query embedding and the candidate's indexed embedding, both
+/// L2-normalized, mapped absolutely per [`semantic_value`].
+///
+/// A missing query embedding or a candidate without a vector contributes
+/// exactly 0.0 — zero, not a penalty — so a candidate the signal knows
+/// nothing about is never demoted below its other signals' score.
+pub(crate) struct SemanticSignal;
+
+impl Signal for SemanticSignal {
+    fn name(&self) -> &'static str {
+        "semantic"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_embeddings()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let Some(query) = ctx.query_embedding() else {
+            return 0.0;
+        };
+        let file = candidate.result.file.to_string_lossy();
+        let Some(vector) = ctx.embedding_at(&file, candidate.result.line) else {
+            return 0.0;
+        };
+        semantic_value(crate::semantic::dot_product(query, vector))
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
 pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
-    vec![Box::new(KindSignal)]
+    vec![
+        Box::new(KindSignal),
+        Box::new(LexicalSignal),
+        Box::new(SemanticSignal),
+        Box::new(CentralitySignal),
+        Box::new(ProminenceSignal),
+    ]
 }
 
 /// Valid signal names, derived from the registry (single source of truth).
@@ -311,6 +633,7 @@ pub fn prepare_context(
     pattern: &str,
     results: &[ClassifiedResult],
     conn: Option<&Connection>,
+    sources: &ContextSources,
 ) -> SharedContext {
     let mut ctx = SharedContext::default();
     if reqs.query_terms {
@@ -331,6 +654,73 @@ pub fn prepare_context(
         && let Some(conn) = conn
     {
         ctx.symbol_hits = load_symbol_hits(conn, results);
+        ctx.max_caller_count = ctx
+            .symbol_hits
+            .values()
+            .map(|hit| hit.caller_count)
+            .max()
+            .unwrap_or(0);
+    }
+    if reqs.lexical_scores
+        && let Some(conn) = conn
+    {
+        let files: std::collections::HashSet<String> = results
+            .iter()
+            .map(|r| r.result.file.to_string_lossy().into_owned())
+            .collect();
+        if let Some(scores) = crate::bm25::file_bm25_scores(conn, &files, pattern, sources.bm25)
+            && !scores.is_empty()
+        {
+            let min = scores.values().copied().fold(f32::INFINITY, f32::min);
+            let max = scores.values().copied().fold(f32::NEG_INFINITY, f32::max);
+            ctx.lexical = LexicalContext { scores, min, max };
+        }
+    }
+    if reqs.embeddings
+        && let Some(conn) = conn
+    {
+        ctx.embeddings = prepare_embeddings(conn, pattern, results, sources.embedding);
+    }
+    ctx
+}
+
+/// Prepare the semantic context: candidate vectors first, then the query
+/// embedding, exactly once (TASK-093).
+///
+/// Every failure is a zero-path, never an error — a supplementary signal
+/// must not be able to fail a search whose other sources are healthy: a
+/// provider plan error (foreign vector space) yields an empty context; no
+/// candidate vectors skips the query embed entirely; an embed failure or a
+/// corrupt row yields an empty context. Fallback warnings from the plan
+/// are swallowed here (the primary semantic path already warns); tracked
+/// for TASK-095.
+fn prepare_embeddings(
+    conn: &Connection,
+    pattern: &str,
+    results: &[ClassifiedResult],
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> EmbeddingContext {
+    let mut ctx = EmbeddingContext::default();
+    let Ok(plan) = crate::embedding::plan_query_provider(conn, configured) else {
+        return ctx;
+    };
+    let provider = plan.provider;
+    let positions: std::collections::HashSet<(String, u64)> = results
+        .iter()
+        .map(|r| (r.result.file.to_string_lossy().into_owned(), r.result.line))
+        .collect();
+    let Ok(vectors) =
+        crate::embedding::load_embedding_vectors_at_positions(conn, &positions, provider.as_ref())
+    else {
+        return ctx;
+    };
+    if vectors.is_empty() {
+        return ctx;
+    }
+    if let Ok(mut query) = provider.embed_single(pattern) {
+        crate::embedding::normalize(&mut query);
+        ctx.query = Some(query);
+        ctx.vectors = vectors;
     }
     ctx
 }
@@ -424,8 +814,9 @@ pub fn rerank(
     query: &QueryInfo<'_>,
     conn: Option<&Connection>,
     weights: &WeightTable,
+    sources: &ContextSources,
 ) -> Vec<ScoredResult> {
-    rerank_with_signals(builtin_signals(), results, query, conn, weights)
+    rerank_with_signals(builtin_signals(), results, query, conn, weights, sources)
 }
 
 /// `rerank` over an explicit signal list (the test seam for spy signals).
@@ -435,13 +826,14 @@ pub(crate) fn rerank_with_signals(
     query: &QueryInfo<'_>,
     conn: Option<&Connection>,
     weights: &WeightTable,
+    sources: &ContextSources,
 ) -> Vec<ScoredResult> {
     let active: Vec<&Box<dyn Signal>> = signals
         .iter()
         .filter(|s| weights.weight(s.name()) != 0.0)
         .collect();
     let reqs = union_reqs(&signals, weights);
-    let ctx = prepare_context(reqs, query.pattern, &results, conn);
+    let ctx = prepare_context(reqs, query.pattern, &results, conn, sources);
 
     let mut scored: Vec<ScoredResult> = results
         .into_iter()
@@ -490,6 +882,9 @@ pub struct RankSettings {
     pub use_pipeline: bool,
     /// Signal weights for the pipeline path.
     pub weights: WeightTable,
+    /// Query sources for shared-context preparation (BM25 constants and the
+    /// embedding provider kind).
+    pub sources: ContextSources,
 }
 
 impl Default for RankSettings {
@@ -497,6 +892,7 @@ impl Default for RankSettings {
         Self {
             use_pipeline: false,
             weights: WeightTable::kind_dominant(),
+            sources: ContextSources::default(),
         }
     }
 }
@@ -515,7 +911,13 @@ pub fn rank_and_explain(
 ) -> Vec<(ResultCategory, Vec<ScoredResult>)> {
     let classified = crate::ranker::classify_results(results, conn);
     let ranked = if settings.use_pipeline {
-        let scored = rerank(classified, &QueryInfo { pattern }, conn, &settings.weights);
+        let scored = rerank(
+            classified,
+            &QueryInfo { pattern },
+            conn,
+            &settings.weights,
+            &settings.sources,
+        );
         // Score order interleaves categories under any non-kind-only
         // weight table (group_by_category groups by adjacency); bucket
         // into tier order first so every category is emitted exactly
@@ -575,11 +977,52 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_kind_and_names_derive_from_it() {
+    fn registry_contains_five_signals_in_order() {
         let registry = builtin_signals();
-        assert_eq!(registry.len(), 1);
-        assert_eq!(registry[0].name(), "kind");
-        assert_eq!(known_signal_names(), vec!["kind"]);
+        let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
+        assert_eq!(
+            names,
+            vec!["kind", "lexical", "semantic", "centrality", "prominence"]
+        );
+        assert_eq!(known_signal_names(), names);
+    }
+
+    #[test]
+    fn weight_table_accepts_every_builtin_signal_name() {
+        let mut weights = HashMap::new();
+        for name in known_signal_names() {
+            weights.insert(name.to_string(), 0.5);
+        }
+        let table = WeightTable::from_config(&weights).unwrap();
+        for name in known_signal_names() {
+            assert_eq!(table.weight(name), 0.5, "{name}");
+        }
+    }
+
+    #[test]
+    fn new_signals_zero_weight_never_evaluated() {
+        // Kind-only weights over a fully seeded connection: the union of
+        // requirements collapses to none (no supplementary context SQL),
+        // and the breakdown carries only kind.
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![classified("a.rs", 1, "alpha", ResultCategory::Other)];
+        let weights = table(&[("kind", 1.0)]);
+
+        assert_eq!(
+            union_reqs(&builtin_signals(), &weights),
+            ContextReqs::none()
+        );
+
+        let scored = rerank_with_signals(
+            builtin_signals(),
+            results,
+            &QueryInfo { pattern: "alpha" },
+            Some(&conn),
+            &weights,
+            &ContextSources::default(),
+        );
+        assert_eq!(scored[0].contributions.len(), 1);
+        assert_eq!(scored[0].contributions[0].signal, "kind");
     }
 
     #[test]
@@ -614,15 +1057,15 @@ mod tests {
     #[test]
     fn weight_table_rejects_unknown_name_with_valid_names() {
         let mut weights = HashMap::new();
-        weights.insert("lexical".to_string(), 1.0);
+        weights.insert("nosuch_signal".to_string(), 1.0);
         let err = WeightTable::from_config(&weights).unwrap_err().to_string();
         assert!(
-            err.contains("unknown signal name 'lexical'"),
+            err.contains("unknown signal name 'nosuch_signal'"),
             "error names the offender: {err}"
         );
         assert!(
-            err.contains("known: kind"),
-            "error lists the valid names: {err}"
+            err.contains("known: kind, lexical, semantic, centrality, prominence"),
+            "error lists every valid name: {err}"
         );
     }
 
@@ -745,7 +1188,14 @@ mod tests {
         let query = QueryInfo { pattern: "x" };
         let weights = table(&[("alpha", 2.0), ("beta", -1.0)]);
 
-        let scored = rerank_with_signals(signals, results, &query, None, &weights);
+        let scored = rerank_with_signals(
+            signals,
+            results,
+            &query,
+            None,
+            &weights,
+            &ContextSources::default(),
+        );
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].score, 0.5 * 2.0 - 0.25);
         // Breakdown in registry order with UNWEIGHTED values retained.
@@ -782,7 +1232,14 @@ mod tests {
         let query = QueryInfo { pattern: "x" };
         let weights = table(&[("kind", 1.0)]);
 
-        let scored = rerank_with_signals(signals, results, &query, None, &weights);
+        let scored = rerank_with_signals(
+            signals,
+            results,
+            &query,
+            None,
+            &weights,
+            &ContextSources::default(),
+        );
         assert_eq!(count.load(AtomicOrdering::SeqCst), 0);
         // Only the active signal appears in the breakdown.
         assert_eq!(scored[0].contributions.len(), 1);
@@ -820,6 +1277,7 @@ mod tests {
             &QueryInfo { pattern: "foo" },
             None,
             &WeightTable::kind_dominant(),
+            &ContextSources::default(),
         );
 
         let key = |c: &ClassifiedResult| (c.result.file.clone(), c.result.line);
@@ -846,8 +1304,20 @@ mod tests {
         let mut swapped = make();
         swapped.reverse();
         let query = QueryInfo { pattern: "foo" };
-        let a = rerank(make(), &query, None, &WeightTable::kind_dominant());
-        let b = rerank(swapped, &query, None, &WeightTable::kind_dominant());
+        let a = rerank(
+            make(),
+            &query,
+            None,
+            &WeightTable::kind_dominant(),
+            &ContextSources::default(),
+        );
+        let b = rerank(
+            swapped,
+            &query,
+            None,
+            &WeightTable::kind_dominant(),
+            &ContextSources::default(),
+        );
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(&b) {
             assert_eq!(x.classified, y.classified);
@@ -943,7 +1413,13 @@ mod tests {
             ResultCategory::Definition,
         )];
 
-        let ctx = prepare_context(ContextReqs::none(), "my_func", &results, Some(&conn));
+        let ctx = prepare_context(
+            ContextReqs::none(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
 
         // The DB has a matching symbol row; emptiness proves the gate
         // short-circuited before any SQL ran.
@@ -967,6 +1443,7 @@ mod tests {
             "my_func",
             &results,
             Some(&conn),
+            &ContextSources::default(),
         );
 
         let hit = ctx
@@ -993,6 +1470,7 @@ mod tests {
             "my_func",
             &results,
             None,
+            &ContextSources::default(),
         );
         assert!(ctx.symbol_hits.is_empty());
     }
@@ -1004,7 +1482,13 @@ mod tests {
             classified("src/a.rs", 5, "x", ResultCategory::Other),
             classified("tests/b.rs", 1, "x", ResultCategory::Other),
         ];
-        let ctx = prepare_context(ContextReqs::none().with_path_class(), "x", &results, None);
+        let ctx = prepare_context(
+            ContextReqs::none().with_path_class(),
+            "x",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
         assert_eq!(ctx.path_class.len(), 2);
         assert_eq!(ctx.path_class("src/a.rs"), Some(PathClass::Ordinary));
         assert_eq!(ctx.path_class("tests/b.rs"), Some(PathClass::Test));
@@ -1017,6 +1501,7 @@ mod tests {
             "Cache Eviction!",
             &[],
             None,
+            &ContextSources::default(),
         );
         assert_eq!(ctx.terms(), &["cache".to_string(), "eviction".to_string()]);
     }
@@ -1061,6 +1546,7 @@ mod tests {
         let settings = RankSettings {
             use_pipeline: true,
             weights: table(&[("kind", 0.0)]),
+            ..Default::default()
         };
 
         let groups = rank_and_explain(&results, Some(&conn), "my_func", &settings);
@@ -1085,6 +1571,812 @@ mod tests {
         };
         assert_eq!(files(&groups[0].1), vec!["src/a.rs", "src/c.rs"]);
         assert_eq!(files(&groups[1].1), vec!["src/b.rs", "src/d.rs"]);
+    }
+
+    // -------------------------------------------------------------------
+    // TASK-093 context plumbing
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn context_sources_default_matches_search_defaults() {
+        let sources = ContextSources::default();
+        assert_eq!(
+            sources.bm25,
+            crate::bm25::Bm25Params::from(&crate::config::SearchConfig::default())
+        );
+        assert_eq!(
+            sources.embedding,
+            crate::embedding::EmbeddingProviderKind::Bundled
+        );
+    }
+
+    /// Seed term_stats/files rows so `file_bm25_scores` returns real values:
+    /// a.rs carries tf 5 for "alpha", b.rs tf 1, both 100 lines.
+    fn lexical_seeded_conn() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = seeded_conn();
+        for path in ["a.rs", "b.rs"] {
+            conn.execute(
+                "INSERT INTO files (path, language, hash, last_indexed, line_count) \
+                 VALUES (?1, 'rust', 'h', 0, 100)",
+                rusqlite::params![path],
+            )
+            .unwrap();
+        }
+        for (file, tf) in [("a.rs", 5), ("b.rs", 1)] {
+            conn.execute(
+                "INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["alpha", file, tf],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    #[test]
+    fn prepare_context_lexical_gated_off_leaves_scores_empty() {
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![classified("a.rs", 1, "alpha", ResultCategory::Other)];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_hits(),
+            "alpha",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(ctx.lexical_score("a.rs"), None);
+        assert_eq!(ctx.lexical_bounds(), None);
+    }
+
+    #[test]
+    fn prepare_context_lexical_scores_and_bounds_folded_once() {
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![
+            classified("a.rs", 1, "alpha", ResultCategory::Other),
+            classified("b.rs", 1, "alpha", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_lexical_scores(),
+            "alpha",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let (min, max) = ctx.lexical_bounds().expect("bounds folded with the scores");
+        let score_a = ctx.lexical_score("a.rs").expect("a.rs scored");
+        let score_b = ctx.lexical_score("b.rs").expect("b.rs scored");
+        assert!(
+            score_a > score_b,
+            "tf 5 must beat tf 1: {score_a} vs {score_b}"
+        );
+        assert_eq!(min, score_b);
+        assert_eq!(max, score_a);
+    }
+
+    // -------------------------------------------------------------------
+    // LexicalSignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn min_max_normalize_exact_and_clamped() {
+        assert!((min_max_normalize(0.5, 0.0, 1.0) - 0.5).abs() < 1e-6);
+        assert_eq!(min_max_normalize(0.0, 0.0, 1.0), 0.0);
+        assert_eq!(min_max_normalize(1.0, 0.0, 1.0), 1.0);
+        // Out-of-range inputs clamp instead of amplifying.
+        assert_eq!(min_max_normalize(-1.0, 0.0, 1.0), 0.0);
+        assert_eq!(min_max_normalize(2.0, 0.0, 1.0), 1.0);
+        assert_eq!(min_max_normalize(3.0, 1.0, 2.0), 1.0);
+    }
+
+    #[test]
+    fn min_max_normalize_degenerate_range_and_nan_are_zero() {
+        // An all-equal set (max == min) has no contrast: everyone gets 0.
+        assert_eq!(min_max_normalize(3.0, 3.0, 3.0), 0.0);
+        // An inverted range (max < min) is degenerate, not an error.
+        assert_eq!(min_max_normalize(0.0, 2.0, 1.0), 0.0);
+        // NaN and non-finite bounds normalize to 0, never propagate.
+        assert_eq!(min_max_normalize(f32::NAN, 0.0, 1.0), 0.0);
+        assert_eq!(
+            min_max_normalize(0.5, f32::NEG_INFINITY, f32::INFINITY),
+            0.0
+        );
+    }
+
+    #[test]
+    fn lexical_signal_inherits_file_score_and_set_normalizes() {
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![
+            classified("a.rs", 1, "alpha", ResultCategory::Other),
+            classified("a.rs", 7, "alpha", ResultCategory::Other),
+            classified("b.rs", 3, "alpha", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_lexical_scores(),
+            "alpha",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = LexicalSignal;
+        assert_eq!(signal.name(), "lexical");
+        assert_eq!(signal.requires(), ContextReqs::none().with_lexical_scores());
+        let query = QueryInfo { pattern: "alpha" };
+        // a.rs holds the set max (tf 5), b.rs the min (tf 1); lines in the
+        // same file share the file's score.
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 1.0);
+        assert_eq!(signal.contribution(&query, &results[2], &ctx), 0.0);
+    }
+
+    #[test]
+    fn lexical_signal_zero_when_context_missing() {
+        // No term_stats rows in seeded_conn: scoring is unavailable and the
+        // signal contributes exactly zero rather than erroring.
+        let (_dir, conn) = seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+        let ctx = prepare_context(
+            ContextReqs::none().with_lexical_scores(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        let signal = LexicalSignal;
+        let query = QueryInfo { pattern: "my_func" };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 0.0);
+
+        // Gated-off preparation leaves the same zero contribution.
+        let gated = prepare_context(
+            ContextReqs::none(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        assert_eq!(signal.contribution(&query, &results[0], &gated), 0.0);
+    }
+
+    #[test]
+    fn lexical_signal_zero_when_set_is_uniform() {
+        let (_dir, conn) = lexical_seeded_conn();
+        // Same tf for both files: the raw scores tie, the range is zero, and
+        // every member contributes 0 (no contrast to amplify).
+        conn.execute("UPDATE term_stats SET tf = 3", []).unwrap();
+        let results = vec![
+            classified("a.rs", 1, "alpha", ResultCategory::Other),
+            classified("b.rs", 1, "alpha", ResultCategory::Other),
+        ];
+        let ctx = prepare_context(
+            ContextReqs::none().with_lexical_scores(),
+            "alpha",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        let signal = LexicalSignal;
+        let query = QueryInfo { pattern: "alpha" };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 0.0);
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
+    }
+
+    #[test]
+    fn prepare_context_default_reqs_leaves_new_slices_empty() {
+        let (_dir, conn) = lexical_seeded_conn();
+        let results = vec![classified("a.rs", 1, "alpha", ResultCategory::Other)];
+
+        let ctx = prepare_context(
+            ContextReqs::none(),
+            "alpha",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(ctx.lexical_bounds(), None);
+        assert_eq!(ctx.max_caller_count(), 0);
+        assert!(ctx.query_embedding().is_none());
+        assert!(ctx.embedding_at("a.rs", 1).is_none());
+    }
+
+    #[test]
+    fn prepare_context_folds_max_caller_count_once() {
+        let (_dir, conn) = seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_hits(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(ctx.max_caller_count(), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // CentralitySignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn centrality_value_exact_log_formula() {
+        let expected = (1.0f32 + 5.0).ln() / (1.0f32 + 500.0).ln();
+        assert!((centrality_value(5, 500) - expected).abs() < 1e-4);
+        // The hub itself saturates at exactly 1.0.
+        assert_eq!(centrality_value(500, 500), 1.0);
+        assert_eq!(centrality_value(2, 2), 1.0);
+    }
+
+    #[test]
+    fn centrality_value_zero_floor_and_all_zero_set() {
+        // No callers: a floor, not a penalty.
+        assert_eq!(centrality_value(0, 500), 0.0);
+        // An all-zero set has no denominator: everything is 0.
+        assert_eq!(centrality_value(0, 0), 0.0);
+        assert_eq!(centrality_value(3, 0), 0.0);
+    }
+
+    #[test]
+    fn centrality_value_monotone_and_log_damped() {
+        let mut prev = centrality_value(0, 500);
+        for count in [1u32, 5, 20, 100, 500] {
+            let value = centrality_value(count, 500);
+            assert!(value > prev, "more callers must score higher");
+            prev = value;
+        }
+        // Log damping is the point: 5-of-500 callers retains ~0.288 of the
+        // range where a linear ratio keeps 1% — a mid-tier symbol stays
+        // competitive with the hub instead of being crushed to zero.
+        let log_ratio = centrality_value(5, 500);
+        let linear_ratio = 5.0f32 / 500.0f32;
+        assert!(
+            log_ratio > 0.28,
+            "log ratio must stay substantial: {log_ratio}"
+        );
+        assert!((linear_ratio - 0.01).abs() < 1e-6);
+        assert!(log_ratio > linear_ratio * 20.0);
+    }
+
+    #[test]
+    fn centrality_signal_reads_hit_and_set_max_from_prepared_context() {
+        let (_dir, conn) = seeded_conn();
+        let results = vec![
+            classified(
+                "src/main.rs",
+                10,
+                "fn my_func() {}",
+                ResultCategory::Definition,
+            ),
+            classified("src/main.rs", 11, "my_func();", ResultCategory::CallSite),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_hits(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = CentralitySignal;
+        assert_eq!(signal.name(), "centrality");
+        assert_eq!(signal.requires(), ContextReqs::none().with_symbol_hits());
+        let query = QueryInfo { pattern: "my_func" };
+        // The definition carries caller_count 2, the set max: ln(3)/ln(3).
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        // A candidate with no symbol hit (a call site line) is genuinely
+        // un-called: exactly 0.
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // ProminenceSignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn contains_identifier_token_matches_maximal_runs_only() {
+        assert!(contains_identifier_token("map(x, y);", "map"));
+        assert!(
+            contains_identifier_token("let MAP = 3;", "map"),
+            "case-folded"
+        );
+        assert!(
+            contains_identifier_token("a map:", "map"),
+            "run ending at :"
+        );
+        assert!(
+            contains_identifier_token("map", "map"),
+            "whole line is the run"
+        );
+        // A term inside a LONGER identifier is a different name entirely.
+        assert!(!contains_identifier_token("my_map_value();", "map"));
+        assert!(!contains_identifier_token("foo_bar", "foo"));
+        assert!(!contains_identifier_token("foo_bar", "bar"));
+        assert!(!contains_identifier_token("remapped!", "map"));
+        assert!(!contains_identifier_token("", "map"));
+        assert!(!contains_identifier_token("anything", ""));
+    }
+
+    #[test]
+    fn prominence_signal_three_tiers() {
+        // gamma defined at src/def.rs:5 (hit name "gamma"), called at
+        // src/call.rs:9 (no hit), mentioned incidentally at src/note.rs:2
+        // (substring only).
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["gamma", "function", "src/def.rs", 5, 0, "rust"],
+        )
+        .unwrap();
+        let results = vec![
+            classified("src/def.rs", 5, "fn gamma() {}", ResultCategory::Definition),
+            classified("src/call.rs", 9, "gamma(3);", ResultCategory::CallSite),
+            classified(
+                "src/note.rs",
+                2,
+                "// see gamma_helper",
+                ResultCategory::Comment,
+            ),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms().with_symbol_hits(),
+            "gamma",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = ProminenceSignal;
+        assert_eq!(signal.name(), "prominence");
+        assert_eq!(
+            signal.requires(),
+            ContextReqs::none().with_query_terms().with_symbol_hits()
+        );
+        let query = QueryInfo { pattern: "gamma" };
+        // Tier 1: the hit's name equals the query term.
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        // Tier 2: the term appears as a maximal identifier run.
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.5);
+        // Tier 0: substring-only inside a longer identifier.
+        assert_eq!(signal.contribution(&query, &results[2], &ctx), 0.0);
+    }
+
+    #[test]
+    fn prominence_signal_multi_term_takes_best_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["map", "function", "src/m.rs", 1, 0, "rust"],
+        )
+        .unwrap();
+        let results = vec![
+            classified("src/m.rs", 1, "pub fn map()", ResultCategory::Definition),
+            classified("src/f.rs", 1, "foo = 1;", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms().with_symbol_hits(),
+            "map foo",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = ProminenceSignal;
+        let query = QueryInfo { pattern: "map foo" };
+        // "map" hits tier 1 for the definition even though "foo" only
+        // token-matches elsewhere: the best tier wins.
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.5);
+    }
+
+    #[test]
+    fn prominence_signal_zero_without_terms() {
+        let results = vec![classified(
+            "src/a.rs",
+            1,
+            "fn foo()",
+            ResultCategory::Definition,
+        )];
+        // Punctuation-only pattern: no terms, no tiers.
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms().with_symbol_hits(),
+            ":: - _",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        let signal = ProminenceSignal;
+        let query = QueryInfo { pattern: ":: - _" };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 0.0);
+    }
+
+    #[test]
+    fn prominence_signal_raw_pattern_matches_compound_names() {
+        // Query "my_func" tokenizes to [my, func] — neither equals the
+        // indexed name "my_func", and neither token-matches the maximal run
+        // "my_func". Only the raw-pattern comparison can award tier 1.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["my_func", "function", "src/main.rs", 10, 0, "rust"],
+        )
+        .unwrap();
+        let results = vec![
+            classified(
+                "src/main.rs",
+                10,
+                "fn my_func() {}",
+                ResultCategory::Definition,
+            ),
+            classified("src/call.rs", 3, "my_func();", ResultCategory::CallSite),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms().with_symbol_hits(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = ProminenceSignal;
+        let query = QueryInfo { pattern: "my_func" };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        // The call line's maximal run is the compound "my_func": neither
+        // term matches it, so the mention is incidental.
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // Embedding context preparation (TASK-093)
+    // -------------------------------------------------------------------
+
+    /// A unit vector in the bundled provider's 256-dim space.
+    fn bundled_unit_vector() -> Vec<f32> {
+        let mut vector = vec![0.0f32; 256];
+        vector[0] = 1.0;
+        vector
+    }
+
+    /// `seeded_conn` plus a bundled-space embedding row for `my_func`
+    /// (symbols.id 1 at src/main.rs:10).
+    fn embedding_seeded_conn() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = seeded_conn();
+        let vector = bundled_unit_vector();
+        conn.execute(
+            "INSERT INTO embeddings \
+             (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+             VALUES (1, 'src/main.rs', 'my_func chunk', ?1, 0, 0, 'bundled', 256)",
+            rusqlite::params![bytemuck::cast_slice(&vector)],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn prepare_context_embeddings_populate_query_and_candidate_vectors() {
+        let (_dir, conn) = embedding_seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_embeddings(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let query = ctx.query_embedding().expect("query embedded once");
+        assert_eq!(query.len(), 256, "bundled provider space");
+        let candidate = ctx
+            .embedding_at("src/main.rs", 10)
+            .expect("candidate vector at the symbol position");
+        assert_eq!(candidate.len(), 256);
+        assert_eq!(candidate[0], 1.0);
+        // The stored vector round-trips unit-normalized.
+        let norm: f32 = candidate.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn prepare_context_embeddings_degrade_to_zero_on_foreign_space() {
+        // Only ollama/768 rows exist while the configured provider is
+        // bundled: the plan blocks, and the signal context must come back
+        // empty (zero-path) instead of panicking or erroring.
+        let (_dir, conn) = seeded_conn();
+        let mut vector = vec![0.0f32; 768];
+        vector[0] = 1.0;
+        conn.execute(
+            "INSERT INTO embeddings \
+             (symbol_id, file, chunk_text, vector, stale, created_at, provider, dim)
+             VALUES (1, 'src/main.rs', 'my_func chunk', ?1, 0, 0, 'ollama', 768)",
+            rusqlite::params![bytemuck::cast_slice(&vector)],
+        )
+        .unwrap();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_embeddings(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert!(ctx.query_embedding().is_none());
+        assert!(ctx.embedding_at("src/main.rs", 10).is_none());
+    }
+
+    #[test]
+    fn prepare_context_embeddings_zero_when_no_rows() {
+        // No embeddings anywhere: the loader returns nothing and the query
+        // embed must never run (a successful bundled embed would otherwise
+        // populate the query vector).
+        let (_dir, conn) = seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_embeddings(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert!(ctx.query_embedding().is_none());
+        assert!(ctx.embedding_at("src/main.rs", 10).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // SemanticSignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn semantic_value_maps_cosine_range_absolutely() {
+        assert_eq!(semantic_value(1.0), 1.0, "parallel");
+        assert_eq!(semantic_value(0.0), 0.5, "orthogonal");
+        assert_eq!(semantic_value(-1.0), 0.0, "anti-parallel");
+        assert!((semantic_value(0.6) - 0.8).abs() < 1e-6);
+        // Clamped, never extrapolated.
+        assert_eq!(semantic_value(2.0), 1.0);
+        assert_eq!(semantic_value(-2.0), 0.0);
+        assert_eq!(semantic_value(f32::NAN), 0.0);
+    }
+
+    fn embed_ctx(query: Option<Vec<f32>>, vectors: Vec<(&str, u64, Vec<f32>)>) -> SharedContext {
+        let mut ctx = SharedContext::default();
+        ctx.embeddings.query = query;
+        for (file, line, vector) in vectors {
+            ctx.embeddings
+                .vectors
+                .insert((file.to_string(), line), vector);
+        }
+        ctx
+    }
+
+    #[test]
+    fn semantic_signal_reads_direction_from_prepared_vectors() {
+        let ctx = embed_ctx(
+            Some(vec![1.0, 0.0]),
+            vec![
+                ("src/a.rs", 1, vec![1.0, 0.0]),
+                ("src/b.rs", 1, vec![0.0, 1.0]),
+                ("src/c.rs", 1, vec![-1.0, 0.0]),
+            ],
+        );
+
+        let signal = SemanticSignal;
+        assert_eq!(signal.name(), "semantic");
+        assert_eq!(signal.requires(), ContextReqs::none().with_embeddings());
+        let query = QueryInfo { pattern: "x" };
+        for (file, expected) in [("src/a.rs", 1.0), ("src/b.rs", 0.5), ("src/c.rs", 0.0)] {
+            let candidate = classified(file, 1, "x", ResultCategory::Definition);
+            let value = signal.contribution(&query, &candidate, &ctx);
+            assert!(
+                (value - expected).abs() < 1e-6,
+                "{file}: {value} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_signal_zero_when_query_missing_or_candidate_absent() {
+        let signal = SemanticSignal;
+        let query = QueryInfo { pattern: "x" };
+
+        // Query present, candidate position carries no vector.
+        let ctx = embed_ctx(Some(vec![1.0, 0.0]), vec![("src/a.rs", 1, vec![1.0, 0.0])]);
+        let absent = classified("src/b.rs", 1, "x", ResultCategory::Definition);
+        assert_eq!(signal.contribution(&query, &absent, &ctx), 0.0);
+
+        // Query absent entirely (no embeddable source): still zero, never
+        // an error.
+        let no_query = embed_ctx(None, vec![("src/a.rs", 1, vec![1.0, 0.0])]);
+        let present = classified("src/a.rs", 1, "x", ResultCategory::Definition);
+        assert_eq!(signal.contribution(&query, &present, &no_query), 0.0);
+    }
+
+    #[test]
+    fn semantic_signal_positive_for_embedded_definition() {
+        // Full preparation path: the bundled provider embeds the query
+        // in-process and the stored vector lives in the same space.
+        let (_dir, conn) = embedding_seeded_conn();
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+        let ctx = prepare_context(
+            ContextReqs::none().with_embeddings(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        let signal = SemanticSignal;
+        let query = QueryInfo { pattern: "my_func" };
+        let value = signal.contribution(&query, &results[0], &ctx);
+        assert!(
+            value > 0.0,
+            "same-space similarity must be positive: {value}"
+        );
+    }
+
+    #[test]
+    fn semantic_signal_absence_is_zero_not_penalty() {
+        let (_dir, conn) = embedding_seeded_conn();
+        let results = vec![
+            classified(
+                "src/main.rs",
+                10,
+                "fn my_func() {}",
+                ResultCategory::Definition,
+            ),
+            classified("src/call.rs", 5, "my_func();", ResultCategory::CallSite),
+            classified("src/note.rs", 2, "// my_func", ResultCategory::Comment),
+        ];
+        let query = QueryInfo { pattern: "my_func" };
+
+        let kind_only = rerank_with_signals(
+            vec![Box::new(KindSignal)],
+            results.clone(),
+            &query,
+            Some(&conn),
+            &table(&[("kind", 1.0)]),
+            &ContextSources::default(),
+        );
+        let with_semantic = rerank_with_signals(
+            vec![Box::new(KindSignal), Box::new(SemanticSignal)],
+            results,
+            &query,
+            Some(&conn),
+            &table(&[("kind", 1.0), ("semantic", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        let key = |s: &ScoredResult| {
+            (
+                s.classified.result.file.to_string_lossy().into_owned(),
+                s.classified.result.line,
+            )
+        };
+        let kind_keys: Vec<_> = kind_only.iter().map(key).collect();
+        let semantic_keys: Vec<_> = with_semantic.iter().map(key).collect();
+        // Absent candidates contribute exactly 0, so they cannot be
+        // reordered past each other: the kind order survives intact.
+        assert_eq!(semantic_keys, kind_keys);
+        for scored in &with_semantic {
+            if scored.classified.result.file != std::path::Path::new("src/main.rs") {
+                assert_eq!(
+                    scored.score,
+                    kind_value(scored.classified.category),
+                    "absent candidate must score its kind value exactly"
+                );
+            }
+        }
+        // The one embedded candidate only gained.
+        assert!(with_semantic[0].score > kind_only[0].score);
+    }
+
+    // -------------------------------------------------------------------
+    // Query-cost gate (PRD-RANK action: no additional queries per candidate)
+    // -------------------------------------------------------------------
+
+    static TRACE_STATEMENT_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn trace_stmt(event: rusqlite::trace::TraceEvent<'_>) {
+        // trace_v2 takes a plain fn, so the counter lives in a static; only
+        // the counting test installs a tracer, so there is no cross-talk.
+        // The mask admits only SQLITE_TRACE_STMT, so every event counts.
+        if matches!(event, rusqlite::trace::TraceEvent::Stmt(..)) {
+            TRACE_STATEMENT_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn count_context_statements(conn: &Connection, results: &[ClassifiedResult]) -> usize {
+        TRACE_STATEMENT_COUNT.store(0, AtomicOrdering::SeqCst);
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_stmt),
+        );
+        let reqs = ContextReqs::none()
+            .with_query_terms()
+            .with_path_class()
+            .with_symbol_hits()
+            .with_lexical_scores()
+            .with_embeddings();
+        let _ = prepare_context(
+            reqs,
+            "alpha",
+            results,
+            Some(conn),
+            &ContextSources::default(),
+        );
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+        TRACE_STATEMENT_COUNT.load(AtomicOrdering::SeqCst)
+    }
+
+    #[test]
+    fn prepare_context_statement_count_independent_of_candidate_count() {
+        // Signals take no Connection (structurally impossible to issue
+        // per-candidate SQL); this gate proves it empirically. Accounting
+        // for the one-term query "alpha" over lexical_seeded_conn (no
+        // embedding rows): 8 statements total — 2 symbol-hit lookups
+        // (symbols IN, references GROUP BY) + 4 lexical (presence probe,
+        // corpus stats, 1 postings scan, document lengths) + 2 embedding
+        // (stored vector spaces, position loader; the query embed itself
+        // is in-process and SQL-free). query_terms and path_class touch
+        // no SQL. The count must not move when the candidate set grows.
+        let (_dir, conn) = lexical_seeded_conn();
+        let make = |n: u64| -> Vec<ClassifiedResult> {
+            (0..n)
+                .map(|i| classified("a.rs", i + 1, "alpha", ResultCategory::Other))
+                .collect()
+        };
+
+        let small = count_context_statements(&conn, &make(3));
+        let large = count_context_statements(&conn, &make(30));
+
+        assert_eq!(small, large, "statement count must be O(1) in candidates");
+        assert!(large <= 10, "unexpected statements: {large}");
+        assert_eq!(large, 8, "documented statement accounting (see comment)");
     }
 
     #[test]
@@ -1118,6 +2410,7 @@ mod tests {
             &QueryInfo { pattern: "foo" },
             None,
             &WeightTable::kind_dominant(),
+            &ContextSources::default(),
         );
 
         let deduped = crate::ranker::dedup_reexports(scored, "foo");
