@@ -1032,6 +1032,140 @@ mod tests {
         assert_eq!(CO_CHANGE_TOP_K, 10);
     }
 
+    /// The reformatting-sweep shape: `[a.rs, b.rs]@100` then a commit
+    /// sweeping `a.rs` plus `f000..f499` at 200.
+    fn make_reformat_repo(with_pair_commit: bool) -> (TempDir, Connection) {
+        let mut sweep: Vec<&str> = vec!["a.rs"];
+        let owned: Vec<String> = (0..500).map(|i| format!("f{i:03}.rs")).collect();
+        let mut sweep = sweep;
+        sweep.extend(owned.iter().map(String::as_str));
+        let groups: Vec<(&[&str], i64)> = if with_pair_commit {
+            vec![(&["a.rs", "b.rs"], 100), (&sweep, 200)]
+        } else {
+            vec![(&sweep, 200)]
+        };
+        make_history_repo_groups(&groups)
+    }
+
+    #[test]
+    fn ac2_500_file_reformat_commit_produces_no_coupling() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_reformat_repo(true);
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
+
+        // No swept file is coupled to anything, in either direction.
+        let swept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM co_change \
+                 WHERE file_a LIKE 'f%' OR file_b LIKE 'f%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(swept, 0, "a 500-file sweep must derive no coupling");
+
+        // The pair below it keeps its exact age weight (the ts=100 commit
+        // is the only non-bulk co-occurrence; head 200, span 100 → 0.0).
+        assert_eq!(
+            coupling(&conn, "a.rs", "b.rs"),
+            Some(age_weight(100, 200, 100) as f64)
+        );
+
+        // Exclusion is co-change ONLY: the sweep still feeds churn
+        // (a.rs = 0.0 from ts=100 + 1.0 from the sweep; b.rs = 0.0).
+        assert!((churn_score(&conn, "a.rs").unwrap() - 1.0).abs() < 1e-6);
+        assert_eq!(mined_count(&conn), 2, "the sweep still bounds the window");
+    }
+
+    #[test]
+    fn ac2_reformat_only_repo_stores_no_coupling_rows() {
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_reformat_repo(false);
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM co_change", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "a repo whose only commit is a sweep has no coupling");
+        // The sweep itself was still mined.
+        assert_eq!(mined_count(&conn), 1);
+    }
+
+    #[test]
+    fn bulk_threshold_is_configurable_boundary() {
+        if !git_available() {
+            return;
+        }
+        let four = make_history_repo_groups(&[(&["a.rs", "b.rs", "c.rs", "d.rs"], 100)]);
+        mine_full(
+            &four.1,
+            four.0.path(),
+            &MiningOptions {
+                window: 10,
+                max_commit_files: 3,
+            },
+        )
+        .unwrap();
+        assert!(
+            co_change_rows(&four.1).is_empty(),
+            "4 files > max_commit_files=3: excluded"
+        );
+
+        let three = make_history_repo_groups(&[(&["a.rs", "b.rs", "c.rs"], 100)]);
+        mine_full(
+            &three.1,
+            three.0.path(),
+            &MiningOptions {
+                window: 10,
+                max_commit_files: 3,
+            },
+        )
+        .unwrap();
+        // 3 files == threshold: every ordered pair retained (3*2).
+        assert_eq!(co_change_rows(&three.1).len(), 6);
+        assert!((coupling(&three.1, "a.rs", "b.rs").unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ac3_storage_is_linear_top_k_per_file() {
+        if !git_available() {
+            return;
+        }
+        let owned: Vec<String> = (0..12).map(|i| format!("f{i:02}.rs")).collect();
+        let files: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let (dir, conn) = make_history_repo_groups(&[(&files, 100), (&files, 200)]);
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
+
+        // 12 files x 11 equal-weight partners each: top-K keeps exactly
+        // K per file_a — 120 rows, linear in files, never 12*11.
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM co_change", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 120, "12 files x top-10 = 120 rows exactly");
+
+        // The tie-break (weight equal, file_b ASC) drops each file's
+        // lexicographically-largest partner — deterministic.
+        let per_file: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT file_a, COUNT(*) FROM co_change GROUP BY file_a")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(per_file.len(), 12);
+        assert!(per_file.iter().all(|(_, n)| *n == 10));
+        assert!(coupling(&conn, "f00.rs", "f11.rs").is_none(), "largest dropped");
+        assert!(coupling(&conn, "f11.rs", "f10.rs").is_none(), "largest dropped");
+        assert!(coupling(&conn, "f11.rs", "f09.rs").is_some(), "rest kept");
+        assert!(coupling(&conn, "f05.rs", "f11.rs").is_none(), "largest dropped");
+    }
+
     // -- parse_git_log ---------------------------------------------------------
 
     #[test]
