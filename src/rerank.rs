@@ -286,17 +286,10 @@ pub fn classify_path_character(path: &Path) -> PathClass {
     PathClass::Ordinary
 }
 
-/// Escape a literal for a SQLite `LIKE ... ESCAPE '\'` pattern.
-fn escape_like_pattern(literal: &str) -> String {
-    let mut escaped = String::with_capacity(literal.len());
-    for c in literal.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            escaped.push('\\');
-        }
-        escaped.push(c);
-    }
-    escaped
-}
+/// Bound parameters per IN-list statement (the repo's chunking convention,
+/// as in reach.rs). Bundled SQLite allows 32766; 900 keeps every statement
+/// well under any build's limit.
+const IN_CHUNK: usize = 900;
 
 /// Which of `files` are generated names shadowing a hand-written peer
 /// VERIFIED IN THE INDEX (the `files` table) — never the candidate set:
@@ -304,10 +297,12 @@ fn escape_like_pattern(literal: &str) -> String {
 ///
 /// A peer is a file with the marker-stripped name in the same directory
 /// (`src/user.g.dart` ← `src/user.dart`) that is not itself generated.
-/// Resolution costs ONE prepared query per unique parent directory
-/// (LIKE-escaped directory prefix); a failing prepare degrades to ONE full
-/// `files` scan. No connection or no generated candidates → no demotion
-/// (the conservative branch of AC-2).
+/// Resolution queries exactly the wanted peer paths in IN_CHUNK-sized
+/// batches against the `files` PRIMARY KEY — an indexed point lookup per
+/// peer, no directory over-fetch (a LIKE-prefix scan cannot use the
+/// BINARY-collated path index and reads the whole table per directory). A
+/// failing prepare degrades to ONE full `files` scan. No connection or no
+/// generated candidates → no demotion (the conservative branch of AC-2).
 pub fn resolve_generated_shadowing(conn: Option<&Connection>, files: &[String]) -> HashSet<String> {
     let mut shadowed = HashSet::new();
     let Some(conn) = conn else {
@@ -340,30 +335,27 @@ pub fn resolve_generated_shadowing(conn: Option<&Connection>, files: &[String]) 
         return shadowed;
     }
 
-    // One statement per unique parent directory; on any failure, one full
-    // scan instead — either way the resolution is O(1) queries.
+    // The exact wanted peer paths, in chunks, against the `files` primary
+    // key: an indexed point lookup per peer, fetching nothing else.
+    let peers: Vec<&String> = wanted.iter().map(|(_, peer)| peer).collect();
     let mut found: HashSet<String> = HashSet::new();
-    let mut dirs: Vec<String> = Vec::new();
-    for (_, peer) in &wanted {
-        let dir = match peer.rfind('/') {
-            Some(idx) => peer[..idx].to_string(),
-            None => String::new(),
-        };
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
     let mut resolved = false;
-    for dir in &dirs {
-        let pattern = format!("{}%", escape_like_pattern(dir));
-        if let Ok(mut stmt) = conn.prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")
-            && let Ok(rows) =
-                stmt.query_map(rusqlite::params![pattern], |row| row.get::<_, String>(0))
+    for chunk in peers.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("SELECT path FROM files WHERE path IN ({placeholders})");
+        if let Ok(mut stmt) = conn.prepare(&sql)
+            && let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                row.get::<_, String>(0)
+            })
         {
             found.extend(rows.flatten());
             resolved = true;
         }
     }
+    // Schema-mismatch fallback (kept from the LIKE form): an index whose
+    // schema rejects the chunked statement still gets ONE full `files`
+    // scan, so verification degrades the same conservative way instead of
+    // silently demoting nothing.
     if !resolved
         && let Ok(mut stmt) = conn.prepare("SELECT path FROM files")
         && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))

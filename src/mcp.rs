@@ -1747,22 +1747,16 @@ impl McpServer {
                 if !include_tests {
                     r.retain(|s| !crate::ranker::is_test_file(std::path::Path::new(&s.file)));
                 }
-                // TASK-094: the ONE graded path-character demotion (absorbs
-                // the old .d.ts-only push-to-end) — ordinary source first,
+                // The graded path-character order (ordinary source first,
                 // then barrels/module entries, type declarations, shims,
-                // examples, tests; generated files demote only with an
-                // index-verified hand-written peer. Stable, so equal ladder
-                // values keep the query order.
-                let files: Vec<String> = r.iter().map(|s| s.file.clone()).collect();
-                let values = crate::rerank::path_character_values(&files, Some(conn));
-                r.sort_by(|a, b| {
-                    let a_value = values.get(&a.file).copied().unwrap_or(1.0);
-                    let b_value = values.get(&b.file).copied().unwrap_or(1.0);
-                    b_value
-                        .partial_cmp(&a_value)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                // Apply limit after sorting.
+                // examples, tests; generated files demoted only with an
+                // index-verified hand-written peer) is already established by
+                // query_symbols_db_with_filters — one classification and one
+                // stable sort per query. This retain only removes rows, so it
+                // preserves that order; re-sorting here with the same keys
+                // would be a no-op paid in a second classifier pass and a
+                // second resolver query.
+                // Apply limit after that graded order.
                 if let Some(limit) = limit {
                     r.truncate(limit);
                 }
