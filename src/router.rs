@@ -268,6 +268,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             &config.search,
                             config.embedding.provider,
                             args.query_class,
+                            config.topology.enabled,
                         )?;
                         // --why opts into the pipeline for this invocation.
                         settings.use_pipeline |= args.why;

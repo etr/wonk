@@ -2047,15 +2047,25 @@ impl RankSettings {
     /// place the `[rank]` section becomes pipeline settings, so flipping
     /// the default is a one-line change. `pinned` is the caller's explicit
     /// class pin (`--query-class` / MCP `query_class`), `None` = detect.
+    /// `topology_enabled` is the `[topology] enabled` kill switch
+    /// (PRD-TOPO-REQ-008): when off, both topology weights are forced to
+    /// exactly 0.0, so the signals are skipped and no topology context is
+    /// prepared — ranking returns to its prior behavior bitwise.
     pub fn from_config(
         rank: &crate::config::RankConfig,
         search: &crate::config::SearchConfig,
         embedding: crate::embedding::EmbeddingProviderKind,
         pinned: Option<QueryClass>,
+        topology_enabled: bool,
     ) -> anyhow::Result<Self> {
+        let mut weights = WeightTable::from_config(&rank.weights)?;
+        if !topology_enabled {
+            weights.weights.insert("hub".to_string(), 0.0);
+            weights.weights.insert("authority".to_string(), 0.0);
+        }
         Ok(Self {
             use_pipeline: rank.enabled,
-            weights: WeightTable::from_config(&rank.weights)?,
+            weights,
             sources: ContextSources {
                 bm25: crate::bm25::Bm25Params::from(search),
                 embedding,
@@ -5015,6 +5025,77 @@ proximity, signature, churn, co_change, hub, authority",
     }
 
     #[test]
+    fn rank_settings_topology_kill_switch_restores_prior_behavior_exactly() {
+        // A table that opts into topology, loaded with the kill switch on:
+        // both weights are forced to exactly 0.0 (PRD-TOPO-REQ-008).
+        let rank = crate::config::RankConfig {
+            enabled: true,
+            weights: std::collections::HashMap::from([
+                ("kind".to_string(), 1.0),
+                ("hub".to_string(), 2.0),
+                ("authority".to_string(), 3.0),
+            ]),
+            class_multipliers: ClassMultipliers::neutral(),
+        };
+        let search = crate::config::SearchConfig::default();
+        let disabled = RankSettings::from_config(
+            &rank,
+            &search,
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(disabled.weights.weight("hub"), 0.0);
+        assert_eq!(disabled.weights.weight("authority"), 0.0);
+        assert_eq!(disabled.weights.weight("kind"), 1.0);
+
+        // The zeroed table scores a populated candidate set
+        // bitwise-identically to a table that never named topology:
+        // zero-weight signals are skipped and no topology context is
+        // prepared, so ranking returns to its prior behavior EXACTLY.
+        let (_dir, conn) = topology_seeded_conn();
+        let results = vec![
+            classified("src/core.rs", 1, "handler", ResultCategory::Definition),
+            classified("src/mid.rs", 5, "handler", ResultCategory::Definition),
+        ];
+        let scored_disabled = rerank(
+            results.clone(),
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &disabled.weights,
+            &ContextSources::default(),
+        );
+        let mut prior = rank.clone();
+        prior.weights.remove("hub");
+        prior.weights.remove("authority");
+        let prior_settings = RankSettings::from_config(
+            &prior,
+            &search,
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            true,
+        )
+        .unwrap();
+        let scored_prior = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &prior_settings.weights,
+            &ContextSources::default(),
+        );
+        assert_eq!(scored_disabled.len(), scored_prior.len());
+        for (with_switch, without_names) in scored_disabled.iter().zip(&scored_prior) {
+            assert_eq!(
+                with_switch.score.to_bits(),
+                without_names.score.to_bits(),
+                "scores must be bitwise-identical"
+            );
+            assert_eq!(with_switch.contributions, without_names.contributions);
+        }
+    }
+
+    #[test]
     fn rank_settings_from_config_maps_every_surface() {
         let mut rank = crate::config::RankConfig {
             enabled: true,
@@ -5034,6 +5115,7 @@ proximity, signature, churn, co_change, hub, authority",
             &search,
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
+            true,
         )
         .unwrap();
         assert!(settings.use_pipeline);
@@ -5048,6 +5130,7 @@ proximity, signature, churn, co_change, hub, authority",
             &search,
             crate::embedding::EmbeddingProviderKind::Bundled,
             Some(QueryClass::Path),
+            true,
         )
         .unwrap();
         assert_eq!(pinned.pinned_class, Some(QueryClass::Path));
@@ -5059,6 +5142,7 @@ proximity, signature, churn, co_change, hub, authority",
             &search,
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
+            true,
         )
         .unwrap();
         assert!(!legacy.use_pipeline);
@@ -5070,7 +5154,8 @@ proximity, signature, churn, co_change, hub, authority",
                 &rank,
                 &search,
                 crate::embedding::EmbeddingProviderKind::Bundled,
-                None
+                None,
+                true
             )
             .is_err()
         );

@@ -1645,6 +1645,7 @@ impl McpServer {
             &config.search,
             config.embedding.provider,
             pinned_class,
+            config.topology.enabled,
         ) {
             Ok(s) => s,
             Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),
