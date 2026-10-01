@@ -26,7 +26,10 @@ pub struct MinedCommit {
 /// opens a commit; every other non-empty line is a file path of the
 /// current commit. Blank separators are skipped, and a trailing newline is
 /// tolerated. The timestamp guard keeps a (pathological) tab-containing
-/// file path out of the header position.
+/// file path out of the header position. Path lines are stored under
+/// their REAL names: a C-style-quoted line (git quotes any path with a
+/// quote, backslash, or control byte even under `core.quotePath=false`)
+/// is unquoted by [`unquote_git_path`] first.
 pub fn parse_git_log(output: &str) -> Vec<MinedCommit> {
     let mut commits: Vec<MinedCommit> = Vec::new();
     for line in output.lines() {
@@ -40,10 +43,86 @@ pub fn parse_git_log(output: &str) -> Vec<MinedCommit> {
                 files: Vec::new(),
             });
         } else if let Some(commit) = commits.last_mut() {
-            commit.files.push(line.to_string());
+            commit.files.push(unquote_git_path(line));
         }
     }
     commits
+}
+
+/// Decode one C-style-quoted git path line to the real path.
+///
+/// A quoted pair (`"..."`) has its escape sequences decoded: `\t` `\n`
+/// `\\` `\"` map directly, and a `\NNN` octal triple is one raw byte
+/// (git emits a UTF-8 sequence one byte per triple — `"caf\303\251"` is
+/// `café`); the bytes are then read as (possibly lossy) UTF-8. Anything
+/// else — an unquoted line (the `core.quotePath=false` form), an
+/// unrecognized escape, or a dangling backslash — is kept verbatim: the
+/// parser never guesses a name it was not given.
+fn unquote_git_path(line: &str) -> String {
+    let Some(inner) = line
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return line.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte != b'\\' {
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        let Some(&next) = bytes.get(i + 1) else {
+            out.push(byte); // dangling backslash: keep it
+            i += 1;
+            continue;
+        };
+        match next {
+            b't' => {
+                out.push(b'\t');
+                i += 2;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 2;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 2;
+            }
+            b'"' => {
+                out.push(b'"');
+                i += 2;
+            }
+            b'0'..=b'7' => {
+                let digits = bytes.get(i + 1..i + 4).unwrap_or(&[]);
+                let octal = std::str::from_utf8(digits)
+                    .ok()
+                    .and_then(|s| u8::from_str_radix(s, 8).ok())
+                    .filter(|_| {
+                        digits.len() == 3 && digits.iter().all(|d| (b'0'..=b'7').contains(d))
+                    });
+                match octal {
+                    Some(value) => {
+                        out.push(value);
+                        i += 4;
+                    }
+                    None => {
+                        out.push(byte); // not a full \NNN triple: keep verbatim
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                out.push(byte); // unknown escape: keep the backslash
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Split a `%H%x09%ct` header line, or `None` when it is not one (no TAB,
@@ -99,11 +178,18 @@ pub fn has_git(repo_root: &Path) -> bool {
 
 /// `git log` invocation shared by the full and incremental mines: the
 /// newest `window` commits of `range` (None = HEAD), no renames, one TAB
-/// header + `--name-only` paths per commit. `-n` bounds cost by the
-/// window regardless of repository age (PRD-HIST-REQ-002).
+/// header + `--name-only` paths per commit. `-c core.quotePath=false`
+/// asks git for RAW non-ASCII paths — under the default it C-quotes every
+/// path with a byte over 0x7f (`"src/caf\303\251.rs"`), which would never
+/// match a real path at lookup time; paths git still quotes (quotes,
+/// backslashes, control bytes) are unquoted by [`parse_git_log`]. `-n`
+/// bounds cost by the window regardless of repository age
+/// (PRD-HIST-REQ-002).
 fn git_log(repo_root: &Path, window: usize, range: Option<&str>) -> Result<String> {
     let n = window.to_string();
     let mut args: Vec<&str> = vec![
+        "-c",
+        "core.quotePath=false",
         "log",
         "-n",
         &n,
@@ -462,6 +548,39 @@ mod tests {
     }
 
     #[test]
+    fn mine_full_keys_special_filenames_by_their_real_paths() {
+        if !git_available() {
+            return;
+        }
+        // Under git's default core.quotePath=true a non-ASCII path is
+        // emitted C-quoted (`"src/caf\303\251.rs"`), and a path carrying a
+        // quote or backslash is ALWAYS quoted whatever quotePath says
+        // (`"src/wei\"rd\\name.rs"`). Every one of them must be keyed in
+        // file_churn under its REAL name — the churn signal looks up
+        // `candidate.result.file`, never a quoted form.
+        let (dir, conn) = make_history_repo(&[("src/café.rs", 100), ("src/wei\"rd\\name.rs", 200)]);
+        mine_full(&conn, dir.path(), 10).unwrap();
+
+        assert!(
+            churn_score(&conn, "src/café.rs").is_some(),
+            "unicode path must be keyed unquoted"
+        );
+        assert!(
+            churn_score(&conn, "src/wei\"rd\\name.rs").is_some(),
+            "quote/backslash path must be keyed unquoted"
+        );
+        // And nothing is keyed under a quoted form.
+        let quoted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_churn WHERE file LIKE '\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(quoted, 0, "no file_churn row may start with a quote");
+    }
+
+    #[test]
     fn refresh_is_unchanged_when_head_stable() {
         if !git_available() {
             return;
@@ -652,10 +771,52 @@ mod tests {
 
     #[test]
     fn parse_git_log_tab_line_with_non_numeric_second_field_is_a_path() {
-        // A tab-containing path must not be mistaken for a commit header.
+        // The defensive (non-git) form: a raw-TAB path must not be
+        // mistaken for a commit header. Real git never emits this — it
+        // C-quotes control bytes (see the quoted form below).
         let commits = parse_git_log("aaaa\t10\nweird\tname.rs\n");
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].files, vec!["weird\tname.rs".to_string()]);
+    }
+
+    #[test]
+    fn parse_git_log_unquotes_c_style_quoted_paths() {
+        // Exactly what `git log --name-only` emits for these filenames
+        // under the default core.quotePath=true: the non-ASCII path as
+        // octal byte escapes, the quote/backslash path escaped in place.
+        let log = "aaaaaaaa\t100\n\"src/caf\\303\\251.rs\"\n\"src/wei\\\"rd\\\\name.rs\"\n";
+        let commits = parse_git_log(log);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits[0].files,
+            vec![
+                "src/café.rs".to_string(),
+                "src/wei\"rd\\name.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_git_log_quoted_tab_path_decodes_to_a_real_tab() {
+        // A tab-containing path — the realistic quoted form git emits even
+        // with core.quotePath=false. The escaped tab keeps the line out of
+        // the header branch, and the decode yields a real TAB.
+        let commits = parse_git_log("aaaa\t10\n\"weird\\tname.rs\"\n");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].files, vec!["weird\tname.rs".to_string()]);
+    }
+
+    #[test]
+    fn parse_git_log_leaves_unquoted_and_unknown_escapes_verbatim() {
+        // A plain path (quotePath=false emits these) stays untouched, and
+        // an unrecognized escape inside quotes is kept as written rather
+        // than guessed at.
+        let commits = parse_git_log("aaaa\t10\nsrc/plain.rs\n\"odd\\q.rs\"\n");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits[0].files,
+            vec!["src/plain.rs".to_string(), "odd\\q.rs".to_string()]
+        );
     }
 
     // -- age_weight --------------------------------------------------------

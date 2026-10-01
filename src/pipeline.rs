@@ -1931,22 +1931,199 @@ class Component {
         assert_eq!(head.len(), 40, "mined_head is a full sha");
     }
 
+    /// A comparable `files` row: every column except `last_indexed` (a
+    /// wall-clock stamp per build) — deterministic across builds of the
+    /// same tree.
+    type FileRow = (String, Option<String>, String, Option<i64>, Option<i64>);
+
+    /// The index's comparable `files` rows, ordered by path.
+    fn indexed_files(conn: &rusqlite::Connection) -> Vec<FileRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, language, hash, line_count, symbols_count \
+                 FROM files ORDER BY path",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// A comparable `symbols` row: every column except the rowid (an
+    /// insertion-order implementation detail).
+    type SymbolRow = (
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+
+    /// The index's comparable `symbols` rows, deterministically ordered.
+    fn indexed_symbols(conn: &rusqlite::Connection) -> Vec<SymbolRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, kind, file, line, col, end_line, scope, signature, language \
+                 FROM symbols ORDER BY name, kind, file, line, col",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })
+            .unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// An AC-3 rerank candidate: a fixed file/category pair — kind and
+    /// churn are the only signals under test.
+    fn ac3_candidate(
+        file: &str,
+        category: crate::ranker::ResultCategory,
+    ) -> crate::ranker::ClassifiedResult {
+        crate::ranker::ClassifiedResult {
+            result: crate::search::SearchResult {
+                file: std::path::PathBuf::from(file),
+                line: 1,
+                col: 1,
+                content: "fn target() {}".to_string(),
+            },
+            category,
+            annotation: None,
+        }
+    }
+
     #[test]
     fn build_index_without_git_behaves_as_today() {
         if !git_available() {
             return;
         }
-        // No .git at all: the build succeeds, indexes as before, and the
-        // history tables exist but stay empty (AC-3).
-        let dir = TempDir::new().unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "fn a() {}\n").unwrap();
+        // AC-3 identity: the SAME tree built twice — once with no .git at
+        // all, once inside a git repository with [history] disabled (the
+        // pre-TASK-096 shape) — must index IDENTICALLY (files and symbols
+        // equal; only the per-build timestamp and rowids may differ), with
+        // the history tables empty in both.
+        let no_git = TempDir::new().unwrap();
+        fs::create_dir_all(no_git.path().join("src")).unwrap();
+        fs::write(no_git.path().join("src/lib.rs"), "fn f0() {}\n").unwrap();
+        write_reach_config(no_git.path(), "[history]\nenabled = false\n");
 
-        let stats = build_index(dir.path(), true).unwrap();
+        let git_repo = make_git_history_repo(&[("src/lib.rs", 100)]);
+        write_reach_config(git_repo.path(), "[history]\nenabled = false\n");
+
+        let stats = build_index(no_git.path(), true).unwrap();
         assert_eq!(stats.file_count, 1, "indexing is unaffected");
+        build_index(git_repo.path(), true).unwrap();
 
-        let conn = db::open_existing(&db::local_index_path(dir.path())).unwrap();
-        assert_eq!(history_counts(&conn), (0, 0));
+        let conn_no_git = db::open_existing(&db::local_index_path(no_git.path())).unwrap();
+        let conn_disabled = db::open_existing(&db::local_index_path(git_repo.path())).unwrap();
+        assert_eq!(
+            history_counts(&conn_no_git),
+            (0, 0),
+            "no-.git history tables stay empty"
+        );
+        assert_eq!(
+            history_counts(&conn_disabled),
+            (0, 0),
+            "disabled-history history tables stay empty"
+        );
+        assert_eq!(
+            indexed_files(&conn_no_git),
+            indexed_files(&conn_disabled),
+            "no-.git must index the same files as pre-TASK-096 behavior"
+        );
+        assert_eq!(
+            indexed_symbols(&conn_no_git),
+            indexed_symbols(&conn_disabled),
+            "no-.git must index the same symbols as pre-TASK-096 behavior"
+        );
+
+        // The ranking identity: on a no-git connection the churn signal
+        // contributes exactly zero, so churn weight 1.0 must produce the
+        // same scores and order as churn weight 0.0 (AC-3: no other
+        // feature is affected). Candidates are ordered worst-first so the
+        // rerank's kind ordering is actually exercised.
+        let candidates = || {
+            vec![
+                ac3_candidate("src/imp.rs", crate::ranker::ResultCategory::Import),
+                ac3_candidate("src/call.rs", crate::ranker::ResultCategory::CallSite),
+                ac3_candidate("src/def.rs", crate::ranker::ResultCategory::Definition),
+            ]
+        };
+        let churn_heavy = crate::rerank::WeightTable::from_pairs([
+            ("kind".to_string(), 1.0),
+            ("churn".to_string(), 1.0),
+        ])
+        .unwrap();
+        let churn_free = crate::rerank::WeightTable::from_pairs([
+            ("kind".to_string(), 1.0),
+            ("churn".to_string(), 0.0),
+        ])
+        .unwrap();
+        let query = crate::rerank::QueryInfo { pattern: "target" };
+        let sources = crate::rerank::ContextSources::default();
+
+        let heavy = crate::rerank::rerank(
+            candidates(),
+            &query,
+            Some(&conn_no_git),
+            &churn_heavy,
+            &sources,
+        );
+        let free = crate::rerank::rerank(
+            candidates(),
+            &query,
+            Some(&conn_no_git),
+            &churn_free,
+            &sources,
+        );
+
+        let order = |scored: &[crate::rerank::ScoredResult]| {
+            scored
+                .iter()
+                .map(|s| (s.classified.result.file.clone(), s.classified.result.line))
+                .collect::<Vec<_>>()
+        };
+        let scores = |scored: &[crate::rerank::ScoredResult]| {
+            scored.iter().map(|s| s.score).collect::<Vec<f32>>()
+        };
+        // The fixture is non-degenerate: kind alone strictly reorders it.
+        assert_eq!(
+            order(&heavy)[0],
+            (std::path::PathBuf::from("src/def.rs"), 1),
+            "definition must rank first: {heavy:?}"
+        );
+        assert_eq!(order(&heavy), order(&free), "identical group order");
+        assert_eq!(scores(&heavy), scores(&free), "identical scores");
+
+        // WHY they are identical: every churn contribution on a no-git
+        // connection is exactly zero, weight and all.
+        for scored in &heavy {
+            let churn = scored
+                .contributions
+                .iter()
+                .find(|c| c.signal == "churn")
+                .expect("churn weight 1.0 keeps the signal active");
+            assert_eq!(churn.value, 0.0, "no churn rows: value is exactly 0.0");
+            assert_eq!(churn.weighted, 0.0, "0.0 * 1.0 is exactly 0.0");
+        }
     }
 
     #[test]
