@@ -831,6 +831,38 @@ impl Signal for ChurnSignal {
     }
 }
 
+/// The co-change signal (TASK-097, PRD-HIST-REQ-006): the candidate's
+/// strongest retained coupling to ANOTHER file in the response set,
+/// log-damped against the set maximum — a file that historically changes
+/// WITH a matched file outranks an equally-matched loner. Reads the
+/// `co_change` aggregate prepared for the candidate set; a candidate with
+/// no in-set coupling (a loner, a single-file set, no history) is exactly
+/// 0.0 — absent is zero, never a penalty.
+pub(crate) struct CoChangeSignal;
+
+impl Signal for CoChangeSignal {
+    fn name(&self) -> &'static str {
+        "co_change"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_co_change()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        match ctx.co_change_coupling(&file) {
+            Some(weight) => co_change_value(weight, ctx.max_co_change()),
+            None => 0.0,
+        }
+    }
+}
+
 /// The MAXIMAL identifier runs (`[A-Za-z0-9_]+` bounded by
 /// non-identifier characters) of `line`, lowercased — the ONE shared
 /// scanner behind the prominence token tier and the proximity signal.
@@ -1248,6 +1280,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(ProximitySignal),
         Box::new(SignatureSignal),
         Box::new(ChurnSignal),
+        Box::new(CoChangeSignal),
     ]
 }
 
@@ -1959,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_nine_signals_in_order() {
+    fn registry_contains_ten_signals_in_order() {
         let registry = builtin_signals();
         let names: Vec<&str> = registry.iter().map(|s| s.name()).collect();
         assert_eq!(
@@ -1973,7 +2006,8 @@ mod tests {
                 "path_character",
                 "proximity",
                 "signature",
-                "churn"
+                "churn",
+                "co_change"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -2058,7 +2092,7 @@ mod tests {
         assert!(
             err.contains(
                 "known: kind, lexical, semantic, centrality, prominence, path_character, \
-proximity, signature, churn",
+proximity, signature, churn, co_change",
             ),
             "error lists every valid name: {err}"
         );
@@ -2491,6 +2525,67 @@ proximity, signature, churn",
             &ContextSources::default(),
         );
         assert_eq!(ctx.co_change_coupling("src/a.rs"), None);
+    }
+
+    #[test]
+    fn co_change_signal_scores_set_relative() {
+        let (_dir, conn) = co_change_seeded_conn();
+        let scored = rerank(
+            co_change_candidates(),
+            &QueryInfo { pattern: "x" },
+            Some(&conn),
+            &table(&[("co_change", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        let by_file = |f: &str| {
+            scored
+                .iter()
+                .find(|s| s.classified.result.file == *f)
+                .unwrap()
+        };
+        assert_eq!(
+            scored[0].contributions[0].signal,
+            "co_change",
+            "the registry's newest signal breaks the kind tie"
+        );
+        // Set-relative: the strongest in-set pair maps to 1.0, the weaker
+        // one log-damps below it, the loner scores exactly 0.
+        let expected_weak = 2.0f32.ln() / 4.0f32.ln();
+        assert_eq!(by_file("src/handler.rs").contributions[0].value, 1.0);
+        assert_eq!(by_file("src/serializer.rs").contributions[0].value, 1.0);
+        assert!(
+            (by_file("src/migration.rs").contributions[0].value - expected_weak).abs() < 1e-6,
+            "weak pair log-damps against the set max"
+        );
+        assert_eq!(
+            by_file("src/loner.rs").contributions[0].value, 0.0,
+            "no coupling is zero, not a penalty"
+        );
+        assert!(by_file("src/loner.rs").score < by_file("src/migration.rs").score);
+    }
+
+    #[test]
+    fn co_change_absent_from_default_weights_but_configurable() {
+        // Absent = weight 0: rankings are unchanged until a user opts in.
+        let defaults =
+            WeightTable::from_config(&crate::config::RankConfig::default().weights).unwrap();
+        assert_eq!(defaults.weight("co_change"), 0.0);
+
+        // Registered: the name is accepted by [rank.weights].
+        let mut weights = HashMap::new();
+        weights.insert("co_change".to_string(), 1.0);
+        let table = WeightTable::from_config(&weights).unwrap();
+        assert_eq!(table.weight("co_change"), 1.0);
+    }
+
+    #[test]
+    fn co_change_requires_its_context_slice() {
+        assert_eq!(
+            CoChangeSignal.requires(),
+            ContextReqs::none().with_co_change()
+        );
+        assert_eq!(CoChangeSignal.name(), "co_change");
     }
 
     #[test]
