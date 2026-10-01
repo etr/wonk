@@ -80,34 +80,37 @@ pub fn term_contribution(tf: u64, doc_len: f32, avgdl: f32, idf: f32, k1: f32, b
     idf * tf * (k1 + 1.0) / denominator
 }
 
-/// Re-rank grep candidates by BM25 over `term_stats`, or `None` when
+/// Per-file BM25 scores for a set of candidate files, or `None` when
 /// scoring is unavailable (pre-V5 index, empty or dropped `term_stats`,
-/// degenerate corpus, query error). `None` means "keep the input order" —
-/// the V4 fallback — never an error.
+/// degenerate corpus). This is the scoring core `rerank_lexical` sorts on
+/// top of and the TASK-093 lexical signal consumes; the math is shared so
+/// the two paths can never drift apart.
 ///
-/// Empty results or a query with no tokens return the input unchanged.
-/// The output is always a permutation of the input: same set, reordered by
-/// `(score desc, file asc, line asc)`; line results inherit their file's
-/// score. Query cost is `2 + T` statements for T query terms.
-pub fn rerank_lexical(
+/// Every input file gets an entry: files without term_stats rows score
+/// exactly 0.0. An empty file set or a query with no tokens yields an
+/// empty map. Query cost is `3 + T` statements for T query terms
+/// (presence probe, corpus stats, one postings scan per term, document
+/// lengths), independent of the candidate count.
+pub fn file_bm25_scores(
     conn: &Connection,
-    results: &[SearchResult],
+    files: &std::collections::HashSet<String>,
     query: &str,
     params: Bm25Params,
-) -> Option<Vec<SearchResult>> {
+) -> Option<HashMap<String, f32>> {
+    if files.is_empty() {
+        return Some(HashMap::new());
+    }
+
     // Presence probe: an index built before TASK-078 (or a freshly opened
     // but unpopulated one) has no rows here — signal the V4 fallback.
     conn.query_row("SELECT 1 FROM term_stats LIMIT 1", [], |_| Ok(()))
         .ok()?;
 
-    if results.is_empty() {
-        return Some(results.to_vec());
-    }
     let mut terms = crate::tokenizer::tokenize(query);
     terms.sort_unstable();
     terms.dedup();
     if terms.is_empty() {
-        return Some(results.to_vec());
+        return Some(HashMap::new());
     }
 
     let corpus = load_corpus_stats(conn)?;
@@ -153,22 +156,46 @@ pub fn rerank_lexical(
         }
     }
 
-    // Score each distinct candidate file.
-    let mut scores: HashMap<String, f32> = HashMap::new();
-    for result in results {
-        let file = result.file.to_string_lossy().into_owned();
-        if scores.contains_key(&file) {
-            continue;
-        }
-        let len = doc_len.get(&file).copied().unwrap_or(corpus.avg_doc_len);
+    let mut scores: HashMap<String, f32> = HashMap::with_capacity(files.len());
+    for file in files {
+        let len = doc_len.get(file).copied().unwrap_or(corpus.avg_doc_len);
         let score = scored_terms
             .iter()
             .map(|(idf, tf_by_file)| {
-                let tf = tf_by_file.get(&file).copied().unwrap_or(0);
+                let tf = tf_by_file.get(file).copied().unwrap_or(0);
                 term_contribution(tf, len, corpus.avg_doc_len, *idf, params.k1, params.b)
             })
             .sum();
-        scores.insert(file, score);
+        scores.insert(file.clone(), score);
+    }
+    Some(scores)
+}
+
+/// Re-rank grep candidates by BM25 over `term_stats`, or `None` when
+/// scoring is unavailable (pre-V5 index, empty or dropped `term_stats`,
+/// degenerate corpus, query error). `None` means "keep the input order" —
+/// the V4 fallback — never an error.
+///
+/// Empty results or a query with no tokens return the input unchanged.
+/// The output is always a permutation of the input: same set, reordered by
+/// `(score desc, file asc, line asc)`; line results inherit their file's
+/// score.
+pub fn rerank_lexical(
+    conn: &Connection,
+    results: &[SearchResult],
+    query: &str,
+    params: Bm25Params,
+) -> Option<Vec<SearchResult>> {
+    if results.is_empty() {
+        return Some(results.to_vec());
+    }
+    let files: std::collections::HashSet<String> = results
+        .iter()
+        .map(|r| r.file.to_string_lossy().into_owned())
+        .collect();
+    let scores = file_bm25_scores(conn, &files, query, params)?;
+    if scores.is_empty() {
+        return Some(results.to_vec());
     }
 
     let mut ranked: Vec<(f32, SearchResult)> = results
@@ -548,6 +575,94 @@ mod tests {
         insert_term(&conn, "alpha", "a.rs", 3);
         let results = vec![hit("a.rs", 1)];
         assert!(rerank_lexical(&conn, &results, "alpha", default_params()).is_none());
+    }
+
+    // -- file_bm25_scores (TASK-093 signal core) -----------------------------
+
+    fn files_set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn file_scores_cover_every_candidate_file_with_zero_for_statsless() {
+        let (_dir, conn) = test_conn();
+        insert_file(&conn, "a.rs", Some(100));
+        insert_file(&conn, "b.rs", Some(100));
+        insert_term(&conn, "alpha", "a.rs", 5);
+
+        let scores = file_bm25_scores(
+            &conn,
+            &files_set(&["a.rs", "b.rs"]),
+            "alpha",
+            default_params(),
+        )
+        .expect("stats present, so scoring must happen");
+
+        assert_eq!(scores.len(), 2, "every candidate file is scored");
+        assert!(scores["a.rs"] > 0.0);
+        // b.rs has no term_stats row at all: present, at exactly zero.
+        assert_eq!(scores["b.rs"], 0.0);
+    }
+
+    #[test]
+    fn file_scores_multi_term_sums_contributions() {
+        let (_dir, conn) = test_conn();
+        insert_file(&conn, "a.rs", Some(100));
+        insert_file(&conn, "b.rs", Some(100));
+        insert_term(&conn, "alpha", "a.rs", 5);
+        insert_term(&conn, "beta", "a.rs", 5);
+        insert_term(&conn, "beta", "b.rs", 5);
+
+        let scores = file_bm25_scores(
+            &conn,
+            &files_set(&["a.rs", "b.rs"]),
+            "alpha beta",
+            default_params(),
+        )
+        .unwrap();
+
+        // Hand-computed sum over the pure primitives: N=2, df(alpha)=1,
+        // df(beta)=2, both files at avgdl so the length factor is neutral.
+        let idf_alpha = idf(2, 1);
+        let idf_beta = idf(2, 2);
+        let expected_a = term_contribution(5, 100.0, 100.0, idf_alpha, 1.2, 0.75)
+            + term_contribution(5, 100.0, 100.0, idf_beta, 1.2, 0.75);
+        let expected_b = term_contribution(5, 100.0, 100.0, idf_beta, 1.2, 0.75);
+        assert!((scores["a.rs"] - expected_a).abs() < TOL);
+        assert!((scores["b.rs"] - expected_b).abs() < TOL);
+        assert!(scores["a.rs"] > scores["b.rs"]);
+    }
+
+    #[test]
+    fn file_scores_empty_files_or_tokens_yield_empty_map() {
+        let (_dir, conn) = test_conn();
+        insert_file(&conn, "a.rs", Some(10));
+        insert_term(&conn, "alpha", "a.rs", 3);
+
+        let empty_files =
+            file_bm25_scores(&conn, &files_set(&[]), "alpha", default_params()).unwrap();
+        assert!(empty_files.is_empty());
+
+        let no_tokens =
+            file_bm25_scores(&conn, &files_set(&["a.rs"]), ":: - _", default_params()).unwrap();
+        assert!(no_tokens.is_empty());
+    }
+
+    #[test]
+    fn file_scores_none_when_stats_missing_or_corpus_degenerate() {
+        // No term_stats rows: the pre-V5 fallback marker.
+        let (_dir, conn) = test_conn();
+        insert_file(&conn, "a.rs", Some(10));
+        assert!(
+            file_bm25_scores(&conn, &files_set(&["a.rs"]), "alpha", default_params()).is_none()
+        );
+
+        // Stats present but the files table is empty: degenerate corpus.
+        let (_dir2, conn2) = test_conn();
+        insert_term(&conn2, "alpha", "a.rs", 3);
+        assert!(
+            file_bm25_scores(&conn2, &files_set(&["a.rs"]), "alpha", default_params()).is_none()
+        );
     }
 
     // -- Benchmark (manual gate, run in release) ------------------------------
