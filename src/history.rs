@@ -171,6 +171,90 @@ pub fn aggregate_churn(rows: &[MinedCommit], head_ts: i64, span: i64) -> HashMap
     scores
 }
 
+/// One retained co-change coupling: `file_a`'s directed coupling to
+/// `file_b` (TASK-097). Both directions of a pair are stored
+/// independently — each carries its own top-K retention.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoChangeRow {
+    pub file_a: String,
+    pub file_b: String,
+    pub weight: f32,
+}
+
+/// The age-weighted co-occurrence aggregate (TASK-097, PRD-HIST-REQ-004/005):
+/// `weight(a, b) = sum(age_weight(ts))` over the retained commits touching
+/// BOTH `a` and `b`, using the same [`age_weight`] machinery as churn — so
+/// folding in new commits rescales every retained pair exactly.
+///
+/// A commit touching strictly more than `max_commit_files` files is EXCLUDED
+/// from co-change derivation only (PRD-HIST-REQ-005): reformatting sweeps
+/// and vendored imports would otherwise couple everything to everything.
+/// It still feeds churn and still bounds the window. Rows are summed
+/// newest-first as given; every ordered pair `a != b` is accumulated, which
+/// makes the aggregate symmetric by construction.
+pub fn aggregate_co_change(
+    rows: &[MinedCommit],
+    head_ts: i64,
+    span: i64,
+    max_commit_files: usize,
+) -> HashMap<String, HashMap<String, f32>> {
+    let mut weights: HashMap<String, HashMap<String, f32>> = HashMap::new();
+    for commit in rows {
+        if commit.files.len() > max_commit_files {
+            continue;
+        }
+        let weight = age_weight(commit.ts, head_ts, span);
+        for file_a in &commit.files {
+            for file_b in &commit.files {
+                if file_a == file_b {
+                    continue;
+                }
+                *weights
+                    .entry(file_a.clone())
+                    .or_default()
+                    .entry(file_b.clone())
+                    .or_insert(0.0) += weight;
+            }
+        }
+    }
+    weights
+}
+
+/// Retain each `file_a`'s `top_k` strongest partners (weight DESC,
+/// `file_b` ASC tie-break), each direction independently — so storage is
+/// linear in files, never quadratic (PRD-HIST-REQ-004). The result is
+/// sorted by `(file_a, file_b)`, the canonical insert order.
+pub fn top_k_per_file(
+    weights: &HashMap<String, HashMap<String, f32>>,
+    top_k: usize,
+) -> Vec<CoChangeRow> {
+    let mut rows: Vec<CoChangeRow> = Vec::new();
+    for (file_a, partners) in weights {
+        let mut ranked: Vec<(&String, &f32)> = partners.iter().collect();
+        ranked.sort_by(|(b, wb), (d, wd)| {
+            wd.partial_cmp(wb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.cmp(d))
+        });
+        rows.extend(
+            ranked
+                .into_iter()
+                .take(top_k)
+                .map(|(file_b, weight)| CoChangeRow {
+                    file_a: file_a.clone(),
+                    file_b: file_b.clone(),
+                    weight: *weight,
+                }),
+        );
+    }
+    rows.sort_by(|x, y| {
+        x.file_a
+            .cmp(&y.file_a)
+            .then_with(|| x.file_b.cmp(&y.file_b))
+    });
+    rows
+}
+
 /// Whether `repo_root` looks like a git work tree (a `.git` entry exists).
 pub fn has_git(repo_root: &Path) -> bool {
     repo_root.join(".git").exists()
@@ -897,6 +981,157 @@ mod tests {
     #[test]
     fn aggregate_churn_empty_is_empty() {
         assert!(aggregate_churn(&[], 0, 0).is_empty());
+    }
+
+    // -- aggregate_co_change / top_k_per_file (TASK-097) ---------------------
+
+    fn commit(id: &str, ts: i64, files: &[&str]) -> MinedCommit {
+        MinedCommit {
+            id: id.to_string(),
+            ts,
+            files: files.iter().map(|f| f.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn aggregate_co_change_sums_age_weights_per_ordered_pair() {
+        let rows = vec![
+            commit("a", 100, &["handler.rs", "serializer.rs"]),
+            commit("b", 50, &["handler.rs", "serializer.rs"]),
+            commit("c", 50, &["handler.rs", "loner.rs"]),
+        ];
+        let weights = aggregate_co_change(&rows, 100, 50, 50);
+
+        // Only the newest commit weighs 1.0; the ts=50 commits weigh 0.0.
+        assert!((weights["handler.rs"]["serializer.rs"] - 1.0).abs() < 1e-6);
+        assert!(
+            (weights["serializer.rs"]["handler.rs"] - 1.0).abs() < 1e-6,
+            "symmetric by construction"
+        );
+        assert!((weights["handler.rs"]["loner.rs"] - 0.0).abs() < 1e-6);
+        assert_eq!(weights.len(), 3);
+    }
+
+    #[test]
+    fn aggregate_co_change_solo_commit_yields_no_pairs() {
+        let rows = vec![commit("a", 100, &["one.rs"]), commit("b", 50, &[])];
+        let weights = aggregate_co_change(&rows, 100, 50, 50);
+        assert!(weights.is_empty(), "got {weights:?}");
+    }
+
+    #[test]
+    fn aggregate_co_change_never_pairs_a_file_with_itself() {
+        // A duplicated path in one commit's file list (defensive: the
+        // commit_files primary key rules it out in practice) must not
+        // create a self-coupling.
+        let rows = vec![commit("a", 100, &["x.rs", "x.rs"])];
+        let weights = aggregate_co_change(&rows, 100, 50, 50);
+        assert!(weights.is_empty(), "got {weights:?}");
+    }
+
+    #[test]
+    fn aggregate_co_change_excludes_commits_strictly_over_the_threshold() {
+        let rows = vec![
+            commit("at", 100, &["a.rs", "b.rs", "c.rs"]),
+            commit("over", 50, &["a.rs", "b.rs", "d.rs", "e.rs"]),
+        ];
+        let weights = aggregate_co_change(&rows, 100, 50, 3);
+
+        // Exactly-at-threshold contributes (span: weights 1.0 and 0.0).
+        assert!((weights["a.rs"]["b.rs"] - 1.0).abs() < 1e-6);
+        assert!((weights["a.rs"]["c.rs"] - 1.0).abs() < 1e-6);
+        assert!((weights["b.rs"]["c.rs"] - 1.0).abs() < 1e-6);
+        // Strictly-over contributes nothing: d and e have no coupling.
+        assert!(!weights.contains_key("d.rs"));
+        assert!(!weights.contains_key("e.rs"));
+    }
+
+    #[test]
+    fn top_k_per_file_keeps_k_strongest_ties_break_file_b_asc() {
+        let mut weights: HashMap<String, HashMap<String, f32>> = HashMap::new();
+        let mut partners = HashMap::new();
+        partners.insert("b.rs".to_string(), 0.5);
+        partners.insert("c.rs".to_string(), 1.0);
+        partners.insert("d.rs".to_string(), 0.5);
+        weights.insert("a.rs".to_string(), partners);
+
+        let rows = top_k_per_file(&weights, 2);
+        assert_eq!(
+            rows,
+            vec![
+                CoChangeRow {
+                    file_a: "a.rs".into(),
+                    file_b: "b.rs".into(),
+                    weight: 0.5
+                },
+                CoChangeRow {
+                    file_a: "a.rs".into(),
+                    file_b: "c.rs".into(),
+                    weight: 1.0
+                },
+            ],
+            "K=2 keeps the strongest (c) and the ASC tie-break (b over d)"
+        );
+    }
+
+    #[test]
+    fn top_k_per_file_at_least_partner_count_keeps_all() {
+        let mut weights: HashMap<String, HashMap<String, f32>> = HashMap::new();
+        let mut a_partners = HashMap::new();
+        a_partners.insert("b.rs".to_string(), 1.0);
+        weights.insert("a.rs".to_string(), a_partners);
+        let mut b_partners = HashMap::new();
+        b_partners.insert("a.rs".to_string(), 1.0);
+        weights.insert("b.rs".to_string(), b_partners);
+
+        let rows = top_k_per_file(&weights, 10);
+        assert_eq!(
+            rows,
+            vec![
+                CoChangeRow {
+                    file_a: "a.rs".into(),
+                    file_b: "b.rs".into(),
+                    weight: 1.0
+                },
+                CoChangeRow {
+                    file_a: "b.rs".into(),
+                    file_b: "a.rs".into(),
+                    weight: 1.0
+                },
+            ],
+            "rows are emitted sorted by (file_a, file_b)"
+        );
+    }
+
+    #[test]
+    fn top_k_per_file_zero_k_yields_nothing() {
+        let mut weights: HashMap<String, HashMap<String, f32>> = HashMap::new();
+        let mut partners = HashMap::new();
+        partners.insert("b.rs".to_string(), 1.0);
+        weights.insert("a.rs".to_string(), partners);
+        assert!(top_k_per_file(&weights, 0).is_empty());
+        assert!(top_k_per_file(&HashMap::new(), 10).is_empty());
+    }
+
+    #[test]
+    fn top_k_per_file_selects_each_direction_independently() {
+        // a's strongest partner is b, so a DROPS c; c's only partner is a,
+        // so c KEEPS a — (c,a) exists while (a,c) does not.
+        let mut weights: HashMap<String, HashMap<String, f32>> = HashMap::new();
+        let mut a_partners = HashMap::new();
+        a_partners.insert("b.rs".to_string(), 2.0);
+        a_partners.insert("c.rs".to_string(), 1.0);
+        weights.insert("a.rs".to_string(), a_partners);
+        let mut c_partners = HashMap::new();
+        c_partners.insert("a.rs".to_string(), 1.0);
+        weights.insert("c.rs".to_string(), c_partners);
+
+        let rows = top_k_per_file(&weights, 1);
+        let pairs: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.file_a.as_str(), r.file_b.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("a.rs", "b.rs"), ("c.rs", "a.rs")]);
     }
 
     // -- has_git --------------------------------------------------------------
