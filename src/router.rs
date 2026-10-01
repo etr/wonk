@@ -3015,6 +3015,10 @@ pub struct StatusInfo {
 pub struct TopologyStatus {
     /// Symbols carrying hub/authority scores.
     pub scored: i64,
+    /// Distinct connectivity communities among the scored symbols
+    /// (TASK-099); NULL communities — a TASK-098-scored index — count
+    /// toward none, so a pre-upgrade index reports 0.
+    pub communities: i64,
     /// Epoch seconds of the last recompute; `None` when never run.
     pub last_computed: Option<i64>,
     /// Whether the stored scores are older than `[topology] stale_after`.
@@ -3098,7 +3102,10 @@ fn topology_status_line(status: &TopologyStatus) -> String {
     if status.scored == 0 {
         return "Topology: none".to_string();
     }
-    let mut line = format!("Topology: {} symbols scored", status.scored);
+    let mut line = format!(
+        "Topology: {} symbols scored ({} communities)",
+        status.scored, status.communities
+    );
     if status.stale {
         let age = status
             .last_computed
@@ -3157,6 +3164,7 @@ pub fn query_status_info(
             workspace_comembers,
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: topology_config.enabled,
@@ -3184,10 +3192,16 @@ pub fn query_status_info(
     let probe_ollama =
         configured == crate::embedding::EmbeddingProviderKind::Ollama || stored_ollama;
 
+    let (topology_scored, topology_communities) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT community) FROM symbol_topology",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap_or((0, 0));
     let topology = TopologyStatus {
-        scored: conn
-            .query_row("SELECT COUNT(*) FROM symbol_topology", [], |row| row.get(0))
-            .unwrap_or(0),
+        scored: topology_scored,
+        communities: topology_communities,
         last_computed: crate::topology::last_computed(conn),
         stale: crate::topology::is_stale(conn, topology_config.stale_after),
         enabled: topology_config.enabled,
@@ -5978,6 +5992,7 @@ mod tests {
             workspace_comembers: vec!["repoB".to_string(), "repoC".to_string()],
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: true,
@@ -6008,6 +6023,7 @@ mod tests {
             workspace_comembers: Vec::new(),
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: true,
@@ -6038,6 +6054,7 @@ mod tests {
             workspace_comembers: Vec::new(),
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: true,
@@ -6072,6 +6089,7 @@ mod tests {
             workspace_comembers: Vec::new(),
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: true,
@@ -6099,6 +6117,7 @@ mod tests {
             workspace_comembers: Vec::new(),
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: true,
@@ -6131,6 +6150,7 @@ mod tests {
             workspace_comembers: Vec::new(),
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: true,
@@ -6160,6 +6180,7 @@ mod tests {
             workspace_comembers: Vec::new(),
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: true,
@@ -6187,6 +6208,7 @@ mod tests {
             workspace_comembers: Vec::new(),
             topology: TopologyStatus {
                 scored: 0,
+                communities: 0,
                 last_computed: None,
                 stale: false,
                 enabled: true,
@@ -6203,6 +6225,7 @@ mod tests {
 
     fn topology_status_info(
         scored: i64,
+        communities: i64,
         last_computed: Option<i64>,
         stale: bool,
         enabled: bool,
@@ -6223,6 +6246,7 @@ mod tests {
             workspace_comembers: Vec::new(),
             topology: TopologyStatus {
                 scored,
+                communities,
                 last_computed,
                 stale,
                 enabled,
@@ -6233,24 +6257,27 @@ mod tests {
     #[test]
     fn test_status_topology_line_disabled_none_and_fresh() {
         // The kill switch says so.
-        let out = format_status_info(&topology_status_info(0, None, false, false));
+        let out = format_status_info(&topology_status_info(0, 0, None, false, false));
         assert!(out.contains("Topology: disabled"), "got: {out}");
 
         // Never scored: absent data reads as none.
-        let out = format_status_info(&topology_status_info(0, None, false, true));
+        let out = format_status_info(&topology_status_info(0, 0, None, false, true));
         assert!(out.contains("Topology: none"), "got: {out}");
 
-        // Scored and fresh: just the count.
-        let out = format_status_info(&topology_status_info(4321, Some(1_000_000), false, true));
-        assert!(out.contains("Topology: 4321 symbols scored"), "got: {out}");
+        // Scored and fresh: the count and the community count.
+        let out = format_status_info(&topology_status_info(4321, 4, Some(1_000_000), false, true));
+        assert!(
+            out.contains("Topology: 4321 symbols scored (4 communities)"),
+            "got: {out}"
+        );
         assert!(!out.contains("stale"), "fresh is unmarked: {out}");
     }
 
     #[test]
     fn test_status_topology_line_stale_names_the_age() {
-        let out = format_status_info(&topology_status_info(12, Some(1_000_000), true, true));
+        let out = format_status_info(&topology_status_info(12, 3, Some(1_000_000), true, true));
         assert!(
-            out.contains("Topology: 12 symbols scored (stale, computed "),
+            out.contains("Topology: 12 symbols scored (3 communities) (stale, computed "),
             "got: {out}"
         );
         assert!(out.contains("s ago)"), "the age renders in seconds: {out}");
@@ -6290,9 +6317,40 @@ mod tests {
             &crate::config::TopologyConfig::default(),
         );
         assert_eq!(info.topology.scored, 1);
+        assert_eq!(
+            info.topology.communities, 0,
+            "a TASK-098 row with NULL community counts toward no community"
+        );
         assert_eq!(info.topology.last_computed, Some(stamp));
         assert!(!info.topology.stale);
         assert!(info.topology.enabled);
+
+        // Distinct communities: two scored symbols in two communities.
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('leaf', 'function', 'src/b.rs', 1, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_topology (symbol_id, hub, authority, community) \
+             VALUES (2, 0.1, 0.1, 7)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE symbol_topology SET community = 7 WHERE symbol_id = 1",
+            [],
+        )
+        .unwrap();
+        let info = query_status_info(
+            Some(&conn),
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            &crate::config::TopologyConfig::default(),
+        );
+        assert_eq!(info.topology.scored, 2);
+        assert_eq!(info.topology.communities, 1, "both rows share community 7");
 
         // Aged past the threshold: the marker flips.
         let aged = crate::config::TopologyConfig {

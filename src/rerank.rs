@@ -478,12 +478,17 @@ pub struct CoChangeContext {
 
 /// Computed topology scores at the candidate positions (TASK-098):
 /// `(hub, authority)` per (file, line), with the two set maxes folded once
-/// at preparation time.
+/// at preparation time. TASK-099 adds the community assignment per
+/// position plus the candidate set's modal community and its
+/// concentration fraction — the two halves of the REQ-004 signal.
 #[derive(Debug, Default, Clone)]
 pub struct TopologyContext {
     pub(crate) scores: HashMap<(String, u64), (f32, f32)>,
     pub(crate) max_hub: f32,
     pub(crate) max_authority: f32,
+    pub(crate) communities: HashMap<(String, u64), i64>,
+    pub(crate) modal: Option<i64>,
+    pub(crate) modal_fraction: f32,
 }
 
 /// The query sources the pipeline prepares context against: the BM25
@@ -606,6 +611,29 @@ impl SharedContext {
     /// The largest authority score across the candidate set; 0 when none.
     pub fn max_authority(&self) -> f32 {
         self.topology.max_authority
+    }
+
+    /// Community assignment at a candidate position (None unless
+    /// prepared, or when the position carries no topology row — a call
+    /// site, a comment, or a TASK-098-scored index with NULL communities).
+    pub fn community_at(&self, file: &str, line: u64) -> Option<i64> {
+        self.topology
+            .communities
+            .get(&(file.to_string(), line))
+            .copied()
+    }
+
+    /// The candidate set's modal community — the largest histogram entry,
+    /// ties to the smallest community id; `None` when no carrying
+    /// candidate exists.
+    pub fn modal_community(&self) -> Option<i64> {
+        self.topology.modal
+    }
+
+    /// Fraction of carrying candidates in the modal community: how
+    /// concentrated the results are (0.0 when there is no modal).
+    pub fn modal_community_fraction(&self) -> f32 {
+        self.topology.modal_fraction
     }
 }
 
@@ -852,6 +880,20 @@ pub fn topology_value(score: f32, set_max: f32) -> f32 {
     (score / set_max).clamp(0.0, 1.0)
 }
 
+/// The community-membership value (TASK-099, PRD-TOPO-REQ-004): a member
+/// of the candidate set's modal community scores exactly the
+/// concentration `fraction` — full weight at 100% concentration, 0.4 of
+/// it at 40%, vanishing as results scatter — and EVERY other candidate
+/// (another community, no community, or no modal at all) scores exactly
+/// 0.0: membership is a bonus, never a penalty. A non-finite fraction is
+/// a corrupt context, not a score.
+pub fn community_value(mine: Option<i64>, modal: Option<i64>, fraction: f32) -> f32 {
+    if mine.is_none() || mine != modal || !fraction.is_finite() {
+        return 0.0;
+    }
+    fraction.clamp(0.0, 1.0)
+}
+
 /// The churn signal: how actively the candidate file was modified within
 /// the mined commit window. Reads the `file_churn` aggregate prepared for
 /// the candidate set; a file absent from the table (never touched in the
@@ -969,6 +1011,39 @@ impl Signal for AuthoritySignal {
             Some((_, authority)) => topology_value(authority, ctx.max_authority()),
             None => 0.0,
         }
+    }
+}
+
+/// The community-membership signal (TASK-099, PRD-TOPO-REQ-003/004):
+/// when a query's results concentrate in one connectivity community, the
+/// members of that modal community earn a bonus scaled by the
+/// concentration — full weight at 100%, vanishing as results scatter.
+/// Membership is computed from the candidate set itself (the modal fold),
+/// never from an absolute per-symbol score; non-members and candidates
+/// without a community contribute exactly 0.0.
+pub(crate) struct CommunitySignal;
+
+impl Signal for CommunitySignal {
+    fn name(&self) -> &'static str {
+        "community"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_symbol_topology()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let file = candidate.result.file.to_string_lossy();
+        community_value(
+            ctx.community_at(&file, candidate.result.line),
+            ctx.modal_community(),
+            ctx.modal_community_fraction(),
+        )
     }
 }
 
@@ -1392,6 +1467,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(CoChangeSignal),
         Box::new(HubSignal),
         Box::new(AuthoritySignal),
+        Box::new(CommunitySignal),
     ]
 }
 
@@ -1692,7 +1768,7 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
     for chunk in wanted.chunks(IN_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!(
-            "SELECT s.file, s.line, t.hub, t.authority \
+            "SELECT s.file, s.line, t.hub, t.authority, t.community \
              FROM symbols s JOIN symbol_topology t ON t.symbol_id = s.id \
              WHERE s.file IN ({placeholders})"
         );
@@ -1705,18 +1781,22 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
                 row.get::<_, i64>(1)?,
                 row.get::<_, f64>(2)?,
                 row.get::<_, f64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         }) else {
             continue;
         };
-        for (file, line, hub, authority) in rows.flatten() {
+        for (file, line, hub, authority, community) in rows.flatten() {
             let key = (file, line as u64);
             if !positions.contains(&key) {
                 continue;
             }
             ctx.scores
-                .entry(key)
+                .entry(key.clone())
                 .or_insert((hub as f32, authority as f32));
+            if let Some(community) = community {
+                ctx.communities.entry(key).or_insert(community);
+            }
         }
     }
     ctx.max_hub = ctx
@@ -1731,6 +1811,26 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
         .map(|(_, authority)| *authority)
         .filter(|s| s.is_finite())
         .fold(0.0f32, f32::max);
+
+    // The REQ-004 fold: a UNIFORM histogram over the carrying candidates
+    // — scores do not exist at preparation time, so any score weighting
+    // would be circular. Modal is a max under (count desc, id asc), a
+    // total order, so HashMap iteration order cannot leak in. Candidates
+    // without a topology row are outside the histogram AND the
+    // denominator: they are not evidence about concentration.
+    let mut histogram: HashMap<i64, usize> = HashMap::new();
+    for key in &positions {
+        if let Some(&community) = ctx.communities.get(key) {
+            *histogram.entry(community).or_insert(0) += 1;
+        }
+    }
+    if let Some((&modal, &count)) = histogram
+        .iter()
+        .max_by(|&(id_a, count_a), &(id_b, count_b)| count_a.cmp(count_b).then(id_b.cmp(id_a)))
+    {
+        ctx.modal = Some(modal);
+        ctx.modal_fraction = count as f32 / histogram.values().sum::<usize>() as f32;
+    }
     ctx
 }
 
@@ -2062,6 +2162,7 @@ impl RankSettings {
         if !topology_enabled {
             weights.weights.insert("hub".to_string(), 0.0);
             weights.weights.insert("authority".to_string(), 0.0);
+            weights.weights.insert("community".to_string(), 0.0);
         }
         Ok(Self {
             use_pipeline: rank.enabled,
@@ -2210,7 +2311,8 @@ mod tests {
                 "churn",
                 "co_change",
                 "hub",
-                "authority"
+                "authority",
+                "community"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -2295,7 +2397,7 @@ mod tests {
         assert!(
             err.contains(
                 "known: kind, lexical, semantic, centrality, prominence, path_character, \
-proximity, signature, churn, co_change, hub, authority",
+proximity, signature, churn, co_change, hub, authority, community",
             ),
             "error lists every valid name: {err}"
         );
@@ -2795,7 +2897,9 @@ proximity, signature, churn, co_change, hub, authority",
 
     /// Seed topology rows at candidate positions: `core` (src/core.rs:1)
     /// carries the set's top scores, `mid` (src/mid.rs:5) half that, and
-    /// `unscored.rs` has a symbol with NO topology row at all.
+    /// `unscored.rs` has a symbol with NO topology row at all. `core` and
+    /// `mid` share community 7 (TASK-099); `not_a_candidate` sits alone in
+    /// community 99 to prove non-candidates stay out of the histogram.
     fn topology_seeded_conn() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
@@ -2812,15 +2916,15 @@ proximity, signature, churn, co_change, hub, authority",
             )
             .unwrap();
         }
-        for (name, hub, authority) in [
-            ("core", 0.8f64, 0.9f64),
-            ("mid", 0.4, 0.45),
-            ("not_a_candidate", 99.0, 99.0),
+        for (name, hub, authority, community) in [
+            ("core", 0.8f64, 0.9f64, 7i64),
+            ("mid", 0.4, 0.45, 7),
+            ("not_a_candidate", 99.0, 99.0, 99),
         ] {
             conn.execute(
-                "INSERT INTO symbol_topology (symbol_id, hub, authority) \
-                 SELECT id, ?2, ?3 FROM symbols WHERE name = ?1",
-                rusqlite::params![name, hub, authority],
+                "INSERT INTO symbol_topology (symbol_id, hub, authority, community) \
+                 SELECT id, ?2, ?3, ?4 FROM symbols WHERE name = ?1",
+                rusqlite::params![name, hub, authority, community],
             )
             .unwrap();
         }
@@ -2844,20 +2948,39 @@ proximity, signature, churn, co_change, hub, authority",
     }
 
     #[test]
+    fn community_value_exact_constants_and_zero_paths() {
+        // A modal member scores exactly the concentration fraction...
+        assert_eq!(community_value(Some(7), Some(7), 0.75), 0.75);
+        // ...clamped, never extrapolated.
+        assert_eq!(community_value(Some(7), Some(7), 1.4), 1.0);
+        // Every other path — another community, no community, no modal
+        // (an empty or all-NULL candidate set) — is exactly 0.0.
+        assert_eq!(community_value(Some(12), Some(7), 0.75), 0.0);
+        assert_eq!(community_value(None, Some(7), 0.75), 0.0);
+        assert_eq!(community_value(Some(7), None, 0.75), 0.0);
+        assert_eq!(community_value(None, None, 0.0), 0.0);
+        // A non-finite fraction must not leak into a score.
+        assert_eq!(community_value(Some(7), Some(7), f32::NAN), 0.0);
+    }
+
+    #[test]
     fn hub_authority_absent_from_default_weights_but_configurable() {
         // Absent = weight 0: rankings are unchanged until a user opts in.
         let defaults =
             WeightTable::from_config(&crate::config::RankConfig::default().weights).unwrap();
         assert_eq!(defaults.weight("hub"), 0.0);
         assert_eq!(defaults.weight("authority"), 0.0);
+        assert_eq!(defaults.weight("community"), 0.0);
 
-        // Registered: both names are accepted by [rank.weights].
+        // Registered: the names are accepted by [rank.weights].
         let mut weights = HashMap::new();
         weights.insert("hub".to_string(), 1.0);
         weights.insert("authority".to_string(), 1.0);
+        weights.insert("community".to_string(), 1.0);
         let table = WeightTable::from_config(&weights).unwrap();
         assert_eq!(table.weight("hub"), 1.0);
         assert_eq!(table.weight("authority"), 1.0);
+        assert_eq!(table.weight("community"), 1.0);
     }
 
     #[test]
@@ -2872,6 +2995,12 @@ proximity, signature, churn, co_change, hub, authority",
             ContextReqs::none().with_symbol_topology()
         );
         assert_eq!(AuthoritySignal.name(), "authority");
+        assert_eq!(
+            CommunitySignal.requires(),
+            ContextReqs::none().with_symbol_topology(),
+            "community shares the topology slice — no new context flag"
+        );
+        assert_eq!(CommunitySignal.name(), "community");
     }
 
     #[test]
@@ -2909,6 +3038,42 @@ proximity, signature, churn, co_change, hub, authority",
     }
 
     #[test]
+    fn topology_context_folds_the_modal_community_and_fraction() {
+        let (_dir, conn) = topology_seeded_conn();
+        let results = vec![
+            classified("src/core.rs", 1, "x", ResultCategory::Other),
+            classified("src/mid.rs", 5, "x", ResultCategory::Other),
+            classified("src/unscored.rs", 9, "x", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        assert_eq!(ctx.community_at("src/core.rs", 1), Some(7));
+        assert_eq!(ctx.community_at("src/mid.rs", 5), Some(7));
+        assert_eq!(
+            ctx.community_at("src/unscored.rs", 9),
+            None,
+            "a position without a topology row is absent"
+        );
+        assert_eq!(
+            ctx.community_at("src/other.rs", 3),
+            None,
+            "a scored symbol outside the candidate set stays out"
+        );
+        // Both carrying candidates are community 7: modal 7, and the
+        // fraction is exactly 2/2 — `naked` (no row) and community 99
+        // (not a candidate) are outside the denominator.
+        assert_eq!(ctx.modal_community(), Some(7));
+        assert_eq!(ctx.modal_community_fraction(), 1.0);
+    }
+
+    #[test]
     fn topology_context_empty_without_table_or_connection() {
         // A pre-TASK-098 index has no symbol_topology table: the presence
         // probe degrades to an empty slice, never an error.
@@ -2934,6 +3099,38 @@ proximity, signature, churn, co_change, hub, authority",
             &ContextSources::default(),
         );
         assert_eq!(ctx.topology_scores("src/a.rs", 1), None);
+
+        // A TASK-098-scored index has topology rows but NULL communities:
+        // the per-position lookup and the modal fold both see absence.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('legacy', 'function', 'src/a.rs', 1, 1, 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_topology (symbol_id, hub, authority) \
+             SELECT id, 0.5, 0.5 FROM symbols WHERE name = 'legacy'",
+            [],
+        )
+        .unwrap();
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "x",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        assert_eq!(
+            ctx.topology_scores("src/a.rs", 1),
+            Some((0.5, 0.5)),
+            "hub and authority still serve"
+        );
+        assert_eq!(ctx.community_at("src/a.rs", 1), None);
+        assert_eq!(ctx.modal_community(), None);
+        assert_eq!(ctx.modal_community_fraction(), 0.0);
     }
 
     #[test]
@@ -3005,6 +3202,193 @@ proximity, signature, churn, co_change, hub, authority",
             PathBuf::from("src/unscored.rs"),
             "the equally-matched leaf helper follows"
         );
+    }
+
+    /// Symbols + topology rows at explicit `(file, line, community)`
+    /// positions, with uniform hub/authority — community is the only
+    /// signal that differs between candidates.
+    fn community_seeded_conn(entries: &[(&str, i64, i64)]) -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for (i, (file, line, community)) in entries.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, file, line, col, language) \
+                 VALUES (?1, 'function', ?2, ?3, 1, 'rust')",
+                rusqlite::params![format!("sym{i}"), file, line],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_topology (symbol_id, hub, authority, community) \
+                 SELECT id, 0.5, 0.5, ?1 FROM symbols WHERE file = ?2 AND line = ?3",
+                rusqlite::params![community, file, line],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    #[test]
+    fn community_signal_favors_the_modal_communitys_members() {
+        // REQ-004 end-to-end: five equally-matched Definition candidates,
+        // three in community 7 and two in community 12. Concentration is
+        // exactly 3/5: the modal members' bonus is exactly 3/5, the
+        // others' exactly 0.0, and that bonus alone reorders results no
+        // ordinal signal could.
+        let entries = [
+            ("src/a1.rs", 1i64, 7i64),
+            ("src/a2.rs", 1, 7),
+            ("src/a3.rs", 1, 7),
+            ("src/b1.rs", 1, 12),
+            ("src/b2.rs", 1, 12),
+        ];
+        let (_dir, conn) = community_seeded_conn(&entries);
+        let results: Vec<ClassifiedResult> = entries
+            .iter()
+            .map(|(file, line, _)| {
+                classified(file, *line as u64, "handler", ResultCategory::Definition)
+            })
+            .collect();
+
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("community", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        let community_of = |file: &str| entries.iter().find(|(f, _, _)| *f == file).unwrap().2;
+        for s in &scored {
+            let file = s.classified.result.file.to_str().unwrap();
+            let value = s
+                .contributions
+                .iter()
+                .find(|c| c.signal == "community")
+                .unwrap()
+                .value;
+            if community_of(file) == 7 {
+                assert_eq!(value, 3.0f32 / 5.0f32, "modal member: {file}");
+            } else {
+                assert_eq!(
+                    value, 0.0,
+                    "non-member is never penalized, just unbuilt: {file}"
+                );
+            }
+        }
+        let best_of = |community: i64| {
+            scored
+                .iter()
+                .filter(|s| community_of(s.classified.result.file.to_str().unwrap()) == community)
+                .map(|s| s.score)
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        assert!(
+            best_of(7) > best_of(12),
+            "the modal community's members outrank equally-matched outsiders"
+        );
+        assert_eq!(
+            community_of(scored[0].classified.result.file.to_str().unwrap()),
+            7,
+            "the winner is a modal-community member"
+        );
+    }
+
+    #[test]
+    fn scattered_communities_scale_the_bonus_down() {
+        // "Predominantly" is continuous: a 2-2-1 scatter makes the modal
+        // community (7, the tie-break winner) exactly 40% concentrated,
+        // so its members' bonus is exactly 0.4 — not the full weight.
+        let entries = [
+            ("src/a1.rs", 1i64, 7i64),
+            ("src/a2.rs", 1, 7),
+            ("src/b1.rs", 1, 12),
+            ("src/b2.rs", 1, 12),
+            ("src/c1.rs", 1, 30),
+        ];
+        let (_dir, conn) = community_seeded_conn(&entries);
+        let results: Vec<ClassifiedResult> = entries
+            .iter()
+            .map(|(file, line, _)| {
+                classified(file, *line as u64, "handler", ResultCategory::Definition)
+            })
+            .collect();
+
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("community", 1.0)]),
+            &ContextSources::default(),
+        );
+
+        for s in &scored {
+            let file = s.classified.result.file.to_str().unwrap();
+            let value = s
+                .contributions
+                .iter()
+                .find(|c| c.signal == "community")
+                .unwrap()
+                .value;
+            let community = entries.iter().find(|(f, _, _)| *f == file).unwrap().2;
+            if community == 7 {
+                assert_eq!(value, 2.0f32 / 5.0f32, "40% concentration: {file}");
+            } else {
+                assert_eq!(value, 0.0, "{file}");
+            }
+        }
+    }
+
+    #[test]
+    fn community_histogram_ties_pick_the_smallest_community_id() {
+        // A 2-vs-2 split: the SMALLER community id is the modal one, so
+        // its members carry the 0.5 bonus while the larger id's members
+        // carry 0.0 — determinism independent of HashMap iteration order.
+        let entries = [
+            ("src/a1.rs", 1i64, 12i64),
+            ("src/a2.rs", 1, 12),
+            ("src/b1.rs", 1, 7),
+            ("src/b2.rs", 1, 7),
+        ];
+        let (_dir, conn) = community_seeded_conn(&entries);
+        let results: Vec<ClassifiedResult> = entries
+            .iter()
+            .map(|(file, line, _)| {
+                classified(file, *line as u64, "handler", ResultCategory::Definition)
+            })
+            .collect();
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_topology(),
+            "handler",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        assert_eq!(
+            ctx.modal_community(),
+            Some(7),
+            "ties break to the smallest id"
+        );
+        assert_eq!(ctx.modal_community_fraction(), 0.5);
+
+        let scored = rerank(
+            results,
+            &QueryInfo { pattern: "handler" },
+            Some(&conn),
+            &table(&[("kind", 1.0), ("community", 1.0)]),
+            &ContextSources::default(),
+        );
+        for s in &scored {
+            let file = s.classified.result.file.to_str().unwrap();
+            let community = entries.iter().find(|(f, _, _)| *f == file).unwrap().2;
+            let value = s
+                .contributions
+                .iter()
+                .find(|c| c.signal == "community")
+                .unwrap()
+                .value;
+            assert_eq!(value, if community == 7 { 0.5 } else { 0.0 }, "{file}");
+        }
     }
 
     #[test]
@@ -5070,13 +5454,15 @@ proximity, signature, churn, co_change, hub, authority",
     #[test]
     fn rank_settings_topology_kill_switch_restores_prior_behavior_exactly() {
         // A table that opts into topology, loaded with the kill switch on:
-        // both weights are forced to exactly 0.0 (PRD-TOPO-REQ-008).
+        // the three topology weights are forced to exactly 0.0
+        // (PRD-TOPO-REQ-008).
         let rank = crate::config::RankConfig {
             enabled: true,
             weights: std::collections::HashMap::from([
                 ("kind".to_string(), 1.0),
                 ("hub".to_string(), 2.0),
                 ("authority".to_string(), 3.0),
+                ("community".to_string(), 4.0),
             ]),
             class_multipliers: ClassMultipliers::neutral(),
         };
@@ -5091,6 +5477,7 @@ proximity, signature, churn, co_change, hub, authority",
         .unwrap();
         assert_eq!(disabled.weights.weight("hub"), 0.0);
         assert_eq!(disabled.weights.weight("authority"), 0.0);
+        assert_eq!(disabled.weights.weight("community"), 0.0);
         assert_eq!(disabled.weights.weight("kind"), 1.0);
 
         // The zeroed table scores a populated candidate set
@@ -5112,6 +5499,7 @@ proximity, signature, churn, co_change, hub, authority",
         let mut prior = rank.clone();
         prior.weights.remove("hub");
         prior.weights.remove("authority");
+        prior.weights.remove("community");
         let prior_settings = RankSettings::from_config(
             &prior,
             &search,

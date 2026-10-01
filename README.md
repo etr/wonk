@@ -236,7 +236,7 @@ Wonk includes a built-in [MCP](https://modelcontextprotocol.io/) server for AI c
 | `context <name>` | Full symbol context: callers, callees, flows, children |
 | `impact <file>` | Symbol-level change impact analysis |
 | **Semantic** | |
-| `cluster <path>` | Cluster symbols by semantic similarity (K-Means) |
+| `cluster <path>` | Cluster symbols by embedding similarity (K-Means). Connectivity-based grouping is a different mechanism: the opt-in `community` rerank signal (`[rank.weights]`) groups symbols by call-graph structure |
 | **Index management** | |
 | `init` | Build index (auto-runs on first query) |
 | `update` | Rebuild index |

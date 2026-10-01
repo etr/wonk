@@ -73,7 +73,11 @@ pub enum Command {
     /// Semantic search: find symbols related to a natural language query
     Ask(AskArgs),
 
-    /// Cluster symbols by semantic similarity within a directory
+    /// Cluster symbols by semantic (embedding) similarity within a directory
+    ///
+    /// Embedding similarity is textual affinity; the `community` rerank
+    /// signal groups by call-graph connectivity instead — a cohesive
+    /// subsystem across directories — and is unrelated to this command.
     Cluster(ClusterArgs),
 
     /// Analyze impact of changed symbols via semantic similarity
