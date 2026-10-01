@@ -51,7 +51,7 @@
 | M31 | Body Elision | 2 | Complete |
 | M32 | Signal-Based Reranking | 4 | Complete |
 | M33 | History-Derived Signals | 2 | Complete |
-| M34 | Graph-Topology Signals | 2 | In Progress |
+| M34 | Graph-Topology Signals | 2 | Complete |
 | M35 | Near-Duplicate Similarity | 1 | Not Started |
 | M36 | Usage Feedback Loop | 5 | Not Started |
 
@@ -4136,11 +4136,11 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Estimate:** M
 
 **Action Items:**
-- [ ] Compute community assignments by connectivity; store on `symbol_topology` (PRD-TOPO-REQ-002)
-- [ ] Deterministic assignment — stable community identifiers across runs on an unchanged graph (PRD-TOPO-REQ-005)
-- [ ] Expose community membership as a rerank signal (PRD-TOPO-REQ-003)
-- [ ] When results concentrate in one community, favor that community's members (PRD-TOPO-REQ-004)
-- [ ] Document the distinction from `wonk cluster` — connectivity vs. embedding similarity — in help text and README
+- [x] Compute community assignments by connectivity; store on `symbol_topology` (PRD-TOPO-REQ-002)
+- [x] Deterministic assignment — stable community identifiers across runs on an unchanged graph (PRD-TOPO-REQ-005)
+- [x] Expose community membership as a rerank signal (PRD-TOPO-REQ-003)
+- [x] When results concentrate in one community, favor that community's members (PRD-TOPO-REQ-004)
+- [x] Document the distinction from `wonk cluster` — connectivity vs. embedding similarity — in help text and README
 
 **Dependencies:**
 - Blocked by: TASK-098
@@ -4155,7 +4155,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-TOPO-REQ-002, PRD-TOPO-REQ-003, PRD-TOPO-REQ-004, PRD-TOPO-REQ-005
 **Related Decisions:** DR-040
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
