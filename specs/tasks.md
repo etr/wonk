@@ -51,7 +51,7 @@
 | M31 | Body Elision | 2 | Complete |
 | M32 | Signal-Based Reranking | 4 | Complete |
 | M33 | History-Derived Signals | 2 | Complete |
-| M34 | Graph-Topology Signals | 2 | Not Started |
+| M34 | Graph-Topology Signals | 2 | In Progress |
 | M35 | Near-Duplicate Similarity | 1 | Not Started |
 | M36 | Usage Feedback Loop | 5 | Not Started |
 
@@ -4125,7 +4125,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-TOPO-REQ-001, PRD-TOPO-REQ-003, PRD-TOPO-REQ-005, PRD-TOPO-REQ-006, PRD-TOPO-REQ-007, PRD-TOPO-REQ-008
 **Related Decisions:** DR-040
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
