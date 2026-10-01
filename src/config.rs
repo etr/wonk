@@ -219,8 +219,13 @@ pub struct RankConfig {
 impl Default for RankConfig {
     fn default() -> Self {
         Self {
-            // REQ-017: the flip to `true` is its own gated commit.
-            enabled: false,
+            // REQ-017 FLIPPED (TASK-095): the tuned pipeline is the default.
+            // Evidence: bench/rank-tuning-results.md (mean p@10 0.5025 ->
+            // 0.5175 on the labeled set, no class regressed) and
+            // bench/rank-latency-results.md (mean added 8.309 ms per
+            // 40-query pass, < 20 ms gate). [rank] enabled = false keeps
+            // the previous ordering byte-for-byte.
+            enabled: true,
             // Tuned against the labeled set (TASK-095); every number below
             // is transcribed verbatim from bench/rank-tuning-results.md
             // (candidate K, the mildest of the tied 0.5175 plateau).
@@ -1668,14 +1673,15 @@ rrf_k = 80.0
     // -- Rank config tests --------------------------------------------------
 
     #[test]
-    fn rank_defaults_to_disabled_with_tuned_weights() {
-        // REQ-017: reranking stays behind config defaulting to the current
-        // ordering. The weights/multipliers ARE the TASK-095 tuned table,
-        // transcribed verbatim from bench/rank-tuning-results.md
-        // (candidate K; mean p@10 0.5025 -> 0.5175, no class regressed).
+    fn rank_defaults_to_enabled_with_tuned_weights() {
+        // REQ-017 FLIPPED (TASK-095): the tuned pipeline is the default,
+        // earned on the labeled set — bench/rank-tuning-results.md
+        // (candidate K; mean p@10 0.5025 -> 0.5175, no class regressed) and
+        // bench/rank-latency-results.md (added latency < 20 ms). The
+        // previous ordering stays reachable via [rank] enabled = false.
         let env = TestEnv::new();
         let config = env.load().unwrap();
-        assert!(!config.rank.enabled);
+        assert!(config.rank.enabled);
         assert_eq!(
             config.rank.weights,
             HashMap::from([
@@ -1823,8 +1829,8 @@ rrf_k = 40.0
 "#,
         );
         let config = env.load().unwrap();
-        assert!(!config.rank.enabled);
-        // The tuned table (see rank_defaults_to_disabled_with_tuned_weights
+        assert!(config.rank.enabled, "the flipped default survives");
+        // The tuned table (see rank_defaults_to_enabled_with_tuned_weights
         // for the provenance) survives an unrelated section untouched.
         assert_eq!(config.rank.weights.get("lexical"), Some(&0.4));
         assert_eq!(config.rank.weights.get("kind"), Some(&1.0));

@@ -295,19 +295,24 @@ fn legacy_settings_reproduce_rank_and_dedup() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_config_gates_to_legacy_ordering() {
-    let config = Config::default();
-    assert!(!config.rank.enabled, "pipeline must be disabled by default");
-    // TASK-095: the default weights are the TUNED table (transcribed from
-    // bench/rank-tuning-results.md, candidate K) — they are inert while
-    // enabled = false (the legacy path ignores weights) and gate the
-    // pipeline once enabled. kind stays anchored at 1.0.
-    assert_eq!(config.rank.weights.get("kind"), Some(&1.0f32));
-    assert_eq!(config.rank.weights.get("lexical"), Some(&0.4f32));
-    assert_eq!(config.rank.class_multipliers.symbol.lexical, 1.8f32);
+fn disabled_config_reproduces_legacy_ordering() {
+    // TASK-095 flip: the DEFAULT config now runs the tuned pipeline
+    // (earned on the labeled set; see bench/rank-tuning-results.md). The
+    // conscious update of the old default-gate test: an EXPLICIT disabled
+    // config is the escape hatch that keeps the previous ordering.
+    let default_config = Config::default();
+    assert!(default_config.rank.enabled, "the flip is pinned here");
+    assert_eq!(default_config.rank.weights.get("kind"), Some(&1.0f32));
+    assert_eq!(default_config.rank.weights.get("lexical"), Some(&0.4f32));
+    assert_eq!(default_config.rank.class_multipliers.symbol.lexical, 1.8f32);
 
-    // Settings derived exactly as the router derives them from a default
-    // config take the legacy path and reproduce its output.
+    let config = Config {
+        rank: wonk::config::RankConfig {
+            enabled: false,
+            ..default_config.rank.clone()
+        },
+        ..default_config
+    };
     let settings = RankSettings {
         use_pipeline: config.rank.enabled,
         weights: WeightTable::from_config(&config.rank.weights).unwrap(),
@@ -481,8 +486,24 @@ fn cli_pipeline_rows_record_query_class_and_legacy_rows_do_not() {
         output
     };
 
-    // Legacy (default config): rows carry no query_class key at all.
-    let legacy = run(None);
+    // Post-flip default: every row records the detected class.
+    let piped = run(None);
+    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&piped.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("NDJSON lines"))
+        .filter(|v: &serde_json::Value| v.get("file").is_some())
+        .collect();
+    assert!(!rows.is_empty(), "fixture corpus must produce rows");
+    for row in &rows {
+        assert_eq!(
+            row["query_class"], "symbol",
+            "default (flipped) rows record the class: {row}"
+        );
+    }
+
+    // The escape hatch: an explicit disabled config returns to legacy rows
+    // carrying no query_class key at all.
+    let legacy = run(Some("[rank]\nenabled = false\n"));
     let legacy_stdout = String::from_utf8_lossy(&legacy.stdout).into_owned();
     let mut legacy_rows = 0usize;
     for line in legacy_stdout.lines() {
@@ -497,10 +518,6 @@ fn cli_pipeline_rows_record_query_class_and_legacy_rows_do_not() {
         );
     }
     assert!(legacy_rows > 0, "fixture corpus must produce rows");
-
-    // Pipeline enabled: every row records the detected class, and stdout
-    // stays byte-identical to --why (the class line goes to stderr only).
-    let piped = run(Some("[rank]\nenabled = true\n"));
     let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&piped.stdout)
         .lines()
         .map(|l| serde_json::from_str(l).expect("NDJSON lines"))
