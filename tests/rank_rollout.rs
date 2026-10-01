@@ -20,7 +20,7 @@ use serde::Deserialize;
 use tempfile::TempDir;
 use wonk::db;
 use wonk::pipeline;
-use wonk::rerank::{self, ClassMultipliers, QueryClass, RankSettings, WeightTable};
+use wonk::rerank::{self, ClassMultipliers, QueryClass, RankSettings};
 use wonk::search::{self, SearchResult};
 
 const CORPUS: &str = "tests/fixtures/labeled_queries/corpus";
@@ -123,30 +123,43 @@ fn precision_at_10(ranked: &[String], relevant: &[String]) -> f32 {
         / 10.0
 }
 
-/// Mean precision@10 per query class and overall for `settings` over the
-/// whole labeled set.
+/// Mean precision@10 for `settings` over the whole labeled set: the
+/// per-query mean (sum of p@10 over all 40 queries / 40) — the same
+/// `ranking_regression` metric bench/rank_tune_bench.rs reports and
+/// rank-tuning-results.md records — plus per-class means and the raw
+/// per-query values.
 fn measure(root: &Path, conn: &Connection, settings: &RankSettings) -> Summary {
     let labels = load_labels();
     let mut by_class: HashMap<String, (f32, usize)> = HashMap::new();
+    let mut per_query = HashMap::new();
+    let mut sum = 0.0f32;
     for query in &labels.query {
         let ranked = ranked_files(root, conn, &query.text, settings);
         let p = precision_at_10(&ranked, &query.relevant);
+        sum += p;
+        per_query.insert(query.text.clone(), p);
         let entry = by_class.entry(query.class.clone()).or_insert((0.0, 0));
         entry.0 += p;
         entry.1 += 1;
     }
     let mut per_class = HashMap::new();
-    for (class, (sum, count)) in by_class {
-        per_class.insert(class, sum / count as f32);
+    for (class, (class_sum, count)) in by_class {
+        per_class.insert(class, class_sum / count as f32);
     }
-    let overall = per_class.values().sum::<f32>() / per_class.len() as f32;
-    Summary { overall, per_class }
+    let overall = sum / labels.query.len() as f32;
+    Summary {
+        overall,
+        per_class,
+        per_query,
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Summary {
+    /// Mean precision@10 over all queries (the recorded bench metric).
     overall: f32,
     per_class: HashMap<String, f32>,
+    per_query: HashMap<String, f32>,
 }
 
 /// The legacy ordering (REQ-017's baseline): the pre-pipeline sort.
@@ -170,24 +183,23 @@ fn tuned_defaults_as_shipped() -> RankSettings {
     .unwrap()
 }
 
-fn weights_of(entries: &[(&str, f32)]) -> WeightTable {
-    WeightTable::from_config(&entries.iter().map(|(n, w)| (n.to_string(), *w)).collect()).unwrap()
-}
-
-fn multipliers_of(symbol: (f32, f32), path: (f32, f32), signature: (f32, f32)) -> ClassMultipliers {
-    ClassMultipliers {
-        symbol: rerank::ChannelMultipliers {
-            lexical: symbol.0,
-            semantic: symbol.1,
+/// A discrimination control for the flip gate: the shipped table with
+/// every class-multiplier split inverted (lexical and semantic swapped
+/// pairwise). Same weights, wrong direction — built from the shipped
+/// settings so it always tracks future retunes.
+fn inverted_split_settings() -> RankSettings {
+    let shipped = tuned_defaults_as_shipped();
+    let swap = |m: rerank::ChannelMultipliers| rerank::ChannelMultipliers {
+        lexical: m.semantic,
+        semantic: m.lexical,
+    };
+    RankSettings {
+        class_multipliers: ClassMultipliers {
+            symbol: swap(shipped.class_multipliers.symbol),
+            path: swap(shipped.class_multipliers.path),
+            signature: swap(shipped.class_multipliers.signature),
         },
-        path: rerank::ChannelMultipliers {
-            lexical: path.0,
-            semantic: path.1,
-        },
-        signature: rerank::ChannelMultipliers {
-            lexical: signature.0,
-            semantic: signature.1,
-        },
+        ..shipped
     }
 }
 
@@ -312,13 +324,28 @@ fn tuned_rank_config() -> wonk::config::RankConfig {
 fn tuned_defaults_beat_legacy_on_labeled_set() {
     // REQ-017's standing flip gate: the shipping defaults (with the flip
     // applied) must beat the legacy ordering on the labeled set — mean
-    // precision@10 strictly higher, no query class regressing. The
-    // measured numbers are recorded in bench/rank-tuning-results.md
-    // (legacy 0.5025 vs tuned 0.5175; symbol +0.05, conceptual +0.0071,
-    // path and signature unchanged).
+    // precision@10 over all 40 queries (the metric bench/rank_tune_bench
+    // reports and rank-tuning-results.md records) strictly higher, no
+    // query class regressing (legacy 0.5025 -> tuned 0.5175; symbol
+    // +0.05, conceptual +0.0071, path and signature unchanged).
+    //
+    // Beating legacy alone cannot certify the tuning: at 40 queries a
+    // p@10 step is 0.0025, so a wrong-but-harmless table also clears the
+    // no-regression bar (an inverted symbol split measures 0.5125 and
+    // used to pass). Three discriminators pin the gate to the recorded
+    // tuning (bench/rank-tuning-results.md, candidate K):
+    //   1. MARGIN PIN — the legacy and tuned means reproduce the recorded
+    //      0.5025 / 0.5175 within three query-flip quanta (0.0075).
+    //   2. INVERTED CONTROL — the same weights with every class
+    //      multiplier split swapped (lexical <-> semantic) measures
+    //      STRICTLY LOWER than the shipped tuning: the splits must point
+    //      the right way, not merely avoid harm.
+    //   3. The four recorded per-query improvements (retry_backoff,
+    //      parse_header, TokenClaims, session storage) are present.
     let (dir, conn) = setup_labeled_corpus();
     let legacy = measure(dir.path(), &conn, &legacy_settings());
     let tuned = measure(dir.path(), &conn, &tuned_defaults_as_shipped());
+    let inverted = measure(dir.path(), &conn, &inverted_split_settings());
 
     for (class, value) in &tuned.per_class {
         let baseline = legacy.per_class.get(class).copied().unwrap_or(0.0);
@@ -333,37 +360,132 @@ fn tuned_defaults_beat_legacy_on_labeled_set() {
         tuned.overall,
         legacy.overall
     );
+
+    // 1. Margin pin: the measured means tie the gate to the recorded
+    //    evidence (one p@10 flip at 40 queries moves the mean 0.0025;
+    //    three quanta of tolerance absorb float summation only).
+    const RECORDED_LEGACY_MEAN: f32 = 0.5025;
+    const RECORDED_TUNED_MEAN: f32 = 0.5175;
+    const QUERY_FLIP_QUANTUM: f32 = 0.0025;
+    const TOLERANCE: f32 = 3.0 * QUERY_FLIP_QUANTUM;
+    assert!(
+        (tuned.overall - RECORDED_TUNED_MEAN).abs() <= TOLERANCE,
+        "tuned mean {} must reproduce the recorded {} (bench/rank-tuning-results.md) \
+         within {TOLERANCE}",
+        tuned.overall,
+        RECORDED_TUNED_MEAN
+    );
+    assert!(
+        (legacy.overall - RECORDED_LEGACY_MEAN).abs() <= TOLERANCE,
+        "legacy mean {} must reproduce the recorded {} (bench/rank-tuning-results.md) \
+         within {TOLERANCE}",
+        legacy.overall,
+        RECORDED_LEGACY_MEAN
+    );
+
+    // 2. Inverted control: a table that anti-tunes the class splits must
+    //    not measure as well as the shipped one.
+    assert!(
+        inverted.overall < tuned.overall,
+        "the inverted-split control must measure strictly lower than the shipped \
+         tuning: inverted {} vs tuned {}",
+        inverted.overall,
+        tuned.overall
+    );
+
+    // 3. The recorded per-query improvements must actually appear.
+    for query in [
+        "retry_backoff",
+        "parse_header",
+        "TokenClaims",
+        "session storage",
+    ] {
+        let before = legacy.per_query[query];
+        let after = tuned.per_query[query];
+        assert!(
+            after > before,
+            "recorded improvement for {query:?} missing: legacy {before} -> tuned {after}"
+        );
+    }
 }
 
 #[test]
-fn symbol_query_over_corpus_prefers_the_definition_above_doc_mentions() {
-    // The headline AC over the labeled corpus: a symbol query's exact-token
-    // definition outranks prose mentions; a conceptual query's topical
-    // files outrank incidental mentions.
+fn ac_pair_over_corpus_holds_under_shipped_defaults() {
+    // The headline acceptance pair, pinned to the configuration users
+    // actually receive (tuned_defaults_as_shipped: RankConfig::default()
+    // with the flip applied) — not a bespoke table:
+    //   - SYMBOL leg: for `validate_token`, the exact-token definition
+    //     (src/auth/token.rs) ranks strictly above the same-named compat
+    //     stub (src/compat/legacy_auth.rs), and the relevant files supply
+    //     the top-10: only the tolerated compat mention may intrude
+    //     (p@10 >= 0.9). The strength clause is the mutation check —
+    //     under an inverted symbol split the mention still trails the
+    //     definition, but a passer-by file enters the top-10 and drops
+    //     p@10 to 0.8.
+    //   - CONCEPTUAL leg: for `session storage`, the labeled topical
+    //     files (src/auth/session.rs, src/notes/storage_notes.rs) outrank
+    //     the incidental exact-token mention (src/misc/a_auth_notes.rs) —
+    //     a file the query text literally matches (case-sensitively, as
+    //     the candidate grep runs) but that is not an answer.
+    // Neither leg may pass vacuously: a missing fixture file panics
+    // instead of skipping its assertion.
     let (dir, conn) = setup_labeled_corpus();
-    let settings = RankSettings {
-        use_pipeline: true,
-        weights: weights_of(&[
-            ("kind", 1.0),
-            ("lexical", 0.3),
-            ("semantic", 1.2),
-            ("prominence", 1.0),
-            ("centrality", 0.3),
-        ]),
-        class_multipliers: multipliers_of((2.0, 0.2), (1.0, 1.0), (1.0, 1.0)),
-        ..Default::default()
-    };
+    let settings = tuned_defaults_as_shipped();
 
+    // --- symbol leg -------------------------------------------------------
     let ranked = ranked_files(dir.path(), &conn, "validate_token", &settings);
     let position = |file: &str| ranked.iter().position(|f| f == file);
-    let definition = position("src/auth/token.rs");
-    let mention = position("src/compat/legacy_auth.rs");
-    match (definition, mention) {
-        (Some(d), Some(m)) => assert!(
-            d < m,
-            "the exact-token definition must outrank the compat doc mention: {ranked:?}"
-        ),
-        (None, _) => panic!("definition file missing from results: {ranked:?}"),
-        _ => {}
+    let definition = position("src/auth/token.rs")
+        .unwrap_or_else(|| panic!("definition file missing from results: {ranked:?}"));
+    let mention = position("src/compat/legacy_auth.rs")
+        .unwrap_or_else(|| panic!("compat mention file missing from results: {ranked:?}"));
+    assert!(
+        definition < mention,
+        "the exact-token definition must outrank the compat mention: {ranked:?}"
+    );
+    let symbol_relevant: Vec<String> = [
+        "src/auth/token.rs",
+        "tests/token_test.rs",
+        "src/auth/session.rs",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let symbol_p10 = precision_at_10(&ranked, &symbol_relevant);
+    assert!(
+        symbol_p10 >= 0.9,
+        "the definition must supply the top-10 (only the compat mention may \
+         intrude): p@10 {symbol_p10}, ranked {ranked:?}"
+    );
+
+    // --- conceptual leg ---------------------------------------------------
+    let ranked = ranked_files(dir.path(), &conn, "session storage", &settings);
+    let position = |file: &str| ranked.iter().position(|f| f == file);
+    let conceptual_relevant = ["src/auth/session.rs", "src/notes/storage_notes.rs"];
+    for file in conceptual_relevant {
+        position(file).unwrap_or_else(|| {
+            panic!("relevant topical file {file} missing from top-10: {ranked:?}")
+        });
+    }
+    let last_relevant_row = ranked
+        .iter()
+        .rposition(|f| conceptual_relevant.contains(&f.as_str()))
+        .expect("a relevant row exists (presence asserted above)");
+    let mentions = ["src/misc/a_auth_notes.rs"];
+    // The mentions must be real candidates: the ranking demoted them, the
+    // grep did not skip them.
+    let found = candidates(dir.path(), "session storage");
+    for file in mentions {
+        assert!(
+            found.iter().any(|r| r.file == Path::new(file)),
+            "incidental mention {file} must be a grep candidate for the leg to mean anything"
+        );
+        if let Some(m) = position(file) {
+            assert!(
+                m > last_relevant_row,
+                "incidental mention {file} at row {m} outranks the topical files \
+                 (last relevant row {last_relevant_row}): {ranked:?}"
+            );
+        }
     }
 }
