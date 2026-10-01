@@ -1680,6 +1680,7 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM reach_meta;
          DELETE FROM files;
          DELETE FROM file_churn;
+         DELETE FROM co_change;
          DELETE FROM commit_files;
          DELETE FROM mined_commits;
          DELETE FROM history_meta;",
