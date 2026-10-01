@@ -1166,6 +1166,82 @@ mod tests {
         assert!(coupling(&conn, "f05.rs", "f11.rs").is_none(), "largest dropped");
     }
 
+    #[test]
+    fn ac1_file_repeatedly_changing_alongside_query_target_is_surfaced() {
+        if !git_available() {
+            return;
+        }
+        // handler.rs and serializer.rs change together five times; loner.rs
+        // changes alone five times at the same moments — equally hot by
+        // churn, coupled to nothing (TASK-097, PRD-HIST-REQ-006).
+        let mut groups: Vec<(&[&str], i64)> = Vec::new();
+        for i in 0..5 {
+            let ts = 110 + i;
+            groups.push((&["handler.rs", "serializer.rs"], ts));
+            groups.push((&["loner.rs"], ts));
+        }
+        let (dir, conn) = make_history_repo_groups(&groups);
+        mine_full(&conn, dir.path(), &opts(10)).unwrap();
+
+        // Three same-category candidates, all containing the query target:
+        // only the co-change signal separates them.
+        let hits = ["handler.rs", "serializer.rs", "loner.rs"]
+            .into_iter()
+            .map(|file| {
+                crate::search::SearchResult {
+                    file: Path::new(file).to_path_buf(),
+                    line: 1,
+                    col: 1,
+                    content: format!("{file} target"),
+                }
+            })
+            .collect::<Vec<_>>();
+        let scored = crate::rerank::rerank(
+            crate::ranker::classify_results(&hits, None),
+            &crate::rerank::QueryInfo { pattern: "target" },
+            Some(&conn),
+            &crate::rerank::WeightTable::from_pairs([("co_change".to_string(), 1.0f32)])
+                .unwrap(),
+            &crate::rerank::ContextSources::default(),
+        );
+
+        let by_file = |f: &str| {
+            scored
+                .iter()
+                .find(|s| s.classified.result.file == Path::new(f))
+                .unwrap()
+        };
+        let coupled: Vec<&str> = ["handler.rs", "serializer.rs"]
+            .into_iter()
+            .filter(|f| by_file(f).score > by_file("loner.rs").score)
+            .collect();
+        assert_eq!(coupled.len(), 2, "both co-moving files outrank the loner");
+        for f in ["handler.rs", "serializer.rs"] {
+            let contribution = by_file(f)
+                .contributions
+                .iter()
+                .find(|c| c.signal == "co_change")
+                .unwrap();
+            assert!(contribution.value > 0.0, "{f} has positive evidence");
+            assert!(
+                (contribution.value - 1.0).abs() < 1e-6,
+                "{f} carries the set max: {}",
+                contribution.value
+            );
+        }
+        let loner = by_file("loner.rs");
+        let loner_contribution = loner
+            .contributions
+            .iter()
+            .find(|c| c.signal == "co_change")
+            .unwrap();
+        assert_eq!(
+            loner_contribution.value, 0.0,
+            "the loner has no coupling evidence"
+        );
+        assert_eq!(loner.score, 0.0);
+    }
+
     // -- parse_git_log ---------------------------------------------------------
 
     #[test]
