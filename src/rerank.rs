@@ -414,6 +414,83 @@ impl Signal for CentralitySignal {
     }
 }
 
+/// Whether `term` occurs in `line` as a MAXIMAL identifier run
+/// (`[A-Za-z0-9_]+` bounded by non-identifier characters),
+/// case-insensitively.
+///
+/// A dedicated scanner rather than `tokenizer::tokenize`: the tokenizer
+/// splits on `_`, so it would token-match `foo` inside `foo_bar` — here the
+/// boundary is the point, because a query term appearing inside a longer
+/// identifier names a different symbol. Terms containing non-ASCII
+/// characters can never match (code identifiers are ASCII runs).
+pub fn contains_identifier_token(line: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|run| run.eq_ignore_ascii_case(term))
+}
+
+/// Prominence tier constants (TASK-093, PRD-RANK-REQ-015).
+pub const PROMINENCE_EXACT: f32 = 1.0;
+/// A query term mentioned as a whole identifier in the matched line.
+pub const PROMINENCE_TOKEN: f32 = 0.5;
+
+/// The prominence signal: does this candidate DEFINE (or merely mention,
+/// or merely contain) the queried name?
+///
+/// Tiers, best one wins: 1.0 exact definition — the symbol indexed at this
+/// position has a name equal to a query term or to the trimmed raw pattern
+/// (the raw pattern is required because tokenization splits `my_func` into
+/// `[my, func]`, neither of which equals the indexed name); 0.5 token
+/// mention — some term occurs in the matched line as a maximal identifier
+/// run; 0.0 incidental — substring only, which grep already guarantees.
+/// No query terms means no tiers: exactly 0.
+// Wired into builtin_signals() with the TASK-093 registry; until then only
+// the unit tests construct it.
+#[allow(dead_code)]
+pub(crate) struct ProminenceSignal;
+
+impl Signal for ProminenceSignal {
+    fn name(&self) -> &'static str {
+        "prominence"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none().with_query_terms().with_symbol_hits()
+    }
+
+    fn contribution(
+        &self,
+        query: &QueryInfo<'_>,
+        candidate: &ClassifiedResult,
+        ctx: &SharedContext,
+    ) -> f32 {
+        let terms = ctx.terms();
+        if terms.is_empty() {
+            return 0.0;
+        }
+        let file = candidate.result.file.to_string_lossy();
+        if let Some(hit) = ctx.symbol_hit(&file, candidate.result.line) {
+            let raw = query.pattern.trim();
+            let name_matches_term = terms
+                .iter()
+                .any(|term| term.eq_ignore_ascii_case(&hit.name));
+            let name_matches_pattern = !raw.is_empty() && hit.name.eq_ignore_ascii_case(raw);
+            if name_matches_term || name_matches_pattern {
+                return PROMINENCE_EXACT;
+            }
+        }
+        if terms
+            .iter()
+            .any(|term| contains_identifier_token(&candidate.result.content, term))
+        {
+            return PROMINENCE_TOKEN;
+        }
+        0.0
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -1671,6 +1748,169 @@ mod tests {
         assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
         // A candidate with no symbol hit (a call site line) is genuinely
         // un-called: exactly 0.
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
+    }
+
+    // -------------------------------------------------------------------
+    // ProminenceSignal
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn contains_identifier_token_matches_maximal_runs_only() {
+        assert!(contains_identifier_token("map(x, y);", "map"));
+        assert!(
+            contains_identifier_token("let MAP = 3;", "map"),
+            "case-folded"
+        );
+        assert!(
+            contains_identifier_token("a map:", "map"),
+            "run ending at :"
+        );
+        assert!(
+            contains_identifier_token("map", "map"),
+            "whole line is the run"
+        );
+        // A term inside a LONGER identifier is a different name entirely.
+        assert!(!contains_identifier_token("my_map_value();", "map"));
+        assert!(!contains_identifier_token("foo_bar", "foo"));
+        assert!(!contains_identifier_token("foo_bar", "bar"));
+        assert!(!contains_identifier_token("remapped!", "map"));
+        assert!(!contains_identifier_token("", "map"));
+        assert!(!contains_identifier_token("anything", ""));
+    }
+
+    #[test]
+    fn prominence_signal_three_tiers() {
+        // gamma defined at src/def.rs:5 (hit name "gamma"), called at
+        // src/call.rs:9 (no hit), mentioned incidentally at src/note.rs:2
+        // (substring only).
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["gamma", "function", "src/def.rs", 5, 0, "rust"],
+        )
+        .unwrap();
+        let results = vec![
+            classified("src/def.rs", 5, "fn gamma() {}", ResultCategory::Definition),
+            classified("src/call.rs", 9, "gamma(3);", ResultCategory::CallSite),
+            classified(
+                "src/note.rs",
+                2,
+                "// see gamma_helper",
+                ResultCategory::Comment,
+            ),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms().with_symbol_hits(),
+            "gamma",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = ProminenceSignal;
+        assert_eq!(signal.name(), "prominence");
+        assert_eq!(
+            signal.requires(),
+            ContextReqs::none().with_query_terms().with_symbol_hits()
+        );
+        let query = QueryInfo { pattern: "gamma" };
+        // Tier 1: the hit's name equals the query term.
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        // Tier 2: the term appears as a maximal identifier run.
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.5);
+        // Tier 0: substring-only inside a longer identifier.
+        assert_eq!(signal.contribution(&query, &results[2], &ctx), 0.0);
+    }
+
+    #[test]
+    fn prominence_signal_multi_term_takes_best_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["map", "function", "src/m.rs", 1, 0, "rust"],
+        )
+        .unwrap();
+        let results = vec![
+            classified("src/m.rs", 1, "pub fn map()", ResultCategory::Definition),
+            classified("src/f.rs", 1, "foo = 1;", ResultCategory::Other),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms().with_symbol_hits(),
+            "map foo",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = ProminenceSignal;
+        let query = QueryInfo { pattern: "map foo" };
+        // "map" hits tier 1 for the definition even though "foo" only
+        // token-matches elsewhere: the best tier wins.
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.5);
+    }
+
+    #[test]
+    fn prominence_signal_zero_without_terms() {
+        let results = vec![classified(
+            "src/a.rs",
+            1,
+            "fn foo()",
+            ResultCategory::Definition,
+        )];
+        // Punctuation-only pattern: no terms, no tiers.
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms().with_symbol_hits(),
+            ":: - _",
+            &results,
+            None,
+            &ContextSources::default(),
+        );
+        let signal = ProminenceSignal;
+        let query = QueryInfo { pattern: ":: - _" };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 0.0);
+    }
+
+    #[test]
+    fn prominence_signal_raw_pattern_matches_compound_names() {
+        // Query "my_func" tokenizes to [my, func] — neither equals the
+        // indexed name "my_func", and neither token-matches the maximal run
+        // "my_func". Only the raw-pattern comparison can award tier 1.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["my_func", "function", "src/main.rs", 10, 0, "rust"],
+        )
+        .unwrap();
+        let results = vec![
+            classified(
+                "src/main.rs",
+                10,
+                "fn my_func() {}",
+                ResultCategory::Definition,
+            ),
+            classified("src/call.rs", 3, "my_func();", ResultCategory::CallSite),
+        ];
+
+        let ctx = prepare_context(
+            ContextReqs::none().with_query_terms().with_symbol_hits(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let signal = ProminenceSignal;
+        let query = QueryInfo { pattern: "my_func" };
+        assert_eq!(signal.contribution(&query, &results[0], &ctx), 1.0);
+        // The call line's maximal run is the compound "my_func": neither
+        // term matches it, so the mention is incidental.
         assert_eq!(signal.contribution(&query, &results[1], &ctx), 0.0);
     }
 
