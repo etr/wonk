@@ -4291,19 +4291,19 @@ Extract descriptive properties of each returned result alongside its signal cont
 Convert feedback events into bounded, decaying adjustments to ranking signal weights — the mechanism that makes feedback generalize.
 
 **Action Items:**
-- [ ] Add the `learned_weights` table keyed by feature (overall and per query class)
-- [ ] Derive updates contrastively: raise weights of signals scoring the useful result above the passed-over alternatives, lower those that did not (PRD-FB-REQ-007)
-- [ ] Learn per query class as well as overall (PRD-FB-REQ-008)
-- [ ] **Skip events where the useful result was already ranked first** — learn only where the ranking was wrong (PRD-FB-REQ-009, AR-042)
-- [ ] Bound learned weights by a configurable maximum deviation from defaults (PRD-FB-REQ-010, AR-043)
-- [ ] **Gate influence on a minimum observation count across distinct sessions; unseen features default to zero influence** (PRD-FB-REQ-025, PRD-FB-REQ-026, AR-044)
-- [ ] Store and display each weight's supporting observation count (PRD-FB-REQ-029)
-- [ ] Decay learned weights toward defaults with age (PRD-FB-REQ-011)
-- [ ] Surface the feedback-derived contribution in `--why` (PRD-FB-REQ-014)
-- [ ] Absent feedback behaves exactly as the feature disabled (PRD-FB-REQ-020)
-- [ ] Tune update rule and step size against recorded traces; record what was chosen and why (OQ-019)
-- [ ] **Adversarial test: repeated feedback cannot push any weight beyond the configured deviation** (AR-043)
-- [ ] **Generalization test: feedback from one query set shifts ranking for a query sharing no terms with it** — the property item-keyed feedback cannot deliver
+- [x] Add the `learned_weights` table keyed by feature (overall and per query class)
+- [x] Derive updates contrastively: raise weights of signals scoring the useful result above the passed-over alternatives, lower those that did not (PRD-FB-REQ-007)
+- [x] Learn per query class as well as overall (PRD-FB-REQ-008)
+- [x] **Skip events where the useful result was already ranked first** — learn only where the ranking was wrong (PRD-FB-REQ-009, AR-042)
+- [x] Bound learned weights by a configurable maximum deviation from defaults (PRD-FB-REQ-010, AR-043)
+- [x] **Gate influence on a minimum observation count across distinct sessions; unseen features default to zero influence** (PRD-FB-REQ-025, PRD-FB-REQ-026, AR-044)
+- [x] Store and display each weight's supporting observation count (PRD-FB-REQ-029)
+- [x] Decay learned weights toward defaults with age (PRD-FB-REQ-011)
+- [x] Surface the feedback-derived contribution in `--why` (PRD-FB-REQ-014)
+- [x] Absent feedback behaves exactly as the feature disabled (PRD-FB-REQ-020)
+- [x] Tune update rule and step size against recorded traces; record what was chosen and why (OQ-019)
+- [x] **Adversarial test: repeated feedback cannot push any weight beyond the configured deviation** (AR-043)
+- [x] **Generalization test: feedback from one query set shifts ranking for a query sharing no terms with it** — the property item-keyed feedback cannot deliver
 
 **Dependencies:**
 - Blocked by: TASK-105
@@ -4324,7 +4324,7 @@ Convert feedback events into bounded, decaying adjustments to ranking signal wei
 **Related Requirements:** PRD-FB-REQ-007 through PRD-FB-REQ-011, PRD-FB-REQ-014, PRD-FB-REQ-020, PRD-FB-REQ-025, PRD-FB-REQ-026, PRD-FB-REQ-029
 **Related Decisions:** DR-042
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
@@ -4426,6 +4426,7 @@ Tasks identified but not yet scheduled:
 
 | Date | Change | Author |
 |------|--------|--------|
+| 2026-10-02 | TASK-102 complete (M36): contrastive weight learning — `learned_weights` keyed by feature (bare signal names + TASK-105's flattened descriptive keys), bounded decaying contrastive updates run synchronously in the feedback dispatch, session/observation gates, the `feedback` signal + `--why` contribution, `learned:` line, and `wonk feedback --weights`; OQ-019 closed via the tuning sweep recorded in `bench/feedback-learning-tuning.md`. | TBD |
 | 2026-02-11 | Initial task breakdown — 30 tasks across 6 milestones | TBD |
 | 2026-02-11 | Added Smart Search milestone (M6, TASK-031 to TASK-034). Renumbered Polish to M7. Updated milestone statuses. Total tasks: 34 across 7 milestones. Reframed around token-efficiency value proposition. | TBD |
 | 2026-02-12 | Added Git Worktree Support milestone (M8, TASK-035 to TASK-037). 3 tasks: walker boundary exclusion, watcher boundary filtering, integration tests. Total tasks: 37 across 8 milestones. | TBD |

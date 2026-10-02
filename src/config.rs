@@ -230,8 +230,11 @@ impl Default for DuplicateConfig {
 /// search into the signal pipeline (the `--why` implication), because a
 /// legacy-path slate carries no signal contributions to learn from.
 /// Default off: a default-config search writes nothing and behaves
-/// byte-identically (PRD-FB-REQ-020).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// byte-identically (PRD-FB-REQ-020). The `learn_*` keys (TASK-102,
+/// OQ-019) govern contrastive weight learning from the recorded events;
+/// their defaults are the tuned pair recorded in
+/// `bench/feedback-learning-tuning.md`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FeedbackConfig {
     /// Kill switch: `false` records no slates and accepts no feedback.
     pub enabled: bool,
@@ -247,6 +250,22 @@ pub struct FeedbackConfig {
     /// switch exists for repositories that do not want author data
     /// recorded at all.
     pub author_features: bool,
+    /// Learning-rate: the per-event fraction of the contrastive advantage
+    /// applied to each feature weight (finite, > 0).
+    pub learn_step: f32,
+    /// Maximum deviation from the configured default a signal weight may
+    /// learn (multiplicative: `[d·(1−dev), d·(1+dev)]`; descriptive keys
+    /// learn within `±dev` around 0). In `(0.0, 1.0]`.
+    pub learn_max_deviation: f32,
+    /// Age in days over which an unrefreshed learned weight halves its
+    /// distance from the default (PRD-FB-REQ-011). >= 1.
+    pub learn_half_life_days: i64,
+    /// Observations a (feature, scope) row needs before it influences
+    /// ranking (PRD-FB-REQ-025). >= 1.
+    pub learn_min_observations: i64,
+    /// Distinct sessions a (feature, scope) row needs before it influences
+    /// ranking (PRD-FB-REQ-025, AR-044). >= 1.
+    pub learn_min_sessions: i64,
 }
 
 impl Default for FeedbackConfig {
@@ -255,6 +274,11 @@ impl Default for FeedbackConfig {
             enabled: false,
             slate_retention: 64,
             author_features: true,
+            learn_step: 0.02,
+            learn_max_deviation: 0.5,
+            learn_half_life_days: 30,
+            learn_min_observations: 10,
+            learn_min_sessions: 3,
         }
     }
 }
@@ -372,6 +396,11 @@ impl Default for RankConfig {
                 ("centrality".to_string(), 0.4),
                 ("signature".to_string(), 0.8),
                 ("path_character".to_string(), 0.6),
+                // TASK-102: the descriptive learned-weight channel. INERT
+                // without gated learned rows (the stub contributes
+                // nothing, the pass never runs) — zeroing it is the
+                // one-knob full disable.
+                ("feedback".to_string(), 0.35),
             ]),
             class_multipliers: crate::rerank::ClassMultipliers {
                 symbol: crate::rerank::ChannelMultipliers {
@@ -549,6 +578,11 @@ struct FeedbackOverlay {
     enabled: Option<bool>,
     slate_retention: Option<usize>,
     author_features: Option<bool>,
+    learn_step: Option<f32>,
+    learn_max_deviation: Option<f32>,
+    learn_half_life_days: Option<i64>,
+    learn_min_observations: Option<i64>,
+    learn_min_sessions: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -820,10 +854,64 @@ impl Config {
             if let Some(v) = feedback.author_features {
                 self.feedback.author_features = v;
             }
+            if let Some(v) = feedback.learn_step {
+                self.feedback.learn_step = v;
+            }
+            if let Some(v) = feedback.learn_max_deviation {
+                self.feedback.learn_max_deviation = v;
+            }
+            if let Some(v) = feedback.learn_half_life_days {
+                self.feedback.learn_half_life_days = v;
+            }
+            if let Some(v) = feedback.learn_min_observations {
+                self.feedback.learn_min_observations = v;
+            }
+            if let Some(v) = feedback.learn_min_sessions {
+                self.feedback.learn_min_sessions = v;
+            }
             if self.feedback.slate_retention == 0 {
                 anyhow::bail!(
                     "[feedback] slate_retention must be >= 1 (got 0): no slate could \
                      survive for the feedback call to reference"
+                );
+            }
+            let learn = self.feedback;
+            if !learn.learn_step.is_finite() || learn.learn_step <= 0.0 {
+                anyhow::bail!(
+                    "[feedback] learn_step must be finite and > 0 (got {}): a zero or \
+                     negative step never moves a weight",
+                    learn.learn_step
+                );
+            }
+            if !learn.learn_max_deviation.is_finite()
+                || learn.learn_max_deviation <= 0.0
+                || learn.learn_max_deviation > 1.0
+            {
+                anyhow::bail!(
+                    "[feedback] learn_max_deviation must be finite and in (0, 1] (got {}): \
+                     beyond 1.0 a signal weight could flip sign",
+                    learn.learn_max_deviation
+                );
+            }
+            if learn.learn_half_life_days < 1 {
+                anyhow::bail!(
+                    "[feedback] learn_half_life_days must be >= 1 (got {}): a sub-day \
+                     half-life erases evidence almost immediately",
+                    learn.learn_half_life_days
+                );
+            }
+            if learn.learn_min_observations < 1 {
+                anyhow::bail!(
+                    "[feedback] learn_min_observations must be >= 1 (got {}): a zero \
+                     gate lets one spurious event steer ranking",
+                    learn.learn_min_observations
+                );
+            }
+            if learn.learn_min_sessions < 1 {
+                anyhow::bail!(
+                    "[feedback] learn_min_sessions must be >= 1 (got {}): one session \
+                     repeating feedback must never steer ranking",
+                    learn.learn_min_sessions
                 );
             }
         }
@@ -1429,7 +1517,8 @@ threshold = 1.0
             FeedbackConfig {
                 enabled: false,
                 slate_retention: 64,
-                author_features: true
+                author_features: true,
+                ..FeedbackConfig::default()
             }
         );
         let mut env = TestEnv::new();
@@ -1440,7 +1529,8 @@ threshold = 1.0
             FeedbackConfig {
                 enabled: false,
                 slate_retention: 64,
-                author_features: true
+                author_features: true,
+                ..FeedbackConfig::default()
             }
         );
     }
@@ -1462,7 +1552,8 @@ slate_retention = 8
             FeedbackConfig {
                 enabled: true,
                 slate_retention: 8,
-                author_features: true
+                author_features: true,
+                ..FeedbackConfig::default()
             }
         );
     }
@@ -1509,6 +1600,85 @@ slate_retention = 0
             err.contains("[feedback] slate_retention must be >= 1"),
             "error names the offending key: {err}"
         );
+    }
+
+    // -- [feedback] learn_* (TASK-102) ----------------------------------------
+
+    #[test]
+    fn feedback_learn_defaults() {
+        let config = Config::default().feedback;
+        assert!((config.learn_step - 0.02).abs() < f32::EPSILON);
+        assert!((config.learn_max_deviation - 0.5).abs() < f32::EPSILON);
+        assert_eq!(config.learn_half_life_days, 30);
+        assert_eq!(config.learn_min_observations, 10);
+        assert_eq!(config.learn_min_sessions, 3);
+    }
+
+    #[test]
+    fn feedback_learn_keys_parsed() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[feedback]
+enabled = true
+learn_step = 0.05
+learn_max_deviation = 0.25
+learn_half_life_days = 14
+learn_min_observations = 4
+learn_min_sessions = 2
+"#,
+        );
+        let config = env.load().unwrap().feedback;
+        assert!((config.learn_step - 0.05).abs() < f32::EPSILON);
+        assert!((config.learn_max_deviation - 0.25).abs() < f32::EPSILON);
+        assert_eq!(config.learn_half_life_days, 14);
+        assert_eq!(config.learn_min_observations, 4);
+        assert_eq!(config.learn_min_sessions, 2);
+    }
+
+    #[test]
+    fn feedback_learn_keys_layer_repo_over_global() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[feedback]
+learn_min_observations = 40
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[feedback]
+learn_min_observations = 5
+"#,
+        );
+        let config = env.load().unwrap().feedback;
+        assert_eq!(config.learn_min_observations, 5, "repo layer wins");
+        assert_eq!(config.learn_min_sessions, 3, "untouched sibling default");
+    }
+
+    #[test]
+    fn feedback_learn_invalid_values_rejected_naming_the_key() {
+        for (toml, key) in [
+            ("learn_step = 0.0\n", "learn_step"),
+            ("learn_step = -0.1\n", "learn_step"),
+            ("learn_step = nan\n", "learn_step"),
+            ("learn_max_deviation = 0.0\n", "learn_max_deviation"),
+            ("learn_max_deviation = 1.5\n", "learn_max_deviation"),
+            ("learn_half_life_days = 0\n", "learn_half_life_days"),
+            ("learn_min_observations = 0\n", "learn_min_observations"),
+            ("learn_min_sessions = 0\n", "learn_min_sessions"),
+        ] {
+            let mut env = TestEnv::new();
+            env.create_repo();
+            env.write_repo_config(&format!("[feedback]\n{toml}"));
+            let err = env.load().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("[feedback] {key}")),
+                "error names the offending key {key}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2390,6 +2560,7 @@ rrf_k = 80.0
                 ("centrality".to_string(), 0.4),
                 ("signature".to_string(), 0.8),
                 ("path_character".to_string(), 0.6),
+                ("feedback".to_string(), 0.35),
             ])
         );
         assert_eq!(config.rank.class_multipliers.symbol.lexical, 1.8);

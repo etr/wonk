@@ -164,6 +164,48 @@ pub fn print_query_class_line(class: crate::rerank::QueryClass) {
     eprintln!("{}", format_query_class_line(class));
 }
 
+/// Render the `learned:` line (TASK-102, pure; pinned by test):
+/// `learned: path_character 0.720 (default 0.600, 42 obs/9 sessions); …`
+/// — one entry per gated row in effect for this query's class, each
+/// carrying its supporting counts (PRD-FB-REQ-029).
+pub fn format_learned_line(rows: &[crate::learning::FeedbackEvidence]) -> String {
+    if rows.is_empty() {
+        return "learned:".to_string();
+    }
+    let entries: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {:.3} (default {:.3}, {} obs/{} sessions)",
+                row.feature, row.effective, row.default, row.observations, row.sessions
+            )
+        })
+        .collect();
+    format!("learned: {}", entries.join("; "))
+}
+
+/// Emit the `learned:` line to stderr — the query-class-line contract.
+pub fn print_learned_line(rows: &[crate::learning::FeedbackEvidence]) {
+    eprintln!("{}", format_learned_line(rows));
+}
+
+/// One `wonk feedback --weights` row (TASK-102): a learned weight
+/// against its default, with its supporting evidence. `query_class` is
+/// `None` for the overall scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct LearnedWeightOutput {
+    pub feature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_class: Option<String>,
+    /// The decayed-at-now effective weight.
+    pub effective: f32,
+    pub default: f32,
+    pub observations: i64,
+    pub sessions: i64,
+    /// Whether the row clears the gates and influences ranking.
+    pub gated: bool,
+}
+
 /// A symbol definition result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolOutput {
@@ -2724,6 +2766,39 @@ mod tests {
             format_query_class_line(QueryClass::Conceptual),
             "query-class: conceptual"
         );
+    }
+
+    #[test]
+    fn format_learned_line_pinned() {
+        use crate::learning::FeedbackEvidence;
+        let rows = [
+            FeedbackEvidence {
+                feature: "path_character".to_string(),
+                query_class: String::new(),
+                effective: 0.72,
+                default: 0.6,
+                observations: 42,
+                sessions: 9,
+                updated_at: 0,
+                gated: true,
+            },
+            FeedbackEvidence {
+                feature: "path:tests".to_string(),
+                query_class: String::new(),
+                effective: -0.21,
+                default: 0.0,
+                observations: 88,
+                sessions: 12,
+                updated_at: 0,
+                gated: true,
+            },
+        ];
+        assert_eq!(
+            format_learned_line(&rows),
+            "learned: path_character 0.720 (default 0.600, 42 obs/9 sessions); \
+             path:tests -0.210 (default 0.000, 88 obs/12 sessions)"
+        );
+        assert_eq!(format_learned_line(&[]), "learned:");
     }
 
     #[test]

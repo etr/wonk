@@ -117,6 +117,7 @@ previous (legacy) ordering byte-for-byte — the escape hatch.
 | `weights.path_character` | `0.6` | Graded ladder value of the candidate's path: ordinary `1.0`, module entry `0.80`, barrel `0.70`, example `0.60`, shim `0.45`, type declaration `0.30`, test `0.20`, generated-shadowing-a-verified-peer `0.10`. Graded, never exclusion — a test file that is the best answer still ranks. A generated file is demoted only when a same-named hand-written peer exists in the index |
 | `weights.proximity` | `0.0` | `1 / gap` over the first-occurrence positions of the query terms present as whole identifiers in the matched line (adjacent terms `1.0`, one token between `0.5`, decaying). Fewer than two present terms contribute zero |
 | `weights.novelty` | `0.0` | Near-duplicate demotion (TASK-100): `1 - clamp01((jaccard - threshold) / (1 - threshold))` against the best sketch-Jaccard versus higher-ranked results carrying a signature, with `threshold` from `[duplicate]`. A weight of `0` (the default, pending bench evidence) skips the pass entirely; the earliest member of a duplicate group is never demoted, so every group keeps a representative |
+| `weights.feedback` | `0.35` | The feedback-learned descriptive channel (TASK-102): the candidate's value is the clamped sum of the learned weights of the descriptive keys it carries (`path:src/auth`, `symbol:kind=trait`, …), zero without learned rows — the default weight is inert until feedback evidence accumulates and clears the `[feedback]` gates. `0` skips the pass entirely: the one-knob full disable |
 | `weights.signature` | `0.8` | Answers signature-shaped queries (containing `(`, `->`, or `::`): `1.0` for the index-backed definition, `0.5` for a definition-shaped line (a parenthesis plus a definition keyword among its first three identifiers), `0.0` otherwise. Name-shaped queries are inert |
 | `class_multipliers.symbol` | `lexical = 1.8`, `semantic = 0.6` | Per-class scaling of the lexical and semantic weights for symbol-shaped queries (a single identifier token) |
 | `class_multipliers.path` | `lexical = 1.3`, `semantic = 0.8` | Same scaling for path-shaped queries (containing `/` or `\`) |
@@ -174,6 +175,11 @@ reporting (which also takes a one-off `--threshold` override).
 | `enabled` | `false` | Kill switch for usage-feedback capture. `false` records no slates and accepts no feedback; `true` also opts ranked search into the signal pipeline — the same implication as `--why` — because a legacy-path slate carries no signal contributions to learn from |
 | `slate_retention` | `64` | Most recent slates kept per repo; older slates LRU-pruned in the same transaction as each insert. Must be at least `1`: `0` is a hard configuration error naming the key |
 | `author_features` | `true` | Whether author-derived features (`last_touched_by`, `primary`) are recorded per slate member. `false` never builds the `author` group — no author data is written at all — and leaves every other recorded feature untouched |
+| `learn_step` | `0.02` | Learning rate: the per-event fraction of each feature's contrastive advantage applied to its weight. Must be finite and `> 0`. Tuned via the deterministic sweep in `bench/feedback-learning-tuning.md` (OQ-019) |
+| `learn_max_deviation` | `0.5` | Maximum deviation a learned weight may take from its default: multiplicative `[d·(1−dev), d·(1+dev)]` for signal names, `±dev` around zero for descriptive keys. Must be in `(0, 1]` — beyond `1.0` a signal weight could flip sign. The bound re-clamps stored values at load time, so tightening it immediately re-bounds what was learned (AR-043) |
+| `learn_half_life_days` | `30` | Age in days over which an unrefreshed learned weight halves its distance from the default (PRD-FB-REQ-011). Must be `>= 1` |
+| `learn_min_observations` | `10` | Observations a (feature, scope) row needs before it influences ranking (PRD-FB-REQ-025). Must be `>= 1` |
+| `learn_min_sessions` | `3` | Distinct sessions a row needs before it influences ranking — one session repeating feedback never steers ranking (AR-044). Must be `>= 1` |
 
 Usage-feedback capture (TASK-101): when enabled, every ranked search
 persists its slate — the full ranked result list, each entry carrying a
@@ -203,6 +209,22 @@ shared `__overflow__` bucket. The caller supplies the hint as
 argument to `wonk_search` (MCP); it feeds features only and never
 affects ranking. Without a hint the context group is absent from the
 recorded slate, not defaulted.
+
+Contrastive weight learning (TASK-102, DR-042/DR-043): recording
+feedback also learns. Each qualifying event — the useful result was not
+already ranked first — moves every observable feature one bounded step
+along its contrastive advantage (useful result minus the passed-over
+alternatives), per query class and overall, with the weights stored in
+the per-repo index and decaying back toward their defaults with age. A
+row influences ranking only once it clears `learn_min_observations`
+across `learn_min_sessions` distinct sessions and its decayed value
+still differs from the default; below the gate the row is displayed
+(`wonk feedback --weights`) but inert. A repository with no feedback, or
+none past the gate, ranks exactly as with the feature disabled
+(PRD-FB-REQ-020). Learning runs synchronously in the feedback call,
+best-effort: a failure warns and leaves the events for the next call.
+The rule and its constants are recorded in
+`bench/feedback-learning-tuning.md`.
 
 Author features exist behind their own switch because they deserve their
 own decision (AR-046). The DR-039 distinction: DR-039 excludes

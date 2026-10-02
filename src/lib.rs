@@ -19,6 +19,7 @@ pub mod flows;
 pub mod history;
 pub mod impact;
 pub mod indexer;
+pub mod learning;
 pub mod llm;
 pub mod mcp;
 pub mod output;

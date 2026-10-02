@@ -1692,7 +1692,21 @@ impl McpServer {
         };
         settings.use_pipeline |= config.feedback.enabled;
         settings.feedback_capture = config.feedback.enabled;
+        settings.feedback_author_features = config.feedback.author_features;
         settings.working_context = context_file;
+        // Learned weights (TASK-102): the gated overlay — ONE read,
+        // best-effort (a missing table is silent; other errors warn).
+        settings.learned = ranker_conn.and_then(|conn| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as i64)
+                .unwrap_or(0);
+            crate::learning::load_learned(conn, &config.feedback, &config.rank.weights, now)
+                .unwrap_or_else(|e| {
+                    eprintln!("wonk: learned-weight load failed: {e:#}");
+                    None
+                })
+        });
         let ranked =
             crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
         // Best-effort REQ-003 memo: persist the pairs the novelty pass
@@ -1828,7 +1842,12 @@ impl McpServer {
             return CallToolResult::error(format!("feedback schema migration failed: {e}"));
         }
         match crate::feedback::record_feedback(conn, &slate, &useful, &session) {
-            Ok(summary) => format_result(&summary, OutputFormat::Json),
+            Ok(summary) => {
+                // Learning (TASK-102) runs synchronously in the dispatch,
+                // best-effort — the router-surface contract.
+                crate::router::learn_pending_best_effort(conn, &config);
+                format_result(&summary, OutputFormat::Json)
+            }
             Err(e) => CallToolResult::error(format!("{e:#}")),
         }
     }
@@ -6045,5 +6064,25 @@ mod tests {
         );
         assert!(err.contains("feedback capture is disabled"), "{err}");
         assert!(err.contains("[feedback] enabled = true"), "{err}");
+    }
+
+    #[test]
+    fn tool_feedback_learns_after_recording() {
+        let (_dir, mut server) = feedback_server(true);
+        let (rows, slate) = feedback_search(&mut server, "login_handler");
+        let slate = slate.unwrap();
+        let second = rows[1]["identity"].as_str().unwrap().to_string();
+        for session in ["a", "b"] {
+            let result = server.handle_tools_call(&serde_json::json!({
+                "name": "wonk_feedback",
+                "arguments": {"slate": &slate, "useful": [&second], "session": session}
+            }));
+            assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        }
+        let conn = server.router.conn().unwrap();
+        let learned: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learned_weights", [], |r| r.get(0))
+            .unwrap();
+        assert!(learned > 0, "the MCP dispatch learned too");
     }
 }

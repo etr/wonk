@@ -565,9 +565,37 @@ rank 2  src/api.rs:42  handle_request  [useful]
 | `--slate <token>` | Slate token from the search output (`slate:` line or JSON field) |
 | `--useful <ranks-or-identities>` | Results that were useful: 1-based ranks or 64-hex identities; repeatable and comma-separated |
 | `--session <id>` | Stable id for your current session/conversation (distinct sessions are counted separately) |
+| `--weights` | List the learned weights instead of recording: every `learned_weights` row — gated and inert — with its default, observation count, and session count. Mutually exclusive with the three recording flags |
 
-All three flags are required, and `--useful` must name at least one
+All three recording flags are required together (or none, with
+`--weights`), and `--useful` must name at least one
 result; a result named twice (by rank and by identity) records once.
+
+Each recorded event also drives contrastive weight learning
+(TASK-102): features that scored the useful result above the passed-over
+alternatives gain weight, bounded by
+`[feedback] learn_max_deviation` and decaying toward the defaults with
+age. Inspect what the repository has learned with `wonk feedback
+--weights`:
+
+```
+$ wonk feedback --weights
+kind [overall] 1.000 (default 1.000) 24 obs, 24 sessions
+path_character [overall] 0.150 (default 0.100) 40 obs, 40 sessions
+path:tests [overall] -0.400 (default 0.000) 40 obs, 40 sessions
+lexical [overall] 0.340 (default 0.400) 12 obs, 12 sessions [below gate]
+```
+
+`[overall]` is the all-queries scope; `[symbol]`/`[path]`/`[signature]`
+rows carry the per-query-class adjustments. The effective value is
+decayed to now, so an untouched row drifts back toward its default
+visibly. `[below gate]` marks rows that have not cleared
+`learn_min_observations` across `learn_min_sessions` distinct sessions —
+legible evidence, no ranking influence. `--format json` emits the rows
+as objects (`feature`, `query_class`, `effective`, `default`,
+`observations`, `sessions`, `gated`). Under `--why`, a live search also
+prints a `learned:` line to stderr naming the gated weights in effect
+for that query's class.
 Recording requires `[feedback] enabled = true` in `.wonk/config.toml`
 (otherwise the command fails with `feedback capture is disabled; set
 [feedback] enabled = true in .wonk/config.toml`) and an existing index

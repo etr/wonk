@@ -286,7 +286,26 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // hint (--context) into the slate's features; the
                         // hint never affects ranking.
                         settings.feedback_capture = config.feedback.enabled;
+                        settings.feedback_author_features = config.feedback.author_features;
                         settings.working_context = args.context.clone();
+                        // Learned weights (TASK-102): the gated overlay
+                        // joins the settings — ONE read, best-effort like
+                        // the slate recording (a missing table is silent;
+                        // other errors warn and disable the overlay).
+                        if config.feedback.enabled
+                            && let Some(index_conn) = conn.as_ref()
+                        {
+                            settings.learned = crate::learning::load_learned(
+                                index_conn,
+                                &config.feedback,
+                                &config.rank.weights,
+                                system_secs(),
+                            )
+                            .unwrap_or_else(|e| {
+                                eprintln!("wonk: learned-weight load failed: {e:#}");
+                                None
+                            });
+                        }
                         let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
@@ -320,11 +339,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             .unwrap_or_default();
                         // One class line per query, before any why lines
                         // (DR-038): a misclassification is diagnosable from
-                        // the breakdown it produced.
+                        // the breakdown it produced. The `learned:` line
+                        // follows (TASK-102): the gated weights in effect
+                        // for THIS query's class, named numbers with their
+                        // counts.
                         if args.why
                             && let Some(class) = ranked.query_class
                         {
                             output::print_query_class_line(class);
+                            if let Some(table) = settings.learned.as_ref() {
+                                let resolved = table.resolve(class);
+                                if !resolved.evidence.is_empty() {
+                                    output::print_learned_line(&resolved.evidence);
+                                }
+                            }
                         }
 
                         for (category, items) in &ranked.groups {
@@ -2654,7 +2682,7 @@ fn dispatch_feedback<W: io::Write>(
     // `ensure_summaries_table` precedent).
     db::ensure_feedback_tables(&conn)?;
 
-    run_feedback(&conn, &args, fmt, suppress, format)
+    run_feedback(&conn, &args, &config, fmt, suppress, format)
 }
 
 /// Record feedback and print the summary. Split from
@@ -2663,11 +2691,24 @@ fn dispatch_feedback<W: io::Write>(
 fn run_feedback<W: io::Write>(
     conn: &Connection,
     args: &crate::cli::FeedbackArgs,
+    config: &crate::config::Config,
     fmt: &mut Formatter<W>,
     _suppress: bool,
     format: OutputFormat,
 ) -> Result<()> {
-    let summary = crate::feedback::record_feedback(conn, &args.slate, &args.useful, &args.session)?;
+    if args.weights {
+        return run_feedback_weights(conn, config, fmt, format);
+    }
+    let summary = crate::feedback::record_feedback(
+        conn,
+        args.slate.as_deref().unwrap_or_default(),
+        &args.useful,
+        args.session.as_deref().unwrap_or_default(),
+    )?;
+    // Learning (TASK-102) runs synchronously in the dispatch, best-effort:
+    // a failure warns, the events stay recorded, and the watermark stays
+    // put so the next feedback call replays them.
+    learn_pending_best_effort(conn, config);
     if format.is_structured() {
         let json = serde_json::to_string(&summary)?;
         writeln!(fmt.writer_mut(), "{json}")?;
@@ -2678,7 +2719,7 @@ fn run_feedback<W: io::Write>(
         fmt.writer_mut(),
         "recorded {} event(s) against slate {} (query {:?}, class {})",
         summary.recorded,
-        args.slate,
+        args.slate.as_deref().unwrap_or_default(),
         summary.query,
         class
     )?;
@@ -2699,6 +2740,71 @@ fn run_feedback<W: io::Write>(
                 event.identity
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Wall-clock seconds since the epoch — the `created_at` precedent for
+/// learning's injected clock.
+fn system_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Learn from pending events, best-effort (both dispatch surfaces):
+/// a failure warns and leaves the recorded events for the next call.
+pub(crate) fn learn_pending_best_effort(conn: &Connection, config: &crate::config::Config) {
+    if let Err(e) =
+        crate::learning::learn_pending(conn, &config.feedback, &config.rank.weights, system_secs())
+    {
+        eprintln!("wonk: feedback learning deferred: {e:#}");
+    }
+}
+
+/// `wonk feedback --weights` (TASK-102, PRD-FB-REQ-029/012): every
+/// learned row — gated and inert — with its default and supporting
+/// counts, decay visible in the effective value (PRD-FB-REQ-011).
+fn run_feedback_weights<W: io::Write>(
+    conn: &Connection,
+    config: &crate::config::Config,
+    fmt: &mut Formatter<W>,
+    format: OutputFormat,
+) -> Result<()> {
+    let rows =
+        crate::learning::list_learned(conn, &config.feedback, &config.rank.weights, system_secs())?;
+    if format.is_structured() {
+        let outputs: Vec<output::LearnedWeightOutput> = rows
+            .iter()
+            .map(|row| output::LearnedWeightOutput {
+                feature: row.feature.clone(),
+                query_class: (!row.query_class.is_empty()).then(|| row.query_class.clone()),
+                effective: row.effective,
+                default: row.default,
+                observations: row.observations,
+                sessions: row.sessions,
+                gated: row.gated,
+            })
+            .collect();
+        let json = serde_json::to_string(&outputs)?;
+        writeln!(fmt.writer_mut(), "{json}")?;
+        return Ok(());
+    }
+    for row in &rows {
+        let scope = if row.query_class.is_empty() {
+            "overall"
+        } else {
+            row.query_class.as_str()
+        };
+        let mut line = format!(
+            "{} [{}] {:.3} (default {:.3}) {} obs, {} sessions",
+            row.feature, scope, row.effective, row.default, row.observations, row.sessions
+        );
+        if !row.gated {
+            line.push_str(" [below gate]");
+        }
+        writeln!(fmt.writer_mut(), "{line}")?;
     }
     Ok(())
 }
@@ -7124,8 +7230,7 @@ mod tests {
     fn feedback_config(enabled: bool) -> crate::config::FeedbackConfig {
         crate::config::FeedbackConfig {
             enabled,
-            slate_retention: 64,
-            author_features: true,
+            ..crate::config::FeedbackConfig::default()
         }
     }
 
@@ -7203,16 +7308,25 @@ mod tests {
 
     fn feedback_args(slate: &str, useful: &[&str]) -> crate::cli::FeedbackArgs {
         crate::cli::FeedbackArgs {
-            slate: slate.to_string(),
-            session: "conv-1".to_string(),
+            slate: Some(slate.to_string()),
+            session: Some("conv-1".to_string()),
             useful: useful.iter().map(|u| u.to_string()).collect(),
+            weights: false,
         }
     }
 
     fn run_fb(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
         let mut buf = Vec::new();
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
-        run_feedback(conn, args, &mut fmt, true, OutputFormat::Grep).unwrap();
+        run_feedback(
+            conn,
+            args,
+            &learning_config(),
+            &mut fmt,
+            true,
+            OutputFormat::Grep,
+        )
+        .unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -7266,6 +7380,7 @@ mod tests {
         let err = run_feedback(
             &conn,
             &feedback_args("deadbeefdeadbeef", &["1"]),
+            &learning_config(),
             &mut fmt,
             true,
             OutputFormat::Grep,
@@ -7274,6 +7389,169 @@ mod tests {
         .to_string();
         assert!(err.contains("slate not found"), "{err}");
         assert_eq!(feedback_event_count(&conn), 0);
+        drop(dir);
+    }
+
+    // -- TASK-102: learning dispatch + --weights --------------------------------
+
+    /// A two-result slate — useful at rank 2 with a real alternative —
+    /// over a genuinely indexed twin-symbol repo.
+    fn learning_repo_with_slate() -> (TempDir, Connection, String) {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("a.rs"), DUP_HANDLER).unwrap();
+        std::fs::write(
+            dir.path().join("b.rs"),
+            DUP_HANDLER.replace("handle_user_created", "handle_user_backup"),
+        )
+        .unwrap();
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+        let index = crate::db::find_existing_index(dir.path()).unwrap();
+        let conn = crate::db::open(&index).unwrap();
+        let ranked = crate::rerank::rank_and_explain_classed(
+            &[
+                crate::search::SearchResult {
+                    file: std::path::PathBuf::from("a.rs"),
+                    line: 1,
+                    col: 1,
+                    content: "pub fn handle_user_created(".to_string(),
+                },
+                crate::search::SearchResult {
+                    file: std::path::PathBuf::from("b.rs"),
+                    line: 1,
+                    col: 1,
+                    content: "pub fn handle_user_backup(".to_string(),
+                },
+            ],
+            Some(&conn),
+            "handle_user_created",
+            &crate::rerank::RankSettings {
+                use_pipeline: true,
+                ..Default::default()
+            },
+        );
+        let token = record_slate_best_effort(
+            Some(&conn),
+            "handle_user_created",
+            &ranked,
+            &feedback_config(true),
+        )
+        .unwrap()
+        .token;
+        (dir, conn, token)
+    }
+
+    fn learning_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.feedback.enabled = true;
+        config
+    }
+
+    fn session_args(slate: &str, session: &str, useful: &str) -> crate::cli::FeedbackArgs {
+        crate::cli::FeedbackArgs {
+            slate: Some(slate.to_string()),
+            session: Some(session.to_string()),
+            useful: vec![useful.to_string()],
+            weights: false,
+        }
+    }
+
+    fn learned_weight_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM learned_weights", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn learned_watermark(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT value FROM learned_meta WHERE key = 'event_watermark'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap()
+    }
+
+    #[test]
+    fn run_feedback_learns_synchronously_after_recording() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        for session in ["s1", "s2", "s3", "s4"] {
+            run_fb(&conn, &session_args(&token, session, "2"));
+        }
+        assert!(
+            learned_weight_count(&conn) > 0,
+            "the dispatch learned: run_feedback must call learn_pending"
+        );
+        assert_eq!(learned_watermark(&conn), 4, "one id per event");
+        drop(dir);
+    }
+
+    #[test]
+    fn feedback_weights_lists_every_row_with_its_counts() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        for session in ["s1", "s2", "s3", "s4"] {
+            run_fb(&conn, &session_args(&token, session, "2"));
+        }
+        let args = crate::cli::FeedbackArgs {
+            weights: true,
+            ..session_args(&token, "", "")
+        };
+        let mut buf = Vec::new();
+        let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
+        run_feedback(
+            &conn,
+            &args,
+            &learning_config(),
+            &mut fmt,
+            true,
+            OutputFormat::Grep,
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("kind [overall] 1.000 (default 1.000) 4 obs, 4 sessions"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[below gate]"),
+            "inert rows stay legible with their counts: {out}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn feedback_weights_json_emits_row_objects() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        for session in ["s1", "s2"] {
+            run_fb(&conn, &session_args(&token, session, "2"));
+        }
+        let args = crate::cli::FeedbackArgs {
+            weights: true,
+            ..session_args(&token, "", "")
+        };
+        let mut buf = Vec::new();
+        let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Json, false);
+        run_feedback(
+            &conn,
+            &args,
+            &learning_config(),
+            &mut fmt,
+            true,
+            OutputFormat::Json,
+        )
+        .unwrap();
+        let rows: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert!(!rows.is_empty());
+        let kind = rows
+            .iter()
+            .find(|row| row["feature"] == "kind" && row["query_class"].is_null())
+            .unwrap();
+        assert_eq!(kind["observations"], 2);
+        assert_eq!(kind["sessions"], 2);
+        assert_eq!(kind["gated"], false);
+        assert_eq!(kind["default"], 1.0);
         drop(dir);
     }
 }

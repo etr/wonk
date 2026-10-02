@@ -149,23 +149,24 @@ pub struct SlateMember {
 /// result path the caller saw (which may be absolute). `id`/`scope`/
 /// `language` feed the descriptive features (TASK-105); the SELECT gained
 /// them without adding a statement.
-struct SymbolRow {
-    id: i64,
-    file: String,
-    line: i64,
-    end_line: Option<i64>,
-    name: String,
-    kind: String,
-    scope: Option<String>,
-    signature: Option<String>,
-    language: String,
+#[derive(Debug)]
+pub(crate) struct SymbolRow {
+    pub(crate) id: i64,
+    pub(crate) file: String,
+    pub(crate) line: i64,
+    pub(crate) end_line: Option<i64>,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) scope: Option<String>,
+    pub(crate) signature: Option<String>,
+    pub(crate) language: String,
 }
 
 /// The owning symbol of `line` in `file`: the candidate with the SMALLEST
 /// span containing it (`line <= target <= end_line`, NULL `end_line`
 /// treated as `line`), tie-broken on (line desc, name) for determinism.
 /// Returns `None` when no span contains the line.
-fn owning_symbol(rows: &[SymbolRow], line: u64) -> Option<&SymbolRow> {
+pub(crate) fn owning_symbol(rows: &[SymbolRow], line: u64) -> Option<&SymbolRow> {
     let target = line as i64;
     rows.iter()
         .filter(|r| {
@@ -190,7 +191,7 @@ fn owning_symbol(rows: &[SymbolRow], line: u64) -> Option<&SymbolRow> {
 /// repo-relative, and the identity's stability depends on anchoring on
 /// the DB path. The returned map is keyed by the REQUESTED file string so
 /// callers resolve by what they hold.
-fn load_symbols_by_file(
+pub(crate) fn load_symbols_by_file(
     conn: &Connection,
     files: &[String],
 ) -> Result<HashMap<String, Vec<SymbolRow>>> {
@@ -245,6 +246,23 @@ fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRow> {
         signature: row.get(7)?,
         language: row.get(8)?,
     })
+}
+
+/// One query's prepared feedback feature extraction (TASK-102): the
+/// symbol bulk-load and the capped per-candidate feature groups the
+/// descriptive pre-sort pass (`learning::apply_feedback_contribution`)
+/// produced, cached on the shared context so the feedback slate build
+/// reuses them — the heaviest per-query feedback work (symbol load,
+/// including the per-unresolved-file suffix fallback's table scan, group
+/// extraction, cardinality cap) runs at most once per query. `symbols`
+/// is [`load_symbols_by_file`]'s map; `groups` keys on
+/// (canonical file, line) exactly as both consumers resolve candidates,
+/// with `signals` empty as `extract_groups` leaves them — the slate
+/// build assigns the retained contributions itself.
+#[derive(Debug)]
+pub(crate) struct FeedbackExtraction {
+    pub(crate) symbols: HashMap<String, Vec<SymbolRow>>,
+    pub(crate) groups: HashMap<(String, u64), FeatureGroups>,
 }
 
 /// SQLite's default host-parameter limit; chunking keeps the IN-list
@@ -455,20 +473,20 @@ fn ancestor_dirs(canonical: &str) -> Vec<String> {
 /// symbol row, the shared context the pipeline already prepared, the
 /// query, one clock reading, and the author switch. Nothing else — no
 /// connection, so extraction is a pure function with no round trips.
-struct ExtractionInputs<'a> {
-    query: &'a str,
-    ctx: &'a crate::rerank::SharedContext,
+pub(crate) struct ExtractionInputs<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) ctx: &'a crate::rerank::SharedContext,
     /// Wall clock captured once per slate (the `created_at` precedent):
     /// same-input determinism holds except across bucket boundaries.
-    now: SystemTime,
-    author_features: bool,
+    pub(crate) now: SystemTime,
+    pub(crate) author_features: bool,
 }
 
 /// Extract one member's descriptive groups (the D2 catalogue, one clause
 /// per row). Pure over its inputs; members with no owning symbol
 /// (line-anchored) get `path`/`match`/`history`/`author`/`context` only —
 /// `symbol`/`graph` keys are omitted for them, never defaulted.
-fn extract_groups(
+pub(crate) fn extract_groups(
     item: &crate::rerank::ScoredResult,
     owning: Option<&SymbolRow>,
     canonical: &str,
@@ -697,8 +715,10 @@ fn parent_dir(path: &str) -> &str {
 }
 
 /// The scalar (non-ancestor) feature names of the `path` group — every
-/// other `path` key is an ancestor presence feature.
-const PATH_SCALARS: [&str; 3] = ["class", "depth", "lang"];
+/// other `path` key is an ancestor presence feature. The learner's
+/// flattening reads the same list (`path:<name>=<value>` vs bare
+/// `path:<ancestor>`), so the two sides cannot drift.
+pub(crate) const PATH_SCALARS: [&str; 3] = ["class", "depth", "lang"];
 
 /// Cap per-slate categorical cardinality (PRD-FB-REQ-024, D8): for every
 /// scalar feature, and for the `path` ancestor keys as one family, keep
@@ -707,7 +727,7 @@ const PATH_SCALARS: [&str; 3] = ["class", "depth", "lang"];
 /// other occurrence into the shared `__overflow__` label (ancestors
 /// collapse to one `__overflow__` presence key). Fixed-label bucket
 /// features are closed sets; the rule passes over them harmlessly.
-fn apply_cardinality_cap(groups: &mut [FeatureGroups]) {
+pub(crate) fn apply_cardinality_cap(groups: &mut [FeatureGroups]) {
     use std::collections::{BTreeSet, HashMap as CountMap};
 
     // (group name, feature name) -> value -> count, across all members.
@@ -852,8 +872,10 @@ fn canonical_of(ranked: &crate::rerank::RankedSearch, as_seen: &std::path::Path)
 /// contributions verbatim plus the descriptive feature groups extracted
 /// PURELY over the shared context the pipeline already prepared
 /// (TASK-105). The symbol bulk-load is the ONLY statement set the slate
-/// build issues — features add no round trips beyond the batched prepare
-/// (the trace test enforces it).
+/// build issues — and only when the descriptive pre-sort pass did not
+/// already run it: the pass's prepared extraction rides the shared
+/// context, and this build reuses its symbol map and capped groups
+/// verbatim (ONE extraction per query, TASK-102).
 fn build_members(
     conn: &Connection,
     query: &str,
@@ -862,19 +884,30 @@ fn build_members(
 ) -> Result<Vec<SlateMember>> {
     let flat: Vec<&crate::rerank::ScoredResult> =
         ranked.groups.iter().flat_map(|(_, g)| g.iter()).collect();
-    // Canonical keys BEFORE the bulk load: the prepare already resolved
-    // every result path (absolute MCP paths included) to its repo-relative
-    // `files.path`, so the exact `symbols IN` pass hits for every shape
-    // and the per-file suffix fallback stays reserved for paths the index
-    // genuinely cannot resolve.
-    let files: Vec<String> = {
+    // ONE extraction per query: when the descriptive pass ran, its
+    // prepared bundle (symbol bulk-load + capped groups) is already on
+    // the shared context, keyed exactly as this build resolves — same
+    // context, same canonicalization. Otherwise extract here as before:
+    // canonical keys BEFORE the bulk load, so the prepare already
+    // resolved every result path (absolute MCP paths included) to its
+    // repo-relative `files.path` and the exact `symbols IN` pass hits
+    // for every shape, the per-file suffix fallback staying reserved
+    // for paths the index genuinely cannot resolve.
+    let shared = ranked.context.feedback_extraction.as_deref();
+    let loaded;
+    let symbols: &HashMap<String, Vec<SymbolRow>> = if let Some(shared) = shared {
+        &shared.symbols
+    } else {
         let mut seen = std::collections::BTreeSet::new();
         for item in &flat {
             seen.insert(canonical_of(ranked, &item.classified.result.file));
         }
-        seen.into_iter().collect()
+        let files: Vec<String> = seen.into_iter().collect();
+        loaded = load_symbols_by_file(conn, &files)?;
+        &loaded
     };
-    let symbols = load_symbols_by_file(conn, &files)?;
+    // The fallback extraction inputs — used per member only when no
+    // prepared bundle covers it (the pass did not run).
     let inputs = ExtractionInputs {
         query,
         ctx: &ranked.context,
@@ -888,7 +921,8 @@ fn build_members(
         let file = result.file.to_string_lossy().into_owned();
         let canonical = canonical_of(ranked, &result.file);
         let rows = symbols.get(&canonical).map(Vec::as_slice).unwrap_or(&[]);
-        let (identity, symbol, kind) = match owning_symbol(rows, result.line) {
+        let owning = owning_symbol(rows, result.line);
+        let (identity, symbol, kind) = match owning {
             Some(sym) => (
                 // Anchor on the DB-stored repo-relative path: re-indexing
                 // re-inserts the same row, wherever the repo is checked out.
@@ -914,12 +948,16 @@ fn build_members(
                 None,
             ),
         };
-        extracted.push(extract_groups(
-            item,
-            owning_symbol(rows, result.line),
-            &canonical,
-            &inputs,
-        ));
+        extracted.push(
+            match shared.and_then(|shared| shared.groups.get(&(canonical.clone(), result.line))) {
+                // The pass's groups arrive already cardinality-capped —
+                // recorded under the pass's extraction clock (the learned
+                // table's load instant), the determinism the pass itself
+                // extracts under.
+                Some(groups) => groups.clone(),
+                None => extract_groups(item, owning, &canonical, &inputs),
+            },
+        );
         members.push(SlateMember {
             identity,
             rank: idx + 1,
@@ -932,7 +970,9 @@ fn build_members(
             groups: FeatureGroups::default(),
         });
     }
-    apply_cardinality_cap(&mut extracted);
+    if shared.is_none() {
+        apply_cardinality_cap(&mut extracted);
+    }
     for (member, mut groups) in members.iter_mut().zip(extracted) {
         groups.signals = crate::output::WhyOutput::from_contributions(
             member.score,
@@ -1093,6 +1133,23 @@ pub struct FeedbackEvent {
     pub created_at: i64,
 }
 
+/// Map one `feedback_events` row to a [`FeedbackEvent`] (shared by the
+/// full load and TASK-102's watermark cursor).
+fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedbackEvent> {
+    Ok(FeedbackEvent {
+        id: row.get(0)?,
+        result_identity: row.get(1)?,
+        query_class: row.get(2)?,
+        chosen_rank: row.get(3)?,
+        features: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        useful: row.get::<_, i64>(5)? == 1,
+        session: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
 /// Load every feedback event, oldest first, features parsed.
 pub fn load_events(conn: &Connection) -> Result<Vec<FeedbackEvent>> {
     let mut stmt = conn.prepare(
@@ -1100,26 +1157,59 @@ pub fn load_events(conn: &Connection) -> Result<Vec<FeedbackEvent>> {
          created_at FROM feedback_events ORDER BY id",
     )?;
     let events = stmt
-        .query_map([], |row| {
-            Ok(FeedbackEvent {
-                id: row.get(0)?,
-                result_identity: row.get(1)?,
-                query_class: row.get(2)?,
-                chosen_rank: row.get(3)?,
-                features: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                useful: row.get::<_, i64>(5)? == 1,
-                session: row.get(6)?,
-                created_at: row.get(7)?,
-            })
-        })?
+        .query_map([], event_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(events)
+}
+
+/// Load feedback events with `id > since`, oldest first — the full
+/// event-table tail. The chunked learning replay uses
+/// [`load_learning_chunk`] instead; this remains the plain cursor.
+pub fn load_events_since(conn: &Connection, since: i64) -> Result<Vec<FeedbackEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, result_identity, query_class, chosen_rank, features, useful, session, \
+         created_at FROM feedback_events WHERE id > ?1 ORDER BY id",
+    )?;
+    let events = stmt
+        .query_map([since], event_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(events)
+}
+
+/// Load one bounded learning chunk past the watermark (TASK-102): the
+/// chunk's id FRONTIER — the next `count` event ids in id order,
+/// qualification-agnostic so the watermark advances past skipped events
+/// exactly as an unchunked replay would — plus the full rows of the
+/// qualifying events inside `(since, frontier]`. The whole-event skip
+/// rules (`chosen_rank != 1`, more than one slate member) run in SQL, so
+/// a skip-rule event's slate JSON — every row's heaviest column — is
+/// never parsed at all; a payload too corrupt for the size test still
+/// loads (and fails loudly) rather than silently vanishing.
+pub(crate) fn load_learning_chunk(
+    conn: &Connection,
+    since: i64,
+    count: i64,
+) -> Result<(i64, Vec<FeedbackEvent>)> {
+    let frontier: Option<i64> = conn.query_row(
+        "SELECT MAX(id) FROM \
+         (SELECT id FROM feedback_events WHERE id > ?1 ORDER BY id LIMIT ?2)",
+        rusqlite::params![since, count],
+        |row| row.get(0),
+    )?;
+    let Some(frontier) = frontier else {
+        return Ok((since, Vec::new()));
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, result_identity, query_class, chosen_rank, features, useful, session, \
+         created_at FROM feedback_events \
+         WHERE id > ?1 AND id <= ?2 AND chosen_rank != 1 \
+         AND (NOT json_valid(features) OR json_array_length(features, '$.members') > 1) \
+         ORDER BY id",
+    )?;
+    let events = stmt
+        .query_map(rusqlite::params![since, frontier], event_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((frontier, events))
 }
 
 /// Distinct sessions that have reported `identity` useful — the exact

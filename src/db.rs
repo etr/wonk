@@ -326,6 +326,40 @@ CREATE TABLE IF NOT EXISTS feedback_slates (
     members TEXT NOT NULL,           -- JSON array of SlateMember
     created_at INTEGER NOT NULL
 );
+
+-- [V5] TASK-102: Learned per-repo weights — the entire durable product of
+-- feedback (DR-042/DR-043). Bounded deviation from defaults, decaying with
+-- age, resettable independently of event history. `feature` is a signal
+-- name (bare) or a flattened descriptive key (group-prefixed).
+CREATE TABLE IF NOT EXISTS learned_weights (
+    feature TEXT NOT NULL,
+    query_class TEXT NOT NULL DEFAULT '',  -- '' = overall; symbol/path/signature/conceptual
+    weight REAL NOT NULL,
+    observations INTEGER NOT NULL,
+    sessions INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (feature, query_class)
+);
+
+-- [V5] TASK-102: Exact distinct-session bookkeeping per (feature, scope):
+-- one row per session that ever observed the feature. Keeps the `sessions`
+-- column and the REQ-025 gate honest under interleaved sessions
+-- (A,B,A counts 2).
+CREATE TABLE IF NOT EXISTS learned_weight_sessions (
+    feature TEXT NOT NULL,
+    query_class TEXT NOT NULL DEFAULT '',
+    session TEXT NOT NULL,
+    PRIMARY KEY (feature, query_class, session)
+);
+
+-- [V5] TASK-102: Learning progress watermark: the highest feedback_events.id
+-- processed. Missed learning runs (best-effort contract) are picked up by
+-- the next successful feedback call; TASK-103's reset/recompute builds on
+-- this.
+CREATE TABLE IF NOT EXISTS learned_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 const TRIGGERS_SQL: &str = r#"
@@ -589,8 +623,9 @@ pub fn ensure_duplicate_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the TASK-101 feedback tables exist (`feedback_events`,
-/// `feedback_slates`).
+/// Ensure the TASK-101/102 feedback tables exist (`feedback_events`,
+/// `feedback_slates`, `learned_weights`, `learned_weight_sessions`,
+/// `learned_meta`).
 ///
 /// Handles schema migration for indexes created before feedback capture:
 /// safe to call on databases that already have the tables.
@@ -2305,7 +2340,8 @@ mod tests {
     // -- feedback tables (TASK-101) --------------------------------------------
 
     fn feedback_table_names(conn: &Connection) -> Vec<String> {
-        let names = "('feedback_events','feedback_slates')";
+        let names = "('feedback_events','feedback_slates','learned_weights',\
+                     'learned_weight_sessions','learned_meta')";
         conn.prepare(&format!(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN {names}"
         ))
@@ -2335,7 +2371,16 @@ mod tests {
 
         let mut tables = feedback_table_names(&conn);
         tables.sort();
-        assert_eq!(tables, vec!["feedback_events", "feedback_slates"]);
+        assert_eq!(
+            tables,
+            vec![
+                "feedback_events",
+                "feedback_slates",
+                "learned_meta",
+                "learned_weight_sessions",
+                "learned_weights"
+            ]
+        );
         let mut indexes = feedback_index_names(&conn);
         indexes.sort();
         assert_eq!(
@@ -2345,16 +2390,91 @@ mod tests {
     }
 
     #[test]
+    fn test_learned_weights_columns_match_architecture_ddl() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+        assert_eq!(
+            table_columns(&conn, "learned_weights"),
+            vec![
+                "feature",
+                "query_class",
+                "weight",
+                "observations",
+                "sessions",
+                "updated_at"
+            ]
+        );
+        assert_eq!(
+            table_columns(&conn, "learned_weight_sessions"),
+            vec!["feature", "query_class", "session"]
+        );
+        assert_eq!(table_columns(&conn, "learned_meta"), vec!["key", "value"]);
+        // The composite primary key holds: a duplicate (feature, class)
+        // insert is a constraint violation, not a second row.
+        conn.execute(
+            "INSERT INTO learned_weights \
+             (feature, query_class, weight, observations, sessions, updated_at) \
+             VALUES ('path_character', '', 0.6, 1, 1, 0)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO learned_weights \
+                 (feature, query_class, weight, observations, sessions, updated_at) \
+                 VALUES ('path_character', '', 0.7, 1, 1, 0)",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO learned_weights \
+                 (feature, query_class, weight, observations, sessions, updated_at) \
+                 VALUES ('path_character', 'symbol', 0.7, 1, 1, 0)",
+                [],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_ensure_feedback_tables_on_pre102_db_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A pre-TASK-102 index: the TASK-101 tables exist, the learner's
+        // three do not — the shape a TASK-105-era index presents.
+        let conn = open(&db_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE learned_weights;
+             DROP TABLE learned_weight_sessions;
+             DROP TABLE learned_meta;",
+        )
+        .unwrap();
+        assert_eq!(feedback_table_names(&conn).len(), 2);
+
+        // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
+        ensure_feedback_tables(&conn).unwrap();
+        ensure_feedback_tables(&conn).unwrap();
+        assert_eq!(feedback_table_names(&conn).len(), 5);
+        assert_eq!(feedback_index_names(&conn).len(), 2);
+    }
+
+    #[test]
     fn test_ensure_feedback_tables_on_pre101_db_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("index.db");
 
-        // A pre-TASK-101 index: full schema applied, then both feedback
-        // tables dropped — the shape an old index presents after upgrade.
+        // A pre-TASK-101 index: full schema applied, then every feedback
+        // table dropped — the shape an old index presents after upgrade.
         let conn = open(&db_path).unwrap();
         conn.execute_batch(
             "DROP TABLE feedback_events;
-             DROP TABLE feedback_slates;",
+             DROP TABLE feedback_slates;
+             DROP TABLE learned_weights;
+             DROP TABLE learned_weight_sessions;
+             DROP TABLE learned_meta;",
         )
         .unwrap();
         assert!(feedback_table_names(&conn).is_empty());
@@ -2362,7 +2482,7 @@ mod tests {
         // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
         ensure_feedback_tables(&conn).unwrap();
         ensure_feedback_tables(&conn).unwrap();
-        assert_eq!(feedback_table_names(&conn).len(), 2);
+        assert_eq!(feedback_table_names(&conn).len(), 5);
         assert_eq!(feedback_index_names(&conn).len(), 2);
     }
 
