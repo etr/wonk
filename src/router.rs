@@ -2535,6 +2535,10 @@ fn dispatch_duplicates<W: io::Write>(
 /// [`dispatch_duplicates`] so tests drive it with a seeded connection
 /// instead of the process working directory.
 ///
+/// The duplicate tables are ensured here (the `ensure_summaries_table`
+/// precedent) so a pre-TASK-100 index migrates instead of erroring: the
+/// sweep then sees an empty signature table and reports no groups.
+///
 /// Text output only in this task — the grep-shaped lines are
 /// machine-cuttable; JSON output is a follow-up.
 fn run_duplicates<W: io::Write>(
@@ -2543,6 +2547,7 @@ fn run_duplicates<W: io::Write>(
     fmt: &mut Formatter<W>,
     suppress: bool,
 ) -> Result<()> {
+    crate::db::ensure_duplicate_tables(conn)?;
     let report = crate::shingles::sweep_near_duplicates(conn, threshold)?;
     if report.groups.is_empty() {
         output::print_hint(
@@ -2557,6 +2562,17 @@ fn run_duplicates<W: io::Write>(
                 "{} oversized buckets truncated to {} members; more duplicates may exist",
                 report.truncated_buckets,
                 crate::shingles::MAX_BUCKET_MEMBERS
+            ),
+            suppress,
+        );
+    }
+    if report.truncated_groups > 0 {
+        output::print_hint(
+            &format!(
+                "{} duplicate groups capped at {} recorded pairs (strongest first); \
+                 run `wonk init` to refresh signatures",
+                report.truncated_groups,
+                crate::shingles::MAX_PAIRS_PER_GROUP
             ),
             suppress,
         );
@@ -6804,21 +6820,23 @@ mod tests {
         (dir, conn)
     }
 
-    fn seed_dup_symbol(conn: &Connection, name: &str, file: &str, body: &str) {
+    fn seed_dup_symbol(conn: &Connection, name: &str, file: &str, body: &str) -> i64 {
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language) \
              VALUES (?1, 'function', ?2, 1, 0, 'rust')",
             rusqlite::params![name, file],
         )
         .unwrap();
+        let id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO symbol_shingles (symbol_id, signature) VALUES (?1, ?2)",
             rusqlite::params![
-                conn.last_insert_rowid(),
+                id,
                 crate::shingles::encode_sketch(&crate::shingles::body_signature(body))
             ],
         )
         .unwrap();
+        id
     }
 
     fn run_dups(conn: &Connection, threshold: f32) -> String {
@@ -6858,13 +6876,43 @@ mod tests {
     }
 
     #[test]
+    fn duplicates_on_pre_task100_index_migrates_and_degrades() {
+        let (_dir, conn) = duplicates_conn();
+        // Strip the TASK-100 tables: the shape of a pre-TASK-100 index.
+        conn.execute("DROP TABLE symbol_shingles", []).unwrap();
+        conn.execute("DROP TABLE near_duplicates", []).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, col, language) \
+             VALUES ('handler', 'function', 'a.rs', 1, 0, 'rust')",
+            [],
+        )
+        .unwrap();
+
+        // `wonk duplicates` must degrade to an empty report over the
+        // migrated (ensure_*) schema — never a raw SQL error.
+        let text = run_dups(&conn, 0.85);
+        assert!(text.trim().is_empty(), "old index: empty, graceful: {text}");
+
+        // The migration ran: both duplicate tables exist afterwards.
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name IN ('symbol_shingles', 'near_duplicates')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 2, "ensure_duplicate_tables migrated the old index");
+    }
+
+    #[test]
     fn search_records_near_duplicates() {
         let (_dir, conn) = duplicates_conn();
-        seed_dup_symbol(&conn, "handler_a", "a.rs", DUP_HANDLER);
-        seed_dup_symbol(&conn, "handler_b", "b.rs", DUP_HANDLER);
+        let a = seed_dup_symbol(&conn, "handler_a", "a.rs", DUP_HANDLER);
+        let b = seed_dup_symbol(&conn, "handler_b", "b.rs", DUP_HANDLER);
         let pairs = vec![crate::shingles::NearDuplicatePair {
-            a: ("a.rs".to_string(), 1),
-            b: ("b.rs".to_string(), 1),
+            symbol_id_a: a,
+            symbol_id_b: b,
             similarity: 1.0,
         }];
         crate::shingles::record_pairs_best_effort(Some(&conn), &pairs);

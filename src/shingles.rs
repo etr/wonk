@@ -52,6 +52,14 @@ pub const BUCKET_KEY_COUNT: usize = 4;
 /// output (the report notes the truncation).
 pub const MAX_BUCKET_MEMBERS: usize = 1024;
 
+/// Rows of `near_duplicates` recorded per duplicate group: a bounded
+/// sample of the group's qualifying pairs (strongest first, the
+/// max-similarity pair always kept), NOT the group definition — the
+/// sweep's union-find groups are recomputed from `symbol_shingles` on
+/// every run, and typical copy groups (2-10 members, fewer pairs than
+/// the cap) record every pair unchanged.
+pub const MAX_PAIRS_PER_GROUP: usize = 64;
+
 /// One symbol's non-empty sketch, correlated to its symbol by start line
 /// (unique within a file). Written into `symbol_shingles` at index time.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,15 +70,17 @@ pub struct ShingleSignature {
     pub sketch: Vec<u32>,
 }
 
-/// A pair of positions whose sketch Jaccard exceeds the duplicate
+/// A pair of symbols whose sketch Jaccard exceeds the duplicate
 /// threshold, surfaced by the novelty pass (and recorded by
-/// [`record_near_duplicate_pairs`]).
+/// [`record_near_duplicate_pairs`]). Carries the `symbols.id` values the
+/// sketch loader's join already resolved, so recording is one batched
+/// INSERT with zero per-pair lookups.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NearDuplicatePair {
-    /// First position, in pre-novelty rank order.
-    pub a: (String, u64),
-    /// Second position, in pre-novelty rank order.
-    pub b: (String, u64),
+    /// First symbol's id, in pre-novelty rank order.
+    pub symbol_id_a: i64,
+    /// Second symbol's id, in pre-novelty rank order.
+    pub symbol_id_b: i64,
     /// Sketch Jaccard at detection time.
     pub similarity: f32,
 }
@@ -107,6 +117,12 @@ pub struct DuplicatesReport {
     /// Number of buckets truncated to MAX_BUCKET_MEMBERS — nonzero means
     /// the sweep compared a subset and more duplicates may exist.
     pub truncated_buckets: usize,
+    /// Number of groups whose recorded pair rows were capped at
+    /// [`MAX_PAIRS_PER_GROUP`] — nonzero means the memo stores a bounded
+    /// sample of the group's pairs, not every internal pair. Group
+    /// REPORTING is unaffected: groups are recomputed from
+    /// `symbol_shingles` on every sweep.
+    pub truncated_groups: usize,
 }
 
 /// Hash every shingle of `body` in body order: tokenize (canonical
@@ -209,14 +225,16 @@ pub fn novelty_redundancy(max_sim: f32, threshold: f32) -> f32 {
     ((max_sim - threshold) / (1.0 - threshold)).clamp(0.0, 1.0)
 }
 
-/// Persist qualifying pairs into `near_duplicates`, resolving each
-/// (file, line) to its smallest symbol id, canonicalizing
-/// `symbol_id_a < symbol_id_b`, one transaction, INSERT OR REPLACE (the
-/// memo is a cache; re-recording refreshes the similarity).
+/// Persist qualifying pairs into `near_duplicates` as ONE batched INSERT
+/// transaction. The pairs already carry `symbols.id` values (resolved by
+/// the sketch loader's join), so there are no per-pair lookups; ids
+/// canonicalize to `symbol_id_a < symbol_id_b`.
 ///
-/// Positions that no longer resolve to a symbol (edited away between
-/// ranking and recording) are skipped silently — a memo must never fail
-/// a search.
+/// An existing row is rewritten only when its similarity changed — the
+/// memo is a cache, so repeat searches and repeat sweeps pay nothing for
+/// pairs that did not change. A pair whose ids are equal (two candidates
+/// resolving to the same symbol) is skipped — a memo must never fail a
+/// search.
 pub fn record_near_duplicate_pairs(
     conn: &Connection,
     pairs: &[NearDuplicatePair],
@@ -224,35 +242,41 @@ pub fn record_near_duplicate_pairs(
     if pairs.is_empty() {
         return Ok(());
     }
+    let mut rows: Vec<(i64, i64, f32)> = pairs
+        .iter()
+        .filter_map(|pair| {
+            let (lo, hi) = if pair.symbol_id_a < pair.symbol_id_b {
+                (pair.symbol_id_a, pair.symbol_id_b)
+            } else {
+                (pair.symbol_id_b, pair.symbol_id_a)
+            };
+            (lo != hi).then_some((lo, hi, pair.similarity))
+        })
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    rows.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    insert_pair_rows(conn, &rows)?;
+    Ok(())
+}
+
+/// Insert canonical `(symbol_id_a < symbol_id_b)` pair rows in one
+/// transaction, churn-free: a new row inserts, an existing row updates
+/// only when its similarity differs (so unchanged memos are not
+/// rewritten).
+fn insert_pair_rows(conn: &Connection, rows: &[(i64, i64, f32)]) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
     let tx = conn.unchecked_transaction()?;
     {
-        let mut resolve = tx.prepare(
-            "SELECT id FROM symbols WHERE file = ?1 AND line = ?2 \
-             ORDER BY id ASC LIMIT 1",
-        )?;
         let mut insert = tx.prepare(
-            "INSERT OR REPLACE INTO near_duplicates (symbol_id_a, symbol_id_b, similarity) \
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO near_duplicates (symbol_id_a, symbol_id_b, similarity) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (symbol_id_a, symbol_id_b) DO UPDATE SET similarity = excluded.similarity \
+             WHERE similarity <> excluded.similarity",
         )?;
-        for pair in pairs {
-            let a: Option<i64> = resolve
-                .query_row(rusqlite::params![pair.a.0, pair.a.1 as i64], |row| {
-                    row.get(0)
-                })
-                .ok();
-            let b: Option<i64> = resolve
-                .query_row(rusqlite::params![pair.b.0, pair.b.1 as i64], |row| {
-                    row.get(0)
-                })
-                .ok();
-            let (Some(a), Some(b)) = (a, b) else {
-                continue;
-            };
-            if a == b {
-                continue;
-            }
-            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            insert.execute(rusqlite::params![lo, hi, pair.similarity])?;
+        for (a, b, sim) in rows {
+            insert.execute(rusqlite::params![a, b, sim])?;
         }
     }
     tx.commit()?;
@@ -293,7 +317,8 @@ fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
 
 /// Sweep every indexed signature, bucket by the smallest hashes, compare
 /// within buckets (capped at [`MAX_BUCKET_MEMBERS`]), record qualifying
-/// pairs into `near_duplicates`, and return the union-find groups with
+/// pairs into `near_duplicates` (bounded per group at
+/// [`MAX_PAIRS_PER_GROUP`]), and return the union-find groups with
 /// singletons dropped.
 ///
 /// Deterministic end to end: signatures load ordered by symbol id, bucket
@@ -303,6 +328,21 @@ fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
 pub fn sweep_near_duplicates(
     conn: &Connection,
     threshold: f32,
+) -> anyhow::Result<DuplicatesReport> {
+    sweep_near_duplicates_capped(conn, threshold, MAX_BUCKET_MEMBERS, MAX_PAIRS_PER_GROUP)
+}
+
+/// The sweep with injectable caps: `max_bucket_members` bounds each
+/// bucket's comparisons and `max_pairs_per_group` bounds the pair rows
+/// recorded per duplicate group. Production callers take the shipped
+/// constants via [`sweep_near_duplicates`]; tests pin the truncation
+/// semantics with small values instead of materializing half a million
+/// rows.
+pub fn sweep_near_duplicates_capped(
+    conn: &Connection,
+    threshold: f32,
+    max_bucket_members: usize,
+    max_pairs_per_group: usize,
 ) -> anyhow::Result<DuplicatesReport> {
     let mut entries: Vec<SweepEntry> = Vec::new();
     {
@@ -364,8 +404,8 @@ pub fn sweep_near_duplicates(
                 .then(entries[a].symbol_id.cmp(&entries[b].symbol_id))
         });
         members.dedup();
-        if members.len() > MAX_BUCKET_MEMBERS {
-            members.truncate(MAX_BUCKET_MEMBERS);
+        if members.len() > max_bucket_members {
+            members.truncate(max_bucket_members);
             truncated_buckets += 1;
         }
         for w in 0..members.len() {
@@ -429,32 +469,52 @@ pub fn sweep_near_duplicates(
             .then_with(|| a.members[0].line.cmp(&b.members[0].line))
     });
 
-    // Record the qualifying pairs (REQ-003), canonical and deterministic.
-    let mut pair_rows: Vec<(i64, i64, f32)> = qualifying
-        .iter()
-        .map(|(&(i, j), &sim)| {
-            let (a, b) = (entries[i].symbol_id, entries[j].symbol_id);
-            if a < b { (a, b, sim) } else { (b, a, sim) }
-        })
-        .collect();
-    pair_rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    if !pair_rows.is_empty() {
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut insert = tx.prepare(
-                "INSERT OR REPLACE INTO near_duplicates (symbol_id_a, symbol_id_b, similarity) \
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for (a, b, sim) in &pair_rows {
-                insert.execute(rusqlite::params![a, b, sim])?;
-            }
-        }
-        tx.commit()?;
+    // Record the qualifying pairs (REQ-003), canonical, deterministic,
+    // and bounded per group: each group's strongest pairs survive (the
+    // max-similarity pair always kept), the report notes the capping,
+    // and typical groups (fewer pairs than the cap) record every pair.
+    // One sorted pass — (root, sim desc, entry ids) groups each
+    // component's pairs contiguously, strongest first.
+    let mut truncated_groups = 0usize;
+    let mut rooted: Vec<(usize, f32, usize, usize)> = Vec::with_capacity(qualifying.len());
+    for (&(i, j), &sim) in &qualifying {
+        rooted.push((uf_find(&mut parent, i), sim, i, j));
     }
+    rooted.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.2.cmp(&b.2).then(a.3.cmp(&b.3)))
+    });
+    let mut pair_rows: Vec<(i64, i64, f32)> = Vec::new();
+    let mut current_root = usize::MAX;
+    let mut taken = 0usize;
+    let mut group_total = 0usize;
+    for &(root, sim, i, j) in &rooted {
+        if root != current_root {
+            if group_total > max_pairs_per_group {
+                truncated_groups += 1;
+            }
+            current_root = root;
+            taken = 0;
+            group_total = 0;
+        }
+        group_total += 1;
+        if taken < max_pairs_per_group {
+            taken += 1;
+            let (a, b) = (entries[i].symbol_id, entries[j].symbol_id);
+            pair_rows.push(if a < b { (a, b, sim) } else { (b, a, sim) });
+        }
+    }
+    if group_total > max_pairs_per_group {
+        truncated_groups += 1;
+    }
+    pair_rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    insert_pair_rows(conn, &pair_rows)?;
 
     Ok(DuplicatesReport {
         groups,
         truncated_buckets,
+        truncated_groups,
     })
 }
 
@@ -685,12 +745,12 @@ mod tests {
         let a = insert_symbol_with_sketch(&conn, "handler_a", "a.rs", 1, &handler_body());
         let b = insert_symbol_with_sketch(&conn, "handler_b", "b.rs", 1, &handler_body());
 
-        // Positions given in either order canonicalize to (min, max).
+        // Ids given in either order canonicalize to (min, max).
         record_near_duplicate_pairs(
             &conn,
             &[NearDuplicatePair {
-                a: ("b.rs".to_string(), 1),
-                b: ("a.rs".to_string(), 1),
+                symbol_id_a: b,
+                symbol_id_b: a,
                 similarity: 1.0,
             }],
         )
@@ -701,8 +761,8 @@ mod tests {
         record_near_duplicate_pairs(
             &conn,
             &[NearDuplicatePair {
-                a: ("a.rs".to_string(), 1),
-                b: ("b.rs".to_string(), 1),
+                symbol_id_a: a,
+                symbol_id_b: b,
                 similarity: 0.95,
             }],
         )
@@ -739,23 +799,90 @@ mod tests {
     }
 
     #[test]
-    fn sweep_bucket_cap_truncates_and_notes() {
+    fn sweep_bucket_cap_truncates_and_notes_at_injected_cap() {
         let (_dir, conn) = seeded_conn();
-        // MAX_BUCKET_MEMBERS + 1 identical bodies: the bucket they all
-        // share is truncated, the note is set, and pairs are still
-        // recorded among the first MAX_BUCKET_MEMBERS members.
+        // Injected bucket cap 8: 9 identical bodies share their buckets;
+        // each oversized bucket truncates to 8 members, the note is set,
+        // and the pairs among the kept members are recorded (C(8,2)=28,
+        // under the injected pair cap).
         let body = handler_body();
-        for i in 0..=MAX_BUCKET_MEMBERS {
+        for i in 0..9 {
+            insert_symbol_with_sketch(&conn, "clone", &format!("f{i}.rs"), 1, &body);
+        }
+        let report = sweep_near_duplicates_capped(&conn, 0.85, 8, usize::MAX).unwrap();
+        assert!(report.truncated_buckets >= 1);
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].members.len(), 8);
+        assert_eq!(report.truncated_groups, 0);
+        assert_eq!(recorded_pairs(&conn).len(), 28);
+    }
+
+    #[test]
+    fn sweep_pair_cap_bounds_recorded_pairs_per_group() {
+        let (_dir, conn) = seeded_conn();
+        // Injected pair cap 8: the same saturated group's C(8,2)=28
+        // qualifying pairs truncate to 8 recorded rows, the note is
+        // set, and the GROUP report (members, mean similarity) is
+        // unchanged — REQ-006 reporting never depends on the memo cap.
+        let body = handler_body();
+        for i in 0..9 {
+            insert_symbol_with_sketch(&conn, "clone", &format!("f{i}.rs"), 1, &body);
+        }
+        let report = sweep_near_duplicates_capped(&conn, 0.85, 8, 8).unwrap();
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].members.len(), 8);
+        assert!(report.groups[0].mean_similarity > 0.85);
+        assert_eq!(report.truncated_groups, 1, "the group's pairs were capped");
+        assert_eq!(recorded_pairs(&conn).len(), 8);
+    }
+
+    #[test]
+    fn sweep_pair_cap_keeps_max_similarity_pair() {
+        let (_dir, conn) = seeded_conn();
+        // Three mutual near-duplicates with distinct similarities; an
+        // injected pair cap of 1 must keep the strongest pair (the two
+        // identical bodies, similarity 1.0).
+        let body = handler_body();
+        let renamed = body.replace("handle_user_created", "handle_account_created");
+        let a = insert_symbol_with_sketch(&conn, "handler_a", "a.rs", 1, &body);
+        let b = insert_symbol_with_sketch(&conn, "handler_b", "b.rs", 1, &body);
+        insert_symbol_with_sketch(&conn, "handler_c", "c.rs", 1, &renamed);
+        assert!(
+            crate::shingles::sketch_jaccard(
+                &crate::shingles::body_signature(&body),
+                &crate::shingles::body_signature(&renamed)
+            ) > 0.85,
+            "fixture: the renamed variant must also qualify"
+        );
+
+        let report = sweep_near_duplicates_capped(&conn, 0.85, MAX_BUCKET_MEMBERS, 1).unwrap();
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].members.len(), 3, "group report uncapped");
+        assert_eq!(report.truncated_groups, 1);
+        assert_eq!(recorded_pairs(&conn), vec![(a.min(b), a.max(b), 1.0)]);
+    }
+
+    #[test]
+    fn sweep_default_constants_bound_pair_rows() {
+        // At the shipped constants a 12-member group (C(12,2)=66 pairs,
+        // one bucket, no bucket truncation) records exactly
+        // MAX_PAIRS_PER_GROUP rows and reports the capping.
+        let (_dir, conn) = seeded_conn();
+        let body = handler_body();
+        for i in 0..12 {
             insert_symbol_with_sketch(&conn, "clone", &format!("f{i}.rs"), 1, &body);
         }
         let report = sweep_near_duplicates(&conn, 0.85).unwrap();
-        assert!(report.truncated_buckets >= 1);
+        assert_eq!(report.truncated_buckets, 0);
         assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.groups[0].members.len(), MAX_BUCKET_MEMBERS);
-        // Capped bucket: C(1024, 2) qualifying pairs, bounded.
-        assert_eq!(
-            recorded_pairs(&conn).len(),
-            MAX_BUCKET_MEMBERS * (MAX_BUCKET_MEMBERS - 1) / 2
+        assert_eq!(report.groups[0].members.len(), 12);
+        assert_eq!(report.truncated_groups, 1);
+        assert_eq!(recorded_pairs(&conn).len(), MAX_PAIRS_PER_GROUP);
+        assert!(
+            recorded_pairs(&conn)
+                .iter()
+                .all(|(_, _, sim)| (*sim - 1.0).abs() < 1e-6),
+            "identical bodies: every kept pair is max-similarity"
         );
     }
 
@@ -765,6 +892,132 @@ mod tests {
         let report = sweep_near_duplicates(&conn, 0.85).unwrap();
         assert_eq!(report.groups.len(), 0);
         assert_eq!(report.truncated_buckets, 0);
+    }
+
+    // -- PERF: churn-free, resolve-free pair persistence --------------------
+
+    /// Rows INSERTed/UPDATEd/DELETEd on this connection since it opened.
+    fn total_changes(conn: &Connection) -> i64 {
+        conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn record_pairs_rerecording_unchanged_row_is_free() {
+        let (_dir, conn) = seeded_conn();
+        let a = insert_symbol_with_sketch(&conn, "handler_a", "a.rs", 1, &handler_body());
+        let b = insert_symbol_with_sketch(&conn, "handler_b", "b.rs", 1, &handler_body());
+
+        record_near_duplicate_pairs(
+            &conn,
+            &[NearDuplicatePair {
+                symbol_id_a: a,
+                symbol_id_b: b,
+                similarity: 1.0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(recorded_pairs(&conn), vec![(a.min(b), a.max(b), 1.0)]);
+
+        // Re-recording the SAME pair at the SAME similarity must not
+        // rewrite the row: every repeat search and repeat sweep pays
+        // nothing for memos that did not change.
+        let before = total_changes(&conn);
+        record_near_duplicate_pairs(
+            &conn,
+            &[NearDuplicatePair {
+                symbol_id_a: a,
+                symbol_id_b: b,
+                similarity: 1.0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            total_changes(&conn),
+            before,
+            "unchanged pair re-recording must not rewrite the row"
+        );
+
+        // A changed similarity still refreshes exactly one row.
+        record_near_duplicate_pairs(
+            &conn,
+            &[NearDuplicatePair {
+                symbol_id_a: a,
+                symbol_id_b: b,
+                similarity: 0.95,
+            }],
+        )
+        .unwrap();
+        assert_eq!(total_changes(&conn), before + 1);
+        assert_eq!(recorded_pairs(&conn)[0].2, 0.95);
+    }
+
+    static TRACE_STMTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn trace_stmts(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && let Ok(mut log) = TRACE_STMTS.lock()
+        {
+            log.push(sql.to_string());
+        }
+    }
+
+    #[test]
+    fn record_pairs_is_batched_insert_without_resolve_reads() {
+        let (_dir, conn) = seeded_conn();
+        let a = insert_symbol_with_sketch(&conn, "handler_a", "a.rs", 1, &handler_body());
+        let b = insert_symbol_with_sketch(&conn, "handler_b", "b.rs", 1, &handler_body());
+        let c = insert_symbol_with_sketch(&conn, "handler_c", "c.rs", 1, &handler_body());
+        let pairs: Vec<NearDuplicatePair> = [(a, b), (a, c), (b, c)]
+            .into_iter()
+            .map(|(a, b)| NearDuplicatePair {
+                symbol_id_a: a,
+                symbol_id_b: b,
+                similarity: 1.0,
+            })
+            .collect();
+
+        TRACE_STMTS.lock().unwrap().clear();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_stmts),
+        );
+        record_near_duplicate_pairs(&conn, &pairs).unwrap();
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+
+        assert_eq!(recorded_pairs(&conn).len(), 3);
+        let statements = TRACE_STMTS.lock().unwrap().clone();
+        assert!(
+            statements
+                .iter()
+                .all(|s| !s.to_uppercase().contains("SELECT")),
+            "recording must be one batched INSERT transaction with zero \
+             per-pair resolve reads, saw: {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|s| s.to_uppercase().contains("INSERT INTO NEAR_DUPLICATES")),
+            "the batched INSERT ran: {statements:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_rerun_rewrites_nothing_unchanged() {
+        let (_dir, conn) = seeded_conn();
+        let body = handler_body();
+        insert_symbol_with_sketch(&conn, "handler_a", "a.rs", 1, &body);
+        insert_symbol_with_sketch(&conn, "handler_b", "b.rs", 1, &body);
+
+        sweep_near_duplicates(&conn, 0.85).unwrap();
+        assert_eq!(recorded_pairs(&conn).len(), 1);
+        let before = total_changes(&conn);
+        sweep_near_duplicates(&conn, 0.85).unwrap();
+        assert_eq!(
+            total_changes(&conn),
+            before,
+            "a repeat sweep must not rewrite unchanged pair rows"
+        );
     }
 
     // A realistic ~90-token handler body: validation, dedup, persistence,

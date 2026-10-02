@@ -500,12 +500,23 @@ pub struct TopologyContext {
     pub(crate) modal_fraction: f32,
 }
 
+/// One loaded sketch with its resolved `symbols.id` (TASK-100): the
+/// sketch loader's join produces both, so the pairs the novelty pass
+/// surfaces — and the memo rows recorded from them — never re-resolve
+/// positions back to ids (recording is one batched INSERT, zero point
+/// lookups).
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedSketch {
+    pub(crate) symbol_id: i64,
+    pub(crate) sketch: Vec<u32>,
+}
+
 /// Bottom-k shingle sketches at the candidate positions (TASK-100),
 /// decoded from `symbol_shingles`. The ONLY duplicate-detection input —
 /// no symbol body is ever read at query time (PRD-DUP-REQ-002).
 #[derive(Debug, Default, Clone)]
 pub struct ShingleContext {
-    pub(crate) sketches: HashMap<(String, u64), Vec<u32>>,
+    pub(crate) sketches: HashMap<(String, u64), LoadedSketch>,
 }
 
 /// The query sources the pipeline prepares context against: the BM25
@@ -666,7 +677,17 @@ impl SharedContext {
         self.shingles
             .sketches
             .get(&(file.to_string(), line))
-            .map(|v| v.as_slice())
+            .map(|entry| entry.sketch.as_slice())
+    }
+
+    /// The `symbols.id` the loaded sketch at a position belongs to (None
+    /// unless prepared). Pairs carry this id so recording needs no
+    /// resolve lookup (TASK-100).
+    pub fn symbol_id_at(&self, file: &str, line: u64) -> Option<i64> {
+        self.shingles
+            .sketches
+            .get(&(file.to_string(), line))
+            .map(|entry| entry.symbol_id)
     }
 }
 
@@ -1934,7 +1955,7 @@ fn load_shingle_sketches(conn: &Connection, results: &[ClassifiedResult]) -> Shi
     for chunk in wanted.chunks(IN_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!(
-            "SELECT s.file, s.line, ss.signature \
+            "SELECT s.id, s.file, s.line, ss.signature \
              FROM symbols s JOIN symbol_shingles ss ON ss.symbol_id = s.id \
              WHERE s.file IN ({placeholders}) ORDER BY s.id ASC"
         );
@@ -1943,14 +1964,15 @@ fn load_shingle_sketches(conn: &Connection, results: &[ClassifiedResult]) -> Shi
         };
         let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
             ))
         }) else {
             continue;
         };
-        for (file, line, blob) in rows.flatten() {
+        for (symbol_id, file, line, blob) in rows.flatten() {
             let key = (file, line as u64);
             if !positions.contains(&key) {
                 continue;
@@ -1959,7 +1981,9 @@ fn load_shingle_sketches(conn: &Connection, results: &[ClassifiedResult]) -> Shi
             if sketch.is_empty() {
                 continue;
             }
-            ctx.sketches.entry(key).or_insert(sketch);
+            ctx.sketches
+                .entry(key)
+                .or_insert_with(|| LoadedSketch { symbol_id, sketch });
         }
     }
     ctx
@@ -2115,7 +2139,9 @@ pub const NOVELTY_WINDOW: usize = 256;
 ///
 /// Returns every compared pair with similarity strictly above
 /// `threshold`, in deterministic (i asc, j asc) loop order, for the
-/// dispatch layer to record (PRD-DUP-REQ-003).
+/// dispatch layer to record (PRD-DUP-REQ-003). Pairs carry the
+/// `symbols.id` values the sketch loader resolved, so recording is a
+/// batched INSERT with no per-pair lookups.
 fn apply_novelty(
     scored: &mut [ScoredResult],
     ctx: &SharedContext,
@@ -2125,33 +2151,36 @@ fn apply_novelty(
 ) -> Vec<crate::shingles::NearDuplicatePair> {
     let window_end = window.min(scored.len());
 
-    // Sketches of the examined candidates, in pre-novelty rank order —
-    // a copy (<= 256 x 64 u32) so the borrow below is free.
-    let sketches: Vec<Option<Vec<u32>>> = scored[..window_end]
+    // Sketches (with their resolved symbol ids) of the examined
+    // candidates, in pre-novelty rank order — a copy (<= 256 x 64 u32)
+    // so the borrow below is free.
+    let loaded: Vec<Option<(i64, Vec<u32>)>> = scored[..window_end]
         .iter()
         .map(|result| {
             let file = result.classified.result.file.to_string_lossy().into_owned();
-            ctx.sketch_at(&file, result.classified.result.line)
-                .map(|sketch| sketch.to_vec())
+            ctx.shingles
+                .sketches
+                .get(&(file, result.classified.result.line))
+                .map(|entry| (entry.symbol_id, entry.sketch.clone()))
         })
         .collect();
 
     let mut values = vec![1.0f32; scored.len()];
     let mut pairs = Vec::new();
     for i in 0..window_end {
-        let Some(sketch_i) = &sketches[i] else {
+        let Some((id_i, sketch_i)) = &loaded[i] else {
             continue;
         };
         let mut max_sim = 0.0f32;
-        for j in 0..i {
-            let Some(sketch_j) = &sketches[j] else {
+        for entry in loaded.iter().take(i) {
+            let Some((id_j, sketch_j)) = entry else {
                 continue;
             };
             let sim = crate::shingles::sketch_jaccard(sketch_i, sketch_j);
             if sim > threshold {
                 pairs.push(crate::shingles::NearDuplicatePair {
-                    a: position_of(&scored[j]),
-                    b: position_of(&scored[i]),
+                    symbol_id_a: *id_j,
+                    symbol_id_b: *id_i,
                     similarity: sim,
                 });
             }
@@ -2171,14 +2200,6 @@ fn apply_novelty(
         });
     }
     pairs
-}
-
-/// A scored result's `(file, line)` position, the identity pairs carry.
-fn position_of(result: &ScoredResult) -> (String, u64) {
-    (
-        result.classified.result.file.to_string_lossy().into_owned(),
-        result.classified.result.line,
-    )
 }
 
 /// Score, sort, and (when `novelty` weighs nonzero) run the novelty
@@ -6272,11 +6293,11 @@ proximity, signature, churn, co_change, hub, authority, community",
         (dir, conn)
     }
 
-    fn seed_sketch(conn: &Connection, file: &str, line: u64, body: &str) {
-        seed_raw_sketch(conn, file, line, &crate::shingles::body_signature(body));
+    fn seed_sketch(conn: &Connection, file: &str, line: u64, body: &str) -> i64 {
+        seed_raw_sketch(conn, file, line, &crate::shingles::body_signature(body))
     }
 
-    fn seed_raw_sketch(conn: &Connection, file: &str, line: u64, sketch: &[u32]) {
+    fn seed_raw_sketch(conn: &Connection, file: &str, line: u64, sketch: &[u32]) -> i64 {
         conn.execute(
             "INSERT INTO symbols (name, kind, file, line, col, language) \
              VALUES (?1, 'function', ?2, ?3, 0, 'rust')",
@@ -6289,6 +6310,7 @@ proximity, signature, churn, co_change, hub, authority, community",
             rusqlite::params![id, crate::shingles::encode_sketch(sketch)],
         )
         .unwrap();
+        id
     }
 
     fn novelty_value(scored: &ScoredResult) -> f32 {
@@ -6654,8 +6676,8 @@ proximity, signature, churn, co_change, hub, authority, community",
         let (_dir, conn) = dup_conn();
         seed_raw_sketch(&conn, "a.rs", 1, &at_threshold);
         seed_raw_sketch(&conn, "b.rs", 1, &at_threshold_b);
-        seed_raw_sketch(&conn, "c.rs", 1, &above);
-        seed_raw_sketch(&conn, "e.rs", 1, &above_b);
+        let c = seed_raw_sketch(&conn, "c.rs", 1, &above);
+        let e = seed_raw_sketch(&conn, "e.rs", 1, &above_b);
 
         let results: Vec<ClassifiedResult> = ["a.rs", "b.rs", "c.rs", "e.rs"]
             .into_iter()
@@ -6672,14 +6694,14 @@ proximity, signature, churn, co_change, hub, authority, community",
         );
         assert_eq!(scored.len(), 4);
 
-        let mut names: Vec<(String, String)> = pairs
+        let mut ids: Vec<(i64, i64)> = pairs
             .iter()
-            .map(|p| (p.a.0.clone(), p.b.0.clone()))
+            .map(|p| (p.symbol_id_a, p.symbol_id_b))
             .collect();
-        names.sort();
+        ids.sort_unstable();
         assert_eq!(
-            names,
-            vec![("c.rs".to_string(), "e.rs".to_string())],
+            ids,
+            vec![(c.min(e), c.max(e))],
             "only strictly-above-threshold pairs surface"
         );
     }
@@ -6724,10 +6746,15 @@ proximity, signature, churn, co_change, hub, authority, community",
         let mut ctx = SharedContext::default();
         let mut scored: Vec<ScoredResult> = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]
             .into_iter()
-            .map(|f| {
-                ctx.shingles
-                    .sketches
-                    .insert((f.to_string(), 1), sketch.clone());
+            .enumerate()
+            .map(|(n, f)| {
+                ctx.shingles.sketches.insert(
+                    (f.to_string(), 1),
+                    LoadedSketch {
+                        symbol_id: n as i64 + 1,
+                        sketch: sketch.clone(),
+                    },
+                );
                 ScoredResult {
                     classified: classified(f, 1, "fn", ResultCategory::Other),
                     score: 1.0,
@@ -6742,10 +6769,10 @@ proximity, signature, churn, co_change, hub, authority, community",
 
         let values: Vec<f32> = scored.iter().map(novelty_value).collect();
         assert_eq!(values, vec![1.0, 0.0, 1.0, 1.0, 1.0]);
-        // Only the one examined pair surfaced.
+        // Only the one examined pair surfaced, carrying the loaded ids.
         assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].a.0, "a.rs");
-        assert_eq!(pairs[0].b.0, "b.rs");
+        assert_eq!(pairs[0].symbol_id_a, 1);
+        assert_eq!(pairs[0].symbol_id_b, 2);
     }
 
     #[test]

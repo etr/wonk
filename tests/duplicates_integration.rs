@@ -349,6 +349,42 @@ fn req003_pairs_recorded_after_search() {
     assert!(rows.iter().all(|(_, _, sim)| (*sim - 1.0).abs() < 1e-6));
 }
 
+/// Rows in the fixture index's `near_duplicates` table.
+fn recorded_pair_count(root: &Path) -> i64 {
+    let index_path = db::find_existing_index(root).expect("fixture index to exist");
+    let conn = db::open(&index_path).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM near_duplicates", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn req003_real_cli_search_records_pairs_end_to_end() {
+    let (dir, conn) = duplicates_repo();
+    drop(conn);
+    let root = dir.path();
+
+    // The REAL CLI search dispatch must record the pairs its novelty
+    // pass surfaced (REQ-003) — not just the library helper.
+    let out = Command::new(wonk_bin())
+        .arg("--quiet")
+        .arg("search")
+        .arg("created")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "search must succeed (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        recorded_pair_count(root) > 0,
+        "the real CLI search dispatch recorded no near-duplicate pairs"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // REQ-006: `wonk duplicates` reporting (binary level)
 // ---------------------------------------------------------------------------
@@ -413,6 +449,44 @@ fn req006_duplicates_command_reports_groups() {
         stdout.contains("dup-group"),
         "0.5 finds the pairs: {stdout}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PERF (iter 1): the recorded-pairs memo is bounded per group
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duplicates_notes_bounded_recorded_pairs() {
+    // 12 byte-identical copies: one group of 12 with C(12, 2) = 66
+    // qualifying pairs — past the 64-rows-per-group bound. The GROUP
+    // report stays whole; the recorded-pairs truncation is noted like
+    // the bucket truncation; the memo holds exactly the bound.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    for i in 1..=12 {
+        fs::write(root.join(format!("a{i}.rs")), COPY_HANDLER).unwrap();
+    }
+    pipeline::build_index(root, true).unwrap();
+
+    // No --quiet: the truncation note rides stderr like every hint.
+    let out = Command::new(wonk_bin())
+        .arg("duplicates")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("dup-group 1 size=12 mean-sim=1.00"),
+        "group reporting unaffected by the pair cap: {stdout}"
+    );
+    assert!(
+        stderr.contains("1 duplicate groups capped at 64 recorded pairs"),
+        "pair-cap truncation must be noted: {stderr}"
+    );
+    assert_eq!(recorded_pair_count(root), 64);
 }
 
 // ---------------------------------------------------------------------------
