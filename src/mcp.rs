@@ -3065,33 +3065,18 @@ impl McpServer {
             Err(e) => return CallToolResult::error(e),
         };
 
-        // Scope parsing mirrors tool_changes, plus `since` as sugar for
-        // compare+base (the CLI's --since).
+        // Scope resolution through the shared seam (TASK-086 review
+        // debt): the router's parse — including the base-ref validation
+        // this copy used to skip — plus `since` sugar.
         let scope_str = args
             .get("scope")
             .and_then(|v| v.as_str())
             .unwrap_or("unstaged");
-        let (scope_str, base) = match args.get("since").and_then(|v| v.as_str()) {
-            Some(since) => ("compare".to_string(), Some(since.to_string())),
-            None => (
-                scope_str.to_string(),
-                args.get("base").and_then(|v| v.as_str()).map(String::from),
-            ),
-        };
-        let scope = if scope_str == "compare" {
-            match base {
-                Some(b) => crate::types::ChangeScope::Compare(b),
-                None => {
-                    return CallToolResult::error(
-                        "'base' is required when scope=compare (or use 'since')".into(),
-                    );
-                }
-            }
-        } else {
-            match scope_str.parse::<crate::types::ChangeScope>() {
-                Ok(s) => s,
-                Err(e) => return CallToolResult::error(e),
-            }
+        let since = args.get("since").and_then(|v| v.as_str());
+        let base = args.get("base").and_then(|v| v.as_str());
+        let scope = match crate::router::resolve_scope_args(scope_str, base, since) {
+            Ok(s) => s,
+            Err(e) => return CallToolResult::error(format!("{e:#}")),
         };
 
         let config = match crate::config::Config::load(Some(&repo_root)) {
@@ -3099,18 +3084,10 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
         };
         let options = crate::review::ReviewOptions {
-            breaking_change: config.review.breaking_change,
-            coverage_gap: config.review.coverage_gap,
-            cross_repo: config.review.cross_repo,
-            reach_enabled: config.reach.enabled,
             elide,
-            ..crate::review::ReviewOptions::default()
+            ..crate::review::ReviewOptions::from_config(&config)
         };
-        let cross_repo = config
-            .review
-            .cross_repo
-            .then(|| crate::review::CrossRepoInputs::discover(&repo_root))
-            .flatten();
+        let cross_repo = crate::review::CrossRepoInputs::discover_if_enabled(&config, &repo_root);
 
         match crate::review::run_review(conn, &scope, &repo_root, &options, cross_repo.as_ref()) {
             Ok(result) => {
@@ -3222,24 +3199,16 @@ impl McpServer {
 
         let format = extract_format(&args);
 
-        // Parse scope.
+        // Parse scope through the shared seam (TASK-086 review debt) —
+        // including the base-ref validation this copy used to skip.
         let scope_str = args
             .get("scope")
             .and_then(|v| v.as_str())
             .unwrap_or("unstaged");
-        let scope = if scope_str == "compare" {
-            let base = match args.get("base").and_then(|v| v.as_str()) {
-                Some(b) => b.to_string(),
-                None => {
-                    return CallToolResult::error("'base' is required when scope=compare".into());
-                }
-            };
-            crate::types::ChangeScope::Compare(base)
-        } else {
-            match scope_str.parse::<crate::types::ChangeScope>() {
-                Ok(s) => s,
-                Err(e) => return CallToolResult::error(e),
-            }
+        let base = args.get("base").and_then(|v| v.as_str());
+        let scope = match crate::router::resolve_scope_args(scope_str, base, None) {
+            Ok(s) => s,
+            Err(e) => return CallToolResult::error(format!("{e:#}")),
         };
 
         let blast = args.get("blast").and_then(|v| v.as_bool()).unwrap_or(false);

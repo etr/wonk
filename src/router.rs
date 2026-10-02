@@ -2055,7 +2055,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
 /// Parse a scope string plus optional base ref into a [`ChangeScope`]
 /// (REQ-008 verbatim parsing; compare requires and validates the base ref).
-fn parse_change_scope(scope: &str, base: Option<&str>) -> Result<crate::types::ChangeScope> {
+pub(crate) fn parse_change_scope(
+    scope: &str,
+    base: Option<&str>,
+) -> Result<crate::types::ChangeScope> {
     use crate::types::ChangeScope;
 
     if scope == "compare" {
@@ -2067,6 +2070,22 @@ fn parse_change_scope(scope: &str, base: Option<&str>) -> Result<crate::types::C
     scope
         .parse::<ChangeScope>()
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The `since`-as-compare+base sugar on top of [`parse_change_scope`] —
+/// the one scope-resolution seam for every dispatch surface (CLI
+/// `dispatch_review`, MCP `tool_review`/`tool_changes`; TASK-086 review
+/// debt: four hand-rolled copies had drifted in error wording and the
+/// MCP copies skipped the base-ref validation entirely).
+pub(crate) fn resolve_scope_args(
+    scope: &str,
+    base: Option<&str>,
+    since: Option<&str>,
+) -> Result<crate::types::ChangeScope> {
+    match since {
+        Some(s) => parse_change_scope("compare", Some(s)),
+        None => parse_change_scope(scope, base),
+    }
 }
 
 fn dispatch_changes<W: io::Write>(
@@ -2149,35 +2168,23 @@ fn dispatch_review<W: io::Write>(
         })?;
 
     // 2. --since <ref> is sugar for --scope=compare --base=<ref>.
-    let (scope_str, base) = match &args.since {
-        Some(since) => ("compare".to_string(), Some(since.clone())),
-        None => (args.scope.clone(), args.base.clone()),
-    };
-    let scope = parse_change_scope(&scope_str, base.as_deref())?;
+    let scope = resolve_scope_args(&args.scope, args.base.as_deref(), args.since.as_deref())?;
 
     // 3. Load [review] rule switches, the [reach] kill switch, and the
     //    REQ-015 filter knobs from the CLI (default off = today's report).
     let config = crate::config::Config::load(Some(&repo_root))?;
     let options = crate::review::ReviewOptions {
-        breaking_change: config.review.breaking_change,
-        coverage_gap: config.review.coverage_gap,
-        cross_repo: config.review.cross_repo,
-        reach_enabled: config.reach.enabled,
         min_confidence: args.min_confidence,
         min_severity: args.min_severity,
         kinds: args.kind,
         max_findings: args.max_findings,
         elide: args.elide.map(Into::into),
-        ..crate::review::ReviewOptions::default()
+        ..crate::review::ReviewOptions::from_config(&config)
     };
 
     // Cross-repo inputs resolved once here — run_review never touches
     // $HOME itself, and a disabled rule C passes no inputs at all.
-    let cross_repo = config
-        .review
-        .cross_repo
-        .then(|| crate::review::CrossRepoInputs::discover(&repo_root))
-        .flatten();
+    let cross_repo = crate::review::CrossRepoInputs::discover_if_enabled(&config, &repo_root);
 
     // 4. Run the review. The verdict is data: exit code stays 0 — a
     // non-zero exit would force piping consumers to treat REVIEW (the

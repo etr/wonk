@@ -281,6 +281,17 @@ impl From<&ChangedSymbol> for SymbolRef {
     }
 }
 
+impl From<&BlastAffectedSymbol> for SymbolRef {
+    fn from(s: &BlastAffectedSymbol) -> Self {
+        Self {
+            name: s.name.clone(),
+            kind: s.kind,
+            file: s.file.clone(),
+            line: s.line,
+        }
+    }
+}
+
 /// A single impact analysis result linking a changed symbol to a semantically
 /// similar symbol that may be affected.
 ///
