@@ -1737,7 +1737,7 @@ mod tests {
             .join("other/src/auth.rs")
             .to_string_lossy()
             .into_owned();
-        let map = load_symbols_by_file(&conn, &[requested.clone()]).unwrap();
+        let map = load_symbols_by_file(&conn, std::slice::from_ref(&requested)).unwrap();
         let rows = map.get(&requested).expect("suffix fallback must resolve");
         assert!(
             rows.iter().all(|r| r.file == "other/src/auth.rs"),
