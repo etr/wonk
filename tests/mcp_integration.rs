@@ -686,17 +686,20 @@ fn mcp_search_rows_stable_from_default_through_enabled_pipeline() {
     let rows: Vec<Value> =
         serde_json::from_str(default_text).expect("wonk_search returns a JSON row array");
 
-    let expected: [(&str, u64, &str); 3] = [
-        ("src/caller.rs", 1, "use crate::auth::authenticate_user;"),
+    // TASK-105's canonical file keys make the absolute-path MCP results
+    // classify like their CLI equivalents: the re-export import now merges
+    // into the definition (annotation) instead of standing apart.
+    let expected: [(&str, u64, &str, bool); 2] = [
         (
             "src/auth.rs",
             3,
             "pub fn authenticate_user(token: &str) -> Session {",
+            true,
         ),
-        ("src/caller.rs", 4, "    authenticate_user(\"t\");"),
+        ("src/caller.rs", 4, "    authenticate_user(\"t\");", false),
     ];
     assert_eq!(rows.len(), expected.len(), "row set: {default_text}");
-    for (row, (file, line, content)) in rows.iter().zip(&expected) {
+    for (row, (file, line, content, deduped)) in rows.iter().zip(&expected) {
         assert_eq!(row["line"], *line, "row line mismatch: {row}");
         assert_eq!(row["col"], 1, "row col mismatch: {row}");
         assert_eq!(
@@ -709,11 +712,16 @@ fn mcp_search_rows_stable_from_default_through_enabled_pipeline() {
             got_file.ends_with(file),
             "row file {got_file} must end with {file}"
         );
-        // The annotation field renders only when dedup fires; it must stay
-        // absent otherwise (pre-change serde shape).
-        assert!(
-            row.get("annotation").is_none(),
-            "annotation key must be omitted when None: {row}"
+        // The annotation field renders only when dedup fires; it must
+        // stay absent otherwise (pre-change serde shape).
+        assert_eq!(
+            row.get("annotation").and_then(Value::as_str),
+            if *deduped {
+                Some("(+1 other location)")
+            } else {
+                None
+            },
+            "annotation must track dedup: {row}"
         );
     }
 
