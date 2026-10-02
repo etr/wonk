@@ -7124,8 +7124,7 @@ mod tests {
     fn feedback_config(enabled: bool) -> crate::config::FeedbackConfig {
         crate::config::FeedbackConfig {
             enabled,
-            slate_retention: 64,
-            author_features: true,
+            ..crate::config::FeedbackConfig::default()
         }
     }
 
