@@ -436,6 +436,25 @@ pub fn path_character_values(files: &[String], conn: Option<&Connection>) -> Has
         .collect()
 }
 
+/// THE graded path-character comparator for the symbol-lookup sort sites
+/// (TASK-094): descending by ladder value, with the two policy decisions
+/// every site must share embedded exactly once — a missing entry means
+/// Ordinary (1.0, never a demotion), and a NaN value compares Equal
+/// (never panics, never reorders). Stable sorts keep the caller's own
+/// tie order; prefix with `.then_with` for site-specific keys (show's
+/// exact-name match).
+pub fn compare_path_character(
+    values: &HashMap<String, f32>,
+    a: &str,
+    b: &str,
+) -> std::cmp::Ordering {
+    let a_value = values.get(a).copied().unwrap_or(1.0);
+    let b_value = values.get(b).copied().unwrap_or(1.0);
+    b_value
+        .partial_cmp(&a_value)
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
 /// A symbol definition located at a candidate position, with the number of
 /// distinct indexed callers of that symbol name. The seam TASK-093's
 /// centrality signal consumes.

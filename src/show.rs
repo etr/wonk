@@ -158,7 +158,8 @@ pub fn show_symbol(
     // the ONE graded path-character ladder (TASK-094) so the most relevant
     // result appears first within budget. The old local substring heuristic
     // (which demoted any path containing "test" — including contest.rs) is
-    // absorbed into rerank::path_character_values.
+    // absorbed into rerank::path_character_values. The shared comparator
+    // owns the missing-entry and NaN policies.
     if !options.exact {
         let query_name = name.to_string();
         let files: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
@@ -166,13 +167,9 @@ pub fn show_symbol(
         rows.sort_by(|a, b| {
             let a_exact = a.0.eq_ignore_ascii_case(&query_name);
             let b_exact = b.0.eq_ignore_ascii_case(&query_name);
-            let a_value = values.get(&a.2).copied().unwrap_or(1.0);
-            let b_value = values.get(&b.2).copied().unwrap_or(1.0);
-            b_exact.cmp(&a_exact).then_with(|| {
-                b_value
-                    .partial_cmp(&a_value)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            b_exact
+                .cmp(&a_exact)
+                .then_with(|| crate::rerank::compare_path_character(&values, &a.2, &b.2))
         });
     }
 

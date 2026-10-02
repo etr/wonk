@@ -4493,16 +4493,11 @@ pub fn query_symbols_db_with_filters(
     // local test-path heuristic): ordinary source files sort before
     // barrels/module entries, type declarations, shims, examples, and
     // tests. Stable, so equal ladder values keep the row order; generated
-    // files demote only with an index-verified hand-written peer.
+    // files demote only with an index-verified hand-written peer. The
+    // shared comparator owns the missing-entry and NaN policies.
     let files: Vec<String> = results.iter().map(|s| s.file.clone()).collect();
     let values = crate::rerank::path_character_values(&files, Some(conn));
-    results.sort_by(|a, b| {
-        let a_value = values.get(&a.file).copied().unwrap_or(1.0);
-        let b_value = values.get(&b.file).copied().unwrap_or(1.0);
-        b_value
-            .partial_cmp(&a_value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(|a, b| crate::rerank::compare_path_character(&values, &a.file, &b.file));
 
     Ok(results)
 }
