@@ -1743,24 +1743,12 @@ impl McpServer {
             .get("no_feedback")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        settings.feedback_free = no_feedback;
         // Learned weights (TASK-102): the gated overlay — ONE read,
-        // best-effort (a missing table is silent; other errors warn).
-        settings.learned = if no_feedback {
-            None
-        } else {
-            ranker_conn.and_then(|conn| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_secs() as i64)
-                    .unwrap_or(0);
-                crate::learning::load_learned(conn, &config.feedback, &config.rank.weights, now)
-                    .unwrap_or_else(|e| {
-                        eprintln!("wonk: learned-weight load failed: {e:#}");
-                        None
-                    })
-            })
-        };
+        // best-effort (a missing table is silent; other errors warn),
+        // through the shared AR-039 policy seam.
+        settings.feedback_free = no_feedback;
+        settings.learned =
+            crate::router::load_learned_best_effort(ranker_conn, &config, no_feedback);
         let ranked =
             crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
         // Best-effort REQ-003 memo: persist the pairs the novelty pass
@@ -1770,15 +1758,6 @@ impl McpServer {
         // [feedback] enabled; rows carry the token and identities.
         let stored_slate =
             crate::router::record_slate_best_effort(ranker_conn, &query, &ranked, &config.feedback);
-        let identity_of = stored_slate
-            .as_ref()
-            .map(|s| {
-                s.members
-                    .iter()
-                    .map(|m| ((m.file.clone(), m.line), m.identity.clone()))
-                    .collect::<std::collections::HashMap<_, _>>()
-            })
-            .unwrap_or_default();
 
         let mut budget = budget_limit.map(|limit| {
             if let Some(p) = page {
@@ -1802,12 +1781,10 @@ impl McpServer {
                 out.query_class = ranked.query_class.map(|c| c.as_str().to_string());
                 if let Some(slate) = stored_slate.as_ref() {
                     out.slate = Some(slate.token.clone());
-                    out.identity = identity_of
-                        .get(&(
-                            item.classified.result.file.to_string_lossy().into_owned(),
-                            item.classified.result.line,
-                        ))
-                        .cloned();
+                    out.identity = slate.identity_for(
+                        &item.classified.result.file.to_string_lossy(),
+                        item.classified.result.line,
+                    );
                 }
 
                 if let Some(ref mut b) = budget {

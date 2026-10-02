@@ -238,24 +238,40 @@ pub(crate) fn load_symbols_by_file(
             map.entry(symbol.file.clone()).or_default().push(symbol);
         }
     }
-    for file in files {
-        if map.contains_key(file) {
-            continue;
-        }
-        // Suffix resolution: `symbols.file` is a path-separator-boundary
-        // suffix of the requested (possibly absolute) path.
-        let sql = "SELECT id, file, line, end_line, name, kind, scope, signature, language \
-                   FROM symbols WHERE ?1 LIKE '%' || file";
-        let mut stmt = conn.prepare(sql)?;
+    // Suffix resolution for the files the exact IN lookup missed: the
+    // one shared longest-suffix rule resolves each requested (possibly
+    // absolute) path to its single DB file first (TASK-101 review debt:
+    // nested same-named files made the old collect-from-every-match form
+    // anchor identities on the WRONG file's symbols), and the per-file
+    // fallback statements are prepared once for the whole loop (one scan
+    // per unresolved file was also re-preparing the statement per file).
+    let candidates: Option<Vec<String>> = if files.iter().any(|f| !map.contains_key(f)) {
+        let mut stmt = conn.prepare("SELECT DISTINCT file FROM symbols")?;
         let rows = stmt
-            .query_map([file], symbol_row)?
-            .collect::<rusqlite::Result<Vec<SymbolRow>>>()?;
-        let matched: Vec<SymbolRow> = rows
-            .into_iter()
-            .filter(|r| crate::rerank::is_path_suffix(file, &r.file))
-            .collect();
-        if !matched.is_empty() {
-            map.insert(file.clone(), matched);
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Some(rows)
+    } else {
+        None
+    };
+    if let Some(candidates) = candidates {
+        for file in files {
+            if map.contains_key(file) {
+                continue;
+            }
+            let Some(resolved) = crate::rerank::longest_suffix_match(&candidates, file) else {
+                continue;
+            };
+            let mut stmt = conn.prepare(
+                "SELECT id, file, line, end_line, name, kind, scope, signature, language \
+                 FROM symbols WHERE file = ?1",
+            )?;
+            let rows = stmt
+                .query_map([resolved.as_str()], symbol_row)?
+                .collect::<rusqlite::Result<Vec<SymbolRow>>>()?;
+            if !rows.is_empty() {
+                map.insert(file.clone(), rows);
+            }
         }
     }
     Ok(map)
@@ -1035,6 +1051,20 @@ pub fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
 pub struct StoredSlate {
     pub token: String,
     pub members: Vec<SlateMember>,
+}
+
+impl StoredSlate {
+    /// The recorded identity of the result at (file, line), if the slate
+    /// captured one — the one place the (file, line) keying semantics
+    /// live (TASK-101 review debt: the dispatch surfaces each built the
+    /// same members map and repeated the same stamping dance). Linear
+    /// scan; slates are single-digit-member.
+    pub fn identity_for(&self, file: &str, line: u64) -> Option<String> {
+        self.members
+            .iter()
+            .find(|m| m.file == file && m.line == line)
+            .map(|m| m.identity.clone())
+    }
 }
 
 /// Build the slate for `ranked` and persist it as one `feedback_slates`
