@@ -213,7 +213,10 @@ fn json_rows(stdout: &str) -> Vec<Value> {
 /// Search stdout minus the `slate:` plumbing line — the enabled repo
 /// records a slate, the disabled one cannot; RANKING is what must match.
 fn result_lines(stdout: &str) -> Vec<&str> {
-    stdout.lines().filter(|l| !l.starts_with("slate: ")).collect()
+    stdout
+        .lines()
+        .filter(|l| !l.starts_with("slate: "))
+        .collect()
 }
 
 fn feedback_config(enabled: bool) -> FeedbackConfig {
@@ -225,7 +228,12 @@ fn feedback_config(enabled: bool) -> FeedbackConfig {
 
 /// The ranked search the dispatch layer would hold, with capture and the
 /// learned overlay both threaded — the `[feedback] enabled` search shape.
-fn ranked_for(root: &Path, conn: &Connection, query: &str, learned: Option<learning::LearnedTable>) -> wonk::rerank::RankedSearch {
+fn ranked_for(
+    root: &Path,
+    conn: &Connection,
+    query: &str,
+    learned: Option<learning::LearnedTable>,
+) -> wonk::rerank::RankedSearch {
     let root_str = root.display().to_string();
     let mut results = wonk::search::text_search(query, false, false, &[root_str]).unwrap();
     for result in &mut results {
@@ -245,7 +253,14 @@ fn ranked_for(root: &Path, conn: &Connection, query: &str, learned: Option<learn
 
 /// Record one useful-identity event from a real search and learn from
 /// everything pending. Returns the identity used.
-fn record_and_learn(root: &Path, conn: &Connection, query: &str, pick: Pick, session: &str, now: i64) -> String {
+fn record_and_learn(
+    root: &Path,
+    conn: &Connection,
+    query: &str,
+    pick: Pick,
+    session: &str,
+    now: i64,
+) -> String {
     let ranked = ranked_for(root, conn, query, None);
     let stored =
         feedback::build_and_store_slate(conn, query, &ranked, &feedback_config(true)).unwrap();
@@ -265,7 +280,13 @@ fn record_and_learn(root: &Path, conn: &Connection, query: &str, pick: Pick, ses
             .identity
             .clone(),
     };
-    feedback::record_feedback(conn, &stored.token, &[identity.clone()], session).unwrap();
+    feedback::record_feedback(
+        conn,
+        &stored.token,
+        std::slice::from_ref(&identity),
+        session,
+    )
+    .unwrap();
     learning::learn_pending(conn, &feedback_config(true), &fixture_weights(), now).unwrap();
     identity
 }
@@ -288,18 +309,6 @@ fn flat_positions(ranked: &wonk::rerank::RankedSearch) -> Vec<(String, u64)> {
             (
                 item.classified.result.file.to_string_lossy().into_owned(),
                 item.classified.result.line,
-            )
-        })
-        .collect()
-}
-
-/// Flattened (file, line) of a JSON search's rows.
-fn row_positions(rows: &[Value]) -> Vec<(String, u64)> {
-    rows.iter()
-        .map(|row| {
-            (
-                row["file"].as_str().unwrap().to_string(),
-                row["line"].as_u64().unwrap(),
             )
         })
         .collect()
@@ -329,7 +338,13 @@ fn preferring_implementation_shifts_path_character_visibly() {
     // distinct sessions — past every gate.
     let (code, stdout, stderr) = run_wonk(
         &root,
-        &["search", "--include-tests", "--format", "json", "crop_yield"],
+        &[
+            "search",
+            "--include-tests",
+            "--format",
+            "json",
+            "crop_yield",
+        ],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
     let rows = json_rows(&stdout);
@@ -339,7 +354,10 @@ fn preferring_implementation_shifts_path_character_visibly() {
         .and_then(|row| row["identity"].as_str())
         .expect("identity on rows")
         .to_string();
-    let slate = rows[0]["slate"].as_str().expect("slate on rows").to_string();
+    let slate = rows[0]["slate"]
+        .as_str()
+        .expect("slate on rows")
+        .to_string();
     for n in 0..40 {
         let (code, _, err) = run_wonk(
             &root,
@@ -370,7 +388,8 @@ fn preferring_implementation_shifts_path_character_visibly() {
     );
 
     // The `learned:` line under --why.
-    let (code, _, why_stderr) = run_wonk(&root, &["search", "--include-tests", "--why", "crop_yield"]);
+    let (code, _, why_stderr) =
+        run_wonk(&root, &["search", "--include-tests", "--why", "crop_yield"]);
     assert_eq!(code, 0);
     assert!(
         why_stderr.contains("learned: "),
@@ -455,7 +474,14 @@ fn shift_generalizes_to_a_term_disjoint_query() {
 
     // Learn from crop_yield only — 40 events across 40 sessions.
     for n in 0..40 {
-        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, &format!("s{n}"), 1000);
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            1000,
+        );
     }
 
     // Post-learning: the src lines outscore the tests lines on the
@@ -483,7 +509,13 @@ fn max_score_of(ranked: &wonk::rerank::RankedSearch, suffix: &str) -> Option<f32
         .groups
         .iter()
         .flat_map(|(_, group)| group.iter())
-        .filter(|item| item.classified.result.file.to_string_lossy().ends_with(suffix))
+        .filter(|item| {
+            item.classified
+                .result
+                .file
+                .to_string_lossy()
+                .ends_with(suffix)
+        })
         .map(|item| item.score)
         .fold(None, |acc, v| Some(acc.map_or(v, |m: f32| m.max(v))))
 }
@@ -498,7 +530,14 @@ fn already_first_feedback_changes_no_weight() {
     let conn = open_index(&root);
 
     for n in 0..12 {
-        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, &format!("s{n}"), 1000);
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            1000,
+        );
     }
     let dump = |conn: &Connection| learned_dump(conn);
     let before = dump(&conn);
@@ -511,7 +550,14 @@ fn already_first_feedback_changes_no_weight() {
         "a real identity was recorded: {identity}"
     );
     for n in 2..6 {
-        record_and_learn(&root, &conn, "granary", Pick::Rank(1), &format!("late-{n}"), 2000);
+        record_and_learn(
+            &root,
+            &conn,
+            "granary",
+            Pick::Rank(1),
+            &format!("late-{n}"),
+            2000,
+        );
     }
     assert_eq!(before, dump(&conn), "rank-1 feedback learns nothing");
     drop(conn);
@@ -606,7 +652,10 @@ fn adversarial_repetition_stays_within_the_deviation() {
                 "descriptive keys within ±dev: {feature} = {weight}"
             );
             let pinned = (*weight - 0.5).abs() < 1e-6 || (*weight + 0.5).abs() < 1e-6;
-            assert!(pinned, "500 same-direction events pin the bound: {feature} = {weight}");
+            assert!(
+                pinned,
+                "500 same-direction events pin the bound: {feature} = {weight}"
+            );
         } else {
             let default = fixture_weights().get(feature).copied().unwrap_or(0.0);
             let (lo, hi) = (default * 0.5, default * 1.5);
@@ -615,7 +664,10 @@ fn adversarial_repetition_stays_within_the_deviation() {
                 "signal within its multiplicative bound: {feature} = {weight} not in [{lo}, {hi}]"
             );
             let pinned = (*weight - hi).abs() < 1e-6 || (*weight - lo).abs() < 1e-6;
-            assert!(pinned, "the bound is REACHED: {feature} = {weight} not at {lo}/{hi}");
+            assert!(
+                pinned,
+                "the bound is REACHED: {feature} = {weight} not at {lo}/{hi}"
+            );
         }
     }
 
@@ -651,14 +703,18 @@ fn member_groups(path_character: f32) -> wonk::feedback::FeatureGroups {
         weight: 1.0,
         weighted: value,
     };
-    let mut groups = wonk::feedback::FeatureGroups::default();
-    groups.signals = vec![
-        contribution("path_character", path_character),
-        contribution("lexical", 1.0 - path_character),
-    ];
+    let mut groups = wonk::feedback::FeatureGroups {
+        signals: vec![
+            contribution("path_character", path_character),
+            contribution("lexical", 1.0 - path_character),
+        ],
+        ..wonk::feedback::FeatureGroups::default()
+    };
     if path_character > 0.5 {
         groups.path.insert("src".to_string(), "1".to_string());
-        groups.path.insert("class".to_string(), "ordinary".to_string());
+        groups
+            .path
+            .insert("class".to_string(), "ordinary".to_string());
     } else {
         groups.path.insert("tests".to_string(), "1".to_string());
         groups.path.insert("class".to_string(), "test".to_string());
@@ -675,7 +731,14 @@ fn learned_weights_decay_toward_defaults_with_age() {
     let (dir, root) = learning_repo(true, "");
     let conn = open_index(&root);
     for n in 0..12 {
-        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, &format!("s{n}"), 1000);
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            1000,
+        );
     }
 
     let at = |now: i64| {
@@ -720,7 +783,14 @@ fn gates_hold_until_observations_span_sessions() {
 
     // 5 events, 1 session: no ranking influence.
     for _ in 0..5 {
-        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, "only-session", 1000);
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            "only-session",
+            1000,
+        );
     }
     assert!(
         learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
@@ -736,7 +806,14 @@ fn gates_hold_until_observations_span_sessions() {
 
     // 50 events, STILL 1 session: repetition alone never activates.
     for _ in 0..45 {
-        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, "only-session", 1000);
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            "only-session",
+            1000,
+        );
     }
     assert!(
         learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
@@ -747,7 +824,14 @@ fn gates_hold_until_observations_span_sessions() {
 
     // The same feature across sessions does clear the gate.
     for n in 0..8 {
-        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, &format!("multi-{n}"), 1000);
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("multi-{n}"),
+            1000,
+        );
     }
     assert!(
         learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
@@ -768,12 +852,24 @@ fn new_feature_has_no_influence_until_evidence() {
     let (dir, root) = learning_repo(true, "");
     let conn = open_index(&root);
     for n in 0..12 {
-        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, &format!("s{n}"), 1000);
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            1000,
+        );
     }
     let learned = learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
         .unwrap()
         .expect("gated rows");
-    let before = flat_positions(&ranked_for(&root, &conn, "crop_yield", Some(learned.clone())));
+    let before = flat_positions(&ranked_for(
+        &root,
+        &conn,
+        "crop_yield",
+        Some(learned.clone()),
+    ));
 
     // A brand-new trait file enters the index; its symbol:kind=trait key
     // appears in freshly recorded slates...
@@ -788,7 +884,8 @@ fn new_feature_has_no_influence_until_evidence() {
     let stored =
         feedback::build_and_store_slate(&conn, "Ledger", &ranked, &feedback_config(true)).unwrap();
     assert!(
-        stored.members.iter().any(|m| m.groups
+        stored.members.iter().any(|m| m
+            .groups
             .symbol
             .get("kind")
             .map(|k| k == "trait")
@@ -799,7 +896,8 @@ fn new_feature_has_no_influence_until_evidence() {
     // ...but the never-observed key has no row, so nothing changes: the
     // crop_yield ranking is bit-identical to the pre-trait state.
     assert!(
-        learned.evidence()
+        learned
+            .evidence()
             .iter()
             .all(|row| !row.feature.starts_with("symbol:kind=trait")),
         "no trait rows were learned"
@@ -825,11 +923,21 @@ fn no_feedback_repo_ranks_exactly_as_disabled() {
         let (code, _, stderr) = run_wonk(root, &["search", "--include-tests", "crop_yield"]);
         assert_eq!(code, 0, "{stderr}");
     }
-    let (code_on, out_on, why_on) = run_wonk(&root_on, &["search", "--include-tests", "--why", "crop_yield"]);
-    let (code_off, out_off, why_off) = run_wonk(&root_off, &["search", "--include-tests", "--why", "crop_yield"]);
+    let (code_on, out_on, why_on) = run_wonk(
+        &root_on,
+        &["search", "--include-tests", "--why", "crop_yield"],
+    );
+    let (code_off, out_off, why_off) = run_wonk(
+        &root_off,
+        &["search", "--include-tests", "--why", "crop_yield"],
+    );
     assert_eq!(code_on, 0, "{why_on}");
     assert_eq!(code_off, 0, "{why_off}");
-    assert_eq!(result_lines(&out_on), result_lines(&out_off), "ranking identical");
+    assert_eq!(
+        result_lines(&out_on),
+        result_lines(&out_off),
+        "ranking identical"
+    );
     assert_eq!(why_on, why_off, "--why breakdown identical");
 
     // And the below-gate store is equally inert.
@@ -837,9 +945,16 @@ fn no_feedback_repo_ranks_exactly_as_disabled() {
     for _ in 0..5 {
         record_and_learn(&root_on, &conn, "crop_yield", Pick::SrcImpl, "one", 1000);
     }
-    let (code_below, out_below, why_below) = run_wonk(&root_on, &["search", "--include-tests", "--why", "crop_yield"]);
+    let (code_below, out_below, why_below) = run_wonk(
+        &root_on,
+        &["search", "--include-tests", "--why", "crop_yield"],
+    );
     assert_eq!(code_below, 0);
-    assert_eq!(result_lines(&out_below), result_lines(&out_off), "below-gate ranking identical");
+    assert_eq!(
+        result_lines(&out_below),
+        result_lines(&out_off),
+        "below-gate ranking identical"
+    );
     assert_eq!(why_below, why_off, "below-gate --why identical");
     drop(conn);
     drop(dir_off);
@@ -859,7 +974,14 @@ fn learning_replays_identically_from_identical_events() {
         let (dir, root) = learning_repo(true, "");
         let conn = open_index(&root);
         for n in 0..10 {
-            record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, &format!("s{n}"), 5000);
+            record_and_learn(
+                &root,
+                &conn,
+                "crop_yield",
+                Pick::SrcImpl,
+                &format!("s{n}"),
+                5000,
+            );
         }
         dumps.push(learned_dump(&conn));
         drop(conn);
@@ -890,7 +1012,14 @@ fn ranked_search_adds_one_learned_read_and_no_writes() {
     // Learn FIRST (outside every trace window): the query path under
     // test is the READ side.
     for n in 0..12 {
-        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, &format!("s{n}"), 1000);
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            1000,
+        );
     }
     // Baseline: capture-on search with NO learned rows — no
     // learned_weights access at all.
@@ -903,7 +1032,9 @@ fn ranked_search_adds_one_learned_read_and_no_writes() {
         TRACE_SQL.lock().unwrap().clone()
     };
     assert!(
-        baseline.iter().all(|stmt| !stmt.to_lowercase().contains("learned_weights")),
+        baseline
+            .iter()
+            .all(|stmt| !stmt.to_lowercase().contains("learned_weights")),
         "no learned rows → no learned read"
     );
 
@@ -911,9 +1042,10 @@ fn ranked_search_adds_one_learned_read_and_no_writes() {
     // search — beyond the baseline only the pass's chunked symbols
     // reads, and never a write.
     {
-        let reloaded = learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
-            .unwrap()
-            .expect("gated rows");
+        let reloaded =
+            learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
+                .unwrap()
+                .expect("gated rows");
         ranked_for(&root, &conn, "crop_yield", Some(reloaded));
     }
     let statements = TRACE_SQL.lock().unwrap().clone();
@@ -947,3 +1079,209 @@ fn ranked_search_adds_one_learned_read_and_no_writes() {
     drop(dir);
 }
 
+// ---------------------------------------------------------------------------
+// OQ-019: the deterministic tuning experiment (D4). Real usage traces do
+// not exist yet, so the honest method is a deterministic simulation over
+// synthetic-but-shaped event streams derived from the integration
+// fixture's slate shapes, driven by a fixed xorshift per scenario. The
+// sweep prints its table under --nocapture; the pinning test below
+// asserts the CHOSEN constants' recorded outcomes so
+// bench/feedback-learning-tuning.md cannot drift from the code.
+// ---------------------------------------------------------------------------
+
+mod tuning {
+    use std::collections::HashMap;
+
+    /// Deterministic xorshift — no new dependencies (the D4 contract).
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        /// Uniform in [0, 1).
+        fn unit(&mut self) -> f32 {
+            (self.next() % 1_000_003) as f32 / 1_000_003.0
+        }
+    }
+
+    /// The learnable stand-in for the sweep: a `path_character`-shaped
+    /// signal, default 0.6, dev 0.5 → bounds [0.3, 0.9]; the deviation
+    /// band is 0.3 wide and its 50%-of-bound mark sits at 0.75.
+    fn params(step: f32, half_life_days: i64) -> super::learning::LearnParams {
+        super::learning::LearnParams::from_config(
+            &super::FeedbackConfig {
+                learn_step: step,
+                learn_half_life_days: half_life_days,
+                ..super::feedback_config(true)
+            },
+            &HashMap::from([("path_character".to_string(), 0.6)]),
+        )
+    }
+
+    const DEFAULT: f32 = 0.6;
+    const HALF_BOUND: f32 = 0.15; // 50% of the 0.3-wide deviation band
+    const QUARTER_BOUND: f32 = 0.075;
+
+    /// One scenario's advantage stream: 2000 events, one per simulated
+    /// hour, `seed` fixed per scenario name.
+    fn advantages(scenario: &str) -> Vec<f32> {
+        let seed = match scenario {
+            "consistent" => 0x6469736b,
+            "noisy" => 0x6e6f6973,
+            "adversarial" => 0x61647630,
+            "stale" => 0x7374616c,
+            "flip" => 0x666c6970,
+            _ => unreachable!(),
+        };
+        let mut rng = XorShift(seed | 1);
+        (0..2000)
+            .map(|i| match scenario {
+                // 85% of events favor the true direction, |A| ≈ 0.8.
+                "consistent" => {
+                    let sign = if rng.unit() < 0.85 { 1.0 } else { -1.0 };
+                    sign * (0.7 + 0.2 * rng.unit())
+                }
+                // A weak true direction: 60% +0.3 / 40% −0.3 — mean
+                // advantage +0.06, the shape of mixed real feedback.
+                "noisy" => {
+                    let sign = if rng.unit() < 0.60 { 1.0 } else { -1.0 };
+                    sign * 0.3
+                }
+                // 100% one direction at full magnitude.
+                "adversarial" => 1.0,
+                // The stale burst uses the consistent shape for its 50
+                // events; the silence after is handled by the driver.
+                "stale" => {
+                    let sign = if rng.unit() < 0.85 { 1.0 } else { -1.0 };
+                    sign * (0.7 + 0.2 * rng.unit())
+                }
+                // Consistent, then at event 1000 the true direction
+                // reverses.
+                "flip" => {
+                    let sign = if rng.unit() < 0.85 { 1.0 } else { -1.0 };
+                    let direction = if i < 1000 { 1.0 } else { -1.0 };
+                    direction * sign * (0.7 + 0.2 * rng.unit())
+                }
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// Drive the update rule over one scenario's stream (hourly events),
+    /// recording the weight after every event.
+    fn trajectory(scenario: &str, step: f32, half_life: i64) -> Vec<f32> {
+        let params = params(step, half_life);
+        let stream = advantages(scenario);
+        let events = if scenario == "stale" {
+            50
+        } else {
+            stream.len()
+        };
+        let mut weight = DEFAULT;
+        let mut updated_at = 0i64;
+        let mut out = Vec::with_capacity(events);
+        for (i, advantage) in stream.iter().take(events).enumerate() {
+            let now = (i as i64) * 3600;
+            weight = super::learning::next_weight(
+                weight,
+                updated_at,
+                now,
+                *advantage,
+                "path_character",
+                &params,
+            );
+            updated_at = now;
+            out.push(weight);
+        }
+        out
+    }
+
+    /// The five metrics of one (step, half-life) cell:
+    /// (a) events to 50% of the bound (consistent stream; 2000 = never),
+    /// (b) noisy-stream residual |effective − default| after 2000 events,
+    /// (c) sign flips of effective − default in the noisy stream,
+    /// (d) days for the stale stream to fall back under 25% of bound,
+    /// (e) bound violations across every stream (must be 0).
+    #[allow(clippy::too_many_arguments)]
+    fn metrics(step: f32, half_life: i64) -> (usize, f32, usize, f32, usize) {
+        let consistent = trajectory("consistent", step, half_life);
+        let noisy = trajectory("noisy", step, half_life);
+        let adversarial = trajectory("adversarial", step, half_life);
+        let stale = trajectory("stale", step, half_life);
+
+        let a = consistent
+            .iter()
+            .position(|w| (w - DEFAULT).abs() >= HALF_BOUND)
+            .map(|i| i + 1)
+            .unwrap_or(2000);
+        let b = (noisy[noisy.len() - 1] - DEFAULT).abs();
+        let c = noisy
+            .windows(2)
+            .filter(|pair| {
+                let (x, y) = (pair[0] - DEFAULT, pair[1] - DEFAULT);
+                x * y < 0.0
+            })
+            .count();
+        let d = {
+            // After the 50-event burst the row ages undisturbed; find
+            // the days until the read-time decayed deviation falls under
+            // 25% of the bound.
+            let stored = stale[stale.len() - 1];
+            let deviation = (stored - DEFAULT).abs().max(1e-9);
+            half_life as f32 * (deviation / QUARTER_BOUND).log2().max(0.0)
+        };
+        let e = [consistent, noisy, adversarial, stale]
+            .iter()
+            .flat_map(|t| t.iter())
+            .filter(|w| **w < 0.3 - 1e-6 || **w > 0.9 + 1e-6)
+            .count();
+        (a, b, c, d, e)
+    }
+
+    #[test]
+    fn sweep_prints_the_grid_table() {
+        println!("step | half_life |  a  |   b   | c |    d    | e");
+        for step in [0.01f32, 0.02, 0.05] {
+            for half_life in [14i64, 30, 60] {
+                let (a, b, c, d, e) = metrics(step, half_life);
+                println!("{step:.2} | {half_life:9} | {a:3} | {b:.3} | {c} | {d:7.1} | {e}");
+            }
+        }
+        // (e) is the adversarial guarantee: it must hold for EVERY cell.
+        for step in [0.01f32, 0.02, 0.05] {
+            for half_life in [14i64, 30, 60] {
+                let (_, _, _, _, e) = metrics(step, half_life);
+                assert_eq!(e, 0, "step {step} hl {half_life} violated the bound");
+            }
+        }
+    }
+
+    /// The pinning test: the CHOSEN constants (step 0.02, half-life 30d —
+    /// the `[feedback]` defaults, retained by the grid; see
+    /// bench/feedback-learning-tuning.md) and their recorded outcomes,
+    /// verbatim, so the bench doc cannot drift from the code.
+    ///
+    /// The plan's aspirational wants for (b) residual and (c) flips are
+    /// UNSATISFIABLE at the hourly event rate for EVERY grid cell: i.i.d.
+    /// evidence with any drift saturates the band, and the clamp — metric
+    /// (e), zero everywhere — is precisely the property that makes that
+    /// safe. The grid therefore separates cells only on (a); every step
+    /// already meets the "tens of events" want, and the defaults keep the
+    /// mildest step that converges quickly.
+    #[test]
+    fn chosen_constants_pin_their_recorded_outcomes() {
+        let (a, b, c, d, e) = metrics(0.02, 30);
+        assert_eq!(a, 12, "events to 50% of the bound (consistent)");
+        assert!((b - 0.286).abs() < 0.005, "noisy residual: {b}");
+        assert_eq!(c, 23, "noisy-stream sign flips");
+        assert!((d - 60.0).abs() < 0.1, "stale falls back in days: {d}");
+        assert_eq!(e, 0, "no bound violations");
+    }
+}

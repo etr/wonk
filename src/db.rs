@@ -2418,22 +2418,24 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "INSERT INTO learned_weights \
                  (feature, query_class, weight, observations, sessions, updated_at) \
                  VALUES ('path_character', '', 0.7, 1, 1, 0)",
                 [],
             )
-            .is_err());
-        assert!(conn
-            .execute(
+            .is_err()
+        );
+        assert!(
+            conn.execute(
                 "INSERT INTO learned_weights \
                  (feature, query_class, weight, observations, sessions, updated_at) \
                  VALUES ('path_character', 'symbol', 0.7, 1, 1, 0)",
                 [],
             )
-            .is_ok());
+            .is_ok()
+        );
     }
 
     #[test]

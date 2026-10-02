@@ -2769,7 +2769,9 @@ fn rerank_core(
     }
     let feedback_weight = weights.weight("feedback");
     let feedback_pass = feedback_weight != 0.0
-        && extras.learned.is_some_and(|learned| !learned.descriptive.is_empty())
+        && extras
+            .learned
+            .is_some_and(|learned| !learned.descriptive.is_empty())
         && conn.is_some();
     if feedback_pass {
         // The descriptive pass extracts over the same widened slices the
@@ -7870,7 +7872,12 @@ proximity, signature, churn, co_change, hub, authority, community",
 
     use crate::learning::{FeedbackEvidence, LearnedTable};
 
-    fn learned_evidence(feature: &str, scope: &str, effective: f32, default: f32) -> FeedbackEvidence {
+    fn learned_evidence(
+        feature: &str,
+        scope: &str,
+        effective: f32,
+        default: f32,
+    ) -> FeedbackEvidence {
         FeedbackEvidence {
             feature: feature.to_string(),
             query_class: scope.to_string(),
@@ -7887,9 +7894,11 @@ proximity, signature, churn, co_change, hub, authority, community",
         LearnedTable::from_rows(rows, 1000)
     }
 
-    /// Flattened (file, line), score BITS, and contribution bits — the
-    /// bit-identity pin's comparison key.
-    fn ranked_bits(ranked: &RankedSearch) -> Vec<(String, u64, u32, Vec<(&'static str, u32, f32, u32)>)> {
+    /// One result's comparison key: (file, line, score bits, contribution
+    /// bits) — the bit-identity pin's unit.
+    type BitsKey = (String, u64, u32, Vec<(&'static str, u32, f32, u32)>);
+
+    fn ranked_bits(ranked: &RankedSearch) -> Vec<BitsKey> {
         ranked
             .groups
             .iter()
@@ -7902,14 +7911,7 @@ proximity, signature, churn, co_change, hub, authority, community",
                     scored
                         .contributions
                         .iter()
-                        .map(|c| {
-                            (
-                                c.signal,
-                                c.value.to_bits(),
-                                c.weight,
-                                c.weighted.to_bits(),
-                            )
-                        })
+                        .map(|c| (c.signal, c.value.to_bits(), c.weight, c.weighted.to_bits()))
                         .collect::<Vec<_>>(),
                 )
             })
@@ -7982,12 +7984,7 @@ proximity, signature, churn, co_change, hub, authority, community",
                 },
                 ..ClassMultipliers::neutral()
             },
-            learned: Some(learned_of(vec![learned_evidence(
-                "lexical",
-                "",
-                0.3,
-                0.4,
-            )])),
+            learned: Some(learned_of(vec![learned_evidence("lexical", "", 0.3, 0.4)])),
             ..RankSettings::default()
         };
         let ranked = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
@@ -8026,9 +8023,7 @@ proximity, signature, churn, co_change, hub, authority, community",
                 content: "def my_func():".to_string(),
             },
         ];
-        let learned = || {
-            learned_of(vec![learned_evidence("path:tools", "", 0.9, 0.0)])
-        };
+        let learned = || learned_of(vec![learned_evidence("path:tools", "", 0.9, 0.0)]);
         let live = RankSettings {
             use_pipeline: true,
             weights: table(&[("kind", 1.0), ("feedback", 0.8)]),

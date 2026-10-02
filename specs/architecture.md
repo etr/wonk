@@ -1118,6 +1118,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Credit assignment is contrastive, so the slate is required (PRD-FB-REQ-002).** "This was useful" carries no information about *which* criterion mattered until it is set against what was shown and passed over. The reporting interface therefore carries the returned set and its ranks; the update raises weights on signals that scored the chosen result above the alternatives and lowers those that did not. Recording only the chosen result would make the data uninterpretable.
 - **Learn only where the ranking was wrong (PRD-FB-REQ-009).** The caller chooses from what wonk ranked highly, so feedback is biased toward confirming the current weights. Discarding events where the useful result was already first removes the bulk of that bias with one condition and concentrates learning on the cases that carry information — the ones where the existing order was wrong.
 - **Bounded drift replaces bounded boost (PRD-FB-REQ-010/011).** Influence is capped as a maximum deviation from default weights, and decays back toward them. This is a stronger guarantee than the per-item ceiling it replaces, because no individual result has a lever at all: the rich-get-richer loop that per-item boosting creates has no mechanism here (AR-036).
+- **The update rule (TASK-102, closes OQ-019):** one rule covers signals and descriptive keys alike — per qualifying event, every feature observable on the useful result or its alternatives takes `next = clamp(decayed + step·A, lo, hi)`, where `A` is the contrastive advantage (useful minus the mean of the passed-over alternatives) and `decayed` pulls the stored value one half-life toward its default. Tuned constants (deterministic trace simulation, `bench/feedback-learning-tuning.md`): `learn_step = 0.02`, `learn_half_life_days = 30`, `learn_max_deviation = 0.5`; a zero-default signal is pinned at `[0, 0]` — enabling a criterion stays a human decision, and the descriptive channel is where new criteria emerge from evidence. Events whose useful result already ranked first are skipped whole (PRD-FB-REQ-009), and the clamp re-runs at load time against the current defaults, so tightening the deviation re-bounds stored values immediately (AR-043).
 - **Learned state is legible and separately resettable (PRD-FB-REQ-012/013).** Learned weights are presented against their defaults, so what a repository has learned reads as "path character 0.62, default 0.40" — a claim a human can evaluate and reject. Resetting weights is independent of clearing feedback history, so a bad learning outcome can be undone without discarding the observations.
 - **Per-class learning (PRD-FB-REQ-008):** Adjustments are learned per query class as well as overall, which is the same structure DR-038 defines with hand-tuned constants. Feedback lets a repository replace those shipped guesses with its own measurements.
 - **Memorization survives, hard-gated (PRD-FB-REQ-016):** Weight learning cannot express "in this repo, auth questions mean `TokenValidator`" — a genuine loss. A direct per-result preference is therefore retained, but applies only after confirmation across a configured number of *distinct sessions* and is capped below the weight mechanism. Session counting, already required for honest aggregation, becomes the gate.
@@ -1330,6 +1331,24 @@ CREATE TABLE IF NOT EXISTS learned_weights (
     sessions INTEGER NOT NULL,             -- distinct sessions contributing (PRD-FB-REQ-025)
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (feature, query_class)
+);
+
+-- [V5] Exact distinct-session bookkeeping per (feature, scope): one row per
+-- session that ever observed the feature; keeps `sessions` and the
+-- PRD-FB-REQ-025 gate honest under interleaved sessions (A,B,A counts 2).
+CREATE TABLE IF NOT EXISTS learned_weight_sessions (
+    feature TEXT NOT NULL,
+    query_class TEXT NOT NULL DEFAULT '',
+    session TEXT NOT NULL,
+    PRIMARY KEY (feature, query_class, session)
+);
+
+-- [V5] Learning progress watermark: the highest feedback_events.id processed.
+-- Missed learning runs (best-effort contract) are picked up by the next
+-- successful feedback call; reset/recompute builds on this.
+CREATE TABLE IF NOT EXISTS learned_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 -- [V5] BM25 per-term document statistics (DR-033)

@@ -17,8 +17,10 @@
 //! members returned but not reported useful — other useful members of
 //! the same call are not alternatives),
 //!
-//!     A(k)  = v_U(k) − mean_{x∈ALT}( v_x(k) )             ∈ [−1, 1]
-//!     next  = clamp( decayed(k) + step · A(k),  lo(k), hi(k) )
+//! ```text
+//! A(k)  = v_U(k) − mean_{x∈ALT}( v_x(k) )             ∈ [−1, 1]
+//! next  = clamp( decayed(k) + step · A(k),  lo(k), hi(k) )
+//! ```
 //!
 //! where `decayed` pulls the stored weight one half-life toward its
 //! default per `learn_half_life_days` of age, and the bounds are
@@ -85,10 +87,7 @@ impl LearnParams {
     /// Derive the parameters from the resolved `[feedback]` section and
     /// the configured weight map (config load has already validated the
     /// ranges).
-    pub fn from_config(
-        feedback: &FeedbackConfig,
-        weights: &HashMap<String, f32>,
-    ) -> Self {
+    pub fn from_config(feedback: &FeedbackConfig, weights: &HashMap<String, f32>) -> Self {
         Self {
             step: feedback.learn_step,
             max_deviation: feedback.learn_max_deviation,
@@ -190,7 +189,11 @@ pub fn event_updates(
     let Some(useful) = members
         .iter()
         .find(|member| member.chosen && member.identity == event.result_identity)
-        .or_else(|| members.iter().find(|member| member.identity == event.result_identity))
+        .or_else(|| {
+            members
+                .iter()
+                .find(|member| member.identity == event.result_identity)
+        })
     else {
         return Vec::new();
     };
@@ -262,7 +265,8 @@ pub fn next_weight(
     params: &LearnParams,
 ) -> f32 {
     let default = params.default_of(feature);
-    let decayed = default + decay_factor(updated_at, now, params.half_life_days) * (stored - default);
+    let decayed =
+        default + decay_factor(updated_at, now, params.half_life_days) * (stored - default);
     let (lo, hi) = params.bounds(feature);
     (decayed + params.step * advantage).clamp(lo, hi)
 }
@@ -272,11 +276,7 @@ pub fn next_weight(
 /// keys.
 fn value_of(member: &SlateMember, keys: &BTreeSet<String>, key: &str) -> f32 {
     if key.contains(':') {
-        if keys.contains(key) {
-            1.0
-        } else {
-            0.0
-        }
+        if keys.contains(key) { 1.0 } else { 0.0 }
     } else {
         member
             .groups
@@ -314,14 +314,7 @@ fn apply_updates(
                 "SELECT weight, observations, sessions, updated_at \
                  FROM learned_weights WHERE feature = ?1 AND query_class = ?2",
                 rusqlite::params![update.feature, update.scope],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map(Some)
             .or_else(|e| match e {
@@ -458,9 +451,9 @@ pub struct LearnedTable {
 }
 
 impl LearnedTable {
-    /// Build a table from explicit rows — the in-crate seam for tests
-    /// and callers that already hold evidence; `load_learned` is the
-    /// production path.
+    /// Build a table from explicit rows — the in-crate test seam;
+    /// `load_learned` is the production path.
+    #[cfg(test)]
     pub(crate) fn from_rows(rows: Vec<FeedbackEvidence>, loaded_at: i64) -> Self {
         Self { rows, loaded_at }
     }
@@ -494,7 +487,9 @@ impl LearnedTable {
                     continue;
                 }
                 if row.feature.contains(':') {
-                    resolved.descriptive.insert(row.feature.clone(), row.effective);
+                    resolved
+                        .descriptive
+                        .insert(row.feature.clone(), row.effective);
                 } else {
                     resolved.signals.insert(row.feature.clone(), row.effective);
                 }
@@ -560,11 +555,7 @@ fn read_raw_rows(conn: &Connection) -> Result<Option<Vec<RawRow>>> {
 
 /// The read-side view of one stored row: the decayed, re-clamped
 /// effective value with its evidence and gate verdict.
-fn evidence_of(
-    raw: RawRow,
-    params: &LearnParams,
-    now: i64,
-) -> FeedbackEvidence {
+fn evidence_of(raw: RawRow, params: &LearnParams, now: i64) -> FeedbackEvidence {
     let (feature, query_class, stored, observations, sessions, updated_at) = raw;
     let default = params.default_of(&feature);
     let (lo, hi) = params.bounds(&feature);
@@ -613,7 +604,10 @@ pub fn load_learned(
     if rows.is_empty() {
         return Ok(None);
     }
-    Ok(Some(LearnedTable { rows, loaded_at: now }))
+    Ok(Some(LearnedTable {
+        rows,
+        loaded_at: now,
+    }))
 }
 
 /// List EVERY learned row — gated and inert, all scopes — decayed at
@@ -794,35 +788,82 @@ mod tests {
 
     #[test]
     fn flatten_forms_every_key_shape_of_the_contract() {
-        let mut groups = FeatureGroups::default();
-        groups.signals = vec![contribution("kind", 1.0), contribution("path_character", 0.2)];
+        let mut groups = FeatureGroups {
+            signals: vec![
+                contribution("kind", 1.0),
+                contribution("path_character", 0.2),
+            ],
+            ..FeatureGroups::default()
+        };
         groups.path.insert("src".to_string(), "1".to_string());
         groups.path.insert("src/auth".to_string(), "1".to_string());
-        groups.path.insert("__overflow__".to_string(), "1".to_string());
+        groups
+            .path
+            .insert("__overflow__".to_string(), "1".to_string());
         groups.path.insert("class".to_string(), "test".to_string());
         groups.path.insert("depth".to_string(), "mid".to_string());
         groups.path.insert("lang".to_string(), "Rust".to_string());
-        groups.symbol.insert("kind".to_string(), "function".to_string());
-        groups.symbol.insert("scoped".to_string(), "nested".to_string());
-        groups.symbol.insert("name_match".to_string(), "exact".to_string());
-        groups.symbol.insert("body_size".to_string(), "small".to_string());
-        groups.match_.insert("category".to_string(), "definition".to_string());
-        groups.match_.insert("term_coverage".to_string(), "most".to_string());
-        groups.match_.insert("anchored".to_string(), "symbol".to_string());
+        groups
+            .symbol
+            .insert("kind".to_string(), "function".to_string());
+        groups
+            .symbol
+            .insert("scoped".to_string(), "nested".to_string());
+        groups
+            .symbol
+            .insert("name_match".to_string(), "exact".to_string());
+        groups
+            .symbol
+            .insert("body_size".to_string(), "small".to_string());
+        groups
+            .match_
+            .insert("category".to_string(), "definition".to_string());
+        groups
+            .match_
+            .insert("term_coverage".to_string(), "most".to_string());
+        groups
+            .match_
+            .insert("anchored".to_string(), "symbol".to_string());
         groups.graph.insert("hub".to_string(), "low".to_string());
-        groups.graph.insert("authority".to_string(), "top".to_string());
-        groups.graph.insert("fan_in".to_string(), "medium".to_string());
-        groups.graph.insert("fan_out".to_string(), "zero".to_string());
-        groups.graph.insert("community".to_string(), "7".to_string());
-        groups.history.insert("recency".to_string(), "days".to_string());
-        groups.history.insert("churn".to_string(), "high".to_string());
-        groups.author.insert("last_touched_by".to_string(), "Ada".to_string());
-        groups.author.insert("primary".to_string(), "Grace".to_string());
-        groups.context.insert("same_file".to_string(), "yes".to_string());
-        groups.context.insert("same_directory".to_string(), "no".to_string());
-        groups.context.insert("same_community".to_string(), "yes".to_string());
-        groups.context.insert("import_distance".to_string(), "direct".to_string());
-        groups.context.insert("co_change".to_string(), "weak".to_string());
+        groups
+            .graph
+            .insert("authority".to_string(), "top".to_string());
+        groups
+            .graph
+            .insert("fan_in".to_string(), "medium".to_string());
+        groups
+            .graph
+            .insert("fan_out".to_string(), "zero".to_string());
+        groups
+            .graph
+            .insert("community".to_string(), "7".to_string());
+        groups
+            .history
+            .insert("recency".to_string(), "days".to_string());
+        groups
+            .history
+            .insert("churn".to_string(), "high".to_string());
+        groups
+            .author
+            .insert("last_touched_by".to_string(), "Ada".to_string());
+        groups
+            .author
+            .insert("primary".to_string(), "Grace".to_string());
+        groups
+            .context
+            .insert("same_file".to_string(), "yes".to_string());
+        groups
+            .context
+            .insert("same_directory".to_string(), "no".to_string());
+        groups
+            .context
+            .insert("same_community".to_string(), "yes".to_string());
+        groups
+            .context
+            .insert("import_distance".to_string(), "direct".to_string());
+        groups
+            .context
+            .insert("co_change".to_string(), "weak".to_string());
 
         let mut expect: Vec<String> = vec![
             "kind".into(),
@@ -865,7 +906,9 @@ mod tests {
         for name in &known {
             assert!(!name.contains(':'), "signal name carries a colon: {name}");
         }
-        for group in ["path", "symbol", "match", "graph", "history", "author", "context"] {
+        for group in [
+            "path", "symbol", "match", "graph", "history", "author", "context",
+        ] {
             assert!(
                 !known.contains(&group),
                 "group name collides with a signal name: {group}"
@@ -934,10 +977,14 @@ mod tests {
     #[test]
     fn descriptive_advantage_is_presence_fraction() {
         let mut useful_groups = FeatureGroups::default();
-        useful_groups.path.insert("src/auth".to_string(), "1".to_string());
+        useful_groups
+            .path
+            .insert("src/auth".to_string(), "1".to_string());
         let useful = member(2, true, useful_groups);
         let mut alt_groups = FeatureGroups::default();
-        alt_groups.path.insert("src/auth".to_string(), "1".to_string());
+        alt_groups
+            .path
+            .insert("src/auth".to_string(), "1".to_string());
         let a1 = member(1, false, alt_groups);
         let a2 = member(3, false, FeatureGroups::default());
         let a3 = member(4, false, FeatureGroups::default());
@@ -962,9 +1009,7 @@ mod tests {
             "signal on no member must not update: {updates:?}"
         );
         assert!(
-            updates
-                .iter()
-                .all(|update| update.feature != "path:src"),
+            updates.iter().all(|update| update.feature != "path:src"),
             "key on no member must not update: {updates:?}"
         );
     }
@@ -1001,7 +1046,10 @@ mod tests {
         // Clamp at the (computed) bounds.
         let (lo, hi) = params.bounds("path_character");
         assert_eq!(next_weight(0.6, 0, 0, 100.0, "path_character", &params), hi);
-        assert_eq!(next_weight(0.6, 0, 0, -100.0, "path_character", &params), lo);
+        assert_eq!(
+            next_weight(0.6, 0, 0, -100.0, "path_character", &params),
+            lo
+        );
     }
 
     #[test]
@@ -1068,9 +1116,17 @@ mod tests {
         useful_value: f32,
         alt_value: f32,
     ) {
-        let useful = member(2, true, groups_with_signals(&[("path_character", useful_value)]));
+        let useful = member(
+            2,
+            true,
+            groups_with_signals(&[("path_character", useful_value)]),
+        );
         let identity = useful.identity.clone();
-        let alt = member(1, false, groups_with_signals(&[("path_character", alt_value)]));
+        let alt = member(
+            1,
+            false,
+            groups_with_signals(&[("path_character", alt_value)]),
+        );
         let features = SlateFeatures {
             schema: 1,
             slate: format!("t{id}"),
@@ -1168,12 +1224,10 @@ mod tests {
         assert_eq!(rows[0].3, 3, "observations");
         assert_eq!(rows[0].4, 2, "distinct sessions");
         assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM learned_weight_sessions",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM learned_weight_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            },)
+                .unwrap(),
             2
         );
     }
@@ -1267,8 +1321,7 @@ mod tests {
             insert_event(&conn, id, None, &format!("s{}", id % 3), 1.0, 0.2);
         }
         learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
-        let table =
-            load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let table = load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
         assert!(table.is_some(), "10 obs / 3 sessions clears the gates");
     }
 
@@ -1280,18 +1333,19 @@ mod tests {
         }
         learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
 
-        let table =
-            load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let table = load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
         let fresh = table.unwrap();
         let (_, effective_fresh) = fresh_row(&fresh);
-        let (_, effective_aged) = fresh_row(&load_learned(
-            &conn,
-            &enabled_config(),
-            &default_weights(),
-            1000 + 30 * 86_400,
-        )
-        .unwrap()
-        .unwrap());
+        let (_, effective_aged) = fresh_row(
+            &load_learned(
+                &conn,
+                &enabled_config(),
+                &default_weights(),
+                1000 + 30 * 86_400,
+            )
+            .unwrap()
+            .unwrap(),
+        );
         // One half-life: the deviation from the default halves.
         let deviation_fresh = (effective_fresh - 0.6).abs();
         let deviation_aged = (effective_aged - 0.6).abs();
@@ -1329,9 +1383,11 @@ mod tests {
     fn load_learned_missing_table_is_silently_absent() {
         let conn = Connection::open_in_memory().unwrap();
         // A pre-TASK-102 index: no learned tables at all.
-        assert!(load_learned(&conn, &enabled_config(), &default_weights(), 0)
-            .unwrap()
-            .is_none());
+        assert!(
+            load_learned(&conn, &enabled_config(), &default_weights(), 0)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1365,10 +1421,12 @@ mod tests {
             insert_event(&conn, id, Some("symbol"), &format!("s{}", id % 4), 1.0, 0.2);
         }
         learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
-        let table =
-            load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let table = load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
 
-        let resolved = table.as_ref().unwrap().resolve(crate::rerank::QueryClass::Symbol);
+        let resolved = table
+            .as_ref()
+            .unwrap()
+            .resolve(crate::rerank::QueryClass::Symbol);
         let class_row = resolved
             .evidence
             .iter()

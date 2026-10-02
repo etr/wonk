@@ -406,9 +406,9 @@ fn default_weights_run_no_new_context_paths() {
 
     assert_eq!(
         rerank::builtin_signals().len(),
-        14,
+        15,
         "registry carries the TASK-093/094 signals plus churn, co_change, hub, authority, \
-         community and novelty"
+         community, novelty and feedback"
     );
     let scored = rerank::rerank(
         ranker::classify_results(&[hit("a.rs", 1, "alpha")], Some(&conn)),

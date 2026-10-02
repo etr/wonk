@@ -2372,10 +2372,20 @@ mod tests {
 
     #[test]
     fn parse_feedback_weights_conflicts_with_recording_flags() {
-        assert!(Cli::try_parse_from([
-            "wonk", "feedback", "--weights", "--slate", "t", "--session", "s", "--useful", "1"
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "wonk",
+                "feedback",
+                "--weights",
+                "--slate",
+                "t",
+                "--session",
+                "s",
+                "--useful",
+                "1"
+            ])
+            .is_err()
+        );
         assert!(Cli::try_parse_from(["wonk", "feedback", "--weights", "--useful", "1"]).is_err());
     }
 }

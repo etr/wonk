@@ -1104,11 +1104,7 @@ fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedbackEvent> {
         query_class: row.get(2)?,
         chosen_rank: row.get(3)?,
         features: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                4,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
         })?,
         useful: row.get::<_, i64>(5)? == 1,
         session: row.get(6)?,

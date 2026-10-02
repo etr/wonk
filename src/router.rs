@@ -294,17 +294,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         if config.feedback.enabled
                             && let Some(index_conn) = conn.as_ref()
                         {
-                            settings.learned =
-                                crate::learning::load_learned(
-                                    index_conn,
-                                    &config.feedback,
-                                    &config.rank.weights,
-                                    system_secs(),
-                                )
-                                .unwrap_or_else(|e| {
-                                    eprintln!("wonk: learned-weight load failed: {e:#}");
-                                    None
-                                });
+                            settings.learned = crate::learning::load_learned(
+                                index_conn,
+                                &config.feedback,
+                                &config.rank.weights,
+                                system_secs(),
+                            )
+                            .unwrap_or_else(|e| {
+                                eprintln!("wonk: learned-weight load failed: {e:#}");
+                                None
+                            });
                         }
                         let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
@@ -2756,12 +2755,9 @@ fn system_secs() -> i64 {
 /// Learn from pending events, best-effort (both dispatch surfaces):
 /// a failure warns and leaves the recorded events for the next call.
 pub(crate) fn learn_pending_best_effort(conn: &Connection, config: &crate::config::Config) {
-    if let Err(e) = crate::learning::learn_pending(
-        conn,
-        &config.feedback,
-        &config.rank.weights,
-        system_secs(),
-    ) {
+    if let Err(e) =
+        crate::learning::learn_pending(conn, &config.feedback, &config.rank.weights, system_secs())
+    {
         eprintln!("wonk: feedback learning deferred: {e:#}");
     }
 }
@@ -2775,12 +2771,8 @@ fn run_feedback_weights<W: io::Write>(
     fmt: &mut Formatter<W>,
     format: OutputFormat,
 ) -> Result<()> {
-    let rows = crate::learning::list_learned(
-        conn,
-        &config.feedback,
-        &config.rank.weights,
-        system_secs(),
-    )?;
+    let rows =
+        crate::learning::list_learned(conn, &config.feedback, &config.rank.weights, system_secs())?;
     if format.is_structured() {
         let outputs: Vec<output::LearnedWeightOutput> = rows
             .iter()
@@ -7325,7 +7317,15 @@ mod tests {
     fn run_fb(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
         let mut buf = Vec::new();
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
-        run_feedback(conn, args, &learning_config(), &mut fmt, true, OutputFormat::Grep).unwrap();
+        run_feedback(
+            conn,
+            args,
+            &learning_config(),
+            &mut fmt,
+            true,
+            OutputFormat::Grep,
+        )
+        .unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -7456,10 +7456,8 @@ mod tests {
     }
 
     fn learned_weight_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM learned_weights", [], |row| {
-            row.get(0)
-        })
-        .unwrap()
+        conn.query_row("SELECT COUNT(*) FROM learned_weights", [], |row| row.get(0))
+            .unwrap()
     }
 
     fn learned_watermark(conn: &Connection) -> i64 {
@@ -7499,10 +7497,20 @@ mod tests {
         };
         let mut buf = Vec::new();
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
-        run_feedback(&conn, &args, &learning_config(), &mut fmt, true, OutputFormat::Grep)
-            .unwrap();
+        run_feedback(
+            &conn,
+            &args,
+            &learning_config(),
+            &mut fmt,
+            true,
+            OutputFormat::Grep,
+        )
+        .unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("kind [overall] 1.000 (default 1.000) 4 obs, 4 sessions"), "{out}");
+        assert!(
+            out.contains("kind [overall] 1.000 (default 1.000) 4 obs, 4 sessions"),
+            "{out}"
+        );
         assert!(
             out.contains("[below gate]"),
             "inert rows stay legible with their counts: {out}"
@@ -7522,8 +7530,15 @@ mod tests {
         };
         let mut buf = Vec::new();
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Json, false);
-        run_feedback(&conn, &args, &learning_config(), &mut fmt, true, OutputFormat::Json)
-            .unwrap();
+        run_feedback(
+            &conn,
+            &args,
+            &learning_config(),
+            &mut fmt,
+            true,
+            OutputFormat::Json,
+        )
+        .unwrap();
         let rows: serde_json::Value =
             serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap();
         let rows = rows.as_array().unwrap();
