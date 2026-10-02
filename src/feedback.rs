@@ -108,8 +108,11 @@ pub struct SlateMember {
     pub groups: FeatureGroups,
 }
 
-/// One `symbols` row, bulk-loaded for span resolution.
+/// One `symbols` row, bulk-loaded for span resolution. `file` is the
+/// DB-stored repo-relative path — identities anchor on it, never on the
+/// result path the caller saw (which may be absolute).
 struct SymbolRow {
+    file: String,
     line: i64,
     end_line: Option<i64>,
     name: String,
@@ -138,7 +141,14 @@ fn owning_symbol(rows: &[SymbolRow], line: u64) -> Option<&SymbolRow> {
         })
 }
 
-/// Bulk-load the symbol rows of `files` (one bounded query per search).
+/// Bulk-load the symbol rows of `files` (one bounded query per chunk).
+///
+/// Result paths are matched exactly first; a file with no exact rows is
+/// re-queried by suffix — search paths may be absolute or `./`-prefixed
+/// (the MCP surface passes absolute paths) while `symbols.file` is always
+/// repo-relative, and the identity's stability depends on anchoring on
+/// the DB path. The returned map is keyed by the REQUESTED file string so
+/// callers resolve by what they hold.
 fn load_symbols_by_file(
     conn: &Connection,
     files: &[String],
@@ -152,24 +162,54 @@ fn load_symbols_by_file(
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    SymbolRow {
-                        line: row.get(1)?,
-                        end_line: row.get(2)?,
-                        name: row.get(3)?,
-                        kind: row.get(4)?,
-                        signature: row.get(5)?,
-                    },
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<(String, SymbolRow)>>>()?;
-        for (file, symbol) in rows {
-            map.entry(file).or_default().push(symbol);
+            .query_map(rusqlite::params_from_iter(chunk.iter()), symbol_row)?
+            .collect::<rusqlite::Result<Vec<SymbolRow>>>()?;
+        for symbol in rows {
+            map.entry(symbol.file.clone()).or_default().push(symbol);
+        }
+    }
+    for file in files {
+        if map.contains_key(file) {
+            continue;
+        }
+        // Suffix resolution: `symbols.file` is a path-separator-boundary
+        // suffix of the requested (possibly absolute) path.
+        let sql = "SELECT file, line, end_line, name, kind, signature FROM symbols \
+                   WHERE ?1 LIKE '%' || file";
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([file], symbol_row)?
+            .collect::<rusqlite::Result<Vec<SymbolRow>>>()?;
+        let matched: Vec<SymbolRow> = rows
+            .into_iter()
+            .filter(|r| is_path_suffix(file, &r.file))
+            .collect();
+        if !matched.is_empty() {
+            map.insert(file.clone(), matched);
         }
     }
     Ok(map)
+}
+
+/// Map one query row to a [`SymbolRow`].
+fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRow> {
+    Ok(SymbolRow {
+        file: row.get(0)?,
+        line: row.get(1)?,
+        end_line: row.get(2)?,
+        name: row.get(3)?,
+        kind: row.get(4)?,
+        signature: row.get(5)?,
+    })
+}
+
+/// Whether `suffix` is `path`'s tail at a path-separator boundary (or
+/// equal to it).
+fn is_path_suffix(path: &str, suffix: &str) -> bool {
+    path == suffix
+        || (path.len() > suffix.len()
+            && path.ends_with(suffix)
+            && path[..path.len() - suffix.len()].ends_with('/'))
 }
 
 /// SQLite's default host-parameter limit; chunking keeps the IN-list
@@ -201,8 +241,10 @@ fn build_members(
         let rows = symbols.get(&file).map(Vec::as_slice).unwrap_or(&[]);
         let (identity, symbol, kind) = match owning_symbol(rows, result.line) {
             Some(sym) => (
+                // Anchor on the DB-stored repo-relative path: re-indexing
+                // re-inserts the same row, wherever the repo is checked out.
                 result_identity(
-                    &file,
+                    &sym.file,
                     &sym.kind,
                     &sym.name,
                     sym.signature.as_deref().unwrap_or(""),
@@ -584,11 +626,12 @@ pub fn record_feedback(
 
 /// Which of `identities` still resolve against the current index (D7)?
 ///
-/// Recomputes [`result_identity`] over the `symbols` rows of `files` (one
-/// bounded query) and intersects: a rename, kind change, signature-token
-/// change, or file move yields a different identity and the entry no
-/// longer applies (PRD-FB-REQ-006) — retirement resolved at read time,
-/// never a write. Body-only edits and re-indexing re-insert the same
+/// Recomputes [`result_identity`] over the `symbols` rows of `files`
+/// (exact-then-suffix resolution, the same anchoring the slate builder
+/// used) and intersects: a rename, kind change, signature-token change,
+/// or file move yields a different identity and the entry no longer
+/// applies (PRD-FB-REQ-006) — retirement resolved at read time, never a
+/// write. Body-only edits and re-indexing re-insert the same
 /// `(file, kind, name, signature)` row, so those identities survive
 /// (PRD-FB-REQ-005). Line-anchored identities are content-derived and not
 /// recomputable from the index; they never match and are treated as live
@@ -602,27 +645,17 @@ pub fn live_identities(
     if files.is_empty() || identities.is_empty() {
         return live;
     }
-    for chunk in files.chunks(SQL_VAR_LIMIT) {
-        let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql = format!(
-            "SELECT file, kind, name, signature FROM symbols WHERE file IN ({placeholders})"
-        );
-        let Ok(mut stmt) = conn.prepare(&sql) else {
-            return live;
-        };
-        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        }) else {
-            return live;
-        };
-        for row in rows.flatten() {
-            let (file, kind, name, signature) = row;
-            let identity = result_identity(&file, &kind, &name, signature.as_deref().unwrap_or(""));
+    let Ok(symbols) = load_symbols_by_file(conn, files) else {
+        return live;
+    };
+    for rows in symbols.values() {
+        for sym in rows {
+            let identity = result_identity(
+                &sym.file,
+                &sym.kind,
+                &sym.name,
+                sym.signature.as_deref().unwrap_or(""),
+            );
             if identities.contains(&identity) {
                 live.insert(identity);
             }

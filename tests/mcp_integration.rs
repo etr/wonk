@@ -118,8 +118,8 @@ fn mcp_server_initialize_and_list_tools() {
     assert_eq!(list_resp["id"], 2);
     assert!(list_resp["error"].is_null());
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    // TASK-086 adds wonk_review as the 24th tool.
-    assert_eq!(tools.len(), 24);
+    // TASK-101 adds wonk_feedback as the 25th tool.
+    assert_eq!(tools.len(), 25);
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(tool_names.contains(&"wonk_search"));
