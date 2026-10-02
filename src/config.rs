@@ -239,6 +239,14 @@ pub struct FeedbackConfig {
     /// load error — no slate could survive for the feedback call to
     /// reference.
     pub slate_retention: usize,
+    /// Whether author-derived features (`last_touched_by`, `primary`) are
+    /// recorded per slate member (TASK-105, PRD-FB-REQ-028, AR-046). One
+    /// switch gates the whole `author` group — the two features share one
+    /// data source and one concern. Default on: the features stay inert
+    /// until TASK-102's observation gate, so recording costs nothing; the
+    /// switch exists for repositories that do not want author data
+    /// recorded at all.
+    pub author_features: bool,
 }
 
 impl Default for FeedbackConfig {
@@ -246,6 +254,7 @@ impl Default for FeedbackConfig {
         Self {
             enabled: false,
             slate_retention: 64,
+            author_features: true,
         }
     }
 }
@@ -539,6 +548,7 @@ struct DuplicateOverlay {
 struct FeedbackOverlay {
     enabled: Option<bool>,
     slate_retention: Option<usize>,
+    author_features: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -806,6 +816,9 @@ impl Config {
             }
             if let Some(v) = feedback.slate_retention {
                 self.feedback.slate_retention = v;
+            }
+            if let Some(v) = feedback.author_features {
+                self.feedback.author_features = v;
             }
             if self.feedback.slate_retention == 0 {
                 anyhow::bail!(
@@ -1415,7 +1428,8 @@ threshold = 1.0
             Config::default().feedback,
             FeedbackConfig {
                 enabled: false,
-                slate_retention: 64
+                slate_retention: 64,
+                author_features: true
             }
         );
         let mut env = TestEnv::new();
@@ -1425,7 +1439,8 @@ threshold = 1.0
             config.feedback,
             FeedbackConfig {
                 enabled: false,
-                slate_retention: 64
+                slate_retention: 64,
+                author_features: true
             }
         );
     }
@@ -1446,9 +1461,36 @@ slate_retention = 8
             config.feedback,
             FeedbackConfig {
                 enabled: true,
-                slate_retention: 8
+                slate_retention: 8,
+                author_features: true
             }
         );
+    }
+
+    #[test]
+    fn feedback_author_features_parsed_and_layered() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[feedback]
+author_features = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(!config.feedback.author_features, "repo layer");
+        assert!(!config.feedback.enabled, "untouched sibling");
+
+        // Layered: a global value holds where the repo layer is silent.
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_global_config(
+            r#"
+[feedback]
+author_features = false
+"#,
+        );
+        assert!(!env.load().unwrap().feedback.author_features);
     }
 
     #[test]

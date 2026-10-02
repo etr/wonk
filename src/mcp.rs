@@ -473,6 +473,10 @@ fn tool_definitions() -> &'static Vec<Tool> {
                             "type": "string",
                             "enum": ["symbol", "path", "signature", "conceptual"],
                             "description": "Pin the query class, bypassing detection (scales the lexical/semantic blend when reranking is enabled)"
+                        },
+                        "context_file": {
+                            "type": "string",
+                            "description": "The file you are currently working in (relative or absolute). Feeds context-relative feedback features when [feedback] is enabled; never affects ranking."
                         }
                     },
                     "required": ["query"]
@@ -1659,6 +1663,14 @@ impl McpServer {
             results.retain(|r| !ranker::is_test_file(&r.file));
         }
 
+        // Optional working-context hint (TASK-105, PRD-FB-REQ-027):
+        // relative or absolute, rejected never — an unresolvable hint
+        // degrades to the string-computable context features only.
+        let context_file = args
+            .get("context_file")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
         // Config-gated pipeline (REQ-017); no why parameter over MCP in
         // TASK-092 — rows are unchanged either way. [feedback] enabled
         // opts the search into the pipeline (TASK-101): a legacy-path
@@ -1679,6 +1691,8 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),
         };
         settings.use_pipeline |= config.feedback.enabled;
+        settings.feedback_capture = config.feedback.enabled;
+        settings.working_context = context_file;
         let ranked =
             crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
         // Best-effort REQ-003 memo: persist the pairs the novelty pass
@@ -5571,6 +5585,28 @@ mod tests {
     }
 
     // -- wonk_search no longer has semantic param ------------------------------
+
+    #[test]
+    fn tool_search_has_context_file_param() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_search").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        let context_file = props.get("context_file").expect("context_file property");
+        assert_eq!(context_file["type"], "string");
+        let description = context_file["description"].as_str().unwrap();
+        assert!(
+            description.contains("working"),
+            "description names the working-context role: {description}"
+        );
+        assert!(
+            !tool.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "context_file"),
+            "the hint is optional"
+        );
+    }
 
     #[test]
     fn tool_search_no_semantic_param() {

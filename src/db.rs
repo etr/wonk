@@ -211,14 +211,23 @@ CREATE INDEX IF NOT EXISTS idx_review_suppressions_rule ON review_suppressions(r
 // row per DIRECTED pair, at most top-K per `file_a`, so storage stays
 // linear in files rather than quadratic; `idx_co_change_a` serves the
 // per-file strongest-coupling lookup the rerank signal folds.
+//
+// TASK-105 adds the author/recency columns: `mined_commits.author` (the
+// `%an` field) and the per-file `last_ts`/`last_author`/`primary_author`
+// the feedback features read — all nullable, all NULL-filled on a
+// pre-TASK-105 index until the next mine rewrites them.
 const HISTORY_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS file_churn (
     file TEXT PRIMARY KEY,
-    score REAL NOT NULL
+    score REAL NOT NULL,
+    last_ts INTEGER,
+    last_author TEXT,
+    primary_author TEXT
 );
 CREATE TABLE IF NOT EXISTS mined_commits (
     commit_id TEXT PRIMARY KEY,
-    commit_ts INTEGER NOT NULL
+    commit_ts INTEGER NOT NULL,
+    author TEXT
 );
 CREATE TABLE IF NOT EXISTS commit_files (
     commit_id TEXT NOT NULL REFERENCES mined_commits(commit_id) ON DELETE CASCADE,
@@ -244,14 +253,19 @@ CREATE INDEX IF NOT EXISTS idx_co_change_a ON co_change(file_a, weight DESC);
 // incrementally per file (PRD-TOPO-REQ-006) — the scores are global
 // graph properties, so a file edit cannot update them locally. `community`
 // and its index are created now but stay NULL-filled/unread until
-// TASK-099 owns them. `topology_meta.last_computed` drives the cadence
+// TASK-099 owns them. TASK-105 adds the CSR degrees `fan_in`/`fan_out`
+// (global graph properties like hub/authority, written by the same pass;
+// nullable so a pre-TASK-105 index migrates in place).
+// `topology_meta.last_computed` drives the cadence
 // gate and the staleness marker (PRD-TOPO-REQ-007).
 const TOPOLOGY_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS symbol_topology (
     symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
     hub REAL NOT NULL,
     authority REAL NOT NULL,
-    community INTEGER
+    community INTEGER,
+    fan_in INTEGER,
+    fan_out INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_topology_community ON symbol_topology(community);
 CREATE TABLE IF NOT EXISTS topology_meta (
@@ -405,8 +419,10 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating review_suppressions table")?;
     conn.execute_batch(HISTORY_SQL)
         .context("creating history tables")?;
+    ensure_history_columns(conn)?;
     conn.execute_batch(TOPOLOGY_SQL)
         .context("creating topology tables")?;
+    ensure_topology_columns(conn)?;
     conn.execute_batch(DUPLICATES_SQL)
         .context("creating duplicate tables")?;
     conn.execute_batch(FEEDBACK_SQL)
@@ -468,24 +484,97 @@ pub fn ensure_summaries_table(conn: &Connection) -> Result<()> {
 }
 
 /// Ensure the TASK-096/097 history tables exist (`file_churn`,
-/// `mined_commits`, `commit_files`, `history_meta`, `co_change`).
-///
-/// Handles schema migration for indexes created before history mining:
-/// safe to call on databases that already have the tables.
+/// `mined_commits`, `commit_files`, `history_meta`, `co_change`), plus
+/// the TASK-105 author/recency columns on pre-TASK-105 indexes (the
+/// `ensure_embedding_metadata_columns` precedent: PRAGMA table_info +
+/// ALTER). Safe to call on databases that already have the shape.
 pub fn ensure_history_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(HISTORY_SQL)
         .context("creating history tables (migration)")?;
+    ensure_history_columns(conn)?;
+    Ok(())
+}
+
+/// Add the TASK-105 author/recency columns to history tables created
+/// before them: `mined_commits.author`, `file_churn.last_ts`,
+/// `file_churn.last_author`, `file_churn.primary_author`. Existing rows
+/// backfill NULL — the features stay omitted until the next mine.
+fn ensure_history_columns(conn: &Connection) -> Result<()> {
+    add_missing_columns(
+        conn,
+        "mined_commits",
+        &[("author", "ALTER TABLE mined_commits ADD COLUMN author TEXT")],
+    )?;
+    add_missing_columns(
+        conn,
+        "file_churn",
+        &[
+            (
+                "last_ts",
+                "ALTER TABLE file_churn ADD COLUMN last_ts INTEGER",
+            ),
+            (
+                "last_author",
+                "ALTER TABLE file_churn ADD COLUMN last_author TEXT",
+            ),
+            (
+                "primary_author",
+                "ALTER TABLE file_churn ADD COLUMN primary_author TEXT",
+            ),
+        ],
+    )?;
     Ok(())
 }
 
 /// Ensure the TASK-098 topology tables exist (`symbol_topology`,
-/// `topology_meta`).
+/// `topology_meta`), plus the TASK-105 fan-degree columns on
+/// pre-TASK-105 indexes.
 ///
 /// Handles schema migration for indexes created before graph-topology
 /// scoring: safe to call on databases that already have the tables.
 pub fn ensure_topology_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(TOPOLOGY_SQL)
         .context("creating topology tables (migration)")?;
+    ensure_topology_columns(conn)?;
+    Ok(())
+}
+
+/// Add the TASK-105 fan-degree columns to a `symbol_topology` table created
+/// before them. Existing rows backfill NULL — the graph features stay
+/// omitted until the next topology recompute.
+fn ensure_topology_columns(conn: &Connection) -> Result<()> {
+    add_missing_columns(
+        conn,
+        "symbol_topology",
+        &[
+            (
+                "fan_in",
+                "ALTER TABLE symbol_topology ADD COLUMN fan_in INTEGER",
+            ),
+            (
+                "fan_out",
+                "ALTER TABLE symbol_topology ADD COLUMN fan_out INTEGER",
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Add each named column to `table` when `PRAGMA table_info` shows it
+/// missing — the shared body of the column migrations (the
+/// `ensure_embedding_metadata_columns` precedent). `stmts` pairs a column
+/// name with the ALTER statement that adds it.
+fn add_missing_columns(conn: &Connection, table: &str, stmts: &[(&str, &str)]) -> Result<()> {
+    let columns: Vec<String> = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (column, stmt) in stmts {
+        if !columns.iter().any(|name| name == column) {
+            conn.execute_batch(stmt)
+                .with_context(|| format!("adding {column} column to {table} table"))?;
+        }
+    }
     Ok(())
 }
 
@@ -2061,6 +2150,52 @@ mod tests {
         ensure_history_tables(&conn).unwrap();
         ensure_history_tables(&conn).unwrap();
         assert_eq!(history_table_names(&conn).len(), 5);
+    }
+
+    /// Column names of `table`, in declaration order.
+    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    #[test]
+    fn test_history_columns_migrate_on_pre105_index_with_null_backfill() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A pre-TASK-105 index: the history tables in their old shape,
+        // seeded so the backfill is observable.
+        let conn = Connection::open(&db_path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE file_churn (file TEXT PRIMARY KEY, score REAL NOT NULL);
+             CREATE TABLE mined_commits (
+                commit_id TEXT PRIMARY KEY, commit_ts INTEGER NOT NULL);
+             INSERT INTO file_churn VALUES ('a.rs', 1.0);",
+        )
+        .unwrap();
+
+        // Migrate, then migrate again — the ALTERs are guarded by PRAGMA.
+        ensure_history_tables(&conn).unwrap();
+        ensure_history_tables(&conn).unwrap();
+
+        assert!(table_columns(&conn, "file_churn").contains(&"last_ts".to_string()));
+        assert!(table_columns(&conn, "file_churn").contains(&"last_author".to_string()));
+        assert!(table_columns(&conn, "file_churn").contains(&"primary_author".to_string()));
+        assert!(table_columns(&conn, "mined_commits").contains(&"author".to_string()));
+
+        let backfill: (Option<i64>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT last_ts, last_author, primary_author FROM file_churn WHERE file = 'a.rs'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(backfill, (None, None, None), "old rows stay NULL-filled");
     }
 
     // -- topology tables (TASK-098) -------------------------------------------

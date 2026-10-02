@@ -253,13 +253,18 @@ fn ac_no_body_reads_at_query_time() {
             );
         }
     }
-    // And the ranked path never touches the files table at all.
-    assert!(
-        statements
-            .iter()
-            .all(|s| !s.to_lowercase().contains("from files")),
-        "ranking read the files table: {statements:?}"
-    );
+    // And the ranked path's only files-table read is the canonical-key
+    // probe (TASK-105): path-only and IN-bounded, never a file body or
+    // metadata column.
+    for stmt in &statements {
+        let lowered = stmt.to_lowercase();
+        if lowered.contains("from files") {
+            assert!(
+                lowered.starts_with("select path from files where path in"),
+                "unexpected files read: {stmt}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

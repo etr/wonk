@@ -114,6 +114,12 @@ struct IndexLookup {
 impl IndexLookup {
     /// Bulk-query the symbols and references tables, filtered to only the
     /// files present in the result set. Two SQL queries are executed.
+    ///
+    /// Paths the exact pass missed (absolute or `./`-prefixed result
+    /// paths, the MCP shape, while the tables key repo-relative paths)
+    /// are resolved to their canonical `files.path` and re-queried as one
+    /// batched pair — rows land under the as-seen keys `classify_one`
+    /// looks up by (the `load_symbols_by_file` precedent, TASK-105).
     fn load(conn: &Connection, files: &HashSet<&str>) -> Self {
         if files.is_empty() {
             return IndexLookup {
@@ -126,20 +132,80 @@ impl IndexLookup {
         let in_clause = placeholders.join(", ");
         let file_params: Vec<&str> = files.iter().copied().collect();
 
-        let definitions = Self::query_map(
+        let mut definitions = Self::query_map(
             conn,
             &format!("SELECT file, line FROM symbols WHERE file IN ({in_clause})"),
             &file_params,
         );
-        let references = Self::query_map(
+        let mut references = Self::query_map(
             conn,
             &format!("SELECT file, line FROM \"references\" WHERE file IN ({in_clause})"),
             &file_params,
         );
+
+        let missed: Vec<&str> = files
+            .iter()
+            .copied()
+            .filter(|f| !definitions.contains_key(*f) && !references.contains_key(*f))
+            .collect();
+        let aliases = Self::resolve_aliases(conn, &missed);
+        if !aliases.is_empty() {
+            let mut db_params: Vec<&str> = aliases.values().map(String::as_str).collect();
+            db_params.sort_unstable();
+            db_params.dedup();
+            let db_placeholders: Vec<&str> = db_params.iter().map(|_| "?").collect();
+            let db_clause = db_placeholders.join(", ");
+            let defs_by_db = Self::query_map(
+                conn,
+                &format!("SELECT file, line FROM symbols WHERE file IN ({db_clause})"),
+                &db_params,
+            );
+            let refs_by_db = Self::query_map(
+                conn,
+                &format!("SELECT file, line FROM \"references\" WHERE file IN ({db_clause})"),
+                &db_params,
+            );
+            for (as_seen, db) in &aliases {
+                if let Some(lines) = defs_by_db.get(db.as_str()) {
+                    definitions.insert(as_seen.clone(), lines.clone());
+                }
+                if let Some(lines) = refs_by_db.get(db.as_str()) {
+                    references.insert(as_seen.clone(), lines.clone());
+                }
+            }
+        }
         IndexLookup {
             definitions,
             references,
         }
+    }
+
+    /// Map each missed result path to its canonical repo-relative
+    /// `files.path` — longest path-separator-boundary suffix, ties to the
+    /// lexicographically smallest — via ONE bounded `files` scan. Empty
+    /// when nothing missed or nothing resolves.
+    fn resolve_aliases(conn: &Connection, missed: &[&str]) -> HashMap<String, String> {
+        let mut aliases = HashMap::new();
+        if missed.is_empty() {
+            return aliases;
+        }
+        let Ok(mut stmt) = conn.prepare("SELECT path FROM files") else {
+            return aliases;
+        };
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return aliases;
+        };
+        let indexed: Vec<String> = rows.flatten().collect();
+        for as_seen in missed {
+            let best = indexed
+                .iter()
+                .filter(|db| crate::rerank::is_path_suffix(as_seen, db))
+                .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)));
+            if let Some(db) = best {
+                aliases.insert(as_seen.to_string(), db.clone());
+            }
+        }
+        aliases
     }
 
     fn query_map(conn: &Connection, sql: &str, params: &[&str]) -> HashMap<String, HashSet<i64>> {

@@ -281,6 +281,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // implication, config-consented — a legacy-path
                         // slate carries no contributions to learn from).
                         settings.use_pipeline |= args.why || config.feedback.enabled;
+                        // Feedback capture (TASK-105): widen the prepared
+                        // slices and thread the optional working-context
+                        // hint (--context) into the slate's features; the
+                        // hint never affects ranking.
+                        settings.feedback_capture = config.feedback.enabled;
+                        settings.working_context = args.context.clone();
                         let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
@@ -2580,7 +2586,7 @@ pub(crate) fn record_slate_best_effort(
         return None;
     }
     let conn = conn?;
-    match crate::feedback::build_and_store_slate(conn, query, ranked, feedback.slate_retention) {
+    match crate::feedback::build_and_store_slate(conn, query, ranked, feedback) {
         Ok(stored) => Some(stored),
         Err(e) => {
             eprintln!("warn: could not record feedback slate: {e:#}");
@@ -6143,6 +6149,7 @@ mod tests {
             semantic: false,
             why: false,
             query_class: None,
+            context: None,
             file: None,
             paths: vec![],
         });
@@ -7118,6 +7125,7 @@ mod tests {
         crate::config::FeedbackConfig {
             enabled,
             slate_retention: 64,
+            author_features: true,
         }
     }
 

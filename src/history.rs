@@ -12,22 +12,27 @@ use std::path::Path;
 use anyhow::Result;
 use rusqlite::Connection;
 
-/// One mined commit: its sha, committer timestamp (unix seconds), and the
-/// repo-relative paths it touched.
+/// One mined commit: its sha, committer timestamp (unix seconds), author
+/// name (TASK-105; `None` when the log line carried none — the 2-field
+/// legacy header — or an empty `%an`), and the repo-relative paths it
+/// touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MinedCommit {
     pub id: String,
     pub ts: i64,
+    pub author: Option<String>,
     pub files: Vec<String>,
 }
 
-/// Parse `git log --format=%H%x09%ct --name-only` output.
+/// Parse `git log --format=%H%x09%ct%x09%an --name-only` output.
 ///
 /// A line carrying a TAB whose second field parses as a commit timestamp
 /// opens a commit; every other non-empty line is a file path of the
 /// current commit. Blank separators are skipped, and a trailing newline is
 /// tolerated. The timestamp guard keeps a (pathological) tab-containing
-/// file path out of the header position. Path lines are stored under
+/// file path out of the header position. The author is the third TAB
+/// field; the 2-field legacy header (old stored detail) parses with
+/// `author: None`. Path lines are stored under
 /// their REAL names: a C-style-quoted line (git quotes any path with a
 /// quote, backslash, or control byte even under `core.quotePath=false`)
 /// is unquoted by [`unquote_git_path`] first.
@@ -37,10 +42,11 @@ pub fn parse_git_log(output: &str) -> Vec<MinedCommit> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some((id, ts)) = split_commit_header(line) {
+        if let Some((id, ts, author)) = split_commit_header(line) {
             commits.push(MinedCommit {
                 id: id.to_string(),
                 ts,
+                author: author.map(|a| a.to_string()),
                 files: Vec::new(),
             });
         } else if let Some(commit) = commits.last_mut() {
@@ -126,14 +132,28 @@ fn unquote_git_path(line: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Split a `%H%x09%ct` header line, or `None` when it is not one (no TAB,
-/// an empty sha field, or a second field that is not a timestamp).
-fn split_commit_header(line: &str) -> Option<(&str, i64)> {
-    let (id, ts) = line.split_once('\t')?;
+/// Split a `%H%x09%ct(%x09%an)` header line into `(sha, ts, author)`, or
+/// `None` when it is not one (no TAB, an empty sha field, or a second
+/// field that is not a timestamp). The third field is the author name
+/// (`Some("")` from the log maps to `None` at the caller); a 2-field
+/// legacy header yields `author: None`.
+fn split_commit_header(line: &str) -> Option<(&str, i64, Option<&str>)> {
+    let (id, rest) = line.split_once('\t')?;
     if id.trim().is_empty() {
         return None;
     }
-    Some((id, ts.trim().parse::<i64>().ok()?))
+    match rest.split_once('\t') {
+        Some((ts, author)) => {
+            let ts = ts.trim().parse::<i64>().ok()?;
+            let author = if author.is_empty() {
+                None
+            } else {
+                Some(author)
+            };
+            Some((id, ts, author))
+        }
+        None => Some((id, rest.trim().parse::<i64>().ok()?, None)),
+    }
 }
 
 /// The age weight of a commit at `ts` (PRD-HIST-REQ-003): linear
@@ -170,6 +190,73 @@ pub fn aggregate_churn(rows: &[MinedCommit], head_ts: i64, span: i64) -> HashMap
         }
     }
     scores
+}
+
+/// The per-file author/recency facts the feedback features read
+/// (TASK-105, PRD-FB-REQ-023/028): the newest commit's timestamp and
+/// author, and the file's dominant author.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileHistory {
+    /// Newest commit ts touching the file (unix seconds).
+    pub last_ts: i64,
+    /// Author of that newest commit; `None` when the detail row predates
+    /// author capture or git recorded an empty name.
+    pub last_author: Option<String>,
+    /// Argmax of age-weighted per-author commit count; `None` when no
+    /// retained commit touching the file carries an author.
+    pub primary_author: Option<String>,
+}
+
+/// Fold the per-file history facts (TASK-105) from the retained commits,
+/// newest-first as [`recompute_history_aggregates`] reads them: the FIRST
+/// sighting of a file fixes `last_ts`/`last_author`, and `primary_author`
+/// is the argmax of age-weighted per-author commit count, ties breaking
+/// to the lexicographically smallest author name — a total order, so
+/// HashMap iteration order cannot leak into the stored aggregate.
+pub fn aggregate_file_history(
+    rows: &[MinedCommit],
+    head_ts: i64,
+    span: i64,
+) -> HashMap<String, FileHistory> {
+    let mut history: HashMap<String, FileHistory> = HashMap::new();
+    let mut weighted: HashMap<(String, String), f32> = HashMap::new();
+    for commit in rows {
+        let weight = age_weight(commit.ts, head_ts, span);
+        for file in &commit.files {
+            // Rows are newest-first: the first sighting IS the newest.
+            history.entry(file.clone()).or_insert_with(|| FileHistory {
+                last_ts: commit.ts,
+                last_author: commit.author.clone(),
+                primary_author: None,
+            });
+            if let Some(author) = &commit.author {
+                *weighted
+                    .entry((file.clone(), author.clone()))
+                    .or_insert(0.0) += weight;
+            }
+        }
+    }
+    let mut by_file: HashMap<&str, Vec<(&str, f32)>> = HashMap::new();
+    for ((file, author), weight) in &weighted {
+        by_file
+            .entry(file.as_str())
+            .or_default()
+            .push((author.as_str(), *weight));
+    }
+    for (file, mut authors) in by_file {
+        // argmax of weighted count, ties to the lexicographically smallest
+        // name — (count desc, name asc) is a total order.
+        authors.sort_by(|(name_a, count_a), (name_b, count_b)| {
+            count_b
+                .partial_cmp(count_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| name_a.cmp(name_b))
+        });
+        if let Some((author, _)) = authors.first() {
+            history.entry(file.to_string()).or_default().primary_author = Some(author.to_string());
+        }
+    }
+    history
 }
 
 /// One retained co-change coupling: `file_a`'s directed coupling to
@@ -290,7 +377,8 @@ pub fn has_git(repo_root: &Path) -> bool {
 
 /// `git log` invocation shared by the full and incremental mines: the
 /// newest `window` commits of `range` (None = HEAD), no renames, one TAB
-/// header + `--name-only` paths per commit. `-c core.quotePath=false`
+/// header + `--name-only` paths per commit. The header carries the author
+/// name as its third field (TASK-105: `%an`). `-c core.quotePath=false`
 /// asks git for RAW non-ASCII paths — under the default it C-quotes every
 /// path with a byte over 0x7f (`"src/caf\303\251.rs"`), which would never
 /// match a real path at lookup time; paths git still quotes (quotes,
@@ -306,7 +394,7 @@ fn git_log(repo_root: &Path, window: usize, range: Option<&str>) -> Result<Strin
         "-n",
         &n,
         "--no-renames",
-        "--format=%H%x09%ct",
+        "--format=%H%x09%ct%x09%an",
         "--name-only",
     ];
     if let Some(range) = range {
@@ -454,8 +542,9 @@ fn set_mined_head(conn: &Connection, head: &str) -> Result<()> {
 fn insert_commits(conn: &Connection, commits: &[MinedCommit]) -> Result<()> {
     for commit in commits {
         conn.execute(
-            "INSERT OR IGNORE INTO mined_commits(commit_id, commit_ts) VALUES (?1, ?2)",
-            rusqlite::params![commit.id, commit.ts],
+            "INSERT OR IGNORE INTO mined_commits(commit_id, commit_ts, author) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![commit.id, commit.ts, commit.author],
         )?;
         for file in &commit.files {
             conn.execute(
@@ -499,13 +588,14 @@ fn trim_to_window(conn: &Connection, window: usize) -> Result<()> {
 fn recompute_history_aggregates(conn: &Connection, opts: &MiningOptions) -> Result<()> {
     let mut commits: Vec<MinedCommit> = {
         let mut stmt = conn.prepare(
-            "SELECT commit_id, commit_ts FROM mined_commits \
+            "SELECT commit_id, commit_ts, author FROM mined_commits \
              ORDER BY commit_ts DESC, commit_id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(MinedCommit {
                 id: row.get(0)?,
                 ts: row.get(1)?,
+                author: row.get(2)?,
                 files: Vec::new(),
             })
         })?;
@@ -531,15 +621,29 @@ fn recompute_history_aggregates(conn: &Connection, opts: &MiningOptions) -> Resu
 
     let (head_ts, span) = window_bounds(&commits);
     let churn = aggregate_churn(&commits, head_ts, span);
+    let file_history = aggregate_file_history(&commits, head_ts, span);
     let co_change = top_k_per_file(
         &aggregate_co_change(&commits, head_ts, span, opts.max_commit_files),
         CO_CHANGE_TOP_K,
     );
 
     conn.execute("DELETE FROM file_churn", [])?;
-    let mut churn_insert = conn.prepare("INSERT INTO file_churn(file, score) VALUES (?1, ?2)")?;
-    for (file, score) in &churn {
-        churn_insert.execute(rusqlite::params![file, score])?;
+    {
+        let mut churn_insert = conn.prepare(
+            "INSERT INTO file_churn(file, score, last_ts, last_author, primary_author) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (file, score) in &churn {
+            churn_insert.execute(rusqlite::params![
+                file,
+                score,
+                file_history.get(file).map(|h| h.last_ts),
+                file_history.get(file).and_then(|h| h.last_author.clone()),
+                file_history
+                    .get(file)
+                    .and_then(|h| h.primary_author.clone()),
+            ])?;
+        }
     }
 
     conn.execute("DELETE FROM co_change", [])?;
@@ -1263,6 +1367,7 @@ mod tests {
             MinedCommit {
                 id: "aaaaaaaa".to_string(),
                 ts: 100,
+                author: None,
                 files: vec!["src/lib.rs".to_string(), "src/my file.rs".to_string()]
             }
         );
@@ -1271,6 +1376,7 @@ mod tests {
             MinedCommit {
                 id: "bbbbbbbb".to_string(),
                 ts: 50,
+                author: None,
                 files: vec!["src/lib.rs".to_string(), "README.md".to_string()]
             }
         );
@@ -1371,6 +1477,7 @@ mod tests {
         let one = vec![MinedCommit {
             id: "a".into(),
             ts: 100,
+            author: None,
             files: vec![],
         }];
         assert_eq!(window_bounds(&one), (100, 0));
@@ -1378,16 +1485,19 @@ mod tests {
             MinedCommit {
                 id: "a".into(),
                 ts: 100,
+                author: None,
                 files: vec![],
             },
             MinedCommit {
                 id: "b".into(),
                 ts: 75,
+                author: None,
                 files: vec![],
             },
             MinedCommit {
                 id: "c".into(),
                 ts: 50,
+                author: None,
                 files: vec![],
             },
         ];
@@ -1402,16 +1512,19 @@ mod tests {
             MinedCommit {
                 id: "a".into(),
                 ts: 100,
+                author: None,
                 files: vec!["hot.rs".into()],
             },
             MinedCommit {
                 id: "b".into(),
                 ts: 75,
+                author: None,
                 files: vec!["hot.rs".into(), "mid.rs".into()],
             },
             MinedCommit {
                 id: "c".into(),
                 ts: 50,
+                author: None,
                 files: vec!["hot.rs".into()],
             },
         ];
@@ -1432,6 +1545,7 @@ mod tests {
         MinedCommit {
             id: id.to_string(),
             ts,
+            author: None,
             files: files.iter().map(|f| f.to_string()).collect(),
         }
     }
@@ -1771,5 +1885,167 @@ mod tests {
             tight, wide,
             "the window size must change the mined aggregate"
         );
+    }
+
+    // -- authors + per-file history (TASK-105) --------------------------------
+
+    #[test]
+    fn parse_git_log_parses_three_field_header_with_author() {
+        let commits = parse_git_log("aaaaaaaa\t100\tAda Lovelace\nsrc/lib.rs\n");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].author.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(commits[0].ts, 100);
+        assert_eq!(commits[0].files, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn parse_git_log_empty_author_field_is_none() {
+        let commits = parse_git_log("aaaaaaaa\t100\t\nsrc/lib.rs\n");
+        assert_eq!(commits.len(), 1, "the empty third field is still a header");
+        assert_eq!(commits[0].author, None);
+    }
+
+    #[test]
+    fn parse_git_log_two_field_legacy_header_has_no_author() {
+        // Old stored detail and hand-written fixtures lack the author field;
+        // the header still parses with `author: None`.
+        let commits = parse_git_log("aaaaaaaa\t100\nsrc/lib.rs\n");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].author, None);
+    }
+
+    fn commit_with_author(id: &str, ts: i64, author: &str, files: &[&str]) -> MinedCommit {
+        MinedCommit {
+            id: id.to_string(),
+            ts,
+            author: Some(author.to_string()),
+            files: files.iter().map(|f| f.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn aggregate_file_history_takes_the_newest_sighting() {
+        // Rows newest-first, the order recompute reads them.
+        let rows = vec![
+            commit_with_author("c2", 300, "Bob", &["a.rs"]),
+            commit_with_author("c1", 100, "Ada", &["a.rs"]),
+        ];
+        let history = aggregate_file_history(&rows, 300, 200);
+        let a = &history["a.rs"];
+        assert_eq!(a.last_ts, 300);
+        assert_eq!(
+            a.last_author.as_deref(),
+            Some("Bob"),
+            "newest commit's author"
+        );
+    }
+
+    #[test]
+    fn aggregate_file_history_primary_author_by_weighted_count() {
+        // head 300, span 200: Zed's ts=300 commit weighs 1.0; Ada's ts=200
+        // commit weighs 0.5 — Zed is primary despite one commit each.
+        let rows = vec![
+            commit_with_author("c2", 300, "Zed", &["a.rs"]),
+            commit_with_author("c1", 200, "Ada", &["a.rs"]),
+        ];
+        let history = aggregate_file_history(&rows, 300, 200);
+        assert_eq!(history["a.rs"].primary_author.as_deref(), Some("Zed"));
+    }
+
+    #[test]
+    fn aggregate_file_history_tie_breaks_to_smallest_author_name() {
+        // Same timestamp: equal weights, so the lexicographically smallest
+        // author name wins — a total order, never HashMap iteration order.
+        let rows = vec![
+            commit_with_author("c2", 100, "Zed", &["a.rs"]),
+            commit_with_author("c1", 100, "Ada", &["a.rs"]),
+            commit_with_author("c0", 100, "Mid", &["a.rs"]),
+        ];
+        let history = aggregate_file_history(&rows, 100, 0);
+        assert_eq!(history["a.rs"].primary_author.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn aggregate_file_history_authorless_commits_update_ts_only() {
+        let rows = vec![
+            MinedCommit {
+                id: "c2".into(),
+                ts: 300,
+                author: None,
+                files: vec!["a.rs".into()],
+            },
+            commit_with_author("c1", 100, "Ada", &["a.rs"]),
+        ];
+        let history = aggregate_file_history(&rows, 300, 200);
+        let a = &history["a.rs"];
+        assert_eq!(a.last_ts, 300, "the newest commit still fixes last_ts");
+        assert_eq!(a.last_author, None, "an authorless newest commit");
+        assert_eq!(
+            a.primary_author.as_deref(),
+            Some("Ada"),
+            "Ada is the only author"
+        );
+    }
+
+    #[test]
+    fn aggregate_file_history_empty_is_empty() {
+        assert!(aggregate_file_history(&[], 0, 0).is_empty());
+    }
+
+    /// The five `file_churn` columns after a recompute over directly seeded
+    /// detail rows: `(score, last_ts, last_author, primary_author)`.
+    fn file_churn_row(
+        conn: &Connection,
+        file: &str,
+    ) -> (f64, Option<i64>, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT score, last_ts, last_author, primary_author FROM file_churn WHERE file = ?1",
+            rusqlite::params![file],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recompute_history_aggregates_writes_per_file_history_columns() {
+        let dir = TempDir::new().unwrap();
+        let conn = crate::db::open(&dir.path().join("h.db")).unwrap();
+        let commits = vec![
+            commit_with_author("c2", 300, "Bob", &["a.rs", "b.rs"]),
+            commit_with_author("c1", 100, "Ada", &["a.rs"]),
+        ];
+        insert_commits(&conn, &commits).unwrap();
+        recompute_history_aggregates(&conn, &opts(10)).unwrap();
+
+        // a.rs: last touched by Bob at 300; weighted counts Bob 1.0, Ada 0.0.
+        let (score_a, last_ts, last_author, primary) = file_churn_row(&conn, "a.rs");
+        assert!((score_a - 1.0).abs() < 1e-6, "got {score_a}");
+        assert_eq!(last_ts, Some(300));
+        assert_eq!(last_author.as_deref(), Some("Bob"));
+        assert_eq!(primary.as_deref(), Some("Bob"));
+        // b.rs: only Bob ever touched it.
+        let (_, last_ts_b, last_author_b, primary_b) = file_churn_row(&conn, "b.rs");
+        assert_eq!(last_ts_b, Some(300));
+        assert_eq!(last_author_b.as_deref(), Some("Bob"));
+        assert_eq!(primary_b.as_deref(), Some("Bob"));
+    }
+
+    #[test]
+    fn recompute_history_aggregates_tolerates_authorless_detail() {
+        let dir = TempDir::new().unwrap();
+        let conn = crate::db::open(&dir.path().join("h.db")).unwrap();
+        let commits = vec![MinedCommit {
+            id: "c0".into(),
+            ts: 100,
+            author: None,
+            files: vec!["a.rs".into()],
+        }];
+        insert_commits(&conn, &commits).unwrap();
+        recompute_history_aggregates(&conn, &opts(10)).unwrap();
+
+        let (_, last_ts, last_author, primary) = file_churn_row(&conn, "a.rs");
+        assert_eq!(last_ts, Some(100));
+        assert_eq!(last_author, None);
+        assert_eq!(primary, None);
     }
 }

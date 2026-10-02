@@ -38,6 +38,7 @@ bm25_b = 0.75                # BM25 length-normalization strength
 [feedback]                    # Usage-feedback capture (default off)
 enabled = false               # Kill switch: no slates recorded, no feedback accepted
 slate_retention = 64          # Most recent slates kept per repo
+author_features = true        # Record author-derived slate features (last-touched-by, primary author)
 
 [embedding]
 provider = "bundled"          # Offline default; use "ollama" for the opt-in tier
@@ -171,7 +172,8 @@ reporting (which also takes a one-off `--threshold` override).
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `false` | Kill switch for usage-feedback capture. `false` records no slates and accepts no feedback; `true` also opts ranked search into the signal pipeline — the same implication as `--why` — because a legacy-path slate carries no signal contributions to learn from |
-| `slate_retention` | `64` | Most recent slates kept per repo; older slates are LRU-pruned in the same transaction as each insert. Must be at least `1`: `0` is a hard configuration error naming the key |
+| `slate_retention` | `64` | Most recent slates kept per repo; older slates LRU-pruned in the same transaction as each insert. Must be at least `1`: `0` is a hard configuration error naming the key |
+| `author_features` | `true` | Whether author-derived features (`last_touched_by`, `primary`) are recorded per slate member. `false` never builds the `author` group — no author data is written at all — and leaves every other recorded feature untouched |
 
 Usage-feedback capture (TASK-101): when enabled, every ranked search
 persists its slate — the full ranked result list, each entry carrying a
@@ -183,6 +185,36 @@ per field like every other (per-repo over global over default), and
 `slate_retention = 0` fails configuration load outright: no slate could
 survive for the feedback call to reference. Default off — a
 default-config search writes nothing and behaves byte-identically.
+
+Result feature extraction (TASK-105, DR-043): each recorded slate
+member also carries descriptive feature groups alongside its signal
+contributions — hierarchical path features (one per ancestor directory,
+plus path character, depth, and language), symbol attributes (kind,
+scoping, name-match shape, bucketed body size), match shape (category,
+term coverage, anchoring), graph position (bucketed fan-in/fan-out from
+the persisted topology), modification history (bucketed recency and
+churn, plus author facts), and, when a working-context hint was
+supplied, context-relative features (same file, same directory, same
+community, import-graph distance, co-change with the open file).
+Continuous properties are recorded as fixed buckets, never raw values,
+and per-slate categoricals beyond 32 distinct values collapse into a
+shared `__overflow__` bucket. The caller supplies the hint as
+`wonk search --context <PATH>` (CLI) or the optional `context_file`
+argument to `wonk_search` (MCP); it feeds features only and never
+affects ranking. Without a hint the context group is absent from the
+recorded slate, not defaulted.
+
+Author features exist behind their own switch because they deserve their
+own decision (AR-046). The DR-039 distinction: DR-039 excludes
+*assuming* authorship predicts relevance — baking an author-derived
+ranking signal in without evidence. These features are the opposite
+shape: explicit git-derived *evidence* recorded for learning, inert
+until TASK-102's minimum-observation gate lets this repository's own
+feedback produce a weight, inspectable with its supporting observation
+count, and individually switchable. Nothing is assumed until the
+feedback says so; a repository that does not want author data recorded
+at all sets `author_features = false` and the `author` group is never
+written.
 
 **`[embedding]`**
 
