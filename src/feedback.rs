@@ -273,17 +273,26 @@ pub fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
     Ok(())
 }
 
+/// A persisted slate: the token echoed to the caller plus the members,
+/// so the dispatch layer can stamp per-row `identity` fields without
+/// re-deriving identities.
+#[derive(Debug, Clone)]
+pub struct StoredSlate {
+    pub token: String,
+    pub members: Vec<SlateMember>,
+}
+
 /// Build the slate for `ranked` and persist it as one `feedback_slates`
 /// row, pruned to `retention`, in one transaction. Returns the echoed
-/// token. The caller gates this on `[feedback] enabled` AND the pipeline
-/// having run — a legacy-path slate carries no contributions to learn
-/// from.
+/// token with the members. The caller gates this on `[feedback] enabled`
+/// AND the pipeline having run — a legacy-path slate carries no
+/// contributions to learn from.
 pub fn build_and_store_slate(
     conn: &Connection,
     query: &str,
     ranked: &crate::rerank::RankedSearch,
     retention: usize,
-) -> Result<String> {
+) -> Result<StoredSlate> {
     let members = build_members(conn, ranked)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let query_class = ranked.query_class.map(|c| c.as_str().to_string());
@@ -321,7 +330,7 @@ pub fn build_and_store_slate(
     }
     prune_slates(&tx, retention)?;
     tx.commit()?;
-    Ok(token)
+    Ok(StoredSlate { token, members })
 }
 
 // ---------------------------------------------------------------------------
@@ -781,7 +790,9 @@ mod tests {
             // (1..6) and helper_inner (2..5); the smaller span owns it.
             vec![("nested.rs", 3, "        let doubled = x * 2;", 0.9)],
         )]);
-        let token = build_and_store_slate(&conn, "doubled", &ranked, 64).unwrap();
+        let token = build_and_store_slate(&conn, "doubled", &ranked, 64)
+            .unwrap()
+            .token;
         let (_, _, members_json) = slate_row(&conn, &token);
         let members: Vec<SlateMember> = serde_json::from_str(&members_json).unwrap();
         assert_eq!(members.len(), 1);
@@ -809,7 +820,9 @@ mod tests {
             // Line 1 (the comment) is outside every symbol span.
             vec![("outside.rs", 1, "// file-level note about tuning", 0.5)],
         )]);
-        let token = build_and_store_slate(&conn, "tuning", &ranked, 64).unwrap();
+        let token = build_and_store_slate(&conn, "tuning", &ranked, 64)
+            .unwrap()
+            .token;
         let (_, _, members_json) = slate_row(&conn, &token);
         let members: Vec<SlateMember> = serde_json::from_str(&members_json).unwrap();
         let m = &members[0];
@@ -838,7 +851,9 @@ mod tests {
                 ],
             ),
         ]);
-        let token = build_and_store_slate(&conn, "guard", &ranked, 64).unwrap();
+        let token = build_and_store_slate(&conn, "guard", &ranked, 64)
+            .unwrap()
+            .token;
         let (_, _, members_json) = slate_row(&conn, &token);
         let members: Vec<SlateMember> = serde_json::from_str(&members_json).unwrap();
         assert_eq!(
@@ -874,7 +889,9 @@ mod tests {
             crate::ranker::ResultCategory::Definition,
             vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
         )]);
-        let token = build_and_store_slate(&conn, "outer_guard", &ranked, 64).unwrap();
+        let token = build_and_store_slate(&conn, "outer_guard", &ranked, 64)
+            .unwrap()
+            .token;
         assert_eq!(token.len(), 16);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
         let (query, query_class, members_json) = slate_row(&conn, &token);
@@ -894,11 +911,17 @@ mod tests {
             crate::ranker::ResultCategory::Definition,
             vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
         )]);
-        let t1 = build_and_store_slate(&conn, "one", &ranked, 2).unwrap();
+        let t1 = build_and_store_slate(&conn, "one", &ranked, 2)
+            .unwrap()
+            .token;
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let t2 = build_and_store_slate(&conn, "two", &ranked, 2).unwrap();
+        let t2 = build_and_store_slate(&conn, "two", &ranked, 2)
+            .unwrap()
+            .token;
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let t3 = build_and_store_slate(&conn, "three", &ranked, 2).unwrap();
+        let t3 = build_and_store_slate(&conn, "three", &ranked, 2)
+            .unwrap()
+            .token;
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
             .unwrap();
@@ -950,8 +973,12 @@ mod tests {
             crate::ranker::ResultCategory::Definition,
             vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
         )]);
-        let a = build_and_store_slate(&conn, "q", &ranked, 64).unwrap();
-        let b = build_and_store_slate(&conn, "q", &ranked, 64).unwrap();
+        let a = build_and_store_slate(&conn, "q", &ranked, 64)
+            .unwrap()
+            .token;
+        let b = build_and_store_slate(&conn, "q", &ranked, 64)
+            .unwrap()
+            .token;
         assert_ne!(a, b, "same query back-to-back still mints distinct tokens");
         drop(dir);
     }
@@ -972,7 +999,9 @@ mod tests {
                 vec![("nested.rs", 6, "    helper_inner(a)", 0.7)],
             ),
         ]);
-        build_and_store_slate(conn, "guard", &ranked, 64).unwrap()
+        build_and_store_slate(conn, "guard", &ranked, 64)
+            .unwrap()
+            .token
     }
 
     #[derive(Debug)]

@@ -246,6 +246,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         source: Some(fr.source.to_string()),
                         why: None,
                         query_class: None,
+                        slate: None,
+                        identity: None,
                     };
                     if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
                         truncated += 1;
@@ -271,8 +273,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             config.topology.enabled,
                             config.duplicate.threshold,
                         )?;
-                        // --why opts into the pipeline for this invocation.
-                        settings.use_pipeline |= args.why;
+                        // --why opts into the pipeline for this invocation;
+                        // [feedback] enabled does too (the same
+                        // implication, config-consented — a legacy-path
+                        // slate carries no contributions to learn from).
+                        settings.use_pipeline |= args.why || config.feedback.enabled;
                         let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
@@ -286,6 +291,24 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             conn.as_ref(),
                             &ranked.near_duplicates,
                         );
+                        // Feedback slate capture (TASK-101): the same
+                        // best-effort contract — gated by [feedback]
+                        // enabled, a failure degrades with a warning.
+                        let stored_slate = record_slate_best_effort(
+                            conn.as_ref(),
+                            &args.pattern,
+                            &ranked,
+                            &config.feedback,
+                        );
+                        let identity_of = stored_slate
+                            .as_ref()
+                            .map(|s| {
+                                s.members
+                                    .iter()
+                                    .map(|m| ((m.file.clone(), m.line), m.identity.clone()))
+                                    .collect::<std::collections::HashMap<_, _>>()
+                            })
+                            .unwrap_or_default();
                         // One class line per query, before any why lines
                         // (DR-038): a misclassification is diagnosable from
                         // the breakdown it produced.
@@ -309,6 +332,19 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                 out.annotation = item.classified.annotation.clone();
                                 out.query_class =
                                     ranked.query_class.map(|c| c.as_str().to_string());
+                                if let Some(slate) = stored_slate.as_ref() {
+                                    out.slate = Some(slate.token.clone());
+                                    out.identity = identity_of
+                                        .get(&(
+                                            item.classified
+                                                .result
+                                                .file
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                            item.classified.result.line,
+                                        ))
+                                        .cloned();
+                                }
                                 if args.why {
                                     out.why = Some(crate::output::WhyOutput::from_contributions(
                                         item.score,
@@ -323,6 +359,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                     output::print_why_line(&out.file, out.line, why);
                                 }
                             }
+                        }
+                        // Text mode: one trailing machine-cuttable line
+                        // referencing the slate (JSON rows carry the
+                        // reference in their fields instead).
+                        if let Some(slate) = stored_slate.as_ref()
+                            && !format.is_structured()
+                        {
+                            writeln!(fmt.writer_mut(), "slate: {}", slate.token)?;
                         }
                     }
                     SearchMode::Plain => {
@@ -2498,6 +2542,39 @@ fn dispatch_contracts<W: io::Write>(
         fmt.format_contract(&out)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Feedback slate capture (TASK-101)
+// ---------------------------------------------------------------------------
+
+/// Record the feedback slate for a ranked search, best-effort (TASK-101,
+/// DR-042): gated on `[feedback] enabled`, so a default-config search
+/// writes nothing; a missing connection (grep fallback) is a no-op and a
+/// write failure degrades with a stderr warning, never failing the
+/// search — the `record_pairs_best_effort` contract at the same call
+/// site. Returns the stored slate so rows can carry its token and
+/// identities.
+pub(crate) fn record_slate_best_effort(
+    conn: Option<&Connection>,
+    query: &str,
+    ranked: &crate::rerank::RankedSearch,
+    feedback: &crate::config::FeedbackConfig,
+) -> Option<crate::feedback::StoredSlate> {
+    // Disabled capture records nothing, and a search whose signal
+    // pipeline did not run (`query_class` None, e.g. the legacy path)
+    // would carry no contributions to learn from.
+    if !feedback.enabled || ranked.query_class.is_none() {
+        return None;
+    }
+    let conn = conn?;
+    match crate::feedback::build_and_store_slate(conn, query, ranked, feedback.slate_retention) {
+        Ok(stored) => Some(stored),
+        Err(e) => {
+            eprintln!("warn: could not record feedback slate: {e:#}");
+            None
+        }
+    }
 }
 
 /// Handle `wonk duplicates` dispatch (TASK-100, PRD-DUP-REQ-006): resolve
@@ -6926,5 +7003,81 @@ mod tests {
         // silently.
         crate::shingles::record_pairs_best_effort(None, &pairs);
         crate::shingles::record_pairs_best_effort(Some(&conn), &[]);
+    }
+
+    // -- feedback slate capture on the search path (TASK-101) -------------------
+
+    /// A one-group ranked search over an indexed fixture file.
+    fn feedback_ranked(conn: &Connection) -> crate::rerank::RankedSearch {
+        crate::rerank::rank_and_explain_classed(
+            &[crate::search::SearchResult {
+                file: std::path::PathBuf::from("a.rs"),
+                line: 1,
+                col: 1,
+                content: "pub fn handle_user_created(".to_string(),
+            }],
+            Some(conn),
+            "handle_user_created",
+            &crate::rerank::RankSettings {
+                use_pipeline: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn feedback_config(enabled: bool) -> crate::config::FeedbackConfig {
+        crate::config::FeedbackConfig {
+            enabled,
+            slate_retention: 64,
+        }
+    }
+
+    fn slate_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM feedback_slates", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn record_slate_best_effort_records_when_enabled() {
+        let (dir, conn) = duplicates_conn();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, DUP_HANDLER).unwrap();
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+        // Reindexing opened its own connection; use a fresh one.
+        drop(conn);
+        let index = crate::db::find_existing_index(dir.path()).unwrap();
+        let conn = crate::db::open(&index).unwrap();
+
+        let ranked = feedback_ranked(&conn);
+        assert!(ranked.query_class.is_some(), "pipeline ran");
+
+        let stored = record_slate_best_effort(
+            Some(&conn),
+            "handle_user_created",
+            &ranked,
+            &feedback_config(true),
+        );
+        assert!(stored.is_some(), "enabled search records a slate");
+        let stored = stored.unwrap();
+        assert_eq!(stored.token.len(), 16);
+        assert!(!stored.members.is_empty());
+        assert_eq!(slate_count(&conn), 1);
+    }
+
+    #[test]
+    fn record_slate_best_effort_noop_when_disabled_or_connless() {
+        let (dir, conn) = duplicates_conn();
+        let ranked = feedback_ranked(&conn);
+
+        // Disabled (the default): nothing written, nothing returned.
+        assert!(
+            record_slate_best_effort(Some(&conn), "q", &ranked, &feedback_config(false)).is_none()
+        );
+        assert_eq!(slate_count(&conn), 0, "default config writes nothing");
+
+        // Enabled but no connection (grep fallback search): silent no-op.
+        assert!(record_slate_best_effort(None, "q", &ranked, &feedback_config(true)).is_none());
+        assert_eq!(slate_count(&conn), 0);
+        drop(dir);
     }
 }
