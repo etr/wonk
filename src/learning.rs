@@ -64,6 +64,16 @@ const SECS_PER_DAY: f64 = 86_400.0;
 /// The watermark row key: the highest `feedback_events.id` processed.
 const WATERMARK_KEY: &str = "event_watermark";
 
+/// TASK-104 preference constants — fixed bounds, not behavior knobs (the
+/// bucket-edges precedent): one step per NEW distinct confirming session,
+/// a strength ceiling at half the descriptive channel's full-value clamp
+/// (structurally below every learned channel under the one shared
+/// `feedback` weight), and the decay floor a swept row must fall under
+/// (≈6 half-lives unconfirmed).
+const PREFER_STEP: f32 = 0.1;
+const PREFER_STRENGTH_MAX: f32 = 0.5;
+const PREFER_RETIRE_FLOOR: f32 = 0.01;
+
 /// Tuned learning parameters (D3/D4), built from `[feedback]` plus the
 /// configured signal defaults.
 #[derive(Debug, Clone)]
@@ -80,6 +90,9 @@ pub struct LearnParams {
     pub min_observations: i64,
     /// Distinct sessions a row needs before it influences ranking.
     pub min_sessions: i64,
+    /// Distinct confirming sessions a single result needs before its
+    /// per-result preference activates (TASK-104, PRD-FB-REQ-016).
+    pub prefer_min_sessions: i64,
     /// Configured `[rank.weights]` entries — the DEFAULT a signal key
     /// learns around (absent signals default 0.0).
     signal_defaults: BTreeMap<String, f32>,
@@ -96,6 +109,7 @@ impl LearnParams {
             half_life_days: feedback.learn_half_life_days,
             min_observations: feedback.learn_min_observations,
             min_sessions: feedback.learn_min_sessions,
+            prefer_min_sessions: feedback.prefer_min_sessions,
             signal_defaults: weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         }
     }
@@ -366,6 +380,103 @@ fn apply_updates(
     Ok(())
 }
 
+/// Apply one qualifying event's per-result preference update (TASK-104,
+/// PRD-FB-REQ-016) inside the caller's transaction — the `apply_updates`
+/// pattern: the `INSERT OR IGNORE`'s affected-row count decides whether
+/// the session is NEW (step the strength, decayed since `updated_at`, and
+/// refresh the clock), and a same-session repeat moves `observations`
+/// only — no strength, no decay refresh: one session can neither activate
+/// nor sustain a preference (AR-036).
+fn apply_preference_update(
+    tx: &Connection,
+    event: &crate::feedback::FeedbackEvent,
+    params: &LearnParams,
+    now: i64,
+) -> Result<()> {
+    let session_key = event.session.as_deref().unwrap_or("");
+    let session_inserted = {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO result_preference_sessions \
+             (result_identity, session) VALUES (?1, ?2)",
+        )?;
+        stmt.execute(rusqlite::params![event.result_identity, session_key])? as i64
+    };
+    let current: Option<(f32, i64, i64, i64)> = {
+        let mut stmt = tx.prepare_cached(
+            "SELECT strength, observations, sessions, updated_at \
+             FROM result_preferences WHERE result_identity = ?1",
+        )?;
+        stmt.query_row([&event.result_identity], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?
+    };
+    let (strength, observations, sessions, updated_at) = current.unwrap_or((0.0, 0, 0, now));
+    let (strength, sessions, updated_at) = if session_inserted == 1 {
+        let decayed = decay_factor(updated_at, now, params.half_life_days) * strength + PREFER_STEP;
+        (decayed.clamp(0.0, PREFER_STRENGTH_MAX), sessions + 1, now)
+    } else {
+        (strength, sessions, updated_at)
+    };
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO result_preferences \
+         (result_identity, strength, observations, sessions, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(result_identity) DO UPDATE SET \
+             strength = excluded.strength, \
+             observations = excluded.observations, \
+             sessions = excluded.sessions, \
+             updated_at = excluded.updated_at",
+    )?;
+    stmt.execute(rusqlite::params![
+        event.result_identity,
+        strength,
+        observations + 1,
+        sessions,
+        updated_at
+    ])?;
+    Ok(())
+}
+
+/// Sweep retired preferences (TASK-104, PRD-FB-REQ-011's floor): delete
+/// `result_preferences` rows whose decayed strength fell below
+/// [`PREFER_RETIRE_FLOOR`] — ≈6 half-lives unconfirmed. Influence retires;
+/// the `result_preference_sessions` bookkeeping stands (it is evidence,
+/// and it keeps a swept preference from being cheaply re-activated by the
+/// same old sessions). Bounded table, interactive frequency.
+fn sweep_retired_preferences(conn: &Connection, params: &LearnParams, now: i64) -> Result<()> {
+    let mut stmt =
+        conn.prepare("SELECT result_identity, strength, updated_at FROM result_preferences")?;
+    let retired: Vec<String> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f32>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .filter(|(_identity, strength, updated_at)| {
+            decay_factor(*updated_at, now, params.half_life_days) * *strength < PREFER_RETIRE_FLOOR
+        })
+        .map(|(identity, _, _)| identity)
+        .collect();
+    drop(stmt);
+    if retired.is_empty() {
+        return Ok(());
+    }
+    let mut stmt =
+        conn.prepare_cached("DELETE FROM result_preferences WHERE result_identity = ?1")?;
+    for identity in retired {
+        stmt.execute([identity])?;
+    }
+    Ok(())
+}
+
 /// The learning watermark: the highest `feedback_events.id` processed.
 /// Zero when nothing has been learned yet.
 pub fn read_watermark(conn: &Connection) -> Result<i64> {
@@ -441,7 +552,7 @@ fn learn_pending_bounded(
     loop {
         let (frontier, events) = crate::feedback::load_learning_chunk(conn, watermark, chunk)?;
         if frontier <= watermark {
-            return Ok(());
+            break;
         }
         let tx = conn.unchecked_transaction()?;
         for event in &events {
@@ -450,6 +561,13 @@ fn learn_pending_bounded(
                 continue;
             }
             apply_updates(&tx, &params, &updates, event.session.as_deref(), now)?;
+            // The same qualifying stream feeds the per-result preference
+            // (TASK-104): an event qualifies for every consumer or none,
+            // and the SQL already excluded rank-1 picks and single-member
+            // slates (D4 — a preference that counted rank-1 confirmations
+            // would let its own promotion re-strengthen it from
+            // presentation alone; AR-036).
+            apply_preference_update(&tx, event, &params, now)?;
         }
         // Past EVERY id up to the frontier — skipped events included —
         // exactly the watermark an unchunked replay would write.
@@ -457,6 +575,10 @@ fn learn_pending_bounded(
         tx.commit()?;
         watermark = frontier;
     }
+    // Retire decayed-out preferences on every learn pass — bounded table,
+    // interactive frequency (the `prune_slates` precedent).
+    sweep_retired_preferences(conn, &params, now)?;
+    Ok(())
 }
 
 /// One learned-weights row with its supporting evidence, effective value
@@ -482,24 +604,41 @@ pub struct FeedbackEvidence {
 /// The gated learned rows loaded at one instant (D6): `load_learned`
 /// filters to rows that clear both gates AND differ from their default,
 /// so `None` means "ranking must behave exactly as feature-disabled"
-/// (PRD-FB-REQ-020).
+/// (PRD-FB-REQ-020). TASK-104 adds the gated per-result preferences to
+/// the same table: one more load-time influence channel, the same
+/// none-means-none contract.
 #[derive(Debug, Clone)]
 pub struct LearnedTable {
     rows: Vec<FeedbackEvidence>,
+    preferences: BTreeMap<String, f32>,
     loaded_at: i64,
 }
 
 impl LearnedTable {
-    /// Build a table from explicit rows — the in-crate test seam;
-    /// `load_learned` is the production path.
+    /// Build a table from explicit rows and preferences — the in-crate
+    /// test seam; `load_learned` is the production path.
     #[cfg(test)]
-    pub(crate) fn from_rows(rows: Vec<FeedbackEvidence>, loaded_at: i64) -> Self {
-        Self { rows, loaded_at }
+    pub(crate) fn from_rows(
+        rows: Vec<FeedbackEvidence>,
+        preferences: BTreeMap<String, f32>,
+        loaded_at: i64,
+    ) -> Self {
+        Self {
+            rows,
+            preferences,
+            loaded_at,
+        }
     }
 
     /// Every gated row, all scopes, `(feature, scope)`-ordered.
     pub fn evidence(&self) -> &[FeedbackEvidence] {
         &self.rows
+    }
+
+    /// The gated per-result preferences (TASK-104): identity → strength
+    /// decayed at `loaded_at`.
+    pub fn preferences(&self) -> &BTreeMap<String, f32> {
+        &self.preferences
     }
 
     /// The instant the effective values were computed at — the
@@ -510,11 +649,13 @@ impl LearnedTable {
 
     /// Resolve per query class (D6): a class-scoped gated row wins over
     /// the overall row; a feature with neither contributes nothing and
-    /// its default stands.
+    /// its default stands. Preferences copy through verbatim — a
+    /// per-result preference is class-independent knowledge (TASK-104).
     pub fn resolve(&self, class: crate::rerank::QueryClass) -> ResolvedFeedback {
         let class_name = class.as_str();
         let mut resolved = ResolvedFeedback {
             loaded_at: self.loaded_at,
+            preferences: self.preferences.clone(),
             ..ResolvedFeedback::default()
         };
         for pass in [class_name, ""] {
@@ -550,6 +691,11 @@ pub struct ResolvedFeedback {
     /// Flattened descriptive keys → learned weights (summed per result
     /// into the `feedback` signal's value).
     pub descriptive: BTreeMap<String, f32>,
+    /// Result identities → gated preference strengths (TASK-104,
+    /// PRD-FB-REQ-016) — class-independent, capped at half the
+    /// descriptive channel's full-value clamp under the same `feedback`
+    /// weight.
+    pub preferences: BTreeMap<String, f32>,
     /// The gated rows in effect for the resolved class, in
     /// `(feature, scope)` order.
     pub evidence: Vec<FeedbackEvidence>,
@@ -559,6 +705,9 @@ pub struct ResolvedFeedback {
 
 /// One raw `learned_weights` row as stored.
 type RawRow = (String, String, f32, i64, i64, i64);
+
+/// One raw `result_preferences` row as stored (TASK-104).
+type RawPreference = (String, f32, i64, i64, i64);
 
 /// Read every stored row in `(feature, query_class)` order. `Ok(None)`
 /// when the table is missing (pre-migration index) — silently, per the
@@ -592,6 +741,37 @@ fn read_raw_rows(conn: &Connection) -> Result<Option<Vec<RawRow>>> {
     Ok(Some(rows))
 }
 
+/// Read every stored preference row in identity order (TASK-104).
+/// `Ok(None)` when the table is missing (pre-104 index) — silently, per
+/// the best-effort contract.
+fn read_preference_rows(conn: &Connection) -> Result<Option<Vec<RawPreference>>> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'result_preferences')",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT result_identity, strength, observations, sessions, updated_at \
+         FROM result_preferences ORDER BY result_identity",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<RawPreference>>>()?;
+    Ok(Some(rows))
+}
+
 /// The read-side view of one stored row: the decayed, re-clamped
 /// effective value with its evidence and gate verdict.
 fn evidence_of(raw: RawRow, params: &LearnParams, now: i64) -> FeedbackEvidence {
@@ -616,12 +796,15 @@ fn evidence_of(raw: RawRow, params: &LearnParams, now: i64) -> FeedbackEvidence 
     }
 }
 
-/// Load the gated learned weights (D6): one SELECT over `learned_weights`,
-/// effective values decayed at `now` and re-clamped against the CURRENT
-/// defaults (the adversarial guarantee survives config edits). `Ok(None)`
-/// — deliberately, not an error — when the table is missing
-/// (pre-migration index), `[feedback]` is disabled, or nothing clears the
-/// gates: all three mean "no influence" (PRD-FB-REQ-020/025/026).
+/// Load the gated learned weights (D6): one SELECT over `learned_weights`
+/// plus one over `result_preferences` (TASK-104), effective values decayed
+/// at `now` and re-clamped against the CURRENT defaults (the adversarial
+/// guarantee survives config edits). A preference loads when its distinct
+/// confirming sessions clear `prefer_min_sessions` and its decayed
+/// strength stays above the retire floor. `Ok(None)` — deliberately, not
+/// an error — when the tables are missing (pre-migration index),
+/// `[feedback]` is disabled, or nothing clears the gates: all three mean
+/// "no influence" (PRD-FB-REQ-020/025/026).
 pub fn load_learned(
     conn: &Connection,
     feedback: &FeedbackConfig,
@@ -640,13 +823,35 @@ pub fn load_learned(
         .map(|row| evidence_of(row, &params, now))
         .filter(|row| row.gated)
         .collect();
-    if rows.is_empty() {
+    let preferences: BTreeMap<String, f32> = read_preference_rows(conn)?
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(
+            |(identity, strength, _observations, sessions, updated_at)| {
+                let effective = decay_factor(updated_at, now, params.half_life_days) * strength;
+                (sessions >= params.prefer_min_sessions && effective > PREFER_RETIRE_FLOOR)
+                    .then_some((identity, effective))
+            },
+        )
+        .collect();
+    if rows.is_empty() && preferences.is_empty() {
         return Ok(None);
     }
     Ok(Some(LearnedTable {
         rows,
+        preferences,
         loaded_at: now,
     }))
+}
+
+/// The number of stored `result_preferences` rows (TASK-104) — the
+/// `wonk status` count. A missing table reads 0 (the `event_store_stats`
+/// precedent).
+pub fn preference_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM result_preferences", [], |row| {
+        row.get(0)
+    })
+    .unwrap_or(0)
 }
 
 /// List EVERY learned row — gated and inert, all scopes — decayed at
@@ -675,16 +880,20 @@ pub fn list_learned(
 /// `learned_weight_sessions` bookkeeping goes WITH it — otherwise the
 /// `INSERT OR IGNORE` session counter would report "already exists"
 /// forever after and re-learning could never re-clear the
-/// `learn_min_sessions` gate. Event history and the learning watermark
-/// are untouched: recorded events stay processed, so the wiped weights
-/// are not silently re-taught by the past. Returns the number of
-/// `learned_weights` rows removed.
-pub fn reset_learned_weights(conn: &Connection) -> Result<usize> {
+/// `learn_min_sessions` gate. TASK-104's per-result preferences are
+/// learned state exactly like weights: both preference tables go in the
+/// same transaction, for the same re-counting reason. Event history and
+/// the learning watermark are untouched: recorded events stay processed,
+/// so the wiped state is not silently re-taught by the past. Returns the
+/// number of `learned_weights` and `result_preferences` rows removed.
+pub fn reset_learned_weights(conn: &Connection) -> Result<(usize, usize)> {
     let tx = conn.unchecked_transaction()?;
-    let removed = tx.execute("DELETE FROM learned_weights", [])?;
+    let weights = tx.execute("DELETE FROM learned_weights", [])?;
     tx.execute("DELETE FROM learned_weight_sessions", [])?;
+    let preferences = tx.execute("DELETE FROM result_preferences", [])?;
+    tx.execute("DELETE FROM result_preference_sessions", [])?;
     tx.commit()?;
-    Ok(removed)
+    Ok((weights, preferences))
 }
 
 /// Reset ONE feature (e.g. `path_character`), all of its scopes, to the
@@ -733,10 +942,13 @@ fn canonical_key(ctx: &crate::rerank::SharedContext, as_seen: &std::path::Path) 
     }
 }
 
-/// The descriptive application pass (D6, PRD-FB-REQ-014): one
-/// `feedback` contribution row per candidate with
-/// `value = clamp(Σ matched descriptive weights, −1, 1)`, joining the
-/// score BEFORE the sort — features are rank-independent, so there is
+/// The descriptive application pass (D6, PRD-FB-REQ-014): one `feedback`
+/// contribution row per candidate with
+/// `value = clamp(Σ matched descriptive weights, −1, 1)`, plus — when
+/// gated per-result preferences are live (TASK-104, PRD-FB-REQ-016) — a
+/// separate `preference` row per candidate with `value = matched
+/// strength or 0.0` under the SAME `feedback` weight, joining the score
+/// BEFORE the sort — features are rank-independent, so there is
 /// none of novelty's circularity. Extraction mirrors the slate build
 /// exactly (canonical files, bulk-loaded owning symbols, groups over
 /// the shared context, cardinality cap included), so the keys a
@@ -786,33 +998,65 @@ pub(crate) fn apply_feedback_contribution(
     };
 
     let mut extracted = Vec::with_capacity(scored.len());
+    let mut identities = Vec::with_capacity(scored.len());
     for (item, canonical) in scored.iter().zip(&canonicals) {
         let rows = symbols.get(canonical).map(Vec::as_slice).unwrap_or(&[]);
+        let owning = crate::feedback::owning_symbol(rows, item.classified.result.line);
         extracted.push(crate::feedback::extract_groups(
-            item,
-            crate::feedback::owning_symbol(rows, item.classified.result.line),
+            item, owning, canonical, &inputs,
+        ));
+        // The candidate's stable identity via the SAME helper the slate
+        // build records with (`feedback::identity_of`) — the two sides
+        // cannot drift. A materially changed result yields a different
+        // identity, so a stale preference can never re-attach
+        // (PRD-FB-REQ-006 — retirement resolved at match time, never a
+        // write).
+        identities.push(crate::feedback::identity_of(
+            owning,
             canonical,
-            &inputs,
+            &item.classified.category,
+            &item.classified.result.content,
         ));
     }
     crate::feedback::apply_cardinality_cap(&mut extracted);
 
-    for (item, groups) in scored.iter_mut().zip(&extracted) {
-        let mut value = 0.0f32;
-        for key in flatten_keys(groups) {
-            if let Some(learned) = resolved.descriptive.get(&key) {
-                value += learned;
+    // TASK-104: the descriptive `feedback` row only appears when the
+    // descriptive map is live (TASK-102's zero-row shape preserved); the
+    // `preference` row only when preferences are — one row per candidate
+    // per active channel, `value = matched strength or 0.0`, riding the
+    // SAME `feedback` weight so the 0.5-vs-1.0 value clamps keep the
+    // preference structurally below every learned channel.
+    let descriptive_live = !resolved.descriptive.is_empty();
+    let preferences_live = !resolved.preferences.is_empty();
+    for ((item, groups), identity) in scored.iter_mut().zip(&extracted).zip(&identities) {
+        if descriptive_live {
+            let mut value = 0.0f32;
+            for key in flatten_keys(groups) {
+                if let Some(learned) = resolved.descriptive.get(&key) {
+                    value += learned;
+                }
             }
+            let value = value.clamp(-1.0, 1.0);
+            let weighted = value * weight;
+            item.score += weighted;
+            item.contributions.push(crate::rerank::Contribution {
+                signal: "feedback",
+                value,
+                weight,
+                weighted,
+            });
         }
-        let value = value.clamp(-1.0, 1.0);
-        let weighted = value * weight;
-        item.score += weighted;
-        item.contributions.push(crate::rerank::Contribution {
-            signal: "feedback",
-            value,
-            weight,
-            weighted,
-        });
+        if preferences_live {
+            let value = resolved.preferences.get(identity).copied().unwrap_or(0.0);
+            let weighted = value * weight;
+            item.score += weighted;
+            item.contributions.push(crate::rerank::Contribution {
+                signal: "preference",
+                value,
+                weight,
+                weighted,
+            });
+        }
     }
 
     // The prepared bundle for the slate build: capped groups keyed
@@ -1478,6 +1722,241 @@ mod tests {
         assert_eq!(learned_rows(&build()), learned_rows(&build()));
     }
 
+    // -- TASK-104: per-result preferences (learn side) --------------------------
+    //
+    // One row per confirmed result identity, grown one step per NEW
+    // distinct session, decayed on the same half-life, retired below a
+    // floor by a sweep. The qualifying stream is the same one the weight
+    // learner consumes (rank-1 and single-member slates excluded).
+
+    /// Seed one two-member qualifying event whose useful member carries
+    /// `identity` (rank 2, one alternative — the qualifying shape).
+    fn insert_confirming_event(conn: &Connection, id: i64, identity: &str, session: &str) {
+        let mut useful = member(2, true, groups_with_signals(&[("path_character", 1.0)]));
+        useful.identity = identity.to_string();
+        let alt = member(1, false, groups_with_signals(&[("path_character", 0.2)]));
+        conn.execute(
+            "INSERT INTO feedback_events \
+             (id, result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+             VALUES (?1, ?2, NULL, 2, ?3, 1, ?4, ?5)",
+            rusqlite::params![
+                id,
+                identity,
+                serde_json::to_string(&SlateFeatures {
+                    schema: 1,
+                    slate: format!("p{id}"),
+                    members: vec![alt, useful],
+                })
+                .unwrap(),
+                session,
+                id * 1000
+            ],
+        )
+        .unwrap();
+    }
+
+    /// One stored preference row: (strength, observations, sessions,
+    /// updated_at).
+    fn preference_row(conn: &Connection, identity: &str) -> Option<(f32, i64, i64, i64)> {
+        conn.query_row(
+            "SELECT strength, observations, sessions, updated_at \
+             FROM result_preferences WHERE result_identity = ?1",
+            [identity],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+        .unwrap()
+    }
+
+    /// Seed one preference row (plus its session bookkeeping) directly —
+    /// the decay/sweep fixtures.
+    fn seed_preference(
+        conn: &Connection,
+        identity: &str,
+        strength: f32,
+        observations: i64,
+        sessions: i64,
+        updated_at: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO result_preferences \
+             (result_identity, strength, observations, sessions, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![identity, strength, observations, sessions, updated_at],
+        )
+        .unwrap();
+        for n in 0..sessions {
+            conn.execute(
+                "INSERT OR IGNORE INTO result_preference_sessions \
+                 (result_identity, session) VALUES (?1, ?2)",
+                rusqlite::params![identity, format!("seed{n}")],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn first_qualifying_event_creates_the_preference_row() {
+        let conn = learning_conn();
+        insert_confirming_event(&conn, 1, "res-1", "s1");
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        assert_eq!(
+            preference_row(&conn, "res-1"),
+            Some((PREFER_STEP, 1, 1, 1000)),
+            "one step, one session, one observation, updated now"
+        );
+    }
+
+    #[test]
+    fn each_new_distinct_session_steps_and_saturates_at_the_cap() {
+        let conn = learning_conn();
+        for id in 1..=7 {
+            insert_confirming_event(&conn, id, "res-1", &format!("s{id}"));
+        }
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        // 7 steps × 0.1 = 0.7 → clamped at 0.5 (five confirming sessions
+        // saturate; AR-036's cap under adversarial confirmation).
+        assert_eq!(
+            preference_row(&conn, "res-1"),
+            Some((PREFER_STRENGTH_MAX, 7, 7, 1000))
+        );
+    }
+
+    #[test]
+    fn same_session_repeat_moves_observations_only() {
+        let conn = learning_conn();
+        insert_confirming_event(&conn, 1, "res-1", "s1");
+        insert_confirming_event(&conn, 2, "res-1", "s1");
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let before = preference_row(&conn, "res-1").unwrap();
+
+        // A later same-session repeat: no strength, no decay refresh, no
+        // session growth — one session can neither activate nor sustain.
+        insert_confirming_event(&conn, 3, "res-1", "s1");
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000 + 999_999).unwrap();
+        let after = preference_row(&conn, "res-1").unwrap();
+        assert_eq!(after.0, before.0, "strength byte-identical");
+        assert_eq!(after.2, before.2, "sessions byte-identical");
+        assert_eq!(after.3, before.3, "updated_at byte-identical");
+        assert_eq!(after.1, before.1 + 1, "observations grow");
+    }
+
+    #[test]
+    fn interleaved_sessions_count_distinctly_for_preferences() {
+        let conn = learning_conn();
+        insert_confirming_event(&conn, 1, "res-1", "A");
+        insert_confirming_event(&conn, 2, "res-1", "B");
+        insert_confirming_event(&conn, 3, "res-1", "A");
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        assert_eq!(
+            preference_row(&conn, "res-1"),
+            Some((2.0 * PREFER_STEP, 3, 2, 1000)),
+            "A,B,A → two distinct sessions, two steps"
+        );
+    }
+
+    #[test]
+    fn preference_decays_between_new_sessions() {
+        let conn = learning_conn();
+        // A stored 0.4 one half-life old: decay to 0.2, one new session
+        // steps to 0.3 (OQ-019's decay-then-step-then-clamp, advantage +1).
+        seed_preference(&conn, "res-1", 0.4, 4, 4, 1000);
+        insert_confirming_event(&conn, 1, "res-1", "s9");
+        learn_pending(
+            &conn,
+            &enabled_config(),
+            &default_weights(),
+            1000 + 30 * 86_400,
+        )
+        .unwrap();
+        let (strength, observations, sessions, _) = preference_row(&conn, "res-1").unwrap();
+        assert!(
+            (strength - 0.3).abs() < 1e-6,
+            "0.4 decayed one half-life then stepped: {strength}"
+        );
+        assert_eq!(observations, 5);
+        assert_eq!(sessions, 5);
+    }
+
+    #[test]
+    fn preference_sweep_retires_rows_below_the_floor() {
+        let conn = learning_conn();
+        // Fresh enough to survive; and one a year stale — decayed to
+        // ~0.4·2^-12, far below the floor.
+        seed_preference(&conn, "live", 0.3, 3, 3, 1000);
+        seed_preference(&conn, "stale", 0.4, 3, 3, 1000);
+        conn.execute(
+            "UPDATE result_preferences SET updated_at = ?1 WHERE result_identity = 'stale'",
+            [1000 - 365 * 86_400],
+        )
+        .unwrap();
+
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        assert!(
+            preference_row(&conn, "live").is_some(),
+            "a preference above the floor survives the sweep"
+        );
+        assert!(
+            preference_row(&conn, "stale").is_none(),
+            "a decayed-below-floor preference is swept"
+        );
+        let bookkeeping: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM result_preference_sessions \
+                 WHERE result_identity = 'stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bookkeeping, 3,
+            "the sweep retires influence, not the session evidence"
+        );
+    }
+
+    #[test]
+    fn preference_strength_cap_is_structurally_below_the_learned_clamps() {
+        // The descriptive channel clamps at ±1.0 × the feedback weight;
+        // the preference at PREFER_STRENGTH_MAX × the same weight — one
+        // shared knob, strictly below under every configuration. The
+        // const item checks the bound at compile time; the loop pins it
+        // against the running constants at test time.
+        const CAP_BELOW_FULL_CLAMP: () = assert!(PREFER_STRENGTH_MAX < 1.0);
+        let () = CAP_BELOW_FULL_CLAMP;
+        for feedback_weight in [0.35f32, 1.0, 2.0] {
+            assert!(
+                PREFER_STRENGTH_MAX * feedback_weight < 1.0 * feedback_weight,
+                "cap holds at every feedback weight"
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_replay_reaches_the_one_shot_preference_state() {
+        let build = |chunk: i64| {
+            let conn = learning_conn();
+            for id in 1..=9 {
+                insert_confirming_event(&conn, id, &format!("res-{}", id % 3), &format!("s{id}"));
+            }
+            learn_pending_bounded(&conn, &enabled_config(), &default_weights(), 5000, chunk)
+                .unwrap();
+            conn
+        };
+        let one_shot = build(1_000);
+        let chunked = build(2);
+        for identity in ["res-0", "res-1", "res-2"] {
+            assert_eq!(
+                preference_row(&one_shot, identity),
+                preference_row(&chunked, identity),
+                "identical preference end-state across chunk boundaries: {identity}"
+            );
+        }
+    }
+
     #[test]
     fn skip_rule_events_are_filtered_before_their_features_are_parsed() {
         let conn = learning_conn();
@@ -1663,6 +2142,125 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // -- TASK-104: per-result preferences (load side) ---------------------------
+
+    #[test]
+    fn load_learned_gates_preferences_on_distinct_sessions() {
+        let conn = learning_conn();
+        // Below the default gate (2 sessions < 3): excluded entirely.
+        seed_preference(&conn, "below", 0.2, 2, 2, 1000);
+        let table = load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        assert!(
+            table
+                .as_ref()
+                .is_none_or(|t| !t.preferences().contains_key("below")),
+            "a below-gate preference must not surface: {:?}",
+            table.as_ref().map(|t| t.preferences().clone())
+        );
+
+        // At the gate (3 sessions): included, at its undecayed strength.
+        seed_preference(&conn, "at-gate", 0.3, 3, 3, 1000);
+        let table = load_learned(&conn, &enabled_config(), &default_weights(), 1000)
+            .unwrap()
+            .expect("a gated preference surfaces the table");
+        assert_eq!(table.preferences().get("at-gate"), Some(&0.3));
+    }
+
+    #[test]
+    fn load_learned_serves_a_preferences_only_table() {
+        let conn = learning_conn();
+        // No gated weight rows at all — the preference alone is state
+        // worth loading (PRD-FB-REQ-020's converse: present state means
+        // influence).
+        seed_preference(&conn, "res-1", 0.3, 3, 3, 1000);
+        let table = load_learned(&conn, &enabled_config(), &default_weights(), 1000)
+            .unwrap()
+            .expect("a gated preference alone surfaces the table");
+        assert!(table.evidence().is_empty(), "no weight rows");
+        assert_eq!(table.preferences().len(), 1);
+    }
+
+    #[test]
+    fn load_learned_decays_preferences_with_now() {
+        let conn = learning_conn();
+        seed_preference(&conn, "res-1", 0.4, 3, 3, 1000);
+        let table = load_learned(
+            &conn,
+            &enabled_config(),
+            &default_weights(),
+            1000 + 30 * 86_400,
+        )
+        .unwrap()
+        .expect("one half-life old is still above the floor");
+        let effective = *table.preferences().get("res-1").unwrap();
+        assert!(
+            (effective - 0.2).abs() < 1e-6,
+            "one half-life halves the strength: {effective}"
+        );
+    }
+
+    #[test]
+    fn load_learned_excludes_preferences_below_the_retire_floor() {
+        let conn = learning_conn();
+        // A year stale: 0.4·2^-12 ≈ 0.0001 — below the floor, invisible
+        // until the sweep collects it.
+        seed_preference(&conn, "ancient", 0.4, 3, 3, 1000 - 365 * 86_400);
+        assert!(
+            load_learned(&conn, &enabled_config(), &default_weights(), 1000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn load_learned_missing_preference_tables_stay_silent() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::ensure_feedback_tables(&conn).unwrap();
+        // A pre-TASK-104 index shape: the weight tables exist, the
+        // preference tables do not.
+        conn.execute_batch(
+            "DROP TABLE result_preferences;
+             DROP TABLE result_preference_sessions;",
+        )
+        .unwrap();
+        seed_learned_row(&conn, "path_character", 0.55, 40, 9, 1000);
+        let table = load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        assert!(
+            table.as_ref().is_none_or(|t| t.preferences().is_empty()),
+            "missing preference tables degrade silently"
+        );
+        assert_eq!(preference_count(&conn), 0, "count reads 0, not an error");
+    }
+
+    #[test]
+    fn resolve_passes_preferences_through_for_every_class() {
+        let conn = learning_conn();
+        seed_preference(&conn, "res-1", 0.3, 3, 3, 1000);
+        let table = load_learned(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let table = table.unwrap();
+        for class in [
+            crate::rerank::QueryClass::Symbol,
+            crate::rerank::QueryClass::Path,
+            crate::rerank::QueryClass::Signature,
+            crate::rerank::QueryClass::Conceptual,
+        ] {
+            assert_eq!(
+                table.resolve(class).preferences.get("res-1"),
+                Some(&0.3),
+                "a per-result preference is class-independent: {class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preference_count_reads_the_table() {
+        let conn = learning_conn();
+        assert_eq!(preference_count(&conn), 0);
+        seed_preference(&conn, "res-1", 0.3, 3, 3, 1000);
+        seed_preference(&conn, "res-2", 0.2, 2, 2, 1000);
+        assert_eq!(preference_count(&conn), 2);
     }
 
     #[test]
@@ -1884,16 +2482,32 @@ mod tests {
         assert_eq!(learned_rows(&conn).len(), 2, "overall + symbol scopes");
         let watermark = read_watermark(&conn).unwrap();
         assert_eq!(watermark, 2);
+        assert_eq!(
+            preference_row(&conn, "id2"),
+            Some((2.0 * PREFER_STEP, 2, 2, 1000)),
+            "the events also grew a preference for their useful result"
+        );
 
-        let removed = reset_learned_weights(&conn).unwrap();
-        assert_eq!(removed, 2, "one per learned_weights row");
+        let (weights_removed, preferences_removed) = reset_learned_weights(&conn).unwrap();
+        assert_eq!(weights_removed, 2, "one per learned_weights row");
+        assert_eq!(preferences_removed, 1, "one per result_preferences row");
         assert!(learned_rows(&conn).is_empty(), "weights wiped");
+        assert!(
+            preference_row(&conn, "id2").is_none(),
+            "preferences wiped with them"
+        );
         let session_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM learned_weight_sessions", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(session_rows, 0, "session bookkeeping wiped with them");
+        let preference_sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM result_preference_sessions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(preference_sessions, 0, "preference bookkeeping wiped too");
         let events: i64 = conn
             .query_row("SELECT COUNT(*) FROM feedback_events", [], |r| r.get(0))
             .unwrap();
@@ -1902,6 +2516,25 @@ mod tests {
             read_watermark(&conn).unwrap(),
             watermark,
             "events stay processed — no silent re-teach"
+        );
+    }
+
+    #[test]
+    fn relearning_after_reset_recounts_preference_sessions_from_zero() {
+        let conn = learning_conn();
+        seed_preference(&conn, "res-1", 0.3, 3, 3, 1000);
+        reset_learned_weights(&conn).unwrap();
+
+        // An event from a PREVIOUSLY SEEN session must count as a new one:
+        // this is the trap the bookkeeping wipe defuses (INSERT OR IGNORE
+        // would keep reporting "already exists" forever after, and the
+        // preference could never re-clear its gate).
+        insert_confirming_event(&conn, 1, "res-1", "seed0");
+        learn_pending(&conn, &enabled_config(), &default_weights(), 2000).unwrap();
+        assert_eq!(
+            preference_row(&conn, "res-1"),
+            Some((PREFER_STEP, 1, 1, 2000)),
+            "sessions recount from zero after the reset"
         );
     }
 

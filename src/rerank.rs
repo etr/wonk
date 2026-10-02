@@ -2780,9 +2780,9 @@ fn rerank_core(
     }
     let feedback_weight = weights.weight("feedback");
     let feedback_pass = feedback_weight != 0.0
-        && extras
-            .learned
-            .is_some_and(|learned| !learned.descriptive.is_empty())
+        && extras.learned.is_some_and(|learned| {
+            !learned.descriptive.is_empty() || !learned.preferences.is_empty()
+        })
         && conn.is_some();
     if feedback_pass {
         // The descriptive pass extracts over the same widened slices the
@@ -7932,7 +7932,7 @@ proximity, signature, churn, co_change, hub, authority, community",
     }
 
     fn learned_of(rows: Vec<FeedbackEvidence>) -> LearnedTable {
-        LearnedTable::from_rows(rows, 1000)
+        LearnedTable::from_rows(rows, std::collections::BTreeMap::new(), 1000)
     }
 
     /// One result's comparison key: (file, line, score bits, contribution
@@ -8101,6 +8101,221 @@ proximity, signature, churn, co_change, hub, authority, community",
         let zeroed = rank_and_explain_classed(&results, Some(&conn), "my_func", &zero);
         let disabled = rank_and_explain_classed(&results, Some(&conn), "my_func", &none);
         assert_eq!(ranked_bits(&zeroed), ranked_bits(&disabled));
+    }
+
+    // -- TASK-104: the per-result preference layer -----------------------------
+
+    use std::collections::BTreeMap;
+
+    /// A preferences-only learned table (no weight rows).
+    fn preferences_of(map: &[(&str, f32)]) -> LearnedTable {
+        LearnedTable::from_rows(
+            Vec::new(),
+            map.iter()
+                .map(|(identity, strength)| (identity.to_string(), *strength))
+                .collect::<BTreeMap<String, f32>>(),
+            1000,
+        )
+    }
+
+    /// The fixture's twin results: a Definition with an owning symbol and
+    /// a line-anchored Other — the identity shapes the pass must match.
+    fn preference_fixture_results() -> Vec<crate::search::SearchResult> {
+        vec![
+            crate::search::SearchResult {
+                file: std::path::PathBuf::from("src/main.rs"),
+                line: 10,
+                col: 0,
+                content: "fn my_func() {}".to_string(),
+            },
+            crate::search::SearchResult {
+                file: std::path::PathBuf::from("tools/parse.py"),
+                line: 1,
+                col: 0,
+                content: "def my_func():".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn preferences_only_table_activates_the_pass_and_reorders() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = preference_fixture_results();
+        let tools_id = crate::feedback::line_identity("tools/parse.py", "other", "def my_func():");
+        let settings = |learned: Option<LearnedTable>| RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 0.4), ("feedback", 1.0)]),
+            learned,
+            ..RankSettings::default()
+        };
+
+        // Pre-preference: the Definition's kind lead keeps src/main.rs's
+        // score ahead. With a saturated preference the line-anchored twin
+        // overtakes in score (0.5 × 1.0 > the 0.24 kind gap) — the
+        // display tiers stay structural, scores are where the preference
+        // lives.
+        let plain = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings(None));
+        let score_of = |ranked: &RankedSearch, suffix: &str| {
+            ranked
+                .groups
+                .iter()
+                .flat_map(|(_, g)| g.iter())
+                .find(|s| s.classified.result.file.ends_with(suffix))
+                .unwrap()
+                .score
+        };
+        assert!(
+            score_of(&plain, "src/main.rs") > score_of(&plain, "tools/parse.py"),
+            "without preferences the Definition scores ahead"
+        );
+
+        let preferred = rank_and_explain_classed(
+            &results,
+            Some(&conn),
+            "my_func",
+            &settings(Some(preferences_of(&[(&tools_id, 0.5)]))),
+        );
+        assert!(
+            score_of(&preferred, "tools/parse.py") > score_of(&preferred, "src/main.rs"),
+            "the preferred candidate overtakes in score"
+        );
+        let tools = preferred
+            .groups
+            .iter()
+            .flat_map(|(_, g)| g.iter())
+            .find(|s| s.classified.result.file.ends_with("tools/parse.py"))
+            .unwrap();
+        let preference = tools
+            .contributions
+            .iter()
+            .find(|c| c.signal == "preference")
+            .expect("the pass appends a preference row per candidate");
+        assert_eq!(preference.value, 0.5);
+        assert_eq!(preference.weight, 1.0);
+        assert!((preference.weighted - 0.5 * 1.0).abs() < 1e-6);
+        // The unmatched candidate carries the uniform zero row.
+        let src = preferred
+            .groups
+            .iter()
+            .flat_map(|(_, g)| g.iter())
+            .find(|s| s.classified.result.file.ends_with("src/main.rs"))
+            .unwrap();
+        let zero = src
+            .contributions
+            .iter()
+            .find(|c| c.signal == "preference")
+            .expect("one row per candidate, matched or not");
+        assert_eq!(zero.value, 0.0);
+    }
+
+    #[test]
+    fn preference_rows_appear_without_a_feedback_row_when_descriptive_is_empty() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = preference_fixture_results();
+        let tools_id = crate::feedback::line_identity("tools/parse.py", "other", "def my_func():");
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 0.4), ("feedback", 1.0)]),
+            learned: Some(preferences_of(&[(&tools_id, 0.3)])),
+            ..RankSettings::default()
+        };
+        let ranked = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
+        for scored in ranked.groups.iter().flat_map(|(_, g)| g.iter()) {
+            assert!(
+                scored.contributions.iter().all(|c| c.signal != "feedback"),
+                "no zero-value feedback rows when only preferences exist"
+            );
+            assert!(
+                scored
+                    .contributions
+                    .iter()
+                    .any(|c| c.signal == "preference"),
+                "every candidate carries a preference row"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_anchored_candidates_match_by_their_result_identity() {
+        // src/main.rs:10 is owned by the my_func symbol row: its identity
+        // is the symbol-anchored one the slate build records, and the
+        // preference lands on it (the pass computes identity exactly as
+        // build_members does).
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = preference_fixture_results();
+        let src_id = crate::feedback::result_identity("src/main.rs", "function", "my_func", "");
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 0.4), ("feedback", 1.0)]),
+            learned: Some(preferences_of(&[(&src_id, 0.5)])),
+            ..RankSettings::default()
+        };
+        let ranked = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
+        let src = ranked
+            .groups
+            .iter()
+            .flat_map(|(_, g)| g.iter())
+            .find(|s| s.classified.result.file.ends_with("src/main.rs"))
+            .unwrap();
+        let preference = src
+            .contributions
+            .iter()
+            .find(|c| c.signal == "preference")
+            .unwrap();
+        assert_eq!(
+            preference.value, 0.5,
+            "the symbol-anchored identity matched"
+        );
+    }
+
+    #[test]
+    fn an_empty_preferences_map_leaves_scores_bit_identical() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = preference_fixture_results();
+        let with = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("feedback", 0.35)]),
+            learned: Some(preferences_of(&[])),
+            ..RankSettings::default()
+        };
+        let without = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0)]),
+            ..RankSettings::default()
+        };
+        let a = rank_and_explain_classed(&results, Some(&conn), "my_func", &with);
+        let b = rank_and_explain_classed(&results, Some(&conn), "my_func", &without);
+        assert_eq!(ranked_bits(&a), ranked_bits(&b));
+    }
+
+    #[test]
+    fn feedback_free_strips_an_attached_preferences_table() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = preference_fixture_results();
+        let tools_id = crate::feedback::line_identity("tools/parse.py", "other", "def my_func():");
+        let base_settings = |learned: Option<LearnedTable>, feedback_free: bool| RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 0.4), ("feedback", 1.0)]),
+            learned,
+            feedback_free,
+            ..RankSettings::default()
+        };
+        let none = base_settings(None, false);
+        let attached = base_settings(Some(preferences_of(&[(&tools_id, 0.5)])), false);
+        let stripped = base_settings(Some(preferences_of(&[(&tools_id, 0.5)])), true);
+        let expected = rank_and_explain_classed(&results, Some(&conn), "my_func", &none);
+        let live = rank_and_explain_classed(&results, Some(&conn), "my_func", &attached);
+        let free = rank_and_explain_classed(&results, Some(&conn), "my_func", &stripped);
+        assert_eq!(
+            ranked_bits(&free),
+            ranked_bits(&expected),
+            "feedback_free strips the preference channel exactly"
+        );
+        assert_ne!(
+            ranked_bits(&live),
+            ranked_bits(&expected),
+            "the attached preference must still act when the flag is off"
+        );
     }
 
     // -- TASK-103: the feedback-free seam ---------------------------------------

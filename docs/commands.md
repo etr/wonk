@@ -33,10 +33,10 @@ wonk search "render" -- src/components/
 | `--raw` | Skip ranking, deduplication, and category headers |
 | `--smart` | Force smart ranking even if pattern does not match known symbols |
 | `--semantic` | Blend structural results with embedding-based semantic results (RRF fusion) |
-| `--why` | Explain each result's ranking: per-signal contributions and the final score. Implies smart ranked mode through the signal pipeline; conflicts with `--raw` and `--semantic`. The breakdown is printed to stderr (one `why:` line per result, so stdout stays pipe-clean) and embedded as a `why` object per row in `--format json` |
+| `--why` | Explain each result's ranking: per-signal contributions and the final score. Implies smart ranked mode through the signal pipeline; conflicts with `--raw` and `--semantic`. The breakdown is printed to stderr (one `why:` line per result, so stdout stays pipe-clean) and embedded as a `why` object per row in `--format json`. Feedback state renders as its own contributions: `feedback` (learned descriptive weights) and `preference` (the session-gated per-result bonus, TASK-104), each `value*weight=weighted` |
 | `--query-class <class>` | Pin the query class (`symbol`, `path`, `signature`, `conceptual`), bypassing detection for this invocation. Implies smart ranked mode; conflicts with `--raw` and `--semantic`. The class scales the lexical/semantic blend (see `[rank] class_multipliers`) |
 | `--context <PATH>` | The file you are currently working in. Feeds the context-relative features of the recorded feedback slate (same file, same directory, same community, import distance, co-change) when `[feedback]` is enabled; never affects ranking. Absent by default — the context features are absent rather than defaulted |
-| `--no-feedback` | Ignore learned feedback weights for this search: ranking reproduces the index alone exactly (TASK-103, PRD-FB-REQ-017). Slates still record — capture is not influence — so feedback can still be reported against the reproducible ranking. The `learned:` `--why` line does not print |
+| `--no-feedback` | Ignore learned feedback state — weights and per-result preferences — for this search: ranking reproduces the index alone exactly (TASK-103, PRD-FB-REQ-017). Slates still record — capture is not influence — so feedback can still be reported against the reproducible ranking. The `learned:` `--why` line does not print |
 | `-- <paths>` | Restrict search to specific paths |
 
 When `[feedback] enabled = true` (default off, see
@@ -569,9 +569,9 @@ rank 2  src/api.rs:42  handle_request  [useful]
 | `--weights` | List the learned weights instead of recording: every `learned_weights` row — gated and inert — with its default, observation count, and session count. Mutually exclusive with the three recording flags |
 | `--list` | List the recorded feedback events instead of recording: one line per event (`#id rank N file:line symbol session S class C`, with `[retired]` when the identity no longer resolves). `--format json` emits the event summaries as objects |
 | `--export` | Dump the complete event store — features payloads included — as one JSON array to stdout (`wonk feedback --export > events.json` to save). Round-trips the store verbatim |
-| `--clear-events` | Wipe EVERY recorded feedback event. Learned weights are untouched — clearing history and resetting weights are independent operations (PRD-FB-REQ-013) |
-| `--clear-result <IDENTITY>` | Wipe one result's recorded events by its 64-hex identity. Learned weights are untouched |
-| `--reset-weights` | Reset ALL learned weights to their configured defaults (every scope). The event history is untouched: recorded events stay processed and never silently re-teach the wiped weights |
+| `--clear-events` | Wipe EVERY recorded feedback event. Learned state — weights and per-result preferences — is untouched: clearing history and resetting weights are independent operations (PRD-FB-REQ-013) |
+| `--clear-result <IDENTITY>` | Wipe one result's recorded events by its 64-hex identity. Learned state — weights, and that result's preference — is untouched (the per-result kill is `--reset-weights`) |
+| `--reset-weights` | Reset ALL learned weights to their configured defaults (every scope) and clear every per-result preference — both are learned state and reset together (TASK-104). The event history is untouched: recorded events stay processed and never silently re-teach the wiped state |
 | `--reset-weight <FEATURE>` | Reset ONE feature's learned weights to defaults (e.g. `path_character`), all of its scopes; sibling features and the event history stand |
 
 All three recording flags are required together (or none, with one of
@@ -607,6 +607,16 @@ as objects (`feature`, `query_class`, `effective`, `default`,
 `observations`, `sessions`, `gated`). Under `--why`, a live search also
 prints a `learned:` line to stderr naming the gated weights in effect
 for that query's class.
+
+The same events also grow session-gated per-result preferences
+(TASK-104, PRD-FB-REQ-016): a result confirmed useful across
+`prefer_min_sessions` distinct sessions (default 3) gains an additive
+preference shown as its own `preference` contribution in `--why` —
+distinct from the `feedback` row the learned weights produce — capped at
+half that channel's swing, decaying on the same half-life, and never
+counting rank-1 picks or same-session repeats. A materially changed
+result yields a new identity, so its stored preference stops applying
+without any write.
 Recording requires `[feedback] enabled = true` in `.wonk/config.toml`
 (otherwise the command fails with `feedback capture is disabled; set
 [feedback] enabled = true in .wonk/config.toml`) and an existing index
@@ -701,11 +711,12 @@ reports reachability and, when unreachable with Ollama configured, notes that
 semantic queries fall back to the bundled provider. `Stored vectors: none`
 means the index has no embeddings yet.
 
-A `Feedback:` line summarizes the usage-feedback loop (TASK-103):
-`Feedback: enabled, 40 events, 40 sessions, weight deviation 0.050` —
-event count, distinct sessions among them, and the current weight
-deviation (the largest `|effective − default|` over gated learned
-rows, bounded by `[feedback] learn_max_deviation`). With the feature
+A `Feedback:` line summarizes the usage-feedback loop (TASK-103/104):
+`Feedback: enabled, 40 events, 40 sessions, weight deviation 0.050, 3
+result preferences` — event count, distinct sessions among them, the
+current weight deviation (the largest `|effective − default|` over
+gated learned rows, bounded by `[feedback] learn_max_deviation`), and
+the stored per-result preference count. With the feature
 off the line reads `Feedback: disabled`, still showing the counts when
 leftover state exists — turning the feature off hides influence, not
 history.

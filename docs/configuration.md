@@ -117,7 +117,7 @@ previous (legacy) ordering byte-for-byte — the escape hatch.
 | `weights.path_character` | `0.6` | Graded ladder value of the candidate's path: ordinary `1.0`, module entry `0.80`, barrel `0.70`, example `0.60`, shim `0.45`, type declaration `0.30`, test `0.20`, generated-shadowing-a-verified-peer `0.10`. Graded, never exclusion — a test file that is the best answer still ranks. A generated file is demoted only when a same-named hand-written peer exists in the index |
 | `weights.proximity` | `0.0` | `1 / gap` over the first-occurrence positions of the query terms present as whole identifiers in the matched line (adjacent terms `1.0`, one token between `0.5`, decaying). Fewer than two present terms contribute zero |
 | `weights.novelty` | `0.0` | Near-duplicate demotion (TASK-100): `1 - clamp01((jaccard - threshold) / (1 - threshold))` against the best sketch-Jaccard versus higher-ranked results carrying a signature, with `threshold` from `[duplicate]`. A weight of `0` (the default, pending bench evidence) skips the pass entirely; the earliest member of a duplicate group is never demoted, so every group keeps a representative |
-| `weights.feedback` | `0.35` | The feedback-learned descriptive channel (TASK-102): the candidate's value is the clamped sum of the learned weights of the descriptive keys it carries (`path:src/auth`, `symbol:kind=trait`, …), zero without learned rows — the default weight is inert until feedback evidence accumulates and clears the `[feedback]` gates. `0` skips the pass entirely: the one-knob full disable |
+| `weights.feedback` | `0.35` | The feedback-learned descriptive channel (TASK-102): the candidate's value is the clamped sum of the learned weights of the descriptive keys it carries (`path:src/auth`, `symbol:kind=trait`, …), zero without learned rows — the default weight is inert until feedback evidence accumulates and clears the `[feedback]` gates. The session-gated per-result preferences (TASK-104) ride this same knob as a separate `preference` contribution, capped at half this channel's full value swing. `0` skips the pass entirely: the one-knob full disable |
 | `weights.signature` | `0.8` | Answers signature-shaped queries (containing `(`, `->`, or `::`): `1.0` for the index-backed definition, `0.5` for a definition-shaped line (a parenthesis plus a definition keyword among its first three identifiers), `0.0` otherwise. Name-shaped queries are inert |
 | `class_multipliers.symbol` | `lexical = 1.8`, `semantic = 0.6` | Per-class scaling of the lexical and semantic weights for symbol-shaped queries (a single identifier token) |
 | `class_multipliers.path` | `lexical = 1.3`, `semantic = 0.8` | Same scaling for path-shaped queries (containing `/` or `\`) |
@@ -180,6 +180,7 @@ reporting (which also takes a one-off `--threshold` override).
 | `learn_half_life_days` | `30` | Age in days over which an unrefreshed learned weight halves its distance from the default (PRD-FB-REQ-011). Must be `>= 1` |
 | `learn_min_observations` | `10` | Observations a (feature, scope) row needs before it influences ranking (PRD-FB-REQ-025). Must be `>= 1` |
 | `learn_min_sessions` | `3` | Distinct sessions a row needs before it influences ranking — one session repeating feedback never steers ranking (AR-044). Must be `>= 1` |
+| `prefer_min_sessions` | `3` | Distinct confirming sessions a single RESULT needs before its per-result preference activates (TASK-104, PRD-FB-REQ-016). Must be `>= 2` — a value of `1` would let one session repeating feedback promote its own pick, the exact rich-get-richer loop DR-042 removed (AR-036), so it is a hard configuration error |
 
 Usage-feedback capture (TASK-101): when enabled, every ranked search
 persists its slate — the full ranked result list, each entry carrying a
@@ -226,19 +227,38 @@ best-effort: a failure warns and leaves the events for the next call.
 The rule and its constants are recorded in
 `bench/feedback-learning-tuning.md`.
 
+Session-gated per-result preferences (TASK-104, DR-042's narrow per-result
+layer, PRD-FB-REQ-016): the one kind of repository knowledge weights
+cannot express — "THIS result keeps being the answer". A result confirmed
+useful across `prefer_min_sessions` distinct sessions gains an additive
+preference that rides the same `weights.feedback` knob as its own
+`preference` contribution in `--why`, growing `+0.1` per new distinct
+session up to a strength of `0.5` — half the descriptive channel's full
+value clamp, so under the shared weight it can never outweigh learned
+weights. Repetition inside a single session grows nothing (AR-036), rank-1
+confirmations never count (a preference that counted them could keep
+re-strengthening itself from presentation alone), decay follows
+`learn_half_life_days` at learn AND load time, and a preference whose
+decayed strength falls below `0.01` is excluded and swept by the next
+learn pass. A materially changed result yields a different identity, so
+its stored preference can never re-attach (PRD-FB-REQ-006).
+
 Determinism and reset (TASK-103): no new keys — the controls are the
 `--no-feedback` search flag (and the MCP `wonk_search` `no_feedback`
 parameter), which reproduces index-only ranking exactly while still
 recording slates, and the `wonk feedback` management modes:
 `--list`/`--export` inspect the recorded history, `--clear-events`/
 `--clear-result <IDENTITY>` wipe it, and `--reset-weights`/
-`--reset-weight <FEATURE>` restore learned weights to their defaults.
+`--reset-weight <FEATURE>` restore learned weights to their defaults
+(`--reset-weights` also clears every per-result preference — they are
+learned state; `--clear-events`/`--clear-result` leave them, and the
+per-result kill story is the reset).
 Resetting weights and clearing history are deliberately independent
 (PRD-FB-REQ-013): wiped weights are not silently re-taught (events
 stay processed), and cleared history never touches what was already
 learned. `wonk status` reports the loop's state — events, distinct
-sessions, and the current weight deviation, whose ceiling is
-`learn_max_deviation`.
+sessions, the current weight deviation, whose ceiling is
+`learn_max_deviation`, and the stored result-preference count.
 
 Author features exist behind their own switch because they deserve their
 own decision (AR-046). The DR-039 distinction: DR-039 excludes

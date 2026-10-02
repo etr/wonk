@@ -1142,15 +1142,17 @@ fn ranked_search_adds_one_learned_read_and_no_writes() {
         TRACE_SQL.lock().unwrap().clone()
     };
     assert!(
-        baseline
-            .iter()
-            .all(|stmt| !stmt.to_lowercase().contains("learned_weights")),
+        baseline.iter().all(|stmt| {
+            !stmt.to_lowercase().contains("learned_weights")
+                && !stmt.to_lowercase().contains("result_preferences")
+        }),
         "no learned rows → no learned read"
     );
 
-    // Gated rows: the load (one learned_weights read) plus the ranked
-    // search — beyond the baseline only the pass's chunked symbols
-    // reads, and never a write.
+    // Gated rows: the load (one learned_weights read AND one
+    // result_preferences read — TASK-104) plus the ranked search —
+    // beyond the baseline only the pass's chunked symbols reads, and
+    // never a write.
     {
         let reloaded =
             learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
@@ -1166,14 +1168,23 @@ fn ranked_search_adds_one_learned_read_and_no_writes() {
         .filter(|s| s.to_lowercase().contains("from learned_weights"))
         .count();
     assert_eq!(learned_reads, 1, "exactly one learned_weights read");
+    let preference_reads = statements
+        .iter()
+        .filter(|s| s.to_lowercase().contains("from result_preferences"))
+        .count();
+    assert_eq!(
+        preference_reads, 1,
+        "exactly one result_preferences read — the preference adds one read, no writes"
+    );
     for stmt in &statements {
         let lowered = stmt.to_lowercase();
         let reads_symbols = lowered.contains("from symbols");
         let reads_learned = lowered.contains("from learned_weights");
+        let reads_preferences = lowered.contains("from result_preferences");
         let probes_schema = lowered.contains("from sqlite_master");
         let prepare_shaped = baseline.iter().any(|b| b == stmt);
         assert!(
-            reads_symbols || reads_learned || probes_schema || prepare_shaped,
+            reads_symbols || reads_learned || reads_preferences || probes_schema || prepare_shaped,
             "statement beyond the contract: {stmt}"
         );
         assert!(
@@ -1181,7 +1192,8 @@ fn ranked_search_adds_one_learned_read_and_no_writes() {
                 && !lowered.starts_with("update")
                 && !lowered.starts_with("delete")
                 && !lowered.contains("feedback_slates")
-                && !lowered.contains("into learned"),
+                && !lowered.contains("into learned")
+                && !lowered.contains("into result_preferences"),
             "the query path never writes: {stmt}"
         );
     }
@@ -2029,5 +2041,661 @@ fn status_shows_feedback_state_with_deviation() {
         stderr.contains("Feedback: enabled, 40 events, 40 sessions, weight deviation 0.000"),
         "reset reads through status: {stderr}"
     );
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-104: session-gated per-result preferences (PRD-FB-REQ-016, AR-036)
+// ---------------------------------------------------------------------------
+
+/// A `now` the CLI's own `system_secs()` clock can see without decay —
+/// `record_and_learn`-grown state must survive the real dispatch's load.
+fn recent_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Every stored preference row: (identity, strength, observations,
+/// sessions, updated_at).
+fn preference_dump(conn: &Connection) -> Vec<(String, f32, i64, i64, i64)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT result_identity, strength, observations, sessions, updated_at \
+             FROM result_preferences ORDER BY result_identity",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, f32>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .unwrap()
+}
+
+/// Load the gated learned table for the fixture's config and weights.
+fn load_table(conn: &Connection, now: i64) -> Option<learning::LearnedTable> {
+    learning::load_learned(conn, &feedback_config(true), &fixture_weights(), now).unwrap()
+}
+
+#[test]
+fn preference_activates_only_across_distinct_sessions() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+
+    // Two distinct sessions: below the default gate of 3 — the preference
+    // exists in the tables but must not influence anything.
+    let identity = record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, "s1", now);
+    record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, "s2", now);
+    assert_eq!(
+        learning::preference_count(&conn),
+        1,
+        "the row grows from the first confirming event"
+    );
+    assert!(
+        load_table(&conn, now).is_none(),
+        "two sessions gate the preference out entirely"
+    );
+    let baseline_src = max_score_of(
+        &ranked_for(&root, &conn, "crop_yield", None),
+        "src/crop/mod.rs",
+    )
+    .expect("src twin scored");
+
+    // The THIRD distinct session activates it: strength 0.3 at the default
+    // gate, riding the feedback weight 0.35.
+    record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, "s3", now);
+    let table = load_table(&conn, now).expect("the preference surfaces the table");
+    assert_eq!(
+        table.preferences().get(&identity),
+        Some(&0.3),
+        "one step per distinct session: {:?}",
+        table.preferences()
+    );
+    let preferred = ranked_for(&root, &conn, "crop_yield", Some(table));
+    let preferred_src = max_score_of(&preferred, "src/crop/mod.rs").unwrap();
+    assert!(
+        (preferred_src - baseline_src - 0.3 * 0.35).abs() < 1e-4,
+        "the preference joins the score at strength × feedback weight: \
+         {preferred_src} vs {baseline_src}"
+    );
+
+    // The visible surface: the src twin's why line carries its own
+    // preference entry with the exact weighted value.
+    let (code, _, why) = run_wonk(&root, &["search", "--include-tests", "--why", "crop_yield"]);
+    assert_eq!(code, 0);
+    let src_line = why
+        .lines()
+        .find(|l| l.starts_with("why: ") && l.contains("src/crop/mod.rs"))
+        .expect("src why line");
+    assert!(
+        src_line.contains("preference 0.300*0.35=0.1050"),
+        "own contribution row: {src_line}"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn one_session_repetition_never_activates_a_preference() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+
+    // AR-036 adversarial: fifty confirming events, ONE session.
+    for n in 0..50 {
+        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, "solo", now + n);
+    }
+    let rows = preference_dump(&conn);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, 0.1, "one step only: {rows:?}");
+    assert_eq!(rows[0].3, 1, "one session only: {rows:?}");
+    assert_eq!(rows[0].2, 50, "every event is still evidence");
+
+    // No influence in any direction: the load is empty and the why lines
+    // carry no preference entry.
+    assert!(
+        load_table(&conn, now + 100).is_none(),
+        "repetition in one session never activates"
+    );
+    let (code, _, why) = run_wonk(&root, &["search", "--include-tests", "--why", "crop_yield"]);
+    assert_eq!(code, 0);
+    assert!(
+        !why.contains("preference"),
+        "no preference contribution anywhere: {why}"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn preference_row_is_distinct_from_learned_weights_in_why() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+
+    // Enough mass to gate BOTH channels: 12 events preferring the src
+    // twin grow its preference AND gated descriptive weights (path:* keys
+    // the alternatives lack).
+    for n in 0..12 {
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            now,
+        );
+    }
+
+    // Text why: the src twin's line shows BOTH entries, separately named.
+    let (_, _, why) = search_with_why(&root, false, "crop_yield");
+    let src_line = why
+        .lines()
+        .find(|l| l.starts_with("why: ") && l.contains("src/crop/mod.rs"))
+        .expect("src why line");
+    assert!(
+        src_line.contains("feedback "),
+        "the learned row: {src_line}"
+    );
+    assert!(
+        src_line.contains("preference "),
+        "the per-result row: {src_line}"
+    );
+
+    // The learned: line stays weights-only.
+    let learned_line = why
+        .lines()
+        .find(|l| l.starts_with("learned: "))
+        .expect("the learned line prints");
+    assert!(
+        !learned_line.contains("preference"),
+        "preferences never ride the weights line: {learned_line}"
+    );
+
+    // JSON: signals[] carries both signal names.
+    let (code, stdout, stderr) = run_wonk(
+        &root,
+        &[
+            "search",
+            "--include-tests",
+            "--why",
+            "--format",
+            "json",
+            "crop_yield",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let src_row = json_rows(&stdout)
+        .into_iter()
+        .find(|row| row["file"].as_str().unwrap().ends_with("src/crop/mod.rs"))
+        .expect("src row");
+    let names: Vec<&str> = src_row["why"]["signals"]
+        .as_array()
+        .expect("why signals")
+        .iter()
+        .map(|signal| signal["signal"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"feedback") && names.contains(&"preference"),
+        "both channels in JSON signals: {names:?}"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn preference_cannot_outweigh_learned_weights() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+
+    // A SATURATED preference for the src twin: six distinct sessions.
+    for n in 0..6 {
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            now,
+        );
+    }
+    // The tests twin favored by gated descriptive keys summing to the
+    // descriptive channel's full 1.0 value clamp (upsert over whatever
+    // the six events already observed there): its `tests` ancestor and
+    // its Test match category — both B-exclusive.
+    for feature in ["path:tests", "match:category=test"] {
+        conn.execute(
+            "INSERT INTO learned_weights \
+             (feature, query_class, weight, observations, sessions, updated_at) \
+             VALUES (?1, '', 0.5, 40, 9, ?2) \
+             ON CONFLICT(feature, query_class) DO UPDATE SET \
+                 weight = 0.5, observations = 40, sessions = 9, updated_at = ?2",
+            rusqlite::params![feature, now],
+        )
+        .unwrap();
+    }
+
+    let table = load_table(&conn, now).expect("both channels gated");
+    let ranked = ranked_for(&root, &conn, "crop_yield", Some(table));
+    let find = |suffix: &str, signal: &str| {
+        ranked
+            .groups
+            .iter()
+            .flat_map(|(_, g)| g.iter())
+            .find(|s| s.classified.result.file.ends_with(suffix))
+            .unwrap()
+            .contributions
+            .iter()
+            .find(|c| c.signal == signal)
+            .unwrap()
+            .weighted
+    };
+    let a_preference = find("src/crop/mod.rs", "preference");
+    let b_feedback = find("tests/crop_test.rs", "feedback");
+    assert!(
+        (a_preference - 0.5 * 0.35).abs() < 1e-4,
+        "the preference's own ceiling: {a_preference}"
+    );
+    assert!(
+        (b_feedback - 1.0 * 0.35).abs() < 1e-4,
+        "the descriptive channel's full clamp: {b_feedback}"
+    );
+    assert!(
+        b_feedback > a_preference,
+        "a saturated preference stays under the learned channel: \
+         {b_feedback} vs {a_preference}"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn preference_strength_is_capped_under_adversarial_confirmation() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+
+    // Twenty distinct sessions all confirming the same result.
+    for n in 0..20 {
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            now,
+        );
+    }
+    let rows = preference_dump(&conn);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, 0.5, "saturated at the cap: {rows:?}");
+    assert_eq!(rows[0].3, 20, "sessions keep counting as evidence");
+
+    let table = load_table(&conn, now).expect("gated");
+    let ranked = ranked_for(&root, &conn, "crop_yield", Some(table));
+    let preference = ranked
+        .groups
+        .iter()
+        .flat_map(|(_, g)| g.iter())
+        .find(|s| s.classified.result.file.ends_with("src/crop/mod.rs"))
+        .unwrap()
+        .contributions
+        .iter()
+        .find(|c| c.signal == "preference")
+        .unwrap();
+    assert_eq!(preference.value, 0.5);
+    assert!(
+        preference.weighted <= 0.5 * 0.35 + 1e-6,
+        "never above half the feedback weight's full swing: {}",
+        preference.weighted
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn preference_decays_and_retires_like_every_entry() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+
+    // Confirmed across 3 sessions at t=1000: strength 0.3.
+    for session in ["a", "b", "c"] {
+        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, session, 1000);
+    }
+    let table = load_table(&conn, 1000).unwrap();
+    assert_eq!(table.preferences().len(), 1);
+
+    // One half-life later: the strength halves (PRD-FB-REQ-011 parity).
+    let table = load_table(&conn, 1000 + 30 * 86_400).expect("still above the retire floor");
+    let effective = *table.preferences().values().next().unwrap();
+    assert!(
+        (effective - 0.15).abs() < 1e-6,
+        "one half-life halves the strength: {effective}"
+    );
+
+    // A year unconfirmed: below the floor — excluded at load, and the
+    // next learn pass sweeps the row.
+    let year = 1000 + 365 * 86_400;
+    assert!(
+        load_table(&conn, year).is_none(),
+        "below the floor means no influence"
+    );
+    learning::learn_pending(&conn, &feedback_config(true), &fixture_weights(), year).unwrap();
+    assert_eq!(
+        learning::preference_count(&conn),
+        0,
+        "the sweep collected the retired row"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn materially_changed_result_loses_its_preference() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+
+    for session in ["a", "b", "c"] {
+        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, session, now);
+    }
+    assert_eq!(learning::preference_count(&conn), 1);
+
+    // Material change (PRD-FB-REQ-006): the signature edit re-anchors the
+    // symbol's identity — the stored preference can never match again.
+    let changed = CROP_IMPL.replace(
+        "pub fn crop_yield(acres: f64, rain: f64) -> f64 {",
+        "pub fn crop_yield(acres: f64, rain: f64, season: u32) -> f64 {",
+    );
+    assert_ne!(&changed, CROP_IMPL, "the fixture edit must apply");
+    fs::write(root.join("src/crop/mod.rs"), changed).unwrap();
+    wonk::pipeline::build_index(&root, true).unwrap();
+
+    // The row is still stored (it is history), but the recomputed identity
+    // no longer matches: zero contribution, bit-identical index-only score.
+    let table = load_table(&conn, now).expect("the stale row still loads");
+    assert_eq!(
+        table.preferences().len(),
+        1,
+        "the row itself is retired at match time"
+    );
+    let ranked = ranked_for(&root, &conn, "crop_yield", Some(table));
+    let baseline = ranked_for(&root, &conn, "crop_yield", None);
+    let src = ranked
+        .groups
+        .iter()
+        .flat_map(|(_, g)| g.iter())
+        .find(|s| s.classified.result.file.ends_with("src/crop/mod.rs"))
+        .unwrap();
+    let preference = src
+        .contributions
+        .iter()
+        .find(|c| c.signal == "preference")
+        .expect("the channel runs; the match decides");
+    assert_eq!(preference.value, 0.0, "identity mismatch → no influence");
+    let base_src = baseline
+        .groups
+        .iter()
+        .flat_map(|(_, g)| g.iter())
+        .find(|s| s.classified.result.file.ends_with("src/crop/mod.rs"))
+        .unwrap();
+    assert_eq!(
+        src.score.to_bits(),
+        base_src.score.to_bits(),
+        "the changed result ranks at its index-only score"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn rank_one_confirmations_never_count_toward_a_preference() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+
+    // PRD-FB-REQ-009 interplay: picking the rank-1 result across four
+    // sessions — a confirmation that never qualifies.
+    for session in ["a", "b", "c", "d"] {
+        record_and_learn(&root, &conn, "crop_yield", Pick::Rank(1), session, now);
+    }
+    assert_eq!(
+        learning::preference_count(&conn),
+        0,
+        "rank-1 confirmations never form a preference"
+    );
+    assert!(
+        load_table(&conn, now).is_none(),
+        "no learned influence at all"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn no_feedback_reproduces_index_only_ranking_with_preferences() {
+    let (dir, root) = learning_repo(true, "");
+
+    // Baseline before any feedback.
+    let (_, base_stdout, base_why) = search_with_why(&root, false, "crop_yield");
+
+    // An ACTIVE preference: three distinct sessions (weights stay below
+    // their observation gate, so the preference is the only live channel).
+    let conn = open_index(&root);
+    let now = recent_now();
+    for session in ["a", "b", "c"] {
+        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, session, now);
+    }
+    drop(conn);
+
+    // Sanity: the preference is live in the enabled search.
+    let (_, _, learned_why) = search_with_why(&root, false, "crop_yield");
+    assert!(
+        learned_why.contains("preference"),
+        "the preference acts: {learned_why}"
+    );
+
+    // THE assertion: --no-feedback reproduces the index-only baseline
+    // byte-for-byte — results and why lines (PRD-FB-REQ-017/018, AR-039).
+    let (code, free_stdout, free_why) = search_with_why(&root, true, "crop_yield");
+    assert_eq!(code, 0);
+    assert_eq!(free_stdout, base_stdout, "result lines identical");
+    assert_eq!(free_why, base_why, "why stderr identical");
+    drop(dir);
+}
+
+#[test]
+fn preference_replay_is_identical_from_identical_events() {
+    // Wipe + replay (watermark reset) vs the original pass: identical
+    // preference state from identical events.
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    for n in 0..10 {
+        record_and_learn(
+            &root,
+            &conn,
+            "crop_yield",
+            Pick::SrcImpl,
+            &format!("s{n}"),
+            5000,
+        );
+    }
+    let first = preference_dump(&conn);
+
+    learning::reset_learned_weights(&conn).unwrap();
+    conn.execute("DELETE FROM learned_meta WHERE key = 'event_watermark'", [])
+        .unwrap();
+    learning::learn_pending(&conn, &feedback_config(true), &fixture_weights(), 5000).unwrap();
+    assert_eq!(
+        preference_dump(&conn),
+        first,
+        "wiped and replayed: identical preference state"
+    );
+
+    // And two fresh identical repos agree bit-for-bit.
+    let build = || {
+        let (dir, root) = learning_repo(true, "");
+        let conn = open_index(&root);
+        for n in 0..10 {
+            record_and_learn(
+                &root,
+                &conn,
+                "crop_yield",
+                Pick::SrcImpl,
+                &format!("s{n}"),
+                5000,
+            );
+        }
+        let dump = preference_dump(&conn);
+        drop(conn);
+        drop(dir);
+        dump
+    };
+    assert_eq!(build(), build(), "bit-identical preferences on replay");
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn reset_weights_clears_preferences_and_keeps_events() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+    for session in ["a", "b", "c"] {
+        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, session, now);
+    }
+    assert_eq!(learning::preference_count(&conn), 1);
+    let events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM feedback_events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(events, 3);
+    let watermark: i64 = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM learned_meta WHERE key = 'event_watermark'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // --clear-events: history goes, the preference stays (it is learned
+    // state, not an event) — TASK-103's independence contract, both ways.
+    let (code, _, err) = run_wonk(&root, &["feedback", "--clear-events"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        learning::preference_count(&conn),
+        1,
+        "clearing events leaves the preference"
+    );
+    let events_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM feedback_events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(events_after, 0, "the events are gone");
+
+    // --reset-weights: the preference goes with the weights; events are
+    // already empty here and the watermark never moves.
+    let (code, out, err) = run_wonk(&root, &["feedback", "--reset-weights"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("1 result preference(s) cleared"),
+        "the confirmation names the preference wipe: {out}"
+    );
+    assert_eq!(learning::preference_count(&conn), 0);
+    let watermark_after: i64 = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM learned_meta WHERE key = 'event_watermark'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(watermark_after, watermark, "the watermark stands");
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn feedback_disabled_repo_unchanged_by_preference_tables() {
+    // Enabled repo with only a BELOW-GATE preference row: the load is
+    // empty and the order is byte-identical to the feature-off repo
+    // (PRD-FB-REQ-020).
+    let (dir_on, root_on) = learning_repo(true, "");
+    let conn = open_index(&root_on);
+    conn.execute(
+        "INSERT INTO result_preferences \
+         (result_identity, strength, observations, sessions, updated_at) \
+         VALUES ('inert', 0.2, 5, 2, 1000)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        load_table(&conn, recent_now()).is_none(),
+        "below-gate preference tables change nothing"
+    );
+    drop(conn);
+
+    // The disabled twin with an ACTIVE-gate row stored: also no influence
+    // — the kill switch outranks stored state.
+    let (dir_off, root_off) = learning_repo(false, "");
+    let conn_off = open_index(&root_off);
+    conn_off
+        .execute(
+            "INSERT INTO result_preferences \
+             (result_identity, strength, observations, sessions, updated_at) \
+             VALUES ('live-but-off', 0.5, 5, 9, 1000)",
+            [],
+        )
+        .unwrap();
+    assert!(
+        learning::load_learned(
+            &conn_off,
+            &feedback_config(false),
+            &fixture_weights(),
+            recent_now()
+        )
+        .unwrap()
+        .is_none(),
+        "feature off means no influence, stored state or not"
+    );
+    drop(conn_off);
+
+    let (_, out_on, _) = run_wonk(&root_on, &["search", "--include-tests", "crop_yield"]);
+    let (_, out_off, _) = run_wonk(&root_off, &["search", "--include-tests", "crop_yield"]);
+    assert_eq!(
+        result_lines(&out_on),
+        result_lines(&out_off),
+        "inert tables are byte-identical to feature-off"
+    );
+    drop(dir_on);
+    drop(dir_off);
+}
+
+#[test]
+fn status_counts_result_preferences() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+    let now = recent_now();
+    for session in ["a", "b", "c"] {
+        record_and_learn(&root, &conn, "crop_yield", Pick::SrcImpl, session, now);
+    }
+    drop(conn);
+    let (code, _, stderr) = run_wonk(&root, &["status"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("3 events, 3 sessions, weight deviation 0.000, 1 result preferences"),
+        "the preferences ride the Feedback line: {stderr}"
+    );
+    let (code, stdout, stderr) = run_wonk(&root, &["status", "--format", "json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let status: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["feedback"]["preferences"], 1);
     drop(dir);
 }
