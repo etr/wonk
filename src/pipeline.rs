@@ -605,25 +605,11 @@ pub fn process_events(
 // Internals — incremental helpers
 // ---------------------------------------------------------------------------
 
-/// Delete all data for a single file (symbols, references, file row) in a
-/// single transaction.
-fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
-    let tx = conn
-        .unchecked_transaction()
-        .context("starting delete transaction")?;
-
-    // Capture the reach table's pre-delete view of this file before any
-    // rows go away (TASK-081, PRD-REACH-REQ-005).
-    let scope = crate::reach::begin_file_edit(&tx, rel_path)?;
-
-    // Subtract this file's contribution from the corpus-stats summary
-    // while its row (and line_count) is still readable; a legacy index
-    // with no summary row heals by recomputing after the delete.
-    let summary_present = corpus_stats_present(&tx)?;
-    if summary_present {
-        corpus_stats_remove_file(&tx, rel_path)?;
-    }
-
+/// The per-file DELETE set shared by the delete and upsert paths (TASK-078
+/// review debt): every table keyed by file must be cleared in BOTH, so
+/// the set lives exactly once here. `files` itself is the caller's
+/// business — delete removes the row, upsert replaces it.
+fn delete_file_rows(tx: &rusqlite::Transaction<'_>, rel_path: &str) -> Result<()> {
     // Delete type edges before symbols (explicit, mirrors references/imports pattern).
     tx.execute(
         "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
@@ -651,22 +637,56 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         "DELETE FROM term_stats WHERE file = ?1",
         rusqlite::params![rel_path],
     )?;
-    tx.execute(
-        "DELETE FROM files WHERE path = ?1",
-        rusqlite::params![rel_path],
-    )?;
+    Ok(())
+}
 
-    // Incrementally repair the reach rows this deletion touched. On
-    // failure, degrade: mark the table stale in this same transaction and
-    // commit anyway — reach is a cache, and a stale table falls back to
-    // BFS rather than serving wrong data (PRD-REACH-REQ-007).
-    if let Err(e) = crate::reach::finish_file_edit(&tx, &scope) {
-        crate::reach::mark_stale(&tx)?;
+/// Incrementally repair the reach rows an edit touched, degrading on
+/// failure: mark the table stale in the SAME transaction and commit
+/// anyway — reach is a cache, and a stale table falls back to BFS
+/// rather than serving wrong data (PRD-REACH-REQ-007). The REQ-007
+/// protocol lives exactly once, not as one hand-synced copy per path
+/// (TASK-081 review debt).
+fn finish_reach_edit(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &crate::reach::FileEditScope,
+    rel_path: &str,
+) -> Result<()> {
+    if let Err(e) = crate::reach::finish_file_edit(tx, scope) {
+        crate::reach::mark_stale(tx)?;
         eprintln!(
             "warn: incremental reach repair failed for {rel_path}: {e:#}; \
              table marked stale, queries fall back to BFS"
         );
     }
+    Ok(())
+}
+
+/// Delete all data for a single file (symbols, references, file row) in a
+/// single transaction.
+fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("starting delete transaction")?;
+
+    // Capture the reach table's pre-delete view of this file before any
+    // rows go away (TASK-081, PRD-REACH-REQ-005).
+    let scope = crate::reach::begin_file_edit(&tx, rel_path)?;
+
+    // Subtract this file's contribution from the corpus-stats summary
+    // while its row (and line_count) is still readable; a legacy index
+    // with no summary row heals by recomputing after the delete.
+    let summary_present = corpus_stats_present(&tx)?;
+    if summary_present {
+        corpus_stats_remove_file(&tx, rel_path)?;
+    }
+
+    delete_file_rows(&tx, rel_path)?;
+    tx.execute(
+        "DELETE FROM files WHERE path = ?1",
+        rusqlite::params![rel_path],
+    )?;
+
+    finish_reach_edit(&tx, &scope, rel_path)?;
 
     if !summary_present {
         corpus_stats_recompute(&tx)?;
@@ -693,35 +713,7 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     // reverse-target predecessors that only exist pre-delete.
     let scope = crate::reach::begin_file_edit(&tx, &result.rel_path)?;
 
-    // Delete old type edges, symbols, references, and imports for this file.
-    // type_edges has ON DELETE CASCADE from symbols, but we delete explicitly
-    // for clarity and to mirror the pattern used for references and imports.
-    tx.execute(
-        "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
-        rusqlite::params![result.rel_path],
-    )?;
-    // Contracts are cleared and rewritten per file on re-index; the symbol
-    // cascade misses NULL-symbol_id rows (documents, top-level sites).
-    tx.execute(
-        "DELETE FROM contracts WHERE file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM symbols WHERE file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM \"references\" WHERE file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM file_imports WHERE source_file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM term_stats WHERE file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
+    delete_file_rows(&tx, &result.rel_path)?;
 
     // Subtract the file's previous contribution from the corpus-stats
     // summary while the old row (and its line_count) is still readable;
@@ -876,18 +868,9 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     insert_contracts(&tx, &result.rel_path, &result.contracts, Some(&caller_map))?;
 
     // Incrementally repair the reach rows this edit touched (the same
-    // traversal the full build runs, over the affected source set). On
-    // failure, degrade: mark the table stale in this same transaction and
-    // commit anyway — reach is a cache, and a stale table falls back to
-    // BFS rather than serving wrong data (PRD-REACH-REQ-007).
-    if let Err(e) = crate::reach::finish_file_edit(&tx, &scope) {
-        crate::reach::mark_stale(&tx)?;
-        eprintln!(
-            "warn: incremental reach repair failed for {}: {e:#}; \
-             table marked stale, queries fall back to BFS",
-            result.rel_path
-        );
-    }
+    // traversal the full build runs, over the affected source set); the
+    // degrade protocol lives in finish_reach_edit.
+    finish_reach_edit(&tx, &scope, &result.rel_path)?;
 
     tx.commit().context("committing upsert transaction")?;
     Ok(())
@@ -4458,6 +4441,100 @@ fn extra() -> i32 {
                 "tf for '{term}'"
             );
         }
+    }
+
+    #[test]
+    fn test_term_stats_failure_rolls_back_whole_upsert() {
+        // TASK-078 review debt: the UTF-8 twin above fails at READ time,
+        // before any transaction, so it cannot pin the criterion "stats
+        // written in the same transaction as symbol rows" (AR-024). A
+        // trigger failing INSIDE the upsert transaction can: the whole
+        // write must roll back, not partially land.
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        let before = (
+            conn.query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        );
+
+        conn.execute(
+            "CREATE TRIGGER term_stats_boom BEFORE INSERT ON term_stats \
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            [],
+        )
+        .unwrap();
+
+        let mut modified = fs::read_to_string(root.join("lib.rs")).unwrap();
+        modified.push_str("\nfn injected_after_boom() {}\n");
+        fs::write(root.join("lib.rs"), modified).unwrap();
+
+        let result = reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        );
+        assert!(result.is_err(), "the trigger must abort the re-index");
+
+        let after = (
+            conn.query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            after, before,
+            "rollback, not partial write: files/symbols/term_stats keep their pre-edit state"
+        );
+
+        // Drop the trigger: the same re-index now succeeds and the new
+        // content lands — the abort was the only thing standing in the way.
+        conn.execute("DROP TRIGGER term_stats_boom", []).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
+        let injected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs' AND name = 'injected_after_boom'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            injected, 1,
+            "the post-fix re-index must land the new symbol"
+        );
     }
 
     #[test]
