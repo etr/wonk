@@ -24,6 +24,13 @@ pub(crate) struct BundledModel {
 
 impl BundledProvider {
     fn model() -> Result<&'static BundledModel, EmbeddingError> {
+        // Once per PROCESS: the decode (zstd + nibble unpack +
+        // StaticModel::from_bytes) costs ~60ms cold on Apple Silicon and
+        // is amortized by the long-lived daemon/MCP surfaces. A one-shot
+        // CLI smart search pays it every invocation — the measured
+        // cold-start numbers and the mitigation path (persist a
+        // memory-mappable decoded artifact) are recorded in
+        // bench/rank-latency-results.md (TASK-095 review debt).
         MODEL
             .get_or_init(|| decode_model(MODEL_BYTES).map_err(|error| error.to_string()))
             .as_ref()

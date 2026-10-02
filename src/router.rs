@@ -261,9 +261,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     SearchMode::Smart(_) => {
                         // Ranked mode: classify, then either the legacy
                         // lexicographic sort or the signal pipeline, then the
-                        // shared dedup/group with headers. REQ-017: the
-                        // pipeline is config-gated and off by default;
-                        // --why opts in for this invocation.
+                        // shared dedup/group with headers. REQ-017
+                        // (default flipped in TASK-095): the tuned pipeline
+                        // is ON by default; `[rank] enabled = false`
+                        // restores the legacy ordering; `--why`
+                        // additionally forces the pipeline for this
+                        // invocation.
                         use crate::ranker;
 
                         // Defense in depth: config load already rejected
@@ -293,26 +296,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // joins the settings — ONE read, best-effort like
                         // the slate recording (a missing table is silent;
                         // other errors warn and disable the overlay).
-                        // --no-feedback (TASK-103, PRD-FB-REQ-017) skips
-                        // the load outright; the flag ALSO strips any
+                        // --no-feedback (TASK-103, PRD-FB-REQ-017)
+                        // skips the load outright and ALSO strips any
                         // attached table inside the ranking seam —
-                        // belt-and-suspenders (AR-039).
+                        // belt-and-suspenders (AR-039). The shared
+                        // load_learned_best_effort owns the policy.
                         settings.feedback_free = args.no_feedback;
-                        if config.feedback.enabled
-                            && !args.no_feedback
-                            && let Some(index_conn) = conn.as_ref()
-                        {
-                            settings.learned = crate::learning::load_learned(
-                                index_conn,
-                                &config.feedback,
-                                &config.rank.weights,
-                                system_secs(),
-                            )
-                            .unwrap_or_else(|e| {
-                                eprintln!("wonk: learned-weight load failed: {e:#}");
-                                None
-                            });
-                        }
+                        settings.learned =
+                            load_learned_best_effort(conn.as_ref(), &config, args.no_feedback);
                         let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
@@ -335,15 +326,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             &ranked,
                             &config.feedback,
                         );
-                        let identity_of = stored_slate
-                            .as_ref()
-                            .map(|s| {
-                                s.members
-                                    .iter()
-                                    .map(|m| ((m.file.clone(), m.line), m.identity.clone()))
-                                    .collect::<std::collections::HashMap<_, _>>()
-                            })
-                            .unwrap_or_default();
                         // One class line per query, before any why lines
                         // (DR-038): a misclassification is diagnosable from
                         // the breakdown it produced. The `learned:` line
@@ -378,16 +360,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                     ranked.query_class.map(|c| c.as_str().to_string());
                                 if let Some(slate) = stored_slate.as_ref() {
                                     out.slate = Some(slate.token.clone());
-                                    out.identity = identity_of
-                                        .get(&(
-                                            item.classified
-                                                .result
-                                                .file
-                                                .to_string_lossy()
-                                                .into_owned(),
-                                            item.classified.result.line,
-                                        ))
-                                        .cloned();
+                                    out.identity = slate.identity_for(
+                                        &item.classified.result.file.to_string_lossy(),
+                                        item.classified.result.line,
+                                    );
                                 }
                                 if args.why {
                                     out.why = Some(crate::output::WhyOutput::from_contributions(
@@ -2794,6 +2770,28 @@ pub(crate) fn learn_pending_best_effort(conn: &Connection, config: &crate::confi
     {
         eprintln!("wonk: feedback learning deferred: {e:#}");
     }
+}
+
+/// The read side of the feedback-learning seam (TASK-102/103 review
+/// debt): one gated, best-effort learned-overlay load shared by both
+/// dispatch surfaces — the AR-039 policy (skip the load when
+/// no_feedback; warn and degrade to None on failure) lives exactly
+/// once, mirroring its write-side sibling [`learn_pending_best_effort`].
+pub(crate) fn load_learned_best_effort(
+    conn: Option<&Connection>,
+    config: &crate::config::Config,
+    no_feedback: bool,
+) -> Option<crate::learning::LearnedTable> {
+    if no_feedback || !config.feedback.enabled {
+        return None;
+    }
+    conn.and_then(|conn| {
+        crate::learning::load_learned(conn, &config.feedback, &config.rank.weights, system_secs())
+            .unwrap_or_else(|e| {
+                eprintln!("wonk: learned-weight load failed: {e:#}");
+                None
+            })
+    })
 }
 
 /// `wonk feedback --weights` (TASK-102, PRD-FB-REQ-029/012): every

@@ -100,8 +100,36 @@ pub fn elide_span_tree(
     start_line: usize,
     end_line: usize,
 ) -> Result<String, NotElided> {
-    let ranges = collect_body_ranges(tree, source, language, mode);
-    Ok(render_window(source, &ranges, start_line, end_line))
+    let ctx = ElisionCtx::derive(tree, source, language, mode);
+    Ok(ctx.render(source, start_line, end_line))
+}
+
+/// Per-file elision context derived once and shared by every span a
+/// request extracts from that file (TASK-091 review debt): the body
+/// ranges and line starts are pure functions of (tree, source, mode),
+/// so deriving them per span made `--elide` cost
+/// O(spans x file nodes + spans x file bytes) — quadratic in file size
+/// for exactly the large body-heavy files the feature targets. The
+/// mode is baked in: a request runs under one mode; callers switching
+/// modes re-derive.
+pub struct ElisionCtx {
+    ranges: Vec<BodyRange>,
+    starts: Vec<usize>,
+}
+
+impl ElisionCtx {
+    pub fn derive(tree: &Tree, source: &str, language: Lang, mode: Mode) -> Self {
+        ElisionCtx {
+            ranges: collect_body_ranges(tree, source, language, mode),
+            starts: line_starts(source),
+        }
+    }
+
+    /// Render the `start_line..=end_line` window under the derived
+    /// context — the same output `elide_span_tree` gives for one span.
+    pub fn render(&self, source: &str, start_line: usize, end_line: usize) -> String {
+        render_window(source, &self.ranges, &self.starts, start_line, end_line)
+    }
 }
 
 /// `true` when a tree-sitter node kind names a control-flow construct.
@@ -210,7 +238,7 @@ fn retains_closing_rows(lang: Lang) -> bool {
 }
 
 /// A body's byte range in the source plus everything needed to stub it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BodyRange {
     start: usize,
     end: usize,
@@ -475,8 +503,13 @@ fn rebuild(source: &str, ranges: &[BodyRange]) -> String {
 
 /// Render a 1-based inclusive line window of the source with every body
 /// range fully inside it stubbed; straddling ranges stay verbatim.
-fn render_window(source: &str, ranges: &[BodyRange], start_line: usize, end_line: usize) -> String {
-    let starts = line_starts(source);
+fn render_window(
+    source: &str,
+    ranges: &[BodyRange],
+    starts: &[usize],
+    start_line: usize,
+    end_line: usize,
+) -> String {
     let first_row = start_line.saturating_sub(1);
     let last_row = (end_line.saturating_sub(1)).min(starts.len().saturating_sub(1));
     if first_row > last_row {
@@ -498,7 +531,7 @@ fn render_window(source: &str, ranges: &[BodyRange], start_line: usize, end_line
             continue;
         }
         out.push_str(&source[last..range.start]);
-        out.push_str(&render_range(source, range, Some(&starts)));
+        out.push_str(&render_range(source, range, Some(starts)));
         last = range.end;
     }
     out.push_str(&source[last..window_end]);

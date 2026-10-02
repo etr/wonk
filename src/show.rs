@@ -189,7 +189,8 @@ fn collect_show_results(
     // One parse per file when elision is active (PRD-ELIDE-REQ-010: the text
     // is already read; the tree is parsed once and shared by every span
     // extracted from that file). A `None` entry caches the miss.
-    let mut tree_cache: HashMap<String, Option<(Tree, Lang)>> = HashMap::new();
+    let mut tree_cache: HashMap<String, Option<(Tree, Lang, crate::elide::ElisionCtx)>> =
+        HashMap::new();
     let canonical_root = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
@@ -321,7 +322,7 @@ fn read_source_file(
 /// not parse standalone); `None` is the fail-soft signal for the caller to
 /// fall back to plain line extraction (PRD-ELIDE-REQ-006).
 fn elide_window(
-    tree_cache: &mut HashMap<String, Option<(Tree, Lang)>>,
+    tree_cache: &mut HashMap<String, Option<(Tree, Lang, crate::elide::ElisionCtx)>>,
     file: &str,
     content: &str,
     line: usize,
@@ -329,14 +330,22 @@ fn elide_window(
     mode: Option<Mode>,
 ) -> Option<String> {
     let mode = mode?;
-    let tree = tree_cache.entry(file.to_string()).or_insert_with(|| {
-        let lang = crate::indexer::detect_language(Path::new(file))?;
-        let mut parser = crate::indexer::try_get_parser(lang).ok()?;
-        let tree = parser.parse(content, None)?;
-        Some((tree, lang))
-    });
-    let (tree, lang) = tree.as_ref()?;
-    crate::elide::elide_span_tree(tree, content, *lang, mode, line, end).ok()
+    // The parsed tree AND its derived elision context (body ranges, line
+    // starts) are computed once per file and shared by every span the
+    // request extracts from it (TASK-091 review debt) — per-span
+    // re-derivation made --elide quadratic in file size. `get` before
+    // `entry` avoids the per-span key allocation.
+    if let Some(entry) = tree_cache.get(file) {
+        let (_, _, ctx) = entry.as_ref()?;
+        return Some(ctx.render(content, line, end));
+    }
+    let lang = crate::indexer::detect_language(Path::new(file))?;
+    let mut parser = crate::indexer::try_get_parser(lang).ok()?;
+    let tree = parser.parse(content, None)?;
+    let ctx = crate::elide::ElisionCtx::derive(&tree, content, lang, mode);
+    let rendered = ctx.render(content, line, end);
+    tree_cache.insert(file.to_string(), Some((tree, lang, ctx)));
+    Some(rendered)
 }
 
 /// Query child symbol signatures using a pre-prepared statement.
