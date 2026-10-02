@@ -63,10 +63,19 @@ fn embedding_provider_for(
 /// stored vector spaces: an unreachable configured Ollama degrades to the
 /// bundled provider with a stderr warning, while a mismatched stored space
 /// errors with the re-embed command — the same contract as `wonk ask`.
+///
+/// Returns the provider together with the configured kind it was resolved
+/// from, so tool arms can re-plan (degrade) after a mid-query disconnect.
 fn plan_query_provider(
     conn: &rusqlite::Connection,
     repo_root: &Path,
-) -> Result<Box<dyn crate::embedding::EmbeddingProvider>, CallToolResult> {
+) -> Result<
+    (
+        Box<dyn crate::embedding::EmbeddingProvider>,
+        crate::embedding::EmbeddingProviderKind,
+    ),
+    CallToolResult,
+> {
     let configured = match embedding_provider_kind_for(repo_root, None) {
         Ok(kind) => kind,
         Err(error) => return Err(CallToolResult::error(error)),
@@ -76,9 +85,31 @@ fn plan_query_provider(
         Err(error) => return Err(CallToolResult::error(format!("{error}"))),
     };
     if let Some(warning) = plan.fallback_warning {
-        eprintln!("warning: {warning}");
+        crate::output::print_warning(warning);
     }
-    Ok(plan.provider)
+    Ok((plan.provider, configured))
+}
+
+/// Mid-query disconnect handling for the semantic tool arms: re-plan with
+/// the configured provider dead and degrade to the bundled provider with
+/// the same warning `wonk ask` prints, or surface the re-embed instruction
+/// as a tool error when the stored vectors make the fallback unsafe
+/// (mirrors the router's `degrade_after_disconnect`).
+fn degrade_after_disconnect(
+    conn: &rusqlite::Connection,
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>, CallToolResult> {
+    match crate::embedding::fallback_after_disconnect(conn, configured) {
+        Ok(fallback) => {
+            crate::output::print_warning(
+                fallback
+                    .fallback_warning
+                    .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
+            );
+            Ok(fallback.provider)
+        }
+        Err(error) => Err(CallToolResult::error(format!("{error}"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3376,8 +3407,8 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match plan_query_provider(conn, &repo_root) {
-            Ok(provider) => provider,
+        let (provider, configured) = match plan_query_provider(conn, &repo_root) {
+            Ok(resolved) => resolved,
             Err(e) => return e,
         };
 
@@ -3416,6 +3447,22 @@ impl McpServer {
 
         let mut query_vec = match provider.embed_single(&query) {
             Ok(v) => v,
+            Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
+                // Ollama died between the plan-time health probe and the
+                // query embed: degrade to the bundled provider with the same
+                // warning `wonk ask` prints, or surface the mismatch with
+                // its re-embed command as a tool error — never a hard
+                // transport failure.
+                match degrade_after_disconnect(conn, configured) {
+                    Ok(fallback) => match fallback.embed_single(&query) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return CallToolResult::error(format!("embedding query failed: {e}"));
+                        }
+                    },
+                    Err(e) => return e,
+                }
+            }
             Err(e) => return CallToolResult::error(format!("embedding query failed: {e}")),
         };
         crate::embedding::normalize(&mut query_vec);
@@ -3534,8 +3581,8 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match plan_query_provider(conn, &repo_root) {
-            Ok(provider) => provider,
+        let (provider, _configured) = match plan_query_provider(conn, &repo_root) {
+            Ok(resolved) => resolved,
             Err(e) => return e,
         };
 
@@ -3603,8 +3650,8 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match plan_query_provider(conn, &repo_root) {
-            Ok(provider) => provider,
+        let (provider, _configured) = match plan_query_provider(conn, &repo_root) {
+            Ok(resolved) => resolved,
             Err(e) => return e,
         };
 
@@ -5890,6 +5937,70 @@ mod tests {
         assert_eq!(
             result["content"][0]["text"],
             "invalid embedding provider: remote"
+        );
+    }
+
+    // -- degrade_after_disconnect (mid-query disconnect fallback) -----------
+
+    /// In-memory DB whose embeddings table holds the given vector-space rows.
+    fn mcp_space_db(entries: &[(&str, i64)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                symbol_id INTEGER NOT NULL,
+                file TEXT NOT NULL, chunk_text TEXT NOT NULL, vector BLOB NOT NULL,
+                stale INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                provider TEXT NOT NULL, dim INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for (i, (provider, dim)) in entries.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO embeddings
+                    (symbol_id, file, chunk_text, vector, created_at, provider, dim)
+                 VALUES (?1, 'a.rs', 'chunk', x'00', 1000, ?2, ?3)",
+                rusqlite::params![i as i64 + 1, provider, *dim],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn degrade_after_disconnect_bundled_space_degrades_with_warning() {
+        // The provider died mid-query over a bundled-compatible index: the
+        // re-plan degrades to the bundled provider (the warning itself is
+        // printed by the helper; embedding.rs pins its exact text).
+        let conn = mcp_space_db(&[("bundled", 256), ("bundled", 256)]);
+        let provider =
+            degrade_after_disconnect(&conn, crate::embedding::EmbeddingProviderKind::Ollama)
+                .map_err(|error| format!("should degrade over a bundled index, got {error:?}"))
+                .unwrap();
+        assert_eq!(provider.name(), "bundled");
+        assert_eq!(provider.dim(), 256);
+    }
+
+    #[test]
+    fn degrade_after_disconnect_foreign_space_returns_tool_error() {
+        // Stored vectors in the ollama space: the fallback must refuse and
+        // surface the mismatch with the exact re-embed command as a tool
+        // error, mirroring the CLI arm.
+        let conn = mcp_space_db(&[("ollama", 768)]);
+        let result =
+            degrade_after_disconnect(&conn, crate::embedding::EmbeddingProviderKind::Ollama);
+        let error = result
+            .err()
+            .expect("foreign-space stored vectors must block the fallback");
+        let serialized = serde_json::to_value(&error).unwrap();
+        assert_eq!(serialized["isError"], true);
+        let message = serialized["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(message.contains("vector space mismatch"), "got: {message}");
+        assert!(
+            message.contains("wonk update --force --provider bundled"),
+            "got: {message}"
         );
     }
 
