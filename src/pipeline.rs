@@ -289,14 +289,12 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
     // Refresh the history window after the file loop (TASK-096). Best-effort:
     // Failed already warned inside refresh; Skipped/Unchanged stay silent
     // (PRD-HIST-REQ-007/008).
-    if config.history.enabled
-        && let Err(e) = crate::history::refresh(
+    if config.history.enabled {
+        crate::history::refresh(
             &conn,
             repo_root,
             &crate::history::MiningOptions::from(&config.history),
-        )
-    {
-        eprintln!("wonk: history refresh failed: {e:#}");
+        );
     }
 
     // Recompute graph topology after the file loop (TASK-098). `wonk

@@ -3650,6 +3650,22 @@ pub struct TopologyStatus {
     pub enabled: bool,
 }
 
+impl TopologyStatus {
+    /// The empty/never-computed status for a given enabled flag — the
+    /// one literal the production fallback and every test StatusInfo
+    /// construction share (TASK-099 review debt: nine hand-maintained
+    /// copies had to be edited in lockstep when `communities` landed).
+    pub fn empty(enabled: bool) -> Self {
+        TopologyStatus {
+            scored: 0,
+            communities: 0,
+            last_computed: None,
+            stale: false,
+            enabled,
+        }
+    }
+}
+
 /// Format status info as a human-readable string for stderr output.
 pub fn format_status_info(info: &StatusInfo) -> String {
     if !info.indexed {
@@ -3810,13 +3826,7 @@ pub fn query_status_info(
             workspaces,
             workspace_declared,
             workspace_comembers,
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: topology_config.enabled,
-            },
+            topology: TopologyStatus::empty(topology_config.enabled),
             feedback: feedback_status(None, feedback_config, rank_weights, system_secs()),
         };
     };
@@ -6637,13 +6647,7 @@ mod tests {
             workspaces: vec!["payments".to_string(), "platform".to_string()],
             workspace_declared: true,
             workspace_comembers: vec!["repoB".to_string(), "repoC".to_string()],
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6675,13 +6679,7 @@ mod tests {
             workspaces: vec!["lone-api".to_string()],
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6713,13 +6711,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6755,13 +6747,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6790,13 +6776,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6830,13 +6810,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6867,13 +6841,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6902,13 +6870,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,

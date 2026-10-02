@@ -449,19 +449,19 @@ pub fn mine_full(conn: &Connection, repo_root: &Path, opts: &MiningOptions) -> R
 ///     falls back to ONE full re-mine; any git failure warns and returns
 ///     [`RefreshOutcome::Failed`] with the previous data retained
 ///     (PRD-HIST-REQ-008) — never an error.
-pub fn refresh(
-    conn: &Connection,
-    repo_root: &Path,
-    opts: &MiningOptions,
-) -> Result<RefreshOutcome> {
+pub fn refresh(conn: &Connection, repo_root: &Path, opts: &MiningOptions) -> RefreshOutcome {
     if !has_git(repo_root) {
-        return Ok(RefreshOutcome::Skipped);
+        return RefreshOutcome::Skipped;
     }
+    // Never an error: every git failure warns here and degrades to
+    // Failed with the previous data retained (PRD-HIST-REQ-008) — the
+    // Result wrapper only ever returned Ok, so callers' error arms were
+    // dead code (TASK-096 review debt).
     match refresh_inner(conn, repo_root, opts) {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("wonk: history refresh failed, keeping previous data: {e:#}");
-            Ok(RefreshOutcome::Failed)
+            RefreshOutcome::Failed
         }
     }
 }
@@ -840,7 +840,7 @@ mod tests {
         let head = mined_head(&conn);
 
         assert_eq!(
-            refresh(&conn, dir.path(), &opts(10)).unwrap(),
+            refresh(&conn, dir.path(), &opts(10)),
             RefreshOutcome::Unchanged
         );
         assert_eq!(mined_count(&conn), rows);
@@ -875,7 +875,7 @@ mod tests {
         assert!(ok.status.success());
 
         assert_eq!(
-            refresh(&conn, dir.path(), &opts(3)).unwrap(),
+            refresh(&conn, dir.path(), &opts(3)),
             RefreshOutcome::Refreshed(1)
         );
 
@@ -914,7 +914,7 @@ mod tests {
             assert!(ok.status.success());
         }
 
-        let outcome = refresh(&conn, dir.path(), &opts(3)).unwrap();
+        let outcome = refresh(&conn, dir.path(), &opts(3));
         assert!(matches!(outcome, RefreshOutcome::Refreshed(_)));
         assert_eq!(mined_count(&conn), 3, "retained rows must equal the window");
         // Only the newest three commits' files remain in the aggregate.
@@ -935,7 +935,7 @@ mod tests {
         // Corrupt the repository after a good mine.
         std::fs::write(dir.path().join(".git/HEAD"), "garbage\n").unwrap();
         assert_eq!(
-            refresh(&conn, dir.path(), &opts(10)).unwrap(),
+            refresh(&conn, dir.path(), &opts(10)),
             RefreshOutcome::Failed
         );
         assert_eq!(churn_score(&conn, "src/lib.rs"), Some(before));
@@ -965,7 +965,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
         assert_eq!(
-            refresh(&conn, dir.path(), &opts(10)).unwrap(),
+            refresh(&conn, dir.path(), &opts(10)),
             RefreshOutcome::Skipped
         );
         assert_eq!(mined_count(&conn), 0);
@@ -1096,7 +1096,7 @@ mod tests {
         assert!(ok.status.success());
 
         assert_eq!(
-            refresh(&conn, dir.path(), &opts(3)).unwrap(),
+            refresh(&conn, dir.path(), &opts(3)),
             RefreshOutcome::Refreshed(1)
         );
 
@@ -1125,7 +1125,7 @@ mod tests {
         assert!(!before.is_empty());
 
         assert_eq!(
-            refresh(&conn, dir.path(), &opts(10)).unwrap(),
+            refresh(&conn, dir.path(), &opts(10)),
             RefreshOutcome::Unchanged
         );
         assert_eq!(co_change_rows(&conn), before);
