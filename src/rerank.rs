@@ -7398,6 +7398,88 @@ proximity, signature, churn, co_change, hub, authority, community",
     /// The seeded fixture plus `files` rows (the canonical-key source),
     /// topology, churn-authority, reach, and co-change rows keyed by the
     /// REPO-RELATIVE paths the DB stores.
+    /// Captured statement SQL for the cost gate (the duplicates-trace
+    /// pattern, lib-level).
+    static TRACE_SQL: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn trace_stmts(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && let Ok(mut log) = TRACE_SQL.lock()
+        {
+            log.push(sql.to_string());
+        }
+    }
+
+    /// Statements one `rank_and_explain_classed` run issues over `n`
+    /// distinct candidate files, with feedback capture and an optional
+    /// hint on/off.
+    fn count_rank_statements(
+        conn: &Connection,
+        n: usize,
+        capture: bool,
+        hint: Option<&str>,
+    ) -> usize {
+        let results: Vec<crate::search::SearchResult> = (0..n)
+            .map(|i| crate::search::SearchResult {
+                file: std::path::PathBuf::from(format!("src/f{i}.rs")),
+                line: 1,
+                col: 0,
+                content: "fn my_func() {}".to_string(),
+            })
+            .collect();
+        let settings = RankSettings {
+            use_pipeline: true,
+            feedback_capture: capture,
+            working_context: hint.map(str::to_string),
+            ..RankSettings::default()
+        };
+        TRACE_SQL.lock().unwrap().clear();
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_stmts),
+        );
+        let _ = rank_and_explain_classed(&results, Some(conn), "my_func", &settings);
+        conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+        TRACE_SQL.lock().unwrap().len()
+    }
+
+    #[test]
+    fn feedback_capture_prepare_delta_is_fixed_not_per_result() {
+        let (_dir, conn) = descriptive_seeded_conn();
+
+        // The capture on-off delta is a fixed bound at BOTH sizes and the
+        // SAME number at both sizes — batched, never per-result.
+        let small_off = count_rank_statements(&conn, 3, false, None);
+        let small_on = count_rank_statements(&conn, 3, true, None);
+        let large_off = count_rank_statements(&conn, 12, false, None);
+        let large_on = count_rank_statements(&conn, 12, true, None);
+        let small_delta = small_on - small_off;
+        let large_delta = large_on - large_off;
+        assert!(
+            small_delta <= 12 && large_delta <= 12,
+            "capture adds {small_delta}/{large_delta} statements"
+        );
+        assert_eq!(
+            small_delta, large_delta,
+            "the widening is fixed-cost, not per-result"
+        );
+
+        // The hint's loader is a fixed slice too (probe + read per source,
+        // never per-result).
+        let hint_small = count_rank_statements(&conn, 3, true, Some("src/main.rs"));
+        let hint_large = count_rank_statements(&conn, 12, true, Some("src/main.rs"));
+        let hint_delta_small = hint_small - small_on;
+        let hint_delta_large = hint_large - large_on;
+        assert!(
+            hint_delta_small <= 8 && hint_delta_large <= 8,
+            "hint adds {hint_delta_small}/{hint_delta_large} statements"
+        );
+        assert_eq!(
+            hint_delta_small, hint_delta_large,
+            "the hint loader is fixed-cost, not per-result"
+        );
+    }
+
     fn descriptive_seeded_conn() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = seeded_conn();
         for file in ["src/main.rs", "src/other.rs", "src/third.rs"] {

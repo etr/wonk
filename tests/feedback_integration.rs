@@ -47,15 +47,22 @@ def cache_session_token(tok):
     CACHE["session_token"] = tok
 "#;
 
+const MINT_RS: &str = r#"// Token minting for the nested auth module.
+pub fn mint_session_token(user: &User) -> Token {
+    issue_session_token(user)
+}
+"#;
+
 /// A repo with the fixture sources and `[feedback]` config, indexed with
 /// the real pipeline (local `.wonk/index.db`).
 fn feedback_repo(enabled: bool, extra_config: &str) -> (TempDir, PathBuf) {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("fb-repo");
-    fs::create_dir_all(root.join("src")).unwrap();
-    fs::create_dir(root.join("tools")).unwrap();
-    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src/auth/tokens")).unwrap();
+    fs::create_dir_all(root.join("tools")).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
     fs::write(root.join("src/auth.rs"), AUTH_RS).unwrap();
+    fs::write(root.join("src/auth/tokens/mint.rs"), MINT_RS).unwrap();
     fs::write(root.join("tools/parse.py"), PARSE_PY).unwrap();
     fs::create_dir_all(root.join(".wonk")).unwrap();
     fs::write(
@@ -414,6 +421,24 @@ fn reindex_survival_and_retirement() {
     let (code, stdout, stderr) = run_wonk(&root, &["search", "session_token"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     let token = slate_line_of(&stdout);
+    // Report the src/auth.rs member: the retirement edits below target
+    // that file, and rank 1 may live elsewhere in the multi-file fixture.
+    let auth_rank: String = {
+        let conn = open_index(&root);
+        let (_, _, members_json): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT query, query_class, members FROM feedback_slates WHERE token = ?1",
+                [&token],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let members: Vec<Value> = serde_json::from_str(&members_json).unwrap();
+        members
+            .iter()
+            .find(|m| m["file"].as_str().unwrap().ends_with("src/auth.rs"))
+            .map(|m| m["rank"].as_u64().unwrap().to_string())
+            .expect("a src/auth.rs member in the slate")
+    };
     let (code, _, stderr) = run_wonk(
         &root,
         &[
@@ -423,7 +448,7 @@ fn reindex_survival_and_retirement() {
             "--session",
             "s",
             "--useful",
-            "1",
+            &auth_rank,
         ],
     );
     assert_eq!(code, 0, "stderr: {stderr}");
@@ -782,4 +807,487 @@ fn never_transmitted_local_only() {
     assert_eq!(count(&conn, "feedback_events"), 1);
     drop(conn);
     drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-105: result feature extraction acceptance
+// ---------------------------------------------------------------------------
+
+/// The members JSON of the newest slate, parsed.
+fn newest_members(conn: &Connection) -> Vec<Value> {
+    let members: String = conn
+        .query_row(
+            "SELECT members FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&members).unwrap()
+}
+
+/// Seed deterministic history rows (the mine's output shape) post-index.
+fn seed_history(conn: &Connection) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT INTO file_churn (file, score, last_ts, last_author, primary_author) VALUES \
+         ('src/auth.rs', 5.0, ?1, 'Ada', 'Ada'), \
+         ('src/auth/tokens/mint.rs', 12.0, ?2, 'Grace', 'Grace'), \
+         ('tools/parse.py', 0.5, ?3, 'Guido', 'Guido')",
+        rusqlite::params![now - 3600, now - 40 * 24 * 3600, now - 400 * 24 * 3600],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO co_change (file_a, file_b, weight) \
+         VALUES ('src/auth.rs', 'tools/parse.py', 4.0)",
+        [],
+    )
+    .unwrap();
+}
+
+/// The ranked search the dispatch layer would hold, with feedback capture
+/// (and an optional hint) on — the extraction's real input.
+fn ranked_capture(
+    root: &Path,
+    conn: &Connection,
+    query: &str,
+    hint: Option<&str>,
+) -> wonk::rerank::RankedSearch {
+    let root_str = root.display().to_string();
+    let mut results = wonk::search::text_search(query, false, false, &[root_str]).unwrap();
+    for result in &mut results {
+        if let Ok(rel) = result.file.strip_prefix(root) {
+            result.file = rel.to_path_buf();
+        }
+    }
+    let settings = wonk::rerank::RankSettings {
+        use_pipeline: true,
+        feedback_capture: true,
+        working_context: hint.map(str::to_string),
+        ..Default::default()
+    };
+    wonk::rerank::rank_and_explain_classed(&results, Some(conn), query, &settings)
+}
+
+#[test]
+fn nested_result_emits_per_ancestor_features() {
+    let (dir, root) = feedback_repo(true, "");
+    {
+        let conn = open_index(&root);
+        seed_history(&conn);
+    }
+    let (code, stdout, stderr) = run_wonk(&root, &["search", "mint_session_token"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let token = slate_line_of(&stdout);
+    let conn = open_index(&root);
+    let (_, _, members_json): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT query, query_class, members FROM feedback_slates WHERE token = ?1",
+            [&token],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let members: Vec<Value> = serde_json::from_str(&members_json).unwrap();
+    let mint = members
+        .iter()
+        .find(|m| {
+            m["file"]
+                .as_str()
+                .unwrap()
+                .ends_with("src/auth/tokens/mint.rs")
+        })
+        .expect("the nested fixture file is in the slate");
+    let path = mint["groups"]["path"].as_object().unwrap();
+    assert_eq!(path.get("src").and_then(Value::as_str), Some("1"));
+    assert_eq!(path.get("src/auth").and_then(Value::as_str), Some("1"));
+    assert_eq!(
+        path.get("src/auth/tokens").and_then(Value::as_str),
+        Some("1")
+    );
+    assert_eq!(path.get("depth").and_then(Value::as_str), Some("mid"));
+    assert_eq!(path.get("class").and_then(Value::as_str), Some("ordinary"));
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn recorded_continuous_values_are_labels_not_numbers() {
+    let (dir, root) = feedback_repo(true, "");
+    {
+        let conn = open_index(&root);
+        seed_history(&conn);
+    }
+    let (code, _, stderr) = run_wonk(&root, &["search", "session_token"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let conn = open_index(&root);
+    for member in newest_members(&conn) {
+        let groups = &member["groups"];
+        let file = member["file"].as_str().unwrap();
+        for group in ["history", "graph"] {
+            for (name, value) in groups[group].as_object().into_iter().flatten() {
+                let label = value.as_str().unwrap();
+                assert!(
+                    !label.chars().any(|c| c.is_ascii_digit()),
+                    "{file} {group}.{name} leaked a raw value: {label}"
+                );
+            }
+        }
+        if let Some(body) = groups["symbol"]["body_size"].as_str() {
+            assert!(!body.chars().any(|c| c.is_ascii_digit()), "{file}: {body}");
+        }
+        // The seeded history is present with the expected buckets.
+        if file.ends_with("src/auth/tokens/mint.rs") {
+            assert_eq!(groups["history"]["churn"].as_str(), Some("high"));
+            assert_eq!(groups["history"]["recency"].as_str(), Some("months"));
+            assert_eq!(groups["author"]["primary"].as_str(), Some("Grace"));
+        }
+    }
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn high_cardinality_authors_collapse_into_overflow_in_stored_slate() {
+    let (dir, root) = feedback_repo(true, "");
+    // 40 more files under distinct directories, one distinct author each.
+    for i in 0..40 {
+        let file = format!("gen{i:02}/file.rs");
+        fs::create_dir_all(root.join(&file).parent().unwrap()).unwrap();
+        fs::write(
+            root.join(&file),
+            format!("pub fn gen_{i}_helper() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+    wonk::pipeline::build_index(&root, true).unwrap();
+    {
+        let conn = open_index(&root);
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO file_churn (file, score, last_ts, last_author, primary_author) \
+                 VALUES (?1, 1.0, 100, ?2, ?2)",
+                rusqlite::params![format!("gen{i:02}/file.rs"), format!("Author{i:02}")],
+            )
+            .unwrap();
+        }
+    }
+    let (code, _, stderr) = run_wonk(&root, &["search", "--smart", "gen_.*_helper", "--regex"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let conn = open_index(&root);
+    let members = newest_members(&conn);
+    let primaries: Vec<&str> = members
+        .iter()
+        .filter_map(|m| m["groups"]["author"]["primary"].as_str())
+        .collect();
+    let kept = primaries.iter().filter(|p| **p != "__overflow__").count();
+    let overflowed = primaries.iter().filter(|p| **p == "__overflow__").count();
+    assert!(kept <= 32, "{kept} distinct labels survive the cap");
+    assert!(
+        overflowed >= 8,
+        "the beyond-cap values collapse: {overflowed}"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn context_hint_present_vs_absent_cli() {
+    let (dir, root) = feedback_repo(true, "");
+    {
+        let conn = open_index(&root);
+        seed_history(&conn);
+    }
+    // With the hint: members of the hinted file carry same_file=yes and
+    // the co-change bucket against the hint's partners.
+    let (code, stdout, stderr) = run_wonk(
+        &root,
+        &["search", "--context", "src/auth.rs", "session_token"],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let token = slate_line_of(&stdout);
+    let conn = open_index(&root);
+    let (_, _, members_json): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT query, query_class, members FROM feedback_slates WHERE token = ?1",
+            [&token],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let members: Vec<Value> = serde_json::from_str(&members_json).unwrap();
+    let auth_members: Vec<&Value> = members
+        .iter()
+        .filter(|m| m["file"].as_str().unwrap().ends_with("src/auth.rs"))
+        .collect();
+    assert!(!auth_members.is_empty());
+    for member in &auth_members {
+        assert_eq!(
+            member["groups"]["context"]["same_file"].as_str(),
+            Some("yes"),
+            "{}",
+            member
+        );
+        // tools/parse.py co-changes with the hint at weight 4.0: strong.
+    }
+    let partner = members
+        .iter()
+        .find(|m| m["file"].as_str().unwrap().ends_with("tools/parse.py"))
+        .expect("partner file in slate");
+    assert_eq!(
+        partner["groups"]["context"]["co_change"].as_str(),
+        Some("strong"),
+        "{}",
+        partner
+    );
+    assert_eq!(
+        partner["groups"]["context"]["same_file"].as_str(),
+        Some("no")
+    );
+    drop(conn);
+
+    // Without the hint: the context key is absent, not defaulted.
+    let (code, stdout, stderr) = run_wonk(&root, &["search", "session_token"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let token = slate_line_of(&stdout);
+    let conn = open_index(&root);
+    let (_, _, members_json): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT query, query_class, members FROM feedback_slates WHERE token = ?1",
+            [&token],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(
+        !members_json.contains("\"context\""),
+        "absent rather than defaulted: {members_json}"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn author_features_off_records_no_author_group_cli() {
+    let (dir, root) = feedback_repo(true, "author_features = false\n");
+    {
+        let conn = open_index(&root);
+        seed_history(&conn);
+    }
+    let (code, _, stderr) = run_wonk(&root, &["search", "session_token"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let conn = open_index(&root);
+    let members_json: String = conn
+        .query_row(
+            "SELECT members FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !members_json.contains("\"author\""),
+        "switch off removes the group: {}",
+        &members_json[..200.min(members_json.len())]
+    );
+    // Every other descriptive group still records.
+    let members: Vec<Value> = serde_json::from_str(&members_json).unwrap();
+    assert!(members.iter().all(|m| {
+        m["groups"]["path"]
+            .as_object()
+            .is_some_and(|p| !p.is_empty())
+    }));
+    drop(conn);
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-105 action item 8: no query-time round trips beyond the batched
+// prepare (the ac_no_body_reads_at_query_time trace pattern)
+// ---------------------------------------------------------------------------
+
+static TRACE_SQL: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn trace_stmts(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+        && let Ok(mut log) = TRACE_SQL.lock()
+    {
+        log.push(sql.to_string());
+    }
+}
+
+#[test]
+fn slate_build_reads_only_symbols_and_writes_only_slates() {
+    let (dir, root) = feedback_repo(true, "");
+    let conn = open_index(&root);
+    seed_history(&conn);
+    let ranked = ranked_capture(&root, &conn, "session_token", None);
+    assert!(!ranked.context.churn_score("src/auth.rs").is_none());
+
+    TRACE_SQL.lock().unwrap().clear();
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(trace_stmts),
+    );
+    let stored =
+        feedback::build_and_store_slate(&conn, "session_token", &ranked, &Default::default())
+            .unwrap();
+    conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+    assert!(!stored.members.is_empty(), "the slate stored");
+
+    let statements = TRACE_SQL.lock().unwrap().clone();
+    assert!(!statements.is_empty());
+    for stmt in &statements {
+        let lowered = stmt.to_lowercase();
+        let touches_symbols = lowered.contains("from symbols");
+        let touches_slates = lowered.contains("feedback_slates");
+        let is_txn = lowered.starts_with("begin") || lowered.starts_with("commit");
+        assert!(
+            touches_symbols || touches_slates || is_txn,
+            "slate build statement beyond the prepare: {stmt}"
+        );
+        for forbidden in [
+            "file_churn",
+            "co_change",
+            "symbol_topology",
+            "reach",
+            "\"references\"",
+            "embeddings",
+            "term_stats",
+        ] {
+            assert!(
+                !lowered.contains(forbidden),
+                "slate build re-read {forbidden}: {stmt}"
+            );
+        }
+    }
+    drop(conn);
+    drop(dir);
+}
+
+#[test]
+fn mcp_context_file_feeds_context_features() {
+    let (dir, root) = feedback_repo(true, "");
+    let hash_dir = centralize_index(&dir, &root);
+    // The serve subprocess resolves the central copy: seed the history
+    // facts there so co-change/churn context exists over MCP too.
+    {
+        let conn = db::open(&hash_dir.join("index.db")).unwrap();
+        seed_history(&conn);
+    }
+
+    let mut child = spawn_mcp(&root, &dir.path().join("home"));
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    mcp_call(
+        &mut stdin,
+        &mut reader,
+        1,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "0"}}
+        }),
+    );
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .unwrap();
+    stdin.flush().unwrap();
+
+    // With the hint: the hinted file's members carry same_file=yes, and
+    // the co-change partner carries its bucket — over ABSOLUTE result
+    // paths (the MCP shape the canonical file keys exist for).
+    let search = mcp_call(
+        &mut stdin,
+        &mut reader,
+        2,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "wonk_search",
+                       "arguments": {"query": "session_token", "format": "json",
+                                     "context_file": "src/auth.rs"}}
+        }),
+    );
+    assert!(
+        !search["result"]["isError"].as_bool().unwrap_or(false),
+        "{search}"
+    );
+    let rows: Vec<Value> =
+        serde_json::from_str(search["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let slate = rows[0]["slate"].as_str().unwrap().to_string();
+
+    let conn = db::open(&hash_dir.join("index.db")).unwrap();
+    let (_, _, members_json): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT query, query_class, members FROM feedback_slates WHERE token = ?1",
+            [&slate],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let members: Vec<Value> = serde_json::from_str(&members_json).unwrap();
+    let auth_members: Vec<&Value> = members
+        .iter()
+        .filter(|m| m["file"].as_str().unwrap().ends_with("src/auth.rs"))
+        .collect();
+    assert!(!auth_members.is_empty(), "absolute-path members recorded");
+    for member in &auth_members {
+        assert_eq!(
+            member["groups"]["context"]["same_file"].as_str(),
+            Some("yes"),
+            "{}",
+            member
+        );
+        // The MCP members also carry the descriptive groups the canonical
+        // keys make possible (the latent-gap fix working end to end).
+        assert!(
+            member["groups"]["history"]
+                .as_object()
+                .is_some_and(|h| !h.is_empty())
+        );
+    }
+    let partner = members
+        .iter()
+        .find(|m| m["file"].as_str().unwrap().ends_with("tools/parse.py"))
+        .expect("partner file in slate");
+    assert_eq!(
+        partner["groups"]["context"]["co_change"].as_str(),
+        Some("strong"),
+        "{}",
+        partner
+    );
+    drop(conn);
+
+    // Without the argument: the context key is absent, not defaulted.
+    let plain = mcp_call(
+        &mut stdin,
+        &mut reader,
+        3,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "wonk_search",
+                       "arguments": {"query": "session_token", "format": "json"}}
+        }),
+    );
+    assert!(
+        !plain["result"]["isError"].as_bool().unwrap_or(false),
+        "{plain}"
+    );
+    let rows: Vec<Value> =
+        serde_json::from_str(plain["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let slate = rows[0]["slate"].as_str().unwrap().to_string();
+    let conn = db::open(&hash_dir.join("index.db")).unwrap();
+    let members_json: String = conn
+        .query_row(
+            "SELECT members FROM feedback_slates WHERE token = ?1",
+            [&slate],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !members_json.contains("\"context\""),
+        "absent rather than defaulted: {}",
+        &members_json[..300.min(members_json.len())]
+    );
+
+    drop(stdin);
+    let _ = child.wait();
 }
