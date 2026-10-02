@@ -479,6 +479,29 @@ fn tool_definitions() -> &'static Vec<Tool> {
                 }),
             },
             Tool {
+                name: "wonk_feedback",
+                description: "Report which search results were useful. Call ONCE per search you are giving feedback on: pass the slate token from the search results and the identities (or 1-based ranks) of the useful results. The full ranked slate is recorded from wonk's own search state. Requires [feedback] enabled = true in .wonk/config.toml.",
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "slate": {
+                            "type": "string",
+                            "description": "Slate token from the search output"
+                        },
+                        "useful": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Identities (64-hex) or 1-based ranks of results that were useful, non-empty"
+                        },
+                        "session": {
+                            "type": "string",
+                            "description": "Stable id for your current session/conversation (distinct sessions are counted separately)"
+                        }
+                    },
+                    "required": ["slate", "useful", "session"]
+                }),
+            },
+            Tool {
                 name: "wonk_sym",
                 description: "Find symbol definitions by name. Returns kind, file, line, and signature. Faster and more precise than Grep for 'where is X defined' questions.",
                 input_schema: serde_json::json!({
@@ -1484,7 +1507,8 @@ impl McpServer {
                  - Text search: wonk_search (keyword/regex, ranked, definitions first)\n\
                  - Pagination: use page=N to read more results; read only the minimum necessary\n\
                  - Service contracts / cross-repo API impact: wonk_contracts (kind/role filters; orphans=true, links=true)\n\
-                 - Review a diff before committing: wonk_review (scope/since; returns findings + BLOCK/REVIEW/APPROVE verdict; cross-repo contract impact included; findings only, no posting/auto-fix)",
+                 - Review a diff before committing: wonk_review (scope/since; returns findings + BLOCK/REVIEW/APPROVE verdict; cross-repo contract impact included; findings only, no posting/auto-fix)\n\
+                 - Report useful results: wonk_feedback (slate token + identities/ranks from wonk_search output; once per search; requires [feedback] enabled in .wonk/config.toml)",
             ),
         })
         .expect("serialize InitializeResult")
@@ -1507,6 +1531,7 @@ impl McpServer {
 
         let result = match call.name.as_str() {
             "wonk_search" => self.tool_search(call.arguments),
+            "wonk_feedback" => self.tool_feedback(call.arguments),
             "wonk_sym" => self.tool_sym(call.arguments),
             "wonk_ref" => self.tool_ref(call.arguments),
             "wonk_sig" => self.tool_sig(call.arguments),
@@ -1635,12 +1660,14 @@ impl McpServer {
         }
 
         // Config-gated pipeline (REQ-017); no why parameter over MCP in
-        // TASK-092 — rows are unchanged either way.
+        // TASK-092 — rows are unchanged either way. [feedback] enabled
+        // opts the search into the pipeline (TASK-101): a legacy-path
+        // slate carries no contributions to learn from.
         let config = match crate::config::Config::load(Some(&repo_root)) {
             Ok(c) => c,
             Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
         };
-        let settings = match crate::rerank::RankSettings::from_config(
+        let mut settings = match crate::rerank::RankSettings::from_config(
             &config.rank,
             &config.search,
             config.embedding.provider,
@@ -1651,11 +1678,25 @@ impl McpServer {
             Ok(s) => s,
             Err(e) => return CallToolResult::error(format!("rank config invalid: {e}")),
         };
+        settings.use_pipeline |= config.feedback.enabled;
         let ranked =
             crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
         // Best-effort REQ-003 memo: persist the pairs the novelty pass
         // compared anyway; a failure degrades, never fails the tool call.
         crate::shingles::record_pairs_best_effort(ranker_conn, &ranked.near_duplicates);
+        // Feedback slate capture (TASK-101): best-effort, gated by
+        // [feedback] enabled; rows carry the token and identities.
+        let stored_slate =
+            crate::router::record_slate_best_effort(ranker_conn, &query, &ranked, &config.feedback);
+        let identity_of = stored_slate
+            .as_ref()
+            .map(|s| {
+                s.members
+                    .iter()
+                    .map(|m| ((m.file.clone(), m.line), m.identity.clone()))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
 
         let mut budget = budget_limit.map(|limit| {
             if let Some(p) = page {
@@ -1677,6 +1718,15 @@ impl McpServer {
                 );
                 out.annotation = item.classified.annotation.clone();
                 out.query_class = ranked.query_class.map(|c| c.as_str().to_string());
+                if let Some(slate) = stored_slate.as_ref() {
+                    out.slate = Some(slate.token.clone());
+                    out.identity = identity_of
+                        .get(&(
+                            item.classified.result.file.to_string_lossy().into_owned(),
+                            item.classified.result.line,
+                        ))
+                        .cloned();
+                }
 
                 if let Some(ref mut b) = budget {
                     let estimate = (out.file.len() + out.content.len() + 20) / 4;
@@ -1716,6 +1766,56 @@ impl McpServer {
             format_result(&wrapper, format)
         } else {
             format_result(&outputs, format)
+        }
+    }
+
+    /// `wonk_feedback` (TASK-101, PRD-FB-REQ-003): record which results of
+    /// a persisted slate were useful. The vectors come from wonk's own
+    /// store — the call passes only the slate token, the useful
+    /// identities/ranks, and a session id.
+    fn tool_feedback(&mut self, args: Value) -> CallToolResult {
+        let slate = match require_str(&args, "slate") {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let session = match require_str(&args, "session") {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let useful: Vec<String> = match args.get("useful") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => {
+                return CallToolResult::error(
+                    "useful must be a non-empty array of identities (64-hex) or 1-based ranks"
+                        .into(),
+                );
+            }
+        };
+
+        let (conn, repo_root) = match self.resolve_repo(&args) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        let config = match crate::config::Config::load(Some(&repo_root)) {
+            Ok(c) => c,
+            Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
+        };
+        if !config.feedback.enabled {
+            return CallToolResult::error(
+                "feedback capture is disabled; set [feedback] enabled = true in .wonk/config.toml"
+                    .into(),
+            );
+        }
+        // Pre-TASK-101 indexes migrate instead of erroring.
+        if let Err(e) = crate::db::ensure_feedback_tables(conn) {
+            return CallToolResult::error(format!("feedback schema migration failed: {e}"));
+        }
+        match crate::feedback::record_feedback(conn, &slate, &useful, &session) {
+            Ok(summary) => format_result(&summary, OutputFormat::Json),
+            Err(e) => CallToolResult::error(format!("{e:#}")),
         }
     }
 
@@ -3867,7 +3967,7 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 25);
     }
 
     // -- wonk_review tests (TASK-086) ------------------------------------------
@@ -4448,11 +4548,11 @@ mod tests {
     // -- Callers/Callees MCP tests -------------------------------------------
 
     #[test]
-    fn tools_list_returns_twenty_four_tools() {
+    fn tools_list_returns_twenty_five_tools() {
         let server = test_server();
         let result = server.handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 25);
     }
 
     #[test]
@@ -5721,5 +5821,193 @@ mod tests {
             !text.contains("unknown tool"),
             "wonk_update should dispatch correctly, got: {text}"
         );
+    }
+
+    // -- wonk_feedback (TASK-101) ----------------------------------------------
+
+    const FB_SRC: &str = "pub fn login_handler(user: &User, store: &mut Store) -> Result<Token, Error> {\n    let found = store.by_email(&user.email)?;\n    if found.is_none() {\n        return Err(Error::NoUser);\n    }\n    Ok(Token::mint(&found))\n}\n\npub fn audit_note() -> String {\n    \"login_handler mints tokens\".to_string()\n}\n";
+
+    /// An indexed repo rooted at the server's working directory, with
+    /// `[feedback]` per `enabled`.
+    fn feedback_server(enabled: bool) -> (tempfile::TempDir, McpServer) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_dir = dir.path().join("fb-svc");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir(repo_dir.join(".git")).unwrap();
+        std::fs::write(repo_dir.join("auth.rs"), FB_SRC).unwrap();
+        std::fs::create_dir_all(repo_dir.join(".wonk")).unwrap();
+        std::fs::write(
+            repo_dir.join(".wonk/config.toml"),
+            format!("[feedback]\nenabled = {enabled}\n"),
+        )
+        .unwrap();
+        pipeline::build_index(&repo_dir, true).unwrap();
+        let server = McpServer {
+            router: QueryRouter::new(Some(repo_dir), true),
+            registry: RepoRegistry::new(Vec::new()),
+        };
+        (dir, server)
+    }
+
+    /// The first wonk_search result as parsed JSON, plus its slate token.
+    fn feedback_search(server: &mut McpServer, query: &str) -> (Value, Option<String>) {
+        let result = server.handle_tools_call(&serde_json::json!({
+            "name": "wonk_search",
+            "arguments": {"query": query, "format": "json"}
+        }));
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let rows: Value = serde_json::from_str(text).unwrap();
+        let slate = rows[0]["slate"].as_str().map(str::to_string);
+        (rows, slate)
+    }
+
+    fn feedback_slates_count(server: &McpServer) -> i64 {
+        let conn = server.router.conn().expect("index connection");
+        conn.query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn tool_feedback_definition_schema() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_feedback").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        for key in ["slate", "useful", "session"] {
+            assert!(props.contains_key(key), "missing '{key}' property");
+        }
+        let required = tool.input_schema["required"].as_array().unwrap();
+        for key in ["slate", "useful", "session"] {
+            assert!(
+                required.iter().any(|v| v == key),
+                "'{key}' must be required"
+            );
+        }
+        assert!(
+            tool.description.contains("ONCE per search"),
+            "the one-call contract is part of the tool description"
+        );
+    }
+
+    #[test]
+    fn tool_search_stamps_slate_and_identity_only_when_enabled() {
+        let (_dir, mut enabled) = feedback_server(true);
+        let (rows, slate) = feedback_search(&mut enabled, "login_handler");
+        let slate = slate.expect("enabled search echoes a slate token");
+        assert_eq!(slate.len(), 16);
+        assert!(
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["identity"].as_str().is_some()),
+            "every row carries its identity"
+        );
+        assert_eq!(feedback_slates_count(&enabled), 1);
+
+        // Disabled (the default): rows are byte-shaped as before — no
+        // slate, no identity — and nothing is written.
+        let (_dir2, mut disabled) = feedback_server(false);
+        let (rows, slate) = feedback_search(&mut disabled, "login_handler");
+        assert!(slate.is_none(), "default search records nothing");
+        for row in rows.as_array().unwrap() {
+            let obj = row.as_object().unwrap();
+            assert!(!obj.contains_key("slate"), "{row}");
+            assert!(!obj.contains_key("identity"), "{row}");
+        }
+        assert_eq!(feedback_slates_count(&disabled), 0);
+    }
+
+    #[test]
+    fn tool_feedback_one_call_records_events_with_ranks() {
+        let (_dir, mut server) = feedback_server(true);
+        let (rows, slate) = feedback_search(&mut server, "login_handler");
+        let slate = slate.unwrap();
+        let identity = rows[0]["identity"].as_str().unwrap().to_string();
+
+        let result = server.handle_tools_call(&serde_json::json!({
+            "name": "wonk_feedback",
+            "arguments": {"slate": slate, "useful": [identity], "session": "conv-7"}
+        }));
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["recorded"], 1, "{parsed}");
+        assert_eq!(parsed["query"], "login_handler");
+        assert_eq!(parsed["query_class"], "symbol");
+        assert_eq!(parsed["events"][0]["rank"], 1);
+        assert_eq!(parsed["events"][0]["live"], true);
+        assert_eq!(parsed["events"][0]["symbol"], "login_handler");
+
+        // The event carries the FULL slate with ranks and one chosen.
+        let conn = server.router.conn().unwrap();
+        let features: String = conn
+            .query_row("SELECT features FROM feedback_events", [], |r| r.get(0))
+            .unwrap();
+        let v: Value = serde_json::from_str(&features).unwrap();
+        let members = v["members"].as_array().unwrap();
+        assert!(members.len() > 1, "alternatives included: {members:?}");
+        assert!(
+            members
+                .iter()
+                .any(|m| m["chosen"] == true && m["rank"] == 1)
+        );
+        assert!(
+            members
+                .iter()
+                .any(|m| m["chosen"] == false && m["rank"] != 1)
+        );
+    }
+
+    #[test]
+    fn tool_feedback_error_paths() {
+        let (_dir, mut server) = feedback_server(true);
+        let (_, slate) = feedback_search(&mut server, "login_handler");
+        let slate = slate.unwrap();
+
+        let call = |server: &mut McpServer, args: Value| -> String {
+            let result = server.handle_tools_call(&serde_json::json!({
+                "name": "wonk_feedback",
+                "arguments": args
+            }));
+            assert!(result["isError"].as_bool().unwrap_or(false), "{result}");
+            result["content"][0]["text"].as_str().unwrap().to_string()
+        };
+
+        // Unknown slate.
+        let err = call(
+            &mut server,
+            serde_json::json!({"slate": "deadbeefdeadbeef", "useful": ["1"], "session": "s"}),
+        );
+        assert!(err.contains("slate not found"), "{err}");
+
+        // Unknown identity.
+        let err = call(
+            &mut server,
+            serde_json::json!({"slate": slate, "useful": ["f".repeat(64)], "session": "s"}),
+        );
+        assert!(err.contains("not in the slate"), "{err}");
+
+        // Empty useful.
+        let err = call(
+            &mut server,
+            serde_json::json!({"slate": slate, "useful": [], "session": "s"}),
+        );
+        assert!(err.contains("useful"), "{err}");
+
+        // Invalid session.
+        let err = call(
+            &mut server,
+            serde_json::json!({"slate": slate, "useful": ["1"], "session": "  "}),
+        );
+        assert!(err.contains("session"), "{err}");
+
+        // Disabled config: the enable hint.
+        let (_dir2, mut disabled) = feedback_server(false);
+        let err = call(
+            &mut disabled,
+            serde_json::json!({"slate": "x", "useful": ["1"], "session": "s"}),
+        );
+        assert!(err.contains("feedback capture is disabled"), "{err}");
+        assert!(err.contains("[feedback] enabled = true"), "{err}");
     }
 }

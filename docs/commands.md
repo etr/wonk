@@ -37,6 +37,12 @@ wonk search "render" -- src/components/
 | `--query-class <class>` | Pin the query class (`symbol`, `path`, `signature`, `conceptual`), bypassing detection for this invocation. Implies smart ranked mode; conflicts with `--raw` and `--semantic`. The class scales the lexical/semantic blend (see `[rank] class_multipliers`) |
 | `-- <paths>` | Restrict search to specific paths |
 
+When `[feedback] enabled = true` (default off, see
+[Usage feedback](#usage-feedback)), a smart-ranked search also appends one
+trailing `slate: <token>` line after the results — the handle
+`wonk feedback` takes; stdout keeps its grep shape, so the line is
+machine-cuttable. With feedback disabled the output is unchanged.
+
 ### `wonk ask <query>`
 
 Semantic search: find symbols related to a natural language query.
@@ -527,6 +533,55 @@ recorded into the index (`near_duplicates`), alongside the pairs each
 ranked search with a `novelty` weight records best-effort. Text output
 only — the grep-shaped lines are machine-cuttable; JSON is a follow-up.
 
+## Usage feedback
+
+### `wonk feedback`
+
+Report which search results were useful, against the slate that search
+persisted (TASK-101). A smart-ranked search with `[feedback] enabled =
+true` records its full result list — every result's content-anchored
+identity and per-signal contributions — in the per-repo index and echoes
+a `slate:` token (see [Search](#search)); this command marks the useful
+entries so future ranking work can learn from them. Nothing leaves the
+repo's index DB — there is no telemetry path.
+
+```
+wonk feedback --slate 3f9c2a1b8d4e7f60 --useful 1 --session fix-auth
+wonk feedback --slate 3f9c2a1b8d4e7f60 --useful 1,3 --session fix-auth
+wonk feedback --slate 3f9c2a1b8d4e7f60 --useful 2 --useful <identity> --session fix-auth
+```
+
+Sample output:
+
+```
+recorded 2 event(s) against slate 3f9c2a1b8d4e7f60 (query "handleRequest", class symbol)
+rank 1  src/handlers/a.rs:10  handle_user_created  [useful]
+rank 2  src/api.rs:42  handle_request  [useful]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--slate <token>` | Slate token from the search output (`slate:` line or JSON field) |
+| `--useful <ranks-or-identities>` | Results that were useful: 1-based ranks or 64-hex identities; repeatable and comma-separated |
+| `--session <id>` | Stable id for your current session/conversation (distinct sessions are counted separately) |
+
+All three flags are required, and `--useful` must name at least one
+result; a result named twice (by rank and by identity) records once.
+Recording requires `[feedback] enabled = true` in `.wonk/config.toml`
+(otherwise the command fails with `feedback capture is disabled; set
+[feedback] enabled = true in .wonk/config.toml`) and an existing index
+(`wonk init`). A token past its `[feedback] slate_retention` window
+fails with `slate not found (expired or pruned); re-run the search and
+report against the new slate`; an unknown rank or identity fails with a
+`not in the slate` error. Arguments are validated before the first
+write, so a failed call records nothing. Identities anchor on the owning
+symbol's file, kind, name, and signature — they survive body-only edits
+and re-indexing, and retire on renames or signature changes; a retired
+entry is reported at record time as a `note: <identity> no longer
+resolves in the index; the entry will not apply` line.
+`--format json` prints the summary as an object (recorded count, query,
+class, and per-event identity/rank/file/line/symbol/liveness).
+
 ## Semantic
 
 ### `wonk cluster <path>`
@@ -701,6 +756,13 @@ recorded as a `query_class` field on every JSON row so a
 misclassification is diagnosable. `--query-class <class>` pins the class
 explicitly. Setting `[rank] enabled = false` restores the pre-pipeline
 tier ordering byte-for-byte.
+
+With `[feedback] enabled = true` (default off, see
+[Usage feedback](#usage-feedback)), a smart-ranked search additionally
+stamps every JSON row with `slate` (the persisted slate's token) and
+`identity` (the row's content-anchored identity) so an agent can report
+useful results by identity. Both fields are absent when feedback is
+disabled, so disabled JSON output is unchanged.
 
 ## Semantic search
 

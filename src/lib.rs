@@ -14,6 +14,7 @@ pub mod db;
 pub mod elide;
 pub mod embedding;
 pub mod errors;
+pub mod feedback;
 pub mod flows;
 pub mod history;
 pub mod impact;

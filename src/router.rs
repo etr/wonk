@@ -86,6 +86,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     // per file) so `| grep "path/"` filters correctly and `| head -N` limits
     // by file count.  Auto-budget is applied in cli::parse().
     let is_piped = !std::io::IsTerminal::is_terminal(&stdout);
+    // Set when a text-mode search already terminated its output with the
+    // slate line, so the piped-mode final newline below is not doubled.
+    let mut text_slate_written = false;
     let budget_limit = cli.budget;
     let page = cli.page;
     let include_tests = cli.include_tests;
@@ -246,6 +249,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         source: Some(fr.source.to_string()),
                         why: None,
                         query_class: None,
+                        slate: None,
+                        identity: None,
                     };
                     if fmt.format_search_result(&out)? == BudgetStatus::Skipped {
                         truncated += 1;
@@ -271,8 +276,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             config.topology.enabled,
                             config.duplicate.threshold,
                         )?;
-                        // --why opts into the pipeline for this invocation.
-                        settings.use_pipeline |= args.why;
+                        // --why opts into the pipeline for this invocation;
+                        // [feedback] enabled does too (the same
+                        // implication, config-consented — a legacy-path
+                        // slate carries no contributions to learn from).
+                        settings.use_pipeline |= args.why || config.feedback.enabled;
                         let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
@@ -286,6 +294,24 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             conn.as_ref(),
                             &ranked.near_duplicates,
                         );
+                        // Feedback slate capture (TASK-101): the same
+                        // best-effort contract — gated by [feedback]
+                        // enabled, a failure degrades with a warning.
+                        let stored_slate = record_slate_best_effort(
+                            conn.as_ref(),
+                            &args.pattern,
+                            &ranked,
+                            &config.feedback,
+                        );
+                        let identity_of = stored_slate
+                            .as_ref()
+                            .map(|s| {
+                                s.members
+                                    .iter()
+                                    .map(|m| ((m.file.clone(), m.line), m.identity.clone()))
+                                    .collect::<std::collections::HashMap<_, _>>()
+                            })
+                            .unwrap_or_default();
                         // One class line per query, before any why lines
                         // (DR-038): a misclassification is diagnosable from
                         // the breakdown it produced.
@@ -309,6 +335,19 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                 out.annotation = item.classified.annotation.clone();
                                 out.query_class =
                                     ranked.query_class.map(|c| c.as_str().to_string());
+                                if let Some(slate) = stored_slate.as_ref() {
+                                    out.slate = Some(slate.token.clone());
+                                    out.identity = identity_of
+                                        .get(&(
+                                            item.classified
+                                                .result
+                                                .file
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                            item.classified.result.line,
+                                        ))
+                                        .cloned();
+                                }
                                 if args.why {
                                     out.why = Some(crate::output::WhyOutput::from_contributions(
                                         item.score,
@@ -323,6 +362,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                     output::print_why_line(&out.file, out.line, why);
                                 }
                             }
+                        }
+                        // Text mode: one trailing machine-cuttable line
+                        // referencing the slate (JSON rows carry the
+                        // reference in their fields instead). In
+                        // single-line mode the last collapsed row omits
+                        // its newline, so complete it first.
+                        if let Some(slate) = stored_slate.as_ref()
+                            && !format.is_structured()
+                        {
+                            if fmt.is_single_line() {
+                                writeln!(fmt.writer_mut())?;
+                                text_slate_written = true;
+                            }
+                            writeln!(fmt.writer_mut(), "slate: {}", slate.token)?;
                         }
                     }
                     SearchMode::Plain => {
@@ -1946,6 +1999,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Duplicates(args) => {
             dispatch_duplicates(args, &mut fmt, suppress)?;
         }
+        Command::Feedback(args) => {
+            dispatch_feedback(args, &mut fmt, suppress, format)?;
+        }
         Command::Review(args) => {
             dispatch_review(args, &mut fmt, suppress)?;
         }
@@ -1956,7 +2012,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     // trailing newline). Structured formats are exempt: their rows are each
     // newline-terminated already, and appending another would leave a blank
     // line that breaks strict NDJSON consumers.
-    if is_piped && !format.is_structured() {
+    if is_piped && !format.is_structured() && !text_slate_written {
         writeln!(fmt.writer_mut())?;
     }
 
@@ -2500,6 +2556,39 @@ fn dispatch_contracts<W: io::Write>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Feedback slate capture (TASK-101)
+// ---------------------------------------------------------------------------
+
+/// Record the feedback slate for a ranked search, best-effort (TASK-101,
+/// DR-042): gated on `[feedback] enabled`, so a default-config search
+/// writes nothing; a missing connection (grep fallback) is a no-op and a
+/// write failure degrades with a stderr warning, never failing the
+/// search — the `record_pairs_best_effort` contract at the same call
+/// site. Returns the stored slate so rows can carry its token and
+/// identities.
+pub(crate) fn record_slate_best_effort(
+    conn: Option<&Connection>,
+    query: &str,
+    ranked: &crate::rerank::RankedSearch,
+    feedback: &crate::config::FeedbackConfig,
+) -> Option<crate::feedback::StoredSlate> {
+    // Disabled capture records nothing, and a search whose signal
+    // pipeline did not run (`query_class` None, e.g. the legacy path)
+    // would carry no contributions to learn from.
+    if !feedback.enabled || ranked.query_class.is_none() {
+        return None;
+    }
+    let conn = conn?;
+    match crate::feedback::build_and_store_slate(conn, query, ranked, feedback.slate_retention) {
+        Ok(stored) => Some(stored),
+        Err(e) => {
+            eprintln!("warn: could not record feedback slate: {e:#}");
+            None
+        }
+    }
+}
+
 /// Handle `wonk duplicates` dispatch (TASK-100, PRD-DUP-REQ-006): resolve
 /// the repo's index, pick the threshold (CLI override > `[duplicate]`
 /// threshold > 0.85), and print the sweep's groups.
@@ -2529,6 +2618,83 @@ fn dispatch_duplicates<W: io::Write>(
     }
 
     run_duplicates(&conn, threshold, fmt, suppress)
+}
+
+/// Handle `wonk feedback` dispatch (TASK-101, PRD-FB-REQ-003): resolve the
+/// repo's index, enforce the `[feedback]` gate, and record.
+fn dispatch_feedback<W: io::Write>(
+    args: crate::cli::FeedbackArgs,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
+
+    let config = crate::config::Config::load(Some(&repo_root))?;
+    if !config.feedback.enabled {
+        anyhow::bail!(
+            "feedback capture is disabled; set [feedback] enabled = true in .wonk/config.toml"
+        );
+    }
+
+    let conn = db::find_existing_index(&repo_root)
+        .and_then(|path| db::open(&path).ok())
+        .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
+
+    // Pre-TASK-101 indexes migrate instead of erroring (the
+    // `ensure_summaries_table` precedent).
+    db::ensure_feedback_tables(&conn)?;
+
+    run_feedback(&conn, &args, fmt, suppress, format)
+}
+
+/// Record feedback and print the summary. Split from
+/// [`dispatch_feedback`] so tests drive it with a seeded connection
+/// instead of the process working directory.
+fn run_feedback<W: io::Write>(
+    conn: &Connection,
+    args: &crate::cli::FeedbackArgs,
+    fmt: &mut Formatter<W>,
+    _suppress: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let summary = crate::feedback::record_feedback(conn, &args.slate, &args.useful, &args.session)?;
+    if format.is_structured() {
+        let json = serde_json::to_string(&summary)?;
+        writeln!(fmt.writer_mut(), "{json}")?;
+        return Ok(());
+    }
+    let class = summary.query_class.as_deref().unwrap_or("unknown");
+    writeln!(
+        fmt.writer_mut(),
+        "recorded {} event(s) against slate {} (query {:?}, class {})",
+        summary.recorded,
+        args.slate,
+        summary.query,
+        class
+    )?;
+    for event in &summary.events {
+        let symbol = event.symbol.as_deref().unwrap_or("-");
+        writeln!(
+            fmt.writer_mut(),
+            "rank {}  {}:{}  {}  [useful]",
+            event.rank,
+            event.file,
+            event.line,
+            symbol
+        )?;
+        if !event.live {
+            writeln!(
+                fmt.writer_mut(),
+                "note: {} no longer resolves in the index; the entry will not apply",
+                event.identity
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Sweep and print the near-duplicate groups. Split from
@@ -6926,5 +7092,180 @@ mod tests {
         // silently.
         crate::shingles::record_pairs_best_effort(None, &pairs);
         crate::shingles::record_pairs_best_effort(Some(&conn), &[]);
+    }
+
+    // -- feedback slate capture on the search path (TASK-101) -------------------
+
+    /// A one-group ranked search over an indexed fixture file.
+    fn feedback_ranked(conn: &Connection) -> crate::rerank::RankedSearch {
+        crate::rerank::rank_and_explain_classed(
+            &[crate::search::SearchResult {
+                file: std::path::PathBuf::from("a.rs"),
+                line: 1,
+                col: 1,
+                content: "pub fn handle_user_created(".to_string(),
+            }],
+            Some(conn),
+            "handle_user_created",
+            &crate::rerank::RankSettings {
+                use_pipeline: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn feedback_config(enabled: bool) -> crate::config::FeedbackConfig {
+        crate::config::FeedbackConfig {
+            enabled,
+            slate_retention: 64,
+        }
+    }
+
+    fn slate_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM feedback_slates", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn record_slate_best_effort_records_when_enabled() {
+        let (dir, conn) = duplicates_conn();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, DUP_HANDLER).unwrap();
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+        // Reindexing opened its own connection; use a fresh one.
+        drop(conn);
+        let index = crate::db::find_existing_index(dir.path()).unwrap();
+        let conn = crate::db::open(&index).unwrap();
+
+        let ranked = feedback_ranked(&conn);
+        assert!(ranked.query_class.is_some(), "pipeline ran");
+
+        let stored = record_slate_best_effort(
+            Some(&conn),
+            "handle_user_created",
+            &ranked,
+            &feedback_config(true),
+        );
+        assert!(stored.is_some(), "enabled search records a slate");
+        let stored = stored.unwrap();
+        assert_eq!(stored.token.len(), 16);
+        assert!(!stored.members.is_empty());
+        assert_eq!(slate_count(&conn), 1);
+    }
+
+    #[test]
+    fn record_slate_best_effort_noop_when_disabled_or_connless() {
+        let (dir, conn) = duplicates_conn();
+        let ranked = feedback_ranked(&conn);
+
+        // Disabled (the default): nothing written, nothing returned.
+        assert!(
+            record_slate_best_effort(Some(&conn), "q", &ranked, &feedback_config(false)).is_none()
+        );
+        assert_eq!(slate_count(&conn), 0, "default config writes nothing");
+
+        // Enabled but no connection (grep fallback search): silent no-op.
+        assert!(record_slate_best_effort(None, "q", &ranked, &feedback_config(true)).is_none());
+        assert_eq!(slate_count(&conn), 0);
+        drop(dir);
+    }
+
+    // -- `wonk feedback` (TASK-101) ---------------------------------------------
+
+    /// A real tempdir repo indexed with the fixture, and a stored slate
+    /// from the enabled capture path.
+    fn feedback_repo_with_slate() -> (TempDir, Connection, String) {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("a.rs"), DUP_HANDLER).unwrap();
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+        let index = crate::db::find_existing_index(dir.path()).unwrap();
+        let conn = crate::db::open(&index).unwrap();
+        let ranked = feedback_ranked(&conn);
+        let token = record_slate_best_effort(
+            Some(&conn),
+            "handle_user_created",
+            &ranked,
+            &feedback_config(true),
+        )
+        .unwrap()
+        .token;
+        (dir, conn, token)
+    }
+
+    fn feedback_args(slate: &str, useful: &[&str]) -> crate::cli::FeedbackArgs {
+        crate::cli::FeedbackArgs {
+            slate: slate.to_string(),
+            session: "conv-1".to_string(),
+            useful: useful.iter().map(|u| u.to_string()).collect(),
+        }
+    }
+
+    fn run_fb(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
+        let mut buf = Vec::new();
+        let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
+        run_feedback(conn, args, &mut fmt, true, OutputFormat::Grep).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn feedback_event_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM feedback_events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn run_feedback_records_and_prints_summary() {
+        let (dir, conn, token) = feedback_repo_with_slate();
+        let out = run_fb(&conn, &feedback_args(&token, &["1"]));
+        assert_eq!(feedback_event_count(&conn), 1);
+        assert!(
+            out.contains(&format!("recorded 1 event(s) against slate {token}")),
+            "summary line: {out}"
+        );
+        assert!(
+            out.contains("(query \"handle_user_created\", class symbol)"),
+            "summary carries the query and class: {out}"
+        );
+        assert!(
+            out.contains("rank 1  a.rs:1  handle_user_created"),
+            "per-event line: {out}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_notes_dead_identity() {
+        let (dir, conn, token) = feedback_repo_with_slate();
+        // Retire the recorded identity: rename the symbol and re-index.
+        let retired = DUP_HANDLER.replace("handle_user_created", "handle_user_renamed");
+        std::fs::write(dir.path().join("a.rs"), retired).unwrap();
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+
+        let out = run_fb(&conn, &feedback_args(&token, &["1"]));
+        assert_eq!(feedback_event_count(&conn), 1, "history is honest");
+        assert!(
+            out.contains("no longer resolves in the index"),
+            "dead-identity note: {out}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_errors_on_unknown_slate() {
+        let (dir, conn, _token) = feedback_repo_with_slate();
+        let mut buf = Vec::new();
+        let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
+        let err = run_feedback(
+            &conn,
+            &feedback_args("deadbeefdeadbeef", &["1"]),
+            &mut fmt,
+            true,
+            OutputFormat::Grep,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("slate not found"), "{err}");
+        assert_eq!(feedback_event_count(&conn), 0);
+        drop(dir);
     }
 }

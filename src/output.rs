@@ -72,6 +72,14 @@ pub struct SearchOutput {
     /// (TASK-095, DR-038); absent on legacy rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_class: Option<String>,
+    /// Feedback slate token recorded for this search (TASK-101); absent
+    /// when `[feedback]` is disabled (the default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slate: Option<String>,
+    /// Content-anchored identity of this result (TASK-101); absent when
+    /// no slate was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 /// The per-result scoring breakdown shown by `wonk search --why`
@@ -1149,6 +1157,8 @@ impl SearchOutput {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         }
     }
 }
@@ -1203,6 +1213,11 @@ impl<W: Write> Formatter<W> {
     /// Results from the same file are joined with ` ; `, results from
     /// different files get separate lines. Structured formats ignore this
     /// mode and always emit one newline-terminated line per row.
+    /// Whether single-line (piped grep) emit mode is on.
+    pub fn is_single_line(&self) -> bool {
+        self.single_line
+    }
+
     pub fn set_single_line(&mut self, enabled: bool) {
         self.single_line = enabled;
     }
@@ -2747,6 +2762,8 @@ mod tests {
                 }],
             }),
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(
@@ -2792,6 +2809,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -2808,6 +2827,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -2830,6 +2851,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             },
             SearchOutput {
                 file: "src/a.rs".into(),
@@ -2840,6 +2863,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             },
         ];
         let mut buf = Vec::new();
@@ -3075,6 +3100,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
@@ -3085,6 +3112,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             },
         ];
         let out = render(OutputFormat::Json, |fmt| {
@@ -3113,6 +3142,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             },
             SearchOutput {
                 file: "b.rs".into(),
@@ -3123,6 +3154,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             },
         ];
         let out = render(OutputFormat::Grep, |fmt| {
@@ -3162,6 +3195,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}  (+3 other locations)\n");
@@ -3178,6 +3213,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/lib.rs:10:pub fn foo() {}\n");
@@ -3194,6 +3231,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -3211,6 +3250,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         assert!(!out.contains("annotation"));
@@ -3229,6 +3270,8 @@ mod tests {
             source: Some("structural".into()),
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -3246,6 +3289,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         assert!(!out.contains("source"));
@@ -3256,6 +3301,53 @@ mod tests {
         let path = std::path::PathBuf::from("src/foo.rs");
         let out = SearchOutput::from_search_result(&path, 10, 3, "let x = 1;");
         assert!(out.source.is_none());
+    }
+
+    // -- SearchOutput slate/identity fields (TASK-101) ------------------------
+
+    #[test]
+    fn search_result_json_skips_slate_and_identity_when_none() {
+        let result = SearchOutput {
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 1,
+            content: "pub fn foo() {}".into(),
+            annotation: None,
+            source: None,
+            why: None,
+            query_class: None,
+            slate: None,
+            identity: None,
+        };
+        let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
+        assert!(
+            !out.contains("slate"),
+            "default rows stay byte-shaped: {out}"
+        );
+        assert!(
+            !out.contains("identity"),
+            "default rows stay byte-shaped: {out}"
+        );
+    }
+
+    #[test]
+    fn search_result_json_carries_slate_and_identity_when_set() {
+        let result = SearchOutput {
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 1,
+            content: "pub fn foo() {}".into(),
+            annotation: None,
+            source: None,
+            why: None,
+            query_class: None,
+            slate: Some("4f3ea1b2c3d4e5f6".into()),
+            identity: Some("a".repeat(64)),
+        };
+        let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["slate"], "4f3ea1b2c3d4e5f6");
+        assert_eq!(v["identity"], "a".repeat(64));
     }
 
     // -- Content with special characters ------------------------------------
@@ -3271,6 +3363,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         // Grep format: file:line:content (colons in content are fine)
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
@@ -3288,6 +3382,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Json, |fmt| fmt.format_search_result(&result));
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
@@ -3336,6 +3432,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Grep, |fmt| fmt.format_search_result(&result));
         assert_eq!(out, "src/main.rs:42:fn main() {}\n");
@@ -3352,6 +3450,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // File path should be wrapped in magenta+bold
@@ -3376,6 +3476,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Line number should be wrapped in green
@@ -3400,6 +3502,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render_color(|fmt| fmt.format_search_result(&result));
         // Separator should be wrapped in cyan
@@ -3420,6 +3524,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let mut buf = Vec::new();
         {
@@ -3444,6 +3550,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let mut buf = Vec::new();
         {
@@ -3470,6 +3578,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let mut buf = Vec::new();
         {
@@ -3496,6 +3606,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let mut buf = Vec::new();
         {
@@ -3615,6 +3727,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             })
             .collect();
 
@@ -3656,6 +3770,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             })
             .collect();
 
@@ -3706,6 +3822,8 @@ mod tests {
                 source: None,
                 why: None,
                 query_class: None,
+                slate: None,
+                identity: None,
             })
             .collect();
 
@@ -3741,6 +3859,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         fmt.format_search_result(&r).unwrap();
         assert!(fmt.budget_used() > 0);
@@ -3792,6 +3912,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let mut buf = Vec::new();
         {
@@ -3846,6 +3968,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let out = render(OutputFormat::Toon, |fmt| fmt.format_search_result(&result));
         assert!(!out.is_empty());
@@ -3938,6 +4062,8 @@ mod tests {
             source: None,
             why: None,
             query_class: None,
+            slate: None,
+            identity: None,
         };
         let mut buf = Vec::new();
         {
