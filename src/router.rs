@@ -281,6 +281,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // implication, config-consented — a legacy-path
                         // slate carries no contributions to learn from).
                         settings.use_pipeline |= args.why || config.feedback.enabled;
+                        // Feedback capture (TASK-105): widen the prepared
+                        // slices and thread the optional working-context
+                        // hint (--context) into the slate's features; the
+                        // hint never affects ranking.
+                        settings.feedback_capture = config.feedback.enabled;
+                        settings.working_context = args.context.clone();
                         let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
@@ -6143,6 +6149,7 @@ mod tests {
             semantic: false,
             why: false,
             query_class: None,
+            context: None,
             file: None,
             paths: vec![],
         });

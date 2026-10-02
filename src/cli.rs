@@ -177,6 +177,11 @@ pub struct SearchArgs {
     #[arg(long, value_enum, conflicts_with_all = ["raw", "semantic"])]
     pub query_class: Option<crate::rerank::QueryClass>,
 
+    /// The file you are currently working in (feeds context-relative
+    /// feedback features; never affects ranking)
+    #[arg(long, value_name = "PATH")]
+    pub context: Option<String>,
+
     /// Restrict search to files matching this path (substring match)
     #[arg(short = 'f', long)]
     pub file: Option<String>,
@@ -744,6 +749,24 @@ mod tests {
         let cli = Cli::try_parse_from(["wonk", "search", "foo"]).unwrap();
         match cli.command {
             Command::Search(args) => assert_eq!(args.query_class, None),
+            _ => panic!("expected Command::Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_context_flag() {
+        let cli =
+            Cli::try_parse_from(["wonk", "search", "foo", "--context", "src/auth.rs"]).unwrap();
+        match cli.command {
+            Command::Search(args) => {
+                assert_eq!(args.context.as_deref(), Some("src/auth.rs"));
+            }
+            _ => panic!("expected Command::Search"),
+        }
+        // Absent by default.
+        let cli = Cli::try_parse_from(["wonk", "search", "foo"]).unwrap();
+        match cli.command {
+            Command::Search(args) => assert_eq!(args.context, None),
             _ => panic!("expected Command::Search"),
         }
     }

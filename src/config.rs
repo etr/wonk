@@ -548,6 +548,7 @@ struct DuplicateOverlay {
 struct FeedbackOverlay {
     enabled: Option<bool>,
     slate_retention: Option<usize>,
+    author_features: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -815,6 +816,9 @@ impl Config {
             }
             if let Some(v) = feedback.slate_retention {
                 self.feedback.slate_retention = v;
+            }
+            if let Some(v) = feedback.author_features {
+                self.feedback.author_features = v;
             }
             if self.feedback.slate_retention == 0 {
                 anyhow::bail!(
@@ -1461,6 +1465,32 @@ slate_retention = 8
                 author_features: true
             }
         );
+    }
+
+    #[test]
+    fn feedback_author_features_parsed_and_layered() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[feedback]
+author_features = false
+"#,
+        );
+        let config = env.load().unwrap();
+        assert!(!config.feedback.author_features, "repo layer");
+        assert!(!config.feedback.enabled, "untouched sibling");
+
+        // Layered: a global value holds where the repo layer is silent.
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_global_config(
+            r#"
+[feedback]
+author_features = false
+"#,
+        );
+        assert!(!env.load().unwrap().feedback.author_features);
     }
 
     #[test]

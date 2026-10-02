@@ -35,6 +35,7 @@ wonk search "render" -- src/components/
 | `--semantic` | Blend structural results with embedding-based semantic results (RRF fusion) |
 | `--why` | Explain each result's ranking: per-signal contributions and the final score. Implies smart ranked mode through the signal pipeline; conflicts with `--raw` and `--semantic`. The breakdown is printed to stderr (one `why:` line per result, so stdout stays pipe-clean) and embedded as a `why` object per row in `--format json` |
 | `--query-class <class>` | Pin the query class (`symbol`, `path`, `signature`, `conceptual`), bypassing detection for this invocation. Implies smart ranked mode; conflicts with `--raw` and `--semantic`. The class scales the lexical/semantic blend (see `[rank] class_multipliers`) |
+| `--context <PATH>` | The file you are currently working in. Feeds the context-relative features of the recorded feedback slate (same file, same directory, same community, import distance, co-change) when `[feedback]` is enabled; never affects ranking. Absent by default — the context features are absent rather than defaulted |
 | `-- <paths>` | Restrict search to specific paths |
 
 When `[feedback] enabled = true` (default off, see
