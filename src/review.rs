@@ -357,8 +357,9 @@ pub fn rank_filter_cap(
 
 /// Collapse every whitespace run to a single space and trim, so re-indenting
 /// or reflowing a line leaves the identity untouched while any token change
-/// still alters it (AR-031).
-fn fold_whitespace(text: &str) -> String {
+/// still alters it (AR-031). Shared with `feedback.rs`'s result identities —
+/// one folding definition across review and feedback.
+pub(crate) fn fold_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
