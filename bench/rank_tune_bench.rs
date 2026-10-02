@@ -417,6 +417,7 @@ fn main() -> Result<()> {
     {
         let settings = RankSettings {
             use_pipeline: true,
+            feedback_free: true,
             weights: candidates[0].weights.clone(),
             class_multipliers: candidates[0].multipliers,
             ..Default::default()
@@ -437,6 +438,7 @@ fn main() -> Result<()> {
     for candidate in &candidates {
         let settings = RankSettings {
             use_pipeline: true,
+            feedback_free: true,
             weights: candidate.weights.clone(),
             class_multipliers: candidate.multipliers,
             ..Default::default()

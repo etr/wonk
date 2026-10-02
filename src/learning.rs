@@ -670,6 +670,57 @@ pub fn list_learned(
         .collect())
 }
 
+/// Reset ALL learned weights to their configured defaults (TASK-103,
+/// PRD-FB-REQ-013): every `learned_weights` row goes, and the
+/// `learned_weight_sessions` bookkeeping goes WITH it — otherwise the
+/// `INSERT OR IGNORE` session counter would report "already exists"
+/// forever after and re-learning could never re-clear the
+/// `learn_min_sessions` gate. Event history and the learning watermark
+/// are untouched: recorded events stay processed, so the wiped weights
+/// are not silently re-taught by the past. Returns the number of
+/// `learned_weights` rows removed.
+pub fn reset_learned_weights(conn: &Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let removed = tx.execute("DELETE FROM learned_weights", [])?;
+    tx.execute("DELETE FROM learned_weight_sessions", [])?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+/// Reset ONE feature (e.g. `path_character`), all of its scopes, to the
+/// configured default (TASK-103, PRD-FB-REQ-013). Sibling features and
+/// the event history stand. Returns the number of `learned_weights`
+/// rows removed.
+pub fn reset_learned_feature(conn: &Connection, feature: &str) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let removed = tx.execute("DELETE FROM learned_weights WHERE feature = ?1", [feature])?;
+    tx.execute(
+        "DELETE FROM learned_weight_sessions WHERE feature = ?1",
+        [feature],
+    )?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+/// The current weight deviation `wonk status` reports (TASK-103,
+/// PRD-FB-REQ-013/012): the largest `|effective − default|` over rows
+/// that clear the observation/session gates, computed on the same
+/// decayed-at-`now`, re-clamped values `--weights` displays. `0.0` when
+/// nothing is gated or the table is missing. Consults stored state even
+/// with `[feedback] enabled = false` — inert, but legible.
+pub fn current_deviation(
+    conn: &Connection,
+    feedback: &FeedbackConfig,
+    weights: &HashMap<String, f32>,
+    now: i64,
+) -> Result<f32> {
+    Ok(list_learned(conn, feedback, weights, now)?
+        .into_iter()
+        .filter(|row| row.gated)
+        .map(|row| (row.effective - row.default).abs())
+        .fold(0.0f32, f32::max))
+}
+
 /// The canonical repo-relative key of a result path as the search
 /// produced it — the prepare's resolution, falling back to the raw
 /// string stripped of a leading `./` (feedback.rs's `canonical_of`,
@@ -1795,5 +1846,160 @@ mod tests {
             "the sum clamps to [-1, 1]"
         );
         assert_eq!(scored[0].score, 1.0);
+    }
+
+    // -- TASK-103: reset + deviation -------------------------------------------
+
+    /// Insert one stored learned row (overall scope, one session of
+    /// bookkeeping) directly — the reset/deviation fixtures.
+    fn seed_learned_row(
+        conn: &Connection,
+        feature: &str,
+        weight: f32,
+        observations: i64,
+        sessions: i64,
+        now: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO learned_weights \
+             (feature, query_class, weight, observations, sessions, updated_at) \
+             VALUES (?1, '', ?2, ?3, ?4, ?5)",
+            rusqlite::params![feature, weight, observations, sessions, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO learned_weight_sessions \
+             (feature, query_class, session) VALUES (?1, '', 's1')",
+            rusqlite::params![feature],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reset_learned_weights_clears_rows_and_sessions_keeps_events_and_watermark() {
+        let conn = learning_conn();
+        insert_event(&conn, 1, Some("symbol"), "s1", 1.0, 0.2);
+        insert_event(&conn, 2, Some("symbol"), "s2", 1.0, 0.2);
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        assert_eq!(learned_rows(&conn).len(), 2, "overall + symbol scopes");
+        let watermark = read_watermark(&conn).unwrap();
+        assert_eq!(watermark, 2);
+
+        let removed = reset_learned_weights(&conn).unwrap();
+        assert_eq!(removed, 2, "one per learned_weights row");
+        assert!(learned_rows(&conn).is_empty(), "weights wiped");
+        let session_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learned_weight_sessions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(session_rows, 0, "session bookkeeping wiped with them");
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 2, "the recorded history stays");
+        assert_eq!(
+            read_watermark(&conn).unwrap(),
+            watermark,
+            "events stay processed — no silent re-teach"
+        );
+    }
+
+    #[test]
+    fn relearning_after_reset_counts_sessions_from_zero() {
+        let conn = learning_conn();
+        insert_event(&conn, 1, None, "s1", 1.0, 0.2);
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let before = learned_rows(&conn);
+        assert_eq!(before[0].4, 1, "one session counted");
+        reset_learned_weights(&conn).unwrap();
+
+        // One event from the PREVIOUSLY SEEN session, one from a new
+        // session: both must count — this is the trap the sessions-table
+        // wipe defuses (INSERT OR IGNORE would keep reporting "already
+        // exists" forever after, and sessions could never re-grow).
+        insert_event(&conn, 2, None, "s1", 1.0, 0.2);
+        insert_event(&conn, 3, None, "s9", 1.0, 0.2);
+        learn_pending(&conn, &enabled_config(), &default_weights(), 2000).unwrap();
+        let after = learned_rows(&conn);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].3, 2, "two observations");
+        assert_eq!(after[0].4, 2, "sessions count from zero: {after:?}");
+    }
+
+    #[test]
+    fn reset_learned_feature_removes_all_scopes_keeps_siblings() {
+        let conn = learning_conn();
+        insert_event(&conn, 1, None, "s1", 1.0, 0.2);
+        insert_event(&conn, 2, None, "s2", 1.0, 0.2);
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        seed_learned_row(&conn, "lexical", 0.5, 5, 5, 1000);
+
+        let removed = reset_learned_feature(&conn, "path_character").unwrap();
+        assert_eq!(removed, 1, "the feature's overall row");
+        let remaining = learned_rows(&conn);
+        assert!(
+            remaining.iter().all(|row| row.0 != "path_character"),
+            "every scope of the feature gone: {remaining:?}"
+        );
+        assert!(
+            remaining.iter().any(|row| row.0 == "lexical"),
+            "sibling rows stand: {remaining:?}"
+        );
+        let session_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM learned_weight_sessions WHERE feature = 'path_character'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_rows, 0, "the feature's sessions wiped too");
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 2, "event history untouched");
+    }
+
+    #[test]
+    fn current_deviation_is_max_gated_deviation() {
+        // default path_character = 0.6, default lexical = 0.4;
+        // updated_at = now so decay is exactly 1.0.
+        let weights = HashMap::from([
+            ("path_character".to_string(), 0.6),
+            ("lexical".to_string(), 0.4),
+        ]);
+        let conn = learning_conn();
+        seed_learned_row(&conn, "path_character", 0.55, 40, 9, 1000);
+        seed_learned_row(&conn, "lexical", 0.2, 40, 9, 1000);
+        let deviation =
+            current_deviation(&conn, &FeedbackConfig::default(), &weights, 1000).unwrap();
+        assert!(
+            (deviation - 0.2).abs() < 1e-6,
+            "max |effective-default|: {deviation}"
+        );
+
+        // A below-gate row contributes nothing, gated rows still do.
+        let conn = learning_conn();
+        seed_learned_row(&conn, "path_character", 0.55, 40, 9, 1000);
+        seed_learned_row(&conn, "lexical", 0.2, 1, 1, 1000);
+        let deviation =
+            current_deviation(&conn, &FeedbackConfig::default(), &weights, 1000).unwrap();
+        assert!(
+            (deviation - 0.05).abs() < 1e-6,
+            "only gated rows count: {deviation}"
+        );
+
+        // Nothing gated at all: 0.0.
+        let conn = learning_conn();
+        seed_learned_row(&conn, "lexical", 0.2, 1, 1, 1000);
+        let deviation =
+            current_deviation(&conn, &FeedbackConfig::default(), &weights, 1000).unwrap();
+        assert_eq!(deviation, 0.0);
+
+        // A missing table (pre-TASK-101 index): 0.0, not an error.
+        let plain = Connection::open_in_memory().unwrap();
+        let deviation =
+            current_deviation(&plain, &FeedbackConfig::default(), &weights, 1000).unwrap();
+        assert_eq!(deviation, 0.0);
     }
 }

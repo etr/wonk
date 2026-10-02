@@ -36,6 +36,7 @@ wonk search "render" -- src/components/
 | `--why` | Explain each result's ranking: per-signal contributions and the final score. Implies smart ranked mode through the signal pipeline; conflicts with `--raw` and `--semantic`. The breakdown is printed to stderr (one `why:` line per result, so stdout stays pipe-clean) and embedded as a `why` object per row in `--format json` |
 | `--query-class <class>` | Pin the query class (`symbol`, `path`, `signature`, `conceptual`), bypassing detection for this invocation. Implies smart ranked mode; conflicts with `--raw` and `--semantic`. The class scales the lexical/semantic blend (see `[rank] class_multipliers`) |
 | `--context <PATH>` | The file you are currently working in. Feeds the context-relative features of the recorded feedback slate (same file, same directory, same community, import distance, co-change) when `[feedback]` is enabled; never affects ranking. Absent by default — the context features are absent rather than defaulted |
+| `--no-feedback` | Ignore learned feedback weights for this search: ranking reproduces the index alone exactly (TASK-103, PRD-FB-REQ-017). Slates still record — capture is not influence — so feedback can still be reported against the reproducible ranking. The `learned:` `--why` line does not print |
 | `-- <paths>` | Restrict search to specific paths |
 
 When `[feedback] enabled = true` (default off, see
@@ -566,10 +567,20 @@ rank 2  src/api.rs:42  handle_request  [useful]
 | `--useful <ranks-or-identities>` | Results that were useful: 1-based ranks or 64-hex identities; repeatable and comma-separated |
 | `--session <id>` | Stable id for your current session/conversation (distinct sessions are counted separately) |
 | `--weights` | List the learned weights instead of recording: every `learned_weights` row — gated and inert — with its default, observation count, and session count. Mutually exclusive with the three recording flags |
+| `--list` | List the recorded feedback events instead of recording: one line per event (`#id rank N file:line symbol session S class C`, with `[retired]` when the identity no longer resolves). `--format json` emits the event summaries as objects |
+| `--export` | Dump the complete event store — features payloads included — as one JSON array to stdout (`wonk feedback --export > events.json` to save). Round-trips the store verbatim |
+| `--clear-events` | Wipe EVERY recorded feedback event. Learned weights are untouched — clearing history and resetting weights are independent operations (PRD-FB-REQ-013) |
+| `--clear-result <IDENTITY>` | Wipe one result's recorded events by its 64-hex identity. Learned weights are untouched |
+| `--reset-weights` | Reset ALL learned weights to their configured defaults (every scope). The event history is untouched: recorded events stay processed and never silently re-teach the wiped weights |
+| `--reset-weight <FEATURE>` | Reset ONE feature's learned weights to defaults (e.g. `path_character`), all of its scopes; sibling features and the event history stand |
 
-All three recording flags are required together (or none, with
-`--weights`), and `--useful` must name at least one
+All three recording flags are required together (or none, with one of
+the management flags above), and `--useful` must name at least one
 result; a result named twice (by rank and by identity) records once.
+The management flags are mutually exclusive with each other and with
+recording, and they work regardless of `[feedback] enabled` —
+inspecting and wiping leftover state after opting out is exactly when
+they matter. Only recording requires the feature on.
 
 Each recorded event also drives contrastive weight learning
 (TASK-102): features that scored the useful result above the passed-over
@@ -690,13 +701,23 @@ reports reachability and, when unreachable with Ollama configured, notes that
 semantic queries fall back to the bundled provider. `Stored vectors: none`
 means the index has no embeddings yet.
 
+A `Feedback:` line summarizes the usage-feedback loop (TASK-103):
+`Feedback: enabled, 40 events, 40 sessions, weight deviation 0.050` —
+event count, distinct sessions among them, and the current weight
+deviation (the largest `|effective − default|` over gated learned
+rows, bounded by `[feedback] learn_max_deviation`). With the feature
+off the line reads `Feedback: disabled`, still showing the counts when
+leftover state exists — turning the feature off hides influence, not
+history.
+
 With `--format json` (or the MCP `wonk_status` tool) the same data is
 serialized, including `active_provider`, `stored_vector_provider`,
 `stored_vector_dim`, `ollama_reachable` (`null` when Ollama was not
 probed), and the workspace fields: `workspaces` (effective set),
 `workspace_declared` (whether `[contracts] workspace` is set in repo-local
 config), and `workspace_comembers` (names of other indexed repos sharing a
-workspace).
+workspace), plus the feedback state under `feedback` (`enabled`, `events`,
+`sessions`, `deviation`).
 
 ### `wonk repos <list|clean>`
 

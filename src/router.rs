@@ -284,7 +284,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // Feedback capture (TASK-105): widen the prepared
                         // slices and thread the optional working-context
                         // hint (--context) into the slate's features; the
-                        // hint never affects ranking.
+                        // hint never affects ranking. Capture stays on
+                        // under --no-feedback — recording is not influence.
                         settings.feedback_capture = config.feedback.enabled;
                         settings.feedback_author_features = config.feedback.author_features;
                         settings.working_context = args.context.clone();
@@ -292,7 +293,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // joins the settings — ONE read, best-effort like
                         // the slate recording (a missing table is silent;
                         // other errors warn and disable the overlay).
+                        // --no-feedback (TASK-103, PRD-FB-REQ-017) skips
+                        // the load outright; the flag ALSO strips any
+                        // attached table inside the ranking seam —
+                        // belt-and-suspenders (AR-039).
+                        settings.feedback_free = args.no_feedback;
                         if config.feedback.enabled
+                            && !args.no_feedback
                             && let Some(index_conn) = conn.as_ref()
                         {
                             settings.learned = crate::learning::load_learned(
@@ -1041,6 +1048,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 config.embedding.provider,
                 workspace,
                 &config.topology,
+                &config.feedback,
+                &config.rank.weights,
             );
 
             if format.is_structured() {
@@ -2668,11 +2677,6 @@ fn dispatch_feedback<W: io::Write>(
         .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
 
     let config = crate::config::Config::load(Some(&repo_root))?;
-    if !config.feedback.enabled {
-        anyhow::bail!(
-            "feedback capture is disabled; set [feedback] enabled = true in .wonk/config.toml"
-        );
-    }
 
     let conn = db::find_existing_index(&repo_root)
         .and_then(|path| db::open(&path).ok())
@@ -2681,6 +2685,23 @@ fn dispatch_feedback<W: io::Write>(
     // Pre-TASK-101 indexes migrate instead of erroring (the
     // `ensure_summaries_table` precedent).
     db::ensure_feedback_tables(&conn)?;
+
+    // The `[feedback] enabled` gate covers RECORDING only (TASK-103):
+    // inspecting and wiping leftover state after opting out is exactly
+    // when --weights/--list/--export/--reset-*/--clear-* matter, and
+    // none of them writes to the recording path.
+    let recording = !args.weights
+        && !args.list
+        && !args.export
+        && !args.clear_events
+        && !args.reset_weights
+        && args.clear_result.is_none()
+        && args.reset_weight.is_none();
+    if recording && !config.feedback.enabled {
+        anyhow::bail!(
+            "feedback capture is disabled; set [feedback] enabled = true in .wonk/config.toml"
+        );
+    }
 
     run_feedback(&conn, &args, &config, fmt, suppress, format)
 }
@@ -2698,6 +2719,24 @@ fn run_feedback<W: io::Write>(
 ) -> Result<()> {
     if args.weights {
         return run_feedback_weights(conn, config, fmt, format);
+    }
+    if args.list {
+        return run_feedback_list(conn, fmt, format);
+    }
+    if args.export {
+        return run_feedback_export(conn, fmt);
+    }
+    if args.clear_events {
+        return run_feedback_clear_events(conn, fmt, format);
+    }
+    if let Some(identity) = args.clear_result.as_deref() {
+        return run_feedback_clear_result(conn, identity, fmt, format);
+    }
+    if args.reset_weights {
+        return run_feedback_reset_weights(conn, fmt, format);
+    }
+    if let Some(feature) = args.reset_weight.as_deref() {
+        return run_feedback_reset_weight(conn, feature, fmt, format);
     }
     let summary = crate::feedback::record_feedback(
         conn,
@@ -2806,6 +2845,129 @@ fn run_feedback_weights<W: io::Write>(
         }
         writeln!(fmt.writer_mut(), "{line}")?;
     }
+    Ok(())
+}
+
+/// `wonk feedback --list` (TASK-103, PRD-FB-REQ-019): every recorded
+/// event with its session, class, and read-time liveness. JSON emits
+/// the [`crate::feedback::EventListing`] objects.
+fn run_feedback_list<W: io::Write>(
+    conn: &Connection,
+    fmt: &mut Formatter<W>,
+    format: OutputFormat,
+) -> Result<()> {
+    let events = crate::feedback::list_events(conn)?;
+    if format.is_structured() {
+        let json = serde_json::to_string(&events)?;
+        writeln!(fmt.writer_mut(), "{json}")?;
+        return Ok(());
+    }
+    for event in &events {
+        let session = event.session.as_deref().unwrap_or("-");
+        let class = event.query_class.as_deref().unwrap_or("-");
+        let symbol = event.symbol.as_deref().unwrap_or("-");
+        let mut line = format!(
+            "#{} rank {}  {}:{}  {}  session {}  class {}",
+            event.id, event.rank, event.file, event.line, symbol, session, class
+        );
+        if !event.live {
+            line.push_str("  [retired]");
+        }
+        writeln!(fmt.writer_mut(), "{line}")?;
+    }
+    Ok(())
+}
+
+/// `wonk feedback --export` (TASK-103): the complete event store —
+/// features payloads included — as one JSON array on stdout, verbatim
+/// round-trippable (`> events.json` to save).
+fn run_feedback_export<W: io::Write>(conn: &Connection, fmt: &mut Formatter<W>) -> Result<()> {
+    let events = crate::feedback::load_events(conn)?;
+    let json = serde_json::to_string(&events)?;
+    writeln!(fmt.writer_mut(), "{json}")?;
+    Ok(())
+}
+
+/// `wonk feedback --clear-events` (TASK-103, PRD-FB-REQ-013/019): wipe
+/// the whole event store; learned weights are untouched.
+fn run_feedback_clear_events<W: io::Write>(
+    conn: &Connection,
+    fmt: &mut Formatter<W>,
+    format: OutputFormat,
+) -> Result<()> {
+    let cleared = crate::feedback::clear_events(conn)?;
+    if format.is_structured() {
+        let json = serde_json::json!({"cleared": cleared});
+        writeln!(fmt.writer_mut(), "{json}")?;
+        return Ok(());
+    }
+    writeln!(
+        fmt.writer_mut(),
+        "cleared {cleared} feedback event(s); learned weights untouched"
+    )?;
+    Ok(())
+}
+
+/// `wonk feedback --clear-result <IDENTITY>` (TASK-103): wipe one
+/// result's events; learned weights are untouched.
+fn run_feedback_clear_result<W: io::Write>(
+    conn: &Connection,
+    identity: &str,
+    fmt: &mut Formatter<W>,
+    format: OutputFormat,
+) -> Result<()> {
+    let cleared = crate::feedback::clear_result_events(conn, identity)?;
+    if format.is_structured() {
+        let json = serde_json::json!({"cleared": cleared, "identity": identity});
+        writeln!(fmt.writer_mut(), "{json}")?;
+        return Ok(());
+    }
+    writeln!(
+        fmt.writer_mut(),
+        "cleared {cleared} feedback event(s) for {identity}; learned weights untouched"
+    )?;
+    Ok(())
+}
+
+/// `wonk feedback --reset-weights` (TASK-103, PRD-FB-REQ-013): every
+/// learned weight back to its configured default, all scopes; the
+/// event history is untouched.
+fn run_feedback_reset_weights<W: io::Write>(
+    conn: &Connection,
+    fmt: &mut Formatter<W>,
+    format: OutputFormat,
+) -> Result<()> {
+    let reset = crate::learning::reset_learned_weights(conn)?;
+    if format.is_structured() {
+        let json = serde_json::json!({"reset": reset});
+        writeln!(fmt.writer_mut(), "{json}")?;
+        return Ok(());
+    }
+    writeln!(
+        fmt.writer_mut(),
+        "reset {reset} learned weight row(s) to defaults; event history untouched"
+    )?;
+    Ok(())
+}
+
+/// `wonk feedback --reset-weight <FEATURE>` (TASK-103): one feature,
+/// all of its scopes, back to defaults; the event history is untouched.
+fn run_feedback_reset_weight<W: io::Write>(
+    conn: &Connection,
+    feature: &str,
+    fmt: &mut Formatter<W>,
+    format: OutputFormat,
+) -> Result<()> {
+    let reset = crate::learning::reset_learned_feature(conn, feature)?;
+    if format.is_structured() {
+        let json = serde_json::json!({"reset": reset, "feature": feature});
+        writeln!(fmt.writer_mut(), "{json}")?;
+        return Ok(());
+    }
+    writeln!(
+        fmt.writer_mut(),
+        "reset {reset} learned weight row(s) for {feature} to defaults; event history untouched"
+    )?;
     Ok(())
 }
 
@@ -3397,6 +3559,53 @@ pub struct StatusInfo {
     /// visible here because a stale score is served, never awaited on
     /// (PRD-TOPO-REQ-007).
     pub topology: TopologyStatus,
+    /// The feedback loop's state (TASK-103): event count, distinct
+    /// sessions, and the current learned-weight deviation — legible
+    /// even with the feature off, because inert-but-legible is the
+    /// inspection contract.
+    pub feedback: FeedbackStatus,
+}
+
+/// The feedback-loop state `wonk status` reports (TASK-103).
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct FeedbackStatus {
+    /// Whether `[feedback] enabled` is on.
+    pub enabled: bool,
+    /// Recorded feedback events, whole store.
+    pub events: i64,
+    /// Distinct sessions among them (NULL counts as one).
+    pub sessions: i64,
+    /// The largest `|effective − default|` over gated learned rows —
+    /// the same value `wonk feedback --weights` displays per row.
+    /// `learn_max_deviation` is its ceiling.
+    pub deviation: f32,
+}
+
+/// Compute the feedback state (TASK-103) with an injected clock — the
+/// repo's testability pattern. Stored state is consulted even when
+/// `[feedback] enabled = false`: turning the feature off must not hide
+/// the history it left behind.
+pub(crate) fn feedback_status(
+    conn: Option<&Connection>,
+    feedback: &crate::config::FeedbackConfig,
+    weights: &std::collections::HashMap<String, f32>,
+    now: i64,
+) -> FeedbackStatus {
+    let (events, sessions, deviation) = match conn {
+        Some(conn) => {
+            let stats = crate::feedback::event_store_stats(conn).unwrap_or((0, 0));
+            let deviation =
+                crate::learning::current_deviation(conn, feedback, weights, now).unwrap_or(0.0);
+            (stats.0, stats.1, deviation)
+        }
+        None => (0, 0, 0.0),
+    };
+    FeedbackStatus {
+        enabled: feedback.enabled,
+        events,
+        sessions,
+        deviation,
+    }
 }
 
 /// The topology pass's state as `wonk status` reports it (TASK-098).
@@ -3453,6 +3662,8 @@ pub fn format_status_info(info: &StatusInfo) -> String {
     }
 
     lines.push(topology_status_line(&info.topology));
+
+    lines.push(feedback_status_line(&info.feedback));
 
     lines.push(format!("Provider: {}", info.active_provider));
 
@@ -3511,6 +3722,26 @@ fn topology_status_line(status: &TopologyStatus) -> String {
     line
 }
 
+/// The `Feedback:` line of `wonk status` (TASK-103): the loop's state at
+/// a glance. Enabled always shows the full counts; disabled shows them
+/// only when leftover state exists — the opt-out hides influence, not
+/// history.
+fn feedback_status_line(status: &FeedbackStatus) -> String {
+    let state = if status.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let has_state = status.events > 0 || status.deviation != 0.0;
+    if !status.enabled && !has_state {
+        return "Feedback: disabled".to_string();
+    }
+    format!(
+        "Feedback: {state}, {} events, {} sessions, weight deviation {:.3}",
+        status.events, status.sessions, status.deviation
+    )
+}
+
 /// Query status from the database and the embedding-provider state.
 ///
 /// Ollama is probed (quick 500 ms check) only when it is relevant — the
@@ -3521,6 +3752,8 @@ pub fn query_status_info(
     configured: crate::embedding::EmbeddingProviderKind,
     workspace: Option<crate::contracts::WorkspaceStatus>,
     topology_config: &crate::config::TopologyConfig,
+    feedback_config: &crate::config::FeedbackConfig,
+    rank_weights: &std::collections::HashMap<String, f32>,
 ) -> StatusInfo {
     let (workspaces, workspace_declared, workspace_comembers) = match &workspace {
         Some(ws) => (
@@ -3558,6 +3791,7 @@ pub fn query_status_info(
                 stale: false,
                 enabled: topology_config.enabled,
             },
+            feedback: feedback_status(None, feedback_config, rank_weights, system_secs()),
         };
     };
 
@@ -3612,6 +3846,7 @@ pub fn query_status_info(
         workspace_declared,
         workspace_comembers,
         topology,
+        feedback: feedback_status(Some(conn), feedback_config, rank_weights, system_secs()),
     }
 }
 
@@ -6256,6 +6491,7 @@ mod tests {
             why: false,
             query_class: None,
             context: None,
+            no_feedback: false,
             file: None,
             paths: vec![],
         });
@@ -6387,6 +6623,12 @@ mod tests {
                 stale: false,
                 enabled: true,
             },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
+            },
         };
         let output = format_status_info(&info);
         assert!(
@@ -6418,6 +6660,12 @@ mod tests {
                 stale: false,
                 enabled: true,
             },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
+            },
         };
         let output = format_status_info(&info);
         assert!(
@@ -6448,6 +6696,12 @@ mod tests {
                 last_computed: None,
                 stale: false,
                 enabled: true,
+            },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
             },
         };
         let output = format_status_info(&info);
@@ -6484,6 +6738,12 @@ mod tests {
                 stale: false,
                 enabled: true,
             },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
+            },
         };
         let output = format_status_info(&info);
         assert!(output.contains("No index"));
@@ -6511,6 +6771,12 @@ mod tests {
                 last_computed: None,
                 stale: false,
                 enabled: true,
+            },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
             },
         };
         let output = format_status_info(&info);
@@ -6545,6 +6811,12 @@ mod tests {
                 stale: false,
                 enabled: true,
             },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
+            },
         };
         let output = format_status_info(&info);
         assert!(output.contains("Provider: bundled"));
@@ -6575,6 +6847,12 @@ mod tests {
                 stale: false,
                 enabled: true,
             },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
+            },
         };
         let output = format_status_info(&info);
         assert!(output.contains("Stored vectors: none"), "got: {output}");
@@ -6602,6 +6880,12 @@ mod tests {
                 last_computed: None,
                 stale: false,
                 enabled: true,
+            },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
             },
         };
         let value = serde_json::to_value(&info).unwrap();
@@ -6641,6 +6925,12 @@ mod tests {
                 stale,
                 enabled,
             },
+            feedback: FeedbackStatus {
+                enabled: false,
+                events: 0,
+                sessions: 0,
+                deviation: 0.0,
+            },
         }
     }
 
@@ -6671,6 +6961,127 @@ mod tests {
             "got: {out}"
         );
         assert!(out.contains("s ago)"), "the age renders in seconds: {out}");
+    }
+
+    // -- feedback status (TASK-103) --------------------------------------------
+
+    #[test]
+    fn test_status_feedback_line_pins_all_three_shapes() {
+        let with = |feedback: FeedbackStatus| StatusInfo {
+            feedback,
+            ..topology_status_info(0, 0, None, false, true)
+        };
+        // Enabled: the full state, always.
+        let out = format_status_info(&with(FeedbackStatus {
+            enabled: true,
+            events: 40,
+            sessions: 40,
+            deviation: 0.05,
+        }));
+        assert!(
+            out.contains("Feedback: enabled, 40 events, 40 sessions, weight deviation 0.050"),
+            "got: {out}"
+        );
+        // Disabled with leftover state: the counts stay legible.
+        let out = format_status_info(&with(FeedbackStatus {
+            enabled: false,
+            events: 40,
+            sessions: 40,
+            deviation: 0.05,
+        }));
+        assert!(
+            out.contains("Feedback: disabled, 40 events, 40 sessions, weight deviation 0.050"),
+            "got: {out}"
+        );
+        // Disabled with nothing recorded: bare.
+        let out = format_status_info(&with(FeedbackStatus {
+            enabled: false,
+            events: 0,
+            sessions: 0,
+            deviation: 0.0,
+        }));
+        assert!(out.contains("Feedback: disabled"), "got: {out}");
+        assert!(
+            !out.contains("weight deviation"),
+            "no counts to show: {out}"
+        );
+    }
+
+    #[test]
+    fn test_status_info_serializes_feedback_fields() {
+        let info = StatusInfo {
+            feedback: FeedbackStatus {
+                enabled: true,
+                events: 7,
+                sessions: 3,
+                deviation: 0.25,
+            },
+            ..topology_status_info(0, 0, None, false, true)
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["feedback"]["enabled"], true);
+        assert_eq!(value["feedback"]["events"], 7);
+        assert_eq!(value["feedback"]["sessions"], 3);
+        assert_eq!(value["feedback"]["deviation"], 0.25);
+    }
+
+    #[test]
+    fn feedback_status_counts_events_sessions_and_deviation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        crate::db::ensure_feedback_tables(&conn).unwrap();
+        let features = r#"{"schema":1,"slate":"t","members":[]}"#;
+        for (identity, session) in [
+            ("id1", "a"),
+            ("id1", "a"),
+            ("id2", "b"),
+            ("id2", "b"),
+            ("id3", "c"),
+        ] {
+            conn.execute(
+                "INSERT INTO feedback_events \
+                 (result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+                 VALUES (?1, NULL, 2, ?2, 1, ?3, 1000)",
+                rusqlite::params![identity, features, session],
+            )
+            .unwrap();
+        }
+        // A gated row at updated_at = now (decay exactly 1.0): stored
+        // 0.55 against default 0.6 → deviation 0.05.
+        conn.execute(
+            "INSERT INTO learned_weights \
+             (feature, query_class, weight, observations, sessions, updated_at) \
+             VALUES ('path_character', '', 0.55, 40, 9, 1000)",
+            [],
+        )
+        .unwrap();
+        let weights = std::collections::HashMap::from([("path_character".to_string(), 0.6)]);
+
+        let status = feedback_status(
+            Some(&conn),
+            &crate::config::FeedbackConfig {
+                enabled: true,
+                ..crate::config::FeedbackConfig::default()
+            },
+            &weights,
+            1000,
+        );
+        assert_eq!(status.events, 5);
+        assert_eq!(status.sessions, 3, "distinct sessions");
+        assert!((status.deviation - 0.05).abs() < 1e-6, "{status:?}");
+
+        // No connection at all: zeros, enabled still reported.
+        let status = feedback_status(
+            None,
+            &crate::config::FeedbackConfig::default(),
+            &weights,
+            1000,
+        );
+        assert_eq!(
+            (status.events, status.sessions, status.deviation),
+            (0, 0, 0.0)
+        );
+        assert!(!status.enabled);
     }
 
     #[test]
@@ -6705,6 +7116,8 @@ mod tests {
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
             &crate::config::TopologyConfig::default(),
+            &crate::config::FeedbackConfig::default(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(info.topology.scored, 1);
         assert_eq!(
@@ -6738,6 +7151,8 @@ mod tests {
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
             &crate::config::TopologyConfig::default(),
+            &crate::config::FeedbackConfig::default(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(info.topology.scored, 2);
         assert_eq!(info.topology.communities, 1, "both rows share community 7");
@@ -6752,6 +7167,8 @@ mod tests {
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
             &aged,
+            &crate::config::FeedbackConfig::default(),
+            &std::collections::HashMap::new(),
         );
         assert!(info.topology.stale, "age >> 1s must read as stale");
 
@@ -6765,6 +7182,8 @@ mod tests {
             crate::embedding::EmbeddingProviderKind::Bundled,
             None,
             &off,
+            &crate::config::FeedbackConfig::default(),
+            &std::collections::HashMap::new(),
         );
         assert!(!info.topology.enabled);
     }
@@ -7312,6 +7731,12 @@ mod tests {
             session: Some("conv-1".to_string()),
             useful: useful.iter().map(|u| u.to_string()).collect(),
             weights: false,
+            list: false,
+            export: false,
+            clear_events: false,
+            clear_result: None,
+            reset_weights: false,
+            reset_weight: None,
         }
     }
 
@@ -7453,6 +7878,12 @@ mod tests {
             session: Some(session.to_string()),
             useful: vec![useful.to_string()],
             weights: false,
+            list: false,
+            export: false,
+            clear_events: false,
+            clear_result: None,
+            reset_weights: false,
+            reset_weight: None,
         }
     }
 
@@ -7552,6 +7983,214 @@ mod tests {
         assert_eq!(kind["sessions"], 2);
         assert_eq!(kind["gated"], false);
         assert_eq!(kind["default"], 1.0);
+        drop(dir);
+    }
+
+    // -- TASK-103: feedback management modes ------------------------------------
+
+    /// A management-mode args base (everything off) — each test flips
+    /// exactly one mode on.
+    fn mode_args() -> crate::cli::FeedbackArgs {
+        crate::cli::FeedbackArgs {
+            slate: None,
+            session: None,
+            useful: vec![],
+            weights: false,
+            list: false,
+            export: false,
+            clear_events: false,
+            clear_result: None,
+            reset_weights: false,
+            reset_weight: None,
+        }
+    }
+
+    fn run_fb_json(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
+        let mut buf = Vec::new();
+        let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Json, false);
+        run_feedback(
+            conn,
+            args,
+            &learning_config(),
+            &mut fmt,
+            true,
+            OutputFormat::Json,
+        )
+        .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn run_feedback_list_prints_one_line_per_event() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        run_fb(&conn, &session_args(&token, "sess-1", "2"));
+        run_fb(&conn, &session_args(&token, "sess-2", "1"));
+
+        let mut args = mode_args();
+        args.list = true;
+        let out = run_fb(&conn, &args);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per event: {out}");
+        assert!(out.contains("rank 2"), "the chosen rank: {out}");
+        assert!(out.contains("a.rs:1"), "the file and line: {out}");
+        assert!(out.contains("sess-1"), "the session: {out}");
+        assert!(out.contains("class symbol"), "the query class: {out}");
+
+        // JSON: the EventListing objects, one array.
+        let json = run_fb_json(&conn, &args);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert_eq!(parsed[0]["session"], "sess-1");
+        assert_eq!(parsed[0]["rank"], 2);
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_export_round_trips_the_store() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        run_fb(&conn, &session_args(&token, "sess-1", "2"));
+        run_fb(&conn, &session_args(&token, "sess-2", "1"));
+
+        let mut args = mode_args();
+        args.export = true;
+        let out = run_fb(&conn, &args);
+        let exported: Vec<crate::feedback::FeedbackEvent> = serde_json::from_str(&out).unwrap();
+        let stored = crate::feedback::load_events(&conn).unwrap();
+        assert_eq!(exported, stored, "the export is the store, verbatim");
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_clear_events_keeps_learned_weights() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        for session in ["s1", "s2", "s3", "s4"] {
+            run_fb(&conn, &session_args(&token, session, "2"));
+        }
+        assert!(learned_weight_count(&conn) > 0, "weights learned");
+
+        let mut args = mode_args();
+        args.clear_events = true;
+        let out = run_fb(&conn, &args);
+        assert!(
+            out.contains("cleared 4 feedback event(s); learned weights untouched"),
+            "the confirmation names the independence: {out}"
+        );
+        assert_eq!(feedback_event_count(&conn), 0, "events wiped");
+        assert!(
+            learned_weight_count(&conn) > 0,
+            "learned weights survive the history wipe"
+        );
+
+        let json = run_fb_json(&conn, &args);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["cleared"], 0, "idempotent, structured");
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_reset_weights_keeps_events() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        for session in ["s1", "s2", "s3", "s4"] {
+            run_fb(&conn, &session_args(&token, session, "2"));
+        }
+        assert!(learned_weight_count(&conn) > 0, "weights learned");
+        let events_before = feedback_event_count(&conn);
+        assert!(events_before > 0);
+
+        let mut args = mode_args();
+        args.reset_weights = true;
+        let out = run_fb(&conn, &args);
+        assert!(
+            out.contains("reset") && out.contains("learned weight row(s) to defaults"),
+            "the confirmation: {out}"
+        );
+        assert!(
+            out.contains("event history untouched"),
+            "the independence is in the message: {out}"
+        );
+        assert_eq!(learned_weight_count(&conn), 0, "weights reset");
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learned_weight_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sessions, 0, "session bookkeeping reset with them");
+        assert_eq!(
+            feedback_event_count(&conn),
+            events_before,
+            "the recorded history stands"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_clear_result_wipes_one_identity() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        run_fb(&conn, &session_args(&token, "sess-1", "2"));
+        run_fb(&conn, &session_args(&token, "sess-2", "1"));
+        run_fb(&conn, &session_args(&token, "sess-3", "2"));
+        let identity: String = conn
+            .query_row(
+                "SELECT result_identity FROM feedback_events                  WHERE chosen_rank = 1 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let mut args = mode_args();
+        args.clear_result = Some(identity.clone());
+        let out = run_fb(&conn, &args);
+        assert!(
+            out.contains(&format!("cleared 1 feedback event(s) for {identity}")),
+            "per-result confirmation: {out}"
+        );
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2, "the other result's events stand");
+        let none_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM feedback_events WHERE result_identity = ?1",
+                [&identity],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(none_left, 0);
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_reset_weight_scopes_to_one_feature() {
+        let (dir, conn, token) = learning_repo_with_slate();
+        for session in ["s1", "s2", "s3", "s4"] {
+            run_fb(&conn, &session_args(&token, session, "2"));
+        }
+        assert!(learned_weight_count(&conn) > 1, "several features learned");
+        let kind_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM learned_weights WHERE feature = 'kind'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(kind_rows > 0, "kind learned in some scope");
+
+        let mut args = mode_args();
+        args.reset_weight = Some("kind".to_string());
+        let out = run_fb(&conn, &args);
+        assert!(
+            out.contains(&format!("reset {kind_rows} learned weight row(s) for kind")),
+            "the per-feature confirmation: {out}"
+        );
+        let features: Vec<String> = conn
+            .prepare("SELECT DISTINCT feature FROM learned_weights")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(!features.contains(&"kind".to_string()), "kind reset");
+        assert!(!features.is_empty(), "sibling features stand");
         drop(dir);
     }
 }

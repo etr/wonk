@@ -205,7 +205,7 @@ Wonk includes a built-in [MCP](https://modelcontextprotocol.io/) server for AI c
 }
 ```
 
-25 tools exposed: search, sym, ref, sig, show, deps, rdeps, callers, callees, callpath, summary, flows, blast, changes, context, ask, cluster, impact, init, update, status, repos, contracts (service-contract listing with kind/role/orphans/links filters), review (diff-scoped review: line-anchored findings plus a BLOCK/REVIEW/APPROVE verdict; findings are emitted only — nothing is posted to a forge and nothing is auto-fixed), feedback (report which search results were useful, against the slate a search persists when `[feedback] enabled = true`). All tools accept an optional `repo` parameter for multi-repo setups.
+25 tools exposed: search, sym, ref, sig, show, deps, rdeps, callers, callees, callpath, summary, flows, blast, changes, context, ask, cluster, impact, init, update, status, repos, contracts (service-contract listing with kind/role/orphans/links filters), review (diff-scoped review: line-anchored findings plus a BLOCK/REVIEW/APPROVE verdict; findings are emitted only — nothing is posted to a forge and nothing is auto-fixed), feedback (report which search results were useful, against the slate a search persists when `[feedback] enabled = true`; pass `no_feedback: true` to `wonk_search` for index-only ranking reproducible from the index alone). All tools accept an optional `repo` parameter for multi-repo setups.
 
 ## Commands
 
@@ -324,6 +324,24 @@ and the exact delta against `nomic-embed-text`.
 Layered TOML config: built-in defaults < `~/.wonk/config.toml` < `<repo>/.wonk/config.toml`.
 
 Full reference: [`docs/configuration.md`](docs/configuration.md)
+
+### Reproducibility
+
+With `[feedback] enabled = true`, ranking is a function of the index
+*and* the accumulated feedback history — that is the point, and it is
+also a determinism tradeoff. On demand, `wonk search --no-feedback`
+(or `no_feedback: true` on the MCP `wonk_search` tool) reproduces
+index-only ranking *exactly*: same index, same output, slates still
+recorded so you can keep reporting feedback. `[feedback] enabled =
+false` is the full opt-out. Learned state is inspectable and
+reversible — `wonk feedback --weights` shows every learned weight
+against its default, `--reset-weights`/`--reset-weight <FEATURE>`
+restore defaults without touching the event history, and
+`--clear-events`/`--clear-result <IDENTITY>` wipe history without
+touching the weights. `wonk status` summarizes the loop's state
+(events, sessions, current weight deviation). Benchmarks and the
+ranking regression suite run feedback-free, so measurement cannot
+confirm itself.
 
 ## Acknowledgments
 

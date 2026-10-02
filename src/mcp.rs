@@ -477,6 +477,11 @@ fn tool_definitions() -> &'static Vec<Tool> {
                         "context_file": {
                             "type": "string",
                             "description": "The file you are currently working in (relative or absolute). Feeds context-relative feedback features when [feedback] is enabled; never affects ranking."
+                        },
+                        "no_feedback": {
+                            "type": "boolean",
+                            "description": "Ignore learned feedback weights for this search: ranking reproduces the index alone exactly. Slates still record.",
+                            "default": false
                         }
                     },
                     "required": ["query"]
@@ -658,7 +663,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_status",
-                description: "Show index status: file/symbol/reference/embedding counts and Ollama reachability.",
+                description: "Show index status: file/symbol/reference/embedding counts, Ollama reachability, and feedback state (events, sessions, weight deviation).",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1512,7 +1517,8 @@ impl McpServer {
                  - Pagination: use page=N to read more results; read only the minimum necessary\n\
                  - Service contracts / cross-repo API impact: wonk_contracts (kind/role filters; orphans=true, links=true)\n\
                  - Review a diff before committing: wonk_review (scope/since; returns findings + BLOCK/REVIEW/APPROVE verdict; cross-repo contract impact included; findings only, no posting/auto-fix)\n\
-                 - Report useful results: wonk_feedback (slate token + identities/ranks from wonk_search output; once per search; requires [feedback] enabled in .wonk/config.toml)",
+                 - Report useful results: wonk_feedback (slate token + identities/ranks from wonk_search output; once per search; requires [feedback] enabled in .wonk/config.toml)\n\
+                 - Reproducibility: when [feedback] is enabled ranking adapts to reported usefulness; pass no_feedback=true to wonk_search for index-only ranking; feedback state is inspectable/resettable via the wonk CLI (wonk feedback --weights, --reset-weights, --clear-events)",
             ),
         })
         .expect("serialize InitializeResult")
@@ -1694,19 +1700,31 @@ impl McpServer {
         settings.feedback_capture = config.feedback.enabled;
         settings.feedback_author_features = config.feedback.author_features;
         settings.working_context = context_file;
+        // --no-feedback (TASK-103, PRD-FB-REQ-017): skip the learned
+        // load outright AND strip any attached table in the ranking
+        // seam — belt-and-suspenders (AR-039). Slate capture stays on.
+        let no_feedback = args
+            .get("no_feedback")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        settings.feedback_free = no_feedback;
         // Learned weights (TASK-102): the gated overlay — ONE read,
         // best-effort (a missing table is silent; other errors warn).
-        settings.learned = ranker_conn.and_then(|conn| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs() as i64)
-                .unwrap_or(0);
-            crate::learning::load_learned(conn, &config.feedback, &config.rank.weights, now)
-                .unwrap_or_else(|e| {
-                    eprintln!("wonk: learned-weight load failed: {e:#}");
-                    None
-                })
-        });
+        settings.learned = if no_feedback {
+            None
+        } else {
+            ranker_conn.and_then(|conn| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .unwrap_or(0);
+                crate::learning::load_learned(conn, &config.feedback, &config.rank.weights, now)
+                    .unwrap_or_else(|e| {
+                        eprintln!("wonk: learned-weight load failed: {e:#}");
+                        None
+                    })
+            })
+        };
         let ranked =
             crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
         // Best-effort REQ-003 memo: persist the pairs the novelty pass
@@ -2150,11 +2168,18 @@ impl McpServer {
             Ok(kind) => kind,
             Err(error) => return CallToolResult::error(error),
         };
-        // The topology config rides along for the staleness marker (TASK-098).
-        let topology = crate::config::Config::load(Some(self.router.repo_root()))
-            .map(|c| c.topology)
-            .unwrap_or_default();
-        let info = crate::router::query_status_info(conn, configured, workspace, &topology);
+        // The topology config rides along for the staleness marker
+        // (TASK-098); the full config also carries the feedback state
+        // (TASK-103).
+        let config = crate::config::Config::load(Some(self.router.repo_root())).unwrap_or_default();
+        let info = crate::router::query_status_info(
+            conn,
+            configured,
+            workspace,
+            &config.topology,
+            &config.feedback,
+            &config.rank.weights,
+        );
         let status = serde_json::to_value(&info).unwrap_or_default();
         format_result(&status, format)
     }
@@ -6084,5 +6109,170 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM learned_weights", [], |r| r.get(0))
             .unwrap();
         assert!(learned > 0, "the MCP dispatch learned too");
+    }
+
+    // -- wonk_search no_feedback (TASK-103) -------------------------------------
+
+    /// Two twin directories with IDENTICAL lexical shape (`widget` once,
+    /// same length): every recorded signal ties, so the only possible
+    /// order-changer is a learned descriptive overlay — verified by
+    /// experiment to flip the order, which makes the no_feedback
+    /// comparison non-trivial.
+    fn no_feedback_server() -> (tempfile::TempDir, McpServer) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_dir = dir.path().join("nf-svc");
+        std::fs::create_dir_all(repo_dir.join("src/alpha")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("src/omega")).unwrap();
+        std::fs::create_dir(repo_dir.join(".git")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/alpha/mod.rs"),
+            "pub fn alpha_widget() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_dir.join("src/omega/mod.rs"),
+            "pub fn omega_widget() -> u32 {\n    2\n}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_dir.join(".wonk")).unwrap();
+        std::fs::write(
+            repo_dir.join(".wonk/config.toml"),
+            "[feedback]\nenabled = true\n\n[rank]\nenabled = true\n\n[rank.weights]\nfeedback = 0.35\n",
+        )
+        .unwrap();
+        pipeline::build_index(&repo_dir, true).unwrap();
+        let server = McpServer {
+            router: QueryRouter::new(Some(repo_dir), true),
+            registry: RepoRegistry::new(Vec::new()),
+        };
+        (dir, server)
+    }
+
+    /// The (file, line) order of a wonk_search for `widget`.
+    fn nf_search_order(server: &mut McpServer, no_feedback: bool) -> Vec<(String, u64)> {
+        let mut arguments = serde_json::json!({
+            "query": "widget", "format": "json"
+        });
+        if no_feedback {
+            arguments["no_feedback"] = serde_json::Value::Bool(true);
+        }
+        let result = server.handle_tools_call(&serde_json::json!({
+            "name": "wonk_search",
+            "arguments": arguments
+        }));
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let rows: Value = serde_json::from_str(text).unwrap();
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["file"].as_str().unwrap().to_string(),
+                    row["line"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_search_no_feedback_ignores_learned_weights() {
+        let (_dir, mut server) = no_feedback_server();
+        // The gated learned overlay, seeded directly: the descriptive
+        // keys of the two twin directories, pushed to their bounds,
+        // stamped now so decay is ~1.0.
+        let conn = server.router.conn().expect("index connection");
+        let now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (feature, weight) in [("path:src/alpha", -0.5f32), ("path:src/omega", 0.5f32)] {
+            conn.execute(
+                "INSERT INTO learned_weights \
+                 (feature, query_class, weight, observations, sessions, updated_at) \
+                 VALUES (?1, '', ?2, 40, 40, ?3)",
+                rusqlite::params![feature, weight, now],
+            )
+            .unwrap();
+        }
+
+        // With the overlay: the omega twin (its directory learned
+        // positive) leads. Stripped: index-only order returns.
+        let overlay = nf_search_order(&mut server, false);
+        assert!(
+            overlay[0].0.ends_with("src/omega/mod.rs"),
+            "the overlay reorders the tied twins: {overlay:?}"
+        );
+        let free = nf_search_order(&mut server, true);
+        let twin_of = |file: &str| {
+            if file.ends_with("src/alpha/mod.rs") {
+                "alpha"
+            } else {
+                "omega"
+            }
+        };
+        assert_eq!(
+            free.iter()
+                .map(|(file, _)| twin_of(file))
+                .collect::<Vec<_>>(),
+            vec!["alpha", "omega"],
+            "no_feedback reproduces the index-only order exactly: {free:?}"
+        );
+    }
+
+    #[test]
+    fn tool_search_schema_has_no_feedback() {
+        let tools = tool_definitions();
+        let tool = tools.iter().find(|t| t.name == "wonk_search").unwrap();
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        let flag = props.get("no_feedback").expect("no_feedback property");
+        assert_eq!(flag["type"], "boolean");
+        assert!(
+            !tool.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "no_feedback"),
+            "no_feedback is optional"
+        );
+    }
+
+    #[test]
+    fn tool_status_includes_feedback_state() {
+        let (_dir, mut server) = feedback_server(true);
+        let conn = server.router.conn().unwrap();
+        let now: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO feedback_events \
+             (result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+             VALUES ('x', NULL, 2, ?1, 1, 's1', ?2)",
+            rusqlite::params![r#"{"schema":1,"slate":"t","members":[]}"#, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO learned_weights \
+             (feature, query_class, weight, observations, sessions, updated_at) \
+             VALUES ('path_character', '', 0.55, 40, 9, ?1)",
+            [now],
+        )
+        .unwrap();
+
+        let result = server.handle_tools_call(&serde_json::json!({
+            "name": "wonk_status",
+            "arguments": {}
+        }));
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let status: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(status["feedback"]["enabled"], true);
+        assert_eq!(status["feedback"]["events"], 1);
+        assert_eq!(status["feedback"]["sessions"], 1);
+        assert!(
+            status["feedback"]["deviation"].as_f64().unwrap() > 0.0,
+            "deviation reads through: {status}"
+        );
     }
 }
