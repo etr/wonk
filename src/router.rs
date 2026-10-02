@@ -862,11 +862,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // with a warning (PRD-EMB-REQ-009), while a stored space that
             // disagrees with the resolved provider blocks with a re-embed
             // command (PRD-EMB-REQ-005).
-            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
-            if let Some(warning) = plan.fallback_warning {
-                output::print_warning(warning);
-            }
-            let mut provider = plan.provider;
+            let mut provider = resolve_query_provider(&conn, config.embedding.provider)?;
 
             // Validate --from/--to files exist in the index before computing
             // reachability (fail fast with a clear error).
@@ -943,16 +939,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             )
                         });
                         if disconnected {
-                            let fallback = crate::embedding::fallback_after_disconnect(
-                                &conn,
-                                config.embedding.provider,
-                            )?;
-                            output::print_warning(
-                                fallback
-                                    .fallback_warning
-                                    .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
-                            );
-                            provider = fallback.provider;
+                            // Re-plan with the provider dead: degrade to the
+                            // bundled provider, or surface the re-embed
+                            // instruction when the stored space refuses.
+                            provider = degrade_after_disconnect(&conn, config.embedding.provider)?;
                         } else {
                             output::print_error(&format!("embedding build failed: {e:#}"));
                             return Ok(());
@@ -982,16 +972,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
                     // Ollama died between the health check and the query
                     // embed: re-plan and degrade if the stored space allows.
-                    let fallback = crate::embedding::fallback_after_disconnect(
-                        &conn,
-                        config.embedding.provider,
-                    )?;
-                    output::print_warning(
-                        fallback
-                            .fallback_warning
-                            .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
-                    );
-                    fallback.provider.embed_single(&args.query)?
+                    degrade_after_disconnect(&conn, config.embedding.provider)?
+                        .embed_single(&args.query)?
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1240,11 +1222,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             };
 
-            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
-            if let Some(warning) = plan.fallback_warning {
-                output::print_warning(warning);
-            }
-            let provider = plan.provider;
+            let provider = resolve_query_provider(&conn, config.embedding.provider)?;
 
             // Normalize path: strip leading "./", normalize "." to empty.
             let prefix = args.path.strip_prefix("./").unwrap_or(&args.path);
@@ -1334,11 +1312,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     }
                 };
 
-            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
-            if let Some(warning) = plan.fallback_warning {
-                output::print_warning(warning);
-            }
-            let provider = plan.provider;
+            let provider = resolve_query_provider(&conn, config.embedding.provider)?;
 
             // Determine files to analyze.
             let files: Vec<String> = if let Some(ref since) = args.since {
@@ -3435,6 +3409,47 @@ fn is_query_command(cmd: &Command) -> bool {
 // Semantic blending helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve the provider for a semantic query and surface the degraded-mode
+/// warning.
+///
+/// Single wiring for the ask/cluster/impact arms and
+/// [`fetch_semantic_results`]: plans via
+/// [`crate::embedding::plan_query_provider`] — an unreachable configured
+/// Ollama degrades to the bundled provider (PRD-EMB-REQ-009) and a stored
+/// space that disagrees with the resolved provider blocks with a re-embed
+/// command (PRD-EMB-REQ-005) — and prints the fallback warning when the
+/// plan degraded.
+fn resolve_query_provider(
+    conn: &Connection,
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>> {
+    let plan = crate::embedding::plan_query_provider(conn, configured)?;
+    if let Some(warning) = plan.fallback_warning {
+        output::print_warning(warning);
+    }
+    Ok(plan.provider)
+}
+
+/// Re-plan after the configured provider died mid-query.
+///
+/// Degrades to the bundled provider with the fallback warning, or — when
+/// the stored vectors make the fallback unsafe — propagates the re-embed
+/// instruction via `?`. This is the single home of the warning default:
+/// every caller reaches here only with the provider configured as Ollama,
+/// for which a degrading plan always carries the warning.
+fn degrade_after_disconnect(
+    conn: &Connection,
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>> {
+    let fallback = crate::embedding::fallback_after_disconnect(conn, configured)?;
+    output::print_warning(
+        fallback
+            .fallback_warning
+            .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
+    );
+    Ok(fallback.provider)
+}
+
 /// Fetch semantic search results without formatting them.
 ///
 /// Returns the resolved semantic results, or an empty Vec on graceful
@@ -3456,11 +3471,7 @@ fn fetch_semantic_results(
     // Resolve the query provider against the stored spaces: unreachable
     // configured Ollama degrades to bundled with a warning; a mismatched
     // stored space blocks with a re-embed command.
-    let plan = crate::embedding::plan_query_provider(conn, configured)?;
-    if let Some(warning) = plan.fallback_warning {
-        output::print_warning(warning);
-    }
-    let provider = plan.provider;
+    let provider = resolve_query_provider(conn, configured)?;
 
     let all_embeddings = match crate::embedding::load_all_embeddings(conn, provider.as_ref()) {
         Ok(e) if !e.is_empty() => e,
@@ -3488,13 +3499,7 @@ fn fetch_semantic_results(
         Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
             // Mid-query disconnect: degrade when the stored space allows it,
             // otherwise surface the re-embed instruction.
-            let fallback = crate::embedding::fallback_after_disconnect(conn, configured)?;
-            output::print_warning(
-                fallback
-                    .fallback_warning
-                    .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
-            );
-            fallback.provider.embed_single(pattern)?
+            degrade_after_disconnect(conn, configured)?.embed_single(pattern)?
         }
         Err(e) => return Err(e.into()),
     };
