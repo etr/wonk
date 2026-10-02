@@ -267,19 +267,25 @@ impl RouterContext {
             .map(|(_, var)| var.as_str())
     }
 
-    /// Concatenated prefix for a router variable: mount paths first, then
-    /// the variable's own binding.
-    fn effective_prefix(&self, var: &str) -> String {
-        let mut prefix = String::new();
-        if let Some(mount_paths) = self.mounts.get(var) {
-            for m in mount_paths {
-                prefix.push_str(m);
+    /// Every prefix a router variable is reachable under: ONE PER MOUNT
+    /// PATH — a router mounted under several prefixes serves each of
+    /// them, not their concatenation (`app.use('/v1', r)` +
+    /// `app.use('/v2', r)` + `r.get('/users')` yields /v1/users AND
+    /// /v2/users — TASK-082 review debt) — each joined with the
+    /// variable's own binding, de-duplicated in first-seen order. A
+    /// binding-only variable yields its single binding; an unbound
+    /// variable yields one empty prefix so consumers keep today's
+    /// behavior.
+    fn effective_prefixes(&self, var: &str) -> Vec<String> {
+        let binding = self.bindings.get(var).cloned().unwrap_or_default();
+        let mut out: Vec<String> = match self.mounts.get(var) {
+            Some(mounts) if !mounts.is_empty() => {
+                mounts.iter().map(|m| format!("{m}{binding}")).collect()
             }
-        }
-        if let Some(b) = self.bindings.get(var) {
-            prefix.push_str(b);
-        }
-        prefix
+            _ => vec![binding],
+        };
+        out.dedup();
+        out
     }
 }
 
@@ -1172,16 +1178,17 @@ impl<'a> Extractor<'a> {
                     && (self.ctx.is_router_var(recv) || JS_ROUTER_VARS.contains(&recv))
                     && let Some(arg) = first_arg
                 {
-                    let mount_prefix = self.ctx.effective_prefix(recv);
-                    self.emit_http(
-                        node,
-                        arg,
-                        ContractRole::Provider,
-                        prop,
-                        &join_raw(prefix, &mount_prefix),
-                        CONFIDENCE_FRAMEWORK,
-                        None,
-                    );
+                    for mount_prefix in self.ctx.effective_prefixes(recv) {
+                        self.emit_http(
+                            node,
+                            arg,
+                            ContractRole::Provider,
+                            prop,
+                            &join_raw(prefix, &mount_prefix),
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
                 } else if JS_CONSUMER_RECEIVERS.contains(&recv)
                     && JS_CONSUMER_VERBS.contains(&prop)
                     && let Some(arg) = first_arg
@@ -1601,16 +1608,17 @@ impl<'a> Extractor<'a> {
                 "get" | "post" | "put" | "patch" | "delete" if is_router => attr,
                 _ => continue,
             };
-            let mount_prefix = self.ctx.effective_prefix(recv);
-            self.emit_http(
-                call,
-                path_node,
-                ContractRole::Provider,
-                verb,
-                &join_raw(prefix, &mount_prefix),
-                CONFIDENCE_FRAMEWORK,
-                owning.as_deref(),
-            );
+            for mount_prefix in self.ctx.effective_prefixes(recv) {
+                self.emit_http(
+                    call,
+                    path_node,
+                    ContractRole::Provider,
+                    verb,
+                    &join_raw(prefix, &mount_prefix),
+                    CONFIDENCE_FRAMEWORK,
+                    owning.as_deref(),
+                );
+            }
         }
         prefix.to_string()
     }
@@ -2213,16 +2221,18 @@ impl<'a> Extractor<'a> {
             // gin/chi-style registration: uppercase verb + handler arg.
             _ if GO_PROVIDER_VERBS.contains(&meth) && argc >= 2 => {
                 if let Some(arg) = first {
-                    let pfx = join_raw(prefix, &self.ctx.effective_prefix(recv));
-                    self.emit_http(
-                        node,
-                        arg,
-                        ContractRole::Provider,
-                        meth,
-                        &pfx,
-                        CONFIDENCE_FRAMEWORK,
-                        None,
-                    );
+                    for mount_prefix in self.ctx.effective_prefixes(recv) {
+                        let pfx = join_raw(prefix, &mount_prefix);
+                        self.emit_http(
+                            node,
+                            arg,
+                            ContractRole::Provider,
+                            meth,
+                            &pfx,
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
                 }
             }
             (_, "HandleFunc") | (_, "Handle") if argc >= 2 => {
@@ -2537,16 +2547,19 @@ impl<'a> Extractor<'a> {
                     let verb = positional_arg(args, 1)
                         .and_then(|handler| rust_handler_verb(handler, self.src))
                         .unwrap_or("ANY");
-                    let route_prefix = self.rust_receiver_prefix(func.child_by_field_name("value"));
-                    self.emit_http(
-                        node,
-                        arg,
-                        ContractRole::Provider,
-                        verb,
-                        &join_raw(prefix, &route_prefix),
-                        CONFIDENCE_FRAMEWORK,
-                        None,
-                    );
+                    for route_prefix in
+                        self.rust_receiver_prefixes(func.child_by_field_name("value"))
+                    {
+                        self.emit_http(
+                            node,
+                            arg,
+                            ContractRole::Provider,
+                            verb,
+                            &join_raw(prefix, &route_prefix),
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
                 } else if let Some(verb) = canonical_verb(field) {
                     let value = func.child_by_field_name("value");
                     let root = rust_chain_root(value);
@@ -2659,17 +2672,18 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// Prefix carried by a `.route` receiver: inline `web::scope("/p")`
-    /// chain segments, plus the prefix of the variable whose initializer
-    /// the chain belongs to (Axum `let user_routes = Router::new()…`).
-    fn rust_receiver_prefix(&self, recv: Option<Node>) -> String {
-        // A bound variable (`api.route(…)`) carries its own prefix.
+    /// Prefixes carried by a `.route` receiver: inline `web::scope("/p")`
+    /// chain segments, plus every prefix of the variable whose
+    /// initializer the chain belongs to (Axum `let user_routes =
+    /// Router::new()…`) — one per mount (TASK-082 review debt).
+    fn rust_receiver_prefixes(&self, recv: Option<Node>) -> Vec<String> {
+        // A bound variable (`api.route(…)`) carries its own prefixes.
         if let Some(r) = recv
             && r.kind() == "identifier"
         {
-            return self.ctx.effective_prefix(node_text(Some(r), self.src));
+            return self.ctx.effective_prefixes(node_text(Some(r), self.src));
         }
-        let mut prefix = String::new();
+        let mut scope_prefix = String::new();
         let mut current = recv;
         let mut last = recv;
         let mut depth = 0;
@@ -2700,7 +2714,7 @@ impl<'a> Extractor<'a> {
                 && path_node.kind() == "string_literal"
             {
                 append_segment(
-                    &mut prefix,
+                    &mut scope_prefix,
                     &render_string_node(path_node, self.src, self.lang),
                 );
             }
@@ -2710,9 +2724,14 @@ impl<'a> Extractor<'a> {
         if let Some(root) = current.or(last)
             && let Some(var) = self.ctx.var_for_range(root.start_byte())
         {
-            prefix.push_str(&self.ctx.effective_prefix(var));
+            return self
+                .ctx
+                .effective_prefixes(var)
+                .into_iter()
+                .map(|p| format!("{scope_prefix}{p}"))
+                .collect();
         }
-        prefix
+        vec![scope_prefix]
     }
 
     /// `env!("X")` — macro_invocation children carry no field names.
@@ -9290,6 +9309,32 @@ router.get('/users/:id', getUser);
         assert!(
             find(&cands, "http::GET::/v1/users/{p1}").is_some(),
             "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn express_router_mounted_twice_serves_each_prefix() {
+        // TASK-082 review debt: a router mounted under several prefixes
+        // serves EACH — two contracts — not the concatenation
+        // (/v1/v2/users was the old, wrong output).
+        let src = "const app = express();
+const router = express.Router();
+app.use('/v1', router);
+app.use('/v2', router);
+router.get('/users', h);
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users").is_some(),
+            "got {cands:?}"
+        );
+        assert!(
+            find(&cands, "http::GET::/v2/users").is_some(),
+            "got {cands:?}"
+        );
+        assert!(
+            find(&cands, "http::GET::/v1/v2/users").is_none(),
+            "concatenated mount leaked: {cands:?}"
         );
     }
 
