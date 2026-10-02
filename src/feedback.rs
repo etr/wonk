@@ -459,10 +459,13 @@ fn extract_groups(
     let class = ctx
         .path_class(canonical)
         .unwrap_or_else(|| crate::rerank::classify_path_character(std::path::Path::new(canonical)));
-    groups.path.insert("class".to_string(), path_class_label(class).to_string());
     groups
         .path
-        .insert("depth".to_string(), depth_bucket(ancestor_dirs(canonical).len()).to_string());
+        .insert("class".to_string(), path_class_label(class).to_string());
+    groups.path.insert(
+        "depth".to_string(),
+        depth_bucket(ancestor_dirs(canonical).len()).to_string(),
+    );
     if let Some(sym) = owning {
         groups.path.insert("lang".to_string(), sym.language.clone());
     }
@@ -474,15 +477,23 @@ fn extract_groups(
             None | Some("") => "top_level",
             Some(_) => "nested",
         };
-        groups.symbol.insert("scoped".to_string(), scoped.to_string());
+        groups
+            .symbol
+            .insert("scoped".to_string(), scoped.to_string());
         let name_match = if sym.name.eq_ignore_ascii_case(inputs.query) {
             "exact"
-        } else if sym.name.to_ascii_lowercase().contains(&inputs.query.to_ascii_lowercase()) {
+        } else if sym
+            .name
+            .to_ascii_lowercase()
+            .contains(&inputs.query.to_ascii_lowercase())
+        {
             "substring"
         } else {
             "other"
         };
-        groups.symbol.insert("name_match".to_string(), name_match.to_string());
+        groups
+            .symbol
+            .insert("name_match".to_string(), name_match.to_string());
         let body = sym.end_line.unwrap_or(sym.line) - sym.line + 1;
         groups
             .symbol
@@ -490,9 +501,10 @@ fn extract_groups(
     }
 
     // -- match ----------------------------------------------------------------
-    groups
-        .match_
-        .insert("category".to_string(), category_label(item.classified.category));
+    groups.match_.insert(
+        "category".to_string(),
+        category_label(item.classified.category),
+    );
     let terms: Vec<String> = if ctx.terms().is_empty() {
         crate::tokenizer::tokenize(inputs.query)
     } else {
@@ -501,14 +513,10 @@ fn extract_groups(
     let covered = terms
         .iter()
         .filter(|term| {
-            let in_line =
-                crate::rerank::contains_identifier_token(&result.content, term);
+            let in_line = crate::rerank::contains_identifier_token(&result.content, term);
             let in_symbol = owning.is_some_and(|sym| {
-                let name_and_signature = format!(
-                    "{} {}",
-                    sym.name,
-                    sym.signature.as_deref().unwrap_or("")
-                );
+                let name_and_signature =
+                    format!("{} {}", sym.name, sym.signature.as_deref().unwrap_or(""));
                 crate::rerank::contains_identifier_token(&name_and_signature, term)
             });
             in_line || in_symbol
@@ -518,9 +526,10 @@ fn extract_groups(
         "term_coverage".to_string(),
         coverage_bucket(covered, terms.len()).to_string(),
     );
-    groups
-        .match_
-        .insert("anchored".to_string(), if owning.is_some() { "symbol" } else { "line" }.to_string());
+    groups.match_.insert(
+        "anchored".to_string(),
+        if owning.is_some() { "symbol" } else { "line" }.to_string(),
+    );
 
     // -- graph ----------------------------------------------------------------
     // Position-keyed through the dual-keyed context: the canonical file is
@@ -529,8 +538,12 @@ fn extract_groups(
         ctx.fan_in_at(canonical, result.line),
         ctx.fan_out_at(canonical, result.line),
     ) {
-        groups.graph.insert("fan_in".to_string(), fan_bucket(fan_in).to_string());
-        groups.graph.insert("fan_out".to_string(), fan_bucket(fan_out).to_string());
+        groups
+            .graph
+            .insert("fan_in".to_string(), fan_bucket(fan_in).to_string());
+        groups
+            .graph
+            .insert("fan_out".to_string(), fan_bucket(fan_out).to_string());
     }
 
     // -- history (whole group omitted without mined history) ------------------
@@ -558,7 +571,9 @@ fn extract_groups(
                     .insert("last_touched_by".to_string(), author.to_string());
             }
             if let Some(author) = ctx.primary_author_of(canonical) {
-                groups.author.insert("primary".to_string(), author.to_string());
+                groups
+                    .author
+                    .insert("primary".to_string(), author.to_string());
             }
         }
     }
@@ -571,19 +586,28 @@ fn extract_groups(
         let same_file = resolved
             .map(|r| r == canonical)
             .unwrap_or_else(|| crate::rerank::is_path_suffix(hint, canonical));
-        groups
-            .context
-            .insert("same_file".to_string(), if same_file { "yes" } else { "no" }.to_string());
+        groups.context.insert(
+            "same_file".to_string(),
+            if same_file { "yes" } else { "no" }.to_string(),
+        );
         let same_dir = parent_dir(&hint_file) == parent_dir(canonical);
         groups.context.insert(
             "same_directory".to_string(),
             if same_dir { "yes" } else { "no" }.to_string(),
         );
-        match (ctx.working_hint_community(), ctx.community_at(canonical, result.line)) {
+        match (
+            ctx.working_hint_community(),
+            ctx.community_at(canonical, result.line),
+        ) {
             (Some(hint_community), Some(member_community)) => {
                 groups.context.insert(
                     "same_community".to_string(),
-                    if hint_community == member_community { "yes" } else { "no" }.to_string(),
+                    if hint_community == member_community {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                    .to_string(),
                 );
             }
             _ => {
@@ -750,7 +774,9 @@ fn apply_cardinality_cap(groups: &mut [FeatureGroups]) {
                 member.path.remove(&key);
             }
             if had_overflow {
-                member.path.insert(OVERFLOW_LABEL.to_string(), "1".to_string());
+                member
+                    .path
+                    .insert(OVERFLOW_LABEL.to_string(), "1".to_string());
             }
         }
     }
@@ -828,7 +854,12 @@ fn build_members(
                 )
             }
         };
-        extracted.push(extract_groups(item, owning_symbol(rows, result.line), &canonical, &inputs));
+        extracted.push(extract_groups(
+            item,
+            owning_symbol(rows, result.line),
+            &canonical,
+            &inputs,
+        ));
         members.push(SlateMember {
             identity,
             rank: idx + 1,
@@ -1539,17 +1570,41 @@ mod tests {
             crate::ranker::ResultCategory::Definition,
             vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
         )]);
-        let t1 = build_and_store_slate(&conn, "one", &ranked, &crate::config::FeedbackConfig { slate_retention: 2, ..test_feedback() })
-            .unwrap()
-            .token;
+        let t1 = build_and_store_slate(
+            &conn,
+            "one",
+            &ranked,
+            &crate::config::FeedbackConfig {
+                slate_retention: 2,
+                ..test_feedback()
+            },
+        )
+        .unwrap()
+        .token;
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let t2 = build_and_store_slate(&conn, "two", &ranked, &crate::config::FeedbackConfig { slate_retention: 2, ..test_feedback() })
-            .unwrap()
-            .token;
+        let t2 = build_and_store_slate(
+            &conn,
+            "two",
+            &ranked,
+            &crate::config::FeedbackConfig {
+                slate_retention: 2,
+                ..test_feedback()
+            },
+        )
+        .unwrap()
+        .token;
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let t3 = build_and_store_slate(&conn, "three", &ranked, &crate::config::FeedbackConfig { slate_retention: 2, ..test_feedback() })
-            .unwrap()
-            .token;
+        let t3 = build_and_store_slate(
+            &conn,
+            "three",
+            &ranked,
+            &crate::config::FeedbackConfig {
+                slate_retention: 2,
+                ..test_feedback()
+            },
+        )
+        .unwrap()
+        .token;
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
             .unwrap();
@@ -1994,12 +2049,14 @@ mod tests {
     ) -> crate::rerank::RankedSearch {
         let results = hits
             .into_iter()
-            .map(|(file, line, content, _score)| crate::search::SearchResult {
-                file: std::path::PathBuf::from(file),
-                line,
-                col: 1,
-                content,
-            })
+            .map(
+                |(file, line, content, _score)| crate::search::SearchResult {
+                    file: std::path::PathBuf::from(file),
+                    line,
+                    col: 1,
+                    content,
+                },
+            )
             .collect::<Vec<_>>();
         let settings = crate::rerank::RankSettings {
             use_pipeline: true,
@@ -2030,10 +2087,18 @@ mod tests {
         assert_eq!(path.get("src").map(String::as_str), Some("1"));
         assert_eq!(path.get("src/auth").map(String::as_str), Some("1"));
         assert_eq!(path.get("src/auth/tokens").map(String::as_str), Some("1"));
-        assert_eq!(path.get("depth").map(String::as_str), Some("mid"), "{path:?}");
+        assert_eq!(
+            path.get("depth").map(String::as_str),
+            Some("mid"),
+            "{path:?}"
+        );
         assert_eq!(path.get("class").map(String::as_str), Some("ordinary"));
         assert_eq!(path.get("lang").map(String::as_str), Some("Rust"));
-        assert_eq!(path.len(), 6, "three ancestors + depth/class/lang: {path:?}");
+        assert_eq!(
+            path.len(),
+            6,
+            "three ancestors + depth/class/lang: {path:?}"
+        );
 
         // A root-level file has no ancestor features at all.
         let ranked = descriptive_ranked(
@@ -2051,7 +2116,9 @@ mod tests {
             .token;
         let path = &stored_members(&conn, &token)[0].groups.path;
         assert!(
-            !path.keys().any(|k| !["class", "depth", "lang"].contains(&k.as_str())),
+            !path
+                .keys()
+                .any(|k| !["class", "depth", "lang"].contains(&k.as_str())),
             "{path:?}"
         );
         assert_eq!(path.get("depth").map(String::as_str), Some("shallow"));
@@ -2072,12 +2139,16 @@ mod tests {
             )],
             "never_matching_query_zzz",
         );
-        let token =
-            build_and_store_slate(&conn, "zzz", &ranked, &test_feedback()).unwrap().token;
+        let token = build_and_store_slate(&conn, "zzz", &ranked, &test_feedback())
+            .unwrap()
+            .token;
         let groups = &stored_members(&conn, &token)[0].groups;
         assert!(groups.symbol.is_empty(), "no owning symbol: {groups:?}");
         assert!(groups.graph.is_empty());
-        assert!(!groups.path.is_empty(), "path features come from the canonical key");
+        assert!(
+            !groups.path.is_empty(),
+            "path features come from the canonical key"
+        );
         assert!(!groups.match_.is_empty());
         drop(dir);
     }
@@ -2177,8 +2248,9 @@ mod tests {
             ],
             "helper_a",
         );
-        let token =
-            build_and_store_slate(&conn, "helper_a", &ranked, &test_feedback()).unwrap().token;
+        let token = build_and_store_slate(&conn, "helper_a", &ranked, &test_feedback())
+            .unwrap()
+            .token;
         let members = stored_members(&conn, &token);
 
         let issue = &members
@@ -2189,10 +2261,16 @@ mod tests {
         // issue.rs: churn 12.0 -> high; last_ts an hour ago -> hours;
         // fan_in 21 -> high; fan_out 0 -> zero; body 3 lines -> tiny.
         assert_eq!(issue.history.get("churn").map(String::as_str), Some("high"));
-        assert_eq!(issue.history.get("recency").map(String::as_str), Some("hours"));
+        assert_eq!(
+            issue.history.get("recency").map(String::as_str),
+            Some("hours")
+        );
         assert_eq!(issue.graph.get("fan_in").map(String::as_str), Some("high"));
         assert_eq!(issue.graph.get("fan_out").map(String::as_str), Some("zero"));
-        assert_eq!(issue.symbol.get("body_size").map(String::as_str), Some("tiny"));
+        assert_eq!(
+            issue.symbol.get("body_size").map(String::as_str),
+            Some("tiny")
+        );
         assert_eq!(issue.author.get("primary").map(String::as_str), Some("Ada"));
         assert_eq!(
             issue.author.get("last_touched_by").map(String::as_str),
@@ -2207,10 +2285,16 @@ mod tests {
         // deep_helpers.rs: churn 2.0 -> low; 40 days old -> months;
         // fan_in 4 -> low; fan_out 1 -> low; primary Zed, last Bob.
         assert_eq!(helper.history.get("churn").map(String::as_str), Some("low"));
-        assert_eq!(helper.history.get("recency").map(String::as_str), Some("months"));
+        assert_eq!(
+            helper.history.get("recency").map(String::as_str),
+            Some("months")
+        );
         assert_eq!(helper.graph.get("fan_in").map(String::as_str), Some("low"));
         assert_eq!(helper.graph.get("fan_out").map(String::as_str), Some("low"));
-        assert_eq!(helper.author.get("primary").map(String::as_str), Some("Zed"));
+        assert_eq!(
+            helper.author.get("primary").map(String::as_str),
+            Some("Zed")
+        );
         assert_eq!(
             helper.author.get("last_touched_by").map(String::as_str),
             Some("Bob")
@@ -2218,7 +2302,12 @@ mod tests {
 
         // No raw number appears anywhere in the labeled groups.
         for member in &members {
-            for (name, value) in member.groups.history.iter().chain(member.groups.graph.iter()) {
+            for (name, value) in member
+                .groups
+                .history
+                .iter()
+                .chain(member.groups.graph.iter())
+            {
                 assert!(
                     !value.chars().any(|c| c.is_ascii_digit()),
                     "{name} leaked a raw value: {value}"
@@ -2332,8 +2421,9 @@ mod tests {
             .unwrap();
         }
         let ranked = descriptive_ranked(&conn, hits, "generated");
-        let token =
-            build_and_store_slate(&conn, "generated", &ranked, &test_feedback()).unwrap().token;
+        let token = build_and_store_slate(&conn, "generated", &ranked, &test_feedback())
+            .unwrap()
+            .token;
         let members = stored_members(&conn, &token);
 
         let primaries: Vec<&str> = members
@@ -2413,7 +2503,10 @@ mod tests {
         let groups_b =
             serde_json::to_string(&members_b.iter().map(|m| &m.groups).collect::<Vec<_>>())
                 .unwrap();
-        assert_eq!(groups_a, groups_b, "identical inputs, identical groups JSON");
+        assert_eq!(
+            groups_a, groups_b,
+            "identical inputs, identical groups JSON"
+        );
         drop(dir);
     }
 
@@ -2460,10 +2553,16 @@ mod tests {
         let on_members = stored_members(&conn, &on);
         let off_members = stored_members(&conn, &off);
         let raw_off = slate_row(&conn, &off).2;
-        assert!(!raw_off.contains("\"author\""), "key absent in JSON: {raw_off}");
+        assert!(
+            !raw_off.contains("\"author\""),
+            "key absent in JSON: {raw_off}"
+        );
         for (on_m, off_m) in on_members.iter().zip(off_members.iter()) {
             assert!(!on_m.groups.author.is_empty(), "switch on records authors");
-            assert!(off_m.groups.author.is_empty(), "switch off never builds the group");
+            assert!(
+                off_m.groups.author.is_empty(),
+                "switch off never builds the group"
+            );
             // Every other group is byte-identical.
             assert_eq!(on_m.groups.path, off_m.groups.path);
             assert_eq!(on_m.groups.symbol, off_m.groups.symbol);
@@ -2475,5 +2574,227 @@ mod tests {
         }
         drop(dir);
     }
-}
+    // -- context-relative features (TASK-105, PRD-FB-REQ-027) ------------------
 
+    use crate::rerank::{SharedContext, WorkingContext};
+
+    /// A pipeline-shaped ranked search carrying a caller-built shared
+    /// context — the seam the context-relative features read.
+    fn ranked_with_context(
+        hits: Vec<(&str, u64, &str, f32)>,
+        ctx: SharedContext,
+    ) -> crate::rerank::RankedSearch {
+        let ranked = ranked_search(vec![(crate::ranker::ResultCategory::Definition, hits)]);
+        crate::rerank::RankedSearch {
+            context: ctx,
+            ..ranked
+        }
+    }
+
+    fn symbol_id(conn: &Connection, name: &str) -> i64 {
+        conn.query_row("SELECT id FROM symbols WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn context_features_over_a_populated_working_context() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC), ("sub/other.rs", OTHER_SRC)]);
+        let hint_id = symbol_id(&conn, "outer_guard");
+        let other_id = symbol_id(&conn, "other_entry");
+        let ctx = SharedContext {
+            working: WorkingContext {
+                hint: Some("nested.rs".to_string()),
+                path: Some("nested.rs".to_string()),
+                community: Some(7),
+                distances: HashMap::from([(hint_id, 1i64), (other_id, 2)]),
+                partners: HashMap::from([
+                    ("nested.rs".to_string(), 4.0f32),
+                    ("sub/other.rs".to_string(), 1.5),
+                ]),
+            },
+            topology: crate::rerank::TopologyContext {
+                communities: HashMap::from([
+                    (("nested.rs".to_string(), 1u64), 7i64),
+                    (("sub/other.rs".to_string(), 1u64), 9),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ranked = ranked_with_context(
+            vec![
+                // The hint file itself: same file, same (root) directory,
+                // same community, distance 1, coupled 4.0.
+                ("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9),
+                // A sibling in a subdirectory: different file, different
+                // directory, different community, distance 2, coupled 1.5.
+                (
+                    "sub/other.rs",
+                    1,
+                    "pub fn other_entry(x: i64) -> i64 {",
+                    0.7,
+                ),
+                // Line-anchored in the hint file.
+                ("nested.rs", 99, "// outside every span", 0.5),
+            ],
+            ctx,
+        );
+        let token = build_and_store_slate(&conn, "guard", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let members = stored_members(&conn, &token);
+
+        let first = &members[0].groups.context;
+        assert_eq!(first.get("same_file").map(String::as_str), Some("yes"));
+        assert_eq!(first.get("same_directory").map(String::as_str), Some("yes"));
+        assert_eq!(first.get("same_community").map(String::as_str), Some("yes"));
+        assert_eq!(
+            first.get("import_distance").map(String::as_str),
+            Some("direct")
+        );
+        assert_eq!(first.get("co_change").map(String::as_str), Some("strong"));
+
+        let second = &members[1].groups.context;
+        assert_eq!(second.get("same_file").map(String::as_str), Some("no"));
+        assert_eq!(second.get("same_directory").map(String::as_str), Some("no"));
+        assert_eq!(second.get("same_community").map(String::as_str), Some("no"));
+        assert_eq!(
+            second.get("import_distance").map(String::as_str),
+            Some("transitive")
+        );
+        assert_eq!(second.get("co_change").map(String::as_str), Some("weak"));
+
+        // Line-anchored: import_distance is omitted (no owning symbol id),
+        // the string-computable keys stay.
+        let third = &members[2].groups.context;
+        assert!(!third.contains_key("import_distance"));
+        assert_eq!(third.get("same_file").map(String::as_str), Some("yes"));
+        drop(dir);
+    }
+
+    #[test]
+    fn unresolvable_hint_still_emits_string_computable_keys() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let ctx = SharedContext {
+            working: WorkingContext {
+                hint: Some("src/gone/missing.rs".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ranked = ranked_with_context(
+            vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+            ctx,
+        );
+        let token = build_and_store_slate(&conn, "guard", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let groups = &stored_members(&conn, &token)[0].groups;
+        assert!(
+            !groups.context.is_empty(),
+            "the group is present: {groups:?}"
+        );
+        assert_eq!(
+            groups.context.get("same_file").map(String::as_str),
+            Some("no")
+        );
+        assert_eq!(
+            groups.context.get("same_directory").map(String::as_str),
+            Some("no")
+        );
+        assert_eq!(
+            groups.context.get("co_change").map(String::as_str),
+            Some("none")
+        );
+        assert!(
+            !groups.context.contains_key("same_community"),
+            "unknown communities are omitted, not defaulted"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn absolute_hint_matches_canonical_member_via_suffix_equivalence() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let absolute = dir.path().join("nested.rs");
+        let ctx = SharedContext {
+            working: WorkingContext {
+                hint: Some(absolute.to_string_lossy().into_owned()),
+                path: Some("nested.rs".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ranked = ranked_with_context(
+            vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+            ctx,
+        );
+        let token = build_and_store_slate(&conn, "guard", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        assert_eq!(
+            stored_members(&conn, &token)[0]
+                .groups
+                .context
+                .get("same_file")
+                .map(String::as_str),
+            Some("yes")
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn no_hint_means_no_context_key_anywhere() {
+        let (dir, conn) = descriptive_conn();
+        let ranked = descriptive_ranked(
+            &conn,
+            vec![(
+                "src/auth/tokens/issue.rs".to_string(),
+                1,
+                "pub fn issue_token(user: &User) -> Token {".to_string(),
+                0.9,
+            )],
+            "issue_token",
+        );
+        assert!(ranked.context.working_hint().is_none(), "no hint anywhere");
+        let token = build_and_store_slate(&conn, "issue_token", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let raw = slate_row(&conn, &token).2;
+        assert!(
+            !raw.contains("\"context\""),
+            "absent rather than defaulted: {raw}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn weak_co_change_and_unreachable_distance_labels() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let ctx = SharedContext {
+            working: WorkingContext {
+                hint: Some("elsewhere.rs".to_string()),
+                path: Some("elsewhere.rs".to_string()),
+                partners: HashMap::from([("nested.rs".to_string(), 1.5f32)]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ranked = ranked_with_context(
+            vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+            ctx,
+        );
+        let token = build_and_store_slate(&conn, "guard", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let context = &stored_members(&conn, &token)[0].groups.context;
+        assert_eq!(
+            context.get("import_distance").map(String::as_str),
+            Some("unreachable")
+        );
+        assert_eq!(context.get("co_change").map(String::as_str), Some("weak"));
+        drop(dir);
+    }
+}

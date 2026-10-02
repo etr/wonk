@@ -547,7 +547,7 @@ fn one_session_distinguishable_from_twenty() {
         &conn,
         "session_token",
         &ranked_for(&root, &conn, "session_token"),
-        64,
+        &wonk::config::FeedbackConfig::default(),
     )
     .unwrap()
     .token;

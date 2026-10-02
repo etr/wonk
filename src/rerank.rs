@@ -786,10 +786,7 @@ impl SharedContext {
     /// The author of the file's newest commit (None unless prepared, or
     /// the mine recorded none).
     pub fn last_author_of(&self, file: &str) -> Option<&str> {
-        self.churn
-            .last_author
-            .get(file)
-            .and_then(|a| a.as_deref())
+        self.churn.last_author.get(file).and_then(|a| a.as_deref())
     }
 
     /// The file's dominant author by age-weighted commit count (None
@@ -1926,8 +1923,7 @@ pub(crate) fn is_path_suffix(path: &str, suffix: &str) -> bool {
 /// that resolve to nothing keep the identity mapping, so the loaders
 /// still query with the raw string and simply miss.
 fn resolve_file_keys(conn: Option<&Connection>, files: &[String]) -> HashMap<String, String> {
-    let mut keys: HashMap<String, String> =
-        files.iter().map(|f| (f.clone(), f.clone())).collect();
+    let mut keys: HashMap<String, String> = files.iter().map(|f| (f.clone(), f.clone())).collect();
     let Some(conn) = conn else {
         return keys;
     };
@@ -2051,9 +2047,7 @@ fn load_working_context(conn: &Connection, hint: &str) -> WorkingContext {
     // load_topology_scores fold).
     if let Some((&community, _)) = histogram
         .iter()
-        .max_by(|&(id_a, count_a), &(id_b, count_b)| {
-            count_a.cmp(count_b).then(id_b.cmp(id_a))
-        })
+        .max_by(|&(id_a, count_a), &(id_b, count_b)| count_a.cmp(count_b).then(id_b.cmp(id_a)))
     {
         ctx.community = Some(community);
     }
@@ -2082,7 +2076,10 @@ fn load_working_context(conn: &Connection, hint: &str) -> WorkingContext {
                 continue;
             };
             for (target, depth) in rows.flatten() {
-                ctx.distances.entry(target).and_modify(|d| *d = (*d).min(depth)).or_insert(depth);
+                ctx.distances
+                    .entry(target)
+                    .and_modify(|d| *d = (*d).min(depth))
+                    .or_insert(depth);
             }
         }
     }
@@ -2127,9 +2124,7 @@ fn resolve_hint_path(conn: &Connection, hint: &str) -> Option<String> {
             continue;
         }
         let better = match &best {
-            Some(b) => {
-                path.len() > b.len() || (path.len() == b.len() && path < *b)
-            }
+            Some(b) => path.len() > b.len() || (path.len() == b.len() && path < *b),
             None => true,
         };
         if better {
@@ -2689,10 +2684,18 @@ pub fn rerank_with_pairs(
         conn,
         weights,
         sources,
-        ContextReqs::none(),
-        None,
+        ScoreExtras::default(),
     );
     (scored, pairs)
+}
+
+/// The feedback-capture widenings threaded through one scoring run
+/// (TASK-105): context slices beyond the active signals' requirements
+/// and the working-context hint.
+#[derive(Default)]
+struct ScoreExtras<'a> {
+    extra_reqs: ContextReqs,
+    hint: Option<&'a str>,
 }
 
 /// The shared scoring body (TASK-105), additionally returning the
@@ -2710,9 +2713,12 @@ fn rerank_core(
     conn: Option<&Connection>,
     weights: &WeightTable,
     sources: &ContextSources,
-    extra_reqs: ContextReqs,
-    hint: Option<&str>,
-) -> (Vec<ScoredResult>, Vec<crate::shingles::NearDuplicatePair>, SharedContext) {
+    extras: ScoreExtras<'_>,
+) -> (
+    Vec<ScoredResult>,
+    Vec<crate::shingles::NearDuplicatePair>,
+    SharedContext,
+) {
     // The additive phase excludes novelty: its rows come from the
     // post-sort pass, not from per-candidate evaluation.
     let active: Vec<&Box<dyn Signal>> = signals
@@ -2725,8 +2731,8 @@ fn rerank_core(
     if weights.weight("novelty") != 0.0 {
         reqs = reqs.with_shingles();
     }
-    reqs = reqs.union(extra_reqs);
-    let ctx = prepare_context_with(reqs, query.pattern, &results, conn, sources, hint);
+    reqs = reqs.union(extras.extra_reqs);
+    let ctx = prepare_context_with(reqs, query.pattern, &results, conn, sources, extras.hint);
 
     let mut scored: Vec<ScoredResult> = results
         .into_iter()
@@ -3045,8 +3051,10 @@ pub fn rank_and_explain_classed(
             conn,
             &effective,
             &settings.sources,
-            widened,
-            settings.working_context.as_deref(),
+            ScoreExtras {
+                extra_reqs: widened,
+                hint: settings.working_context.as_deref(),
+            },
         );
         // Score order interleaves categories under any non-kind-only
         // weight table (group_by_category groups by adjacency); bucket
@@ -7487,7 +7495,7 @@ proximity, signature, churn, co_change, hub, authority, community",
         );
         assert_eq!(ranked.context.fan_out_at(&as_seen, 10), Some(1));
         assert_eq!(
-            ranked.context.last_author_of(&as_seen).as_deref(),
+            ranked.context.last_author_of(&as_seen),
             Some("Ada"),
             "per-file history rides the churn context"
         );
@@ -7590,10 +7598,8 @@ proximity, signature, churn, co_change, hub, authority, community",
     #[test]
     fn working_context_degrades_to_empty_on_missing_tables() {
         let (dir, conn) = descriptive_seeded_conn();
-        conn.execute_batch(
-            "DROP TABLE reach; DROP TABLE co_change; DROP TABLE symbol_topology;",
-        )
-        .unwrap();
+        conn.execute_batch("DROP TABLE reach; DROP TABLE co_change; DROP TABLE symbol_topology;")
+            .unwrap();
         let results = vec![classified(
             "src/other.rs",
             1,
@@ -7644,12 +7650,7 @@ proximity, signature, churn, co_change, hub, authority, community",
             use_pipeline: false,
             ..RankSettings::default()
         };
-        let legacy = rank_and_explain_classed(
-            &results,
-            Some(&conn),
-            "my_func",
-            &legacy_settings,
-        );
+        let legacy = rank_and_explain_classed(&results, Some(&conn), "my_func", &legacy_settings);
         assert_eq!(legacy.context.churn_score("src/main.rs"), None);
     }
 

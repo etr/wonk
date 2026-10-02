@@ -145,7 +145,11 @@ fn split_commit_header(line: &str) -> Option<(&str, i64, Option<&str>)> {
     match rest.split_once('\t') {
         Some((ts, author)) => {
             let ts = ts.trim().parse::<i64>().ok()?;
-            let author = if author.is_empty() { None } else { Some(author) };
+            let author = if author.is_empty() {
+                None
+            } else {
+                Some(author)
+            };
             Some((id, ts, author))
         }
         None => Some((id, rest.trim().parse::<i64>().ok()?, None)),
@@ -226,7 +230,9 @@ pub fn aggregate_file_history(
                 primary_author: None,
             });
             if let Some(author) = &commit.author {
-                *weighted.entry((file.clone(), author.clone())).or_insert(0.0) += weight;
+                *weighted
+                    .entry((file.clone(), author.clone()))
+                    .or_insert(0.0) += weight;
             }
         }
     }
@@ -633,7 +639,9 @@ fn recompute_history_aggregates(conn: &Connection, opts: &MiningOptions) -> Resu
                 score,
                 file_history.get(file).map(|h| h.last_ts),
                 file_history.get(file).and_then(|h| h.last_author.clone()),
-                file_history.get(file).and_then(|h| h.primary_author.clone()),
+                file_history
+                    .get(file)
+                    .and_then(|h| h.primary_author.clone()),
             ])?;
         }
     }
@@ -1925,7 +1933,11 @@ mod tests {
         let history = aggregate_file_history(&rows, 300, 200);
         let a = &history["a.rs"];
         assert_eq!(a.last_ts, 300);
-        assert_eq!(a.last_author.as_deref(), Some("Bob"), "newest commit's author");
+        assert_eq!(
+            a.last_author.as_deref(),
+            Some("Bob"),
+            "newest commit's author"
+        );
     }
 
     #[test]
@@ -1968,7 +1980,11 @@ mod tests {
         let a = &history["a.rs"];
         assert_eq!(a.last_ts, 300, "the newest commit still fixes last_ts");
         assert_eq!(a.last_author, None, "an authorless newest commit");
-        assert_eq!(a.primary_author.as_deref(), Some("Ada"), "Ada is the only author");
+        assert_eq!(
+            a.primary_author.as_deref(),
+            Some("Ada"),
+            "Ada is the only author"
+        );
     }
 
     #[test]

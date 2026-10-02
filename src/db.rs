@@ -500,13 +500,23 @@ pub fn ensure_history_tables(conn: &Connection) -> Result<()> {
 /// `file_churn.last_author`, `file_churn.primary_author`. Existing rows
 /// backfill NULL — the features stay omitted until the next mine.
 fn ensure_history_columns(conn: &Connection) -> Result<()> {
-    add_missing_columns(conn, "mined_commits", &[("author", "ALTER TABLE mined_commits ADD COLUMN author TEXT")])?;
+    add_missing_columns(
+        conn,
+        "mined_commits",
+        &[("author", "ALTER TABLE mined_commits ADD COLUMN author TEXT")],
+    )?;
     add_missing_columns(
         conn,
         "file_churn",
         &[
-            ("last_ts", "ALTER TABLE file_churn ADD COLUMN last_ts INTEGER"),
-            ("last_author", "ALTER TABLE file_churn ADD COLUMN last_author TEXT"),
+            (
+                "last_ts",
+                "ALTER TABLE file_churn ADD COLUMN last_ts INTEGER",
+            ),
+            (
+                "last_author",
+                "ALTER TABLE file_churn ADD COLUMN last_author TEXT",
+            ),
             (
                 "primary_author",
                 "ALTER TABLE file_churn ADD COLUMN primary_author TEXT",
@@ -537,8 +547,14 @@ fn ensure_topology_columns(conn: &Connection) -> Result<()> {
         conn,
         "symbol_topology",
         &[
-            ("fan_in", "ALTER TABLE symbol_topology ADD COLUMN fan_in INTEGER"),
-            ("fan_out", "ALTER TABLE symbol_topology ADD COLUMN fan_out INTEGER"),
+            (
+                "fan_in",
+                "ALTER TABLE symbol_topology ADD COLUMN fan_in INTEGER",
+            ),
+            (
+                "fan_out",
+                "ALTER TABLE symbol_topology ADD COLUMN fan_out INTEGER",
+            ),
         ],
     )?;
     Ok(())
@@ -2169,10 +2185,7 @@ mod tests {
 
         assert!(table_columns(&conn, "file_churn").contains(&"last_ts".to_string()));
         assert!(table_columns(&conn, "file_churn").contains(&"last_author".to_string()));
-        assert!(
-            table_columns(&conn, "file_churn")
-                .contains(&"primary_author".to_string())
-        );
+        assert!(table_columns(&conn, "file_churn").contains(&"primary_author".to_string()));
         assert!(table_columns(&conn, "mined_commits").contains(&"author".to_string()));
 
         let backfill: (Option<i64>, Option<String>, Option<String>) = conn

@@ -150,8 +150,7 @@ impl IndexLookup {
             .collect();
         let aliases = Self::resolve_aliases(conn, &missed);
         if !aliases.is_empty() {
-            let mut db_params: Vec<&str> =
-                aliases.values().map(String::as_str).collect();
+            let mut db_params: Vec<&str> = aliases.values().map(String::as_str).collect();
             db_params.sort_unstable();
             db_params.dedup();
             let db_placeholders: Vec<&str> = db_params.iter().map(|_| "?").collect();
