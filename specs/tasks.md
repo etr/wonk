@@ -4324,7 +4324,7 @@ Convert feedback events into bounded, decaying adjustments to ranking signal wei
 **Related Requirements:** PRD-FB-REQ-007 through PRD-FB-REQ-011, PRD-FB-REQ-014, PRD-FB-REQ-020, PRD-FB-REQ-025, PRD-FB-REQ-026, PRD-FB-REQ-029
 **Related Decisions:** DR-042
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
