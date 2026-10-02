@@ -1243,9 +1243,7 @@ impl<'a> Extractor<'a> {
         let first = positional_arg(args, 0);
         match prop {
             _ if ws_receiver && matches!(prop, "emit" | "send") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_ws(
                         node,
                         t,
@@ -1280,9 +1278,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             "emit" => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_ws(
                         node,
                         t,
@@ -1315,18 +1311,11 @@ impl<'a> Extractor<'a> {
         let first = positional_arg(args, 0);
         match prop {
             "schedule" if recv == "cron" || recv_lower.contains("cron") => {
-                let (name, name_node) =
-                    match positional_arg(args, 1).filter(|cb| cb.kind() == "identifier") {
-                        Some(cb) => (node_text(Some(cb), self.src).to_string(), cb),
-                        None => {
-                            let Some(own) =
-                                crate::indexer::find_enclosing_function(node, self.src, self.lang)
-                            else {
-                                return;
-                            };
-                            (own, node)
-                        }
-                    };
+                let Some((name, name_node)) =
+                    self.job_name_from_callback(node, positional_arg(args, 1))
+                else {
+                    return;
+                };
                 self.emit_job(
                     node,
                     name_node,
@@ -1337,9 +1326,7 @@ impl<'a> Extractor<'a> {
                 );
             }
             "define" if recv_lower.contains("agenda") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_job(
                         node,
                         t,
@@ -1351,9 +1338,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             "add" if recv == "q" || recv_lower.contains("queue") || recv_lower.contains("bull") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_job(
                         node,
                         t,
@@ -1378,26 +1363,20 @@ impl<'a> Extractor<'a> {
         match prop {
             "sendToQueue" => {
                 // amqplib: sendToQueue(queue, content)
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(node, t, &raw, cons, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
                 }
             }
             "publish" if argc >= 3 => {
                 // amqplib: publish(exchange, routingKey, content)
-                if let Some(t) = positional_arg(args, 1)
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(positional_arg(args, 1)) {
                     self.emit_queue(node, t, &raw, cons, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
                 }
             }
             "consume" => {
                 // amqplib: consume(queue, callback) — the only idiomatic
                 // `.consume` in JS clients.
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(node, t, &raw, prov, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
                 }
             }
@@ -1682,9 +1661,7 @@ impl<'a> Extractor<'a> {
                     // -- queue (TASK-087, DR-031) --------------------------------
                     // confluent-kafka: producer.produce('topic', value=…).
                     (_, "produce") => {
-                        if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1700,9 +1677,7 @@ impl<'a> Extractor<'a> {
                     (_, "basic_publish") => {
                         let t = kwarg_string_node(args, "routing_key", self.src)
                             .or_else(|| positional_arg(args, 1));
-                        if let Some(t) = t
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(t) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1717,9 +1692,7 @@ impl<'a> Extractor<'a> {
                     // pika: basic_consume(queue=…) else positional 1.
                     (_, "basic_consume") => {
                         let t = kwarg_string_node(args, "queue", self.src).or(first);
-                        if let Some(t) = t
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(t) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1733,9 +1706,7 @@ impl<'a> Extractor<'a> {
                     }
                     // nats-py: nc.publish(subj, payload) / nc.subscribe(subj).
                     (_, "publish") if matches!(recv, "nc" | "nats") => {
-                        if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1748,9 +1719,7 @@ impl<'a> Extractor<'a> {
                         }
                     }
                     (_, "subscribe") if matches!(recv, "nc" | "nats") => {
-                        if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1784,9 +1753,7 @@ impl<'a> Extractor<'a> {
                     // celery_app.send_task('orders.sync', …) — dispatch by
                     // name.
                     (_, "send_task") => {
-                        if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_job(
                                 node,
                                 t,
@@ -1800,17 +1767,10 @@ impl<'a> Extractor<'a> {
                     // scheduler.add_job(fn, …): the function (or the
                     // enclosing one) names the schedule.
                     (_, "add_job") if recv.to_lowercase().contains("sched") => {
-                        let target = positional_arg(args, 0).filter(|n| n.kind() == "identifier");
-                        let (name, name_node) = match target {
-                            Some(id) => (node_text(Some(id), self.src).to_string(), id),
-                            None => {
-                                let Some(own) = crate::indexer::find_enclosing_function(
-                                    node, self.src, self.lang,
-                                ) else {
-                                    return;
-                                };
-                                (own, node)
-                            }
+                        let Some((name, name_node)) =
+                            self.job_name_from_callback(node, positional_arg(args, 0))
+                        else {
+                            return;
                         };
                         self.emit_job(
                             node,
@@ -2117,9 +2077,7 @@ impl<'a> Extractor<'a> {
                                 CONFIDENCE_FRAMEWORK,
                                 None,
                             );
-                        } else if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        } else if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -2284,9 +2242,7 @@ impl<'a> Extractor<'a> {
             // PublishWithContext(ctx, exchange, key, msg, ...) has >= 4 args
             // with the routing key at position 2.
             (_, "PublishWithContext") if argc >= 4 => {
-                if let Some(t) = positional_arg(args, 2)
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(positional_arg(args, 2)) {
                     self.emit_queue(
                         node,
                         t,
@@ -2299,9 +2255,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, "PublishWithContext") if argc == 3 => {
-                if let Some(t) = positional_arg(args, 1)
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(positional_arg(args, 1)) {
                     self.emit_queue(
                         node,
                         t,
@@ -2314,9 +2268,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, m) if m.starts_with("Publish") && m != "PublishWithContext" && argc >= 3 => {
-                if let Some(t) = positional_arg(args, 1)
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(positional_arg(args, 1)) {
                     self.emit_queue(
                         node,
                         t,
@@ -2329,9 +2281,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, "Publish") if argc == 2 => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2344,9 +2294,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, "Subscribe") | (_, "QueueSubscribe") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2359,9 +2307,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, "Consume") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2375,9 +2321,7 @@ impl<'a> Extractor<'a> {
             }
             // sarama: ConsumePartition(topic, partition, offset).
             (_, "ConsumePartition") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2391,9 +2335,7 @@ impl<'a> Extractor<'a> {
             }
             // sarama: producer.SendMessage(&ProducerMessage{Topic: "…"}).
             (_, "SendMessage") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2408,18 +2350,11 @@ impl<'a> Extractor<'a> {
             // TASK-087 job: robfig/cron c.AddFunc(spec, fn)/AddJob — the
             // scheduled function names the job, else the enclosing one.
             (_, "AddFunc") | (_, "AddJob") => {
-                let (name, name_node) =
-                    match positional_arg(args, 1).filter(|n| n.kind() == "identifier") {
-                        Some(id) => (node_text(Some(id), self.src).to_string(), id),
-                        None => {
-                            let Some(own) =
-                                crate::indexer::find_enclosing_function(node, self.src, self.lang)
-                            else {
-                                return;
-                            };
-                            (own, node)
-                        }
-                    };
+                let Some((name, name_node)) =
+                    self.job_name_from_callback(node, positional_arg(args, 1))
+                else {
+                    return;
+                };
                 self.emit_job(
                     node,
                     name_node,
@@ -2985,9 +2920,7 @@ impl<'a> Extractor<'a> {
             .then(|| object.to_lowercase())
             .unwrap_or_default();
         if object_lower.contains("kafka") && name == "send" {
-            if let Some(t) = first
-                && let Some(raw) = self.topic_arg(t)
-            {
+            if let Some((t, raw)) = self.topic_at(first) {
                 self.emit_queue(
                     node,
                     t,
@@ -3003,9 +2936,7 @@ impl<'a> Extractor<'a> {
         if object_lower.contains("rabbit") && matches!(name, "send" | "convertAndSend") {
             // The routing key is the last leading string literal — the
             // argument just before the non-literal payload.
-            if let Some(t) = java_last_leading_string(args)
-                && let Some(raw) = self.topic_arg(t)
-            {
+            if let Some((t, raw)) = self.topic_at(java_last_leading_string(args)) {
                 self.emit_queue(
                     node,
                     t,
@@ -3022,9 +2953,7 @@ impl<'a> Extractor<'a> {
         // (checked after the rabbit arm — `rabbitTemplate` also contains
         // "Template").
         if object.contains("Template") && name == "convertAndSend" {
-            if let Some(t) = first
-                && let Some(raw) = self.topic_arg(t)
-            {
+            if let Some((t, raw)) = self.topic_at(first) {
                 self.emit_ws(
                     node,
                     t,
@@ -3781,6 +3710,35 @@ impl<'a> Extractor<'a> {
             line: name_node.start_position().row + 1,
             confidence,
         });
+    }
+
+    /// The job-name fallback shared by `cron.schedule`,
+    /// `scheduler.add_job`, and gocron `AddFunc`/`AddJob` (TASK-087
+    /// review debt): the callback identifier names the job, else the
+    /// enclosing function does; no name anywhere means no job contract.
+    fn job_name_from_callback(
+        &self,
+        node: Node<'a>,
+        cb: Option<Node<'a>>,
+    ) -> Option<(String, Node<'a>)> {
+        match cb.filter(|cb| cb.kind() == "identifier") {
+            Some(id) => Some((node_text(Some(id), self.src).to_string(), id)),
+            None => {
+                let own = crate::indexer::find_enclosing_function(node, self.src, self.lang)?;
+                Some((own, node))
+            }
+        }
+    }
+
+    /// The topic argument and its rendered string, paired once
+    /// (TASK-087 review debt): every emitter needs both — the node for
+    /// line attribution, the string for the canonical id — and the
+    /// hand-rolled pairing drifted across ~25 matcher arms before this
+    /// existed.
+    fn topic_at(&self, arg: Option<Node<'a>>) -> Option<(Node<'a>, String)> {
+        let t = arg?;
+        let raw = self.topic_arg(t)?;
+        Some((t, raw))
     }
 
     /// Render the topic-bearing literal of a call argument, per language.
