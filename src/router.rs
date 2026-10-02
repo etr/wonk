@@ -926,10 +926,23 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     }
                     Err(e) => {
                         // A configured Ollama that dies mid-build degrades to
-                        // the bundled provider instead of failing the query.
-                        if config.embedding.provider
-                            == crate::embedding::EmbeddingProviderKind::Ollama
-                        {
+                        // the bundled provider instead of failing the query —
+                        // but only on an actual disconnect. The pipeline types
+                        // its unreachability bails (the pre-flight health
+                        // check and the mid-batch interruption) as
+                        // EmbeddingError::OllamaUnreachable; any other build
+                        // failure (model not found, storage, chunking) stays
+                        // visible instead of masquerading as an unreachable
+                        // provider.
+                        let disconnected = e.chain().any(|cause| {
+                            matches!(
+                                <dyn std::error::Error>::downcast_ref::<
+                                    crate::errors::EmbeddingError,
+                                >(cause),
+                                Some(crate::errors::EmbeddingError::OllamaUnreachable)
+                            )
+                        });
+                        if disconnected {
                             let fallback = crate::embedding::fallback_after_disconnect(
                                 &conn,
                                 config.embedding.provider,

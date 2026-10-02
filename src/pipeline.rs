@@ -1324,6 +1324,30 @@ fn handle_embed_interruption(msg: &str, policy: EmbedErrorPolicy, silent: bool) 
     }
 }
 
+/// Handle an Ollama-unreachable interruption according to the error policy.
+///
+/// The FailFast bail carries the typed [`EmbeddingError::OllamaUnreachable`]
+/// (not a formatted string) so callers — the ask path's embedding-build
+/// fallback — can distinguish an actual disconnect from other build
+/// failures (model not found, storage, chunking) by matching the error's
+/// root cause. SkipPartial behaves like [`handle_embed_interruption`]: log
+/// `msg` and let the caller keep its partial results.
+fn handle_unreachable_interruption(
+    msg: &str,
+    policy: EmbedErrorPolicy,
+    silent: bool,
+) -> Result<()> {
+    match policy {
+        EmbedErrorPolicy::FailFast => Err(anyhow::Error::new(EmbeddingError::OllamaUnreachable)),
+        EmbedErrorPolicy::SkipPartial => {
+            if !silent {
+                eprintln!("{msg}");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Retry a failed batch by embedding each text individually.
 ///
 /// When a batch fails with a context-length error, this function retries each
@@ -1360,7 +1384,7 @@ fn embed_batch_individually(
                 }
             }
             Err(EmbeddingError::OllamaUnreachable) => {
-                handle_embed_interruption(
+                handle_unreachable_interruption(
                     "Ollama became unreachable during individual retry",
                     policy,
                     silent,
@@ -1410,7 +1434,7 @@ fn embed_chunks(
                 let msg = format!(
                     "Ollama became unreachable after embedding {embedded}/{total} symbols."
                 );
-                handle_embed_interruption(&msg, policy, silent)?;
+                handle_unreachable_interruption(&msg, policy, silent)?;
                 break;
             }
             Err(ref e) if embedding::is_context_length_error(e) => {
@@ -1607,9 +1631,11 @@ pub fn build_missing_embeddings(
 
     // Health check — bail before starting the expensive batch-embed loop.
     // Unlike build_embeddings we return Err so the caller can decide how to
-    // degrade (query-time fallback to the bundled provider).
+    // degrade (query-time fallback to the bundled provider). The bail is
+    // typed as `EmbeddingError::OllamaUnreachable` so the caller can tell a
+    // disconnect from other build failures by matching the error root cause.
     if !provider.is_healthy() {
-        anyhow::bail!("{}", embedding::OLLAMA_UNREACHABLE_MSG);
+        return Err(anyhow::Error::new(EmbeddingError::OllamaUnreachable));
     }
 
     let embedded = embed_chunks(
