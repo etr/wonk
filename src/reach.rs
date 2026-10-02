@@ -3309,6 +3309,77 @@ mod tests {
         assert_eq!(built_depth(&conn).as_deref(), Some("3"));
     }
 
+    /// TASK-081 review debt: the FINISH-side budget guard needs a shape
+    /// the begin-side fast path cannot catch — a tiny pre-edit affected
+    /// set whose post-edit predecessor expansion (sources whose recorded
+    /// reach rows target the edited name) blows past the budget.
+    /// Mutation-verified gap: with the finish guard physically deleted,
+    /// every other budget test still passed. The shape: seed → mid → 30
+    /// leaves — the edited file touches 2 names, but all 30 leaves'
+    /// reach rows target `seed`, so the rebuild set is 2 + 30 > budget.
+    #[test]
+    fn finish_guard_refuses_when_predecessor_expansion_blows_the_budget() {
+        let (_dir, conn) = make_db();
+        let leaves = MAX_INCREMENTAL_REPAIR_SOURCES + 5;
+        apply_edit(
+            &conn,
+            "src/seed.rs",
+            &spec(
+                vec![("seed", "function")],
+                vec![("mid", Some("seed"), 0.9)],
+                vec![],
+            ),
+        );
+        let mid_refs: Vec<(String, Option<String>, f64)> = (0..leaves)
+            .map(|i| (format!("f{i}"), Some("mid".to_string()), 0.9))
+            .collect();
+        apply_edit(
+            &conn,
+            "src/mid.rs",
+            &FileSpec {
+                symbols: vec![("mid".to_string(), "function".to_string())],
+                refs: mid_refs,
+                type_edges: vec![],
+            },
+        );
+        let leaf_names: Vec<String> = (0..leaves).map(|i| format!("f{i}")).collect();
+        for (i, name) in leaf_names.iter().enumerate() {
+            apply_edit(
+                &conn,
+                &format!("src/f{i}.rs"),
+                &spec(vec![(name.as_str(), "function")], vec![], vec![]),
+            );
+        }
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+        let before = snapshot_reach(&conn);
+        assert!(!before.0.is_empty(), "fixture sanity: reach rows exist");
+
+        // Rename seed: the edited file's own names stay tiny (a_pre =
+        // ["seed", "mid"]), but every leaf's reach rows target `seed`,
+        // so predecessor expansion crosses the budget — only the
+        // finish-side guard can refuse this.
+        let err = apply_edit_result(
+            &conn,
+            "src/seed.rs",
+            &spec(
+                vec![("seed2", "function")],
+                vec![("mid", Some("seed2"), 0.9)],
+                vec![],
+            ),
+        )
+        .expect_err("predecessor expansion over the budget must be refused");
+        assert!(
+            err.to_string().contains("work budget"),
+            "guard must fail for the budget reason, got: {err:#}"
+        );
+        assert_eq!(
+            snapshot_reach(&conn),
+            before,
+            "a refused repair must not add, remove, or rekey any row"
+        );
+        assert!(!is_stale(&conn), "finish itself must not mark stale");
+    }
+
     /// The boundary is inclusive: a rebuild set of exactly
     /// [`MAX_INCREMENTAL_REPAIR_SOURCES`] names is the largest repair
     /// that still runs incrementally — no degrade, full equivalence.
