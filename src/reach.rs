@@ -1084,8 +1084,20 @@ pub fn build_reach(
     let mut names: Vec<&String> = graph.by_name.keys().collect();
     names.sort();
 
-    let mut rows: Vec<(i64, i64, i64, f64)> = Vec::new();
-    let mut truncated_sources: Vec<i64> = Vec::new();
+    // The previous contents leave FIRST, inside the caller's transaction
+    // (atomicity is the transaction's, not a buffer's), so each source's
+    // rows stream straight into the table instead of accumulating the
+    // whole build on the heap — a dense adversarial repo could otherwise
+    // buffer #sources x max_targets rows (~1.6GB at 100k symbols) before
+    // the first write (TASK-080 review debt, CWE-400). Physical row
+    // order is name-then-target within this build — the same order the
+    // incremental repair writes, and every reader sorts or sets-compares.
+    tx.execute("DELETE FROM reach", [])?;
+    tx.execute("DELETE FROM reach_truncated", [])?;
+    tx.execute("DELETE FROM reach_meta", [])?;
+
+    let mut rows_written = 0usize;
+    let mut truncated_sources = 0usize;
     let mut sources = 0usize;
 
     let mut candidates = GraphCandidates::new(&graph);
@@ -1095,32 +1107,21 @@ pub fn build_reach(
         };
         sources += 1;
 
-        let (source_rows, truncated) = compute_source_rows(&mut candidates, name, opts)?;
+        let (mut source_rows, truncated) = compute_source_rows(&mut candidates, name, opts)?;
         if truncated {
-            truncated_sources.push(source_id);
+            truncated_sources += 1;
+            tx.execute(
+                "INSERT OR REPLACE INTO reach_truncated (source_id) VALUES (?1)",
+                rusqlite::params![source_id],
+            )?;
         }
-        rows.extend(
-            source_rows
-                .into_iter()
-                .map(|(target_id, min_depth, confidence)| {
-                    (source_id, target_id, min_depth, confidence)
-                }),
-        );
-    }
-
-    // Phase 3: replace previous contents inside the caller's transaction.
-    tx.execute("DELETE FROM reach", [])?;
-    tx.execute("DELETE FROM reach_truncated", [])?;
-    tx.execute("DELETE FROM reach_meta", [])?;
-
-    rows.sort_unstable_by_key(|r| (r.0, r.1));
-    write_reach_rows(tx, &rows)?;
-
-    for source_id in &truncated_sources {
-        tx.execute(
-            "INSERT OR REPLACE INTO reach_truncated (source_id) VALUES (?1)",
-            rusqlite::params![source_id],
-        )?;
+        source_rows.sort_unstable_by_key(|r| r.0);
+        let rows: Vec<(i64, i64, i64, f64)> = source_rows
+            .into_iter()
+            .map(|(target_id, min_depth, confidence)| (source_id, target_id, min_depth, confidence))
+            .collect();
+        rows_written += rows.len();
+        write_reach_rows(tx, &rows)?;
     }
 
     tx.execute(
@@ -1130,8 +1131,8 @@ pub fn build_reach(
 
     Ok(ReachBuildStats {
         sources,
-        rows: rows.len(),
-        truncated_sources: truncated_sources.len(),
+        rows: rows_written,
+        truncated_sources,
     })
 }
 
