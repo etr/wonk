@@ -76,6 +76,22 @@ pub enum EmbeddingProviderKind {
     Ollama,
 }
 
+impl EmbeddingProviderKind {
+    /// Parse a provider name as written in tool arguments and configs.
+    ///
+    /// Single source of truth for the string form of a provider selection,
+    /// beside the enum it names: transport surfaces (MCP) parse their
+    /// caller-supplied names through this instead of a transport-local
+    /// match, so adding or renaming a provider touches exactly one module.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "bundled" => Ok(EmbeddingProviderKind::Bundled),
+            "ollama" => Ok(EmbeddingProviderKind::Ollama),
+            other => Err(format!("invalid embedding provider: {other}")),
+        }
+    }
+}
+
 /// Provider-neutral embedding generation contract.
 pub trait EmbeddingProvider: Send + Sync {
     fn name(&self) -> &str;
@@ -1557,6 +1573,22 @@ mod tests {
         assert_eq!(
             resolve_provider_kind(None, EmbeddingProviderKind::Ollama),
             EmbeddingProviderKind::Ollama
+        );
+    }
+
+    #[test]
+    fn provider_kind_parse_accepts_known_names_and_rejects_others() {
+        assert_eq!(
+            EmbeddingProviderKind::parse("bundled").unwrap(),
+            EmbeddingProviderKind::Bundled
+        );
+        assert_eq!(
+            EmbeddingProviderKind::parse("ollama").unwrap(),
+            EmbeddingProviderKind::Ollama
+        );
+        assert_eq!(
+            EmbeddingProviderKind::parse("remote").unwrap_err(),
+            "invalid embedding provider: remote"
         );
     }
 

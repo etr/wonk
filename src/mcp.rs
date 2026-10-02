@@ -28,14 +28,19 @@ use crate::router::QueryRouter;
 use crate::search;
 use crate::types::Symbol;
 
+/// Resolve the provider kind for a tool invocation: the optional
+/// caller-supplied override, else the repo's configured provider.
+///
+/// Parsing and selection live in `crate::embedding`
+/// ([`EmbeddingProviderKind::parse`] + [`resolve_provider_kind`]) so the
+/// CLI and MCP transports share one provider-selection implementation;
+/// only the JSON-RPC error conversion stays here.
 fn embedding_provider_kind_for(
     repo_root: &Path,
     invocation: Option<&str>,
 ) -> Result<crate::embedding::EmbeddingProviderKind, String> {
     let invocation = match invocation {
-        Some("bundled") => Some(crate::embedding::EmbeddingProviderKind::Bundled),
-        Some("ollama") => Some(crate::embedding::EmbeddingProviderKind::Ollama),
-        Some(other) => return Err(format!("invalid embedding provider: {other}")),
+        Some(name) => Some(crate::embedding::EmbeddingProviderKind::parse(name)?),
         None => None,
     };
     let config = crate::config::Config::load(Some(repo_root))
