@@ -1025,6 +1025,94 @@ fn vector_space_mismatch(
     }
 }
 
+/// Shared provider-scoped vector load behind the all / path-prefix /
+/// file-set loaders.
+///
+/// `scope_condition` is a SQL predicate (no `WHERE`/`AND` keywords) that
+/// narrows the requested row set — e.g. `file GLOB ?1 AND NOT stale`; its
+/// bind parameters come first in `scope_params`. The helper appends the
+/// provider-space predicates itself, numbering the provider and dim
+/// parameters after the scope's.
+///
+/// Vector-space invariant (DR-032 / PRD-EMB-REQ-005): before any compatible
+/// row is returned, the same scope is probed for a row from a different
+/// `(provider, dim)` space. Finding one fails fast with
+/// [`EmbeddingError::VectorSpaceMismatch`] — whether it sits alongside
+/// compatible rows (a partially migrated index) or alone (a provider
+/// switch) — so a query never silently serves a subset of the corpus.
+fn load_scoped_embeddings(
+    conn: &Connection,
+    provider: &dyn EmbeddingProvider,
+    scope_condition: Option<&str>,
+    scope_params: &[&dyn rusqlite::types::ToSql],
+) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
+    let provider_param = scope_params.len() + 1;
+    let dim_param = scope_params.len() + 2;
+    let scope = match scope_condition {
+        Some(condition) => format!("{condition} AND "),
+        None => String::new(),
+    };
+
+    let mut params: Vec<&dyn rusqlite::types::ToSql> = scope_params.to_vec();
+    let provider_name = provider.name();
+    let provider_dim = provider.dim() as i64;
+    params.push(&provider_name);
+    params.push(&provider_dim);
+
+    // Refuse the load before decoding anything: any foreign-space row in
+    // scope — even alongside compatible rows — is a mixed-transition index,
+    // not a searchable one.
+    let incompatible_sql = format!(
+        "SELECT provider, dim FROM embeddings
+         WHERE {scope}(provider != ?{provider_param} OR dim != ?{dim_param})
+         LIMIT 1",
+    );
+    match conn.query_row(&incompatible_sql, params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        Ok((stored_provider, stored_dim)) => {
+            return Err(vector_space_mismatch(provider, stored_provider, stored_dim));
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(error) => return Err(EmbeddingError::StorageFailed(error.to_string())),
+    }
+
+    let count: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM embeddings
+                 WHERE {scope}provider = ?{provider_param} AND dim = ?{dim_param}"
+            ),
+            params.as_slice(),
+            |r| r.get(0),
+        )
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+    let count = count as usize;
+
+    let rows_sql = format!(
+        "SELECT symbol_id, vector FROM embeddings
+         WHERE {scope}provider = ?{provider_param} AND dim = ?{dim_param}"
+    );
+    let mut stmt = conn
+        .prepare(&rows_sql)
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            let symbol_id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((symbol_id, blob))
+        })
+        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+
+    let mut results = Vec::with_capacity(count);
+    for r in rows {
+        let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
+        results.push((symbol_id, decode_vector(&blob, provider)?));
+    }
+
+    Ok(results)
+}
+
 /// Load all embedding vectors from the database.
 ///
 /// Returns `(symbol_id, vector)` pairs.  Uses `bytemuck::try_cast_slice`
@@ -1035,57 +1123,7 @@ pub fn load_all_embeddings(
     conn: &Connection,
     provider: &dyn EmbeddingProvider,
 ) -> Result<Vec<(i64, Vec<f32>)>, EmbeddingError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT symbol_id, vector FROM embeddings
-             WHERE provider = ?1 AND dim = ?2",
-        )
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM embeddings WHERE provider = ?1 AND dim = ?2",
-            rusqlite::params![provider.name(), provider.dim() as i64],
-            |r| r.get(0),
-        )
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-    let count = count as usize;
-
-    let rows = stmt
-        .query_map(
-            rusqlite::params![provider.name(), provider.dim() as i64],
-            |row| {
-                let symbol_id: i64 = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
-                Ok((symbol_id, blob))
-            },
-        )
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-
-    let mut results = Vec::with_capacity(count);
-    for r in rows {
-        let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-        results.push((symbol_id, decode_vector(&blob, provider)?));
-    }
-
-    if results.is_empty() {
-        let incompatible = conn.query_row(
-            "SELECT provider, dim FROM embeddings
-             WHERE provider != ?1 OR dim != ?2
-             LIMIT 1",
-            rusqlite::params![provider.name(), provider.dim() as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        );
-        match incompatible {
-            Ok((stored_provider, stored_dim)) => {
-                return Err(vector_space_mismatch(provider, stored_provider, stored_dim));
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {}
-            Err(error) => return Err(EmbeddingError::StorageFailed(error.to_string())),
-        }
-    }
-
-    Ok(results)
+    load_scoped_embeddings(conn, provider, None, &[])
 }
 
 /// Load embedding vectors for symbols whose file path starts with a prefix.
@@ -1110,58 +1148,12 @@ pub fn load_embeddings_for_path_prefix(
         .replace('*', "[*]")
         .replace('?', "[?]");
     let pattern = format!("{escaped}*");
-    let mut stmt = conn
-        .prepare(
-            "SELECT symbol_id, vector FROM embeddings
-             WHERE file GLOB ?1 AND NOT stale AND provider = ?2 AND dim = ?3",
-        )
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM embeddings
-             WHERE file GLOB ?1 AND NOT stale AND provider = ?2 AND dim = ?3",
-            rusqlite::params![pattern, provider.name(), provider.dim() as i64],
-            |r| r.get(0),
-        )
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-    let count = count as usize;
-
-    let rows = stmt
-        .query_map(
-            rusqlite::params![pattern, provider.name(), provider.dim() as i64],
-            |row| {
-                let symbol_id: i64 = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
-                Ok((symbol_id, blob))
-            },
-        )
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-
-    let mut results = Vec::with_capacity(count);
-    for r in rows {
-        let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-        results.push((symbol_id, decode_vector(&blob, provider)?));
-    }
-
-    if results.is_empty() {
-        let incompatible = conn.query_row(
-            "SELECT provider, dim FROM embeddings
-             WHERE file GLOB ?1 AND NOT stale AND (provider != ?2 OR dim != ?3)
-             LIMIT 1",
-            rusqlite::params![pattern, provider.name(), provider.dim() as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        );
-        match incompatible {
-            Ok((stored_provider, stored_dim)) => {
-                return Err(vector_space_mismatch(provider, stored_provider, stored_dim));
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {}
-            Err(error) => return Err(EmbeddingError::StorageFailed(error.to_string())),
-        }
-    }
-
-    Ok(results)
+    load_scoped_embeddings(
+        conn,
+        provider,
+        Some("file GLOB ?1 AND NOT stale"),
+        &[&pattern as &dyn rusqlite::types::ToSql],
+    )
 }
 
 /// Load embedding vectors only for symbols belonging to the specified files.
@@ -1179,78 +1171,12 @@ pub fn load_embeddings_for_files(
 
     // Build a parameterized IN clause: (?1, ?2, ..., ?N)
     let placeholders: Vec<String> = (1..=files.len()).map(|i| format!("?{i}")).collect();
-    let provider_param = files.len() + 1;
-    let dim_param = files.len() + 2;
-    let sql = format!(
-        "SELECT symbol_id, vector FROM embeddings
-         WHERE file IN ({}) AND provider = ?{} AND dim = ?{}",
-        placeholders.join(", "),
-        provider_param,
-        dim_param,
-    );
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-
-    let file_params: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-    let mut params: Vec<&dyn rusqlite::types::ToSql> = file_params
+    let scope = format!("file IN ({})", placeholders.join(", "));
+    let file_params: Vec<&dyn rusqlite::types::ToSql> = files
         .iter()
-        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .map(|f| f as &dyn rusqlite::types::ToSql)
         .collect();
-    let provider_name = provider.name();
-    let provider_dim = provider.dim() as i64;
-    params.push(&provider_name);
-    params.push(&provider_dim);
-
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM embeddings
-         WHERE file IN ({}) AND provider = ?{} AND dim = ?{}",
-        placeholders.join(", "),
-        provider_param,
-        dim_param,
-    );
-    let count: i64 = conn
-        .query_row(&count_sql, params.as_slice(), |r| r.get(0))
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-    let count = count as usize;
-
-    let rows = stmt
-        .query_map(params.as_slice(), |row| {
-            let symbol_id: i64 = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            Ok((symbol_id, blob))
-        })
-        .map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-
-    let mut results = Vec::with_capacity(count);
-    for r in rows {
-        let (symbol_id, blob) = r.map_err(|e| EmbeddingError::StorageFailed(e.to_string()))?;
-        results.push((symbol_id, decode_vector(&blob, provider)?));
-    }
-
-    if results.is_empty() {
-        let mismatch_sql = format!(
-            "SELECT provider, dim FROM embeddings
-             WHERE file IN ({}) AND (provider != ?{} OR dim != ?{})
-             LIMIT 1",
-            placeholders.join(", "),
-            provider_param,
-            dim_param,
-        );
-        let incompatible = conn.query_row(&mismatch_sql, params.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        });
-        match incompatible {
-            Ok((stored_provider, stored_dim)) => {
-                return Err(vector_space_mismatch(provider, stored_provider, stored_dim));
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {}
-            Err(error) => return Err(EmbeddingError::StorageFailed(error.to_string())),
-        }
-    }
-
-    Ok(results)
+    load_scoped_embeddings(conn, provider, Some(&scope), &file_params)
 }
 
 /// Load embedding vectors keyed by the candidate `(file, line)` positions
@@ -1690,7 +1616,11 @@ mod tests {
     }
 
     #[test]
-    fn compatible_partition_is_loaded_without_mixing_other_spaces() {
+    fn partial_partition_fails_fast_with_mismatch() {
+        // A partially migrated index (some rows re-embedded with the active
+        // provider, some still foreign) must refuse to serve a partial
+        // semantic search: any incompatible row in scope fails with the
+        // re-embed instruction, whether or not compatible rows also exist.
         let conn = setup_test_db_with_embeddings();
         let tiny_id = insert_test_symbol(&conn, "tiny", "tiny.rs");
         let ollama_id = insert_test_symbol(&conn, "legacy", "legacy.rs");
@@ -1711,8 +1641,14 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_all_embeddings(&conn, &TinyProvider).unwrap();
-        assert_eq!(loaded, vec![(tiny_id, vec![1.0, 0.0])]);
+        let error = load_all_embeddings(&conn, &TinyProvider).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("active tiny/2"), "got: {message}");
+        assert!(message.contains("stored ollama/768"), "got: {message}");
+        assert!(
+            message.contains("wonk update --force --provider tiny"),
+            "got: {message}"
+        );
     }
 
     #[test]
@@ -3404,6 +3340,32 @@ mod tests {
         assert!(message.contains("wonk update --force --provider test"));
     }
 
+    #[test]
+    fn test_load_embeddings_for_files_partial_partition_fails_fast() {
+        // One compatible row plus one foreign-space row in the requested
+        // files: the load must fail with the mismatch, not return the
+        // compatible subset.
+        let conn = setup_db_with_embeddings();
+        let compatible: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        let foreign: Vec<u8> = bytemuck::cast_slice(&[2.0_f32, 768.0]).to_vec();
+        insert_symbol_and_embedding(&conn, 1, "src/a.ts", &compatible);
+        insert_symbol_and_embedding(&conn, 2, "src/b.ts", &foreign);
+        conn.execute(
+            "UPDATE embeddings SET provider = 'ollama', dim = 768 WHERE symbol_id = 2",
+            [],
+        )
+        .unwrap();
+
+        let files = ["src/a.ts".to_string(), "src/b.ts".to_string()]
+            .into_iter()
+            .collect();
+        let error = load_embeddings_for_files(&conn, &files, &OneDimProvider).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("active test/1"), "got: {message}");
+        assert!(message.contains("stored ollama/768"), "got: {message}");
+    }
+
     // -- load_embeddings_for_path_prefix tests --------------------------------
 
     fn insert_symbol_and_embedding_stale(
@@ -3473,6 +3435,30 @@ mod tests {
         assert!(message.contains("active test/1"));
         assert!(message.contains("stored ollama/768"));
         assert!(message.contains("wonk update --force --provider test"));
+    }
+
+    #[test]
+    fn test_load_embeddings_for_path_prefix_partial_partition_fails_fast() {
+        // A partially migrated prefix scope: one compatible row plus one
+        // foreign-space row under the same prefix must fail, not silently
+        // drop the foreign row from the clustering input.
+        let conn = setup_db_with_embeddings();
+        let compatible: Vec<u8> = bytemuck::cast_slice(&[1.0_f32]).to_vec();
+        let foreign: Vec<u8> = bytemuck::cast_slice(&[2.0_f32]).to_vec();
+        insert_symbol_and_embedding(&conn, 1, "src/auth/middleware.ts", &compatible);
+        insert_symbol_and_embedding(&conn, 2, "src/auth/session.ts", &foreign);
+        conn.execute(
+            "UPDATE embeddings SET provider = 'ollama', dim = 768 WHERE symbol_id = 2",
+            [],
+        )
+        .unwrap();
+
+        let error =
+            load_embeddings_for_path_prefix(&conn, "src/auth/", &OneDimProvider).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("active test/1"), "got: {message}");
+        assert!(message.contains("stored ollama/768"), "got: {message}");
     }
 
     #[test]
