@@ -138,3 +138,35 @@
 - Gotcha: SQLite rowids shift on edit (delete+reinsert reuses max+1, alternating files hold the max) — never assert row-id-stable snapshots across edits; assert content via the rebuild-equivalence oracle
 - Gotcha: `git checkout -- file` during a mutation teeth-check also wipes UNCOMMITTED new tests — commit the green suite BEFORE mutation-checking
 - BlastDirection lives in types.rs and is NOT re-exported from blast.rs (private import there); bench/test code must `use wonk::types::BlastDirection`
+
+## History Mining + Churn Signal (TASK-096)
+- `src/history.rs`: one bounded `git log -n <window> --no-renames --format=%H%x09%ct --name-only` pass (cost ∝ window, never repo age); `run_git_output` extracted pub(crate) in impact.rs is the shared spawn helper
+- 4 tables: `file_churn` aggregate + `mined_commits`/`commit_files` per-commit detail (TASK-097 co-change seam + exact-rescale mechanism) + `history_meta.mined_head`; drop_all_data clears all 4
+- Age weight = linear 1−(head−ts)/span vs the MINED window's newest commit (not wall clock); recompute_file_churn always recomputes from DB detail ORDER BY commit_ts DESC, commit_id DESC — rescales old weights exactly on refresh (test asserts 1.5 → 0.5 after one new commit)
+- refresh: has_git → rev-parse probe (Unchanged) → ranged log insert OR IGNORE → trim (explicit DELETEs, never relies on FK cascade) → recompute → set mined_head; rewrite/invalid head → ONE fallback full re-mine; every git error = eprintln + Failed with data retained
+- Churn signal = 9th builtin ("churn"), log-damped ln(1+score)/ln(1+set_max) like centrality; weight DELIBERATELY absent from RankConfig defaults (0 = ranking unchanged until opted in); requires `with_file_churn` context slice, presence-probe + IN_CHUNK=900 batched load
+- `[history] enabled=true window=500`; window=0 hard load error naming the key
+- Git test fixtures: env dates need `@<unix> +0000` format (bare "100 +0000" is rejected by git); scope `git add src` in fixtures whose repo contains `.wonk/` (add . swallows the index db → phantom churn rows)
+- Registry-count pins exist in THREE places when adding a signal: rerank.rs registry test, rerank.rs unknown-name error message, tests/rerank_path_signals.rs `default_weights_run_no_new_context_paths`
+- Pipe-to-tail masks cargo exit codes — `cmd | grep -c error; echo $?` greps status, not cargo's; run clippy without piping or check its own exit before committing
+- Daemon refreshes history best-effort per event batch (bare git commit emits no events — refreshes on next batch; wonk update authoritative)
+
+## Co-change Coupling (TASK-097)
+- `co_change(file_a, file_b, weight)` PK pair + `idx_co_change_a(file_a, weight DESC)`; weight = Σ age_weight over SHARED non-bulk commits (files.len() ≤ max_commit_files, strictly-more-than excluded), recomputed by `recompute_history_aggregates(conn, &MiningOptions{window, max_commit_files})` — churn + co_change from ONE detail load (replaced recompute_file_churn + HistoryOptions; call sites pipeline.rs ×2, daemon.rs ×1)
+- `CO_CHANGE_TOP_K = 10` const; top-K per file_a independently both directions, (weight DESC, file_b ASC); 12 files × 2 commits → exactly 120 rows
+- `[history] max_commit_files` default 50 (placeholder pending OQ-017), < 2 hard load error; bulk excluded from CO-CHANGE only (still churn + window)
+- Signal = 10th builtin "co_change", SET-RELATIVE: w(f) = max coupling to another file IN THE RESPONSE SET (loader keeps only rows whose file_b is also a candidate; 99.0 coupling to non-candidate ignored), value = ln(1+w)/ln(1+set_max) like churn; default weight 0; CoChangeContext{best, max} + SharedContext::co_change_coupling/max_co_change
+- Zero-path mirrors churn: no git/table/coupling/single-file set → 0.0 (single-file set inert because no row's file_b is in-set)
+- e2e AC pattern lives in history.rs tests: grouped git fixture + `crate::rerank::rerank(classify_results(hits), …, WeightTable::from_pairs([("co_change",1.0)]))`
+- Watcher FSEvents: 4 test_file_watcher_* failures are baseline in this sandbox (verified failing on clean main); `elide::tests::salience_under_20ms` is a parallel-load timing flake (passes in isolation)
+
+## Hub/Authority Topology (TASK-098)
+- `src/topology.rs`: `recompute(conn, &TopologyOptions{iterations})` = 3 deterministic queries (ids ORDER BY id = node order; name→MIN(id) non-module representative; caller_id refs, dedup HashSet → SORTED edges → CSR both directions) + HITS power method EXACTLY `iterations` iters, L1-normalized per iter, sum==0 → all-zero break; persist one tx (DELETE + id-ascending INSERTs + `topology_meta.last_computed` epoch). GOTCHA building CSR: the counting pass must key by the SAME endpoint the fill pass writes (flipped counts by dst) — a mismatch silently yields all-zero scores, no panic.
+- Determinism is bitwise-asserted 3 ways (same conn twice, two conns, reversed insert order); simple PATH graphs converge at iteration 1 — evolving fixtures need asymmetric coupling (many callers → one node → one sink)
+- Tables: `symbol_topology(symbol_id PK FK cascade, hub, authority, community NULL)` + `idx_topology_community` (TASK-099 owns column+index) + `topology_meta(key,value)`; `drop_all_data` deletes both BEFORE symbols
+- `[topology] enabled=true iterations=20 interval=3600 stale_after=86400` (OQ-018 placeholders); iterations/interval/stale_after == 0 each a hard load error (interval message cites PRD-TOPO-REQ-006)
+- Cadence: build_index step 5c + incremental_update recompute UNCONDITIONALLY when enabled (wonk update authoritative); daemon event loop uses `refresh_if_due(conn, opts, interval)` gated by last_computed age; grep gate pins zero topology in per-file fns (reindex_file/remove_file/index_new_file/process_events/delete_file_data/upsert_file_data)
+- Signals 11th/12th: "hub"/"authority", per-(file,line) lookup via symbols JOIN (TopologyContext{scores,max_hub,max_authority}), `topology_value = (score/set_max).clamp(0,1)` NO log damper (HITS already L1-damped); default weights 0; registry-count pins now in rerank.rs registry test + unknown-name message + tests/rerank_path_signals.rs (12 signals)
+- Kill switch: `RankSettings::from_config(…, topology_enabled: bool)` forces hub/authority weights to 0.0 → existing zero-weight skip gives bitwise-exact prior ranking; call sites router.rs/mcp.rs pass config.topology.enabled, tests/benches pass true (bench/rank_latency_bench.rs too — clippy --all-targets catches it)
+- Staleness: `is_stale(conn, stale_after)`/`last_computed` are READ-ONLY helpers; query path never recomputes (pinned by stale_topology_never_blocks_a_query); `StatusInfo.topology: TopologyStatus{scored,last_computed,stale,enabled}` + `topology_status_line` after Embeddings ("Topology: disabled|none|N symbols scored[ (stale, computed Ns ago)]"); query_status_info grew a 4th param `&TopologyConfig` (mcp loads config for it)
+- `wonk status` test fixtures: never use epoch-1000-style stamps with default stale_after 86400 — the fixture reads stale; stamp near now
