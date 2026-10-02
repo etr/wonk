@@ -53,7 +53,7 @@
 | M33 | History-Derived Signals | 2 | Complete |
 | M34 | Graph-Topology Signals | 2 | Complete |
 | M35 | Near-Duplicate Similarity | 1 | Complete |
-| M36 | Usage Feedback Loop | 5 | In Progress |
+| M36 | Usage Feedback Loop | 5 | Complete |
 
 ### Dependency Graph
 
@@ -4376,11 +4376,11 @@ Preserve reproducibility on demand and make learned state legible and reversible
 Retain the repository-specific knowledge weight learning cannot express, behind a gate high enough that it cannot reintroduce the failure mode it comes from.
 
 **Action Items:**
-- [ ] Apply a direct per-result preference only after the result is reported useful across a configurable number of **distinct sessions** (PRD-FB-REQ-016)
-- [ ] Cap its influence below that of learned weights (PRD-FB-REQ-016)
-- [ ] Show it as its own contribution in `--why`, distinct from learned-weight effects (PRD-FB-REQ-014)
-- [ ] Decay and retire it on the same rules as every other feedback entry (PRD-FB-REQ-006, PRD-FB-REQ-011)
-- [ ] **Adversarial test: one session repeating feedback never activates the preference** (AR-036)
+- [x] Apply a direct per-result preference only after the result is reported useful across a configurable number of **distinct sessions** (PRD-FB-REQ-016)
+- [x] Cap its influence below that of learned weights (PRD-FB-REQ-016)
+- [x] Show it as its own contribution in `--why`, distinct from learned-weight effects (PRD-FB-REQ-014)
+- [x] Decay and retire it on the same rules as every other feedback entry (PRD-FB-REQ-006, PRD-FB-REQ-011)
+- [x] **Adversarial test: one session repeating feedback never activates the preference** (AR-036)
 
 **Dependencies:**
 - Blocked by: TASK-102
@@ -4396,7 +4396,7 @@ Retain the repository-specific knowledge weight learning cannot express, behind 
 **Related Requirements:** PRD-FB-REQ-016
 **Related Decisions:** DR-042
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
@@ -4426,6 +4426,7 @@ Tasks identified but not yet scheduled:
 
 | Date | Change | Author |
 |------|--------|--------|
+| 2026-10-02 | TASK-104 complete (M36, closes the 30-task V5 batch): session-gated per-result preference — `result_preferences`/`result_preference_sessions` tables, `[feedback] prefer_min_sessions` gate (default 3, hard floor 2 per AR-036), +0.1 strength per NEW distinct session capped at 0.5 riding the `feedback` weight (structurally below both learned channels), same half-life decay + floor-retire sweep, identity-match liveness, `preference` row in `--why`, `--reset-weights` coverage, status count; rank-1 events excluded (presentation-bias rationale documented in §4.34). | TBD |
 | 2026-10-02 | TASK-103 complete (M36): determinism controls, weight inspection, and reset — `--no-feedback` / MCP `no_feedback` reproduce index-only ranking exactly (overlay stripped at the ranking seam AND both dispatch seams, per AR-039); benches + ranking regression suite pinned feedback-free with a seeded-immunity test; `wonk feedback --list/--export/--clear-events/--clear-result/--reset-weights/--reset-weight` with reset independent of event history in both directions; `wonk status` Feedback line (events, sessions, max gated weight deviation); reproducibility documented in README, docs, bench/README, MCP instructions. | TBD |
 | 2026-10-02 | TASK-102 complete (M36): contrastive weight learning — `learned_weights` keyed by feature (bare signal names + TASK-105's flattened descriptive keys), bounded decaying contrastive updates run synchronously in the feedback dispatch, session/observation gates, the `feedback` signal + `--why` contribution, `learned:` line, and `wonk feedback --weights`; OQ-019 closed via the tuning sweep recorded in `bench/feedback-learning-tuning.md`. | TBD |
 | 2026-02-11 | Initial task breakdown — 30 tasks across 6 milestones | TBD |
