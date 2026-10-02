@@ -445,7 +445,9 @@ pub struct SymbolHit {
     pub name: String,
     /// Symbol kind as indexed (e.g. "function").
     pub kind: String,
-    /// Count of distinct callers referencing this symbol name.
+    /// Count of distinct callers referencing this symbol name, anywhere in
+    /// the index — never restricted to the candidate file set, so callers
+    /// outside the current result list still count.
     pub caller_count: u32,
 }
 
@@ -2522,8 +2524,9 @@ fn prepare_embeddings(
 
 /// Batched symbol-hit lookup, filtered to the files present in the result
 /// set (mirroring `ranker::IndexLookup`), keyed by the canonical DB paths
-/// and dual-keyed under the as-seen aliases (TASK-105 D6): two SQL queries
-/// total.
+/// and dual-keyed under the as-seen aliases (TASK-105 D6): two query
+/// blocks total — the candidate symbols scan, then the caller-count scan
+/// (chunked by hit-name count at IN_CHUNK).
 fn load_symbol_hits(
     conn: &Connection,
     results: &[ClassifiedResult],
@@ -2558,56 +2561,62 @@ fn load_symbol_hits(
     // (file, line) positions.
     let sql_symbols =
         format!("SELECT file, line, name, kind FROM symbols WHERE file IN ({in_clause})");
-    if let Ok(mut stmt) = conn.prepare(&sql_symbols) {
-        let boxed: Vec<Box<dyn rusqlite::types::ToSql>> = file_params
-            .iter()
-            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        let refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
-        if let Ok(rows) = stmt.query_map(refs.as_slice(), |row| {
+    if let Ok(mut stmt) = conn.prepare(&sql_symbols)
+        && let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(file_params.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
             ))
-        }) {
-            for (file, line, name, kind) in rows.flatten() {
-                let key = (file, line as u64);
-                if positions.contains(&key) {
-                    hits.entry(key).or_insert_with(|| SymbolHit {
-                        name,
-                        kind,
-                        caller_count: 0,
-                    });
-                }
+        })
+    {
+        for (file, line, name, kind) in rows.flatten() {
+            let key = (file, line as u64);
+            if positions.contains(&key) {
+                hits.entry(key).or_insert_with(|| SymbolHit {
+                    name,
+                    kind,
+                    caller_count: 0,
+                });
             }
         }
     }
 
-    // Query 2: distinct-caller counts per referenced name, folded into the
-    // hits by symbol name. COUNT(DISTINCT caller_id) ignores NULL callers.
-    let sql_callers = format!(
-        "SELECT name, COUNT(DISTINCT caller_id) FROM \"references\" \
-         WHERE file IN ({in_clause}) GROUP BY name"
-    );
-    if let Ok(mut stmt) = conn.prepare(&sql_callers) {
-        let boxed: Vec<Box<dyn rusqlite::types::ToSql>> = file_params
-            .iter()
-            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        let refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
-        if let Ok(rows) = stmt.query_map(refs.as_slice(), |row| {
+    // Query 2: distinct-caller counts per hit NAME — index-wide, never
+    // restricted to the candidate files, per the SymbolHit.caller_count
+    // contract ("distinct indexed callers"): a definition whose callers
+    // reference it from outside the candidate set (regex queries, --file
+    // filters, budget-truncated lists) still counts them, so TASK-093's
+    // centrality signal never under-reports. Bounded by the hit-name
+    // count, chunked at IN_CHUNK (disjoint name sets, so the GROUP BY
+    // results are exactly the one-statement form's). COUNT(DISTINCT
+    // caller_id) ignores NULL callers.
+    let mut names: Vec<&String> = hits.values().map(|hit| &hit.name).collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut callers: HashMap<String, u32> = HashMap::new();
+    for chunk in names.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql_callers = format!(
+            "SELECT name, COUNT(DISTINCT caller_id) FROM \"references\" \
+             WHERE name IN ({placeholders}) GROUP BY name"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql_callers) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }) {
-            let callers: HashMap<String, u32> = rows
-                .flatten()
-                .map(|(name, count)| (name, count.max(0) as u32))
-                .collect();
-            for hit in hits.values_mut() {
-                hit.caller_count = callers.get(&hit.name).copied().unwrap_or(0);
-            }
-        }
+        }) else {
+            continue;
+        };
+        callers.extend(
+            rows.flatten()
+                .map(|(name, count)| (name, count.max(0) as u32)),
+        );
+    }
+    for hit in hits.values_mut() {
+        hit.caller_count = callers.get(&hit.name).copied().unwrap_or(0);
     }
 
     alias_position_map(&mut hits, file_keys);
@@ -4615,6 +4624,57 @@ proximity, signature, churn, co_change, hub, authority, community",
     }
 
     #[test]
+    fn symbol_hit_caller_counts_span_the_whole_index() {
+        // The SymbolHit.caller_count contract is index-wide — "distinct
+        // indexed callers" — not candidate-wide: a definition whose
+        // callers reference it from files OUTSIDE the candidate set (regex
+        // queries, --file filters, budget-truncated lists) must still
+        // count them. The undercount would flow straight into TASK-093's
+        // centrality signal.
+        let (_dir, conn) = seeded_conn();
+        // Two extra callers that reference my_func only from files that
+        // are NOT candidates (symbols rows so the caller_ids are real).
+        for (name, file) in [("caller_c", "src/fourth.rs"), ("caller_d", "src/fifth.rs")] {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, file, line, col, language) \
+                 VALUES (?1, 'function', ?2, 1, 0, 'rust')",
+                rusqlite::params![name, file],
+            )
+            .unwrap();
+        }
+        // caller_c/caller_d are symbols ids 4 and 5 (seeded_conn made 1-3).
+        for (file, caller) in [("src/outside_a.rs", 4i64), ("src/outside_b.rs", 5i64)] {
+            conn.execute(
+                "INSERT INTO \"references\" (name, file, line, col, context, caller_id) \
+                 VALUES (?1, ?2, 1, 0, 'my_func();', ?3)",
+                rusqlite::params!["my_func", file, caller],
+            )
+            .unwrap();
+        }
+
+        let results = vec![classified(
+            "src/main.rs",
+            10,
+            "fn my_func() {}",
+            ResultCategory::Definition,
+        )];
+        let ctx = prepare_context(
+            ContextReqs::none().with_symbol_hits(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+
+        let hit = ctx
+            .symbol_hit("src/main.rs", 10)
+            .expect("hit at the definition");
+        // 2 in-candidate callers (seeded) + 2 outside-candidate callers.
+        assert_eq!(hit.caller_count, 4);
+        assert_eq!(ctx.max_caller_count(), 4);
+    }
+
+    #[test]
     fn prepare_context_without_conn_leaves_symbol_hits_empty() {
         let results = vec![classified(
             "src/main.rs",
@@ -6204,16 +6264,18 @@ proximity, signature, churn, co_change, hub, authority, community",
         // Signals take no Connection (structurally impossible to issue
         // per-candidate SQL); this gate proves it empirically. Accounting
         // for the one-term query "alpha" over lexical_seeded_conn (no
-        // embedding rows): 9 statements total — 1 canonical file-keys
+        // embedding rows): 8 statements total — 1 canonical file-keys
         // resolution (TASK-105: the exact `files` IN pass; all candidates
-        // repo-relative, so the fallback scan never runs) + 2 symbol-hit
-        // lookups (symbols IN, references GROUP BY) + 4 lexical (presence
-        // probe, corpus-stats summary read, 1 postings scan, document
-        // lengths — one IN chunk for any candidate set under 900 files) +
-        // 2 embedding (stored vector spaces, position loader; the query
+        // repo-relative, so the fallback scan never runs) + 1 symbol-hit
+        // symbols IN scan (the name-keyed caller-count scan runs only
+        // when a candidate position lands on a symbol; this fixture's do
+        // not, so it is skipped) + 4 lexical (presence probe,
+        // corpus-stats summary read, 1 postings scan, document lengths —
+        // one IN chunk for any candidate set under 900 files) + 2
+        // embedding (stored vector spaces, position loader; the query
         // embed itself is in-process and SQL-free). query_terms and
-        // path_class touch
-        // no SQL. The count must not move when the candidate set grows.
+        // path_class touch no SQL. The count must not move when the
+        // candidate set grows.
         let (_dir, conn) = lexical_seeded_conn();
         let make = |n: u64| -> Vec<ClassifiedResult> {
             (0..n)
@@ -6226,7 +6288,7 @@ proximity, signature, churn, co_change, hub, authority, community",
 
         assert_eq!(small, large, "statement count must be O(1) in candidates");
         assert!(large <= 10, "unexpected statements: {large}");
-        assert_eq!(large, 9, "documented statement accounting (see comment)");
+        assert_eq!(large, 8, "documented statement accounting (see comment)");
     }
 
     #[test]
