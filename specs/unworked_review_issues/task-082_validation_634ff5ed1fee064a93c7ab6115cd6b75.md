@@ -6,11 +6,13 @@
 
 ## Major
 
-1. [ ] **code-quality-reviewer** | `src/contracts.rs:1599` | correctness
+1. [x] **code-quality-reviewer** | `src/contracts.rs:1599` | correctness
+   *Addressed (majors sweep, 2026-10-02):* fixed (java_generic_client_verb receiver gate).
    Java consumer detection has no receiver allowlist and no path-likeness gate. `java_call` dispatches purely on method name via `java_client_verb` (src/contracts.rs:2348), which maps the generic names `put`, `delete`, `exchange`, `execute`. Verified by probe: `cache.put("/users/1", "u")` emits `http::PUT::/users/1` and `repository.delete("/users/1")` emits `http::DELETE::/users/1`, both at confidence 1.0. Every other language gates consumers on a receiver allowlist (JS_CONSUMER_RECEIVERS, PY_CONSUMER_RECEIVERS, go_client_verb receiver match, CSHARP_CONSUMER_RECEIVERS, RUBY_CONSUMER_RECEIVERS), so Java uniquely bypasses the noise gate the module's own test `cache_like_receiver_is_not_a_contract` celebrates. Since `Map.put` is ubiquitous in Java, every indexed Java repo will accumulate full-confidence false consumers.
    *Recommendation:* Gate the consumer branch on receiver names (e.g. restTemplate/httpClient/webClient/client) and/or require `is_path_like` on a Direct string argument before emitting; drop the bare `put`/`delete`/`exchange`/`execute` entries or demote them to the 0.5 ambiguous path. Add a regression test with `cache.put("/users/1", u)`.
 
-2. [ ] **code-quality-reviewer** | `src/contracts.rs:89` | correctness
+2. [x] **code-quality-reviewer** | `src/contracts.rs:89` | correctness
+   *Addressed (majors sweep, 2026-10-02):* fixed (effective_prefixes per mount).
    A router mounted under multiple prefixes gets all mount paths concatenated into one bogus prefix. `RouterContext::effective_prefix` (src/contracts.rs:89-100) pushes every entry of `mounts[var]` in sequence. Verified by probe: `app.use('/v1', router); app.use('/v2', router); router.get('/users', h)` yields `http::GET::/v1/v2/users` (wrong for both mounts; correct output is two contracts /v1/users and /v2/users). Same defect in Python: two `app.include_router(router, prefix=...)` calls yield `/v1/v2/users/{p1}`. The `mounts: HashMap<String, Vec<String>>` structure collects multiple mounts but no code path handles len > 1; only single-mount cases are tested (`express_router_mount_same_file`, `fastapi_includerouter_prefix`).
    *Recommendation:* Either emit one contract per mount path (preferred: keeps cross-mount detection correct) or use only the first mount and document the limitation in the module doc comment. Add a multi-mount test pinning the chosen behavior.
 

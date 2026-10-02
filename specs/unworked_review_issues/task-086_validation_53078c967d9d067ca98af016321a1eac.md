@@ -6,11 +6,13 @@
 
 ## Major
 
-1. [ ] **code-simplifier** | `/Users/etr/progs/wonk/.worktrees/TASK-086/src/mcp.rs:2767` | code-structure
+1. [x] **code-simplifier** | `/Users/etr/progs/wonk/.worktrees/TASK-086/src/mcp.rs:2767` | code-structure
+   *Addressed (majors sweep, 2026-10-02):* fixed (resolve_scope_args seam).
    tool_review's inline scope parsing (src/mcp.rs:2767-2794, ~28 lines) is the fourth near-copy of the same scope-resolution logic: it 'mirrors tool_changes' (src/mcp.rs:2923-2941, admitted by its own comment), reimplements the private `router::parse_change_scope` (src/router.rs:1896-1908), and its `since` -> compare+base sugar duplicates dispatch_review's (src/router.rs:1983-1988). Drift is already visible across the copies: three different 'base is required' error strings, and router's copy validates the git ref via `impact::validate_git_ref` while both MCP copies skip that step.
    *Recommendation:* Make `router::parse_change_scope` visible to mcp (pub(crate), like the existing shared `router::build_changes_output`) and have both tool_changes and tool_review call it; move the since-sugar into it or a thin shared `resolve_scope_args(scope, base, since)` helper used by dispatch_review and tool_review so the ref validation and error wording cannot diverge again. (Whether the missing ref validation in MCP is a security issue is the security reviewer's call; from the simplification side it is divergence evidence.)
 
-2. [ ] **code-simplifier** | `/Users/etr/progs/wonk/.worktrees/TASK-086/src/mcp.rs:2800` | code-structure
+2. [x] **code-simplifier** | `/Users/etr/progs/wonk/.worktrees/TASK-086/src/mcp.rs:2800` | code-structure
+   *Addressed (majors sweep, 2026-10-02):* fixed (ReviewOptions::from_config + discover_if_enabled).
    The 12-line block building ReviewOptions from Config and then discovering CrossRepoInputs (`config.review.cross_repo.then(|| CrossRepoInputs::discover(&repo_root)).flatten()`) is duplicated verbatim between the MCP dispatcher (src/mcp.rs:2800-2811) and the CLI dispatcher (src/router.rs:1992-2006). This diff is what creates the second copy. A fourth rule family, or any change to how inputs are discovered, must now be wired in two places; one will drift silently. The `..ReviewOptions::default()` spread in both copies already hides which fields come from config.
    *Recommendation:* Add shared constructors next to the types they build, e.g. `impl ReviewOptions { pub fn from_config(config: &crate::config::Config) -> Self }` in src/review.rs, and a companion `CrossRepoInputs::discover_if_enabled(config: &Config, repo_root: &Path) -> Option<Self>` that folds the `then(..).flatten()` idiom inside. Both dispatchers then read `let options = ReviewOptions::from_config(&config); let cross_repo = CrossRepoInputs::discover_if_enabled(&config, &repo_root);`. This also removes the double Config load noted in finding 7.
 

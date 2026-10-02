@@ -6,7 +6,8 @@
 
 ## Major
 
-1. [ ] **code-simplifier** | `src/rerank.rs:1494` | duplication
+1. [x] **code-simplifier** | `src/rerank.rs:1494` | duplication
+   *Addressed (majors sweep, 2026-10-02):* fixed (load_file_rows chunked loader).
    load_co_change_scores (1494-1545) duplicates the entire skeleton of load_churn_scores (1447-1483): empty-set early return, presence probe via `SELECT 1 FROM <table> LIMIT 1`, `wanted.sort_unstable()`, the IN_CHUNK chunk loop with placeholders/format!/prepare/`let Ok(...) else { continue }` error-swallowing, and the identical finite-filtered `fold(0.0f32, f32::max)` for `ctx.max`. The two differ only in the SQL projection (2 vs 3 columns) and the per-row accumulation (insert vs entry-max with a file_b membership filter). ~40 lines must now evolve in lockstep (IN_CHUNK semantics, probe pattern, zero-path behavior); a future fix to one loader's batching or failure handling can silently miss the other.
    *Recommendation:* Fold the shared machinery into one private helper, e.g. `fn chunked_in_rows<T>(conn, table, columns, key_column, files, map: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>) -> Vec<T>` that owns the probe, sort, chunk loop, and continue-on-error paths and returns the raw tuples; each loader then keeps only its own SQL projection closure plus its accumulation and max fold. A smaller first step that already removes most of the mirror risk: extract just `table_present(conn, table)` and `finite_max(values) -> f32`. Behavior-preserving: same queries, same zero-paths, same fold results. This does not touch the declared deliberate split in history.rs (one load, two aggregates) — it is rerank-side only.
 
