@@ -52,8 +52,8 @@
 | M32 | Signal-Based Reranking | 4 | Complete |
 | M33 | History-Derived Signals | 2 | Complete |
 | M34 | Graph-Topology Signals | 2 | Complete |
-| M35 | Near-Duplicate Similarity | 1 | Not Started |
-| M36 | Usage Feedback Loop | 5 | Not Started |
+| M35 | Near-Duplicate Similarity | 1 | Complete |
+| M36 | Usage Feedback Loop | 5 | In Progress |
 
 ### Dependency Graph
 
@@ -4212,16 +4212,16 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 Capture caller-reported usefulness together with the alternatives that were shown, which contrastive credit assignment requires.
 
 **Action Items:**
-- [ ] Create `feedback.rs`; add the `feedback_events` table (PRD-FB-REQ-001)
-- [ ] Add the `wonk_feedback` MCP tool and `wonk feedback` CLI (PRD-FB-REQ-003)
-- [ ] **Record the returned slate — every result's identity, rank, and full feature vector — not just the chosen one** (PRD-FB-REQ-002)
-- [ ] Reuse the rerank pipeline's retained signal contributions as one group within the feature vector; add no separate extraction path for them
-- [ ] Record the query class at query time to enable per-class learning (PRD-FB-REQ-008)
-- [ ] Key entries on a content-anchored result identity surviving re-index, reusing the review identity technique (PRD-FB-REQ-005)
-- [ ] Retire an entry when the code it refers to changes materially (PRD-FB-REQ-006)
-- [ ] Record contributing session (PRD-FB-REQ-015)
-- [ ] Store per repository; never transmit (PRD-FB-REQ-004)
-- [ ] Confirm the query process writes only to `feedback_events`, never index data
+- [x] Create `feedback.rs`; add the `feedback_events` table (PRD-FB-REQ-001)
+- [x] Add the `wonk_feedback` MCP tool and `wonk feedback` CLI (PRD-FB-REQ-003)
+- [x] **Record the returned slate — every result's identity, rank, and full feature vector — not just the chosen one** (PRD-FB-REQ-002)
+- [x] Reuse the rerank pipeline's retained signal contributions as one group within the feature vector; add no separate extraction path for them
+- [x] Record the query class at query time to enable per-class learning (PRD-FB-REQ-008)
+- [x] Key entries on a content-anchored result identity surviving re-index, reusing the review identity technique (PRD-FB-REQ-005)
+- [x] Retire an entry when the code it refers to changes materially (PRD-FB-REQ-006)
+- [x] Record contributing session (PRD-FB-REQ-015)
+- [x] Store per repository; never transmit (PRD-FB-REQ-004)
+- [x] Confirm the query process writes only to `feedback_events`, never index data
 
 **Dependencies:**
 - Blocked by: TASK-092, TASK-085
@@ -4238,7 +4238,7 @@ Capture caller-reported usefulness together with the alternatives that were show
 **Related Requirements:** PRD-FB-REQ-001 through PRD-FB-REQ-006, PRD-FB-REQ-015
 **Related Decisions:** DR-042
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
