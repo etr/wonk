@@ -75,7 +75,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 | History mining | Bounded by window, not repo age | Configurable commit window with recency weighting; bulk commits excluded from co-change (DR-039) |
 | Topology recompute | Off the query path entirely | Global computation on a cadence; stale-but-served with an explicit marker (DR-040) |
 | Feedback influence | Bounded by a configured ceiling | Reorders near-ties only; feedback-free mode reproduces index-only ranking (DR-042) |
-| Storage (signal data) | churn/co-change top-K per file; one topology row and one shingle signature per symbol; feedback per reported result | All bounded: co-change is top-K not pairwise, feedback decays and is resettable |
+| Storage (signal data) | churn/co-change top-K per file; one topology row and one shingle signature per symbol; near-duplicate pairs capped per group; feedback per reported result | All bounded: co-change is top-K not pairwise, near-duplicate pairs are a per-group-capped memo recomputable from signatures, feedback decays and is resettable |
 | Latency (rerank) | < 20ms added per warm query | Pure functions over a batch-prepared context; zero-weight signals skipped entirely (DR-037) |
 | Latency (elision) | < 20ms per file | Byte-range rebuild over an already-parsed tree; no re-parse, no I/O (DR-036) |
 | Token reduction (elision) | Majority reduction in returned lines on body-heavy source | Bodies collapse to counted stubs while signatures, imports, and declarations survive intact (PRD-ELIDE-REQ-001) |
@@ -1012,6 +1012,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Path character is a graded reduction, not exclusion (PRD-RANK-REQ-011):** Test files, shims, examples, type-declaration files, re-export barrels, and generated files that shadow a hand-written peer each contribute less than an uncategorized file. Encoding this as a smaller positive contribution rather than a filter matters: when the user genuinely wants the test, it still appears — outranked rather than hidden. Wonk already has `is_test_file` and a `.d.ts` deprioritization in symbol lookup; this generalizes both into one graded signal instead of two special cases.
 - **Explainability is a requirement, not debug output (PRD-RANK-REQ-004/005):** Every contribution rides on the result. Without it, weight tuning is guesswork and a surprising ranking is unfalsifiable — the reason wonk's current ordering is defensible is that it is trivially explainable, and that property must survive the move to weights.
 - **Signals requiring new infrastructure are separate features, not exclusions:** Version-history churn and co-change (4.31), graph topology (4.32), near-duplicate similarity (4.33), and usage feedback (4.34) each need a distinct data source or computation. They are specified independently and plug into this pipeline through the same `Signal` abstraction — which is the point of making signals pure functions over a prepared context. The pipeline is the stable seam; the data sources are separately buildable and separately disable-able.
+- **Documented exception — response-relative signals run as a bounded post-sort pass (DR-041):** `novelty` is the one signal whose value is defined *relative to the ranking itself* ("demotion against higher-ranked results in the same response"), and that cannot be expressed as an order-independent additive contribution: the value would depend on the order the sort produces while the sort depends on the value the signal produces — circular. It is therefore computed as a bounded post-sort pass (a 256-candidate examination window) after the additive phase, and the sort runs once more afterwards — the same shape of recorded exception as DR-040's cadence-based topology recomputation. The signal's registry entry is retained so weight validation, unknown-name rejection (PRD-RANK-REQ-006), context preparation, and `--why` rendering treat `novelty` exactly like every other signal; only its evaluation point differs. A zero novelty weight (the default) skips the pass entirely, so the additive seam's properties hold bitwise for every other configuration.
 
 **Related Requirements:** PRD-RANK-REQ-001 through PRD-RANK-REQ-017
 
@@ -1076,6 +1077,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Signatures, not bodies (PRD-DUP-REQ-002):** Compact per-symbol signatures are computed at index time; query-time similarity is estimated from signatures alone. Comparing bodies at query time would be both slow and pointless given the answer can be precomputed.
 - **Response-relative demotion (PRD-DUP-REQ-004):** Novelty is scored against results already ranked higher *in the same response*, not globally. A symbol is not intrinsically less valuable for having twins — it is less valuable as the fifth copy in one answer. Global demotion would penalize duplicated code even when only one copy is returned.
 - **Never eliminate a group (PRD-DUP-REQ-005):** At least one representative always survives. Demotion that removed every copy would make duplicated code invisible rather than compact.
+- **Write path (PRD-DUP-REQ-003):** ranked search records the near-duplicate pairs its novelty pass already surfaced into `near_duplicates`, best-effort — a third documented exception to the read-only query path, alongside `wonk summary`'s cache (5.3) and feedback events (4.34). What makes it safe to write on the search path: the rows are index-derived and fully recomputable from `symbol_shingles` (never a record of user behavior); the write is gated behind the default-0 novelty weight, so a default-config search writes nothing; recording is one bounded, batched INSERT that rewrites nothing unchanged; and a write failure degrades with a stderr warning and never fails the search — all under WAL + busy_timeout (DR-004) alongside daemon re-index writes. The `wonk duplicates` sweep writes the same table with the same policy.
 
 **Related Requirements:** PRD-DUP-REQ-001 through PRD-DUP-REQ-006
 
@@ -1120,7 +1122,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Per-class learning (PRD-FB-REQ-008):** Adjustments are learned per query class as well as overall, which is the same structure DR-038 defines with hand-tuned constants. Feedback lets a repository replace those shipped guesses with its own measurements.
 - **Memorization survives, hard-gated (PRD-FB-REQ-016):** Weight learning cannot express "in this repo, auth questions mean `TokenValidator`" — a genuine loss. A direct per-result preference is therefore retained, but applies only after confirmation across a configured number of *distinct sessions* and is capped below the weight mechanism. Session counting, already required for honest aggregation, becomes the gate.
 - **What this costs, stated plainly:** with feedback enabled, ranking is a function of the index *and* accumulated history. Reproducibility is preserved on demand (PRD-FB-REQ-017), measurement is feedback-free by default so it cannot confirm itself (PRD-FB-REQ-018), and a repository that never reports feedback behaves exactly as today (PRD-FB-REQ-020).
-- **Write path:** query-time processes write to `feedback_events` only; `learned_weights` is updated from those events. No index data is written on the query path.
+- **Write path:** query-time processes write to `feedback_events` only; `learned_weights` is updated from those events. The only other query-path write is index-derived, not observed, data: the best-effort `near_duplicates` memo recorded by ranked search (4.33) — recomputable from `symbol_shingles`, never a record of user behavior, and silent on failure.
 
 **Related Requirements:** PRD-FB-REQ-001 through PRD-FB-REQ-029
 
@@ -1280,6 +1282,17 @@ CREATE TABLE IF NOT EXISTS symbol_shingles (
     signature BLOB NOT NULL       -- compact similarity signature over the body's shingles
 );
 
+-- [V5] Near-duplicate pairs above threshold (DR-041, PRD-DUP-REQ-003): a query/sweep-recorded
+-- memo, fully recomputable from symbol_shingles — never written by an index-time all-pairs pass.
+-- Bounded per duplicate group (strongest pairs first, max-similarity pair always kept) and
+-- cascade-cleaned with symbols.
+CREATE TABLE IF NOT EXISTS near_duplicates (
+    symbol_id_a INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    symbol_id_b INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+    similarity REAL NOT NULL,    -- sketch Jaccard at detection time
+    PRIMARY KEY (symbol_id_a, symbol_id_b)   -- canonical: symbol_id_a < symbol_id_b
+);
+
 -- [V5] Caller-reported usefulness with the slate that was shown — per repo, never transmitted (DR-042)
 -- The slate is required: credit assignment is contrastive, comparing the chosen result's signal
 -- contributions against those of the alternatives that were returned and passed over.
@@ -1333,6 +1346,7 @@ CREATE INDEX idx_reach_target ON reach(target_id);                      -- [V5] 
 CREATE INDEX idx_term_stats_term ON term_stats(term);                   -- [V5] BM25 document-frequency lookup
 CREATE INDEX idx_co_change_a ON co_change(file_a, weight DESC);         -- [V5] top-K coupling lookup
 CREATE INDEX idx_topology_community ON symbol_topology(community);      -- [V5] community-membership signal
+CREATE INDEX idx_near_duplicates_b ON near_duplicates(symbol_id_b);     -- [V5] reverse-direction pair lookup
 CREATE INDEX idx_feedback_identity ON feedback_events(result_identity); -- [V5] per-result gating + retirement
 CREATE INDEX idx_feedback_created ON feedback_events(created_at);       -- [V5] decay and windowed updates
 ```
@@ -1341,6 +1355,7 @@ CREATE INDEX idx_feedback_created ON feedback_events(created_at);       -- [V5] 
 - All V5 tables use `CREATE TABLE IF NOT EXISTS` and all V5 columns are added via `ALTER TABLE ... DEFAULT`, so pre-V5 indexes open without migration. Missing V5 data degrades to prior behavior (PRD-BM25-REQ-006, PRD-REACH-REQ-007) rather than erroring.
 - `contracts` is per-repo. Cross-repo links are **not** stored — they are computed by querying sibling repos' `contracts` tables at request time (DR-031), so a sibling re-index can never stale this repo's data.
 - `reach` is the only V5 table with unbounded growth potential; it is capped by `reach.depth` (default 3) plus a per-symbol fan-out cap, and can be disabled entirely (PRD-REACH-REQ-006, AR-020).
+- `near_duplicates` is a memo, not source data: rows are recorded best-effort by ranked search and the `wonk duplicates` sweep (never by an index-time all-pairs pass), are fully recomputable from `symbol_shingles`, and cascade-clean with symbols. Growth is bounded at 64 rows per duplicate group (strongest pairs first, the max-similarity pair always kept) — linear in duplicate groups, never quadratic in symbols, with typical small groups (fewer pairs than the cap) stored whole.
 
 ### 5.3 Data Flow
 
@@ -1361,7 +1376,15 @@ CREATE INDEX idx_feedback_created ON feedback_events(created_at);       -- [V5] 
 3. For each file: hash → compare → skip if unchanged → re-parse → delete old rows → insert new rows (single transaction per file)
 4. Update `daemon_status` table
 5. [V2] If Ollama is reachable: re-generate chunks for changed symbols, re-embed, update `embeddings` table (PRD-SEM-REQ-010)
-6. [V2] If Ollama is unreachable: set `stale = 1` on affected embeddings (PRD-SEM-REQ-011)
+6. [V2] If Ollama unreachable: set `stale = 1` on affected embeddings (PRD-SEM-REQ-011)
+
+**Ranked search (CLI `wonk search`, MCP `wonk_search`) [V5]:**
+1. CLI opens the SQLite connection with `busy_timeout` (see the connection note below)
+2. Grep-style text search produces the candidate set; the rerank pipeline (4.30) scores it
+3. When the `novelty` signal weighs nonzero, the bounded post-sort pass (4.33) surfaces near-duplicate pairs among the ranked candidates
+4. The dispatch layer records those pairs into `near_duplicates` best-effort (4.33's write-path exception): a write failure warns on stderr and never fails the search; a default-config search (novelty weight 0) writes nothing
+
+*Connection note:* the "read-only connection" wording used by the flows below predates the query-path write exceptions — `wonk summary`'s cache (this section), feedback events (4.34), and the `near_duplicates` memo (4.33). The CLI opens its connection via `db::open` (busy_timeout under WAL, DR-004): reads dominate, and each of the three write channels is documented, bounded, and isolated from the search result on failure.
 
 **Query (`wonk sym <name>`):**
 1. CLI opens read-only SQLite connection with `busy_timeout=5000`
@@ -1513,7 +1536,7 @@ Repo path hash: SHA256 of the canonical repo root path, truncated to first 16 he
 
 | From | To | Mechanism | Notes |
 |------|----|-----------|-------|
-| CLI | SQLite | Direct file access (rusqlite) | Read-only connection with busy_timeout |
+| CLI | SQLite | Direct file access (rusqlite) | Read-mostly connection with busy_timeout (WAL, DR-004); documented query-path writes: summaries cache (5.3), feedback events (4.34), best-effort near_duplicates memo (4.33) |
 | Daemon | SQLite | Direct file access (rusqlite) | Read-write connection with busy_timeout |
 | CLI | Daemon | PID file + OS signals | SIGTERM for stop, PID file for status check |
 | CLI | Daemon status | SQLite daemon_status table | Daemon writes status, CLI reads it |
@@ -2837,9 +2860,11 @@ GitHub Actions workflow:
 **Consequences:**
 - `symbol_shingles` table populated at index time
 - Novelty scored against higher-ranked results in the same response
+- Novelty is computed as a documented post-sort pass outside the additive phase — an exception to 4.30/DR-037's order-independent Signal seam, recorded here following the DR-040 precedent for documenting exceptions to a uniform model. Response-relative demotion is inherently order-dependent (a candidate's redundancy is a function of what ranked above it, which is a function of the scores the signal would contribute to — circular), so no order-independent formulation exists. The Signal-registry entry is retained so weight validation, name acceptance (PRD-RANK-REQ-006), context preparation, and `--why` rendering treat the name uniformly; only the evaluation point is the pass.
 - At least one representative of any duplicate group always survives (PRD-DUP-REQ-005)
 - Similarity threshold configurable; its effect visible in the ranking explanation
 - Duplicate groups reportable on request
+- A `near_duplicates` pair memo (PRD-DUP-REQ-003) recorded best-effort by ranked search and the `wonk duplicates` sweep — index-derived, recomputable from `symbol_shingles`, bounded per duplicate group, and never written by an index-time all-pairs pass (see 5.2 for the growth bound)
 
 ---
 

@@ -492,6 +492,41 @@ workspace: my-api (undeclared — add 'workspace = "my-api"' under [contracts] i
 — and a `run wonk update` nudge when the workspace stored in the index no
 longer matches the declared set.
 
+## Near-duplicate detection
+
+### `wonk duplicates`
+
+Report groups of near-duplicate symbols — copy-pasted code whose lexical
+bodies are almost identical (TASK-100). Similarity is computed from
+compact shingle signatures stored at index time; this command sweeps the
+whole index through hash buckets (never all-pairs) and prints each
+connected group above the threshold:
+
+```
+wonk duplicates
+wonk duplicates --threshold 0.9
+```
+
+Sample output:
+
+```
+dup-group 1 size=5 mean-sim=1.00
+  src/handlers/a.rs:1 function handle_user_created
+  src/handlers/b.rs:1 function handle_user_created
+```
+
+| Flag | Description |
+|------|-------------|
+| `--threshold <f32>` | Similarity override in `(0, 1]`; default from `[duplicate] threshold` (0.85) |
+
+Groups are ordered by size (largest first), members by `(file, line)`;
+singletons never appear. Mass-generated boilerplate can produce oversized
+buckets — those compare only their first 1024 members and the run prints
+a stderr note that more duplicates may exist. Pairs the sweep finds are
+recorded into the index (`near_duplicates`), alongside the pairs each
+ranked search with a `novelty` weight records best-effort. Text output
+only — the grep-shaped lines are machine-cuttable; JSON is a follow-up.
+
 ## Semantic
 
 ### `wonk cluster <path>`

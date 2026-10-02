@@ -111,6 +111,7 @@ previous (legacy) ordering byte-for-byte — the escape hatch.
 | `weights.prominence` | `1.0` | `1.0` when the candidate defines a symbol named by the query (term or raw pattern), `0.5` when a query term appears as a whole identifier in the matched line, `0.0` for substring-only mentions |
 | `weights.path_character` | `0.6` | Graded ladder value of the candidate's path: ordinary `1.0`, module entry `0.80`, barrel `0.70`, example `0.60`, shim `0.45`, type declaration `0.30`, test `0.20`, generated-shadowing-a-verified-peer `0.10`. Graded, never exclusion — a test file that is the best answer still ranks. A generated file is demoted only when a same-named hand-written peer exists in the index |
 | `weights.proximity` | `0.0` | `1 / gap` over the first-occurrence positions of the query terms present as whole identifiers in the matched line (adjacent terms `1.0`, one token between `0.5`, decaying). Fewer than two present terms contribute zero |
+| `weights.novelty` | `0.0` | Near-duplicate demotion (TASK-100): `1 - clamp01((jaccard - threshold) / (1 - threshold))` against the best sketch-Jaccard versus higher-ranked results carrying a signature, with `threshold` from `[duplicate]`. A weight of `0` (the default, pending bench evidence) skips the pass entirely; the earliest member of a duplicate group is never demoted, so every group keeps a representative |
 | `weights.signature` | `0.8` | Answers signature-shaped queries (containing `(`, `->`, or `::`): `1.0` for the index-backed definition, `0.5` for a definition-shaped line (a parenthesis plus a definition keyword among its first three identifiers), `0.0` otherwise. Name-shaped queries are inert |
 | `class_multipliers.symbol` | `lexical = 1.8`, `semantic = 0.6` | Per-class scaling of the lexical and semantic weights for symbol-shaped queries (a single identifier token) |
 | `class_multipliers.path` | `lexical = 1.3`, `semantic = 0.8` | Same scaling for path-shaped queries (containing `/` or `\`) |
@@ -145,6 +146,21 @@ the blend only, never which signals run. `wonk search --query-class
 <symbol|path|signature|conceptual>` (and the MCP `query_class`
 parameter) pins the class explicitly, bypassing detection for that
 invocation.
+
+**`[duplicate]`**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `threshold` | `0.85` | Sketch-Jaccard level strictly above which two symbols are near-duplicates. Finite and in `(0, 1]`, else a hard configuration error naming the key |
+
+Near-duplicate similarity (TASK-100) is lexical, not embedded: every
+indexed symbol body is sketched at index time into a compact bottom-64
+shingle signature (the `symbol_shingles` table), and query-time
+similarity compares signature blobs only — no symbol body is ever read
+to rank. The threshold feeds three consumers: the `novelty` demotion
+pass (see `[rank] weights.novelty`), the `near_duplicates` pairs
+recorded best-effort after each ranked search, and `wonk duplicates`
+reporting (which also takes a one-off `--threshold` override).
 
 **`[embedding]`**
 
