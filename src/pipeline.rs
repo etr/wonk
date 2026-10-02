@@ -616,6 +616,14 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
     // rows go away (TASK-081, PRD-REACH-REQ-005).
     let scope = crate::reach::begin_file_edit(&tx, rel_path)?;
 
+    // Subtract this file's contribution from the corpus-stats summary
+    // while its row (and line_count) is still readable; a legacy index
+    // with no summary row heals by recomputing after the delete.
+    let summary_present = corpus_stats_present(&tx)?;
+    if summary_present {
+        corpus_stats_remove_file(&tx, rel_path)?;
+    }
+
     // Delete type edges before symbols (explicit, mirrors references/imports pattern).
     tx.execute(
         "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
@@ -658,6 +666,10 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
             "warn: incremental reach repair failed for {rel_path}: {e:#}; \
              table marked stale, queries fall back to BFS"
         );
+    }
+
+    if !summary_present {
+        corpus_stats_recompute(&tx)?;
     }
 
     tx.commit().context("committing delete transaction")?;
@@ -711,6 +723,15 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
         rusqlite::params![result.rel_path],
     )?;
 
+    // Subtract the file's previous contribution from the corpus-stats
+    // summary while the old row (and its line_count) is still readable;
+    // a legacy index with no summary row heals by recomputing after the
+    // upsert instead of adjusting.
+    let summary_present = corpus_stats_present(&tx)?;
+    if summary_present {
+        corpus_stats_remove_file(&tx, &result.rel_path)?;
+    }
+
     // Upsert file metadata.
     tx.execute(
         "INSERT OR REPLACE INTO files (path, language, hash, last_indexed, line_count, symbols_count) \
@@ -724,6 +745,13 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
             result.symbols.len() as i64,
         ],
     )?;
+
+    // Add the new row's contribution to the summary (or heal it).
+    if summary_present {
+        corpus_stats_add_file(&tx, Some(result.line_count as i64))?;
+    } else {
+        corpus_stats_recompute(&tx)?;
+    }
 
     // Insert new symbols and build a name -> id map for caller_id resolution.
     let mut caller_map: HashMap<&str, i64> = HashMap::new();
@@ -1265,6 +1293,10 @@ fn batch_insert(
     if let Some(opts) = reach_opts {
         crate::reach::build_reach(&tx, opts)?;
     }
+
+    // Publish the corpus-stats summary for this whole batch (one
+    // aggregate per build, replacing the per-query scan at search time).
+    corpus_stats_recompute(&tx)?;
 
     tx.commit().context("committing transaction")?;
 
@@ -1818,9 +1850,78 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM co_change;
          DELETE FROM commit_files;
          DELETE FROM mined_commits;
-         DELETE FROM history_meta;",
+         DELETE FROM history_meta;
+         DELETE FROM corpus_stats;",
     )
     .context("clearing index data")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Corpus-stats summary maintenance (TASK-079 review)
+// ---------------------------------------------------------------------------
+
+// Maintain the one-row `corpus_stats` summary the BM25 reader loads in
+// O(1) instead of a per-query `COUNT`/`AVG` full scan of `files`. The
+// invariant — the row always equals `COUNT(*)`, `COUNT(line_count)`,
+// `SUM(line_count)` over `files` — is kept inside the three functions
+// that mutate `files` (`batch_insert`, `upsert_file_data`,
+// `delete_file_data`), each within its own transaction, so every caller
+// (full build, incremental update, watcher events) maintains it for free.
+// `AVG` reconstructs as `total_lines / measured`, bitwise-identical to
+// the SQLite aggregate (one f64 division of the same integers); a reader
+// that finds no row falls back to the aggregate, so the summary can only
+// ever save the scan, never change a score.
+
+/// Whether the summary row exists (absent on indexes built before it).
+fn corpus_stats_present(conn: &Connection) -> Result<bool> {
+    let present: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM corpus_stats)", [], |row| {
+            row.get(0)
+        })
+        .context("checking corpus stats summary")?;
+    Ok(present)
+}
+
+/// Recompute the summary wholesale — the batch/full-build path, and the
+/// heal for a legacy index whose first mutation finds no row yet.
+fn corpus_stats_recompute(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO corpus_stats (id, n_docs, measured, total_lines) \
+         SELECT 1, COUNT(*), COUNT(line_count), COALESCE(SUM(line_count), 0) FROM files",
+        [],
+    )
+    .context("refreshing corpus stats summary")?;
+    Ok(())
+}
+
+/// Subtract one file's contribution from the summary. MUST run inside the
+/// same transaction as, and before, that file's `files` row disappears
+/// (delete or `INSERT OR REPLACE`); no-op when the path has no row.
+fn corpus_stats_remove_file(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE corpus_stats SET \
+           n_docs = n_docs - 1, \
+           measured = measured - (SELECT line_count IS NOT NULL FROM files WHERE path = ?1), \
+           total_lines = total_lines \
+             - COALESCE((SELECT line_count FROM files WHERE path = ?1), 0) \
+         WHERE EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+        rusqlite::params![path],
+    )
+    .context("adjusting corpus stats summary")?;
+    Ok(())
+}
+
+/// Add one file's contribution after its `files` row is written.
+fn corpus_stats_add_file(conn: &Connection, line_count: Option<i64>) -> Result<()> {
+    conn.execute(
+        "UPDATE corpus_stats SET \
+           n_docs = n_docs + 1, \
+           measured = measured + (?1 IS NOT NULL), \
+           total_lines = total_lines + COALESCE(?1, 0)",
+        rusqlite::params![line_count],
+    )
+    .context("adjusting corpus stats summary")?;
     Ok(())
 }
 
@@ -1962,6 +2063,90 @@ class Component {
         let stats = build_index(dir.path(), true).unwrap();
         // 2 HTTP providers + 1 env consumer; util.txt contributes nothing.
         assert_eq!(stats.contract_count, 3, "got {stats:?}");
+    }
+
+    // -- corpus-stats summary (TASK-079 review) --------------------------------
+
+    /// The summary row the BM25 reader loads in O(1) must always equal the
+    /// COUNT/COUNT/SUM aggregate over `files`.
+    fn assert_corpus_stats_matches_aggregate(conn: &Connection) {
+        let summary: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT n_docs, measured, total_lines FROM corpus_stats WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("corpus_stats summary row must exist");
+        let aggregate: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(line_count), COALESCE(SUM(line_count), 0) FROM files",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            summary, aggregate,
+            "corpus_stats summary must match the files aggregate"
+        );
+    }
+
+    #[test]
+    fn corpus_stats_summary_matches_aggregate_across_mutation_paths() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let conn = db::open(&db::local_index_path(root)).unwrap();
+        assert_corpus_stats_matches_aggregate(&conn);
+
+        // Modified file with a different line count -> the upsert path
+        // (subtract old contribution, add the new one).
+        let main = root.join("src/main.rs");
+        fs::write(
+            &main,
+            "fn main() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n    let e = 5;\n}\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::load(Some(root)).unwrap_or_default();
+        let opts = crate::contracts::ContractOptions::from(&config.contracts);
+        assert!(reindex_file(&conn, &main, root, &opts).unwrap());
+        assert_corpus_stats_matches_aggregate(&conn);
+
+        // Re-upsert the same file (unchanged content is skipped by hash,
+        // so rewrite again to force a second replace over an existing row).
+        fs::write(
+            &main,
+            "fn main() {\n    let a = 1;\n}\nfn extra() -> u32 {\n    7\n}\n",
+        )
+        .unwrap();
+        assert!(reindex_file(&conn, &main, root, &opts).unwrap());
+        assert_corpus_stats_matches_aggregate(&conn);
+
+        // Deleted file -> the delete path.
+        let py = root.join("app.py");
+        remove_file(&conn, &py, root).unwrap();
+        assert_corpus_stats_matches_aggregate(&conn);
+    }
+
+    #[test]
+    fn corpus_stats_summary_heals_on_first_mutation_of_legacy_index() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let conn = db::open(&db::local_index_path(root)).unwrap();
+
+        // Simulate a pre-summary legacy index: no row, then a mutation.
+        conn.execute("DELETE FROM corpus_stats", []).unwrap();
+        let config = crate::config::Config::load(Some(root)).unwrap_or_default();
+        let opts = crate::contracts::ContractOptions::from(&config.contracts);
+        let js = root.join("index.js");
+        fs::write(&js, "function render() {\n    return 1;\n}\n").unwrap();
+        assert!(reindex_file(&conn, &js, root, &opts).unwrap());
+        assert_corpus_stats_matches_aggregate(&conn);
+
+        // And the delete path heals too.
+        conn.execute("DELETE FROM corpus_stats", []).unwrap();
+        remove_file(&conn, &js, root).unwrap();
+        assert_corpus_stats_matches_aggregate(&conn);
     }
 
     // -- shingle signatures (TASK-100) -----------------------------------------

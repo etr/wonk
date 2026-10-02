@@ -43,11 +43,37 @@ pub struct CorpusStats {
     pub avg_doc_len: f32,
 }
 
-/// Load `(COUNT(*), AVG(line_count))` from `files`.
+/// Bound parameters per IN-list statement (the repo's chunking convention,
+/// as in rerank.rs/reach.rs). Bundled SQLite allows 32766; 900 keeps every
+/// statement well under any build's limit.
+const IN_CHUNK: usize = 900;
+
+/// Load the corpus statistics `(COUNT(*), AVG(line_count))` for `files`.
+///
+/// O(1) on pipeline-maintained indexes: the one-row `corpus_stats` summary
+/// is read directly, reconstructing `AVG` as `total_lines / measured` —
+/// bitwise-identical to the SQLite aggregate (both are a single f64
+/// division of the same integers, then narrowed to f32). Indexes without
+/// the row (built before the summary existed, or test fixtures seeding
+/// `files` directly) fall back to the aggregate query, so a missing row
+/// costs speed, never score correctness.
 ///
 /// Returns `None` for a degenerate corpus: no files at all, or no file
 /// with a non-NULL `line_count`.
 pub fn load_corpus_stats(conn: &Connection) -> Option<CorpusStats> {
+    if let Ok((n_docs, measured, total_lines)) = conn.query_row(
+        "SELECT n_docs, measured, total_lines FROM corpus_stats WHERE id = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    ) {
+        return corpus_stats_from_summary(n_docs, measured, total_lines);
+    }
     let (n_docs, avg): (i64, Option<f64>) = conn
         .query_row("SELECT COUNT(*), AVG(line_count) FROM files", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -56,6 +82,19 @@ pub fn load_corpus_stats(conn: &Connection) -> Option<CorpusStats> {
     Some(CorpusStats {
         n_docs: n_docs as u64,
         avg_doc_len: avg? as f32,
+    })
+}
+
+/// Reconstruct [`CorpusStats`] from the summary counters exactly as the
+/// SQLite aggregate would: the same degenerate-corpus `None`s (no files,
+/// or no file with a measured length) and the same single f64 division.
+fn corpus_stats_from_summary(n_docs: i64, measured: i64, total_lines: i64) -> Option<CorpusStats> {
+    if n_docs <= 0 || measured <= 0 {
+        return None;
+    }
+    Some(CorpusStats {
+        n_docs: n_docs as u64,
+        avg_doc_len: (total_lines as f64 / measured as f64) as f32,
     })
 }
 
@@ -88,9 +127,10 @@ pub fn term_contribution(tf: u64, doc_len: f32, avgdl: f32, idf: f32, k1: f32, b
 ///
 /// Every input file gets an entry: files without term_stats rows score
 /// exactly 0.0. An empty file set or a query with no tokens yields an
-/// empty map. Query cost is `3 + T` statements for T query terms
-/// (presence probe, corpus stats, one postings scan per term, document
-/// lengths), independent of the candidate count.
+/// empty map. Query cost is `2 + T + ceil(C/IN_CHUNK)` statements for T
+/// query terms and C distinct candidate files (presence probe, corpus
+/// stats, one postings scan per term, candidate-scoped document lengths)
+/// — independent of the corpus size.
 pub fn file_bm25_scores(
     conn: &Connection,
     files: &std::collections::HashSet<String>,
@@ -138,20 +178,31 @@ pub fn file_bm25_scores(
         scored_terms.push((idf, tf_by_file));
     }
 
-    // Document lengths; files missing from the index (or with NULL length)
-    // fall back to avgdl, which is length-neutral.
+    // Document lengths for exactly the candidate files, in IN_CHUNK
+    // batches against the `files` PRIMARY KEY (the ranker::IndexLookup
+    // precedent): an indexed point lookup per candidate, so the cost and
+    // the transient memory scale with the candidate set, not the corpus.
+    // Files missing from the index (or with NULL length) fall back to
+    // avgdl, which is length-neutral — the same values the full-table
+    // materialization produced, so scores are bitwise identical.
     let mut doc_len: HashMap<String, f32> = HashMap::new();
     {
-        let mut stmt = conn.prepare("SELECT path, line_count FROM files").ok()?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
-            })
-            .ok()?;
-        for row in rows {
-            let (path, len) = row.ok()?;
-            if let Some(len) = len {
-                doc_len.insert(path, len as f32);
+        let mut wanted: Vec<&String> = files.iter().collect();
+        wanted.sort_unstable();
+        for chunk in wanted.chunks(IN_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!("SELECT path, line_count FROM files WHERE path IN ({placeholders})");
+            let mut stmt = conn.prepare(&sql).ok()?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                })
+                .ok()?;
+            for row in rows {
+                let (path, len) = row.ok()?;
+                if let Some(len) = len {
+                    doc_len.insert(path, len as f32);
+                }
             }
         }
     }
@@ -341,6 +392,54 @@ mod tests {
     fn corpus_stats_none_when_all_line_counts_null() {
         let (_dir, conn) = test_conn();
         insert_file(&conn, "a.rs", None);
+        assert!(load_corpus_stats(&conn).is_none());
+    }
+
+    #[test]
+    fn corpus_stats_summary_read_bitwise_identical_to_aggregate() {
+        let (_dir, conn) = test_conn();
+        insert_file(&conn, "a.rs", Some(10));
+        insert_file(&conn, "b.rs", None);
+        insert_file(&conn, "c.rs", Some(50));
+        // Publish the summary exactly as the pipeline's recompute does.
+        conn.execute(
+            "INSERT INTO corpus_stats (id, n_docs, measured, total_lines) \
+             SELECT 1, COUNT(*), COUNT(line_count), COALESCE(SUM(line_count), 0) FROM files",
+            [],
+        )
+        .unwrap();
+
+        let from_summary = load_corpus_stats(&conn).expect("stats from the summary row");
+        conn.execute("DELETE FROM corpus_stats", []).unwrap();
+        let from_aggregate = load_corpus_stats(&conn).expect("stats from the aggregate fallback");
+
+        assert_eq!(from_summary.n_docs, from_aggregate.n_docs);
+        assert_eq!(
+            from_summary.avg_doc_len.to_bits(),
+            from_aggregate.avg_doc_len.to_bits(),
+            "summary AVG reconstruction must be bitwise identical to SQLite's aggregate"
+        );
+    }
+
+    #[test]
+    fn corpus_stats_summary_degenerate_rows_stay_none() {
+        let (_dir, conn) = test_conn();
+        // A summary of an empty corpus (the row a fresh empty build writes).
+        conn.execute(
+            "INSERT INTO corpus_stats (id, n_docs, measured, total_lines) \
+             VALUES (1, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        assert!(load_corpus_stats(&conn).is_none());
+
+        // All line counts NULL: measured 0, the AVG-NULL degenerate case.
+        conn.execute(
+            "INSERT OR REPLACE INTO corpus_stats (id, n_docs, measured, total_lines) \
+             VALUES (1, 2, 0, 0)",
+            [],
+        )
+        .unwrap();
         assert!(load_corpus_stats(&conn).is_none());
     }
 
@@ -631,6 +730,87 @@ mod tests {
         assert!((scores["a.rs"] - expected_a).abs() < TOL);
         assert!((scores["b.rs"] - expected_b).abs() < TOL);
         assert!(scores["a.rs"] > scores["b.rs"]);
+    }
+
+    #[test]
+    fn file_scores_candidate_scoped_doc_lengths_match_full_table_reference() {
+        // Candidate-scoped doc-length loading must reproduce, bit for bit,
+        // the scores the full-table materialization produced: the same
+        // doc_len values for the candidates and the same global corpus
+        // stats (non-candidate files still shape the corpus via AVG, and
+        // postings still come from the whole term_stats table).
+        let (_dir, conn) = test_conn();
+        insert_file(&conn, "a.rs", Some(40));
+        insert_file(&conn, "b.rs", Some(90));
+        // Not a candidate: under the fix it is never loaded into doc_len,
+        // yet it must still affect corpus stats and df exactly as before.
+        insert_file(&conn, "z-uncandidate.rs", Some(70));
+        insert_file(&conn, "null-len.rs", None);
+        insert_term(&conn, "alpha", "a.rs", 3);
+        insert_term(&conn, "alpha", "z-uncandidate.rs", 5);
+        insert_term(&conn, "alpha", "null-len.rs", 2);
+
+        let candidates = files_set(&["a.rs", "b.rs"]);
+        let scores =
+            file_bm25_scores(&conn, &candidates, "alpha", default_params()).expect("scorable");
+
+        // The reference: the pre-fix algorithm, with doc lengths
+        // materialized from the ENTIRE files table.
+        let corpus = {
+            let (n, avg): (i64, Option<f64>) = conn
+                .query_row("SELECT COUNT(*), AVG(line_count) FROM files", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            CorpusStats {
+                n_docs: n as u64,
+                avg_doc_len: avg.unwrap() as f32,
+            }
+        };
+        let mut full_doc_len: HashMap<String, f32> = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT path, line_count FROM files").unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                })
+                .unwrap();
+            for row in rows {
+                let (path, len) = row.unwrap();
+                if let Some(len) = len {
+                    full_doc_len.insert(path, len as f32);
+                }
+            }
+        }
+        let mut tf_by_file: HashMap<String, u64> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT file, tf FROM term_stats WHERE term = 'alpha'")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap();
+            for row in rows {
+                let (file, tf) = row.unwrap();
+                tf_by_file.insert(file, tf as u64);
+            }
+        }
+        let idf = idf(corpus.n_docs, tf_by_file.len() as u64);
+        for file in ["a.rs", "b.rs"] {
+            let len = full_doc_len
+                .get(file)
+                .copied()
+                .unwrap_or(corpus.avg_doc_len);
+            let tf = tf_by_file.get(file).copied().unwrap_or(0);
+            let expected = term_contribution(tf, len, corpus.avg_doc_len, idf, 1.2, 0.75);
+            assert_eq!(
+                scores[file].to_bits(),
+                expected.to_bits(),
+                "candidate {file} must score bit-identically to the full-table reference"
+            );
+        }
     }
 
     #[test]

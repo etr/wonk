@@ -4766,6 +4766,16 @@ proximity, signature, churn, co_change, hub, authority, community",
             )
             .unwrap();
         }
+        // Publish the corpus-stats summary exactly as the pipeline build
+        // does (TASK-079 review), so the fixture represents a modern
+        // index: BM25 reads it in O(1). Legacy indexes without the row
+        // pay one extra statement (the aggregate fallback).
+        conn.execute(
+            "INSERT INTO corpus_stats (id, n_docs, measured, total_lines) \
+             SELECT 1, COUNT(*), COUNT(line_count), COALESCE(SUM(line_count), 0) FROM files",
+            [],
+        )
+        .unwrap();
         (dir, conn)
     }
 
@@ -6198,8 +6208,9 @@ proximity, signature, churn, co_change, hub, authority, community",
         // resolution (TASK-105: the exact `files` IN pass; all candidates
         // repo-relative, so the fallback scan never runs) + 2 symbol-hit
         // lookups (symbols IN, references GROUP BY) + 4 lexical (presence
-        // probe, corpus stats, 1 postings scan, document lengths) + 2
-        // embedding (stored vector spaces, position loader; the query
+        // probe, corpus-stats summary read, 1 postings scan, document
+        // lengths — one IN chunk for any candidate set under 900 files) +
+        // 2 embedding (stored vector spaces, position loader; the query
         // embed itself is in-process and SQL-free). query_terms and
         // path_class touch
         // no SQL. The count must not move when the candidate set grows.
