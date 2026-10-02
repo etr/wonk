@@ -333,7 +333,7 @@ written.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `provider` | `"bundled"` | Embedding provider: offline bundled model, or opt-in `"ollama"` using `nomic-embed-text` |
+| `provider` | `"bundled"` | Embedding provider: offline bundled model, or opt-in `"ollama"` using `nomic-embed-text`. The bundled model decodes to ~62 MiB resident per process (~97 MiB peak during decode) — see bench/bundled-embedding-results.md |
 
 Provider selection follows the normal configuration precedence: per-repo
 configuration overrides global configuration, which overrides the built-in
