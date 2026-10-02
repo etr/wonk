@@ -396,6 +396,11 @@ impl Default for RankConfig {
                 ("centrality".to_string(), 0.4),
                 ("signature".to_string(), 0.8),
                 ("path_character".to_string(), 0.6),
+                // TASK-102: the descriptive learned-weight channel. INERT
+                // without gated learned rows (the stub contributes
+                // nothing, the pass never runs) — zeroing it is the
+                // one-knob full disable.
+                ("feedback".to_string(), 0.35),
             ]),
             class_multipliers: crate::rerank::ClassMultipliers {
                 symbol: crate::rerank::ChannelMultipliers {
@@ -2555,6 +2560,7 @@ rrf_k = 80.0
                 ("centrality".to_string(), 0.4),
                 ("signature".to_string(), 0.8),
                 ("path_character".to_string(), 0.6),
+                ("feedback".to_string(), 0.35),
             ])
         );
         assert_eq!(config.rank.class_multipliers.symbol.lexical, 1.8);

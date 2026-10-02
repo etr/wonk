@@ -149,23 +149,23 @@ pub struct SlateMember {
 /// result path the caller saw (which may be absolute). `id`/`scope`/
 /// `language` feed the descriptive features (TASK-105); the SELECT gained
 /// them without adding a statement.
-struct SymbolRow {
-    id: i64,
-    file: String,
-    line: i64,
-    end_line: Option<i64>,
-    name: String,
-    kind: String,
-    scope: Option<String>,
-    signature: Option<String>,
-    language: String,
+pub(crate) struct SymbolRow {
+    pub(crate) id: i64,
+    pub(crate) file: String,
+    pub(crate) line: i64,
+    pub(crate) end_line: Option<i64>,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) scope: Option<String>,
+    pub(crate) signature: Option<String>,
+    pub(crate) language: String,
 }
 
 /// The owning symbol of `line` in `file`: the candidate with the SMALLEST
 /// span containing it (`line <= target <= end_line`, NULL `end_line`
 /// treated as `line`), tie-broken on (line desc, name) for determinism.
 /// Returns `None` when no span contains the line.
-fn owning_symbol(rows: &[SymbolRow], line: u64) -> Option<&SymbolRow> {
+pub(crate) fn owning_symbol(rows: &[SymbolRow], line: u64) -> Option<&SymbolRow> {
     let target = line as i64;
     rows.iter()
         .filter(|r| {
@@ -190,7 +190,7 @@ fn owning_symbol(rows: &[SymbolRow], line: u64) -> Option<&SymbolRow> {
 /// repo-relative, and the identity's stability depends on anchoring on
 /// the DB path. The returned map is keyed by the REQUESTED file string so
 /// callers resolve by what they hold.
-fn load_symbols_by_file(
+pub(crate) fn load_symbols_by_file(
     conn: &Connection,
     files: &[String],
 ) -> Result<HashMap<String, Vec<SymbolRow>>> {
@@ -455,20 +455,20 @@ fn ancestor_dirs(canonical: &str) -> Vec<String> {
 /// symbol row, the shared context the pipeline already prepared, the
 /// query, one clock reading, and the author switch. Nothing else — no
 /// connection, so extraction is a pure function with no round trips.
-struct ExtractionInputs<'a> {
-    query: &'a str,
-    ctx: &'a crate::rerank::SharedContext,
+pub(crate) struct ExtractionInputs<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) ctx: &'a crate::rerank::SharedContext,
     /// Wall clock captured once per slate (the `created_at` precedent):
     /// same-input determinism holds except across bucket boundaries.
-    now: SystemTime,
-    author_features: bool,
+    pub(crate) now: SystemTime,
+    pub(crate) author_features: bool,
 }
 
 /// Extract one member's descriptive groups (the D2 catalogue, one clause
 /// per row). Pure over its inputs; members with no owning symbol
 /// (line-anchored) get `path`/`match`/`history`/`author`/`context` only —
 /// `symbol`/`graph` keys are omitted for them, never defaulted.
-fn extract_groups(
+pub(crate) fn extract_groups(
     item: &crate::rerank::ScoredResult,
     owning: Option<&SymbolRow>,
     canonical: &str,
@@ -697,8 +697,10 @@ fn parent_dir(path: &str) -> &str {
 }
 
 /// The scalar (non-ancestor) feature names of the `path` group — every
-/// other `path` key is an ancestor presence feature.
-const PATH_SCALARS: [&str; 3] = ["class", "depth", "lang"];
+/// other `path` key is an ancestor presence feature. The learner's
+/// flattening reads the same list (`path:<name>=<value>` vs bare
+/// `path:<ancestor>`), so the two sides cannot drift.
+pub(crate) const PATH_SCALARS: [&str; 3] = ["class", "depth", "lang"];
 
 /// Cap per-slate categorical cardinality (PRD-FB-REQ-024, D8): for every
 /// scalar feature, and for the `path` ancestor keys as one family, keep
@@ -707,7 +709,7 @@ const PATH_SCALARS: [&str; 3] = ["class", "depth", "lang"];
 /// other occurrence into the shared `__overflow__` label (ancestors
 /// collapse to one `__overflow__` presence key). Fixed-label bucket
 /// features are closed sets; the rule passes over them harmlessly.
-fn apply_cardinality_cap(groups: &mut [FeatureGroups]) {
+pub(crate) fn apply_cardinality_cap(groups: &mut [FeatureGroups]) {
     use std::collections::{BTreeSet, HashMap as CountMap};
 
     // (group name, feature name) -> value -> count, across all members.
@@ -1093,6 +1095,27 @@ pub struct FeedbackEvent {
     pub created_at: i64,
 }
 
+/// Map one `feedback_events` row to a [`FeedbackEvent`] (shared by the
+/// full load and TASK-102's watermark cursor).
+fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedbackEvent> {
+    Ok(FeedbackEvent {
+        id: row.get(0)?,
+        result_identity: row.get(1)?,
+        query_class: row.get(2)?,
+        chosen_rank: row.get(3)?,
+        features: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })?,
+        useful: row.get::<_, i64>(5)? == 1,
+        session: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
 /// Load every feedback event, oldest first, features parsed.
 pub fn load_events(conn: &Connection) -> Result<Vec<FeedbackEvent>> {
     let mut stmt = conn.prepare(
@@ -1100,24 +1123,20 @@ pub fn load_events(conn: &Connection) -> Result<Vec<FeedbackEvent>> {
          created_at FROM feedback_events ORDER BY id",
     )?;
     let events = stmt
-        .query_map([], |row| {
-            Ok(FeedbackEvent {
-                id: row.get(0)?,
-                result_identity: row.get(1)?,
-                query_class: row.get(2)?,
-                chosen_rank: row.get(3)?,
-                features: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                useful: row.get::<_, i64>(5)? == 1,
-                session: row.get(6)?,
-                created_at: row.get(7)?,
-            })
-        })?
+        .query_map([], event_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(events)
+}
+
+/// Load feedback events with `id > since`, oldest first — TASK-102's
+/// learning cursor over the watermark.
+pub fn load_events_since(conn: &Connection, since: i64) -> Result<Vec<FeedbackEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, result_identity, query_class, chosen_rank, features, useful, session, \
+         created_at FROM feedback_events WHERE id > ?1 ORDER BY id",
+    )?;
+    let events = stmt
+        .query_map([since], event_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(events)
 }

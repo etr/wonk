@@ -124,22 +124,37 @@ pub enum Command {
     Review(ReviewArgs),
 }
 
-/// Arguments for `wonk feedback` (TASK-101, PRD-FB-REQ-003).
+/// Arguments for `wonk feedback` (TASK-101, PRD-FB-REQ-003; `--weights`
+/// TASK-102).
+///
+/// The `requires` chain (`useful` → `session` → `slate`) keeps every
+/// partial recording triple a clap error while `--weights` stands alone.
 #[derive(clap::Args, Debug)]
 pub struct FeedbackArgs {
     /// Slate token from the search output (`slate:` line or JSON field)
     #[arg(long)]
-    pub slate: String,
+    pub slate: Option<String>,
 
     /// Stable id for your current session/conversation (distinct sessions
     /// are counted separately)
-    #[arg(long)]
-    pub session: String,
+    #[arg(long, requires = "slate")]
+    pub session: Option<String>,
 
     /// Results that were useful: 64-hex identities or 1-based ranks;
     /// repeatable and comma-separated
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        required_unless_present = "weights",
+        requires = "session"
+    )]
     pub useful: Vec<String>,
+
+    /// List every learned weight with its default, observation count,
+    /// and session count instead of recording (TASK-102,
+    /// PRD-FB-REQ-029/012)
+    #[arg(long, conflicts_with_all = ["slate", "session", "useful"])]
+    pub weights: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2299,8 +2314,8 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Feedback(args) => {
-                assert_eq!(args.slate, "4f3ea1b2c3d4e5f6");
-                assert_eq!(args.session, "conv-42");
+                assert_eq!(args.slate.as_deref(), Some("4f3ea1b2c3d4e5f6"));
+                assert_eq!(args.session.as_deref(), Some("conv-42"));
                 assert_eq!(args.useful, vec!["2".to_string(), "3".to_string()]);
             }
             _ => panic!("expected Command::Feedback"),
@@ -2342,5 +2357,25 @@ mod tests {
         assert!(
             Cli::try_parse_from(["wonk", "feedback", "--session", "s", "--useful", "1"]).is_err()
         );
+    }
+
+    // -- feedback --weights (TASK-102) -----------------------------------------
+
+    #[test]
+    fn parse_feedback_weights_alone_works() {
+        let cli = Cli::try_parse_from(["wonk", "feedback", "--weights"]).unwrap();
+        match cli.command {
+            Command::Feedback(args) => assert!(args.weights, "--weights parsed: {args:?}"),
+            _ => panic!("expected Command::Feedback"),
+        }
+    }
+
+    #[test]
+    fn parse_feedback_weights_conflicts_with_recording_flags() {
+        assert!(Cli::try_parse_from([
+            "wonk", "feedback", "--weights", "--slate", "t", "--session", "s", "--useful", "1"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["wonk", "feedback", "--weights", "--useful", "1"]).is_err());
     }
 }

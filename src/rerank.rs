@@ -1668,6 +1668,36 @@ impl Signal for NoveltySignal {
     }
 }
 
+/// The feedback signal (TASK-102, PRD-FB-REQ-014). NOT additive: its
+/// value is the sum of the candidate's matched learned descriptive keys —
+/// state the registry cannot see — so `rerank_core`'s pre-sort pass
+/// (`learning::apply_feedback_contribution`) appends the real rows.
+/// This member exists so `[rank.weights]` validation,
+/// `known_signal_names`, and the requirements union accept `feedback`
+/// uniformly; `contribution` is dead by design and never evaluated (the
+/// pipeline excludes the name from the additive phase).
+pub(crate) struct FeedbackSignal;
+
+impl Signal for FeedbackSignal {
+    fn name(&self) -> &'static str {
+        "feedback"
+    }
+
+    fn requires(&self) -> ContextReqs {
+        ContextReqs::none()
+    }
+
+    fn contribution(
+        &self,
+        _query: &QueryInfo<'_>,
+        _candidate: &ClassifiedResult,
+        _ctx: &SharedContext,
+    ) -> f32 {
+        // Dead by design — see the type doc. The pass appends real rows.
+        0.0
+    }
+}
+
 /// Registry of built-in signals. TASK-093/094 append entries here; config
 /// name validation derives from this list, so new signals are accepted by
 /// `[rank.weights]` automatically.
@@ -1687,6 +1717,7 @@ pub fn builtin_signals() -> Vec<Box<dyn Signal>> {
         Box::new(AuthoritySignal),
         Box::new(CommunitySignal),
         Box::new(NoveltySignal),
+        Box::new(FeedbackSignal),
     ]
 }
 
@@ -2691,11 +2722,13 @@ pub fn rerank_with_pairs(
 
 /// The feedback-capture widenings threaded through one scoring run
 /// (TASK-105): context slices beyond the active signals' requirements
-/// and the working-context hint.
+/// and the working-context hint — plus the resolved learned overlay the
+/// descriptive `feedback` pass consumes (TASK-102).
 #[derive(Default)]
 struct ScoreExtras<'a> {
     extra_reqs: ContextReqs,
     hint: Option<&'a str>,
+    learned: Option<&'a crate::learning::ResolvedFeedback>,
 }
 
 /// The shared scoring body (TASK-105), additionally returning the
@@ -2719,17 +2752,38 @@ fn rerank_core(
     Vec<crate::shingles::NearDuplicatePair>,
     SharedContext,
 ) {
-    // The additive phase excludes novelty: its rows come from the
-    // post-sort pass, not from per-candidate evaluation.
+    // The additive phase excludes novelty and feedback: their rows come
+    // from passes, not from per-candidate evaluation (novelty post-sort,
+    // feedback pre-sort).
     let active: Vec<&Box<dyn Signal>> = signals
         .iter()
-        .filter(|s| weights.weight(s.name()) != 0.0 && s.name() != "novelty")
+        .filter(|s| {
+            weights.weight(s.name()) != 0.0 && s.name() != "novelty" && s.name() != "feedback"
+        })
         .collect();
     // Belt-and-suspenders: even a spy-signal list without NoveltySignal
     // prepares shingles when novelty weighs in.
     let mut reqs = union_reqs(&signals, weights);
     if weights.weight("novelty") != 0.0 {
         reqs = reqs.with_shingles();
+    }
+    let feedback_weight = weights.weight("feedback");
+    let feedback_pass = feedback_weight != 0.0
+        && extras.learned.is_some_and(|learned| !learned.descriptive.is_empty())
+        && conn.is_some();
+    if feedback_pass {
+        // The descriptive pass extracts over the same widened slices the
+        // slate build records from (TASK-105), so the keys a candidate
+        // matches are the keys the slate recorded.
+        reqs = reqs.union(
+            ContextReqs::none()
+                .with_query_terms()
+                .with_path_class()
+                .with_symbol_hits()
+                .with_file_churn()
+                .with_co_change()
+                .with_symbol_topology(),
+        );
     }
     reqs = reqs.union(extras.extra_reqs);
     let ctx = prepare_context_with(reqs, query.pattern, &results, conn, sources, extras.hint);
@@ -2758,6 +2812,23 @@ fn rerank_core(
             }
         })
         .collect();
+    if feedback_pass {
+        // The descriptive `feedback` contribution joins the score BEFORE
+        // the sort — features are rank-independent (no novelty-style
+        // circularity). Best-effort like the slate recording: a failure
+        // warns and leaves the scores untouched.
+        let learned = extras.learned.unwrap();
+        if let Err(e) = crate::learning::apply_feedback_contribution(
+            &mut scored,
+            &ctx,
+            learned,
+            query,
+            conn.unwrap(),
+            feedback_weight,
+        ) {
+            eprintln!("wonk: feedback contribution pass failed: {e:#}");
+        }
+    }
     scored.sort_by(compare_scored);
 
     let novelty_weight = weights.weight("novelty");
@@ -2924,6 +2995,11 @@ pub struct RankSettings {
     /// per-result, statement set) and the ranked search carries its
     /// prepared context for the slate builder.
     pub feedback_capture: bool,
+    /// Learned weights loaded for this search (TASK-102): gated rows
+    /// only, decayed and re-clamped at load. `None` — no feedback store,
+    /// nothing past the gates — leaves the code path bit-identical to
+    /// the feature disabled (PRD-FB-REQ-020).
+    pub learned: Option<crate::learning::LearnedTable>,
 }
 
 impl Default for RankSettings {
@@ -2936,6 +3012,7 @@ impl Default for RankSettings {
             pinned_class: None,
             working_context: None,
             feedback_capture: false,
+            learned: None,
         }
     }
 }
@@ -2977,6 +3054,7 @@ impl RankSettings {
             pinned_class: pinned,
             working_context: None,
             feedback_capture: false,
+            learned: None,
         })
     }
 }
@@ -3026,7 +3104,17 @@ pub fn rank_and_explain_classed(
         let class = settings
             .pinned_class
             .unwrap_or_else(|| classify_query(pattern));
-        let effective = settings.class_multipliers.apply(&settings.weights, class);
+        // Resolve the learned overlay for THIS class (D6) and let gated
+        // signal weights replace the class-multiplied configured default
+        // outright — the deviation bound was computed against the
+        // un-multiplied default (PRD-FB-REQ-010/012).
+        let resolved = settings.learned.as_ref().map(|table| table.resolve(class));
+        let mut effective = settings.class_multipliers.apply(&settings.weights, class);
+        if let Some(resolved) = &resolved {
+            for (name, weight) in &resolved.signals {
+                effective.weights.insert(name.clone(), *weight);
+            }
+        }
         // Feedback capture widens the prepared slices beyond the active
         // signals (TASK-105): the default weight table carries no
         // history/topology signals, and features must not vanish when a
@@ -3054,6 +3142,7 @@ pub fn rank_and_explain_classed(
             ScoreExtras {
                 extra_reqs: widened,
                 hint: settings.working_context.as_deref(),
+                learned: resolved.as_ref(),
             },
         );
         // Score order interleaves categories under any non-kind-only
@@ -3157,7 +3246,8 @@ mod tests {
                 "hub",
                 "authority",
                 "community",
-                "novelty"
+                "novelty",
+                "feedback"
             ]
         );
         assert_eq!(known_signal_names(), names);
@@ -7188,6 +7278,7 @@ proximity, signature, churn, co_change, hub, authority, community",
             pinned_class: None,
             working_context: None,
             feedback_capture: false,
+            learned: None,
         };
 
         let ranked = rank_and_explain_classed(&results, Some(&conn), "handle", &settings);
@@ -7773,5 +7864,206 @@ proximity, signature, churn, co_change, hub, authority, community",
                 .collect::<Vec<_>>()
         };
         assert_eq!(shape(&plain), shape(&hinted));
+    }
+
+    // -- TASK-102: the feedback signal + learned overlay ----------------------
+
+    use crate::learning::{FeedbackEvidence, LearnedTable};
+
+    fn learned_evidence(feature: &str, scope: &str, effective: f32, default: f32) -> FeedbackEvidence {
+        FeedbackEvidence {
+            feature: feature.to_string(),
+            query_class: scope.to_string(),
+            effective,
+            default,
+            observations: 42,
+            sessions: 9,
+            updated_at: 1000,
+            gated: true,
+        }
+    }
+
+    fn learned_of(rows: Vec<FeedbackEvidence>) -> LearnedTable {
+        LearnedTable::from_rows(rows, 1000)
+    }
+
+    /// Flattened (file, line), score BITS, and contribution bits — the
+    /// bit-identity pin's comparison key.
+    fn ranked_bits(ranked: &RankedSearch) -> Vec<(String, u64, u32, Vec<(&'static str, u32, f32, u32)>)> {
+        ranked
+            .groups
+            .iter()
+            .flat_map(|(_, group)| group.iter())
+            .map(|scored| {
+                (
+                    scored.classified.result.file.to_string_lossy().into_owned(),
+                    scored.classified.result.line,
+                    scored.score.to_bits(),
+                    scored
+                        .contributions
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.signal,
+                                c.value.to_bits(),
+                                c.weight,
+                                c.weighted.to_bits(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn feedback_signal_is_registered_and_accepted_by_weights() {
+        assert!(
+            known_signal_names().contains(&"feedback"),
+            "known_signal_names: {:?}",
+            known_signal_names()
+        );
+        WeightTable::from_config(&HashMap::from([
+            ("kind".to_string(), 1.0),
+            ("feedback".to_string(), 0.35),
+        ]))
+        .unwrap();
+    }
+
+    #[test]
+    fn feedback_weight_without_learned_rows_is_bit_identical() {
+        // The default map carries feedback = 0.35; without gated learned
+        // rows it must be INERT: the stub is excluded from the additive
+        // phase and no pass runs (PRD-FB-REQ-020).
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![crate::search::SearchResult {
+            file: std::path::PathBuf::from("src/main.rs"),
+            line: 10,
+            col: 0,
+            content: "fn my_func() {}".to_string(),
+        }];
+        let with = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("feedback", 0.35)]),
+            ..RankSettings::default()
+        };
+        let without = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0)]),
+            ..RankSettings::default()
+        };
+        let a = rank_and_explain_classed(&results, Some(&conn), "my_func", &with);
+        let b = rank_and_explain_classed(&results, Some(&conn), "my_func", &without);
+        assert_eq!(ranked_bits(&a), ranked_bits(&b));
+        assert!(
+            a.groups
+                .iter()
+                .flat_map(|(_, g)| g.iter())
+                .all(|s| s.contributions.iter().all(|c| c.signal != "feedback"))
+        );
+    }
+
+    #[test]
+    fn learned_signal_overlay_replaces_the_class_multiplied_default() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![crate::search::SearchResult {
+            file: std::path::PathBuf::from("src/main.rs"),
+            line: 10,
+            col: 0,
+            content: "fn my_func() {}".to_string(),
+        }];
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("lexical", 0.4), ("path_character", 0.6)]),
+            class_multipliers: ClassMultipliers {
+                symbol: ChannelMultipliers {
+                    lexical: 2.0,
+                    semantic: 1.0,
+                },
+                ..ClassMultipliers::neutral()
+            },
+            learned: Some(learned_of(vec![learned_evidence(
+                "lexical",
+                "",
+                0.3,
+                0.4,
+            )])),
+            ..RankSettings::default()
+        };
+        let ranked = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
+        let flat: Vec<&ScoredResult> = ranked.groups.iter().flat_map(|(_, g)| g.iter()).collect();
+        let lexical = flat[0]
+            .contributions
+            .iter()
+            .find(|c| c.signal == "lexical")
+            .unwrap();
+        assert_eq!(
+            lexical.weight, 0.3,
+            "the learned weight replaces the class-multiplied default outright"
+        );
+        let path_character = flat[0]
+            .contributions
+            .iter()
+            .find(|c| c.signal == "path_character")
+            .unwrap();
+        assert_eq!(path_character.weight, 0.6, "unlearned signals stand");
+    }
+
+    #[test]
+    fn learned_descriptive_keys_feed_the_feedback_signal_and_reorder() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![
+            crate::search::SearchResult {
+                file: std::path::PathBuf::from("src/main.rs"),
+                line: 10,
+                col: 0,
+                content: "fn my_func() {}".to_string(),
+            },
+            crate::search::SearchResult {
+                file: std::path::PathBuf::from("tools/parse.py"),
+                line: 1,
+                col: 0,
+                content: "def my_func():".to_string(),
+            },
+        ];
+        let learned = || {
+            learned_of(vec![learned_evidence("path:tools", "", 0.9, 0.0)])
+        };
+        let live = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("feedback", 0.8)]),
+            learned: Some(learned()),
+            ..RankSettings::default()
+        };
+        let ranked = rank_and_explain_classed(&results, Some(&conn), "my_func", &live);
+        let flat: Vec<&ScoredResult> = ranked.groups.iter().flat_map(|(_, g)| g.iter()).collect();
+        let tools = flat
+            .iter()
+            .find(|s| s.classified.result.file.ends_with("tools/parse.py"))
+            .unwrap();
+        let feedback = tools
+            .contributions
+            .iter()
+            .find(|c| c.signal == "feedback")
+            .expect("the pass appends a feedback row per candidate");
+        assert_eq!(feedback.value, 0.9, "value = clamp(sum of matched keys)");
+        assert_eq!(feedback.weight, 0.8);
+        assert!((feedback.weighted - 0.9 * 0.8).abs() < 1e-6);
+
+        // Zero weight: one-knob full disable — bit-identical to no table.
+        let zero = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("feedback", 0.0)]),
+            learned: Some(learned()),
+            ..RankSettings::default()
+        };
+        let none = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0)]),
+            ..RankSettings::default()
+        };
+        let zeroed = rank_and_explain_classed(&results, Some(&conn), "my_func", &zero);
+        let disabled = rank_and_explain_classed(&results, Some(&conn), "my_func", &none);
+        assert_eq!(ranked_bits(&zeroed), ranked_bits(&disabled));
     }
 }
