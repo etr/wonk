@@ -281,6 +281,39 @@ CREATE TABLE IF NOT EXISTS near_duplicates (
 CREATE INDEX IF NOT EXISTS idx_near_duplicates_b ON near_duplicates(symbol_id_b);
 "#;
 
+// Usage-feedback capture (TASK-101, DR-042). `feedback_events` is the
+// architecture §5.2 DDL verbatim: one row per (feedback call, reported-
+// useful result), the FULL slate serialized into `features` — contrastive
+// credit assignment needs the alternatives the caller passed over
+// (PRD-FB-REQ-002). `feedback_slates` is the TASK-101 capture mechanism
+// (one addition beyond §5.2): the ranked search path persists the slate it
+// is about to show — every result's identity, rank, and feature vector —
+// so the feedback call references what was shown by token and the stored
+// vectors are wonk's own, never caller-echoed. Both tables are written by
+// query-time processes only; the indexer never touches them.
+const FEEDBACK_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS feedback_events (
+    id INTEGER PRIMARY KEY,
+    result_identity TEXT NOT NULL,   -- content-anchored, survives re-index (PRD-FB-REQ-005)
+    query_class TEXT,                -- class at query time; enables per-class learning (PRD-FB-REQ-008)
+    chosen_rank INTEGER NOT NULL,    -- rank of the useful result; rank 1 yields no update (PRD-FB-REQ-009)
+    features TEXT NOT NULL,          -- feature vector for chosen + alternatives (PRD-FB-REQ-002/021)
+    useful INTEGER NOT NULL,         -- 1 today (events exist for reported-useful results); reserved
+    session TEXT,                    -- distinct-session counting (PRD-FB-REQ-015/016)
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_identity ON feedback_events(result_identity);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback_events(created_at);
+
+CREATE TABLE IF NOT EXISTS feedback_slates (
+    token TEXT PRIMARY KEY,          -- 16-hex-char id echoed to the caller
+    query TEXT NOT NULL,
+    query_class TEXT,                -- class AT QUERY TIME (PRD-FB-REQ-008)
+    members TEXT NOT NULL,           -- JSON array of SlateMember
+    created_at INTEGER NOT NULL
+);
+"#;
+
 const TRIGGERS_SQL: &str = r#"
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
     INSERT INTO symbols_fts(rowid, name, kind, file)
@@ -376,6 +409,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         .context("creating topology tables")?;
     conn.execute_batch(DUPLICATES_SQL)
         .context("creating duplicate tables")?;
+    conn.execute_batch(FEEDBACK_SQL)
+        .context("creating feedback tables")?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -462,6 +497,17 @@ pub fn ensure_topology_tables(conn: &Connection) -> Result<()> {
 pub fn ensure_duplicate_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(DUPLICATES_SQL)
         .context("creating duplicate tables (migration)")?;
+    Ok(())
+}
+
+/// Ensure the TASK-101 feedback tables exist (`feedback_events`,
+/// `feedback_slates`).
+///
+/// Handles schema migration for indexes created before feedback capture:
+/// safe to call on databases that already have the tables.
+pub fn ensure_feedback_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(FEEDBACK_SQL)
+        .context("creating feedback tables (migration)")?;
     Ok(())
 }
 
@@ -2119,6 +2165,70 @@ mod tests {
         ensure_duplicate_tables(&conn).unwrap();
         ensure_duplicate_tables(&conn).unwrap();
         assert_eq!(duplicate_table_names(&conn).len(), 2);
+    }
+
+    // -- feedback tables (TASK-101) --------------------------------------------
+
+    fn feedback_table_names(conn: &Connection) -> Vec<String> {
+        let names = "('feedback_events','feedback_slates')";
+        conn.prepare(&format!(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN {names}"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    fn feedback_index_names(conn: &Connection) -> Vec<String> {
+        let names = "('idx_feedback_identity','idx_feedback_created')";
+        conn.prepare(&format!(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN {names}"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    #[test]
+    fn test_open_creates_feedback_tables() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+
+        let mut tables = feedback_table_names(&conn);
+        tables.sort();
+        assert_eq!(tables, vec!["feedback_events", "feedback_slates"]);
+        let mut indexes = feedback_index_names(&conn);
+        indexes.sort();
+        assert_eq!(
+            indexes,
+            vec!["idx_feedback_created", "idx_feedback_identity"]
+        );
+    }
+
+    #[test]
+    fn test_ensure_feedback_tables_on_pre101_db_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        // A pre-TASK-101 index: full schema applied, then both feedback
+        // tables dropped — the shape an old index presents after upgrade.
+        let conn = open(&db_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE feedback_events;
+             DROP TABLE feedback_slates;",
+        )
+        .unwrap();
+        assert!(feedback_table_names(&conn).is_empty());
+
+        // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
+        ensure_feedback_tables(&conn).unwrap();
+        ensure_feedback_tables(&conn).unwrap();
+        assert_eq!(feedback_table_names(&conn).len(), 2);
+        assert_eq!(feedback_index_names(&conn).len(), 2);
     }
 
     #[test]
