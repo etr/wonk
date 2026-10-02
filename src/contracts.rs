@@ -5826,17 +5826,27 @@ fn skip_balanced(s: &str, open: char, close: char) -> Option<&str> {
 
 /// Depth-0 field names of a selection-set body (the text after the opening
 /// `{`). Field arguments, nested selection sets, aliases (`alias: field`
-/// reports `field`), and spreads (`...name`) are skipped.
+/// reports `field`), directives (`@include`), spreads (`...F` and
+/// `... F`), and inline-fragment type conditions (`... on T`) are
+/// skipped.
 fn top_level_fields(body: &str) -> Vec<String> {
     let chars: Vec<char> = body.chars().collect();
     let mut fields = Vec::new();
     let mut depth = 0i32;
     let mut i = 0usize;
+    // The last significant (non-whitespace) character and whether the
+    // previous depth-0 token was the `on` of a spread — together they
+    // recognize tight/spaced spreads, directives, and inline-fragment
+    // type conditions so none of them emit phantom fields (TASK-088
+    // review debt).
+    let mut last_sig = '\0';
+    let mut after_spread_on = false;
     while i < chars.len() {
         let c = chars[i];
         match c {
             '{' => {
                 depth += 1;
+                last_sig = '{';
                 i += 1;
             }
             '}' => {
@@ -5844,6 +5854,7 @@ fn top_level_fields(body: &str) -> Vec<String> {
                 if depth < 0 {
                     break;
                 }
+                last_sig = '}';
                 i += 1;
             }
             '(' => {
@@ -5860,17 +5871,22 @@ fn top_level_fields(body: &str) -> Vec<String> {
                         break;
                     }
                 }
+                last_sig = ')';
             }
             _ if depth == 0 && (c.is_ascii_alphanumeric() || c == '_') => {
                 let start = i;
                 while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                     i += 1;
                 }
-                let is_spread = start > 0 && chars[start - 1] == '.';
-                if is_spread {
+                let name: String = chars[start..i].iter().collect();
+                let spread = last_sig == '.';
+                let directive = last_sig == '@';
+                let type_condition = after_spread_on;
+                after_spread_on = spread && name == "on";
+                last_sig = chars[i - 1];
+                if spread || directive || type_condition {
                     continue;
                 }
-                let name: String = chars[start..i].iter().collect();
                 // Alias? `alias: field` — the next identifier is the field.
                 let mut j = i;
                 while j < chars.len() && chars[j].is_whitespace() {
@@ -5882,6 +5898,9 @@ fn top_level_fields(body: &str) -> Vec<String> {
                 fields.push(name);
             }
             _ => {
+                if !c.is_whitespace() {
+                    last_sig = c;
+                }
                 i += 1;
             }
         }
@@ -10771,6 +10790,53 @@ server.addService(user.UserService.service, { getUser: handler });
     }
 
     #[test]
+    fn graphql_parse_alias_reports_the_field_not_the_alias() {
+        // TASK-088 review debt: the alias skip had zero coverage —
+        // deleting it used to pass the suite silently.
+        let ops = parse_graphql_operation("query { u: user posts }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "user".to_string()),
+                    ("Query".to_string(), "posts".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn graphql_parse_tight_and_spaced_spreads_are_skipped() {
+        let tight = parse_graphql_operation("query Q { ...UserFields posts }");
+        assert_eq!(
+            tight.as_deref(),
+            Some(&[("Query".to_string(), "posts".to_string())][..])
+        );
+        let spaced = parse_graphql_operation("query Q { ... UserFields posts }");
+        assert_eq!(
+            spaced.as_deref(),
+            Some(&[("Query".to_string(), "posts".to_string())][..])
+        );
+    }
+
+    #[test]
+    fn graphql_parse_inline_fragment_and_directives_emit_no_phantoms() {
+        // `... on User` and `@include` used to leak `on`, `User`, and
+        // `include` as phantom depth-0 fields (TASK-088 review debt).
+        let ops =
+            parse_graphql_operation("query Q { ... on User { id } user @include(if: $x) posts }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "user".to_string()),
+                    ("Query".to_string(), "posts".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
     fn graphql_parse_non_operation_rejected() {
         assert!(parse_graphql_operation("SELECT * FROM users").is_none());
         assert!(parse_graphql_operation("").is_none());
@@ -10876,6 +10942,18 @@ const resolvers = {
         assert_eq!(user.role, ContractRole::Consumer);
         assert_eq!(user.line, 2);
         assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_js_gql_fragment_alias_directive_no_phantoms() {
+        // TASK-088 review debt, through extract(): aliases report the
+        // field, spreads and inline fragments and directives emit
+        // nothing.
+        let src = "const Q = gql`query { u: user ...UserFields ... on User { id } posts @include(if: $x) }`;\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "graphql::Query::user").is_some());
+        assert!(find(&cands, "graphql::Query::posts").is_some());
     }
 
     #[test]
