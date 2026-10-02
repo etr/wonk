@@ -1122,7 +1122,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Per-class learning (PRD-FB-REQ-008):** Adjustments are learned per query class as well as overall, which is the same structure DR-038 defines with hand-tuned constants. Feedback lets a repository replace those shipped guesses with its own measurements.
 - **Memorization survives, hard-gated (PRD-FB-REQ-016):** Weight learning cannot express "in this repo, auth questions mean `TokenValidator`" — a genuine loss. A direct per-result preference is therefore retained, but applies only after confirmation across a configured number of *distinct sessions* and is capped below the weight mechanism. Session counting, already required for honest aggregation, becomes the gate.
 - **What this costs, stated plainly:** with feedback enabled, ranking is a function of the index *and* accumulated history. Reproducibility is preserved on demand (PRD-FB-REQ-017), measurement is feedback-free by default so it cannot confirm itself (PRD-FB-REQ-018), and a repository that never reports feedback behaves exactly as today (PRD-FB-REQ-020).
-- **Write path:** query-time processes write to `feedback_events` only; `learned_weights` is updated from those events. The only other query-path write is index-derived, not observed, data: the best-effort `near_duplicates` memo recorded by ranked search (4.33) — recomputable from `symbol_shingles`, never a record of user behavior, and silent on failure.
+- **Write path:** query-time processes write to `feedback_events` only; `learned_weights` is updated from those events. Recent slates are retained in `feedback_slates` (bounded, LRU-pruned, feedback tables only) so the feedback call references what the search actually showed; `[feedback] enabled` opts ranked search into the signal pipeline. The only other query-path write is index-derived, not observed, data: the best-effort `near_duplicates` memo recorded by ranked search (4.33) — recomputable from `symbol_shingles`, never a record of user behavior, and silent on failure.
 
 **Related Requirements:** PRD-FB-REQ-001 through PRD-FB-REQ-029
 
@@ -1308,6 +1308,18 @@ CREATE TABLE IF NOT EXISTS feedback_events (
     created_at INTEGER NOT NULL
 );
 
+-- [V5] TASK-101: the ranked search path persists the slate it is about to show (every
+-- result's identity, rank, and signal-contribution vector), so the feedback call
+-- references what was shown by token and the stored vectors are wonk's own, never
+-- caller-echoed. Bounded by [feedback] slate_retention (LRU-pruned).
+CREATE TABLE IF NOT EXISTS feedback_slates (
+    token TEXT PRIMARY KEY,          -- 16-hex-char id echoed to the caller
+    query TEXT NOT NULL,
+    query_class TEXT,                -- class AT QUERY TIME (PRD-FB-REQ-008)
+    members TEXT NOT NULL,           -- JSON array of SlateMember
+    created_at INTEGER NOT NULL
+);
+
 -- [V5] Learned per-repo signal weights — the entire durable product of feedback (DR-042)
 -- Bounded deviation from defaults, decaying with age, resettable independently of event history.
 CREATE TABLE IF NOT EXISTS learned_weights (
@@ -1355,6 +1367,7 @@ CREATE INDEX idx_feedback_created ON feedback_events(created_at);       -- [V5] 
 - All V5 tables use `CREATE TABLE IF NOT EXISTS` and all V5 columns are added via `ALTER TABLE ... DEFAULT`, so pre-V5 indexes open without migration. Missing V5 data degrades to prior behavior (PRD-BM25-REQ-006, PRD-REACH-REQ-007) rather than erroring.
 - `contracts` is per-repo. Cross-repo links are **not** stored — they are computed by querying sibling repos' `contracts` tables at request time (DR-031), so a sibling re-index can never stale this repo's data.
 - `reach` is the only V5 table with unbounded growth potential; it is capped by `reach.depth` (default 3) plus a per-symbol fan-out cap, and can be disabled entirely (PRD-REACH-REQ-006, AR-020).
+- `feedback_slates` (TASK-101) is bounded capture, not accumulation: one row per enabled ranked search, pruned to `[feedback] slate_retention` (default 64) in the same transaction as the insert, and written only by query-time processes — the indexer never touches it. Entries in `feedback_events` key on a content-anchored identity (recomputed at read time for retirement), so re-indexing preserves them without any migration.
 - `near_duplicates` is a memo, not source data: rows are recorded best-effort by ranked search and the `wonk duplicates` sweep (never by an index-time all-pairs pass), are fully recomputable from `symbol_shingles`, and cascade-clean with symbols. Growth is bounded at 64 rows per duplicate group (strongest pairs first, the max-similarity pair always kept) — linear in duplicate groups, never quadratic in symbols, with typical small groups (fewer pairs than the cap) stored whole.
 
 ### 5.3 Data Flow
