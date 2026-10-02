@@ -368,10 +368,14 @@ impl OllamaProvider {
     /// Quick health check with a shorter timeout (500ms) for status queries.
     ///
     /// Avoids blocking `wonk status` for the full 2-second connect timeout
-    /// when Ollama is unreachable.
+    /// when Ollama is unreachable. The global bound caps the whole probe —
+    /// DNS, connect, and the header read — so a wedged server that accepts
+    /// the connection but never responds is reported unhealthy instead of
+    /// hanging the query-planning path indefinitely.
     pub fn is_healthy_quick(&self) -> bool {
         let quick: Agent = Agent::config_builder()
             .timeout_connect(Some(Duration::from_millis(500)))
+            .timeout_global(Some(Duration::from_millis(500)))
             .http_status_as_error(false)
             .build()
             .into();
@@ -1677,6 +1681,33 @@ mod tests {
         // Port 19999 should have nothing listening.
         let client = OllamaProvider::with_base_url("http://127.0.0.1:19999");
         assert!(!client.is_healthy());
+    }
+
+    #[test]
+    fn quick_health_probe_is_bounded_when_server_stalls() {
+        // A wedged server that accepts the TCP connection but never returns
+        // response headers must not stall the probe: the whole request —
+        // connect, headers — is bounded, not just the connect phase.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    // Hold each connection open without ever responding.
+                    Ok(_stream) => std::thread::sleep(Duration::from_secs(30)),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = OllamaProvider::with_base_url(&format!("http://{addr}"));
+        let start = std::time::Instant::now();
+        assert!(!client.is_healthy_quick());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "probe must be bounded end-to-end, took {:?}",
+            start.elapsed()
+        );
     }
 
     // -- Connection error classification tests --------------------------------
