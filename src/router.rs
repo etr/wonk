@@ -86,6 +86,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     // per file) so `| grep "path/"` filters correctly and `| head -N` limits
     // by file count.  Auto-budget is applied in cli::parse().
     let is_piped = !std::io::IsTerminal::is_terminal(&stdout);
+    // Set when a text-mode search already terminated its output with the
+    // slate line, so the piped-mode final newline below is not doubled.
+    let mut text_slate_written = false;
     let budget_limit = cli.budget;
     let page = cli.page;
     let include_tests = cli.include_tests;
@@ -362,10 +365,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         }
                         // Text mode: one trailing machine-cuttable line
                         // referencing the slate (JSON rows carry the
-                        // reference in their fields instead).
+                        // reference in their fields instead). In
+                        // single-line mode the last collapsed row omits
+                        // its newline, so complete it first.
                         if let Some(slate) = stored_slate.as_ref()
                             && !format.is_structured()
                         {
+                            if fmt.is_single_line() {
+                                writeln!(fmt.writer_mut())?;
+                                text_slate_written = true;
+                            }
                             writeln!(fmt.writer_mut(), "slate: {}", slate.token)?;
                         }
                     }
@@ -2003,7 +2012,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     // trailing newline). Structured formats are exempt: their rows are each
     // newline-terminated already, and appending another would leave a blank
     // line that breaks strict NDJSON consumers.
-    if is_piped && !format.is_structured() {
+    if is_piped && !format.is_structured() && !text_slate_written {
         writeln!(fmt.writer_mut())?;
     }
 

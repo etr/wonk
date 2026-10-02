@@ -1213,6 +1213,11 @@ impl<W: Write> Formatter<W> {
     /// Results from the same file are joined with ` ; `, results from
     /// different files get separate lines. Structured formats ignore this
     /// mode and always emit one newline-terminated line per row.
+    /// Whether single-line (piped grep) emit mode is on.
+    pub fn is_single_line(&self) -> bool {
+        self.single_line
+    }
+
     pub fn set_single_line(&mut self, enabled: bool) {
         self.single_line = enabled;
     }
