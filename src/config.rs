@@ -37,6 +37,7 @@ pub struct Config {
     pub history: HistoryConfig,
     pub topology: TopologyConfig,
     pub duplicate: DuplicateConfig,
+    pub feedback: FeedbackConfig,
 }
 
 /// Daemon-related settings.
@@ -222,6 +223,30 @@ pub struct DuplicateConfig {
 impl Default for DuplicateConfig {
     fn default() -> Self {
         Self { threshold: 0.85 }
+    }
+}
+
+/// Usage-feedback capture (TASK-101, DR-042). `enabled` also opts ranked
+/// search into the signal pipeline (the `--why` implication), because a
+/// legacy-path slate carries no signal contributions to learn from.
+/// Default off: a default-config search writes nothing and behaves
+/// byte-identically (PRD-FB-REQ-020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedbackConfig {
+    /// Kill switch: `false` records no slates and accepts no feedback.
+    pub enabled: bool,
+    /// Most recent slates kept; older are pruned. A zero value is a hard
+    /// load error — no slate could survive for the feedback call to
+    /// reference.
+    pub slate_retention: usize,
+}
+
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            slate_retention: 64,
+        }
     }
 }
 
@@ -428,6 +453,7 @@ struct ConfigOverlay {
     history: Option<HistoryOverlay>,
     topology: Option<TopologyOverlay>,
     duplicate: Option<DuplicateOverlay>,
+    feedback: Option<FeedbackOverlay>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -506,6 +532,13 @@ struct TopologyOverlay {
 #[serde(default)]
 struct DuplicateOverlay {
     threshold: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct FeedbackOverlay {
+    enabled: Option<bool>,
+    slate_retention: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -764,6 +797,20 @@ impl Config {
                 anyhow::bail!(
                     "[duplicate] threshold must be finite and in (0, 1] (got {t}): \
                      zero flags everything, above one flags nothing"
+                );
+            }
+        }
+        if let Some(feedback) = overlay.feedback {
+            if let Some(v) = feedback.enabled {
+                self.feedback.enabled = v;
+            }
+            if let Some(v) = feedback.slate_retention {
+                self.feedback.slate_retention = v;
+            }
+            if self.feedback.slate_retention == 0 {
+                anyhow::bail!(
+                    "[feedback] slate_retention must be >= 1 (got 0): no slate could \
+                     survive for the feedback call to reference"
                 );
             }
         }
@@ -1358,6 +1405,68 @@ threshold = 1.0
 "#,
         );
         assert_eq!(env.load().unwrap().duplicate.threshold, 1.0);
+    }
+
+    // -- [feedback] (TASK-101) -------------------------------------------------
+
+    #[test]
+    fn feedback_defaults_off_with_retention_64() {
+        assert_eq!(
+            Config::default().feedback,
+            FeedbackConfig {
+                enabled: false,
+                slate_retention: 64
+            }
+        );
+        let mut env = TestEnv::new();
+        env.create_repo();
+        let config = env.load().unwrap();
+        assert_eq!(
+            config.feedback,
+            FeedbackConfig {
+                enabled: false,
+                slate_retention: 64
+            }
+        );
+    }
+
+    #[test]
+    fn feedback_enabled_and_retention_parsed() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[feedback]
+enabled = true
+slate_retention = 8
+"#,
+        );
+        let config = env.load().unwrap();
+        assert_eq!(
+            config.feedback,
+            FeedbackConfig {
+                enabled: true,
+                slate_retention: 8
+            }
+        );
+    }
+
+    #[test]
+    fn feedback_zero_retention_rejected() {
+        let mut env = TestEnv::new();
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[feedback]
+enabled = true
+slate_retention = 0
+"#,
+        );
+        let err = env.load().unwrap_err().to_string();
+        assert!(
+            err.contains("[feedback] slate_retention must be >= 1"),
+            "error names the offending key: {err}"
+        );
     }
 
     #[test]
