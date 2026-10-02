@@ -1299,7 +1299,12 @@ impl<'a> Extractor<'a> {
     /// the enclosing function; BullMQ-style queue adds are 0.5 consumers
     /// (generic `add` verb).
     fn js_job_call(&mut self, node: Node, recv: &str, prop: &str, args: Node) {
-        let recv_lower = recv.to_lowercase();
+        // The lowercase receiver is needed only by the three job verbs;
+        // every other member call (.map/.then/.push/…) falls through here
+        // and must not pay the allocation (TASK-087 review debt).
+        let recv_lower = matches!(prop, "schedule" | "define" | "add")
+            .then(|| recv.to_lowercase())
+            .unwrap_or_default();
         let first = positional_arg(args, 0);
         match prop {
             "schedule" if recv == "cron" || recv_lower.contains("cron") => {
@@ -2954,8 +2959,12 @@ impl<'a> Extractor<'a> {
             return;
         }
         // Queue template producers (DR-031: publishing initiates, so these
-        // are the consumer side).
-        let object_lower = object.to_lowercase();
+        // are the consumer side). The lowercase is computed only behind the
+        // name gate — nearly every member call falls through here (TASK-087
+        // review debt).
+        let object_lower = matches!(name, "send" | "convertAndSend")
+            .then(|| object.to_lowercase())
+            .unwrap_or_default();
         if object_lower.contains("kafka") && name == "send" {
             if let Some(t) = first
                 && let Some(raw) = self.topic_arg(t)
@@ -4574,7 +4583,9 @@ fn template_content(node: Node, src: &[u8]) -> String {
 /// the caller.
 fn concat_literal(node: Node, src: &[u8], lang: Lang, leaf_kinds: &[&str]) -> Option<PathArg> {
     let mut literals = Vec::new();
-    collect_string_leaves(node, src, lang, leaf_kinds, &mut literals);
+    if !collect_string_leaves(node, src, lang, leaf_kinds, &mut literals, 0) {
+        return None;
+    }
     if literals.len() == 1 && is_path_like(&literals[0]) {
         Some(PathArg::Concat(literals.into_iter().next()?))
     } else {
@@ -4582,24 +4593,40 @@ fn concat_literal(node: Node, src: &[u8], lang: Lang, leaf_kinds: &[&str]) -> Op
     }
 }
 
+/// Deepest concatenation chain we will walk. A left-nested chain of ~10k
+/// terms (bundled/minified JS, well under 100KB) overflows the thread
+/// stack one frame per binary-expression level, so the walk is bounded
+/// (TASK-087 review debt, PRD-CTR threat model).
+const MAX_CONCAT_DEPTH: u32 = 256;
+
+/// Collect the string literals of a concatenation tree. Returns false
+/// when the depth cap tripped — the leaf set is then partial, so the
+/// caller must treat the literal as unresolvable rather than act on it.
 fn collect_string_leaves(
     node: Node,
     src: &[u8],
     lang: Lang,
     leaf_kinds: &[&str],
     out: &mut Vec<String>,
-) {
+    depth: u32,
+) -> bool {
+    if depth > MAX_CONCAT_DEPTH {
+        return false;
+    }
     if leaf_kinds.contains(&node.kind()) {
         out.push(render_string_node(node, src, lang));
-        return;
+        return true;
     }
     if node.kind().starts_with("binary") {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                collect_string_leaves(child, src, lang, leaf_kinds, out);
+            if let Some(child) = node.child(i as u32)
+                && !collect_string_leaves(child, src, lang, leaf_kinds, out, depth + 1)
+            {
+                return false;
             }
         }
     }
+    true
 }
 
 /// Render any language's string node to its content. Content children are
@@ -9147,6 +9174,22 @@ void cfg(void) {
     fn concat_multiple_literals_skipped() {
         let src = "const r = await fetch('/api/' + id + '/users');\n";
         let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 0, "got {cands:?}");
+    }
+
+    #[test]
+    fn concat_adversarial_depth_is_bounded_not_crashing() {
+        // TASK-087 review debt: a left-nested ~10k-term concat chain
+        // (bundled/minified JS) used to overflow the thread stack one
+        // frame per binary-expression level. The capped walk must return
+        // no candidates, not crash, and never act on a partial leaf set.
+        let mut src = String::from("const r = await fetch(");
+        src.push_str("'/users'");
+        for i in 0..10_000 {
+            src.push_str(&format!(" + seg{i}"));
+        }
+        src.push_str(");\n");
+        let cands = extract(Lang::JavaScript, &src);
         assert_eq!(cands.len(), 0, "got {cands:?}");
     }
 
