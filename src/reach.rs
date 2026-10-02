@@ -521,15 +521,9 @@ pub(crate) fn finish_file_edit(
 
     // The table self-describes: repair runs at the recorded built depth
     // under the default fan-out cap. No config plumbing.
-    let built: usize = tx
-        .query_row(
-            "SELECT value FROM reach_meta WHERE key = ?1",
-            rusqlite::params![META_BUILT_DEPTH],
-            |row| row.get::<_, String>(0),
-        )
-        .context("reading built_depth for repair")?
-        .parse()
-        .context("parsing built_depth for repair")?;
+    let built = read_reach_meta(tx)?
+        .built
+        .context("reading built_depth for repair")?;
     let opts = ReachBuildOptions {
         depth: built,
         max_targets: DEFAULT_MAX_TARGETS_PER_SOURCE,
@@ -577,16 +571,29 @@ pub(crate) fn finish_file_edit(
     })
 }
 
-/// Whether the reach table can be incrementally repaired: present, built
-/// (numeric `built_depth`), and not stale.
-fn table_fresh(conn: &Connection) -> Result<bool> {
+/// What the reach meta says, read once: the parsed `built_depth` and the
+/// stale marker (a missing table is `built: None`, never an error). The
+/// freshness verdict — "incrementally repairable / answerable" — is
+/// `built.is_some() && !stale`, shared verbatim by the repair side
+/// (table_fresh, finish_file_edit) and the lookup side
+/// (lookup_upstream_impl), which previously hand-rolled three variants
+/// of the same subtle sequence (TASK-081 review debt).
+struct ReachMeta {
+    built: Option<usize>,
+    stale: bool,
+}
+
+fn read_reach_meta(conn: &Connection) -> Result<ReachMeta> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reach'",
         [],
         |row| row.get(0),
     )?;
     if exists == 0 {
-        return Ok(false);
+        return Ok(ReachMeta {
+            built: None,
+            stale: false,
+        });
     }
     let built: Option<String> = conn
         .query_row(
@@ -595,15 +602,23 @@ fn table_fresh(conn: &Connection) -> Result<bool> {
             |row| row.get(0),
         )
         .ok();
-    if built.and_then(|v| v.parse::<usize>().ok()).is_none() {
-        return Ok(false);
-    }
+    let built = built.and_then(|v| v.parse::<usize>().ok());
     let stale: i64 = conn.query_row(
         "SELECT COUNT(*) FROM reach_meta WHERE key = ?1",
         rusqlite::params![META_STALE],
         |row| row.get(0),
     )?;
-    Ok(stale == 0)
+    Ok(ReachMeta {
+        built,
+        stale: stale > 0,
+    })
+}
+
+/// Whether the reach table can be incrementally repaired: present, built
+/// (numeric `built_depth`), and not stale.
+fn table_fresh(conn: &Connection) -> Result<bool> {
+    let meta = read_reach_meta(conn)?;
+    Ok(meta.built.is_some() && !meta.stale)
 }
 
 /// Names whose candidate lists or symbol sets a file edit can change: the
@@ -1158,35 +1173,17 @@ pub(crate) fn lookup_upstream_impl(
     symbol: &str,
     depth: usize,
 ) -> Result<Option<ReachAnswer>> {
-    // Pre-V5 index: no reach tables at all — nothing to answer from.
-    let table_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reach'",
-        [],
-        |row| row.get(0),
-    )?;
-    if table_exists == 0 {
-        return Ok(None);
-    }
-
-    let built: Option<String> = conn
-        .query_row(
-            "SELECT value FROM reach_meta WHERE key = ?1",
-            rusqlite::params![META_BUILT_DEPTH],
-            |row| row.get(0),
-        )
-        .ok();
-    let Some(built) = built.and_then(|v| v.parse::<usize>().ok()) else {
+    // Pre-V5 index or not-yet-built/stale table: nothing to answer from
+    // (the shared freshness core; the depth sufficiency check is this
+    // call site's own).
+    let meta = read_reach_meta(conn)?;
+    let Some(built) = meta.built else {
         return Ok(None);
     };
     if built < depth {
         return Ok(None);
     }
-    let stale: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM reach_meta WHERE key = ?1",
-        rusqlite::params![META_STALE],
-        |row| row.get(0),
-    )?;
-    if stale > 0 {
+    if meta.stale {
         return Ok(None);
     }
 
