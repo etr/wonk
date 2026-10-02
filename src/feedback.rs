@@ -266,6 +266,12 @@ const SQL_VAR_LIMIT: usize = 500;
 // - churn (age-weighted commit count): 0 = untouched, 3 = occasional,
 //   10 = hotbed; co-change mirrors the churn scale.
 // - depth: 2 ancestor dirs keeps shallow utility code out of deep trees.
+// - hub/authority: quartiles of the candidate-set-relative score (the
+//   `topology_value` normalization). HITS masses are L1-normalized over
+//   the WHOLE graph, so their absolute magnitude shrinks as the repo
+//   grows — the ratio against the candidate set's max is the scale-free
+//   quantity the topology signal itself scores, and bucketing it lets
+//   learning generalize across nearby graph positions.
 const BODY_SIZE_TINY_BELOW: i64 = 8;
 const BODY_SIZE_SMALL_BELOW: i64 = 30;
 const BODY_SIZE_MEDIUM_BELOW: i64 = 100;
@@ -281,6 +287,9 @@ const RECENCY_MONTHS_BELOW: i64 = 365 * 24 * 3600;
 const CHURN_LOW_BELOW: f32 = 3.0;
 const CHURN_MEDIUM_BELOW: f32 = 10.0;
 const IMPORT_DISTANCE_TRANSITIVE_MAX: i64 = 3;
+const SCORE_LOW_BELOW: f32 = 0.25;
+const SCORE_MEDIUM_BELOW: f32 = 0.5;
+const SCORE_HIGH_BELOW: f32 = 0.75;
 
 /// Per-slate cap on distinct values of any one categorical feature
 /// (PRD-FB-REQ-024): beyond it the remaining values collapse into the
@@ -317,6 +326,23 @@ fn fan_bucket(degree: u32) -> &'static str {
         "medium"
     } else {
         "high"
+    }
+}
+
+/// Hub/authority bucket over the candidate-set-relative score (the
+/// [`crate::rerank::topology_value`] normalization): `zero` (=0) / `low`
+/// (<0.25) / `medium` (<0.5) / `high` (<0.75) / `top` (>=0.75).
+fn score_bucket(relative: f32) -> &'static str {
+    if relative <= 0.0 {
+        "zero"
+    } else if relative < SCORE_LOW_BELOW {
+        "low"
+    } else if relative < SCORE_MEDIUM_BELOW {
+        "medium"
+    } else if relative < SCORE_HIGH_BELOW {
+        "high"
+    } else {
+        "top"
     }
 }
 
@@ -533,17 +559,40 @@ fn extract_groups(
 
     // -- graph ----------------------------------------------------------------
     // Position-keyed through the dual-keyed context: the canonical file is
-    // always present as a key.
-    if let (Some(fan_in), Some(fan_out)) = (
-        ctx.fan_in_at(canonical, result.line),
-        ctx.fan_out_at(canonical, result.line),
-    ) {
-        groups
-            .graph
-            .insert("fan_in".to_string(), fan_bucket(fan_in).to_string());
-        groups
-            .graph
-            .insert("fan_out".to_string(), fan_bucket(fan_out).to_string());
+    // always present as a key. Hub and authority bucket the candidate-
+    // set-relative score (see `score_bucket`); the community is recorded
+    // as its raw identity — a capped categorical (PRD-FB-REQ-024), never
+    // a bucketed continuous. Fan degrees are per-feature absent on
+    // pre-TASK-105 topology rows (NULL columns), not defaulted.
+    if let Some((hub, authority)) = ctx.topology_scores(canonical, result.line) {
+        groups.graph.insert(
+            "hub".to_string(),
+            score_bucket(crate::rerank::topology_value(hub, ctx.max_hub())).to_string(),
+        );
+        groups.graph.insert(
+            "authority".to_string(),
+            score_bucket(crate::rerank::topology_value(
+                authority,
+                ctx.max_authority(),
+            ))
+            .to_string(),
+        );
+        if let (Some(fan_in), Some(fan_out)) = (
+            ctx.fan_in_at(canonical, result.line),
+            ctx.fan_out_at(canonical, result.line),
+        ) {
+            groups
+                .graph
+                .insert("fan_in".to_string(), fan_bucket(fan_in).to_string());
+            groups
+                .graph
+                .insert("fan_out".to_string(), fan_bucket(fan_out).to_string());
+        }
+        if let Some(community) = ctx.community_at(canonical, result.line) {
+            groups
+                .graph
+                .insert("community".to_string(), community.to_string());
+        }
     }
 
     // -- history (whole group omitted without mined history) ------------------
@@ -782,6 +831,21 @@ fn apply_cardinality_cap(groups: &mut [FeatureGroups]) {
     }
 }
 
+/// The canonical repo-relative key of a result path as the search
+/// produced it: the prepare's resolution (identity for CLI-shaped
+/// repo-relative paths, the D6 mapping for absolute MCP paths), falling
+/// back to the raw string stripped of a leading `./` when no context was
+/// prepared. Feature names and the symbol bulk-load both key on this, so
+/// the same result lands on identical features whichever surface produced
+/// it — and the bulk load's exact `IN` pass hits.
+fn canonical_of(ranked: &crate::rerank::RankedSearch, as_seen: &std::path::Path) -> String {
+    let raw = as_seen.to_string_lossy();
+    match ranked.context.canonical_file(&raw) {
+        Some(canonical) => canonical.to_string(),
+        None => raw.strip_prefix("./").unwrap_or(&raw).to_string(),
+    }
+}
+
 /// Build the slate members for a ranked search: flattened display order,
 /// each member identity-anchored on its owning symbol's DB row (or the
 /// matched line when no symbol owns it), carrying the retained signal
@@ -798,10 +862,15 @@ fn build_members(
 ) -> Result<Vec<SlateMember>> {
     let flat: Vec<&crate::rerank::ScoredResult> =
         ranked.groups.iter().flat_map(|(_, g)| g.iter()).collect();
+    // Canonical keys BEFORE the bulk load: the prepare already resolved
+    // every result path (absolute MCP paths included) to its repo-relative
+    // `files.path`, so the exact `symbols IN` pass hits for every shape
+    // and the per-file suffix fallback stays reserved for paths the index
+    // genuinely cannot resolve.
     let files: Vec<String> = {
         let mut seen = std::collections::BTreeSet::new();
         for item in &flat {
-            seen.insert(item.classified.result.file.to_string_lossy().into_owned());
+            seen.insert(canonical_of(ranked, &item.classified.result.file));
         }
         seen.into_iter().collect()
     };
@@ -817,8 +886,9 @@ fn build_members(
     for (idx, item) in flat.iter().enumerate() {
         let result = &item.classified.result;
         let file = result.file.to_string_lossy().into_owned();
-        let rows = symbols.get(&file).map(Vec::as_slice).unwrap_or(&[]);
-        let (identity, symbol, kind, canonical) = match owning_symbol(rows, result.line) {
+        let canonical = canonical_of(ranked, &result.file);
+        let rows = symbols.get(&canonical).map(Vec::as_slice).unwrap_or(&[]);
+        let (identity, symbol, kind) = match owning_symbol(rows, result.line) {
             Some(sym) => (
                 // Anchor on the DB-stored repo-relative path: re-indexing
                 // re-inserts the same row, wherever the repo is checked out.
@@ -830,29 +900,19 @@ fn build_members(
                 ),
                 Some(sym.name.clone()),
                 Some(sym.kind.clone()),
-                sym.file.clone(),
             ),
-            None => {
-                // Line-anchored: the canonical key the prepare resolved,
-                // falling back to the raw string stripped of a leading
-                // `./` — feature names must be identical for the same
-                // result whether it arrived over CLI or MCP.
-                let canonical = ranked
-                    .context
-                    .canonical_file(&file)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| file.strip_prefix("./").unwrap_or(&file).to_string());
-                (
-                    line_identity(
-                        &canonical,
-                        &item.classified.category.to_string(),
-                        &result.content,
-                    ),
-                    None,
-                    None,
-                    canonical,
-                )
-            }
+            None => (
+                // Line-anchored: identity and feature names key on the
+                // canonical path, so the same result lands on identical
+                // features whether it arrived over CLI or MCP.
+                line_identity(
+                    &canonical,
+                    &item.classified.category.to_string(),
+                    &result.content,
+                ),
+                None,
+                None,
+            ),
         };
         extracted.push(extract_groups(
             item,
@@ -2178,6 +2238,20 @@ mod tests {
         ] {
             assert_eq!(fan_bucket(degree), label);
         }
+        // Hub/authority quartiles over the candidate-set-relative score.
+        for (relative, label) in [
+            (0.0f32, "zero"),
+            (0.1, "low"),
+            (0.24, "low"),
+            (0.25, "medium"),
+            (0.49, "medium"),
+            (0.5, "high"),
+            (0.74, "high"),
+            (0.75, "top"),
+            (1.0, "top"),
+        ] {
+            assert_eq!(score_bucket(relative), label, "relative {relative}");
+        }
         for (ancestors, label) in [
             (0usize, "shallow"),
             (2, "shallow"),
@@ -2300,7 +2374,9 @@ mod tests {
             Some("Bob")
         );
 
-        // No raw number appears anywhere in the labeled groups.
+        // No raw number appears anywhere in the labeled groups — except
+        // `community`, a capped categorical IDENTITY (PRD-FB-REQ-024),
+        // which is supposed to range over ids, not bucket a continuous.
         for member in &members {
             for (name, value) in member
                 .groups
@@ -2308,6 +2384,9 @@ mod tests {
                 .iter()
                 .chain(member.groups.graph.iter())
             {
+                if name == "community" {
+                    continue;
+                }
                 assert!(
                     !value.chars().any(|c| c.is_ascii_digit()),
                     "{name} leaked a raw value: {value}"
@@ -2367,6 +2446,377 @@ mod tests {
         drop(dir);
     }
 
+    /// A topology fixture with DISTINCT hub/authority/community per file,
+    /// so every graph label is observable: issue.rs carries the set's max
+    /// hub (0.8) and a negligible authority (0.08 of max 0.4);
+    /// deep_helpers.rs the reverse (0.16 of 0.8 hub, the max authority).
+    fn graph_conn() -> (TempDir, Connection) {
+        let (dir, conn) = seeded_conn(&[
+            (
+                "src/auth/tokens/issue.rs",
+                "pub fn issue_token(user: &User) -> Token {\n    Token::sign(user.secret())\n}\n",
+            ),
+            (
+                "src/auth/tokens/deep_helpers.rs",
+                "pub fn helper_a() -> u32 {\n    1\n}\n\npub fn helper_b() -> u32 {\n    helper_a()\n}\n",
+            ),
+        ]);
+        conn.execute("DELETE FROM symbol_topology", []).unwrap();
+        for (file, hub, authority, community, fan_in, fan_out) in [
+            (
+                "src/auth/tokens/issue.rs",
+                0.8f64,
+                0.08f64,
+                5i64,
+                21i64,
+                0i64,
+            ),
+            ("src/auth/tokens/deep_helpers.rs", 0.16, 0.4, 9, 4, 1),
+        ] {
+            conn.execute(
+                "INSERT OR IGNORE INTO symbol_topology \
+                 (symbol_id, hub, authority, community, fan_in, fan_out) \
+                 SELECT id, ?2, ?3, ?4, ?5, ?6 FROM symbols WHERE file = ?1",
+                rusqlite::params![file, hub, authority, community, fan_in, fan_out],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    #[test]
+    fn graph_labels_cover_hub_authority_buckets_and_community() {
+        let (dir, conn) = graph_conn();
+        let ranked = descriptive_ranked(
+            &conn,
+            vec![
+                (
+                    "src/auth/tokens/issue.rs".to_string(),
+                    1,
+                    "pub fn issue_token(user: &User) -> Token {".to_string(),
+                    0.9,
+                ),
+                (
+                    "src/auth/tokens/deep_helpers.rs".to_string(),
+                    1,
+                    "pub fn helper_a() -> u32 {".to_string(),
+                    0.8,
+                ),
+            ],
+            "issue_token",
+        );
+        let token = build_and_store_slate(&conn, "issue_token", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let members = stored_members(&conn, &token);
+        let issue = &members
+            .iter()
+            .find(|m| m.file.ends_with("issue.rs"))
+            .unwrap()
+            .groups;
+        // issue.rs: hub 0.8 of max 0.8 -> top; authority 0.08 of max 0.4
+        // (ratio 0.2) -> low; community identity recorded verbatim.
+        assert_eq!(issue.graph.get("hub").map(String::as_str), Some("top"));
+        assert_eq!(
+            issue.graph.get("authority").map(String::as_str),
+            Some("low")
+        );
+        assert_eq!(issue.graph.get("community").map(String::as_str), Some("5"));
+        assert_eq!(issue.graph.get("fan_in").map(String::as_str), Some("high"));
+        assert_eq!(issue.graph.get("fan_out").map(String::as_str), Some("zero"));
+
+        let helper = &members
+            .iter()
+            .find(|m| m.file.ends_with("deep_helpers.rs"))
+            .unwrap()
+            .groups;
+        // deep_helpers.rs: hub 0.16 of max 0.8 (ratio 0.2) -> low;
+        // authority 0.4 of max 0.4 -> top; community 9.
+        assert_eq!(helper.graph.get("hub").map(String::as_str), Some("low"));
+        assert_eq!(
+            helper.graph.get("authority").map(String::as_str),
+            Some("top")
+        );
+        assert_eq!(helper.graph.get("community").map(String::as_str), Some("9"));
+        assert_eq!(helper.graph.get("fan_in").map(String::as_str), Some("low"));
+        assert_eq!(helper.graph.get("fan_out").map(String::as_str), Some("low"));
+
+        // A pre-degrees topology row (NULL fan columns, the pre-TASK-105
+        // migration shape): hub/authority/community still record; the fan
+        // keys are absent per-feature, not defaulted.
+        conn.execute(
+            "UPDATE symbol_topology SET fan_in = NULL, fan_out = NULL",
+            [],
+        )
+        .unwrap();
+        let ranked = descriptive_ranked(
+            &conn,
+            vec![(
+                "src/auth/tokens/issue.rs".to_string(),
+                1,
+                "pub fn issue_token(user: &User) -> Token {".to_string(),
+                0.9,
+            )],
+            "issue_token",
+        );
+        let token = build_and_store_slate(&conn, "issue_token", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let graph = &stored_members(&conn, &token)[0].groups.graph;
+        assert_eq!(graph.get("hub").map(String::as_str), Some("top"));
+        assert_eq!(graph.get("community").map(String::as_str), Some("5"));
+        assert!(
+            !graph.contains_key("fan_in"),
+            "absent, not defaulted: {graph:?}"
+        );
+        assert!(!graph.contains_key("fan_out"), "{graph:?}");
+        drop(dir);
+    }
+
+    #[test]
+    fn community_identity_flows_through_the_cardinality_cap() {
+        // 40 files under 40 distinct directories, 40 distinct communities
+        // (one member each, all tied): the cap keeps the 32
+        // lexicographically smallest ids and collapses the rest into the
+        // shared overflow label — community is a capped categorical
+        // (PRD-FB-REQ-024), not a bucketed continuous.
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let mut hits = Vec::new();
+        for i in 0..40 {
+            let file = format!("gen{i:02}/mod_file.rs");
+            std::fs::create_dir_all(dir.path().join(&file).parent().unwrap()).unwrap();
+            std::fs::write(
+                dir.path().join(&file),
+                format!("pub fn generated_{i}() -> u32 {{ {i} }}\n"),
+            )
+            .unwrap();
+            hits.push((
+                file,
+                1u64,
+                format!("pub fn generated_{i}() -> u32 {{ {i} }}"),
+                0.5f32,
+            ));
+        }
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+        conn.execute("DELETE FROM symbol_topology", []).unwrap();
+        for i in 0..40 {
+            // Zero-padded 3-char ids: lexicographic order == numeric order,
+            // so the kept 32 under all-tied counts are exactly 100..=131.
+            conn.execute(
+                "INSERT OR IGNORE INTO symbol_topology \
+                 (symbol_id, hub, authority, community, fan_in, fan_out) \
+                 SELECT id, 0.1, 0.1, ?2, 1, 1 FROM symbols \
+                 WHERE file = ?1",
+                rusqlite::params![format!("gen{i:02}/mod_file.rs"), 100 + i],
+            )
+            .unwrap();
+        }
+        let ranked = descriptive_ranked(&conn, hits, "generated");
+        let token = build_and_store_slate(&conn, "generated", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let mut members = stored_members(&conn, &token);
+        members.sort_by_key(|m| m.file.clone());
+        assert_eq!(members.len(), 40);
+        for (i, member) in members.iter().enumerate() {
+            let expected = if i < CATEGORICAL_CAP {
+                (100 + i).to_string()
+            } else {
+                OVERFLOW_LABEL.to_string()
+            };
+            assert_eq!(
+                member.groups.graph.get("community").map(String::as_str),
+                Some(expected.as_str()),
+                "file {}: {:?}",
+                member.file,
+                member.groups.graph
+            );
+        }
+        drop(dir);
+    }
+
+    #[test]
+    fn symbol_labels_pin_name_match_scoped_and_kind() {
+        let (dir, conn) = seeded_conn(&[
+            ("nested.rs", NESTED_SRC),
+            (
+                "vault.rs",
+                "pub struct Vault {\n    secret: u32,\n}\n\nimpl Vault {\n    pub fn vault_seal(&self) -> u32 {\n        self.secret\n    }\n}\n",
+            ),
+        ]);
+        // nested.rs line 1 sits in the top-level outer_guard (name ==
+        // query); vault.rs line 6 sits in vault_seal, an impl-block method
+        // (scope "Vault", name neither equal to nor containing the query).
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![
+                ("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9),
+                ("vault.rs", 6, "    pub fn vault_seal(&self) -> u32 {", 0.8),
+            ],
+        )]);
+        let token = build_and_store_slate(&conn, "outer_guard", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let members = stored_members(&conn, &token);
+        let outer = &members
+            .iter()
+            .find(|m| m.file == "nested.rs")
+            .expect("the top-level member")
+            .groups;
+        assert_eq!(
+            outer.symbol.get("name_match").map(String::as_str),
+            Some("exact"),
+            "{outer:?}"
+        );
+        assert_eq!(
+            outer.symbol.get("scoped").map(String::as_str),
+            Some("top_level"),
+            "{outer:?}"
+        );
+        assert_eq!(
+            outer.symbol.get("kind").map(String::as_str),
+            Some("function")
+        );
+        let method = &members
+            .iter()
+            .find(|m| m.file == "vault.rs")
+            .expect("the impl-method member")
+            .groups;
+        assert_eq!(
+            method.symbol.get("name_match").map(String::as_str),
+            Some("other"),
+            "{method:?}"
+        );
+        assert_eq!(
+            method.symbol.get("scoped").map(String::as_str),
+            Some("nested"),
+            "{method:?}"
+        );
+
+        // A partial-name query lands on substring, not exact.
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+        )]);
+        let token = build_and_store_slate(&conn, "guard", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let symbol = &stored_members(&conn, &token)[0].groups.symbol;
+        assert_eq!(
+            symbol.get("name_match").map(String::as_str),
+            Some("substring")
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn match_labels_pin_category_term_coverage_and_anchoring() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        // One 3-term query, three members covering the coverage classes:
+        // all three terms in the line, one of three, none. The owning
+        // symbols (outer_guard, helper_inner) contain none of the terms,
+        // so coverage reads purely off the matched lines.
+        let ranked = ranked_search(vec![
+            (
+                crate::ranker::ResultCategory::Definition,
+                vec![("nested.rs", 1, "alpha beta gamma all present", 0.9)],
+            ),
+            (
+                crate::ranker::ResultCategory::Other,
+                vec![("nested.rs", 3, "alpha alone here", 0.8)],
+            ),
+            (
+                crate::ranker::ResultCategory::Comment,
+                vec![("nested.rs", 99, "// nothing matches the query", 0.5)],
+            ),
+        ]);
+        let token = build_and_store_slate(&conn, "alpha beta gamma", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let members = stored_members(&conn, &token);
+
+        let full = &members.iter().find(|m| m.line == 1).unwrap().groups;
+        assert_eq!(
+            full.match_.get("category").map(String::as_str),
+            Some("definition"),
+            "{full:?}"
+        );
+        assert_eq!(
+            full.match_.get("term_coverage").map(String::as_str),
+            Some("all"),
+            "{full:?}"
+        );
+        assert_eq!(
+            full.match_.get("anchored").map(String::as_str),
+            Some("symbol"),
+            "{full:?}"
+        );
+
+        let partial = &members.iter().find(|m| m.line == 3).unwrap().groups;
+        assert_eq!(
+            partial.match_.get("category").map(String::as_str),
+            Some("other"),
+            "{partial:?}"
+        );
+        assert_eq!(
+            partial.match_.get("term_coverage").map(String::as_str),
+            Some("some"),
+            "1 of 3 terms is some, not most: {partial:?}"
+        );
+        assert_eq!(
+            partial.match_.get("anchored").map(String::as_str),
+            Some("symbol"),
+            "{partial:?}"
+        );
+
+        // Line 99: no owning symbol — line-anchored, nothing covered.
+        let none = &members.iter().find(|m| m.line == 99).unwrap().groups;
+        assert_eq!(
+            none.match_.get("category").map(String::as_str),
+            Some("comment"),
+            "{none:?}"
+        );
+        assert_eq!(
+            none.match_.get("term_coverage").map(String::as_str),
+            Some("none"),
+            "{none:?}"
+        );
+        assert_eq!(
+            none.match_.get("anchored").map(String::as_str),
+            Some("line"),
+            "{none:?}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn path_lang_records_verbatim_non_rust_language() {
+        let (dir, conn) = seeded_conn(&[(
+            "tools/parse.py",
+            "def load_session_token(path):\n    return path.read().strip()\n",
+        )]);
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![("tools/parse.py", 1, "def load_session_token(path):", 0.9)],
+        )]);
+        let token = build_and_store_slate(&conn, "load_session_token", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let member = &stored_members(&conn, &token)[0];
+        assert_eq!(
+            member.groups.path.get("lang").map(String::as_str),
+            Some("Python"),
+            "the symbol's language, verbatim — not folded to Rust: {:?}",
+            member.groups.path
+        );
+        assert_eq!(
+            member.groups.symbol.get("name_match").map(String::as_str),
+            Some("exact"),
+            "exactness is language-independent"
+        );
+        drop(dir);
+    }
+
     #[test]
     fn old_shape_feature_groups_json_still_deserializes() {
         let raw = r#"{"signals":[{"signal":"kind","value":1.0,"weight":1.0,"weighted":1.0}]}"#;
@@ -2380,23 +2830,22 @@ mod tests {
         assert_eq!(groups, back);
     }
 
-    #[test]
-    fn overflow_cap_collapses_beyond_32_distinct_values() {
-        let (dir, conn) = seeded_conn(&[
-            ("nested.rs", NESTED_SRC),
-            (
-                "src/auth/tokens/issue.rs",
-                "pub fn issue_token(user: &User) -> Token {\n    Token::sign(user.secret())\n}\n",
-            ),
-        ]);
-        // 40 files under 40 distinct directories, 40 distinct authors.
-        let mut hits = vec![(
-            "nested.rs".to_string(),
-            1u64,
-            "pub fn outer_guard(a: u32) -> u32 {".to_string(),
-            0.9f32,
-        )];
-        for i in 0..40 {
+    /// The cardinality-cap fixture: `n` single-line files under `n`
+    /// distinct directories, indexed with the real pipeline, one churn
+    /// row per file whose (last and primary) author is `author(i)`, and a
+    /// stored slate over one hit per file. Members come back sorted by
+    /// file — the zero-padded `gen{i:02}` names make file order equal to
+    /// `i` order — so position `i` is fixture index `i`. Callable twice
+    /// over the same dir/conn for cross-build comparisons (churn rows are
+    /// upserts).
+    fn slate_over_authors(
+        dir: &TempDir,
+        conn: &Connection,
+        n: usize,
+        author: impl Fn(usize) -> String,
+    ) -> Vec<SlateMember> {
+        let mut hits = Vec::new();
+        for i in 0..n {
             let file = format!("gen{i:02}/mod_file.rs");
             std::fs::create_dir_all(dir.path().join(&file).parent().unwrap()).unwrap();
             std::fs::write(
@@ -2405,26 +2854,38 @@ mod tests {
             )
             .unwrap();
             hits.push((
-                file.clone(),
-                1,
+                file,
+                1u64,
                 format!("pub fn generated_{i}() -> u32 {{ {i} }}"),
-                0.5,
+                0.5f32,
             ));
         }
         crate::pipeline::build_index(dir.path(), true).unwrap();
-        for i in 0..40 {
+        for i in 0..n {
             conn.execute(
-                "INSERT INTO file_churn (file, score, last_ts, last_author, primary_author) \
+                "INSERT OR REPLACE INTO file_churn \
+                 (file, score, last_ts, last_author, primary_author) \
                  VALUES (?1, 1.0, 1, ?2, ?2)",
-                rusqlite::params![format!("gen{i:02}/mod_file.rs"), format!("Author{i:02}")],
+                rusqlite::params![format!("gen{i:02}/mod_file.rs"), author(i)],
             )
             .unwrap();
         }
-        let ranked = descriptive_ranked(&conn, hits, "generated");
-        let token = build_and_store_slate(&conn, "generated", &ranked, &test_feedback())
+        let ranked = descriptive_ranked(conn, hits, "generated");
+        let token = build_and_store_slate(conn, "generated", &ranked, &test_feedback())
             .unwrap()
             .token;
-        let members = stored_members(&conn, &token);
+        let mut members = stored_members(conn, &token);
+        members.sort_by_key(|m| m.file.clone());
+        members
+    }
+
+    #[test]
+    fn overflow_cap_collapses_beyond_32_distinct_values() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        // 40 files under 40 distinct directories, 40 distinct authors,
+        // every value occurring exactly once: all counts tied.
+        let members = slate_over_authors(&dir, &conn, 40, |i| format!("Author{i:02}"));
+        assert_eq!(members.len(), 40);
 
         let primaries: Vec<&str> = members
             .iter()
@@ -2438,9 +2899,27 @@ mod tests {
         );
         assert!(overflowed >= 40 - CATEGORICAL_CAP, "{overflowed}");
 
+        // WHICH values survive is pinned, not just how many: under the
+        // all-tied counts the documented total order (count desc, then
+        // value asc) keeps exactly the 32 lexicographically smallest —
+        // a dropped tie-break would hand the kept set to HashMap order.
+        for (i, member) in members.iter().enumerate() {
+            let expected = if i < CATEGORICAL_CAP {
+                format!("Author{i:02}")
+            } else {
+                OVERFLOW_LABEL.to_string()
+            };
+            assert_eq!(
+                member.groups.author.get("primary").map(String::as_str),
+                Some(expected.as_str()),
+                "file {}: the kept set is the lexicographically smallest",
+                member.file
+            );
+        }
+
         // The ancestor family caps as one pool: the 40 distinct gen dirs
-        // plus the deeper fixtures' dirs collapse so at most 32 distinct
-        // ancestor keys survive, wearing one shared __overflow__ key.
+        // collapse so at most 32 distinct ancestor keys survive, wearing
+        // one shared __overflow__ key.
         let with_overflow_ancestor = members
             .iter()
             .filter(|m| m.groups.path.contains_key(OVERFLOW_LABEL))
@@ -2464,6 +2943,76 @@ mod tests {
             "kept ancestor keys obey the cap: {}",
             ancestors.len()
         );
+        drop(dir);
+    }
+
+    #[test]
+    fn cap_keeps_the_most_frequent_values_when_frequencies_differ() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        // "Central" authors three files (count 3); 37 single-file authors
+        // follow (count 1). "Central" sorts AFTER every A** singleton, so
+        // it survives on frequency alone — the count-desc head of the
+        // order — while the kept tail is the 31 smallest singletons
+        // (A03..=A33) and A34..=A39 overflow.
+        let members = slate_over_authors(&dir, &conn, 40, |i| {
+            if i < 3 {
+                "Central".to_string()
+            } else {
+                format!("A{i:02}")
+            }
+        });
+        assert_eq!(members.len(), 40);
+        for (i, member) in members.iter().enumerate() {
+            let expected = if i < 3 {
+                "Central".to_string()
+            } else if (3..=33).contains(&i) {
+                format!("A{i:02}")
+            } else {
+                OVERFLOW_LABEL.to_string()
+            };
+            assert_eq!(
+                member.groups.author.get("primary").map(String::as_str),
+                Some(expected.as_str()),
+                "file {}: frequent values survive, rare ones overflow",
+                member.file
+            );
+        }
+        drop(dir);
+    }
+
+    #[test]
+    fn cap_selection_is_deterministic_across_builds_beyond_32_distinct() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        // Build the SAME >32-distinct slate twice: the overflow path must
+        // select identical survivors — the total order (count desc, then
+        // value asc) is what keeps HashMap iteration order from leaking
+        // into stored features across runs.
+        let author = |i: usize| format!("Author{i:02}");
+        let a = slate_over_authors(&dir, &conn, 40, author);
+        let b = slate_over_authors(&dir, &conn, 40, author);
+        let json = |members: &[SlateMember]| {
+            serde_json::to_string(&members.iter().map(|m| &m.groups).collect::<Vec<_>>()).unwrap()
+        };
+        assert_eq!(
+            json(&a),
+            json(&b),
+            "identical inputs must select identical survivors past the cap"
+        );
+        for members in [&a, &b] {
+            for (i, member) in members.iter().enumerate() {
+                let expected = if i < CATEGORICAL_CAP {
+                    format!("Author{i:02}")
+                } else {
+                    OVERFLOW_LABEL.to_string()
+                };
+                assert_eq!(
+                    member.groups.author.get("primary").map(String::as_str),
+                    Some(expected.as_str()),
+                    "file {}",
+                    member.file
+                );
+            }
+        }
         drop(dir);
     }
 

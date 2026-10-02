@@ -927,6 +927,12 @@ fn recorded_continuous_values_are_labels_not_numbers() {
         let file = member["file"].as_str().unwrap();
         for group in ["history", "graph"] {
             for (name, value) in groups[group].as_object().into_iter().flatten() {
+                // `community` is a capped categorical identity
+                // (PRD-FB-REQ-024), not a bucketed continuous — every
+                // other label in these groups must stay digit-free.
+                if group == "graph" && name == "community" {
+                    continue;
+                }
                 let label = value.as_str().unwrap();
                 assert!(
                     !label.chars().any(|c| c.is_ascii_digit()),
@@ -1159,6 +1165,104 @@ fn slate_build_reads_only_symbols_and_writes_only_slates() {
             );
         }
     }
+    drop(conn);
+    drop(dir);
+}
+
+/// The ranked search WITHOUT stripping the repo root — the MCP shape:
+/// result files stay absolute, so the canonical file keys (D6) are the
+/// only thing that maps them onto the repo-relative index.
+fn ranked_capture_absolute(
+    root: &Path,
+    conn: &Connection,
+    query: &str,
+) -> wonk::rerank::RankedSearch {
+    let root_str = root.display().to_string();
+    let results = wonk::search::text_search(query, true, false, &[root_str]).unwrap();
+    assert!(
+        results.iter().any(|r| r.file.is_absolute()),
+        "the MCP shape: absolute result paths"
+    );
+    let settings = wonk::rerank::RankSettings {
+        use_pipeline: true,
+        feedback_capture: true,
+        ..Default::default()
+    };
+    wonk::rerank::rank_and_explain_classed(&results, Some(conn), query, &settings)
+}
+
+/// Statement count of one traced `build_and_store_slate` over the
+/// absolute-path shape, with every statement shape-checked against the
+/// batched invariant (symbols bulk-load + feedback_slates writes + txn).
+fn slate_build_statement_count(root: &Path, conn: &Connection, query: &str) -> usize {
+    let ranked = ranked_capture_absolute(root, conn, query);
+    let distinct_files: std::collections::BTreeSet<String> = ranked
+        .groups
+        .iter()
+        .flat_map(|(_, g)| g.iter())
+        .map(|item| item.classified.result.file.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        distinct_files.iter().any(|f| Path::new(f).is_absolute()),
+        "absolute result paths reached the slate build"
+    );
+
+    TRACE_SQL.lock().unwrap().clear();
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(trace_stmts),
+    );
+    let stored =
+        feedback::build_and_store_slate(conn, query, &ranked, &Default::default()).unwrap();
+    conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+    assert!(!stored.members.is_empty(), "the slate stored");
+
+    let statements = TRACE_SQL.lock().unwrap().clone();
+    assert!(!statements.is_empty());
+    for stmt in &statements {
+        let lowered = stmt.to_lowercase();
+        let touches_symbols = lowered.contains("from symbols");
+        let touches_slates = lowered.contains("feedback_slates");
+        let is_txn = lowered.starts_with("begin") || lowered.starts_with("commit");
+        assert!(
+            touches_symbols || touches_slates || is_txn,
+            "slate build statement beyond the prepare: {stmt}"
+        );
+        assert!(
+            !lowered.contains("like '%'"),
+            "the per-file suffix fallback fired: {stmt}"
+        );
+    }
+    statements.len()
+}
+
+#[test]
+fn absolute_path_slate_build_is_fixed_cost_not_per_file() {
+    // The count-based round-trip gate in the shape where the invariant
+    // actually broke: over MCP the result files are absolute, and a
+    // slate build that missed the exact `symbols IN` pass would issue
+    // ONE suffix-fallback query per distinct file. n=3 vs n=12 distinct
+    // files must cost the same number of statements.
+    let (dir, root) = feedback_repo(true, "");
+    for i in 0..12 {
+        let file = format!("abs{i:02}/file.rs");
+        fs::create_dir_all(root.join(&file).parent().unwrap()).unwrap();
+        fs::write(
+            root.join(&file),
+            format!("pub fn abs_query_{i:02}_target() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+    wonk::pipeline::build_index(&root, true).unwrap();
+    let conn = open_index(&root);
+
+    let three = slate_build_statement_count(&root, &conn, "abs_query_0[0-2]_target");
+    let twelve = slate_build_statement_count(&root, &conn, "abs_query_[0-9][0-9]_target");
+    assert_eq!(
+        three, twelve,
+        "slate-build statement count must not scale with distinct files \
+         (3 files -> {three}, 12 files -> {twelve})"
+    );
     drop(conn);
     drop(dir);
 }
