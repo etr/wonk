@@ -2192,6 +2192,44 @@ fn resolve_hint_path(conn: &Connection, hint: &str) -> Option<String> {
     best
 }
 
+/// Shared chunked loader for the per-file signal tables (TASK-097 review
+/// debt): presence probe, sorted candidates, IN_CHUNK batches, per-chunk
+/// prepare/query_map with error-swallow. Returns the mapped rows of every
+/// batch; the zero-path contract (missing table on a pre-V5 index, any
+/// prepare failure) is an empty result, never an error.
+fn load_file_rows<T>(
+    conn: &Connection,
+    table: &str,
+    projection: &str,
+    where_col: &str,
+    files: &std::collections::HashSet<String>,
+    map_row: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Vec<T> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let probe = format!("SELECT 1 FROM {table} LIMIT 1");
+    if conn.query_row(&probe, [], |_| Ok(())).is_err() {
+        return Vec::new();
+    }
+
+    let mut wanted: Vec<&String> = files.iter().collect();
+    wanted.sort_unstable();
+    let mut out = Vec::new();
+    for chunk in wanted.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("SELECT {projection} FROM {table} WHERE {where_col} IN ({placeholders})");
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), map_row) else {
+            continue;
+        };
+        out.extend(rows.flatten());
+    }
+    out
+}
+
 /// Load the churn scores (and, since TASK-105, the per-file history facts)
 /// for exactly the candidate files — already the canonical DB-path set —
 /// in IN_CHUNK batches against the `file_churn` primary key, folding the
@@ -2202,28 +2240,13 @@ fn resolve_hint_path(conn: &Connection, hint: &str) -> Option<String> {
 /// prepare failure is the same zero-path, never an error.
 fn load_churn_scores(conn: &Connection, files: &std::collections::HashSet<String>) -> ChurnContext {
     let mut ctx = ChurnContext::default();
-    if files.is_empty() {
-        return ctx;
-    }
-    if conn
-        .query_row("SELECT 1 FROM file_churn LIMIT 1", [], |_| Ok(()))
-        .is_err()
-    {
-        return ctx;
-    }
-
-    let mut wanted: Vec<&String> = files.iter().collect();
-    wanted.sort_unstable();
-    for chunk in wanted.chunks(IN_CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql = format!(
-            "SELECT file, score, last_ts, last_author, primary_author \
-             FROM file_churn WHERE file IN ({placeholders})"
-        );
-        let Ok(mut stmt) = conn.prepare(&sql) else {
-            continue;
-        };
-        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+    for (file, score, last_ts, last_author, primary_author) in load_file_rows(
+        conn,
+        "file_churn",
+        "file, score, last_ts, last_author, primary_author",
+        "file",
+        files,
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, f32>(1)?,
@@ -2231,15 +2254,12 @@ fn load_churn_scores(conn: &Connection, files: &std::collections::HashSet<String
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
             ))
-        }) else {
-            continue;
-        };
-        for (file, score, last_ts, last_author, primary_author) in rows.flatten() {
-            ctx.scores.insert(file.clone(), score);
-            ctx.last_ts.insert(file.clone(), last_ts);
-            ctx.last_author.insert(file.clone(), last_author);
-            ctx.primary_author.insert(file.clone(), primary_author);
-        }
+        },
+    ) {
+        ctx.scores.insert(file.clone(), score);
+        ctx.last_ts.insert(file.clone(), last_ts);
+        ctx.last_author.insert(file.clone(), last_author);
+        ctx.primary_author.insert(file.clone(), primary_author);
     }
     ctx.max = ctx
         .scores
@@ -2264,44 +2284,27 @@ fn load_co_change_scores(
     files: &std::collections::HashSet<String>,
 ) -> CoChangeContext {
     let mut ctx = CoChangeContext::default();
-    if files.is_empty() {
-        return ctx;
-    }
-    if conn
-        .query_row("SELECT 1 FROM co_change LIMIT 1", [], |_| Ok(()))
-        .is_err()
-    {
-        return ctx;
-    }
-
-    let mut wanted: Vec<&String> = files.iter().collect();
-    wanted.sort_unstable();
-    for chunk in wanted.chunks(IN_CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql = format!(
-            "SELECT file_a, file_b, weight FROM co_change WHERE file_a IN ({placeholders})"
-        );
-        let Ok(mut stmt) = conn.prepare(&sql) else {
-            continue;
-        };
-        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+    for (file_a, file_b, weight) in load_file_rows(
+        conn,
+        "co_change",
+        "file_a, file_b, weight",
+        "file_a",
+        files,
+        |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, f32>(2)?,
             ))
-        }) else {
+        },
+    ) {
+        if !files.contains(&file_b) || !weight.is_finite() {
             continue;
-        };
-        for (file_a, file_b, weight) in rows.flatten() {
-            if !files.contains(&file_b) || !weight.is_finite() {
-                continue;
-            }
-            ctx.best
-                .entry(file_a)
-                .and_modify(|best| *best = best.max(weight))
-                .or_insert(weight);
         }
+        ctx.best
+            .entry(file_a)
+            .and_modify(|best| *best = best.max(weight))
+            .or_insert(weight);
     }
     ctx.max = ctx
         .best
