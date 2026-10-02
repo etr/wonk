@@ -467,11 +467,17 @@ pub struct EmbeddingContext {
 }
 
 /// Mined per-file churn scores for the candidate set, with the set max
-/// folded once at preparation time (TASK-096).
+/// folded once at preparation time (TASK-096). TASK-105 adds the per-file
+/// history facts the feedback features read (`last_ts`/`last_author`/
+/// `primary_author`, PRD-FB-REQ-023/028) — loaded by the same batched
+/// statement, never a second pass.
 #[derive(Debug, Default, Clone)]
 pub struct ChurnContext {
     pub(crate) scores: HashMap<String, f32>,
     pub(crate) max: f32,
+    pub(crate) last_ts: HashMap<String, Option<i64>>,
+    pub(crate) last_author: HashMap<String, Option<String>>,
+    pub(crate) primary_author: HashMap<String, Option<String>>,
 }
 
 /// Set-relative co-change coupling for the candidate set (TASK-097): each
@@ -485,6 +491,18 @@ pub struct CoChangeContext {
     pub(crate) max: f32,
 }
 
+/// The persisted facts at one candidate position (TASK-098 + TASK-105):
+/// the `(hub, authority)` pair the signals read plus the CSR fan degrees
+/// the graph features bucket (`fan_in`/`fan_out` are `None` on an index
+/// whose topology pass predates degree persistence).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct TopologyScores {
+    pub(crate) hub: f32,
+    pub(crate) authority: f32,
+    pub(crate) fan_in: Option<u32>,
+    pub(crate) fan_out: Option<u32>,
+}
+
 /// Computed topology scores at the candidate positions (TASK-098):
 /// `(hub, authority)` per (file, line), with the two set maxes folded once
 /// at preparation time. TASK-099 adds the community assignment per
@@ -492,7 +510,7 @@ pub struct CoChangeContext {
 /// concentration fraction — the two halves of the REQ-004 signal.
 #[derive(Debug, Default, Clone)]
 pub struct TopologyContext {
-    pub(crate) scores: HashMap<(String, u64), (f32, f32)>,
+    pub(crate) scores: HashMap<(String, u64), TopologyScores>,
     pub(crate) max_hub: f32,
     pub(crate) max_authority: f32,
     pub(crate) communities: HashMap<(String, u64), i64>,
@@ -517,6 +535,31 @@ pub(crate) struct LoadedSketch {
 #[derive(Debug, Default, Clone)]
 pub struct ShingleContext {
     pub(crate) sketches: HashMap<(String, u64), LoadedSketch>,
+}
+
+/// The caller's working-context hint slice (TASK-105, PRD-FB-REQ-027):
+/// everything the context-relative feedback features need about ONE
+/// file — the hint as supplied plus its canonical repo-relative path,
+/// modal community, import-graph distances, and co-change partners —
+/// loaded by the batched prepare only when a hint is present. Every
+/// failure degrades to the empty slice, never an error; an unresolvable
+/// hint keeps the raw string (the string-computable features still work)
+/// and drops the data-backed keys.
+#[derive(Debug, Default, Clone)]
+pub struct WorkingContext {
+    /// The hint exactly as supplied (may be absolute or relative).
+    pub(crate) hint: Option<String>,
+    /// The hint's repo-relative `files.path`, when it resolved.
+    pub(crate) path: Option<String>,
+    /// Modal community of the hint file's symbols (max count, ties to
+    /// the smallest community id).
+    pub(crate) community: Option<i64>,
+    /// `target symbol id -> min_depth` from the hint file's symbols
+    /// through the precomputed `reach` table.
+    pub(crate) distances: HashMap<i64, i64>,
+    /// Co-change weights from the hint file to its retained partners,
+    /// keyed by partner path.
+    pub(crate) partners: HashMap<String, f32>,
 }
 
 /// The query sources the pipeline prepares context against: the BM25
@@ -558,6 +601,14 @@ pub struct SharedContext {
     pub(crate) co_change: CoChangeContext,
     pub(crate) topology: TopologyContext,
     pub(crate) shingles: ShingleContext,
+    /// Canonical file keys (TASK-105, D6): result path as the search
+    /// produced it → repo-relative `files.path`. Identity on the CLI
+    /// surface (results already carry repo-relative paths); the mapping
+    /// is what makes absolute-path MCP callers hit the file-keyed
+    /// loaders at all.
+    pub(crate) file_keys: HashMap<String, String>,
+    /// The working-context hint slice (empty unless a hint was supplied).
+    pub(crate) working: WorkingContext,
 }
 
 impl SharedContext {
@@ -634,7 +685,10 @@ impl SharedContext {
     /// Computed `(hub, authority)` at a candidate position (None unless
     /// prepared, or when the position carries no topology row).
     pub fn topology_scores(&self, file: &str, line: u64) -> Option<(f32, f32)> {
-        self.topology.scores.get(&(file.to_string(), line)).copied()
+        self.topology
+            .scores
+            .get(&(file.to_string(), line))
+            .map(|s| (s.hub, s.authority))
     }
 
     /// The largest hub score across the candidate set; 0 when none.
@@ -688,6 +742,83 @@ impl SharedContext {
             .sketches
             .get(&(file.to_string(), line))
             .map(|entry| entry.symbol_id)
+    }
+
+    /// The repo-relative DB path a result path refers to (TASK-105, D6):
+    /// identity for CLI-shaped results, the canonical key for
+    /// absolute-path MCP results. None when the path was never resolved
+    /// against the candidate set.
+    pub fn canonical_file(&self, as_seen: &str) -> Option<&str> {
+        self.file_keys.get(as_seen).map(String::as_str)
+    }
+
+    /// Persisted fan-in at a candidate position (None unless prepared, or
+    /// when the topology pass that wrote the row predates degrees).
+    pub fn fan_in_at(&self, file: &str, line: u64) -> Option<u32> {
+        self.topology
+            .scores
+            .get(&(file.to_string(), line))
+            .and_then(|s| s.fan_in)
+    }
+
+    /// Persisted fan-out at a candidate position (None unless prepared,
+    /// or when the topology pass that wrote the row predates degrees).
+    pub fn fan_out_at(&self, file: &str, line: u64) -> Option<u32> {
+        self.topology
+            .scores
+            .get(&(file.to_string(), line))
+            .and_then(|s| s.fan_out)
+    }
+
+    /// The file's newest-commit timestamp (None unless churn context was
+    /// prepared, or the row carries no `last_ts`).
+    pub fn last_ts_of(&self, file: &str) -> Option<i64> {
+        self.churn.last_ts.get(file).copied().flatten()
+    }
+
+    /// The author of the file's newest commit (None unless prepared, or
+    /// the mine recorded none).
+    pub fn last_author_of(&self, file: &str) -> Option<&str> {
+        self.churn
+            .last_author
+            .get(file)
+            .and_then(|a| a.as_deref())
+    }
+
+    /// The file's dominant author by age-weighted commit count (None
+    /// unless prepared, or the mine recorded none).
+    pub fn primary_author_of(&self, file: &str) -> Option<&str> {
+        self.churn
+            .primary_author
+            .get(file)
+            .and_then(|a| a.as_deref())
+    }
+
+    /// The working-context hint exactly as supplied (None when absent).
+    pub fn working_hint(&self) -> Option<&str> {
+        self.working.hint.as_deref()
+    }
+
+    /// The hint's canonical repo-relative path (None when unresolvable).
+    pub fn working_hint_path(&self) -> Option<&String> {
+        self.working.path.as_ref()
+    }
+
+    /// The hint file's modal community (None when unknown).
+    pub fn working_hint_community(&self) -> Option<i64> {
+        self.working.community
+    }
+
+    /// Import-graph distance from the hint file to `symbol_id` (None when
+    /// unreachable or no hint loaded).
+    pub fn import_distance(&self, symbol_id: i64) -> Option<i64> {
+        self.working.distances.get(&symbol_id).copied()
+    }
+
+    /// The co-change weight between the hint file and `file` (None when
+    /// uncoupled or no hint loaded).
+    pub fn co_change_partner(&self, file: &str) -> Option<f32> {
+        self.working.partners.get(file).copied()
     }
 }
 
@@ -1646,21 +1777,43 @@ pub fn prepare_context(
     conn: Option<&Connection>,
     sources: &ContextSources,
 ) -> SharedContext {
+    prepare_context_with(reqs, pattern, results, conn, sources, None)
+}
+
+/// [`prepare_context`] plus the working-context hint (TASK-105,
+/// PRD-FB-REQ-027): with a hint present, one fixed, slate-size-independent
+/// statement set loads the [`WorkingContext`] slice — zero statements when
+/// absent. The hint never affects any signal's value.
+pub(crate) fn prepare_context_with(
+    reqs: ContextReqs,
+    pattern: &str,
+    results: &[ClassifiedResult],
+    conn: Option<&Connection>,
+    sources: &ContextSources,
+    hint: Option<&str>,
+) -> SharedContext {
     let mut ctx = SharedContext::default();
+    let files = unique_result_files(results);
+    let file_keyed = reqs.symbol_hits
+        || reqs.lexical_scores
+        || reqs.file_churn
+        || reqs.co_change
+        || reqs.symbol_topology
+        || reqs.shingles;
+    if file_keyed {
+        ctx.file_keys = resolve_file_keys(conn, &files);
+    }
     if reqs.query_terms {
         ctx.terms = crate::tokenizer::tokenize(pattern);
     }
     if reqs.path_class {
-        let files: Vec<String> = results
-            .iter()
-            .map(|r| r.result.file.to_string_lossy().into_owned())
-            .collect();
         ctx.path_class = classify_paths(&files, conn);
+        alias_file_map(&mut ctx.path_class, &ctx.file_keys);
     }
     if reqs.symbol_hits
         && let Some(conn) = conn
     {
-        ctx.symbol_hits = load_symbol_hits(conn, results);
+        ctx.symbol_hits = load_symbol_hits(conn, results, &ctx.file_keys);
         ctx.max_caller_count = ctx
             .symbol_hits
             .values()
@@ -1671,15 +1824,17 @@ pub fn prepare_context(
     if reqs.lexical_scores
         && let Some(conn) = conn
     {
-        let files: std::collections::HashSet<String> = results
+        let db_files: std::collections::HashSet<String> = files
             .iter()
-            .map(|r| r.result.file.to_string_lossy().into_owned())
+            .map(|f| ctx.file_keys.get(f).unwrap_or(f).clone())
             .collect();
-        if let Some(scores) = crate::bm25::file_bm25_scores(conn, &files, pattern, sources.bm25)
+        if let Some(scores) = crate::bm25::file_bm25_scores(conn, &db_files, pattern, sources.bm25)
             && !scores.is_empty()
         {
             let min = scores.values().copied().fold(f32::INFINITY, f32::min);
             let max = scores.values().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut scores = scores;
+            alias_file_map(&mut scores, &ctx.file_keys);
             ctx.lexical = LexicalContext { scores, min, max };
         }
     }
@@ -1691,36 +1846,296 @@ pub fn prepare_context(
     if reqs.file_churn
         && let Some(conn) = conn
     {
-        let files: std::collections::HashSet<String> = results
+        let db_files: std::collections::HashSet<String> = files
             .iter()
-            .map(|r| r.result.file.to_string_lossy().into_owned())
+            .map(|f| ctx.file_keys.get(f).unwrap_or(f).clone())
             .collect();
-        ctx.churn = load_churn_scores(conn, &files);
+        let mut churn = load_churn_scores(conn, &db_files);
+        alias_file_map(&mut churn.scores, &ctx.file_keys);
+        alias_file_map(&mut churn.last_ts, &ctx.file_keys);
+        alias_file_map(&mut churn.last_author, &ctx.file_keys);
+        alias_file_map(&mut churn.primary_author, &ctx.file_keys);
+        ctx.churn = churn;
     }
     if reqs.co_change
         && let Some(conn) = conn
     {
-        let files: std::collections::HashSet<String> = results
+        let db_files: std::collections::HashSet<String> = files
             .iter()
-            .map(|r| r.result.file.to_string_lossy().into_owned())
+            .map(|f| ctx.file_keys.get(f).unwrap_or(f).clone())
             .collect();
-        ctx.co_change = load_co_change_scores(conn, &files);
+        let mut co_change = load_co_change_scores(conn, &db_files);
+        alias_file_map(&mut co_change.best, &ctx.file_keys);
+        ctx.co_change = co_change;
     }
     if reqs.symbol_topology
         && let Some(conn) = conn
     {
-        ctx.topology = load_topology_scores(conn, results);
+        ctx.topology = load_topology_scores(conn, results, &ctx.file_keys);
     }
     if reqs.shingles
         && let Some(conn) = conn
     {
-        ctx.shingles = load_shingle_sketches(conn, results);
+        ctx.shingles = load_shingle_sketches(conn, results, &ctx.file_keys);
+    }
+    if let Some(hint) = hint {
+        ctx.working.hint = Some(hint.to_string());
+        if let Some(conn) = conn {
+            ctx.working = load_working_context(conn, hint);
+        }
     }
     ctx
 }
 
-/// Load the churn scores for exactly the candidate files, in IN_CHUNK
-/// batches against the `file_churn` primary key, folding the set max once.
+/// The unique result file strings, sorted — the canonical candidate set
+/// every file-keyed slice resolves against.
+fn unique_result_files(results: &[ClassifiedResult]) -> Vec<String> {
+    let mut files: Vec<String> = results
+        .iter()
+        .map(|r| r.result.file.to_string_lossy().into_owned())
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+/// Whether `suffix` is `path`'s tail at a path-separator boundary (or
+/// equal to it) — the shared shape behind both the canonical file keys
+/// and the feedback slate's path anchoring.
+pub(crate) fn is_path_suffix(path: &str, suffix: &str) -> bool {
+    path == suffix
+        || (path.len() > suffix.len()
+            && path.ends_with(suffix)
+            && path[..path.len() - suffix.len()].ends_with('/'))
+}
+
+/// Resolve the candidate file set once into canonical keys (TASK-105,
+/// D6): every result path as the search produced it → its repo-relative
+/// `files.path`. Identity whenever the exact `IN` lookup hits (the CLI
+/// shape); the ONE full `files` fallback scan runs only when some path
+/// went unresolved (the absolute-path MCP shape), matching each
+/// unresolved path to its longest path-separator-boundary suffix in the
+/// index (ties to the lexicographically smallest — a total order). Paths
+/// that resolve to nothing keep the identity mapping, so the loaders
+/// still query with the raw string and simply miss.
+fn resolve_file_keys(conn: Option<&Connection>, files: &[String]) -> HashMap<String, String> {
+    let mut keys: HashMap<String, String> =
+        files.iter().map(|f| (f.clone(), f.clone())).collect();
+    let Some(conn) = conn else {
+        return keys;
+    };
+    if files.is_empty() {
+        return keys;
+    }
+
+    // Exact pass: a path that is literally `files.path` maps to itself.
+    let mut resolved: HashSet<&String> = HashSet::new();
+    for chunk in files.chunks(IN_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("SELECT path FROM files WHERE path IN ({placeholders})");
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, String>(0)
+        }) else {
+            continue;
+        };
+        for path in rows.flatten() {
+            if let Ok(idx) = files.binary_search(&path) {
+                resolved.insert(&files[idx]);
+            }
+        }
+    }
+
+    let unresolved: Vec<&String> = files.iter().filter(|f| !resolved.contains(f)).collect();
+    if unresolved.is_empty() {
+        return keys;
+    }
+
+    // One full scan serves every unresolved path (the
+    // `resolve_generated_shadowing` fallback precedent).
+    let Ok(mut stmt) = conn.prepare("SELECT path FROM files") else {
+        return keys;
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return keys;
+    };
+    let indexed: Vec<String> = rows.flatten().collect();
+    for as_seen in unresolved {
+        // The longest boundary-suffix is the most specific match; equal
+        // lengths break to the smallest string so the key is deterministic.
+        let best = indexed
+            .iter()
+            .filter(|db| is_path_suffix(as_seen, db))
+            .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)));
+        if let Some(db) = best {
+            keys.insert(as_seen.clone(), db.clone());
+        }
+    }
+    keys
+}
+
+/// Shadow every DB-keyed entry of a file-keyed map under its as-seen
+/// alias (TASK-105 D6 dual-keying), so accessors hit whichever key the
+/// caller holds — the DB path (features, canonical) or the result path
+/// (signals, as produced).
+fn alias_file_map<V: Clone>(map: &mut HashMap<String, V>, keys: &HashMap<String, String>) {
+    let extra: Vec<(String, V)> = map
+        .iter()
+        .filter_map(|(db, value)| {
+            let as_seen = keys.iter().find(|(k, v)| *v == db && k != v)?;
+            Some((as_seen.0.clone(), value.clone()))
+        })
+        .collect();
+    map.extend(extra);
+}
+
+/// [`alias_file_map`] for position-keyed maps: the file component is
+/// re-keyed, the line rides along.
+fn alias_position_map<V: Clone>(
+    map: &mut HashMap<(String, u64), V>,
+    keys: &HashMap<String, String>,
+) {
+    let extra: Vec<((String, u64), V)> = map
+        .iter()
+        .filter_map(|((db, line), value)| {
+            let as_seen = keys.iter().find(|(k, v)| *v == db && k != v)?;
+            Some(((as_seen.0.clone(), *line), value.clone()))
+        })
+        .collect();
+    map.extend(extra);
+}
+
+/// Load the working-context hint slice (TASK-105, D5): resolve the hint
+/// to its repo-relative path, then its symbols' modal community, the
+/// precomputed `reach` distances from those symbols, and its `co_change`
+/// partners — a fixed statement set, bounded by `IN_CHUNK` and
+/// [`crate::history::CO_CHANGE_TOP_K`]. Every failure degrades to what
+/// already loaded, never an error.
+fn load_working_context(conn: &Connection, hint: &str) -> WorkingContext {
+    let mut ctx = WorkingContext {
+        hint: Some(hint.to_string()),
+        ..WorkingContext::default()
+    };
+    let Some(path) = resolve_hint_path(conn, hint) else {
+        return ctx;
+    };
+    ctx.path = Some(path.clone());
+
+    // The hint file's symbol ids and communities (exact key: `path` IS
+    // the DB path).
+    let mut ids: Vec<i64> = Vec::new();
+    let mut histogram: HashMap<i64, usize> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT s.id, t.community FROM symbols s \
+         LEFT JOIN symbol_topology t ON t.symbol_id = s.id WHERE s.file = ?1",
+    ) && let Ok(rows) = stmt.query_map([&path], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+    }) {
+        for (id, community) in rows.flatten() {
+            ids.push(id);
+            if let Some(community) = community {
+                *histogram.entry(community).or_insert(0) += 1;
+            }
+        }
+    }
+    // Modal community: max count, ties to the smallest id (the
+    // load_topology_scores fold).
+    if let Some((&community, _)) = histogram
+        .iter()
+        .max_by(|&(id_a, count_a), &(id_b, count_b)| {
+            count_a.cmp(count_b).then(id_b.cmp(id_a))
+        })
+    {
+        ctx.community = Some(community);
+    }
+
+    // Distances from the hint file's symbols through the precomputed
+    // reach table (presence probe first, the loader precedent).
+    if !ids.is_empty()
+        && conn
+            .query_row("SELECT 1 FROM reach LIMIT 1", [], |_| Ok(()))
+            .is_ok()
+    {
+        ids.sort_unstable();
+        ids.dedup();
+        for chunk in ids.chunks(IN_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT target_id, MIN(min_depth) FROM reach \
+                 WHERE source_id IN ({placeholders}) GROUP BY target_id"
+            );
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            }) else {
+                continue;
+            };
+            for (target, depth) in rows.flatten() {
+                ctx.distances.entry(target).and_modify(|d| *d = (*d).min(depth)).or_insert(depth);
+            }
+        }
+    }
+
+    // Co-change partners of the hint file (probe + bounded read).
+    if conn
+        .query_row("SELECT 1 FROM co_change LIMIT 1", [], |_| Ok(()))
+        .is_ok()
+        && let Ok(mut stmt) = conn.prepare(
+            "SELECT file_b, weight FROM co_change WHERE file_a = ?1 \
+             LIMIT ?2",
+        )
+        && let Ok(rows) = stmt.query_map(
+            rusqlite::params![path, crate::history::CO_CHANGE_TOP_K as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?)),
+        )
+    {
+        for (partner, weight) in rows.flatten() {
+            if weight.is_finite() {
+                ctx.partners.insert(partner, weight);
+            }
+        }
+    }
+    ctx
+}
+
+/// Resolve a hint to its repo-relative `files.path`: exact first, then the
+/// longest path-separator-boundary suffix in the index (ties to the
+/// smallest). None when nothing matches — the unresolvable-hint
+/// degradation.
+fn resolve_hint_path(conn: &Connection, hint: &str) -> Option<String> {
+    if let Ok(found) = conn.query_row("SELECT path FROM files WHERE path = ?1", [hint], |row| {
+        row.get::<_, String>(0)
+    }) {
+        return Some(found);
+    }
+    let mut stmt = conn.prepare("SELECT path FROM files").ok()?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
+    let mut best: Option<String> = None;
+    for path in rows.flatten() {
+        if !is_path_suffix(hint, &path) {
+            continue;
+        }
+        let better = match &best {
+            Some(b) => {
+                path.len() > b.len() || (path.len() == b.len() && path < *b)
+            }
+            None => true,
+        };
+        if better {
+            best = Some(path);
+        }
+    }
+    best
+}
+
+/// Load the churn scores (and, since TASK-105, the per-file history facts)
+/// for exactly the candidate files — already the canonical DB-path set —
+/// in IN_CHUNK batches against the `file_churn` primary key, folding the
+/// set max once.
 ///
 /// A presence probe (the bm25 precedent) degrades to an empty context on a
 /// pre-TASK-096 index whose `file_churn` table does not exist; every
@@ -1741,17 +2156,29 @@ fn load_churn_scores(conn: &Connection, files: &std::collections::HashSet<String
     wanted.sort_unstable();
     for chunk in wanted.chunks(IN_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql = format!("SELECT file, score FROM file_churn WHERE file IN ({placeholders})");
+        let sql = format!(
+            "SELECT file, score, last_ts, last_author, primary_author \
+             FROM file_churn WHERE file IN ({placeholders})"
+        );
         let Ok(mut stmt) = conn.prepare(&sql) else {
             continue;
         };
         let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f32>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
         }) else {
             continue;
         };
-        for row in rows.flatten() {
-            ctx.scores.insert(row.0, row.1);
+        for (file, score, last_ts, last_author, primary_author) in rows.flatten() {
+            ctx.scores.insert(file.clone(), score);
+            ctx.last_ts.insert(file.clone(), last_ts);
+            ctx.last_author.insert(file.clone(), last_author);
+            ctx.primary_author.insert(file.clone(), primary_author);
         }
     }
     ctx.max = ctx
@@ -1835,11 +2262,19 @@ fn load_co_change_scores(
 /// empty context on a pre-TASK-098 index whose `symbol_topology` table
 /// does not exist (PRD-TOPO-REQ-008); every prepare failure is the same
 /// zero-path, never an error.
-fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> TopologyContext {
+fn load_topology_scores(
+    conn: &Connection,
+    results: &[ClassifiedResult],
+    file_keys: &HashMap<String, String>,
+) -> TopologyContext {
     let mut ctx = TopologyContext::default();
     let positions: std::collections::HashSet<(String, u64)> = results
         .iter()
-        .map(|r| (r.result.file.to_string_lossy().into_owned(), r.result.line))
+        .map(|r| {
+            let as_seen = r.result.file.to_string_lossy().into_owned();
+            let db = file_keys.get(&as_seen).unwrap_or(&as_seen).clone();
+            (db, r.result.line)
+        })
         .collect();
     if positions.is_empty() {
         return ctx;
@@ -1857,7 +2292,7 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
     for chunk in wanted.chunks(IN_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!(
-            "SELECT s.file, s.line, t.hub, t.authority, t.community \
+            "SELECT s.file, s.line, t.hub, t.authority, t.community, t.fan_in, t.fan_out \
              FROM symbols s JOIN symbol_topology t ON t.symbol_id = s.id \
              WHERE s.file IN ({placeholders})"
         );
@@ -1871,33 +2306,40 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
                 row.get::<_, f64>(2)?,
                 row.get::<_, f64>(3)?,
                 row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         }) else {
             continue;
         };
-        for (file, line, hub, authority, community) in rows.flatten() {
+        for (file, line, hub, authority, community, fan_in, fan_out) in rows.flatten() {
             let key = (file, line as u64);
             if !positions.contains(&key) {
                 continue;
             }
-            ctx.scores
-                .entry(key.clone())
-                .or_insert((hub as f32, authority as f32));
+            ctx.scores.entry(key.clone()).or_insert(TopologyScores {
+                hub: hub as f32,
+                authority: authority as f32,
+                fan_in: fan_in.map(|d| d.max(0) as u32),
+                fan_out: fan_out.map(|d| d.max(0) as u32),
+            });
             if let Some(community) = community {
                 ctx.communities.entry(key).or_insert(community);
             }
         }
     }
+    alias_position_map(&mut ctx.scores, file_keys);
+    alias_position_map(&mut ctx.communities, file_keys);
     ctx.max_hub = ctx
         .scores
         .values()
-        .map(|(hub, _)| *hub)
+        .map(|scores| scores.hub)
         .filter(|s| s.is_finite())
         .fold(0.0f32, f32::max);
     ctx.max_authority = ctx
         .scores
         .values()
-        .map(|(_, authority)| *authority)
+        .map(|scores| scores.authority)
         .filter(|s| s.is_finite())
         .fold(0.0f32, f32::max);
 
@@ -1933,11 +2375,19 @@ fn load_topology_scores(conn: &Connection, results: &[ClassifiedResult]) -> Topo
 /// never an error. `ORDER BY s.id ASC` picks deterministically when two
 /// symbols share a position. This loader reads ONLY `symbols` and
 /// `symbol_shingles` — never a body (PRD-DUP-REQ-002).
-fn load_shingle_sketches(conn: &Connection, results: &[ClassifiedResult]) -> ShingleContext {
+fn load_shingle_sketches(
+    conn: &Connection,
+    results: &[ClassifiedResult],
+    file_keys: &HashMap<String, String>,
+) -> ShingleContext {
     let mut ctx = ShingleContext::default();
     let positions: std::collections::HashSet<(String, u64)> = results
         .iter()
-        .map(|r| (r.result.file.to_string_lossy().into_owned(), r.result.line))
+        .map(|r| {
+            let as_seen = r.result.file.to_string_lossy().into_owned();
+            let db = file_keys.get(&as_seen).unwrap_or(&as_seen).clone();
+            (db, r.result.line)
+        })
         .collect();
     if positions.is_empty() {
         return ctx;
@@ -1986,6 +2436,7 @@ fn load_shingle_sketches(conn: &Connection, results: &[ClassifiedResult]) -> Shi
                 .or_insert_with(|| LoadedSketch { symbol_id, sketch });
         }
     }
+    alias_position_map(&mut ctx.sketches, file_keys);
     ctx
 }
 
@@ -2031,14 +2482,20 @@ fn prepare_embeddings(
 }
 
 /// Batched symbol-hit lookup, filtered to the files present in the result
-/// set (mirroring `ranker::IndexLookup`): two SQL queries total.
+/// set (mirroring `ranker::IndexLookup`), keyed by the canonical DB paths
+/// and dual-keyed under the as-seen aliases (TASK-105 D6): two SQL queries
+/// total.
 fn load_symbol_hits(
     conn: &Connection,
     results: &[ClassifiedResult],
+    file_keys: &HashMap<String, String>,
 ) -> HashMap<(String, u64), SymbolHit> {
     let files: std::collections::HashSet<String> = results
         .iter()
-        .map(|r| r.result.file.to_string_lossy().into_owned())
+        .map(|r| {
+            let as_seen = r.result.file.to_string_lossy().into_owned();
+            file_keys.get(&as_seen).unwrap_or(&as_seen).clone()
+        })
         .collect();
     let mut hits = HashMap::new();
     if files.is_empty() {
@@ -2047,7 +2504,11 @@ fn load_symbol_hits(
 
     let positions: std::collections::HashSet<(String, u64)> = results
         .iter()
-        .map(|r| (r.result.file.to_string_lossy().into_owned(), r.result.line))
+        .map(|r| {
+            let as_seen = r.result.file.to_string_lossy().into_owned();
+            let db = file_keys.get(&as_seen).unwrap_or(&as_seen).clone();
+            (db, r.result.line)
+        })
         .collect();
 
     let placeholders: Vec<&str> = files.iter().map(|_| "?").collect();
@@ -2110,6 +2571,7 @@ fn load_symbol_hits(
         }
     }
 
+    alias_position_map(&mut hits, file_keys);
     hits
 }
 
@@ -2213,6 +2675,37 @@ pub fn rerank_with_pairs(
     weights: &WeightTable,
     sources: &ContextSources,
 ) -> (Vec<ScoredResult>, Vec<crate::shingles::NearDuplicatePair>) {
+    let (scored, pairs, _ctx) = rerank_core(
+        signals,
+        results,
+        query,
+        conn,
+        weights,
+        sources,
+        ContextReqs::none(),
+        None,
+    );
+    (scored, pairs)
+}
+
+/// The shared scoring body (TASK-105), additionally returning the
+/// prepared context so `rank_and_explain_classed` can attach it to the
+/// [`RankedSearch`] the feedback slate extracts from. `extra_reqs` are
+/// unioned into the ACTIVE signals' requirements — the descriptive
+/// feature slices must load even when the corresponding signal weight is
+/// zero — and `hint` (the working-context file, if any) loads the
+/// [`WorkingContext`]` slice. Neither changes any signal's value, and
+/// both cost a fixed, candidate-count-independent statement set.
+fn rerank_core(
+    signals: Vec<Box<dyn Signal>>,
+    results: Vec<ClassifiedResult>,
+    query: &QueryInfo<'_>,
+    conn: Option<&Connection>,
+    weights: &WeightTable,
+    sources: &ContextSources,
+    extra_reqs: ContextReqs,
+    hint: Option<&str>,
+) -> (Vec<ScoredResult>, Vec<crate::shingles::NearDuplicatePair>, SharedContext) {
     // The additive phase excludes novelty: its rows come from the
     // post-sort pass, not from per-candidate evaluation.
     let active: Vec<&Box<dyn Signal>> = signals
@@ -2225,7 +2718,8 @@ pub fn rerank_with_pairs(
     if weights.weight("novelty") != 0.0 {
         reqs = reqs.with_shingles();
     }
-    let ctx = prepare_context(reqs, query.pattern, &results, conn, sources);
+    reqs = reqs.union(extra_reqs);
+    let ctx = prepare_context_with(reqs, query.pattern, &results, conn, sources, hint);
 
     let mut scored: Vec<ScoredResult> = results
         .into_iter()
@@ -2267,7 +2761,7 @@ pub fn rerank_with_pairs(
     } else {
         Vec::new()
     };
-    (scored, pairs)
+    (scored, pairs, ctx)
 }
 
 /// Score and sort classified results with the built-in signal registry.
@@ -2408,6 +2902,15 @@ pub struct RankSettings {
     /// A caller-pinned query class bypassing detection (REQ-007). `None`
     /// means detect from the pattern.
     pub pinned_class: Option<QueryClass>,
+    /// The working-context hint (TASK-105, PRD-FB-REQ-027): one file path
+    /// the caller is working in. Feeds context-relative feedback features
+    /// only — it NEVER affects ranking (asserted by test).
+    pub working_context: Option<String>,
+    /// Feedback slate capture is on for this search (TASK-105): the
+    /// prepare widens to the descriptive feature slices (a fixed, not
+    /// per-result, statement set) and the ranked search carries its
+    /// prepared context for the slate builder.
+    pub feedback_capture: bool,
 }
 
 impl Default for RankSettings {
@@ -2418,6 +2921,8 @@ impl Default for RankSettings {
             sources: ContextSources::default(),
             class_multipliers: ClassMultipliers::neutral(),
             pinned_class: None,
+            working_context: None,
+            feedback_capture: false,
         }
     }
 }
@@ -2457,6 +2962,8 @@ impl RankSettings {
             },
             class_multipliers: rank.class_multipliers,
             pinned_class: pinned,
+            working_context: None,
+            feedback_capture: false,
         })
     }
 }
@@ -2466,7 +2973,10 @@ impl RankSettings {
 /// response. `query_class` is `Some` only when the pipeline path ran.
 /// `near_duplicates` carries the pairs the novelty pass surfaced
 /// (TASK-100) for the dispatch layer to record — empty when novelty
-/// weighs zero or the legacy path ran.
+/// weighs zero or the legacy path ran. `context` is the shared context
+/// the pipeline prepared (TASK-105) — the descriptive features are a
+/// pure function over it, so the slate builder adds no round trips; it
+/// defaults empty on the legacy path, which prepares nothing.
 #[derive(Debug, Clone)]
 pub struct RankedSearch {
     /// Ranked, deduplicated, grouped results.
@@ -2477,6 +2987,8 @@ pub struct RankedSearch {
     /// Near-duplicate pairs above `[duplicate] threshold` among the
     /// ranked candidates (PRD-DUP-REQ-003).
     pub near_duplicates: Vec<crate::shingles::NearDuplicatePair>,
+    /// The shared context the pipeline prepared for scoring (TASK-105).
+    pub context: SharedContext,
 }
 
 /// Unified ranking entry point for search results, recording the query
@@ -2502,13 +3014,32 @@ pub fn rank_and_explain_classed(
             .pinned_class
             .unwrap_or_else(|| classify_query(pattern));
         let effective = settings.class_multipliers.apply(&settings.weights, class);
-        let (scored, near_duplicates) = rerank_with_pairs(
+        // Feedback capture widens the prepared slices beyond the active
+        // signals (TASK-105): the default weight table carries no
+        // history/topology signals, and features must not vanish when a
+        // user zeroes a signal weight. A fixed statement set, never
+        // per-result; with default weights the widening adds nothing the
+        // active signals did not already load.
+        let widened = if settings.feedback_capture {
+            ContextReqs::none()
+                .with_query_terms()
+                .with_path_class()
+                .with_symbol_hits()
+                .with_file_churn()
+                .with_co_change()
+                .with_symbol_topology()
+        } else {
+            ContextReqs::none()
+        };
+        let (scored, near_duplicates, ctx) = rerank_core(
             builtin_signals(),
             classified,
             &QueryInfo { pattern },
             conn,
             &effective,
             &settings.sources,
+            widened,
+            settings.working_context.as_deref(),
         );
         // Score order interleaves categories under any non-kind-only
         // weight table (group_by_category groups by adjacency); bucket
@@ -2519,6 +3050,7 @@ pub fn rank_and_explain_classed(
             crate::ranker::bucket_by_category(scored),
             Some(class),
             near_duplicates,
+            ctx,
         )
     } else {
         let legacy = crate::ranker::rank_results(classified)
@@ -2529,14 +3061,15 @@ pub fn rank_and_explain_classed(
                 contributions: Vec::new(),
             })
             .collect();
-        (legacy, None, Vec::new())
+        (legacy, None, Vec::new(), SharedContext::default())
     };
-    let (ranked, query_class, near_duplicates) = ranked_class_pairs;
+    let (ranked, query_class, near_duplicates, ctx) = ranked_class_pairs;
     let deduped = crate::ranker::dedup_reexports(ranked, pattern);
     RankedSearch {
         groups: crate::ranker::group_by_category(deduped),
         query_class,
         near_duplicates,
+        context: ctx,
     }
 }
 
@@ -5509,11 +6042,14 @@ proximity, signature, churn, co_change, hub, authority, community",
         // Signals take no Connection (structurally impossible to issue
         // per-candidate SQL); this gate proves it empirically. Accounting
         // for the one-term query "alpha" over lexical_seeded_conn (no
-        // embedding rows): 8 statements total — 2 symbol-hit lookups
-        // (symbols IN, references GROUP BY) + 4 lexical (presence probe,
-        // corpus stats, 1 postings scan, document lengths) + 2 embedding
-        // (stored vector spaces, position loader; the query embed itself
-        // is in-process and SQL-free). query_terms and path_class touch
+        // embedding rows): 9 statements total — 1 canonical file-keys
+        // resolution (TASK-105: the exact `files` IN pass; all candidates
+        // repo-relative, so the fallback scan never runs) + 2 symbol-hit
+        // lookups (symbols IN, references GROUP BY) + 4 lexical (presence
+        // probe, corpus stats, 1 postings scan, document lengths) + 2
+        // embedding (stored vector spaces, position loader; the query
+        // embed itself is in-process and SQL-free). query_terms and
+        // path_class touch
         // no SQL. The count must not move when the candidate set grows.
         let (_dir, conn) = lexical_seeded_conn();
         let make = |n: u64| -> Vec<ClassifiedResult> {
@@ -5527,7 +6063,7 @@ proximity, signature, churn, co_change, hub, authority, community",
 
         assert_eq!(small, large, "statement count must be O(1) in candidates");
         assert!(large <= 10, "unexpected statements: {large}");
-        assert_eq!(large, 8, "documented statement accounting (see comment)");
+        assert_eq!(large, 9, "documented statement accounting (see comment)");
     }
 
     #[test]
@@ -6635,6 +7171,8 @@ proximity, signature, churn, co_change, hub, authority, community",
             sources: ContextSources::default(),
             class_multipliers: ClassMultipliers::neutral(),
             pinned_class: None,
+            working_context: None,
+            feedback_capture: false,
         };
 
         let ranked = rank_and_explain_classed(&results, Some(&conn), "handle", &settings);
@@ -6836,5 +7374,314 @@ proximity, signature, churn, co_change, hub, authority, community",
         let mut unknown = HashMap::new();
         unknown.insert("not_a_signal".to_string(), 0.5);
         assert!(WeightTable::from_config(&unknown).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // TASK-105: canonical file keys, widened slices, working context
+    // -------------------------------------------------------------------
+
+    /// The seeded fixture plus `files` rows (the canonical-key source),
+    /// topology, churn-authority, reach, and co-change rows keyed by the
+    /// REPO-RELATIVE paths the DB stores.
+    fn descriptive_seeded_conn() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = seeded_conn();
+        for file in ["src/main.rs", "src/other.rs", "src/third.rs"] {
+            conn.execute(
+                "INSERT INTO files (path, language, hash, last_indexed) \
+                 VALUES (?1, 'rust', 'h', 0)",
+                [file],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO symbol_topology (symbol_id, hub, authority, community, fan_in, fan_out) \
+             SELECT id, 0.25, 0.5, 7, 3, 1 FROM symbols WHERE file = 'src/main.rs'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_churn (file, score, last_ts, last_author, primary_author) \
+             VALUES ('src/main.rs', 2.5, 1700000000, 'Ada', 'Ada')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO co_change (file_a, file_b, weight) VALUES ('src/main.rs', 'src/other.rs', 4.0)",
+            [],
+        )
+        .unwrap();
+        let main_id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE file = 'src/main.rs' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let other_id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE file = 'src/other.rs' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO reach (source_id, target_id, min_depth) VALUES (?1, ?2, 2)",
+            rusqlite::params![main_id, other_id],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn capture_settings(weights: &[(&str, f32)]) -> RankSettings {
+        RankSettings {
+            use_pipeline: true,
+            weights: table(weights),
+            feedback_capture: true,
+            ..RankSettings::default()
+        }
+    }
+
+    #[test]
+    fn absolute_path_candidates_load_file_keyed_context() {
+        // The MCP shape: results carry ABSOLUTE paths while every table is
+        // keyed repo-relatively. Before TASK-105's canonical file keys the
+        // file-keyed loaders silently missed over MCP.
+        let (dir, conn) = descriptive_seeded_conn();
+        let abs = dir.path().join("src/main.rs");
+        let results = vec![crate::search::SearchResult {
+            file: abs.clone(),
+            line: 10,
+            col: 0,
+            content: "fn my_func() {}".to_string(),
+        }];
+        let ranked = rank_and_explain_classed(
+            &results,
+            Some(&conn),
+            "my_func",
+            &capture_settings(&[("kind", 1.0)]),
+        );
+        let as_seen = abs.to_string_lossy().into_owned();
+        assert!(
+            ranked.context.churn_score(&as_seen).is_some(),
+            "churn must hit for the absolute-path caller"
+        );
+        assert!(
+            ranked.context.topology_scores(&as_seen, 10).is_some(),
+            "topology must hit for the absolute-path caller"
+        );
+        assert!(
+            ranked.context.symbol_hit(&as_seen, 10).is_some(),
+            "symbol hits must hit for the absolute-path caller"
+        );
+        assert_eq!(
+            ranked.context.fan_in_at(&as_seen, 10),
+            Some(3),
+            "degrees ride the topology context"
+        );
+        assert_eq!(ranked.context.fan_out_at(&as_seen, 10), Some(1));
+        assert_eq!(
+            ranked.context.last_author_of(&as_seen).as_deref(),
+            Some("Ada"),
+            "per-file history rides the churn context"
+        );
+        assert_eq!(ranked.context.last_ts_of(&as_seen), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn relative_and_absolute_candidates_rank_identically() {
+        let (dir, conn) = descriptive_seeded_conn();
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("churn", 0.5), ("hub", 0.5)]),
+            ..RankSettings::default()
+        };
+        let run = |file: std::path::PathBuf| {
+            let results = vec![crate::search::SearchResult {
+                file,
+                line: 10,
+                col: 0,
+                content: "fn my_func() {}".to_string(),
+            }];
+            rank_and_explain_classed(&results, Some(&conn), "my_func", &settings)
+        };
+        let relative = run(std::path::PathBuf::from("src/main.rs"));
+        let absolute = run(dir.path().join("src/main.rs"));
+
+        let shape = |ranked: &RankedSearch| {
+            ranked
+                .groups
+                .iter()
+                .flat_map(|(_, g)| g.iter())
+                .map(|s| (s.score, s.contributions.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&relative), shape(&absolute));
+    }
+
+    #[test]
+    fn feedback_capture_prepares_slices_despite_zeroed_signal_weights() {
+        // The default weight table carries no history/topology signals;
+        // features must not vanish when a user zeroes a signal weight.
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![crate::search::SearchResult {
+            file: std::path::PathBuf::from("src/main.rs"),
+            line: 10,
+            col: 0,
+            content: "fn my_func() {}".to_string(),
+        }];
+        let ranked = rank_and_explain_classed(
+            &results,
+            Some(&conn),
+            "my_func",
+            &capture_settings(&[("kind", 1.0), ("churn", 0.0)]),
+        );
+        assert!(ranked.context.churn_score("src/main.rs").is_some());
+        assert!(ranked.context.topology_scores("src/main.rs", 10).is_some());
+        assert!(ranked.context.symbol_hit("src/main.rs", 10).is_some());
+    }
+
+    #[test]
+    fn working_context_loader_resolves_hint_facts() {
+        let (dir, conn) = descriptive_seeded_conn();
+        let results = vec![classified(
+            "src/other.rs",
+            1,
+            "caller_a",
+            ResultCategory::Definition,
+        )];
+        let hint = dir
+            .path()
+            .join("src/main.rs")
+            .to_string_lossy()
+            .into_owned();
+        let ctx = prepare_context_with(
+            ContextReqs::none().with_symbol_hits(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+            Some(&hint),
+        );
+        assert_eq!(ctx.working_hint(), Some(hint.as_str()));
+        assert_eq!(ctx.working_hint_path(), Some(&"src/main.rs".to_string()));
+        assert_eq!(ctx.working_hint_community(), Some(7));
+        let other_id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE file = 'src/other.rs' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ctx.import_distance(other_id), Some(2));
+        assert_eq!(
+            ctx.co_change_partner("src/other.rs"),
+            Some(4.0),
+            "the hint file's partner map, keyed by partner path"
+        );
+    }
+
+    #[test]
+    fn working_context_degrades_to_empty_on_missing_tables() {
+        let (dir, conn) = descriptive_seeded_conn();
+        conn.execute_batch(
+            "DROP TABLE reach; DROP TABLE co_change; DROP TABLE symbol_topology;",
+        )
+        .unwrap();
+        let results = vec![classified(
+            "src/other.rs",
+            1,
+            "caller_a",
+            ResultCategory::Definition,
+        )];
+        let hint = dir
+            .path()
+            .join("src/main.rs")
+            .to_string_lossy()
+            .into_owned();
+        let ctx = prepare_context_with(
+            ContextReqs::none(),
+            "my_func",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+            Some(&hint),
+        );
+        // The hint string survives (same_file is string-computable); the
+        // data-backed facts are absent, never an error.
+        assert_eq!(ctx.working_hint(), Some(hint.as_str()));
+        assert_eq!(ctx.working_hint_community(), None);
+        assert!(ctx.working_hint_path().is_some());
+    }
+
+    #[test]
+    fn ranked_search_carries_context_on_pipeline_and_defaults_on_legacy() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![crate::search::SearchResult {
+            file: std::path::PathBuf::from("src/main.rs"),
+            line: 10,
+            col: 0,
+            content: "fn my_func() {}".to_string(),
+        }];
+        let piped = rank_and_explain_classed(
+            &results,
+            Some(&conn),
+            "my_func",
+            &capture_settings(&[("kind", 1.0)]),
+        );
+        assert!(
+            piped.context.churn_score("src/main.rs").is_some(),
+            "the ctx prepared for scoring rides the RankedSearch"
+        );
+
+        let legacy_settings = RankSettings {
+            use_pipeline: false,
+            ..RankSettings::default()
+        };
+        let legacy = rank_and_explain_classed(
+            &results,
+            Some(&conn),
+            "my_func",
+            &legacy_settings,
+        );
+        assert_eq!(legacy.context.churn_score("src/main.rs"), None);
+    }
+
+    #[test]
+    fn hint_never_changes_ranking() {
+        let (dir, conn) = descriptive_seeded_conn();
+        let settings = |hint: Option<String>| RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("churn", 0.5)]),
+            working_context: hint,
+            feedback_capture: true,
+            ..RankSettings::default()
+        };
+        let results = vec![crate::search::SearchResult {
+            file: std::path::PathBuf::from("src/main.rs"),
+            line: 10,
+            col: 0,
+            content: "fn my_func() {}".to_string(),
+        }];
+        let plain = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings(None));
+        let hinted = rank_and_explain_classed(
+            &results,
+            Some(&conn),
+            "my_func",
+            &settings(Some(
+                dir.path()
+                    .join("src/main.rs")
+                    .to_string_lossy()
+                    .into_owned(),
+            )),
+        );
+        let shape = |ranked: &RankedSearch| {
+            ranked
+                .groups
+                .iter()
+                .flat_map(|(_, g)| g.iter())
+                .map(|s| (s.score, s.contributions.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&plain), shape(&hinted));
     }
 }

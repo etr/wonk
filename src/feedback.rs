@@ -822,6 +822,7 @@ mod tests {
             groups,
             query_class: Some(crate::rerank::QueryClass::Symbol),
             near_duplicates: Vec::new(),
+            context: Default::default(),
         }
     }
 
