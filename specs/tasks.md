@@ -4171,13 +4171,13 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Estimate:** M
 
 **Action Items:**
-- [ ] Compute a compact lexical signature per symbol body at index time (PRD-DUP-REQ-001)
-- [ ] Add the `symbol_shingles` table
-- [ ] Estimate pairwise similarity from signatures without reading bodies at query time (PRD-DUP-REQ-002)
-- [ ] Record near-duplicates above a configurable threshold (PRD-DUP-REQ-003)
-- [ ] Novelty signal demoting a result near-identical to a **higher-ranked result in the same response**, not globally (PRD-DUP-REQ-004)
-- [ ] Guarantee at least one representative of a duplicate group survives (PRD-DUP-REQ-005)
-- [ ] Add duplicate-group reporting (PRD-DUP-REQ-006)
+- [x] Compute a compact lexical signature per symbol body at index time (PRD-DUP-REQ-001)
+- [x] Add the `symbol_shingles` table
+- [x] Estimate pairwise similarity from signatures without reading bodies at query time (PRD-DUP-REQ-002)
+- [x] Record near-duplicates above a configurable threshold (PRD-DUP-REQ-003)
+- [x] Novelty signal demoting a result near-identical to a **higher-ranked result in the same response**, not globally (PRD-DUP-REQ-004)
+- [x] Guarantee at least one representative of a duplicate group survives (PRD-DUP-REQ-005)
+- [x] Add duplicate-group reporting (PRD-DUP-REQ-006)
 
 **Dependencies:**
 - Blocked by: TASK-092
@@ -4193,7 +4193,7 @@ Classify queries to scale the lexical/semantic blend, tune default weights again
 **Related Requirements:** PRD-DUP-REQ-001 through PRD-DUP-REQ-006
 **Related Decisions:** DR-041
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
