@@ -1971,6 +1971,32 @@ pub(crate) fn is_path_suffix(path: &str, suffix: &str) -> bool {
             && path[..path.len() - suffix.len()].ends_with('/'))
 }
 
+/// The one canonical-path resolution rule (TASK-105 review debt): the
+/// longest path-separator-boundary suffix of `as_seen` among `indexed`,
+/// ties to the lexicographically smallest — a total order. An exact
+/// `files.path` entry is always its own best match (no longer candidate
+/// can be a suffix of it). Behind the file-key fallback, the ranker's
+/// alias pass, and hint resolution.
+pub(crate) fn longest_suffix_match<'a>(indexed: &'a [String], as_seen: &str) -> Option<&'a String> {
+    indexed
+        .iter()
+        .filter(|db| is_path_suffix(as_seen, db))
+        .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)))
+}
+
+/// Every indexed path (`files.path`), for the suffix-resolution
+/// fallbacks. Empty on any prepare/query failure — callers keep their
+/// identity mappings and degrade, never error.
+pub(crate) fn indexed_paths(conn: &Connection) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare("SELECT path FROM files") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.flatten().collect()
+}
+
 /// Resolve the candidate file set once into canonical keys (TASK-105,
 /// D6): every result path as the search produced it → its repo-relative
 /// `files.path`. Identity whenever the exact `IN` lookup hits (the CLI
@@ -2016,21 +2042,11 @@ fn resolve_file_keys(conn: Option<&Connection>, files: &[String]) -> HashMap<Str
 
     // One full scan serves every unresolved path (the
     // `resolve_generated_shadowing` fallback precedent).
-    let Ok(mut stmt) = conn.prepare("SELECT path FROM files") else {
-        return keys;
-    };
-    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-        return keys;
-    };
-    let indexed: Vec<String> = rows.flatten().collect();
+    let indexed = indexed_paths(conn);
     for as_seen in unresolved {
         // The longest boundary-suffix is the most specific match; equal
         // lengths break to the smallest string so the key is deterministic.
-        let best = indexed
-            .iter()
-            .filter(|db| is_path_suffix(as_seen, db))
-            .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)));
-        if let Some(db) = best {
+        if let Some(db) = longest_suffix_match(&indexed, as_seen) {
             keys.insert(as_seen.clone(), db.clone());
         }
     }
@@ -2174,22 +2190,8 @@ fn resolve_hint_path(conn: &Connection, hint: &str) -> Option<String> {
     }) {
         return Some(found);
     }
-    let mut stmt = conn.prepare("SELECT path FROM files").ok()?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
-    let mut best: Option<String> = None;
-    for path in rows.flatten() {
-        if !is_path_suffix(hint, &path) {
-            continue;
-        }
-        let better = match &best {
-            Some(b) => path.len() > b.len() || (path.len() == b.len() && path < *b),
-            None => true,
-        };
-        if better {
-            best = Some(path);
-        }
-    }
-    best
+    let indexed = indexed_paths(conn);
+    longest_suffix_match(&indexed, hint).cloned()
 }
 
 /// Shared chunked loader for the per-file signal tables (TASK-097 review
