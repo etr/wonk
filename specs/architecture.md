@@ -1090,8 +1090,8 @@ Key technology choices: Rust for single static binary distribution and native Tr
 **Technology:** New `feedback.rs`; extends `mcp.rs` (tool) and `rerank.rs` (weight source). No new crates.
 
 **Interfaces:**
-- Exposes: `wonk_feedback` MCP tool, `wonk feedback` CLI, learned weight overrides to `rerank.rs`
-- Consumes: `feedback_events` and `learned_weights` tables, signal contributions from the rerank pipeline
+- Exposes: `wonk_feedback` MCP tool, `wonk feedback` CLI, learned weight overrides and per-result preferences to `rerank.rs`
+- Consumes: `feedback_events`, `learned_weights`, and `result_preferences` tables, signal contributions from the rerank pipeline
 
 **Key Design Notes:**
 - **Feedback teaches criteria, not results (PRD-FB-REQ-007).** The alternative — recording that a result won a query and boosting it when that query recurs — is memorization, and it fails on both sides at once: queries rarely repeat verbatim, so the table stays sparse, and any key loose enough to accumulate transfers a preference about one result onto queries it was never about. Adjusting signal weights instead means a single event informs every weight, generalizes to queries sharing no terms with anything ever reported, and collapses the stored state to a handful of named numbers.
@@ -1121,7 +1121,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **The update rule (TASK-102, closes OQ-019):** one rule covers signals and descriptive keys alike — per qualifying event, every feature observable on the useful result or its alternatives takes `next = clamp(decayed + step·A, lo, hi)`, where `A` is the contrastive advantage (useful minus the mean of the passed-over alternatives) and `decayed` pulls the stored value one half-life toward its default. Tuned constants (deterministic trace simulation, `bench/feedback-learning-tuning.md`): `learn_step = 0.02`, `learn_half_life_days = 30`, `learn_max_deviation = 0.5`; a zero-default signal is pinned at `[0, 0]` — enabling a criterion stays a human decision, and the descriptive channel is where new criteria emerge from evidence. Events whose useful result already ranked first are skipped whole (PRD-FB-REQ-009), and the clamp re-runs at load time against the current defaults, so tightening the deviation re-bounds stored values immediately (AR-043).
 - **Learned state is legible and separately resettable (PRD-FB-REQ-012/013).** Learned weights are presented against their defaults, so what a repository has learned reads as "path character 0.62, default 0.40" — a claim a human can evaluate and reject. Resetting weights is independent of clearing feedback history, so a bad learning outcome can be undone without discarding the observations.
 - **Per-class learning (PRD-FB-REQ-008):** Adjustments are learned per query class as well as overall, which is the same structure DR-038 defines with hand-tuned constants. Feedback lets a repository replace those shipped guesses with its own measurements.
-- **Memorization survives, hard-gated (PRD-FB-REQ-016):** Weight learning cannot express "in this repo, auth questions mean `TokenValidator`" — a genuine loss. A direct per-result preference is therefore retained, but applies only after confirmation across a configured number of *distinct sessions* and is capped below the weight mechanism. Session counting, already required for honest aggregation, becomes the gate.
+- **Memorization survives, hard-gated (PRD-FB-REQ-016, TASK-104):** Weight learning cannot express "in this repo, auth questions mean `TokenValidator`" — a genuine loss. A direct per-result preference is therefore retained, but applies only after confirmation across a configured number of *distinct sessions* and is capped below the weight mechanism. Session counting, already required for honest aggregation, becomes the gate. The concrete design: two tables — `result_preferences` (one row per confirmed identity: decaying `strength`, `observations`, `sessions`, `updated_at`) and `result_preference_sessions` (exact distinct-session bookkeeping, the `learned_weight_sessions` pattern) — updated inside the same watermark-driven replay as the weights. The gate is `[feedback] prefer_min_sessions` (default 3, hard-minimum 2 — a value of 1 would let a single session activate the preference, which is exactly AR-036's failure). Strength grows `+0.1` per NEW distinct session — a same-session repeat moves observations only, neither stepping strength nor refreshing `updated_at`, so one session can neither activate nor sustain — and clamps at `0.5`; the bonus rides the existing `feedback` signal's weight as its own pass-appended `preference` contribution row (visible in `--why`, distinct from the `feedback` row), so `0.5 × weight` is structurally below the descriptive channel's `1.0 × weight` clamp under every configuration of the one shared knob. Decay reuses `learn_half_life_days` at learn and load time; a row whose decayed strength falls below `0.01` is excluded at load and swept by the next learn pass. Rank-1 confirmations and single-member slates never count (the qualifying stream the weights consume — PRD-FB-REQ-009's presentation-bias rationale transfers directly: a preference that counted rank-1 picks could keep re-strengthening itself from its own promotion). Retirement on material change (PRD-FB-REQ-006) is resolved at match time, never a write: the pass matches each candidate's recomputed identity against the stored map, so a rename/signature/file move yields a different identity and the dead row can never re-attach — while an identical symbol returning (a revert) correctly re-gains its decayed preference (PRD-FB-REQ-005). `--no-feedback` / MCP `no_feedback` strip the channel exactly as they strip weights (the preference lives inside the loaded learned table both seams skip); `--reset-weights` clears both preference tables with the weights (learned state resets together; `--clear-events`/`--clear-result` leave it); `wonk status` reports the stored count.
 - **What this costs, stated plainly:** with feedback enabled, ranking is a function of the index *and* accumulated history. Reproducibility is preserved on demand (PRD-FB-REQ-017), measurement is feedback-free by default so it cannot confirm itself (PRD-FB-REQ-018), and a repository that never reports feedback behaves exactly as today (PRD-FB-REQ-020).
 - **Write path:** query-time processes write to `feedback_events` only; `learned_weights` is updated from those events. Recent slates are retained in `feedback_slates` (bounded, LRU-pruned, feedback tables only) so the feedback call references what the search actually showed; `[feedback] enabled` opts ranked search into the signal pipeline. The only other query-path write is index-derived, not observed, data: the best-effort `near_duplicates` memo recorded by ranked search (4.33) — recomputable from `symbol_shingles`, never a record of user behavior, and silent on failure.
 
@@ -1351,6 +1351,33 @@ CREATE TABLE IF NOT EXISTS learned_meta (
     value TEXT NOT NULL
 );
 
+-- [V5] TASK-104: Session-gated per-result preferences (DR-042's narrow
+-- per-result layer, PRD-FB-REQ-016). One row per confirmed result identity;
+-- strength grows one step per NEW distinct confirming session (a repeat
+-- session grows nothing -- AR-036), decays on the learn_half_life_days rule
+-- (PRD-FB-REQ-011), and is capped at half the feedback signal's full value
+-- clamp -- strictly below every learned-weight channel. A materially
+-- changed result yields a different identity and the row stops applying
+-- (PRD-FB-REQ-006); retirement is resolved at match time, never a write.
+CREATE TABLE IF NOT EXISTS result_preferences (
+    result_identity TEXT PRIMARY KEY,   -- content-anchored, survives re-index (PRD-FB-REQ-005)
+    strength REAL NOT NULL,             -- decaying value in [0, 0.5]; +0.1 per new distinct session
+    observations INTEGER NOT NULL,      -- every qualifying confirming event (evidence)
+    sessions INTEGER NOT NULL,          -- distinct confirming sessions (the gate, PRD-FB-REQ-016)
+    updated_at INTEGER NOT NULL
+);
+
+-- [V5] TASK-104: Exact distinct-session bookkeeping per result -- the
+-- learned_weight_sessions pattern: keeps `sessions` honest under
+-- interleaved sessions (A,B,A counts 2) and makes same-session repeats
+-- free (no strength, no decay refresh: one session can neither activate
+-- nor sustain a preference -- AR-036).
+CREATE TABLE IF NOT EXISTS result_preference_sessions (
+    result_identity TEXT NOT NULL,
+    session TEXT NOT NULL,
+    PRIMARY KEY (result_identity, session)
+);
+
 -- [V5] BM25 per-term document statistics (DR-033)
 CREATE TABLE IF NOT EXISTS term_stats (
     term TEXT NOT NULL,
@@ -1387,6 +1414,7 @@ CREATE INDEX idx_feedback_created ON feedback_events(created_at);       -- [V5] 
 - `contracts` is per-repo. Cross-repo links are **not** stored — they are computed by querying sibling repos' `contracts` tables at request time (DR-031), so a sibling re-index can never stale this repo's data.
 - `reach` is the only V5 table with unbounded growth potential; it is capped by `reach.depth` (default 3) plus a per-symbol fan-out cap, and can be disabled entirely (PRD-REACH-REQ-006, AR-020).
 - `feedback_slates` (TASK-101) is bounded capture, not accumulation: one row per enabled ranked search, pruned to `[feedback] slate_retention` (default 64) in the same transaction as the insert, and written only by query-time processes — the indexer never touches it. Entries in `feedback_events` key on a content-anchored identity (recomputed at read time for retirement), so re-indexing preserves them without any migration.
+- `learned_weights`/`learned_weight_sessions`/`learned_meta` (TASK-102) and `result_preferences`/`result_preference_sessions` (TASK-104) are the loop's durable learned state, written only by the feedback dispatch's watermark-driven replay. Preferences key on the same content-anchored identity as events, survive re-index, retire by identity mismatch at match time (never a write), and are swept once their decayed strength falls below the retire floor. Both families reset together under `--reset-weights` and are untouched by event-history operations.
 - `near_duplicates` is a memo, not source data: rows are recorded best-effort by ranked search and the `wonk duplicates` sweep (never by an index-time all-pairs pass), are fully recomputable from `symbol_shingles`, and cascade-clean with symbols. Growth is bounded at 64 rows per duplicate group (strongest pairs first, the max-similarity pair always kept) — linear in duplicate groups, never quadratic in symbols, with typical small groups (fewer pairs than the cap) stored whole.
 
 ### 5.3 Data Flow

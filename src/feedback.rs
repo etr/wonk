@@ -183,8 +183,36 @@ pub(crate) fn owning_symbol(rows: &[SymbolRow], line: u64) -> Option<&SymbolRow>
         })
 }
 
+/// The stable identity of a ranked result (TASK-104's shared definition):
+/// anchored on the owning symbol's DB row when one spans the line, on the
+/// matched line's content otherwise. The slate build and the preference
+/// pass both resolve identities HERE, so the two sides cannot drift — a
+/// preference matches exactly the identities the feedback loop recorded,
+/// and a material change (rename, signature edit, file move) changes both
+/// sides together (PRD-FB-REQ-005/006).
+pub(crate) fn identity_of(
+    owning: Option<&SymbolRow>,
+    canonical: &str,
+    category: &crate::ranker::ResultCategory,
+    content: &str,
+) -> String {
+    match owning {
+        Some(sym) => result_identity(
+            // Anchor on the DB-stored repo-relative path: re-indexing
+            // re-inserts the same row, wherever the repo is checked out.
+            &sym.file,
+            &sym.kind,
+            &sym.name,
+            sym.signature.as_deref().unwrap_or(""),
+        ),
+        // Line-anchored: identity and feature names key on the canonical
+        // path, so the same result lands on identical features whether it
+        // arrived over CLI or MCP.
+        None => line_identity(canonical, &category.to_string(), content),
+    }
+}
+
 /// Bulk-load the symbol rows of `files` (one bounded query per chunk).
-///
 /// Result paths are matched exactly first; a file with no exact rows is
 /// re-queried by suffix — search paths may be absolute or `./`-prefixed
 /// (the MCP surface passes absolute paths) while `symbols.file` is always
@@ -922,31 +950,15 @@ fn build_members(
         let canonical = canonical_of(ranked, &result.file);
         let rows = symbols.get(&canonical).map(Vec::as_slice).unwrap_or(&[]);
         let owning = owning_symbol(rows, result.line);
-        let (identity, symbol, kind) = match owning {
-            Some(sym) => (
-                // Anchor on the DB-stored repo-relative path: re-indexing
-                // re-inserts the same row, wherever the repo is checked out.
-                result_identity(
-                    &sym.file,
-                    &sym.kind,
-                    &sym.name,
-                    sym.signature.as_deref().unwrap_or(""),
-                ),
-                Some(sym.name.clone()),
-                Some(sym.kind.clone()),
-            ),
-            None => (
-                // Line-anchored: identity and feature names key on the
-                // canonical path, so the same result lands on identical
-                // features whether it arrived over CLI or MCP.
-                line_identity(
-                    &canonical,
-                    &item.classified.category.to_string(),
-                    &result.content,
-                ),
-                None,
-                None,
-            ),
+        let identity = identity_of(
+            owning,
+            &canonical,
+            &item.classified.category,
+            &result.content,
+        );
+        let (symbol, kind) = match owning {
+            Some(sym) => (Some(sym.name.clone()), Some(sym.kind.clone())),
+            None => (None, None),
         };
         extracted.push(
             match shared.and_then(|shared| shared.groups.get(&(canonical.clone(), result.line))) {

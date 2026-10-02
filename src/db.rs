@@ -360,6 +360,33 @@ CREATE TABLE IF NOT EXISTS learned_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- [V5] TASK-104: Session-gated per-result preferences (DR-042's narrow
+-- per-result layer, PRD-FB-REQ-016). One row per confirmed result identity;
+-- strength grows one step per NEW distinct confirming session (a repeat
+-- session grows nothing -- AR-036), decays on the learn_half_life_days rule
+-- (PRD-FB-REQ-011), and is capped at half the feedback signal's full value
+-- clamp -- strictly below every learned-weight channel. A materially
+-- changed result yields a different identity and the row stops applying
+-- (PRD-FB-REQ-006); retirement is resolved at match time, never a write.
+CREATE TABLE IF NOT EXISTS result_preferences (
+    result_identity TEXT PRIMARY KEY,   -- content-anchored, survives re-index (PRD-FB-REQ-005)
+    strength REAL NOT NULL,             -- decaying value in [0, 0.5]; +0.1 per new distinct session
+    observations INTEGER NOT NULL,      -- every qualifying confirming event (evidence)
+    sessions INTEGER NOT NULL,          -- distinct confirming sessions (the gate, PRD-FB-REQ-016)
+    updated_at INTEGER NOT NULL
+);
+
+-- [V5] TASK-104: Exact distinct-session bookkeeping per result -- the
+-- learned_weight_sessions pattern: keeps `sessions` honest under
+-- interleaved sessions (A,B,A counts 2) and makes same-session repeats
+-- free (no strength, no decay refresh: one session can neither activate
+-- nor sustain a preference -- AR-036).
+CREATE TABLE IF NOT EXISTS result_preference_sessions (
+    result_identity TEXT NOT NULL,
+    session TEXT NOT NULL,
+    PRIMARY KEY (result_identity, session)
+);
 "#;
 
 const TRIGGERS_SQL: &str = r#"
@@ -623,9 +650,9 @@ pub fn ensure_duplicate_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the TASK-101/102 feedback tables exist (`feedback_events`,
+/// Ensure the TASK-101/102/104 feedback tables exist (`feedback_events`,
 /// `feedback_slates`, `learned_weights`, `learned_weight_sessions`,
-/// `learned_meta`).
+/// `learned_meta`, `result_preferences`, `result_preference_sessions`).
 ///
 /// Handles schema migration for indexes created before feedback capture:
 /// safe to call on databases that already have the tables.
@@ -2341,7 +2368,8 @@ mod tests {
 
     fn feedback_table_names(conn: &Connection) -> Vec<String> {
         let names = "('feedback_events','feedback_slates','learned_weights',\
-                     'learned_weight_sessions','learned_meta')";
+                     'learned_weight_sessions','learned_meta',\
+                     'result_preferences','result_preference_sessions')";
         conn.prepare(&format!(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN {names}"
         ))
@@ -2378,7 +2406,9 @@ mod tests {
                 "feedback_slates",
                 "learned_meta",
                 "learned_weight_sessions",
-                "learned_weights"
+                "learned_weights",
+                "result_preference_sessions",
+                "result_preferences"
             ]
         );
         let mut indexes = feedback_index_names(&conn);
@@ -2439,17 +2469,74 @@ mod tests {
     }
 
     #[test]
+    fn test_result_preferences_columns_match_architecture_ddl() {
+        let dir = TempDir::new().unwrap();
+        let conn = open(&dir.path().join("index.db")).unwrap();
+        assert_eq!(
+            table_columns(&conn, "result_preferences"),
+            vec![
+                "result_identity",
+                "strength",
+                "observations",
+                "sessions",
+                "updated_at"
+            ]
+        );
+        assert_eq!(
+            table_columns(&conn, "result_preference_sessions"),
+            vec!["result_identity", "session"]
+        );
+        // The identity primary key holds: a duplicate identity insert is a
+        // constraint violation, not a second row; a second session for the
+        // same identity is a distinct bookkeeping row.
+        conn.execute(
+            "INSERT INTO result_preferences \
+             (result_identity, strength, observations, sessions, updated_at) \
+             VALUES ('abc', 0.1, 1, 1, 0)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO result_preferences \
+                 (result_identity, strength, observations, sessions, updated_at) \
+                 VALUES ('abc', 0.2, 2, 2, 0)",
+                [],
+            )
+            .is_err()
+        );
+        conn.execute(
+            "INSERT INTO result_preference_sessions (result_identity, session) \
+             VALUES ('abc', 's1')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO result_preference_sessions (result_identity, session) \
+                 VALUES ('abc', 's1')",
+                [],
+            )
+            .is_err(),
+            "the (identity, session) pair is the bookkeeping key"
+        );
+    }
+
+    #[test]
     fn test_ensure_feedback_tables_on_pre102_db_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("index.db");
 
         // A pre-TASK-102 index: the TASK-101 tables exist, the learner's
-        // three do not — the shape a TASK-105-era index presents.
+        // three do not (nor do TASK-104's preference tables) — the shape a
+        // TASK-105-era index presents.
         let conn = open(&db_path).unwrap();
         conn.execute_batch(
             "DROP TABLE learned_weights;
              DROP TABLE learned_weight_sessions;
-             DROP TABLE learned_meta;",
+             DROP TABLE learned_meta;
+             DROP TABLE result_preferences;
+             DROP TABLE result_preference_sessions;",
         )
         .unwrap();
         assert_eq!(feedback_table_names(&conn).len(), 2);
@@ -2457,7 +2544,7 @@ mod tests {
         // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
         ensure_feedback_tables(&conn).unwrap();
         ensure_feedback_tables(&conn).unwrap();
-        assert_eq!(feedback_table_names(&conn).len(), 5);
+        assert_eq!(feedback_table_names(&conn).len(), 7);
         assert_eq!(feedback_index_names(&conn).len(), 2);
     }
 
@@ -2474,7 +2561,9 @@ mod tests {
              DROP TABLE feedback_slates;
              DROP TABLE learned_weights;
              DROP TABLE learned_weight_sessions;
-             DROP TABLE learned_meta;",
+             DROP TABLE learned_meta;
+             DROP TABLE result_preferences;
+             DROP TABLE result_preference_sessions;",
         )
         .unwrap();
         assert!(feedback_table_names(&conn).is_empty());
@@ -2482,7 +2571,7 @@ mod tests {
         // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
         ensure_feedback_tables(&conn).unwrap();
         ensure_feedback_tables(&conn).unwrap();
-        assert_eq!(feedback_table_names(&conn).len(), 5);
+        assert_eq!(feedback_table_names(&conn).len(), 7);
         assert_eq!(feedback_index_names(&conn).len(), 2);
     }
 

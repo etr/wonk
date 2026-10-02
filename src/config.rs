@@ -266,6 +266,13 @@ pub struct FeedbackConfig {
     /// Distinct sessions a (feature, scope) row needs before it influences
     /// ranking (PRD-FB-REQ-025, AR-044). >= 1.
     pub learn_min_sessions: i64,
+    /// Distinct confirming sessions a single RESULT needs before its
+    /// per-result preference activates (TASK-104, PRD-FB-REQ-016).
+    /// Must be at least 2 (default 3): a value of 1 would let one
+    /// session repeating feedback promote its own pick — the exact
+    /// rich-get-richer loop DR-042 removed (AR-036) — so it is a hard
+    /// load error, not a warning.
+    pub prefer_min_sessions: i64,
 }
 
 impl Default for FeedbackConfig {
@@ -279,6 +286,7 @@ impl Default for FeedbackConfig {
             learn_half_life_days: 30,
             learn_min_observations: 10,
             learn_min_sessions: 3,
+            prefer_min_sessions: 3,
         }
     }
 }
@@ -583,6 +591,7 @@ struct FeedbackOverlay {
     learn_half_life_days: Option<i64>,
     learn_min_observations: Option<i64>,
     learn_min_sessions: Option<i64>,
+    prefer_min_sessions: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -869,6 +878,9 @@ impl Config {
             if let Some(v) = feedback.learn_min_sessions {
                 self.feedback.learn_min_sessions = v;
             }
+            if let Some(v) = feedback.prefer_min_sessions {
+                self.feedback.prefer_min_sessions = v;
+            }
             if self.feedback.slate_retention == 0 {
                 anyhow::bail!(
                     "[feedback] slate_retention must be >= 1 (got 0): no slate could \
@@ -912,6 +924,14 @@ impl Config {
                     "[feedback] learn_min_sessions must be >= 1 (got {}): one session \
                      repeating feedback must never steer ranking",
                     learn.learn_min_sessions
+                );
+            }
+            if learn.prefer_min_sessions < 2 {
+                anyhow::bail!(
+                    "[feedback] prefer_min_sessions must be >= 2 (got {}): a single \
+                     session repeating feedback must never activate a per-result \
+                     preference (PRD-FB-REQ-016, AR-036)",
+                    learn.prefer_min_sessions
                 );
             }
         }
@@ -1612,6 +1632,7 @@ slate_retention = 0
         assert_eq!(config.learn_half_life_days, 30);
         assert_eq!(config.learn_min_observations, 10);
         assert_eq!(config.learn_min_sessions, 3);
+        assert_eq!(config.prefer_min_sessions, 3);
     }
 
     #[test]
@@ -1627,6 +1648,7 @@ learn_max_deviation = 0.25
 learn_half_life_days = 14
 learn_min_observations = 4
 learn_min_sessions = 2
+prefer_min_sessions = 2
 "#,
         );
         let config = env.load().unwrap().feedback;
@@ -1635,6 +1657,28 @@ learn_min_sessions = 2
         assert_eq!(config.learn_half_life_days, 14);
         assert_eq!(config.learn_min_observations, 4);
         assert_eq!(config.learn_min_sessions, 2);
+        assert_eq!(config.prefer_min_sessions, 2);
+    }
+
+    #[test]
+    fn feedback_prefer_gate_layers_repo_over_global() {
+        let mut env = TestEnv::new();
+        env.write_global_config(
+            r#"
+[feedback]
+prefer_min_sessions = 9
+"#,
+        );
+        env.create_repo();
+        env.write_repo_config(
+            r#"
+[feedback]
+prefer_min_sessions = 5
+"#,
+        );
+        let config = env.load().unwrap().feedback;
+        assert_eq!(config.prefer_min_sessions, 5, "repo layer wins");
+        assert_eq!(config.learn_min_sessions, 3, "untouched sibling default");
     }
 
     #[test]
@@ -1669,6 +1713,8 @@ learn_min_observations = 5
             ("learn_half_life_days = 0\n", "learn_half_life_days"),
             ("learn_min_observations = 0\n", "learn_min_observations"),
             ("learn_min_sessions = 0\n", "learn_min_sessions"),
+            ("prefer_min_sessions = 1\n", "prefer_min_sessions"),
+            ("prefer_min_sessions = 0\n", "prefer_min_sessions"),
         ] {
             let mut env = TestEnv::new();
             env.create_repo();

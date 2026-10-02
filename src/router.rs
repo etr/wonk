@@ -2930,22 +2930,24 @@ fn run_feedback_clear_result<W: io::Write>(
 }
 
 /// `wonk feedback --reset-weights` (TASK-103, PRD-FB-REQ-013): every
-/// learned weight back to its configured default, all scopes; the
-/// event history is untouched.
+/// learned weight back to its configured default, all scopes; TASK-104's
+/// per-result preferences clear with them (learned state resets
+/// together). The event history is untouched.
 fn run_feedback_reset_weights<W: io::Write>(
     conn: &Connection,
     fmt: &mut Formatter<W>,
     format: OutputFormat,
 ) -> Result<()> {
-    let reset = crate::learning::reset_learned_weights(conn)?;
+    let (weights, preferences) = crate::learning::reset_learned_weights(conn)?;
     if format.is_structured() {
-        let json = serde_json::json!({"reset": reset});
+        let json = serde_json::json!({"reset": weights, "preferences": preferences});
         writeln!(fmt.writer_mut(), "{json}")?;
         return Ok(());
     }
     writeln!(
         fmt.writer_mut(),
-        "reset {reset} learned weight row(s) to defaults; event history untouched"
+        "reset {weights} learned weight row(s) to defaults; \
+         {preferences} result preference(s) cleared; event history untouched"
     )?;
     Ok(())
 }
@@ -3579,6 +3581,9 @@ pub struct FeedbackStatus {
     /// the same value `wonk feedback --weights` displays per row.
     /// `learn_max_deviation` is its ceiling.
     pub deviation: f32,
+    /// Stored per-result preferences (TASK-104), whole store — gated and
+    /// inert alike, like the event count.
+    pub preferences: i64,
 }
 
 /// Compute the feedback state (TASK-103) with an injected clock — the
@@ -3591,20 +3596,22 @@ pub(crate) fn feedback_status(
     weights: &std::collections::HashMap<String, f32>,
     now: i64,
 ) -> FeedbackStatus {
-    let (events, sessions, deviation) = match conn {
+    let (events, sessions, deviation, preferences) = match conn {
         Some(conn) => {
             let stats = crate::feedback::event_store_stats(conn).unwrap_or((0, 0));
             let deviation =
                 crate::learning::current_deviation(conn, feedback, weights, now).unwrap_or(0.0);
-            (stats.0, stats.1, deviation)
+            let preferences = crate::learning::preference_count(conn);
+            (stats.0, stats.1, deviation, preferences)
         }
-        None => (0, 0, 0.0),
+        None => (0, 0, 0.0, 0),
     };
     FeedbackStatus {
         enabled: feedback.enabled,
         events,
         sessions,
         deviation,
+        preferences,
     }
 }
 
@@ -3732,13 +3739,14 @@ fn feedback_status_line(status: &FeedbackStatus) -> String {
     } else {
         "disabled"
     };
-    let has_state = status.events > 0 || status.deviation != 0.0;
+    let has_state = status.events > 0 || status.deviation != 0.0 || status.preferences > 0;
     if !status.enabled && !has_state {
         return "Feedback: disabled".to_string();
     }
     format!(
-        "Feedback: {state}, {} events, {} sessions, weight deviation {:.3}",
-        status.events, status.sessions, status.deviation
+        "Feedback: {state}, {} events, {} sessions, weight deviation {:.3}, \
+         {} result preferences",
+        status.events, status.sessions, status.deviation, status.preferences
     )
 }
 
@@ -6628,6 +6636,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         };
         let output = format_status_info(&info);
@@ -6665,6 +6674,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         };
         let output = format_status_info(&info);
@@ -6702,6 +6712,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         };
         let output = format_status_info(&info);
@@ -6743,6 +6754,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         };
         let output = format_status_info(&info);
@@ -6777,6 +6789,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         };
         let output = format_status_info(&info);
@@ -6816,6 +6829,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         };
         let output = format_status_info(&info);
@@ -6852,6 +6866,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         };
         let output = format_status_info(&info);
@@ -6886,6 +6901,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         };
         let value = serde_json::to_value(&info).unwrap();
@@ -6930,6 +6946,7 @@ mod tests {
                 events: 0,
                 sessions: 0,
                 deviation: 0.0,
+                preferences: 0,
             },
         }
     }
@@ -6977,9 +6994,13 @@ mod tests {
             events: 40,
             sessions: 40,
             deviation: 0.05,
+            preferences: 3,
         }));
         assert!(
-            out.contains("Feedback: enabled, 40 events, 40 sessions, weight deviation 0.050"),
+            out.contains(
+                "Feedback: enabled, 40 events, 40 sessions, weight deviation 0.050, \
+                 3 result preferences"
+            ),
             "got: {out}"
         );
         // Disabled with leftover state: the counts stay legible.
@@ -6988,9 +7009,13 @@ mod tests {
             events: 40,
             sessions: 40,
             deviation: 0.05,
+            preferences: 3,
         }));
         assert!(
-            out.contains("Feedback: disabled, 40 events, 40 sessions, weight deviation 0.050"),
+            out.contains(
+                "Feedback: disabled, 40 events, 40 sessions, weight deviation 0.050, \
+                 3 result preferences"
+            ),
             "got: {out}"
         );
         // Disabled with nothing recorded: bare.
@@ -6999,11 +7024,27 @@ mod tests {
             events: 0,
             sessions: 0,
             deviation: 0.0,
+            preferences: 0,
         }));
         assert!(out.contains("Feedback: disabled"), "got: {out}");
         assert!(
             !out.contains("weight deviation"),
             "no counts to show: {out}"
+        );
+        // Preferences alone are leftover state: legible with the feature off.
+        let out = format_status_info(&with(FeedbackStatus {
+            enabled: false,
+            events: 0,
+            sessions: 0,
+            deviation: 0.0,
+            preferences: 2,
+        }));
+        assert!(
+            out.contains(
+                "Feedback: disabled, 0 events, 0 sessions, weight deviation 0.000, \
+                 2 result preferences"
+            ),
+            "a leftover preference surfaces the line: {out}"
         );
     }
 
@@ -7015,6 +7056,7 @@ mod tests {
                 events: 7,
                 sessions: 3,
                 deviation: 0.25,
+                preferences: 2,
             },
             ..topology_status_info(0, 0, None, false, true)
         };
@@ -7023,6 +7065,7 @@ mod tests {
         assert_eq!(value["feedback"]["events"], 7);
         assert_eq!(value["feedback"]["sessions"], 3);
         assert_eq!(value["feedback"]["deviation"], 0.25);
+        assert_eq!(value["feedback"]["preferences"], 2);
     }
 
     #[test]
@@ -7055,6 +7098,15 @@ mod tests {
             [],
         )
         .unwrap();
+        for identity in ["id1", "id2"] {
+            conn.execute(
+                "INSERT INTO result_preferences \
+                 (result_identity, strength, observations, sessions, updated_at) \
+                 VALUES (?1, 0.3, 4, 4, 1000)",
+                [identity],
+            )
+            .unwrap();
+        }
         let weights = std::collections::HashMap::from([("path_character".to_string(), 0.6)]);
 
         let status = feedback_status(
@@ -7068,6 +7120,7 @@ mod tests {
         );
         assert_eq!(status.events, 5);
         assert_eq!(status.sessions, 3, "distinct sessions");
+        assert_eq!(status.preferences, 2, "stored result preferences");
         assert!((status.deviation - 0.05).abs() < 1e-6, "{status:?}");
 
         // No connection at all: zeros, enabled still reported.
@@ -7078,8 +7131,13 @@ mod tests {
             1000,
         );
         assert_eq!(
-            (status.events, status.sessions, status.deviation),
-            (0, 0, 0.0)
+            (
+                status.events,
+                status.sessions,
+                status.deviation,
+                status.preferences
+            ),
+            (0, 0, 0.0, 0)
         );
         assert!(!status.enabled);
     }
@@ -8105,6 +8163,10 @@ mod tests {
             "the confirmation: {out}"
         );
         assert!(
+            out.contains("result preference(s) cleared"),
+            "preferences ride the reset confirmation: {out}"
+        );
+        assert!(
             out.contains("event history untouched"),
             "the independence is in the message: {out}"
         );
@@ -8115,6 +8177,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(sessions, 0, "session bookkeeping reset with them");
+        let preferences: i64 = conn
+            .query_row("SELECT COUNT(*) FROM result_preferences", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(preferences, 0, "result preferences reset with them");
         assert_eq!(
             feedback_event_count(&conn),
             events_before,
