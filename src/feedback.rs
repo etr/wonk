@@ -324,6 +324,284 @@ pub fn build_and_store_slate(
     Ok(token)
 }
 
+// ---------------------------------------------------------------------------
+// Feedback recording + read APIs
+// ---------------------------------------------------------------------------
+
+/// The `feedback_events.features` payload: the full slate as persisted at
+/// search time, with `chosen` set on the reported-useful members. Every
+/// event of one feedback call carries the same document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SlateFeatures {
+    /// Shape version; bump on breaking change.
+    pub schema: u32,
+    /// The slate token this event was reported against.
+    pub slate: String,
+    /// Every result that was shown, alternatives included (PRD-FB-REQ-002).
+    pub members: Vec<SlateMember>,
+}
+
+/// One recorded event as the caller-facing summary reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedEvent {
+    pub identity: String,
+    pub rank: usize,
+    pub file: String,
+    pub symbol: Option<String>,
+    /// Whether the identity still resolves against the current index.
+    /// Line-anchored members (`symbol: None`) count as live: their
+    /// identity is content-derived and never retires by drift.
+    pub live: bool,
+}
+
+/// One `feedback_events` row, typed, so TASK-102 never parses the JSON
+/// itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeedbackEvent {
+    pub id: i64,
+    pub result_identity: String,
+    pub query_class: Option<String>,
+    pub chosen_rank: i64,
+    pub features: SlateFeatures,
+    pub useful: bool,
+    pub session: Option<String>,
+    pub created_at: i64,
+}
+
+/// Load every feedback event, oldest first, features parsed.
+pub fn load_events(conn: &Connection) -> Result<Vec<FeedbackEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, result_identity, query_class, chosen_rank, features, useful, session, \
+         created_at FROM feedback_events ORDER BY id",
+    )?;
+    let events = stmt
+        .query_map([], |row| {
+            Ok(FeedbackEvent {
+                id: row.get(0)?,
+                result_identity: row.get(1)?,
+                query_class: row.get(2)?,
+                chosen_rank: row.get(3)?,
+                features: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                useful: row.get::<_, i64>(5)? == 1,
+                session: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(events)
+}
+
+/// Distinct sessions that have reported `identity` useful — the exact
+/// observation count TASK-102's gate and TASK-104's multi-session gate
+/// consume (PRD-FB-REQ-015/016).
+pub fn distinct_sessions(conn: &Connection, identity: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(DISTINCT session) FROM feedback_events WHERE result_identity = ?1",
+        [identity],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Maximum session id length (D5).
+const SESSION_MAX: usize = 256;
+
+/// Validate a session id: non-empty after trim, at most [`SESSION_MAX`]
+/// chars.
+fn validate_session(session: &str) -> Result<()> {
+    if session.trim().is_empty() {
+        bail!("session must be a non-empty id identifying your current session/conversation");
+    }
+    if session.chars().count() > SESSION_MAX {
+        bail!("session must be at most {SESSION_MAX} characters");
+    }
+    Ok(())
+}
+
+/// Record feedback against a persisted slate (PRD-FB-REQ-001/002/003).
+///
+/// `useful` names results by identity (64-hex) or 1-based rank; one
+/// `feedback_events` row is written per useful member, each carrying the
+/// FULL slate in `features` with `chosen` set on exactly the useful
+/// members. All resolution happens before the first write, so a bad
+/// argument leaves the table untouched. Returns the per-event summary
+/// with read-time liveness.
+pub fn record_feedback(
+    conn: &Connection,
+    token: &str,
+    useful: &[String],
+    session: &str,
+) -> Result<Vec<RecordedEvent>> {
+    validate_session(session)?;
+    let trimmed: Vec<&str> = useful
+        .iter()
+        .map(|u| u.trim())
+        .filter(|u| !u.is_empty())
+        .collect();
+    if trimmed.is_empty() {
+        bail!("useful must name at least one result (identity or 1-based rank)");
+    }
+    let (query_class, mut members): (Option<String>, Vec<SlateMember>) = conn
+        .query_row(
+            "SELECT query_class, members FROM feedback_slates WHERE token = ?1",
+            [token],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    serde_json::from_str::<Vec<SlateMember>>(&row.get::<_, String>(1)?).map_err(
+                        |e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        },
+                    )?,
+                ))
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => anyhow::anyhow!(
+                "slate not found (expired or pruned); re-run the search and report \
+                 against the new slate"
+            ),
+            other => other.into(),
+        })?;
+
+    // Resolve every useful reference to a member index BEFORE writing.
+    let mut chosen: Vec<usize> = Vec::new();
+    for spec in &trimmed {
+        let idx = match spec.parse::<usize>() {
+            Ok(rank) => members
+                .iter()
+                .position(|m| m.rank == rank)
+                .ok_or_else(|| anyhow::anyhow!("rank {rank} is not in the slate"))?,
+            Err(_) => members
+                .iter()
+                .position(|m| m.identity == *spec)
+                .ok_or_else(|| anyhow::anyhow!("identity '{spec}' is not in the slate"))?,
+        };
+        if !chosen.contains(&idx) {
+            chosen.push(idx);
+        }
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+
+    // Read-time liveness (D7): recompute the identities of the files the
+    // chosen members live in.
+    let files: Vec<String> = {
+        let mut seen = std::collections::BTreeSet::new();
+        for &idx in &chosen {
+            seen.insert(members[idx].file.clone());
+        }
+        seen.into_iter().collect()
+    };
+    let identities: std::collections::HashSet<String> = chosen
+        .iter()
+        .map(|&idx| members[idx].identity.clone())
+        .collect();
+    let live = live_identities(conn, &files, &identities);
+
+    for &idx in &chosen {
+        members[idx].chosen = true;
+    }
+    let features = SlateFeatures {
+        schema: 1,
+        slate: token.to_string(),
+        members,
+    };
+    let features_json = serde_json::to_string(&features)?;
+
+    let tx = conn.unchecked_transaction()?;
+    for &idx in &chosen {
+        let member = &features.members[idx];
+        tx.execute(
+            "INSERT INTO feedback_events \
+             (result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+            rusqlite::params![
+                member.identity,
+                query_class,
+                member.rank as i64,
+                features_json,
+                session,
+                now
+            ],
+        )?;
+    }
+    tx.commit()?;
+
+    Ok(chosen
+        .into_iter()
+        .map(|idx| {
+            let m = &features.members[idx];
+            let is_live = m.symbol.is_none() || live.contains(&m.identity);
+            RecordedEvent {
+                identity: m.identity.clone(),
+                rank: m.rank,
+                file: m.file.clone(),
+                symbol: m.symbol.clone(),
+                live: is_live,
+            }
+        })
+        .collect())
+}
+
+/// Which of `identities` still resolve against the current index (D7)?
+///
+/// Recomputes [`result_identity`] over the `symbols` rows of `files` (one
+/// bounded query) and intersects: a rename, kind change, signature-token
+/// change, or file move yields a different identity and the entry no
+/// longer applies (PRD-FB-REQ-006) — retirement resolved at read time,
+/// never a write. Body-only edits and re-indexing re-insert the same
+/// `(file, kind, name, signature)` row, so those identities survive
+/// (PRD-FB-REQ-005). Line-anchored identities are content-derived and not
+/// recomputable from the index; they never match and are treated as live
+/// by their consumers (they carry `symbol: null`).
+pub fn live_identities(
+    conn: &Connection,
+    files: &[String],
+    identities: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut live = std::collections::HashSet::new();
+    if files.is_empty() || identities.is_empty() {
+        return live;
+    }
+    for chunk in files.chunks(SQL_VAR_LIMIT) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT file, kind, name, signature FROM symbols WHERE file IN ({placeholders})"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            return live;
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        }) else {
+            return live;
+        };
+        for row in rows.flatten() {
+            let (file, kind, name, signature) = row;
+            let identity = result_identity(&file, &kind, &name, signature.as_deref().unwrap_or(""));
+            if identities.contains(&identity) {
+                live.insert(identity);
+            }
+        }
+    }
+    live
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +702,9 @@ mod tests {
     /// Top-level lines outside any function span (a comment and a const)
     /// exercise the `line_identity` fallback.
     const OUTSIDE_SRC: &str = "// file-level note about tuning\nconst TUNING_LIMIT: u32 = 7;\n\npub fn tuned(v: u32) -> u32 {\n    v.min(TUNING_LIMIT)\n}\n";
+
+    /// An unrelated second file for cross-file retirement checks.
+    const OTHER_SRC: &str = "pub fn other_entry(x: i64) -> i64 {\n    x.abs()\n}\n";
 
     fn seeded_conn(files: &[(&str, &str)]) -> (TempDir, Connection) {
         let dir = TempDir::new().unwrap();
@@ -673,5 +954,313 @@ mod tests {
         let b = build_and_store_slate(&conn, "q", &ranked, 64).unwrap();
         assert_ne!(a, b, "same query back-to-back still mints distinct tokens");
         drop(dir);
+    }
+
+    // -- record_feedback + read APIs ---------------------------------------------
+
+    /// A two-member slate over the nested fixture: rank 1 = outer_guard's
+    /// definition line, rank 2 = the call-site line inside outer_guard's
+    /// body (owned by outer_guard, the only span containing line 6).
+    fn stored_slate(conn: &Connection) -> String {
+        let ranked = ranked_search(vec![
+            (
+                crate::ranker::ResultCategory::Definition,
+                vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+            ),
+            (
+                crate::ranker::ResultCategory::CallSite,
+                vec![("nested.rs", 6, "    helper_inner(a)", 0.7)],
+            ),
+        ]);
+        build_and_store_slate(conn, "guard", &ranked, 64).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct EventRow {
+        identity: String,
+        class: Option<String>,
+        rank: i64,
+        features: String,
+        session: Option<String>,
+    }
+
+    fn event_rows(conn: &Connection) -> Vec<EventRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT result_identity, query_class, chosen_rank, features, session \
+                 FROM feedback_events ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(EventRow {
+                identity: row.get(0)?,
+                class: row.get(1)?,
+                rank: row.get(2)?,
+                features: row.get(3)?,
+                session: row.get(4)?,
+            })
+        })
+        .unwrap()
+        .flatten()
+        .collect()
+    }
+
+    #[test]
+    fn record_feedback_writes_one_event_per_useful_member_with_full_slate() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+        let (_, _, members_json) = slate_row(&conn, &token);
+        let members: Vec<SlateMember> = serde_json::from_str(&members_json).unwrap();
+        let chosen_identity = members[1].identity.clone();
+        let alt_identity = members[0].identity.clone();
+
+        let recorded = record_feedback(&conn, &token, &["2".to_string()], "sess-1").unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].identity, chosen_identity);
+        assert_eq!(recorded[0].rank, 2);
+        assert!(recorded[0].live, "untouched index: everything resolves");
+
+        let rows = event_rows(&conn);
+        assert_eq!(rows.len(), 1, "one event per useful member");
+        let row = &rows[0];
+        assert_eq!(row.identity, chosen_identity);
+        assert_eq!(row.class.as_deref(), Some("symbol"));
+        assert_eq!(row.rank, 2);
+        assert_eq!(row.session.as_deref(), Some("sess-1"));
+        let features = &row.features;
+
+        // The features JSON carries EVERY member with chosen only on the
+        // useful one (REQ-002: alternatives included).
+        let parsed: SlateFeatures = serde_json::from_str(features).unwrap();
+        assert_eq!(parsed.schema, 1);
+        assert_eq!(parsed.slate, token);
+        assert_eq!(parsed.members.len(), 2);
+        let by_rank = |r: usize| parsed.members.iter().find(|m| m.rank == r).unwrap();
+        assert!(by_rank(2).chosen);
+        assert!(!by_rank(1).chosen);
+        assert_eq!(by_rank(1).identity, alt_identity);
+        drop(dir);
+    }
+
+    #[test]
+    fn record_feedback_accepts_identities_and_ranks_and_multiple() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+        let (_, _, members_json) = slate_row(&conn, &token);
+        let members: Vec<SlateMember> = serde_json::from_str(&members_json).unwrap();
+        let first = members[0].identity.clone();
+
+        // Rank "2" and the rank-1 identity in one call: two events.
+        record_feedback(&conn, &token, &["2".to_string(), first.clone()], "s").unwrap();
+        assert_eq!(event_rows(&conn).len(), 2);
+
+        // Same member twice (identity + rank): deduplicated to one event.
+        conn.execute("DELETE FROM feedback_events", []).unwrap();
+        record_feedback(&conn, &token, &["1".to_string(), first], "s").unwrap();
+        assert_eq!(event_rows(&conn).len(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn record_feedback_error_paths() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+
+        // Unknown token: the re-search guidance.
+        let err = record_feedback(&conn, "deadbeef00000000", &["1".to_string()], "s")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("slate not found"), "{err}");
+        assert!(err.contains("re-run the search"), "{err}");
+
+        // Empty useful.
+        let err = record_feedback(&conn, &token, &[], "s")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("useful"), "{err}");
+
+        // Whitespace-only useful.
+        let err = record_feedback(&conn, &token, &["  ".to_string()], "s")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("useful"), "{err}");
+
+        // Unknown identity and out-of-range rank.
+        let err = record_feedback(&conn, &token, &["f".repeat(64)], "s")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in the slate"), "{err}");
+        let err = record_feedback(&conn, &token, &["9".to_string()], "s")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in the slate"), "{err}");
+
+        // Invalid session: empty and over-length.
+        let err = record_feedback(&conn, &token, &["1".to_string()], "  ")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("session"), "{err}");
+        let err = record_feedback(&conn, &token, &["1".to_string()], &"x".repeat(257))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("session"), "{err}");
+
+        // Nothing was written by any failed call.
+        assert_eq!(event_rows(&conn).len(), 0);
+        drop(dir);
+    }
+
+    #[test]
+    fn record_feedback_atomic_on_bad_member() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+        // A good rank mixed with a bad identity: the whole batch fails.
+        assert!(record_feedback(&conn, &token, &["1".to_string(), "b".repeat(64)], "s").is_err());
+        assert_eq!(
+            event_rows(&conn).len(),
+            0,
+            "mid-batch failure wrote nothing"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn distinct_sessions_counts_one_vs_many() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+        let (_, _, members_json) = slate_row(&conn, &token);
+        let first = serde_json::from_str::<Vec<SlateMember>>(&members_json).unwrap()[0]
+            .identity
+            .clone();
+
+        for _ in 0..5 {
+            record_feedback(&conn, &token, &["1".to_string()], "one-session").unwrap();
+        }
+        for n in 0..5 {
+            record_feedback(&conn, &token, &["1".to_string()], &format!("s{n}")).unwrap();
+        }
+        // Both fixture members anchor on outer_guard, so they share one
+        // identity; a never-recorded identity is the honest zero case.
+        assert_eq!(distinct_sessions(&conn, &first), 6);
+        assert_eq!(
+            distinct_sessions(
+                &conn,
+                &result_identity("x.rs", "function", "never", "fn never()")
+            ),
+            0
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn load_events_round_trips() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+        let (_, _, members_json) = slate_row(&conn, &token);
+        let members: Vec<SlateMember> = serde_json::from_str(&members_json).unwrap();
+        record_feedback(&conn, &token, &["2".to_string()], "sess-a").unwrap();
+
+        let events = load_events(&conn).unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.result_identity, members[1].identity);
+        assert_eq!(e.query_class.as_deref(), Some("symbol"));
+        assert_eq!(e.chosen_rank, 2);
+        assert_eq!(e.session.as_deref(), Some("sess-a"));
+        assert!(e.useful);
+        assert!(e.created_at > 0);
+        assert_eq!(e.features.slate, token);
+        assert_eq!(e.features.members.len(), 2);
+        assert!(
+            e.features
+                .members
+                .iter()
+                .find(|m| m.rank == 2)
+                .unwrap()
+                .chosen
+        );
+        drop(dir);
+    }
+
+    // -- live_identities ----------------------------------------------------------
+
+    /// Re-index `root` after rewriting `file` to `content` (a real
+    /// incremental re-index, the retirement path's actual trigger).
+    fn reindex(root: &std::path::Path, file: &str, content: &str) {
+        std::fs::write(root.join(file), content).unwrap();
+        crate::pipeline::build_index(root, true).unwrap();
+    }
+
+    #[test]
+    fn live_identities_survive_unrelated_and_body_only_edits() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC), ("other.rs", OTHER_SRC)]);
+        let root = dir.path().to_path_buf();
+        let token = stored_slate(&conn);
+        let (_, _, members_json) = slate_row(&conn, &token);
+        let members: Vec<SlateMember> = serde_json::from_str(&members_json).unwrap();
+        let identity = members[0].identity.clone();
+        let files = vec!["nested.rs".to_string(), "other.rs".to_string()];
+        let queried = std::collections::HashSet::from([identity.clone()]);
+
+        // Edit an unrelated file: nothing changes for nested.rs.
+        reindex(
+            &root,
+            "other.rs",
+            "// a new comment line\nconst FRESH: u32 = 9;\n\npub fn fresh(v: u32) -> u32 {\n    v + FRESH\n}\n",
+        );
+        let live = live_identities(&conn, &files, &queried);
+        assert!(live.contains(&identity), "unrelated edit must not retire");
+
+        // Body-only edit inside nested.rs: same signature, same identity.
+        reindex(
+            &root,
+            "nested.rs",
+            "pub fn outer_guard(a: u32) -> u32 {\n    fn helper_inner(x: u32) -> u32 {\n        let doubled = x * 3;\n        doubled + 1\n    }\n    helper_inner(a)\n}\n",
+        );
+        let live = live_identities(&conn, &files, &queried);
+        assert!(live.contains(&identity), "body-only edit must not retire");
+        drop(dir);
+    }
+
+    #[test]
+    fn live_identities_retire_on_signature_edit_and_rename() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let root = dir.path().to_path_buf();
+        let token = stored_slate(&conn);
+        let (_, _, members_json) = slate_row(&conn, &token);
+        let members: Vec<SlateMember> = serde_json::from_str(&members_json).unwrap();
+        let files = vec!["nested.rs".to_string()];
+        let queried = std::collections::HashSet::from([members[0].identity.clone()]);
+
+        // Signature edit (rename a parameter): identity changes.
+        reindex(
+            &root,
+            "nested.rs",
+            "pub fn outer_guard(b: u32) -> u32 {\n    fn helper_inner(x: u32) -> u32 {\n        let doubled = x * 2;\n        doubled + 1\n    }\n    helper_inner(b)\n}\n",
+        );
+        assert!(
+            !live_identities(&conn, &files, &queried).contains(&members[0].identity),
+            "signature edit must retire"
+        );
+
+        // Fresh index; rename the symbol: identity changes.
+        let (dir2, conn2) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let root2 = dir2.path().to_path_buf();
+        let token2 = stored_slate(&conn2);
+        let (_, _, mj2) = slate_row(&conn2, &token2);
+        let m2: Vec<SlateMember> = serde_json::from_str(&mj2).unwrap();
+        let queried2 = std::collections::HashSet::from([m2[0].identity.clone()]);
+        reindex(
+            &root2,
+            "nested.rs",
+            "pub fn outer_renamed(a: u32) -> u32 {\n    fn helper_inner(x: u32) -> u32 {\n        let doubled = x * 2;\n        doubled + 1\n    }\n    helper_inner(a)\n}\n",
+        );
+        assert!(
+            !live_identities(&conn2, &["nested.rs".to_string()], &queried2)
+                .contains(&m2[0].identity),
+            "rename must retire"
+        );
+        drop(dir);
+        drop(dir2);
     }
 }
