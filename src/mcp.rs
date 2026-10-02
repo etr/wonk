@@ -1692,6 +1692,7 @@ impl McpServer {
         };
         settings.use_pipeline |= config.feedback.enabled;
         settings.feedback_capture = config.feedback.enabled;
+        settings.feedback_author_features = config.feedback.author_features;
         settings.working_context = context_file;
         // Learned weights (TASK-102): the gated overlay — ONE read,
         // best-effort (a missing table is silent; other errors warn).

@@ -286,6 +286,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // hint (--context) into the slate's features; the
                         // hint never affects ranking.
                         settings.feedback_capture = config.feedback.enabled;
+                        settings.feedback_author_features = config.feedback.author_features;
                         settings.working_context = args.context.clone();
                         // Learned weights (TASK-102): the gated overlay
                         // joins the settings — ONE read, best-effort like

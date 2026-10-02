@@ -234,6 +234,18 @@ fn ranked_for(
     query: &str,
     learned: Option<learning::LearnedTable>,
 ) -> wonk::rerank::RankedSearch {
+    ranked_for_with(root, conn, query, learned, fixture_weights())
+}
+
+/// [`ranked_for`] over an explicit weight table — the negative-default
+/// repair exercises a demotion-style configured weight.
+fn ranked_for_with(
+    root: &Path,
+    conn: &Connection,
+    query: &str,
+    learned: Option<learning::LearnedTable>,
+    weights: HashMap<String, f32>,
+) -> wonk::rerank::RankedSearch {
     let root_str = root.display().to_string();
     let mut results = wonk::search::text_search(query, false, false, &[root_str]).unwrap();
     for result in &mut results {
@@ -243,7 +255,7 @@ fn ranked_for(
     }
     let settings = RankSettings {
         use_pipeline: true,
-        weights: wonk::rerank::WeightTable::from_config(&fixture_weights()).unwrap(),
+        weights: wonk::rerank::WeightTable::from_config(&weights).unwrap(),
         feedback_capture: true,
         learned,
         ..RankSettings::default()
@@ -723,6 +735,104 @@ fn member_groups(path_character: f32) -> wonk::feedback::FeatureGroups {
 }
 
 // ---------------------------------------------------------------------------
+// AC (iter-1 repair): a negative configured signal weight is legal config —
+// bounded learning on BOTH the learn and the load/query paths, never a
+// panic (PRD-FB-REQ-010)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn negative_configured_signal_weight_is_bounded_on_both_paths() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+
+    // A demotion-style negative default for path_character: legal config
+    // (WeightTable::from_config rejects only unknown names and
+    // non-finite values).
+    let weights: HashMap<String, f32> = HashMap::from([
+        ("path_character".to_string(), -0.2),
+        ("lexical".to_string(), 0.4),
+        ("feedback".to_string(), 0.35),
+    ]);
+    let span = 0.5f32 * 0.2; // dev * |default|
+    let (lo, hi) = (-0.2 - span, -0.2 + span);
+
+    // LEARN PATH: 40 events preferring the useful member drive
+    // next_weight's clamp around the negative default — the inverted
+    // bounds would panic here.
+    let useful = wonk::feedback::SlateMember {
+        identity: "u".to_string(),
+        rank: 2,
+        chosen: true,
+        file: "src/crop/mod.rs".to_string(),
+        line: 2,
+        symbol: Some("crop_yield".to_string()),
+        kind: Some("function".to_string()),
+        score: 1.0,
+        groups: member_groups(1.0),
+    };
+    let alt = wonk::feedback::SlateMember {
+        identity: "a".to_string(),
+        rank: 1,
+        chosen: false,
+        file: "tests/crop_test.rs".to_string(),
+        line: 3,
+        symbol: Some("crop_yield_stub".to_string()),
+        kind: Some("function".to_string()),
+        score: 0.9,
+        groups: member_groups(0.0),
+    };
+    let features = wonk::feedback::SlateFeatures {
+        schema: 1,
+        slate: "negative-default".to_string(),
+        members: vec![alt, useful],
+    };
+    let payload = serde_json::to_string(&features).unwrap();
+    for id in 1..=40 {
+        conn.execute(
+            "INSERT INTO feedback_events \
+             (id, result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+             VALUES (?1, 'u', NULL, 2, ?2, 1, ?3, ?4)",
+            rusqlite::params![id, payload, format!("neg{}", id % 4), id],
+        )
+        .unwrap();
+    }
+    learning::learn_pending(&conn, &feedback_config(true), &weights, 10_000).unwrap();
+
+    for (feature, _, weight, _, _) in learned_dump(&conn) {
+        if feature == "path_character" {
+            assert!(
+                weight >= lo - 1e-6 && weight <= hi + 1e-6,
+                "negative-default signal within its bounds: {weight} not in [{lo}, {hi}]"
+            );
+        }
+    }
+
+    // QUERY PATH: evidence_of's load-time re-clamp over the stored rows
+    // (the dispatch's one learned_weights read), then the full ranked
+    // search under the negative configured weight — a bounded value, not
+    // a process crash.
+    let learned = learning::load_learned(&conn, &feedback_config(true), &weights, 10_000)
+        .unwrap()
+        .expect("40 obs / 4 sessions clear the gates");
+    for row in learned.evidence() {
+        if row.feature == "path_character" {
+            assert!(
+                row.effective >= lo - 1e-6 && row.effective <= hi + 1e-6,
+                "re-clamped effective {} within [{lo}, {hi}]",
+                row.effective
+            );
+        }
+    }
+    let ranked = ranked_for_with(&root, &conn, "crop_yield", Some(learned), weights);
+    assert!(
+        !ranked.groups.is_empty(),
+        "the query path completes under a negative configured weight"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
 // AC: weights decay toward defaults with age
 // ---------------------------------------------------------------------------
 
@@ -1075,6 +1185,143 @@ fn ranked_search_adds_one_learned_read_and_no_writes() {
             "the query path never writes: {stmt}"
         );
     }
+    drop(conn);
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// AC (iter-1 repair): with feedback enabled the candidate feature
+// extraction (symbol bulk-load + group extraction + cardinality cap) runs
+// ONCE per query, shared between the descriptive pre-sort pass and the
+// slate build
+// ---------------------------------------------------------------------------
+
+static TRACE_SQL_SHARE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn trace_stmts_share(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+        && let Ok(mut log) = TRACE_SQL_SHARE.lock()
+    {
+        log.push(sql.to_string());
+    }
+}
+
+#[test]
+fn the_descriptive_pass_and_slate_build_share_one_extraction() {
+    let (dir, root) = learning_repo(true, "");
+    let conn = open_index(&root);
+
+    // Gated DESCRIPTIVE rows: 12 events whose useful member carries
+    // path:src and whose alternative does not — path:src learns, clears
+    // the gates, and the pre-sort descriptive pass runs on the next
+    // search.
+    let useful = wonk::feedback::SlateMember {
+        identity: "u".to_string(),
+        rank: 2,
+        chosen: true,
+        file: "src/crop/mod.rs".to_string(),
+        line: 2,
+        symbol: Some("crop_yield".to_string()),
+        kind: Some("function".to_string()),
+        score: 1.0,
+        groups: member_groups(1.0),
+    };
+    let alt = wonk::feedback::SlateMember {
+        identity: "a".to_string(),
+        rank: 1,
+        chosen: false,
+        file: "tests/crop_test.rs".to_string(),
+        line: 3,
+        symbol: Some("crop_yield_stub".to_string()),
+        kind: Some("function".to_string()),
+        score: 0.9,
+        groups: member_groups(0.0),
+    };
+    let features = wonk::feedback::SlateFeatures {
+        schema: 1,
+        slate: "share".to_string(),
+        members: vec![alt, useful],
+    };
+    let payload = serde_json::to_string(&features).unwrap();
+    for id in 1..=12 {
+        conn.execute(
+            "INSERT INTO feedback_events \
+             (id, result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+             VALUES (?1, 'u', NULL, 2, ?2, 1, ?3, ?4)",
+            rusqlite::params![id, payload, format!("shr{}", id % 4), id],
+        )
+        .unwrap();
+    }
+    learning::learn_pending(&conn, &feedback_config(true), &fixture_weights(), 10_000).unwrap();
+    let learned = learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 10_000)
+        .unwrap()
+        .expect("gated descriptive rows");
+    assert!(
+        learned
+            .evidence()
+            .iter()
+            .any(|row| row.feature.starts_with("path:")),
+        "a descriptive row must be gated for the pass to run"
+    );
+
+    // The query: ranked search (the descriptive pass extracts) + the
+    // slate build — ONE symbol bulk-load between them.
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(trace_stmts_share),
+    );
+    let stored = {
+        let ranked = ranked_for(&root, &conn, "crop_yield", Some(learned));
+        feedback::build_and_store_slate(&conn, "crop_yield", &ranked, &feedback_config(true))
+            .unwrap()
+    };
+    let statements = TRACE_SQL_SHARE.lock().unwrap().clone();
+    conn.trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, None);
+
+    let bulk_loads = statements
+        .iter()
+        .filter(|s| {
+            s.to_lowercase()
+                .starts_with("select id, file, line, end_line, name, kind, scope, signature, language from symbols where file in")
+        })
+        .count();
+    assert_eq!(
+        bulk_loads, 1,
+        "the symbol bulk-load runs exactly once per query (pass + slate share it): {statements:?}"
+    );
+    // The slate still records its descriptive keys.
+    assert!(
+        stored
+            .members
+            .iter()
+            .any(|m| m.file.ends_with("src/crop/mod.rs") && m.groups.path.contains_key("src")),
+        "the shared extraction still feeds the recorded groups"
+    );
+
+    // Byte identity: the shared-extraction slate records the same
+    // descriptive groups a from-scratch extraction would (signals
+    // excluded — the pass contributes a `feedback` row the plain search
+    // lacks).
+    let plain = ranked_for(&root, &conn, "crop_yield", None);
+    let stored_plain =
+        feedback::build_and_store_slate(&conn, "crop_yield", &plain, &feedback_config(true))
+            .unwrap();
+    let descriptive = |stored: &feedback::StoredSlate| {
+        stored
+            .members
+            .iter()
+            .map(|m| {
+                let mut groups = m.groups.clone();
+                groups.signals = Vec::new();
+                (m.identity.clone(), groups)
+            })
+            .collect::<HashMap<String, wonk::feedback::FeatureGroups>>()
+    };
+    assert_eq!(
+        descriptive(&stored),
+        descriptive(&stored_plain),
+        "shared-extraction slate bytes equal from-scratch extraction bytes"
+    );
     drop(conn);
     drop(dir);
 }

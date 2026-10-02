@@ -609,6 +609,12 @@ pub struct SharedContext {
     pub(crate) file_keys: HashMap<String, String>,
     /// The working-context hint slice (empty unless a hint was supplied).
     pub(crate) working: WorkingContext,
+    /// The ONE prepared feedback feature extraction per query
+    /// (TASK-102): set when the descriptive pre-sort pass ran, so the
+    /// feedback slate build reuses its symbol bulk-load and capped
+    /// feature groups instead of re-deriving identical work over the
+    /// same candidates. `None` on every other path.
+    pub(crate) feedback_extraction: Option<std::sync::Arc<crate::feedback::FeedbackExtraction>>,
 }
 
 impl SharedContext {
@@ -2729,6 +2735,11 @@ struct ScoreExtras<'a> {
     extra_reqs: ContextReqs,
     hint: Option<&'a str>,
     learned: Option<&'a crate::learning::ResolvedFeedback>,
+    /// Whether `[feedback] author_features` records author-derived
+    /// groups — threaded into the descriptive pass so the ONE shared
+    /// extraction carries every author key the slate build's own
+    /// configuration records.
+    author_features: bool,
 }
 
 /// The shared scoring body (TASK-105), additionally returning the
@@ -2788,7 +2799,7 @@ fn rerank_core(
         );
     }
     reqs = reqs.union(extras.extra_reqs);
-    let ctx = prepare_context_with(reqs, query.pattern, &results, conn, sources, extras.hint);
+    let mut ctx = prepare_context_with(reqs, query.pattern, &results, conn, sources, extras.hint);
 
     let mut scored: Vec<ScoredResult> = results
         .into_iter()
@@ -2818,17 +2829,26 @@ fn rerank_core(
         // The descriptive `feedback` contribution joins the score BEFORE
         // the sort — features are rank-independent (no novelty-style
         // circularity). Best-effort like the slate recording: a failure
-        // warns and leaves the scores untouched.
+        // warns and leaves the scores untouched. The pass's prepared
+        // extraction (symbol bulk-load + capped groups) rides the
+        // context so the slate build reuses it — ONE extraction per
+        // query (TASK-102).
         let learned = extras.learned.unwrap();
-        if let Err(e) = crate::learning::apply_feedback_contribution(
+        match crate::learning::apply_feedback_contribution(
             &mut scored,
             &ctx,
             learned,
             query,
             conn.unwrap(),
             feedback_weight,
+            extras.author_features,
         ) {
-            eprintln!("wonk: feedback contribution pass failed: {e:#}");
+            Ok(extraction) => {
+                ctx.feedback_extraction = Some(std::sync::Arc::new(extraction));
+            }
+            Err(e) => {
+                eprintln!("wonk: feedback contribution pass failed: {e:#}");
+            }
         }
     }
     scored.sort_by(compare_scored);
@@ -2997,6 +3017,11 @@ pub struct RankSettings {
     /// per-result, statement set) and the ranked search carries its
     /// prepared context for the slate builder.
     pub feedback_capture: bool,
+    /// Whether `[feedback] author_features` is on (TASK-102): threads
+    /// into the descriptive pass's extraction so the ONE shared
+    /// extraction — which the slate build reuses — records author groups
+    /// exactly per the configuration.
+    pub feedback_author_features: bool,
     /// Learned weights loaded for this search (TASK-102): gated rows
     /// only, decayed and re-clamped at load. `None` — no feedback store,
     /// nothing past the gates — leaves the code path bit-identical to
@@ -3014,6 +3039,7 @@ impl Default for RankSettings {
             pinned_class: None,
             working_context: None,
             feedback_capture: false,
+            feedback_author_features: false,
             learned: None,
         }
     }
@@ -3056,6 +3082,7 @@ impl RankSettings {
             pinned_class: pinned,
             working_context: None,
             feedback_capture: false,
+            feedback_author_features: false,
             learned: None,
         })
     }
@@ -3145,6 +3172,7 @@ pub fn rank_and_explain_classed(
                 extra_reqs: widened,
                 hint: settings.working_context.as_deref(),
                 learned: resolved.as_ref(),
+                author_features: settings.feedback_author_features,
             },
         );
         // Score order interleaves categories under any non-kind-only
@@ -7275,12 +7303,8 @@ proximity, signature, churn, co_change, hub, authority, community",
         let settings = RankSettings {
             use_pipeline: true,
             weights: table(&[("kind", 1.0), ("novelty", 0.8)]),
-            sources: ContextSources::default(),
-            class_multipliers: ClassMultipliers::neutral(),
             pinned_class: None,
-            working_context: None,
-            feedback_capture: false,
-            learned: None,
+            ..RankSettings::default()
         };
 
         let ranked = rank_and_explain_classed(&results, Some(&conn), "handle", &settings);

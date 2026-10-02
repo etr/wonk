@@ -23,9 +23,11 @@
 //! ```
 //!
 //! where `decayed` pulls the stored weight one half-life toward its
-//! default per `learn_half_life_days` of age, and the bounds are
-//! multiplicative around the configured default for signal keys and ±dev
-//! absolute for descriptive keys. Bound semantics, deliberately: a
+//! default per `learn_half_life_days` of age, and the bounds are a
+//! deviation span around the configured default for signal keys —
+//! multiplicative `[d·(1−dev), d·(1+dev)]` for the positive defaults,
+//! mirrored around a negative default so the pair never inverts — and
+//! ±dev absolute for descriptive keys. Bound semantics, deliberately: a
 //! signal whose configured default is 0 is pinned at `[0, 0]` — learning
 //! modulates criteria the configuration enabled, enabling a criterion
 //! stays a human decision, and the descriptive channel is where new
@@ -111,18 +113,22 @@ impl LearnParams {
         feature.contains(':')
     }
 
-    /// The clamp bounds: multiplicative around the configured default for
-    /// signal keys (a zero-default signal is pinned at `[0, 0]`), ±dev
-    /// absolute for descriptive keys.
+    /// The clamp bounds: a deviation SPAN around the configured default
+    /// for signal keys — `span = max_deviation * |default|`, so the pair
+    /// is `(default − span, default + span)` and never inverts, whichever
+    /// sign the configured default carries (negative demotion-style
+    /// weights are legal config). For a positive default the span is
+    /// exactly the documented multiplicative semantics
+    /// `[d·(1−dev), d·(1+dev)]`; a zero-default signal is pinned at
+    /// `[0, 0]`. Descriptive keys learn around default 0 within ±dev
+    /// absolute.
     pub fn bounds(&self, feature: &str) -> (f32, f32) {
         if self.is_descriptive(feature) {
             (-self.max_deviation, self.max_deviation)
         } else {
             let default = self.default_of(feature);
-            (
-                default * (1.0 - self.max_deviation),
-                default * (1.0 + self.max_deviation),
-            )
+            let span = self.max_deviation * default.abs();
+            (default - span, default + span)
         }
     }
 }
@@ -292,7 +298,9 @@ fn value_of(member: &SlateMember, keys: &BTreeSet<String>, key: &str) -> f32 {
 /// bookkeeping first (the INSERT OR IGNORE's affected-row count decides
 /// whether `sessions` increments), then the upsert with decay computed
 /// in Rust from the read row — the SQL stays dead simple and the math
-/// stays testable.
+/// stays testable. The three statements are `prepare_cached`, so a
+/// replay run prepares each once per connection instead of once per
+/// update.
 fn apply_updates(
     tx: &Connection,
     params: &LearnParams,
@@ -304,23 +312,27 @@ fn apply_updates(
     // unknown source under the empty-string key.
     let session_key = session.unwrap_or("");
     for update in updates {
-        let session_inserted = tx.execute(
-            "INSERT OR IGNORE INTO learned_weight_sessions \
-             (feature, query_class, session) VALUES (?1, ?2, ?3)",
-            rusqlite::params![update.feature, update.scope, session_key],
-        )? as i64;
-        let current: Option<(f32, i64, i64, i64)> = tx
-            .query_row(
+        let session_inserted = {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO learned_weight_sessions \
+                 (feature, query_class, session) VALUES (?1, ?2, ?3)",
+            )?;
+            stmt.execute(rusqlite::params![update.feature, update.scope, session_key])? as i64
+        };
+        let current: Option<(f32, i64, i64, i64)> = {
+            let mut stmt = tx.prepare_cached(
                 "SELECT weight, observations, sessions, updated_at \
                  FROM learned_weights WHERE feature = ?1 AND query_class = ?2",
-                rusqlite::params![update.feature, update.scope],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+            )?;
+            stmt.query_row(rusqlite::params![update.feature, update.scope], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
-            })?;
+            })?
+        };
         // A first observation starts from the default, fresh (no decay).
         let (stored, observations, sessions, updated_at) =
             current.unwrap_or_else(|| (params.default_of(&update.feature), 0, 0, now));
@@ -332,7 +344,7 @@ fn apply_updates(
             &update.feature,
             params,
         );
-        tx.execute(
+        let mut stmt = tx.prepare_cached(
             "INSERT INTO learned_weights \
              (feature, query_class, weight, observations, sessions, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -341,15 +353,15 @@ fn apply_updates(
                  observations = excluded.observations, \
                  sessions = excluded.sessions, \
                  updated_at = excluded.updated_at",
-            rusqlite::params![
-                update.feature,
-                update.scope,
-                weight,
-                observations + 1,
-                sessions + session_inserted,
-                now
-            ],
         )?;
+        stmt.execute(rusqlite::params![
+            update.feature,
+            update.scope,
+            weight,
+            observations + 1,
+            sessions + session_inserted,
+            now
+        ])?;
     }
     Ok(())
 }
@@ -387,37 +399,64 @@ fn write_watermark(tx: &Connection, id: i64) -> Result<()> {
 }
 
 /// Learn from every event past the watermark (the feedback-dispatch
-/// trigger, D3): load `id > watermark` in id order, apply each event's
-/// updates, advance the watermark — all inside one transaction, so a
-/// crash mid-learn leaves the watermark unmoved and the next call
-/// replays the events (best-effort contract).
+/// trigger, D3): load `id > watermark` in id order in bounded chunks
+/// (SQL `LIMIT`), apply each chunk's updates in one bounded transaction,
+/// and advance the watermark per chunk INSIDE this call — so replay
+/// memory and transaction size stay capped no matter how large the
+/// backlog, and a crash mid-learn leaves the watermark at the last
+/// committed chunk with the next call resuming from there (best-effort
+/// contract). Skip-rule events (rank 1, single-member slates) are
+/// filtered in SQL before their feature JSON is ever loaded; every
+/// qualifying event still contributes, and the learned end-state is
+/// identical to a one-shot application of the same stream.
 pub fn learn_pending(
     conn: &Connection,
     feedback: &FeedbackConfig,
     weights: &HashMap<String, f32>,
     now: i64,
 ) -> Result<()> {
+    learn_pending_bounded(conn, feedback, weights, now, LEARN_CHUNK_EVENTS)
+}
+
+/// Events per learning chunk — bounds the replay's memory (each row
+/// carries the full serialized slate) and its transaction size.
+const LEARN_CHUNK_EVENTS: i64 = 200;
+
+/// [`learn_pending`] with an explicit chunk size — the multi-chunk
+/// equivalence seam (a backlog larger than `chunk` commits in several
+/// chunks; the end-state must not notice).
+fn learn_pending_bounded(
+    conn: &Connection,
+    feedback: &FeedbackConfig,
+    weights: &HashMap<String, f32>,
+    now: i64,
+    chunk: i64,
+) -> Result<()> {
     if !feedback.enabled {
         return Ok(());
     }
     crate::db::ensure_feedback_tables(conn)?;
-    let watermark = read_watermark(conn)?;
-    let events = crate::feedback::load_events_since(conn, watermark)?;
-    let Some(last_id) = events.last().map(|event| event.id) else {
-        return Ok(());
-    };
     let params = LearnParams::from_config(feedback, weights);
-    let tx = conn.unchecked_transaction()?;
-    for event in &events {
-        let updates = event_updates(event, &params);
-        if updates.is_empty() {
-            continue;
+    let mut watermark = read_watermark(conn)?;
+    loop {
+        let (frontier, events) = crate::feedback::load_learning_chunk(conn, watermark, chunk)?;
+        if frontier <= watermark {
+            return Ok(());
         }
-        apply_updates(&tx, &params, &updates, event.session.as_deref(), now)?;
+        let tx = conn.unchecked_transaction()?;
+        for event in &events {
+            let updates = event_updates(event, &params);
+            if updates.is_empty() {
+                continue;
+            }
+            apply_updates(&tx, &params, &updates, event.session.as_deref(), now)?;
+        }
+        // Past EVERY id up to the frontier — skipped events included —
+        // exactly the watermark an unchunked replay would write.
+        write_watermark(&tx, frontier)?;
+        tx.commit()?;
+        watermark = frontier;
     }
-    write_watermark(&tx, last_id)?;
-    tx.commit()?;
-    Ok(())
 }
 
 /// One learned-weights row with its supporting evidence, effective value
@@ -650,8 +689,14 @@ fn canonical_key(ctx: &crate::rerank::SharedContext, as_seen: &std::path::Path) 
 /// none of novelty's circularity. Extraction mirrors the slate build
 /// exactly (canonical files, bulk-loaded owning symbols, groups over
 /// the shared context, cardinality cap included), so the keys a
-/// candidate matches here are the keys the slate recorded there.
-/// `resolved.loaded_at` is the extraction clock (determinism).
+/// candidate matches here are the keys the slate recorded there — and
+/// it IS that extraction: the prepared bundle this pass returns (symbol
+/// map + capped groups, `author_features` widened to the union of the
+/// configuration's switch and the learned `author:` keys so neither
+/// consumer's observable key set shrinks) rides the shared context for
+/// the slate build to reuse — the heaviest per-query feedback work runs
+/// once, not twice. `resolved.loaded_at` is the extraction clock
+/// (determinism).
 pub(crate) fn apply_feedback_contribution(
     scored: &mut [crate::rerank::ScoredResult],
     ctx: &crate::rerank::SharedContext,
@@ -659,45 +704,51 @@ pub(crate) fn apply_feedback_contribution(
     query: &crate::rerank::QueryInfo<'_>,
     conn: &Connection,
     weight: f32,
-) -> Result<()> {
-    let files: Vec<String> = {
-        let mut seen = BTreeSet::new();
-        for item in scored.iter() {
-            seen.insert(canonical_key(ctx, &item.classified.result.file));
-        }
-        seen.into_iter().collect()
-    };
+    author_features: bool,
+) -> Result<crate::feedback::FeedbackExtraction> {
+    let canonicals: Vec<String> = scored
+        .iter()
+        .map(|item| canonical_key(ctx, &item.classified.result.file))
+        .collect();
+    let files: Vec<String> = canonicals
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .cloned()
+        .collect();
     let symbols = crate::feedback::load_symbols_by_file(conn, &files)?;
     let inputs = crate::feedback::ExtractionInputs {
         query: query.pattern,
         ctx,
         now: std::time::SystemTime::UNIX_EPOCH
             + std::time::Duration::from_secs(resolved.loaded_at.max(0) as u64),
-        // Author keys only matter when some were learned — with
-        // `[feedback] author_features` off none ever are, so the pass
-        // extracts no author data either.
-        author_features: resolved
-            .descriptive
-            .keys()
-            .any(|key| key.starts_with("author:")),
+        // Author data is extracted when the configuration records it OR
+        // some `author:` key was learned: the pass's own contribution
+        // never changes (an `author:` key can only match when one was
+        // learned), and the slate build — reusing this extraction —
+        // keeps every key its configuration records.
+        author_features: author_features
+            || resolved
+                .descriptive
+                .keys()
+                .any(|key| key.starts_with("author:")),
     };
 
     let mut extracted = Vec::with_capacity(scored.len());
-    for item in scored.iter() {
-        let canonical = canonical_key(ctx, &item.classified.result.file);
-        let rows = symbols.get(&canonical).map(Vec::as_slice).unwrap_or(&[]);
+    for (item, canonical) in scored.iter().zip(&canonicals) {
+        let rows = symbols.get(canonical).map(Vec::as_slice).unwrap_or(&[]);
         extracted.push(crate::feedback::extract_groups(
             item,
             crate::feedback::owning_symbol(rows, item.classified.result.line),
-            &canonical,
+            canonical,
             &inputs,
         ));
     }
     crate::feedback::apply_cardinality_cap(&mut extracted);
 
-    for (item, groups) in scored.iter_mut().zip(extracted) {
+    for (item, groups) in scored.iter_mut().zip(&extracted) {
         let mut value = 0.0f32;
-        for key in flatten_keys(&groups) {
+        for key in flatten_keys(groups) {
             if let Some(learned) = resolved.descriptive.get(&key) {
                 value += learned;
             }
@@ -712,7 +763,17 @@ pub(crate) fn apply_feedback_contribution(
             weighted,
         });
     }
-    Ok(())
+
+    // The prepared bundle for the slate build: capped groups keyed
+    // (canonical file, line) — the shape `build_members` resolves by.
+    let mut groups = HashMap::with_capacity(extracted.len());
+    for ((canonical, item), member_groups) in canonicals.iter().zip(scored.iter()).zip(&extracted) {
+        groups.insert(
+            (canonical.clone(), item.classified.result.line),
+            member_groups.clone(),
+        );
+    }
+    Ok(crate::feedback::FeedbackExtraction { symbols, groups })
 }
 
 #[cfg(test)]
@@ -1074,6 +1135,70 @@ mod tests {
     }
 
     #[test]
+    fn negative_default_bounds_do_not_invert() {
+        // A demotion-style negative configured weight is legal config
+        // (WeightTable::from_config rejects only unknown names and
+        // non-finite values); its bounds must stay ordered.
+        let params = LearnParams::from_config(
+            &FeedbackConfig::default(),
+            &HashMap::from([("path_character".to_string(), -0.2)]),
+        );
+        // span = dev * |default| = 0.5 * 0.2 → (-0.3, -0.1).
+        let (lo, hi) = params.bounds("path_character");
+        assert!(
+            lo < hi,
+            "bounds must not invert for a negative default: ({lo}, {hi})"
+        );
+        assert!((lo - -0.3).abs() < 1e-6, "lo: {lo}");
+        assert!((hi - -0.1).abs() < 1e-6, "hi: {hi}");
+        // next_weight clamps to a bounded value instead of panicking.
+        assert_eq!(
+            next_weight(-0.2, 1000, 1000, 1_000.0, "path_character", &params),
+            hi,
+            "a saturating positive advantage stops at the upper bound"
+        );
+        assert_eq!(
+            next_weight(-0.2, 1000, 1000, -1_000.0, "path_character", &params),
+            lo,
+            "a saturating negative advantage stops at the lower bound"
+        );
+    }
+
+    #[test]
+    fn negative_default_learn_and_load_stay_bounded() {
+        // The persistence round trip over a negative default: learn one
+        // event, then read the row back through evidence_of's load-time
+        // re-clamp — both bounded, neither panicking.
+        let weights = HashMap::from([("path_character".to_string(), -0.2)]);
+        let params = LearnParams::from_config(&enabled_config(), &weights);
+        let (lo, hi) = params.bounds("path_character");
+        let conn = learning_conn();
+        insert_event(&conn, 1, None, "s1", 1.0, 0.2);
+        learn_pending(&conn, &enabled_config(), &weights, 1000).unwrap();
+        let rows = learned_rows(&conn);
+        let row = rows
+            .iter()
+            .find(|row| row.0 == "path_character" && row.1.is_empty())
+            .expect("the negative-default signal learned");
+        assert!(
+            row.2 >= lo - 1e-6 && row.2 <= hi + 1e-6,
+            "stored weight {} within ({lo}, {hi})",
+            row.2
+        );
+        // The query path: every stored row re-clamps through evidence_of.
+        let listed = list_learned(&conn, &enabled_config(), &weights, 1000).unwrap();
+        for row in &listed {
+            let (lo, hi) = params.bounds(&row.feature);
+            assert!(
+                row.effective >= lo - 1e-6 && row.effective <= hi + 1e-6,
+                "{} effective {} outside ({lo}, {hi})",
+                row.feature,
+                row.effective
+            );
+        }
+    }
+
+    #[test]
     fn descriptive_keys_are_bounded_plus_minus_deviation() {
         let params = default_params();
         // Saturating advantages hit the ±dev bounds exactly.
@@ -1295,11 +1420,110 @@ mod tests {
             insert_event(&conn, 1, Some("symbol"), "A", 1.0, 0.2);
             insert_event(&conn, 2, Some("symbol"), "B", 0.9, 0.3);
             insert_event(&conn, 3, None, "A", 0.4, 0.6);
-            learn_pending(&conn, &enabled_config(), &default_weights(), 5000).unwrap();
+            learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
             conn
         };
         // Bit-equal weights: same events + same now → identical table.
         assert_eq!(learned_rows(&build()), learned_rows(&build()));
+    }
+
+    #[test]
+    fn skip_rule_events_are_filtered_before_their_features_are_parsed() {
+        let conn = learning_conn();
+        insert_event(&conn, 1, None, "s1", 1.0, 0.2);
+        // A rank-1 (skip-rule) event whose features payload is corrupt:
+        // the replay must filter it in SQL — never parsing its JSON —
+        // learn from the qualifying event, and still advance the
+        // watermark past it.
+        conn.execute(
+            "INSERT INTO feedback_events \
+             (id, result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+             VALUES (2, 'x', NULL, 1, 'not json', 1, 's1', 0)",
+            [],
+        )
+        .unwrap();
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        assert_eq!(learned_rows(&conn).len(), 1, "the qualifying event learned");
+        assert_eq!(
+            read_watermark(&conn).unwrap(),
+            2,
+            "the skipped event still advances the watermark"
+        );
+    }
+
+    #[test]
+    fn chunked_replay_reaches_the_one_shot_end_state() {
+        let session_rows = |conn: &Connection| {
+            conn.query_row("SELECT COUNT(*) FROM learned_weight_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        let build = |chunk: i64| {
+            let conn = learning_conn();
+            // A backlog with every shape the chunk boundaries and the SQL
+            // skip filters must handle identically: 25 qualifying events
+            // across 3 interleaved sessions, one rank-1 skip event, and
+            // one single-member-slate skip event.
+            for id in 1..=25 {
+                insert_event(&conn, id, None, &format!("s{}", id % 3), 1.0, 0.2);
+            }
+            let useful = member(1, true, groups_with_signals(&[("path_character", 1.0)]));
+            let identity = useful.identity.clone();
+            conn.execute(
+                "INSERT INTO feedback_events \
+                 (id, result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+                 VALUES (26, ?1, NULL, 2, ?2, 1, 's1', 0)",
+                rusqlite::params![
+                    identity,
+                    serde_json::to_string(&SlateFeatures {
+                        schema: 1,
+                        slate: "solo".to_string(),
+                        members: vec![useful],
+                    })
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO feedback_events \
+                 (id, result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+                 VALUES (27, 'x', NULL, 1, ?1, 1, 's1', 0)",
+                rusqlite::params![serde_json::to_string(&SlateFeatures {
+                    schema: 1,
+                    slate: "rank1".to_string(),
+                    members: vec![
+                        member(1, true, groups_with_signals(&[("path_character", 1.0)])),
+                        member(2, false, groups_with_signals(&[("path_character", 0.1)])),
+                    ],
+                })
+                .unwrap()],
+            )
+            .unwrap();
+            learn_pending_bounded(&conn, &enabled_config(), &default_weights(), 5000, chunk)
+                .unwrap();
+            conn
+        };
+        // chunk = 2 over 27 events → 14 committed chunks; chunk = 1_000
+        // is the one-shot shape.
+        let one_shot = build(1_000);
+        let chunked = build(2);
+        assert_eq!(
+            learned_rows(&one_shot),
+            learned_rows(&chunked),
+            "identical learned end-state across chunk boundaries"
+        );
+        assert_eq!(
+            session_rows(&one_shot),
+            session_rows(&chunked),
+            "identical session bookkeeping"
+        );
+        assert_eq!(read_watermark(&one_shot).unwrap(), 27);
+        assert_eq!(
+            read_watermark(&chunked).unwrap(),
+            27,
+            "skip events ride the frontier in every chunking"
+        );
     }
 
     #[test]
@@ -1499,13 +1723,14 @@ mod tests {
             loaded_at: 123_456,
             ..ResolvedFeedback::default()
         };
-        apply_feedback_contribution(
+        let prepared = apply_feedback_contribution(
             &mut scored,
             &crate::rerank::SharedContext::default(),
             &resolved,
             &crate::rerank::QueryInfo { pattern: "mint" },
             &conn,
             0.5,
+            false,
         )
         .unwrap();
 
@@ -1521,6 +1746,26 @@ mod tests {
         assert_eq!(scored[1].contributions[0].signal, "feedback");
         assert_eq!(scored[1].contributions[0].value, 0.0);
         assert_eq!(scored[1].score, 0.0);
+
+        // The prepared bundle the slate build reuses: one capped group
+        // per candidate, keyed (canonical, line), symbols for the file
+        // set — the ONE extraction per query.
+        assert_eq!(prepared.groups.len(), 2, "a group per candidate");
+        assert!(
+            prepared
+                .groups
+                .contains_key(&("src/auth/tokens.rs".to_string(), 1)),
+            "keyed by canonical file and line"
+        );
+        // The fixture's symbols table is empty: the bulk-load map stays
+        // empty while the groups still extract (line-anchored members).
+        assert!(prepared.symbols.is_empty());
+        assert!(
+            prepared
+                .groups
+                .values()
+                .all(|groups| groups.signals.is_empty())
+        );
     }
 
     #[test]
@@ -1542,6 +1787,7 @@ mod tests {
             &crate::rerank::QueryInfo { pattern: "mint" },
             &conn,
             1.0,
+            false,
         )
         .unwrap();
         assert_eq!(
