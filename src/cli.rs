@@ -125,10 +125,12 @@ pub enum Command {
 }
 
 /// Arguments for `wonk feedback` (TASK-101, PRD-FB-REQ-003; `--weights`
-/// TASK-102).
+/// TASK-102; management modes TASK-103).
 ///
 /// The `requires` chain (`useful` → `session` → `slate`) keeps every
-/// partial recording triple a clap error while `--weights` stands alone.
+/// partial recording triple a clap error while the inspection and
+/// management modes stand alone. The six management flags are mutually
+/// exclusive with each other and with recording.
 #[derive(clap::Args, Debug)]
 pub struct FeedbackArgs {
     /// Slate token from the search output (`slate:` line or JSON field)
@@ -145,7 +147,15 @@ pub struct FeedbackArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        required_unless_present = "weights",
+        required_unless_present_any = [
+            "weights",
+            "list",
+            "export",
+            "reset_weights",
+            "reset_weight",
+            "clear_events",
+            "clear_result"
+        ],
         requires = "session"
     )]
     pub useful: Vec<String>,
@@ -153,8 +163,132 @@ pub struct FeedbackArgs {
     /// List every learned weight with its default, observation count,
     /// and session count instead of recording (TASK-102,
     /// PRD-FB-REQ-029/012)
-    #[arg(long, conflicts_with_all = ["slate", "session", "useful"])]
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "slate",
+            "session",
+            "useful",
+            "list",
+            "export",
+            "reset_weights",
+            "reset_weight",
+            "clear_events",
+            "clear_result"
+        ]
+    )]
     pub weights: bool,
+
+    /// List recorded feedback events (identity, rank, session, liveness)
+    /// instead of recording (TASK-103, PRD-FB-REQ-019)
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "weights",
+            "export",
+            "reset_weights",
+            "reset_weight",
+            "clear_events",
+            "clear_result",
+            "slate",
+            "session",
+            "useful"
+        ]
+    )]
+    pub list: bool,
+
+    /// Dump the complete event store (features payloads included) as one
+    /// JSON array to stdout instead of recording (TASK-103)
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "weights",
+            "list",
+            "reset_weights",
+            "reset_weight",
+            "clear_events",
+            "clear_result",
+            "slate",
+            "session",
+            "useful"
+        ]
+    )]
+    pub export: bool,
+
+    /// Wipe EVERY recorded feedback event; learned weights are untouched
+    /// (TASK-103, PRD-FB-REQ-013/019)
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "weights",
+            "list",
+            "export",
+            "reset_weights",
+            "reset_weight",
+            "clear_result",
+            "slate",
+            "session",
+            "useful"
+        ]
+    )]
+    pub clear_events: bool,
+
+    /// Wipe one result's recorded events by its 64-hex identity;
+    /// learned weights are untouched (TASK-103, PRD-FB-REQ-019)
+    #[arg(
+        long,
+        value_name = "IDENTITY",
+        conflicts_with_all = [
+            "weights",
+            "list",
+            "export",
+            "reset_weights",
+            "reset_weight",
+            "clear_events",
+            "slate",
+            "session",
+            "useful"
+        ]
+    )]
+    pub clear_result: Option<String>,
+
+    /// Reset ALL learned weights to their configured defaults (every
+    /// scope); the event history is untouched (TASK-103, PRD-FB-REQ-013)
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "weights",
+            "list",
+            "export",
+            "reset_weight",
+            "clear_events",
+            "clear_result",
+            "slate",
+            "session",
+            "useful"
+        ]
+    )]
+    pub reset_weights: bool,
+
+    /// Reset ONE feature's learned weights to defaults (e.g.
+    /// `path_character`), all of its scopes; the event history is
+    /// untouched (TASK-103, PRD-FB-REQ-013)
+    #[arg(
+        long,
+        value_name = "FEATURE",
+        conflicts_with_all = [
+            "weights",
+            "list",
+            "export",
+            "reset_weights",
+            "clear_events",
+            "clear_result",
+            "slate",
+            "session",
+            "useful"
+        ]
+    )]
+    pub reset_weight: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -196,6 +330,12 @@ pub struct SearchArgs {
     /// feedback features; never affects ranking)
     #[arg(long, value_name = "PATH")]
     pub context: Option<String>,
+
+    /// Ignore learned feedback weights for this search: ranking
+    /// reproduces the index alone exactly (TASK-103, PRD-FB-REQ-017).
+    /// Slates still record — capture is not influence.
+    #[arg(long)]
+    pub no_feedback: bool,
 
     /// Restrict search to files matching this path (substring match)
     #[arg(short = 'f', long)]
@@ -2387,5 +2527,98 @@ mod tests {
             .is_err()
         );
         assert!(Cli::try_parse_from(["wonk", "feedback", "--weights", "--useful", "1"]).is_err());
+    }
+
+    // -- feedback management modes (TASK-103) -----------------------------------
+
+    #[test]
+    fn parse_feedback_management_modes() {
+        let cases: [(&str, Vec<&str>); 6] = [
+            ("--list", vec!["--list"]),
+            ("--export", vec!["--export"]),
+            ("--clear-events", vec!["--clear-events"]),
+            (
+                "--clear-result",
+                vec![
+                    "--clear-result",
+                    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                ],
+            ),
+            ("--reset-weights", vec!["--reset-weights"]),
+            ("--reset-weight", vec!["--reset-weight", "path_character"]),
+        ];
+        for (name, flags) in cases {
+            let cli = Cli::try_parse_from(
+                ["wonk", "feedback"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+            .unwrap_or_else(|e| panic!("{name} parses alone: {e}"));
+            match cli.command {
+                Command::Feedback(args) => {
+                    assert!(
+                        !args.weights && args.useful.is_empty(),
+                        "{name} is standalone"
+                    );
+                    match name {
+                        "--list" => assert!(args.list),
+                        "--export" => assert!(args.export),
+                        "--clear-events" => assert!(args.clear_events),
+                        "--clear-result" => {
+                            assert_eq!(args.clear_result.as_deref(), Some(flags[1]))
+                        }
+                        "--reset-weights" => assert!(args.reset_weights),
+                        "--reset-weight" => {
+                            assert_eq!(args.reset_weight.as_deref(), Some("path_character"))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => panic!("expected Command::Feedback for {name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_feedback_management_modes_conflict_with_recording_and_each_other() {
+        // Mode flags are mutually exclusive.
+        assert!(Cli::try_parse_from(["wonk", "feedback", "--list", "--export"]).is_err());
+        assert!(Cli::try_parse_from(["wonk", "feedback", "--weights", "--list"]).is_err());
+        assert!(
+            Cli::try_parse_from(["wonk", "feedback", "--reset-weights", "--clear-events"]).is_err()
+        );
+        // ...and disjoint from the recording triple.
+        assert!(
+            Cli::try_parse_from(["wonk", "feedback", "--reset-weights", "--useful", "1"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "wonk",
+                "feedback",
+                "--list",
+                "--slate",
+                "t",
+                "--session",
+                "s",
+                "--useful",
+                "1"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["wonk", "feedback", "--export", "--session", "s"]).is_err());
+    }
+
+    #[test]
+    fn parse_search_no_feedback() {
+        let cli = Cli::try_parse_from(["wonk", "search", "--no-feedback", "foo"]).unwrap();
+        match cli.command {
+            Command::Search(args) => assert!(args.no_feedback, "--no-feedback parsed: {args:?}"),
+            _ => panic!("expected Command::Search"),
+        }
+        let plain = Cli::try_parse_from(["wonk", "search", "foo"]).unwrap();
+        match plain.command {
+            Command::Search(args) => assert!(!args.no_feedback, "off by default"),
+            _ => panic!("expected Command::Search"),
+        }
     }
 }

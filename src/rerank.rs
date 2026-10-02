@@ -3027,6 +3027,13 @@ pub struct RankSettings {
     /// nothing past the gates — leaves the code path bit-identical to
     /// the feature disabled (PRD-FB-REQ-020).
     pub learned: Option<crate::learning::LearnedTable>,
+    /// Strip ALL feedback influence from the ranking (TASK-103,
+    /// PRD-FB-REQ-017/018): an already-attached `learned` table is
+    /// ignored, so ranking reproduces the index alone exactly. Slate
+    /// capture is recording, not influence, and stays on. Defense in
+    /// depth: the dispatch seams skip `load_learned` when the flag is
+    /// set AND this field strips a table attached anyway (AR-039).
+    pub feedback_free: bool,
 }
 
 impl Default for RankSettings {
@@ -3041,6 +3048,7 @@ impl Default for RankSettings {
             feedback_capture: false,
             feedback_author_features: false,
             learned: None,
+            feedback_free: false,
         }
     }
 }
@@ -3084,6 +3092,7 @@ impl RankSettings {
             feedback_capture: false,
             feedback_author_features: false,
             learned: None,
+            feedback_free: false,
         })
     }
 }
@@ -3136,8 +3145,16 @@ pub fn rank_and_explain_classed(
         // Resolve the learned overlay for THIS class (D6) and let gated
         // signal weights replace the class-multiplied configured default
         // outright — the deviation bound was computed against the
-        // un-multiplied default (PRD-FB-REQ-010/012).
-        let resolved = settings.learned.as_ref().map(|table| table.resolve(class));
+        // un-multiplied default (PRD-FB-REQ-010/012). `feedback_free`
+        // (PRD-FB-REQ-017) strips the table even when one is attached:
+        // belt-and-suspenders with the dispatch seams, which skip the
+        // load outright.
+        let learned_ref = if settings.feedback_free {
+            None
+        } else {
+            settings.learned.as_ref()
+        };
+        let resolved = learned_ref.map(|table| table.resolve(class));
         let mut effective = settings.class_multipliers.apply(&settings.weights, class);
         if let Some(resolved) = &resolved {
             for (name, weight) in &resolved.signals {
@@ -8084,5 +8101,55 @@ proximity, signature, churn, co_change, hub, authority, community",
         let zeroed = rank_and_explain_classed(&results, Some(&conn), "my_func", &zero);
         let disabled = rank_and_explain_classed(&results, Some(&conn), "my_func", &none);
         assert_eq!(ranked_bits(&zeroed), ranked_bits(&disabled));
+    }
+
+    // -- TASK-103: the feedback-free seam ---------------------------------------
+
+    #[test]
+    fn feedback_free_ignores_an_attached_learned_table() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![crate::search::SearchResult {
+            file: std::path::PathBuf::from("src/main.rs"),
+            line: 10,
+            col: 0,
+            content: "fn my_func() {}".to_string(),
+        }];
+        let learned = || Some(learned_of(vec![learned_evidence("lexical", "", 0.3, 0.4)]));
+        let base_settings = |learned: Option<LearnedTable>, feedback_free: bool| RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("lexical", 0.4)]),
+            learned,
+            feedback_free,
+            ..RankSettings::default()
+        };
+        let none = base_settings(None, false);
+        let attached = base_settings(learned(), false);
+        let stripped = base_settings(learned(), true);
+        let expected = rank_and_explain_classed(&results, Some(&conn), "my_func", &none);
+        let live = rank_and_explain_classed(&results, Some(&conn), "my_func", &attached);
+        let free = rank_and_explain_classed(&results, Some(&conn), "my_func", &stripped);
+        assert_eq!(
+            ranked_bits(&free),
+            ranked_bits(&expected),
+            "feedback_free reproduces the learned-free ranking exactly"
+        );
+        assert_ne!(
+            ranked_bits(&live),
+            ranked_bits(&expected),
+            "the same attached table must still act when the flag is off — \
+             the flag, not absence, does the work"
+        );
+    }
+
+    #[test]
+    fn rank_settings_default_carries_no_learned_overlay() {
+        // PRD-FB-REQ-018: benches and the regression suite rely on the
+        // DEFAULT being feedback-free — no learned table, no stripping
+        // needed.
+        let default = RankSettings::default();
+        assert!(
+            default.learned.is_none(),
+            "the default carries no learned overlay"
+        );
     }
 }

@@ -83,6 +83,10 @@ fn pipeline_groups(
         &RankSettings {
             use_pipeline: true,
             weights: WeightTable::kind_dominant(),
+            // PRD-FB-REQ-018/AR-039: the suite is feedback-free BY
+            // CONSTRUCTION and pinned with the flag — measurement must
+            // not be able to confirm itself through learned state.
+            feedback_free: true,
             ..Default::default()
         },
     )
@@ -143,6 +147,7 @@ fn kind_only_pipeline_matches_legacy_over_corpus() {
     let settings = RankSettings {
         use_pipeline: true,
         weights: WeightTable::kind_dominant(),
+        feedback_free: true,
         ..Default::default()
     };
     for &query in QUERIES {
@@ -171,6 +176,7 @@ fn kind_weight_scaling_does_not_change_ordering() {
                     weight,
                 )]))
                 .unwrap(),
+                feedback_free: true,
                 ..Default::default()
             };
             assert_equivalent(&found, Some(&conn), query, &settings);
@@ -230,6 +236,7 @@ fn hand_built_matrix_matches_legacy_including_dedup() {
     let settings = RankSettings {
         use_pipeline: true,
         weights: WeightTable::kind_dominant(),
+        feedback_free: true,
         ..Default::default()
     };
     assert_equivalent(&found, Some(&conn), "my_func", &settings);
@@ -316,6 +323,7 @@ fn disabled_config_reproduces_legacy_ordering() {
     let settings = RankSettings {
         use_pipeline: config.rank.enabled,
         weights: WeightTable::from_config(&config.rank.weights).unwrap(),
+        feedback_free: true,
         ..Default::default()
     };
 
@@ -660,4 +668,62 @@ fn cli_why_alone_implies_smart_ranked_mode() {
             "why line shows the final score: {line}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// TASK-103 (PRD-FB-REQ-018, AR-039): the suite is immune to learned state
+// ---------------------------------------------------------------------------
+
+/// Seeded gated learned rows must not leak into the suite's outputs:
+/// the corpus path can never confirm itself. The pin works at two
+/// layers — the suite never loads learned state, and the settings
+/// carry `feedback_free: true` so an attached table would be stripped
+/// even if a future change started loading one.
+/// One query's suite output: category buckets of (file, line, score).
+type SuiteDump = Vec<(ResultCategory, Vec<(String, u64, f32)>)>;
+
+fn dump_suite(root: &Path, conn: &Connection, query: &str) -> SuiteDump {
+    let found = candidates(root, query);
+    pipeline_groups(&found, Some(conn), query)
+        .into_iter()
+        .map(|(cat, items)| {
+            (
+                cat,
+                items
+                    .into_iter()
+                    .map(|item| {
+                        (
+                            item.classified.result.file.to_string_lossy().into_owned(),
+                            item.classified.result.line,
+                            item.score,
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn suite_is_immune_to_learned_state() {
+    let (dir, conn) = setup_indexed_corpus();
+    let root = dir.path();
+
+    let clean: Vec<SuiteDump> = QUERIES.iter().map(|q| dump_suite(root, &conn, q)).collect();
+
+    // Gated rows straight into learned_weights: a shifted weight for a
+    // live signal (kind — the one the suite exercises) with enough
+    // observations/sessions to clear every gate.
+    wonk::db::ensure_feedback_tables(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO learned_weights \
+         (feature, query_class, weight, observations, sessions, updated_at) \
+         VALUES ('kind', '', 1.5, 40, 9, 0)",
+        [],
+    )
+    .unwrap();
+
+    let seeded: Vec<SuiteDump> = QUERIES.iter().map(|q| dump_suite(root, &conn, q)).collect();
+
+    assert_eq!(clean, seeded, "learned rows cannot reach the suite");
 }

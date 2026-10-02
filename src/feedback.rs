@@ -1416,6 +1416,104 @@ pub fn live_identities(
     live
 }
 
+/// Wipe EVERY recorded feedback event (TASK-103, PRD-FB-REQ-019).
+/// Learned weights are untouched — clearing history and resetting
+/// weights are independent operations (PRD-FB-REQ-013). Returns the
+/// number of event rows removed. `feedback_slates` stand: slates are
+/// capture, not feedback, and pruning them is retention's job.
+pub fn clear_events(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM feedback_events", [])?)
+}
+
+/// Wipe one result's recorded events by identity (TASK-103,
+/// PRD-FB-REQ-019). Returns the number of rows removed — `0` for an
+/// unknown identity, never an error.
+pub fn clear_result_events(conn: &Connection, identity: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM feedback_events WHERE result_identity = ?1",
+        [identity],
+    )?)
+}
+
+/// `(events, distinct sessions)` of the event store (TASK-103): the
+/// `wonk status` counts. A NULL session (a pre-session-ids event) counts
+/// as one distinct unknown source under the empty-string key. A missing
+/// table (pre-TASK-101 index) is `(0, 0)`, not an error — the
+/// `read_raw_rows` precedent.
+pub fn event_store_stats(conn: &Connection) -> Result<(i64, i64)> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'feedback_events')",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        return Ok((0, 0));
+    }
+    let stats = conn.query_row(
+        "SELECT COUNT(*), COUNT(DISTINCT COALESCE(session, '')) FROM feedback_events",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(stats)
+}
+
+/// One recorded event as `wonk feedback --list` reports it (TASK-103,
+/// PRD-FB-REQ-019): the identity, where it lives, which session and
+/// class reported it, and whether it still resolves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventListing {
+    pub id: i64,
+    pub identity: String,
+    pub rank: i64,
+    pub file: String,
+    pub line: u64,
+    pub symbol: Option<String>,
+    pub session: Option<String>,
+    pub query_class: Option<String>,
+    pub created_at: i64,
+    /// Whether the identity still resolves against the current index —
+    /// the [`record_feedback`] summary's read-time liveness, recomputed
+    /// here over the whole store.
+    pub live: bool,
+}
+
+/// List every recorded event with its live status (TASK-103): one
+/// `load_events` pass plus ONE `live_identities` call over the union of
+/// the events' files (the `record_feedback` summary pattern, applied to
+/// the whole store).
+pub fn list_events(conn: &Connection) -> Result<Vec<EventListing>> {
+    let events = load_events(conn)?;
+    let mut files = std::collections::BTreeSet::new();
+    let mut identities = std::collections::HashSet::new();
+    for event in &events {
+        if let Some(member) = event.features.members.iter().find(|m| m.chosen) {
+            files.insert(member.file.clone());
+            identities.insert(member.identity.clone());
+        }
+    }
+    let files: Vec<String> = files.into_iter().collect();
+    let live = live_identities(conn, &files, &identities);
+    Ok(events
+        .into_iter()
+        .map(|event| {
+            let member = event.features.members.iter().find(|m| m.chosen);
+            EventListing {
+                id: event.id,
+                live: member.is_none_or(|m| m.symbol.is_none() || live.contains(&m.identity)),
+                identity: event.result_identity.clone(),
+                rank: event.chosen_rank,
+                file: member.map(|m| m.file.clone()).unwrap_or_default(),
+                line: member.map(|m| m.line).unwrap_or(0),
+                symbol: member.and_then(|m| m.symbol.clone()),
+                session: event.session.clone(),
+                query_class: event.query_class.clone(),
+                created_at: event.created_at,
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3434,6 +3532,137 @@ mod tests {
             Some("unreachable")
         );
         assert_eq!(context.get("co_change").map(String::as_str), Some("weak"));
+        drop(dir);
+    }
+
+    // -- TASK-103: event-store management ---------------------------------------
+
+    #[test]
+    fn clear_events_wipes_whole_store_but_not_slates() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+        record_feedback(&conn, &token, &["2".to_string()], "sess-1").unwrap();
+        record_feedback(&conn, &token, &["2".to_string()], "sess-2").unwrap();
+        let slates: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(slates, 1);
+
+        let cleared = clear_events(&conn).unwrap();
+        assert_eq!(cleared, 2, "one per event row");
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 0, "the event store is empty");
+        let slates_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(slates_after, slates, "slates are capture, not feedback");
+        assert_eq!(clear_events(&conn).unwrap(), 0, "idempotent");
+        drop(dir);
+    }
+
+    #[test]
+    fn clear_result_events_removes_only_that_identity() {
+        let (dir, conn) = seeded_conn(&[
+            ("nested.rs", NESTED_SRC),
+            (
+                "vault.rs",
+                "pub struct Vault {\n    secret: u32,\n}\n\nimpl Vault {\n    pub fn vault_seal(&self) -> u32 {\n        self.secret\n    }\n}\n",
+            ),
+        ]);
+        // Two files, two owning symbols: distinct identities.
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![
+                ("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9),
+                ("vault.rs", 6, "    pub fn vault_seal(&self) -> u32 {", 0.8),
+            ],
+        )]);
+        let token = build_and_store_slate(&conn, "outer_guard", &ranked, &test_feedback())
+            .unwrap()
+            .token;
+        let members = stored_members(&conn, &token);
+        let nested = members
+            .iter()
+            .find(|m| m.file == "nested.rs")
+            .unwrap()
+            .identity
+            .clone();
+        let vault = members
+            .iter()
+            .find(|m| m.file == "vault.rs")
+            .unwrap()
+            .identity
+            .clone();
+        assert_ne!(nested, vault, "the fixture must have two identities");
+        record_feedback(&conn, &token, &["1".to_string()], "sess-1").unwrap();
+        record_feedback(&conn, &token, &["2".to_string()], "sess-2").unwrap();
+        record_feedback(&conn, &token, &["2".to_string()], "sess-3").unwrap();
+
+        let removed = clear_result_events(&conn, &vault).unwrap();
+        assert_eq!(removed, 2, "both of that result's events");
+        let remaining = event_rows(&conn);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].identity, nested, "the other result stands");
+        assert_eq!(
+            clear_result_events(&conn, &"f".repeat(64)).unwrap(),
+            0,
+            "an unknown identity is not an error"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn event_store_stats_counts_events_and_distinct_sessions() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+        record_feedback(&conn, &token, &["2".to_string()], "sess-1").unwrap();
+        record_feedback(&conn, &token, &["2".to_string()], "sess-1").unwrap();
+        record_feedback(&conn, &token, &["1".to_string()], "sess-2").unwrap();
+        // A pre-session-ids event (NULL session) counts as one distinct
+        // unknown source under the empty-string key.
+        conn.execute(
+            "INSERT INTO feedback_events \
+             (result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+             VALUES ('x', NULL, 2, '{}', 1, NULL, 0)",
+            [],
+        )
+        .unwrap();
+
+        let (events, sessions) = event_store_stats(&conn).unwrap();
+        assert_eq!(events, 4);
+        assert_eq!(sessions, 3, "sess-1, sess-2, and the NULL bucket");
+
+        // A pre-TASK-101 index (no feedback tables at all): zeros, not
+        // an error.
+        let plain = Connection::open_in_memory().unwrap();
+        let (events, sessions) = event_store_stats(&plain).unwrap();
+        assert_eq!((events, sessions), (0, 0));
+        drop(dir);
+    }
+
+    #[test]
+    fn list_events_summarizes_every_event_with_liveness() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let token = stored_slate(&conn);
+        record_feedback(&conn, &token, &["2".to_string()], "sess-1").unwrap();
+        record_feedback(&conn, &token, &["1".to_string()], "sess-2").unwrap();
+
+        let listed = list_events(&conn).unwrap();
+        assert_eq!(listed.len(), 2, "one entry per event, oldest first");
+        let second = &listed[0];
+        assert_eq!(second.session.as_deref(), Some("sess-1"));
+        assert_eq!(second.rank, 2);
+        assert!(second.file.ends_with("nested.rs"));
+        assert!(second.symbol.is_some(), "the chosen member's symbol");
+        assert_eq!(second.query_class.as_deref(), Some("symbol"));
+        assert!(second.live, "an untouched index resolves everything");
+
+        // JSON round-trips (the --format json surface).
+        let json = serde_json::to_string(&listed).unwrap();
+        let parsed: Vec<EventListing> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, listed);
         drop(dir);
     }
 }

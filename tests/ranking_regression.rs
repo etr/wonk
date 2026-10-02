@@ -6,6 +6,11 @@
 //! pipeline, and queried through the real `text_search` path. The query set
 //! and the expected top-10 lists are frozen so any scoring change that
 //! shifts lexical ranking shows up as a diff.
+//!
+//! The BM25 path never consults learned feedback state (TASK-103,
+//! PRD-FB-REQ-018): this suite is feedback-free by construction — no
+//! `RankSettings` here loads a learned table, so accumulated feedback
+//! cannot confirm itself through the frozen goldens.
 
 use std::fs;
 use std::path::Path;

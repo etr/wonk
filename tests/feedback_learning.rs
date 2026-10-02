@@ -1532,3 +1532,502 @@ mod tuning {
         assert_eq!(e, 0, "no bound violations");
     }
 }
+
+// ---------------------------------------------------------------------------
+// TASK-103 AC1: --no-feedback reproduces index-only ranking exactly
+// ---------------------------------------------------------------------------
+
+/// Run `wonk search --include-tests --why PATTERN` with an optional
+/// `--no-feedback`, returning (code, result stdout, why stderr).
+fn search_with_why(root: &Path, no_feedback: bool, query: &str) -> (i32, String, String) {
+    let mut args = vec!["search", "--include-tests", "--why"];
+    if no_feedback {
+        args.push("--no-feedback");
+    }
+    args.push(query);
+    let (code, stdout, stderr) = run_wonk(root, &args);
+    (code, result_lines(&stdout).join("\n"), stderr)
+}
+
+#[test]
+fn no_feedback_reproduces_index_only_ranking_exactly() {
+    let (dir, root) = learning_repo(true, "");
+
+    // Baseline BEFORE any feedback: index-only ranking, why totals and
+    // all. (Slates record on every enabled search — including
+    // --no-feedback: capture is not influence.)
+    let (_, base_stdout, base_why) = search_with_why(&root, false, "crop_yield");
+
+    // Learn to a gated, order-shifting state: 40 events preferring the
+    // src implementation across 40 sessions (the
+    // preferring_implementation_shifts_path_character_visibly pattern).
+    let (code, stdout, stderr) = run_wonk(
+        &root,
+        &[
+            "search",
+            "--include-tests",
+            "--format",
+            "json",
+            "crop_yield",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let rows = json_rows(&stdout);
+    let src_identity = rows
+        .iter()
+        .find(|row| row["file"].as_str().unwrap().ends_with("src/crop/mod.rs"))
+        .and_then(|row| row["identity"].as_str())
+        .expect("identity on rows")
+        .to_string();
+    let slate = rows[0]["slate"]
+        .as_str()
+        .expect("slate on rows")
+        .to_string();
+    for n in 0..40 {
+        let (code, _, err) = run_wonk(
+            &root,
+            &[
+                "feedback",
+                "--slate",
+                &slate,
+                "--useful",
+                &src_identity,
+                "--session",
+                &format!("session-{n:02}"),
+            ],
+        );
+        assert_eq!(code, 0, "{err}");
+    }
+
+    // Sanity: the overlay is LIVE — the learned search differs from the
+    // baseline (proves the reproduction below is doing real work).
+    let (_, learned_stdout, _) = search_with_why(&root, false, "crop_yield");
+    assert_ne!(
+        learned_stdout, base_stdout,
+        "the learned overlay must shift the enabled search"
+    );
+
+    // THE assertion: --no-feedback reproduces the pre-learning baseline
+    // byte-for-byte — results and why lines (weights restored to their
+    // defaults, no descriptive feedback rows, no learned: line).
+    let (code, free_stdout, free_why) = search_with_why(&root, true, "crop_yield");
+    assert_eq!(code, 0);
+    assert_eq!(free_stdout, base_stdout, "result lines identical");
+    assert_eq!(free_why, base_why, "why stderr identical");
+    assert!(
+        !free_why.contains("learned: "),
+        "no learned line without the overlay: {free_why}"
+    );
+
+    // Library twin on the same index: an ATTACHED learned table with
+    // feedback_free must equal learned: None at the ScoredResult level.
+    let conn = open_index(&root);
+    let learned =
+        learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 100_000)
+            .unwrap()
+            .expect("gated rows exist");
+    let with_overlay = ranked_for(&root, &conn, "crop_yield", Some(learned));
+    let free = {
+        let table =
+            learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 100_000)
+                .unwrap()
+                .expect("gated rows exist");
+        let root_str = root.display().to_string();
+        let mut results =
+            wonk::search::text_search("crop_yield", false, false, &[root_str]).unwrap();
+        for result in &mut results {
+            if let Ok(rel) = result.file.strip_prefix(&root) {
+                result.file = rel.to_path_buf();
+            }
+        }
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: wonk::rerank::WeightTable::from_config(&fixture_weights()).unwrap(),
+            feedback_capture: true,
+            learned: Some(table),
+            feedback_free: true,
+            ..RankSettings::default()
+        };
+        wonk::rerank::rank_and_explain_classed(&results, Some(&conn), "crop_yield", &settings)
+    };
+    let overlay_bits = flat_scored_bits(&with_overlay);
+    let free_bits = flat_scored_bits(&free);
+    assert_eq!(overlay_bits.len(), free_bits.len());
+    assert_ne!(
+        overlay_bits, free_bits,
+        "the attached overlay shifts scores when not stripped"
+    );
+    let none = ranked_for(&root, &conn, "crop_yield", None);
+    assert_eq!(
+        free_bits,
+        flat_scored_bits(&none),
+        "feedback_free == learned: None at the bit level"
+    );
+    drop(conn);
+    drop(dir);
+}
+
+/// Bit-level comparison key of a ranked search's scored results.
+fn flat_scored_bits(ranked: &wonk::rerank::RankedSearch) -> Vec<(String, u64, u32, u32)> {
+    ranked
+        .groups
+        .iter()
+        .flat_map(|(_, group)| group.iter())
+        .map(|item| {
+            (
+                item.classified.result.file.to_string_lossy().into_owned(),
+                item.classified.result.line,
+                item.score.to_bits(),
+                item.contributions.len() as u32,
+            )
+        })
+        .collect()
+}
+
+/// TASK-103: management modes bypass the `[feedback] enabled` gate —
+/// inspecting and wiping leftover state after opting out is exactly
+/// when they matter. Recording keeps the gate.
+#[test]
+fn feedback_management_modes_work_with_feedback_disabled() {
+    let (dir, root) = learning_repo(false, "");
+    // Leftover state from an opted-out-later life: gated learned rows
+    // and recorded events, seeded straight into the index. The weight's
+    // updated_at is NOW — the display clock is the real system time
+    // here, and a stale stamp would decay the row to its default.
+    let conn = open_index(&root);
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT INTO learned_weights \
+         (feature, query_class, weight, observations, sessions, updated_at) \
+         VALUES ('path_character', '', 0.15, 40, 40, ?1)",
+        [now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO feedback_events \
+         (result_identity, query_class, chosen_rank, features, useful, session, created_at) \
+         VALUES ('x', 'symbol', 2, ?, 1, 's1', 1000)",
+        [r#"{"schema":1,"slate":"t","members":[]}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (code, out, err) = run_wonk(&root, &["feedback", "--weights"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("path_character") && out.contains("0.150"),
+        "weights display with the feature off: {out}"
+    );
+    let (code, out, err) = run_wonk(&root, &["feedback", "--list"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("s1"),
+        "events list with the feature off: {out}"
+    );
+    let (code, out, err) = run_wonk(&root, &["feedback", "--export"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        serde_json::from_str::<Vec<Value>>(&out).is_ok(),
+        "export parses"
+    );
+    let (code, _, err) = run_wonk(&root, &["feedback", "--reset-weights"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = run_wonk(&root, &["feedback", "--clear-events"]);
+    assert_eq!(code, 0, "{err}");
+
+    // Recording still requires the feature on.
+    let (code, _, err) = run_wonk(
+        &root,
+        &[
+            "feedback",
+            "--slate",
+            "t",
+            "--session",
+            "s",
+            "--useful",
+            "1",
+        ],
+    );
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("feedback capture is disabled"),
+        "the recording gate stands: {err}"
+    );
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-103 AC3: weights reset independently of event history
+// ---------------------------------------------------------------------------
+
+/// Drive the fixture to the gated 40-event learned state via the real
+/// binary; returns (baseline stdout, baseline why, src identity, slate).
+fn learn_gated_state(root: &Path) -> (String, String, String, String) {
+    let (_, base_stdout, base_why) = search_with_why(root, false, "crop_yield");
+    let (code, stdout, stderr) = run_wonk(
+        root,
+        &[
+            "search",
+            "--include-tests",
+            "--format",
+            "json",
+            "crop_yield",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let rows = json_rows(&stdout);
+    let src_identity = rows
+        .iter()
+        .find(|row| row["file"].as_str().unwrap().ends_with("src/crop/mod.rs"))
+        .and_then(|row| row["identity"].as_str())
+        .expect("identity on rows")
+        .to_string();
+    let slate = rows[0]["slate"]
+        .as_str()
+        .expect("slate on rows")
+        .to_string();
+    for n in 0..40 {
+        let (code, _, err) = run_wonk(
+            root,
+            &[
+                "feedback",
+                "--slate",
+                &slate,
+                "--useful",
+                &src_identity,
+                "--session",
+                &format!("session-{n:02}"),
+            ],
+        );
+        assert_eq!(code, 0, "{err}");
+    }
+    (base_stdout, base_why, src_identity, slate)
+}
+
+#[test]
+fn weights_reset_independently_of_event_history() {
+    let (dir, root) = learning_repo(true, "");
+    let (base_stdout, base_why, _identity, _slate) = learn_gated_state(&root);
+
+    // Reset ALL weights: confirmation names the independence.
+    let (code, out, err) = run_wonk(&root, &["feedback", "--reset-weights"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("reset") && out.contains("event history untouched"),
+        "the confirmation: {out}"
+    );
+
+    // No learned rows remain...
+    let (code, out, err) = run_wonk(&root, &["feedback", "--weights"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        !out.contains("path_character"),
+        "the learned signal is gone: {out}"
+    );
+
+    // ...but the event history still has all 40 events.
+    let (code, out, err) = run_wonk(&root, &["feedback", "--export"]);
+    assert_eq!(code, 0, "{err}");
+    let exported: Vec<Value> = serde_json::from_str(&out).unwrap();
+    assert_eq!(exported.len(), 40, "the history stands: {out}");
+
+    // And the search is the baseline again — influence gone, recording
+    // still on (the slate line is stripped by search_with_why).
+    let (code, stdout, why) = search_with_why(&root, false, "crop_yield");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, base_stdout, "result lines back to baseline");
+    assert_eq!(why, base_why, "why stderr back to baseline");
+    drop(dir);
+}
+
+#[test]
+fn reset_weight_scopes_to_one_feature_leaving_siblings() {
+    let (dir, root) = learning_repo(true, "");
+    let (_base, _why, _identity, _slate) = learn_gated_state(&root);
+
+    let (code, out, err) = run_wonk(&root, &["feedback", "--weights"]);
+    assert_eq!(code, 0, "{err}");
+    let before: Vec<&str> = out.lines().collect();
+    assert!(before.len() > 1, "several features learned: {out}");
+
+    let (code, out, err) = run_wonk(&root, &["feedback", "--reset-weight", "path_character"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("reset") && out.contains("path_character"),
+        "per-feature confirmation: {out}"
+    );
+    let (code, out, err) = run_wonk(&root, &["feedback", "--weights"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        !out.contains("path_character"),
+        "the feature is reset: {out}"
+    );
+    assert!(
+        out.lines().count() > 0 && out.contains("obs"),
+        "sibling rows stand: {out}"
+    );
+    drop(dir);
+}
+
+#[test]
+fn clear_events_leaves_learned_weights_alone() {
+    let (dir, root) = learning_repo(true, "");
+    let (_base, _why, _identity, _slate) = learn_gated_state(&root);
+
+    // The reverse direction of the independence: wiping history must
+    // not touch the learned weights.
+    let (code, out, err) = run_wonk(&root, &["feedback", "--clear-events"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("cleared 40 feedback event(s); learned weights untouched"),
+        "the confirmation: {out}"
+    );
+    let (code, out, err) = run_wonk(&root, &["feedback", "--weights"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("path_character") && out.contains("40 obs, 40 sessions"),
+        "learned weights survive the history wipe: {out}"
+    );
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-103 AC4: list, export, wipe whole and per result
+// ---------------------------------------------------------------------------
+
+#[test]
+fn feedback_listed_exported_and_wiped_whole_and_per_result() {
+    let (dir, root) = learning_repo(true, "");
+    // Events against two DIFFERENT results: the src twin and the tests
+    // twin of one slate.
+    let (code, stdout, stderr) = run_wonk(
+        &root,
+        &[
+            "search",
+            "--include-tests",
+            "--format",
+            "json",
+            "crop_yield",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let rows = json_rows(&stdout);
+    let pick_identity = |suffix: &str| {
+        rows.iter()
+            .find(|row| row["file"].as_str().unwrap().ends_with(suffix))
+            .and_then(|row| row["identity"].as_str())
+            .expect("identity on rows")
+            .to_string()
+    };
+    let src_identity = pick_identity("src/crop/mod.rs");
+    let tests_identity = pick_identity("tests/crop_test.rs");
+    let slate = rows[0]["slate"].as_str().expect("slate").to_string();
+    for (identity, session) in [
+        (&src_identity, "sess-a"),
+        (&tests_identity, "sess-b"),
+        (&src_identity, "sess-c"),
+    ] {
+        let (code, _, err) = run_wonk(
+            &root,
+            &[
+                "feedback",
+                "--slate",
+                &slate,
+                "--useful",
+                identity,
+                "--session",
+                session,
+            ],
+        );
+        assert_eq!(code, 0, "{err}");
+    }
+
+    // --list: one line per event with session and class.
+    let (code, out, err) = run_wonk(&root, &["feedback", "--list"]);
+    assert_eq!(code, 0, "{err}");
+    // grep mode appends one shell-completing newline; count real lines.
+    let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 3, "one line per event: {out}");
+    assert!(out.contains("sess-a") && out.contains("sess-b"), "{out}");
+    assert!(out.contains("class symbol"), "{out}");
+
+    // --export round-trips the store.
+    let (code, out, err) = run_wonk(&root, &["feedback", "--export"]);
+    assert_eq!(code, 0, "{err}");
+    let exported: Vec<Value> = serde_json::from_str(&out).unwrap();
+    assert_eq!(exported.len(), 3);
+
+    // --clear-result wipes exactly one result's events.
+    let (code, out, err) = run_wonk(&root, &["feedback", "--clear-result", &tests_identity]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains(&format!("cleared 1 feedback event(s) for {tests_identity}")),
+        "per-result confirmation: {out}"
+    );
+    let (code, out, err) = run_wonk(&root, &["feedback", "--list"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out.lines().filter(|l| !l.is_empty()).count(),
+        2,
+        "the other result stands: {out}"
+    );
+    let (code, out, err) = run_wonk(&root, &["feedback", "--export"]);
+    assert_eq!(code, 0, "{err}");
+    let exported: Vec<Value> = serde_json::from_str(&out).unwrap();
+    assert_eq!(exported.len(), 2);
+
+    // --clear-events empties the store.
+    let (code, out, err) = run_wonk(&root, &["feedback", "--clear-events"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("cleared 2 feedback event(s)"), "{out}");
+    let (code, out, err) = run_wonk(&root, &["feedback", "--list"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.trim().is_empty(), "nothing left: {out}");
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// TASK-103 AC5: status shows feedback state including deviation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_shows_feedback_state_with_deviation() {
+    let (dir, root) = learning_repo(true, "");
+    let (_base, _why, _identity, _slate) = learn_gated_state(&root);
+
+    // The deviation is the MAX over gated rows: the 40-event learn
+    // saturates descriptive keys at their ±0.5 bound (path_character
+    // itself sits at 0.150 vs default 0.100) — the line reads 0.500.
+    let (code, _, stderr) = run_wonk(&root, &["status"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("Feedback: enabled, 40 events, 40 sessions, weight deviation 0.500"),
+        "the feedback line: {stderr}"
+    );
+
+    // JSON carries the same state.
+    let (code, stdout, stderr) = run_wonk(&root, &["status", "--format", "json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let status: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["feedback"]["enabled"], true);
+    assert_eq!(status["feedback"]["events"], 40);
+    assert_eq!(status["feedback"]["sessions"], 40);
+    assert!(
+        (status["feedback"]["deviation"].as_f64().unwrap() - 0.5).abs() < 0.001,
+        "deviation reads through: {status}"
+    );
+
+    // After a reset: deviation 0.000, events still counted.
+    let (code, _, err) = run_wonk(&root, &["feedback", "--reset-weights"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, _, stderr) = run_wonk(&root, &["status"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("Feedback: enabled, 40 events, 40 sessions, weight deviation 0.000"),
+        "reset reads through status: {stderr}"
+    );
+    drop(dir);
+}

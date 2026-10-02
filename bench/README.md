@@ -58,3 +58,18 @@ Subsequent runs skip cloning and take ~2 minutes.
 
 Results are written to `bench/results/report.md` (gitignored) and also
 printed to stdout.
+
+## Ranking benches are feedback-free (TASK-103)
+
+`rank_latency_bench.rs` and `rank_tune_bench.rs` never load learned
+feedback state: their `RankSettings` construct no learned table, and
+every literal carries `feedback_free: true` (PRD-FB-REQ-018, AR-039) so
+a future change that starts loading one still cannot let measurement
+confirm itself through accumulated feedback. The regression suites pin
+the same property (`tests/rerank_equivalence.rs` asserts immunity
+against seeded gated rows; the BM25 goldens never consult learned state
+at all).
+
+To measure feedback's *effect* on ranking you must opt in explicitly:
+`learning::load_learned` the gated rows and pass the table as
+`RankSettings::learned` with `feedback_free: false`.

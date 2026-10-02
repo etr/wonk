@@ -64,6 +64,9 @@ fn main() -> Result<()> {
     let legacy = RankSettings::default();
     let tuned = RankSettings {
         use_pipeline: true,
+        // PRD-FB-REQ-018/AR-039: benches rank feedback-free so
+        // measurement cannot confirm itself through learned state.
+        feedback_free: true,
         ..RankSettings::from_config(
             &wonk::config::RankConfig {
                 enabled: true,

@@ -226,6 +226,20 @@ best-effort: a failure warns and leaves the events for the next call.
 The rule and its constants are recorded in
 `bench/feedback-learning-tuning.md`.
 
+Determinism and reset (TASK-103): no new keys — the controls are the
+`--no-feedback` search flag (and the MCP `wonk_search` `no_feedback`
+parameter), which reproduces index-only ranking exactly while still
+recording slates, and the `wonk feedback` management modes:
+`--list`/`--export` inspect the recorded history, `--clear-events`/
+`--clear-result <IDENTITY>` wipe it, and `--reset-weights`/
+`--reset-weight <FEATURE>` restore learned weights to their defaults.
+Resetting weights and clearing history are deliberately independent
+(PRD-FB-REQ-013): wiped weights are not silently re-taught (events
+stay processed), and cleared history never touches what was already
+learned. `wonk status` reports the loop's state — events, distinct
+sessions, and the current weight deviation, whose ceiling is
+`learn_max_deviation`.
+
 Author features exist behind their own switch because they deserve their
 own decision (AR-046). The DR-039 distinction: DR-039 excludes
 *assuming* authorship predicts relevance — baking an author-derived
