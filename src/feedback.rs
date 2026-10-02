@@ -1721,6 +1721,31 @@ mod tests {
         (dir, conn)
     }
 
+    #[test]
+    fn suffix_fallback_resolves_nested_same_named_files_to_the_longest_match() {
+        // TASK-101 review debt: with symbols rows for both src/auth.rs and
+        // other/src/auth.rs, an absolute requested path under other/ is a
+        // boundary suffix of BOTH — the fallback used to mix both files'
+        // symbols into one identity anchor. It now resolves to the single
+        // longest-matching DB file first.
+        let (dir, conn) = seeded_conn(&[
+            ("src/auth.rs", "pub fn login() {}\n"),
+            ("other/src/auth.rs", "pub fn login(x: u32) {}\n"),
+        ]);
+        let root = dir.path();
+        let requested = root
+            .join("other/src/auth.rs")
+            .to_string_lossy()
+            .into_owned();
+        let map = load_symbols_by_file(&conn, &[requested.clone()]).unwrap();
+        let rows = map.get(&requested).expect("suffix fallback must resolve");
+        assert!(
+            rows.iter().all(|r| r.file == "other/src/auth.rs"),
+            "only the longest-matching file's symbols: {rows:?}"
+        );
+        drop(dir);
+    }
+
     /// One synthetic hit: (file, line, content, score).
     type Hit<'a> = (&'a str, u64, &'a str, f32);
 
