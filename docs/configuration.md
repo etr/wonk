@@ -35,6 +35,10 @@ rrf_k = 60.0                  # Reciprocal Rank Fusion constant K
 bm25_k1 = 1.2                # BM25 term-frequency saturation strength
 bm25_b = 0.75                # BM25 length-normalization strength
 
+[feedback]                    # Usage-feedback capture (default off)
+enabled = false               # Kill switch: no slates recorded, no feedback accepted
+slate_retention = 64          # Most recent slates kept per repo
+
 [embedding]
 provider = "bundled"          # Offline default; use "ollama" for the opt-in tier
 
@@ -161,6 +165,24 @@ to rank. The threshold feeds three consumers: the `novelty` demotion
 pass (see `[rank] weights.novelty`), the `near_duplicates` pairs
 recorded best-effort after each ranked search, and `wonk duplicates`
 reporting (which also takes a one-off `--threshold` override).
+
+**`[feedback]`**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Kill switch for usage-feedback capture. `false` records no slates and accepts no feedback; `true` also opts ranked search into the signal pipeline — the same implication as `--why` — because a legacy-path slate carries no signal contributions to learn from |
+| `slate_retention` | `64` | Most recent slates kept per repo; older slates are LRU-pruned in the same transaction as each insert. Must be at least `1`: `0` is a hard configuration error naming the key |
+
+Usage-feedback capture (TASK-101): when enabled, every ranked search
+persists its slate — the full ranked result list, each entry carrying a
+content-anchored identity and the per-signal contributions `--why`
+renders — and `wonk feedback` (or the `wonk_feedback` MCP tool) reports
+which results were useful against that slate by token. Everything stays
+in the per-repo index DB; there is no telemetry path. The section layers
+per field like every other (per-repo over global over default), and
+`slate_retention = 0` fails configuration load outright: no slate could
+survive for the feedback call to reference. Default off — a
+default-config search writes nothing and behaves byte-identically.
 
 **`[embedding]`**
 
