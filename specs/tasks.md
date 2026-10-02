@@ -4338,13 +4338,13 @@ Convert feedback events into bounded, decaying adjustments to ranking signal wei
 Preserve reproducibility on demand and make learned state legible and reversible.
 
 **Action Items:**
-- [ ] Add a feedback-free mode reproducing index-only ranking exactly (PRD-FB-REQ-017)
-- [ ] **Make benchmarks and the ranking regression suite feedback-free by default**, so measurement cannot confirm itself (PRD-FB-REQ-018, AR-039)
-- [ ] Present learned weights alongside their defaults (PRD-FB-REQ-012)
-- [ ] Reset learned weights to defaults, in whole or per signal, **independently of clearing event history** (PRD-FB-REQ-013)
-- [ ] List, export, and reset recorded feedback — whole-store and per-result (PRD-FB-REQ-019)
-- [ ] Surface feedback state in `wonk status`: event count, distinct sessions, current weight deviation
-- [ ] Document the reproducibility tradeoff and how to opt out, in README and MCP server instructions
+- [x] Add a feedback-free mode reproducing index-only ranking exactly (PRD-FB-REQ-017)
+- [x] **Make benchmarks and the ranking regression suite feedback-free by default**, so measurement cannot confirm itself (PRD-FB-REQ-018, AR-039)
+- [x] Present learned weights alongside their defaults (PRD-FB-REQ-012)
+- [x] Reset learned weights to defaults, in whole or per signal, **independently of clearing event history** (PRD-FB-REQ-013)
+- [x] List, export, and reset recorded feedback — whole-store and per-result (PRD-FB-REQ-019)
+- [x] Surface feedback state in `wonk status`: event count, distinct sessions, current weight deviation
+- [x] Document the reproducibility tradeoff and how to opt out, in README and MCP server instructions
 
 **Dependencies:**
 - Blocked by: TASK-102
@@ -4362,7 +4362,7 @@ Preserve reproducibility on demand and make learned state legible and reversible
 **Related Requirements:** PRD-FB-REQ-012, PRD-FB-REQ-013, PRD-FB-REQ-017, PRD-FB-REQ-018, PRD-FB-REQ-019
 **Related Decisions:** DR-042
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
@@ -4426,6 +4426,7 @@ Tasks identified but not yet scheduled:
 
 | Date | Change | Author |
 |------|--------|--------|
+| 2026-10-02 | TASK-103 complete (M36): determinism controls, weight inspection, and reset — `--no-feedback` / MCP `no_feedback` reproduce index-only ranking exactly (overlay stripped at the ranking seam AND both dispatch seams, per AR-039); benches + ranking regression suite pinned feedback-free with a seeded-immunity test; `wonk feedback --list/--export/--clear-events/--clear-result/--reset-weights/--reset-weight` with reset independent of event history in both directions; `wonk status` Feedback line (events, sessions, max gated weight deviation); reproducibility documented in README, docs, bench/README, MCP instructions. | TBD |
 | 2026-10-02 | TASK-102 complete (M36): contrastive weight learning — `learned_weights` keyed by feature (bare signal names + TASK-105's flattened descriptive keys), bounded decaying contrastive updates run synchronously in the feedback dispatch, session/observation gates, the `feedback` signal + `--why` contribution, `learned:` line, and `wonk feedback --weights`; OQ-019 closed via the tuning sweep recorded in `bench/feedback-learning-tuning.md`. | TBD |
 | 2026-02-11 | Initial task breakdown — 30 tasks across 6 milestones | TBD |
 | 2026-02-11 | Added Smart Search milestone (M6, TASK-031 to TASK-034). Renumbered Polish to M7. Updated milestone statuses. Total tasks: 34 across 7 milestones. Reframed around token-efficiency value proposition. | TBD |
