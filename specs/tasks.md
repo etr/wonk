@@ -4277,7 +4277,7 @@ Extract descriptive properties of each returned result alongside its signal cont
 **Related Requirements:** PRD-FB-REQ-021, PRD-FB-REQ-022, PRD-FB-REQ-023, PRD-FB-REQ-024, PRD-FB-REQ-027, PRD-FB-REQ-028
 **Related Decisions:** DR-043
 
-**Status:** Not Started
+**Status:** In Progress
 
 ---
 
