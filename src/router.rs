@@ -1990,6 +1990,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Duplicates(args) => {
             dispatch_duplicates(args, &mut fmt, suppress)?;
         }
+        Command::Feedback(args) => {
+            dispatch_feedback(args, &mut fmt, suppress, format)?;
+        }
         Command::Review(args) => {
             dispatch_review(args, &mut fmt, suppress)?;
         }
@@ -2606,6 +2609,83 @@ fn dispatch_duplicates<W: io::Write>(
     }
 
     run_duplicates(&conn, threshold, fmt, suppress)
+}
+
+/// Handle `wonk feedback` dispatch (TASK-101, PRD-FB-REQ-003): resolve the
+/// repo's index, enforce the `[feedback]` gate, and record.
+fn dispatch_feedback<W: io::Write>(
+    args: crate::cli::FeedbackArgs,
+    fmt: &mut Formatter<W>,
+    suppress: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| db::find_repo_root(&cwd).ok())
+        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
+
+    let config = crate::config::Config::load(Some(&repo_root))?;
+    if !config.feedback.enabled {
+        anyhow::bail!(
+            "feedback capture is disabled; set [feedback] enabled = true in .wonk/config.toml"
+        );
+    }
+
+    let conn = db::find_existing_index(&repo_root)
+        .and_then(|path| db::open(&path).ok())
+        .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
+
+    // Pre-TASK-101 indexes migrate instead of erroring (the
+    // `ensure_summaries_table` precedent).
+    db::ensure_feedback_tables(&conn)?;
+
+    run_feedback(&conn, &args, fmt, suppress, format)
+}
+
+/// Record feedback and print the summary. Split from
+/// [`dispatch_feedback`] so tests drive it with a seeded connection
+/// instead of the process working directory.
+fn run_feedback<W: io::Write>(
+    conn: &Connection,
+    args: &crate::cli::FeedbackArgs,
+    fmt: &mut Formatter<W>,
+    _suppress: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let summary = crate::feedback::record_feedback(conn, &args.slate, &args.useful, &args.session)?;
+    if format.is_structured() {
+        let json = serde_json::to_string(&summary)?;
+        writeln!(fmt.writer_mut(), "{json}")?;
+        return Ok(());
+    }
+    let class = summary.query_class.as_deref().unwrap_or("unknown");
+    writeln!(
+        fmt.writer_mut(),
+        "recorded {} event(s) against slate {} (query {:?}, class {})",
+        summary.recorded,
+        args.slate,
+        summary.query,
+        class
+    )?;
+    for event in &summary.events {
+        let symbol = event.symbol.as_deref().unwrap_or("-");
+        writeln!(
+            fmt.writer_mut(),
+            "rank {}  {}:{}  {}  [useful]",
+            event.rank,
+            event.file,
+            event.line,
+            symbol
+        )?;
+        if !event.live {
+            writeln!(
+                fmt.writer_mut(),
+                "note: {} no longer resolves in the index; the entry will not apply",
+                event.identity
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Sweep and print the near-duplicate groups. Split from
@@ -7078,6 +7158,105 @@ mod tests {
         // Enabled but no connection (grep fallback search): silent no-op.
         assert!(record_slate_best_effort(None, "q", &ranked, &feedback_config(true)).is_none());
         assert_eq!(slate_count(&conn), 0);
+        drop(dir);
+    }
+
+    // -- `wonk feedback` (TASK-101) ---------------------------------------------
+
+    /// A real tempdir repo indexed with the fixture, and a stored slate
+    /// from the enabled capture path.
+    fn feedback_repo_with_slate() -> (TempDir, Connection, String) {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("a.rs"), DUP_HANDLER).unwrap();
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+        let index = crate::db::find_existing_index(dir.path()).unwrap();
+        let conn = crate::db::open(&index).unwrap();
+        let ranked = feedback_ranked(&conn);
+        let token = record_slate_best_effort(
+            Some(&conn),
+            "handle_user_created",
+            &ranked,
+            &feedback_config(true),
+        )
+        .unwrap()
+        .token;
+        (dir, conn, token)
+    }
+
+    fn feedback_args(slate: &str, useful: &[&str]) -> crate::cli::FeedbackArgs {
+        crate::cli::FeedbackArgs {
+            slate: slate.to_string(),
+            session: "conv-1".to_string(),
+            useful: useful.iter().map(|u| u.to_string()).collect(),
+        }
+    }
+
+    fn run_fb(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
+        let mut buf = Vec::new();
+        let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
+        run_feedback(conn, args, &mut fmt, true, OutputFormat::Grep).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn feedback_event_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM feedback_events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn run_feedback_records_and_prints_summary() {
+        let (dir, conn, token) = feedback_repo_with_slate();
+        let out = run_fb(&conn, &feedback_args(&token, &["1"]));
+        assert_eq!(feedback_event_count(&conn), 1);
+        assert!(
+            out.contains(&format!("recorded 1 event(s) against slate {token}")),
+            "summary line: {out}"
+        );
+        assert!(
+            out.contains("(query \"handle_user_created\", class symbol)"),
+            "summary carries the query and class: {out}"
+        );
+        assert!(
+            out.contains("rank 1  a.rs:1  handle_user_created"),
+            "per-event line: {out}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_notes_dead_identity() {
+        let (dir, conn, token) = feedback_repo_with_slate();
+        // Retire the recorded identity: rename the symbol and re-index.
+        let retired = DUP_HANDLER.replace("handle_user_created", "handle_user_renamed");
+        std::fs::write(dir.path().join("a.rs"), retired).unwrap();
+        crate::pipeline::build_index(dir.path(), true).unwrap();
+
+        let out = run_fb(&conn, &feedback_args(&token, &["1"]));
+        assert_eq!(feedback_event_count(&conn), 1, "history is honest");
+        assert!(
+            out.contains("no longer resolves in the index"),
+            "dead-identity note: {out}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn run_feedback_errors_on_unknown_slate() {
+        let (dir, conn, _token) = feedback_repo_with_slate();
+        let mut buf = Vec::new();
+        let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
+        let err = run_feedback(
+            &conn,
+            &feedback_args("deadbeefdeadbeef", &["1"]),
+            &mut fmt,
+            true,
+            OutputFormat::Grep,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("slate not found"), "{err}");
+        assert_eq!(feedback_event_count(&conn), 0);
         drop(dir);
     }
 }

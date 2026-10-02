@@ -351,16 +351,28 @@ pub struct SlateFeatures {
 }
 
 /// One recorded event as the caller-facing summary reports it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RecordedEvent {
     pub identity: String,
     pub rank: usize,
     pub file: String,
+    pub line: u64,
     pub symbol: Option<String>,
     /// Whether the identity still resolves against the current index.
     /// Line-anchored members (`symbol: None`) count as live: their
     /// identity is content-derived and never retires by drift.
     pub live: bool,
+}
+
+/// The result of one feedback call — the summary both the CLI and the
+/// `wonk_feedback` MCP tool render.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FeedbackSummary {
+    /// Events written (one per reported-useful result).
+    pub recorded: usize,
+    pub query: String,
+    pub query_class: Option<String>,
+    pub events: Vec<RecordedEvent>,
 }
 
 /// One `feedback_events` row, typed, so TASK-102 never parses the JSON
@@ -439,14 +451,14 @@ fn validate_session(session: &str) -> Result<()> {
 /// `feedback_events` row is written per useful member, each carrying the
 /// FULL slate in `features` with `chosen` set on exactly the useful
 /// members. All resolution happens before the first write, so a bad
-/// argument leaves the table untouched. Returns the per-event summary
-/// with read-time liveness.
+/// argument leaves the table untouched. Returns the summary both surfaces
+/// render, with read-time liveness per event.
 pub fn record_feedback(
     conn: &Connection,
     token: &str,
     useful: &[String],
     session: &str,
-) -> Result<Vec<RecordedEvent>> {
+) -> Result<FeedbackSummary> {
     validate_session(session)?;
     let trimmed: Vec<&str> = useful
         .iter()
@@ -456,17 +468,18 @@ pub fn record_feedback(
     if trimmed.is_empty() {
         bail!("useful must name at least one result (identity or 1-based rank)");
     }
-    let (query_class, mut members): (Option<String>, Vec<SlateMember>) = conn
+    let (query, query_class, mut members): (String, Option<String>, Vec<SlateMember>) = conn
         .query_row(
-            "SELECT query_class, members FROM feedback_slates WHERE token = ?1",
+            "SELECT query, query_class, members FROM feedback_slates WHERE token = ?1",
             [token],
             |row| {
                 Ok((
                     row.get(0)?,
-                    serde_json::from_str::<Vec<SlateMember>>(&row.get::<_, String>(1)?).map_err(
+                    row.get(1)?,
+                    serde_json::from_str::<Vec<SlateMember>>(&row.get::<_, String>(2)?).map_err(
                         |e| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                1,
+                                2,
                                 rusqlite::types::Type::Text,
                                 Box::new(e),
                             )
@@ -546,7 +559,7 @@ pub fn record_feedback(
     }
     tx.commit()?;
 
-    Ok(chosen
+    let events: Vec<RecordedEvent> = chosen
         .into_iter()
         .map(|idx| {
             let m = &features.members[idx];
@@ -555,11 +568,18 @@ pub fn record_feedback(
                 identity: m.identity.clone(),
                 rank: m.rank,
                 file: m.file.clone(),
+                line: m.line,
                 symbol: m.symbol.clone(),
                 live: is_live,
             }
         })
-        .collect())
+        .collect();
+    Ok(FeedbackSummary {
+        recorded: events.len(),
+        query,
+        query_class,
+        events,
+    })
 }
 
 /// Which of `identities` still resolve against the current index (D7)?
@@ -1044,10 +1064,14 @@ mod tests {
         let alt_identity = members[0].identity.clone();
 
         let recorded = record_feedback(&conn, &token, &["2".to_string()], "sess-1").unwrap();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].identity, chosen_identity);
-        assert_eq!(recorded[0].rank, 2);
-        assert!(recorded[0].live, "untouched index: everything resolves");
+        assert_eq!(recorded.recorded, 1);
+        assert_eq!(recorded.events.len(), 1);
+        assert_eq!(recorded.events[0].identity, chosen_identity);
+        assert_eq!(recorded.events[0].rank, 2);
+        assert!(
+            recorded.events[0].live,
+            "untouched index: everything resolves"
+        );
 
         let rows = event_rows(&conn);
         assert_eq!(rows.len(), 1, "one event per useful member");

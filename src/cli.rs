@@ -116,8 +116,30 @@ pub enum Command {
     /// Report groups of near-duplicate symbols (copy-pasted code)
     Duplicates(DuplicatesArgs),
 
+    /// Report which search results were useful, against a persisted slate
+    /// (requires [feedback] enabled = true)
+    Feedback(FeedbackArgs),
+
     /// Review the current diff for breaking changes and coverage gaps
     Review(ReviewArgs),
+}
+
+/// Arguments for `wonk feedback` (TASK-101, PRD-FB-REQ-003).
+#[derive(clap::Args, Debug)]
+pub struct FeedbackArgs {
+    /// Slate token from the search output (`slate:` line or JSON field)
+    #[arg(long)]
+    pub slate: String,
+
+    /// Stable id for your current session/conversation (distinct sessions
+    /// are counted separately)
+    #[arg(long)]
+    pub session: String,
+
+    /// Results that were useful: 64-hex identities or 1-based ranks;
+    /// repeatable and comma-separated
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub useful: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2235,5 +2257,67 @@ mod tests {
     #[test]
     fn invalid_provider_override_is_rejected() {
         assert!(Cli::try_parse_from(["wonk", "init", "--provider", "remote"]).is_err());
+    }
+
+    // -- feedback args (TASK-101) ---------------------------------------------
+
+    #[test]
+    fn parse_feedback_comma_split_useful() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "feedback",
+            "--slate",
+            "4f3ea1b2c3d4e5f6",
+            "--session",
+            "conv-42",
+            "--useful",
+            "2,3",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Feedback(args) => {
+                assert_eq!(args.slate, "4f3ea1b2c3d4e5f6");
+                assert_eq!(args.session, "conv-42");
+                assert_eq!(args.useful, vec!["2".to_string(), "3".to_string()]);
+            }
+            _ => panic!("expected Command::Feedback"),
+        }
+    }
+
+    #[test]
+    fn parse_feedback_repeatable_useful_accumulates() {
+        let cli = Cli::try_parse_from([
+            "wonk",
+            "feedback",
+            "--slate",
+            "t",
+            "--session",
+            "s",
+            "--useful",
+            "1",
+            "--useful",
+            "abc,def",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Feedback(args) => {
+                assert_eq!(
+                    args.useful,
+                    vec!["1".to_string(), "abc".to_string(), "def".to_string()]
+                );
+            }
+            _ => panic!("expected Command::Feedback"),
+        }
+    }
+
+    #[test]
+    fn parse_feedback_requires_all_three_flags() {
+        assert!(Cli::try_parse_from(["wonk", "feedback", "--slate", "t"]).is_err());
+        assert!(
+            Cli::try_parse_from(["wonk", "feedback", "--slate", "t", "--session", "s"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["wonk", "feedback", "--session", "s", "--useful", "1"]).is_err()
+        );
     }
 }
