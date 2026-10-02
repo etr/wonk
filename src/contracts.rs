@@ -3036,7 +3036,8 @@ impl<'a> Extractor<'a> {
             }
             return;
         }
-        if let Some(verb) = java_client_verb(name)
+        if let Some(verb) =
+            java_client_verb(name).or_else(|| java_generic_client_verb(name, object))
             && let Some(arg) = first
         {
             self.emit_http(
@@ -4487,16 +4488,34 @@ fn java_last_leading_string(args: Node) -> Option<Node> {
     last
 }
 
-/// Java RestTemplate-style client method verbs.
+/// Java RestTemplate-style client method verbs. Only the unambiguous
+/// `*ForObject`/`*ForEntity` family is receiver-independent.
 fn java_client_verb(name: &str) -> Option<&'static str> {
     match name {
         "getForObject" | "getForEntity" => Some("get"),
         "postForObject" | "postForEntity" => Some("post"),
-        "put" => Some("put"),
-        "delete" => Some("delete"),
-        "exchange" | "execute" => Some("ANY"),
         _ => None,
     }
+}
+
+/// The generic Java verbs (`put`/`delete`/`exchange`/`execute`) are
+/// client calls only on an HTTP-looking receiver — `Map.put` and
+/// repository deletes are ubiquitous otherwise, and Java uniquely
+/// bypassed the receiver allowlist every other language applies
+/// (TASK-082 review debt).
+fn java_generic_client_verb(name: &str, object: &str) -> Option<&'static str> {
+    let verb = match name {
+        "put" => "put",
+        "delete" => "delete",
+        "exchange" | "execute" => "ANY",
+        _ => return None,
+    };
+    let object_lower = object.to_lowercase();
+    (object_lower.contains("resttemplate")
+        || object_lower.contains("httpclient")
+        || object_lower.contains("webclient")
+        || object_lower.contains("client"))
+    .then_some(verb)
 }
 
 /// First entry of the `methods: ['GET']` named argument of a PHP attribute.
@@ -8606,6 +8625,42 @@ class Client {
         assert_eq!(cands.len(), 2, "got {cands:?}");
         assert!(find(&cands, "http::GET::/v1/users").is_some());
         assert!(find(&cands, "http::POST::/v1/orders").is_some());
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+    }
+
+    #[test]
+    fn java_generic_verbs_need_a_client_receiver() {
+        // TASK-082 review debt: `cache.put`/`repository.delete` are not
+        // HTTP consumers at full confidence — the generic verbs fire only
+        // on an HTTP-looking receiver, matching every other language's
+        // allowlist.
+        let src = "\
+class A {
+    void f() {
+        cache.put(\"/users/1\", u);
+        repository.delete(\"/users/1\");
+        map.execute(\"/things\");
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 0, "got {cands:?}");
+    }
+
+    #[test]
+    fn java_webclient_generic_verbs_are_consumers() {
+        let src = "\
+class A {
+    void f() {
+        webClient.put(\"/users/1\");
+        restTemplate.delete(\"/users/1\");
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "http::PUT::/users/1").is_some());
+        assert!(find(&cands, "http::DELETE::/users/1").is_some());
         assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
     }
 
