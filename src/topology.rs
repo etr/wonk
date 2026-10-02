@@ -291,28 +291,47 @@ pub fn recompute(conn: &Connection, opts: &TopologyOptions) -> Result<()> {
     {
         // Rows land position-ascending = id-ascending: the deterministic
         // write order. Community is written for EVERY symbol row —
-        // singletons carry their own id, never NULL.
+        // singletons carry their own id, never NULL — and the CSR degrees
+        // (TASK-105) ride the same batched write: fan_out is the successor
+        // list length, fan_in the predecessor list length.
         const ROWS_PER_STMT: usize = 400;
-        let rows: Vec<(i64, f64, f64, i64)> = graph
+        let rows: Vec<(i64, f64, f64, i64, i64, i64)> = graph
             .ids
             .iter()
             .enumerate()
-            .map(|(p, &id)| (id, hub[p], auth[p], community[p]))
+            .map(|(p, &id)| {
+                (
+                    id,
+                    hub[p],
+                    auth[p],
+                    community[p],
+                    graph.predecessors(p).len() as i64,
+                    graph.successors(p).len() as i64,
+                )
+            })
             .collect();
         for chunk in rows.chunks(ROWS_PER_STMT) {
             let placeholders = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?)")
+                .map(|_| "(?, ?, ?, ?, ?, ?)")
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "INSERT INTO symbol_topology (symbol_id, hub, authority, community) \
+                "INSERT INTO symbol_topology \
+                 (symbol_id, hub, authority, community, fan_in, fan_out) \
                  VALUES {placeholders}"
             );
             let params: Vec<&dyn rusqlite::ToSql> = chunk
                 .iter()
-                .flat_map(|(id, h, a, c)| {
-                    [id as &dyn rusqlite::ToSql, h, a, c as &dyn rusqlite::ToSql]
+                .flat_map(|(id, h, a, c, fin, fout)| {
+                    [
+                        id as &dyn rusqlite::ToSql,
+                        h,
+                        a,
+                        c as &dyn rusqlite::ToSql,
+                        fin as &dyn rusqlite::ToSql,
+                        fout as &dyn rusqlite::ToSql,
+                    ]
                 })
                 .collect();
             tx.execute(&sql, params.as_slice())?;
@@ -1006,5 +1025,69 @@ mod tests {
             first,
             "insertion order must not move a community id"
         );
+    }
+
+    // -- fan degrees (TASK-105) --------------------------------------------------
+
+    /// `(fan_in, fan_out)` bits stored for a symbol by name — integers, so
+    /// equality asserts are exact.
+    fn fan_degrees(conn: &Connection, name: &str) -> (Option<i64>, Option<i64>) {
+        conn.query_row(
+            "SELECT t.fan_in, t.fan_out FROM symbol_topology t \
+             JOIN symbols s ON s.id = t.symbol_id WHERE s.name = ?1",
+            rusqlite::params![name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recompute_writes_hand_counted_fan_degrees() {
+        let (_dir, conn) = db();
+        seed_core_vs_leaf(&conn);
+
+        recompute(&conn, &opts(20, 30)).unwrap();
+
+        // core is called by five c{i} callers plus orchestrator: fan_in 6.
+        // leaf is called by orchestrator and single_caller: fan_in 2.
+        // c0..c4 call nothing: fan_in 0, fan_out 1. orchestrator calls core
+        // and leaf: fan_out 2, fan_in 0. single_caller calls leaf: fan_out 1.
+        assert_eq!(fan_degrees(&conn, "core"), (Some(6), Some(0)));
+        assert_eq!(fan_degrees(&conn, "leaf"), (Some(2), Some(0)));
+        assert_eq!(fan_degrees(&conn, "orchestrator"), (Some(0), Some(2)));
+        assert_eq!(fan_degrees(&conn, "single_caller"), (Some(0), Some(1)));
+        assert_eq!(fan_degrees(&conn, "c0"), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn pre105_topology_table_migrates_with_null_degrees() {
+        let (_dir, conn) = db();
+        seed_core_vs_leaf(&conn);
+        recompute(&conn, &opts(20, 30)).unwrap();
+        assert_eq!(fan_degrees(&conn, "core"), (Some(6), Some(0)));
+
+        // The pre-TASK-105 shape: the degree columns gone, scores kept.
+        conn.execute_batch(
+            "CREATE TABLE symbol_topology_old (
+                symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
+                hub REAL NOT NULL,
+                authority REAL NOT NULL,
+                community INTEGER
+            );
+             INSERT INTO symbol_topology_old SELECT symbol_id, hub, authority, community \
+             FROM symbol_topology;
+             DROP TABLE symbol_topology;
+             ALTER TABLE symbol_topology_old RENAME TO symbol_topology;",
+        )
+        .unwrap();
+
+        crate::db::ensure_topology_tables(&conn).unwrap();
+        crate::db::ensure_topology_tables(&conn).unwrap();
+
+        // The migration adds the columns and backfills NULL — the degrees
+        // reappear only after the next recompute.
+        assert_eq!(fan_degrees(&conn, "core"), (None, None));
+        recompute(&conn, &opts(20, 30)).unwrap();
+        assert_eq!(fan_degrees(&conn, "core"), (Some(6), Some(0)));
     }
 }
