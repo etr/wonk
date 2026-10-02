@@ -239,6 +239,14 @@ pub struct FeedbackConfig {
     /// load error — no slate could survive for the feedback call to
     /// reference.
     pub slate_retention: usize,
+    /// Whether author-derived features (`last_touched_by`, `primary`) are
+    /// recorded per slate member (TASK-105, PRD-FB-REQ-028, AR-046). One
+    /// switch gates the whole `author` group — the two features share one
+    /// data source and one concern. Default on: the features stay inert
+    /// until TASK-102's observation gate, so recording costs nothing; the
+    /// switch exists for repositories that do not want author data
+    /// recorded at all.
+    pub author_features: bool,
 }
 
 impl Default for FeedbackConfig {
@@ -246,6 +254,7 @@ impl Default for FeedbackConfig {
         Self {
             enabled: false,
             slate_retention: 64,
+            author_features: true,
         }
     }
 }
@@ -1415,7 +1424,8 @@ threshold = 1.0
             Config::default().feedback,
             FeedbackConfig {
                 enabled: false,
-                slate_retention: 64
+                slate_retention: 64,
+                author_features: true
             }
         );
         let mut env = TestEnv::new();
@@ -1425,7 +1435,8 @@ threshold = 1.0
             config.feedback,
             FeedbackConfig {
                 enabled: false,
-                slate_retention: 64
+                slate_retention: 64,
+                author_features: true
             }
         );
     }
@@ -1446,7 +1457,8 @@ slate_retention = 8
             config.feedback,
             FeedbackConfig {
                 enabled: true,
-                slate_retention: 8
+                slate_retention: 8,
+                author_features: true
             }
         );
     }

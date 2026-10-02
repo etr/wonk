@@ -2580,7 +2580,7 @@ pub(crate) fn record_slate_best_effort(
         return None;
     }
     let conn = conn?;
-    match crate::feedback::build_and_store_slate(conn, query, ranked, feedback.slate_retention) {
+    match crate::feedback::build_and_store_slate(conn, query, ranked, feedback) {
         Ok(stored) => Some(stored),
         Err(e) => {
             eprintln!("warn: could not record feedback slate: {e:#}");
@@ -7118,6 +7118,7 @@ mod tests {
         crate::config::FeedbackConfig {
             enabled,
             slate_retention: 64,
+            author_features: true,
         }
     }
 

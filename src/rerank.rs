@@ -666,6 +666,13 @@ impl SharedContext {
         self.churn.scores.get(file).copied()
     }
 
+    /// Whether ANY churn rows were prepared — the feedback `history`
+    /// group's presence gate: no history tables / never mined means the
+    /// group is omitted, not defaulted (PRD-FB-REQ-023).
+    pub fn churn_scored_files(&self) -> bool {
+        !self.churn.scores.is_empty()
+    }
+
     /// The largest churn score across the candidate set; 0 when none.
     pub fn max_churn(&self) -> f32 {
         self.churn.max
