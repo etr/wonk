@@ -4252,14 +4252,14 @@ Capture caller-reported usefulness together with the alternatives that were show
 Extract descriptive properties of each returned result alongside its signal contributions, in a form dense enough to accumulate evidence.
 
 **Action Items:**
-- [ ] Extract descriptive property groups per result: path character, symbol attributes, match shape, graph position, modification history (PRD-FB-REQ-021)
-- [ ] **Emit one feature per ancestor directory** (`src/`, `src/auth/`, `src/auth/tokens/`) so preferences are learnable at whatever level the evidence supports (PRD-FB-REQ-022)
-- [ ] Bucket continuous properties — recency, churn, body size, fan-in, fan-out, tree depth (PRD-FB-REQ-023)
-- [ ] Cap categorical cardinality with a shared overflow bucket (PRD-FB-REQ-024)
-- [ ] Accept an optional working-context hint on the query interface; when present, emit context-relative features — same file, same directory, same community, import-graph distance, co-change with the open file (PRD-FB-REQ-027)
-- [ ] Add author-derived features (last-touched-by, primary author), individually switchable; document how they differ from DR-039's exclusion of assumed author attribution (PRD-FB-REQ-028, AR-046)
-- [ ] Reuse graph features from `topology.rs` and history features from `history.rs` rather than recomputing
-- [ ] Verify extraction adds no query-time database round trips beyond the batched context prepare
+- [x] Extract descriptive property groups per result: path character, symbol attributes, match shape, graph position, modification history (PRD-FB-REQ-021)
+- [x] **Emit one feature per ancestor directory** (`src/`, `src/auth/`, `src/auth/tokens/`) so preferences are learnable at whatever level the evidence supports (PRD-FB-REQ-022)
+- [x] Bucket continuous properties — recency, churn, body size, fan-in, fan-out, tree depth (PRD-FB-REQ-023)
+- [x] Cap categorical cardinality with a shared overflow bucket (PRD-FB-REQ-024)
+- [x] Accept an optional working-context hint on the query interface; when present, emit context-relative features — same file, same directory, same community, import-graph distance, co-change with the open file (PRD-FB-REQ-027)
+- [x] Add author-derived features (last-touched-by, primary author), individually switchable; document how they differ from DR-039's exclusion of assumed author attribution (PRD-FB-REQ-028, AR-046)
+- [x] Reuse graph features from `topology.rs` and history features from `history.rs` rather than recomputing
+- [x] Verify extraction adds no query-time database round trips beyond the batched context prepare
 
 **Dependencies:**
 - Blocked by: TASK-101
@@ -4277,7 +4277,7 @@ Extract descriptive properties of each returned result alongside its signal cont
 **Related Requirements:** PRD-FB-REQ-021, PRD-FB-REQ-022, PRD-FB-REQ-023, PRD-FB-REQ-024, PRD-FB-REQ-027, PRD-FB-REQ-028
 **Related Decisions:** DR-043
 
-**Status:** In Progress
+**Status:** Complete
 
 ---
 
