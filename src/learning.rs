@@ -234,7 +234,13 @@ pub fn event_updates(
     for keys in &alternative_keys {
         observable.extend(keys.iter().cloned());
     }
-    for member in members {
+    // Signals: a member's recorded contributions name every signal it
+    // carries with a nonzero weight. Restricted to U and the
+    // alternatives (TASK-102 review debt): a signal exclusively on
+    // ANOTHER useful member is on neither side of the contrast — a
+    // zero-advantage update would only inflate observation counts and
+    // refresh the decay clock (PRD-FB-REQ-029/011).
+    for member in std::iter::once(useful).chain(alternatives.iter().copied()) {
         for signal in &member.groups.signals {
             observable.insert(signal.signal.clone());
         }
@@ -1315,6 +1321,24 @@ mod tests {
             .unwrap();
         // ALT is ONLY a1: A = 1.0 − 0.2.
         assert!((pc.advantage - 0.8).abs() < 1e-6, "{pc:?}");
+    }
+
+    #[test]
+    fn signal_exclusive_to_another_useful_member_yields_no_update() {
+        // TASK-102 review debt: the observable set used to sweep ALL
+        // members' signals, so a signal carried only by another useful
+        // member got a zero-advantage update — inflating observation
+        // counts and refreshing the decay clock for evidence that is on
+        // neither side of the contrast.
+        let u2 = member(2, true, groups_with_signals(&[("path_character", 1.0)]));
+        let u3 = member(3, true, groups_with_signals(&[("hub", 0.7)]));
+        let a1 = member(1, false, groups_with_signals(&[("path_character", 0.2)]));
+        let event = event_for(&u2, vec![a1, u2.clone(), u3], None);
+        let updates = event_updates(&event, &default_params());
+        assert!(
+            updates.iter().all(|update| update.feature != "hub"),
+            "zero-advantage signal leaked: {updates:?}"
+        );
     }
 
     #[test]

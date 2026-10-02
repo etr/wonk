@@ -1036,11 +1036,36 @@ fn slate_token(query: &str, nanos: u128, members: &[SlateMember], nonce: u32) ->
 /// Prune `feedback_slates` to the newest `retention` rows (LRU by
 /// `created_at`, token breaking ties deterministically).
 pub fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
-    conn.execute(
-        "DELETE FROM feedback_slates WHERE token NOT IN \
-         (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?1)",
-        [retention as i64],
-    )?;
+    prune_slates_exempting(conn, retention, None)
+}
+
+/// [`prune_slates`] with one token exempt from eviction: the slate minted
+/// by THIS very call (TASK-101 review debt). Retention orders by
+/// second-resolution created_at with a token tie-break, so in a
+/// same-second burst at the cap the fresh row could lose the tie-break
+/// against every retained row — and the caller would hand back a token
+/// its own prune just deleted ('slate not found' on the next feedback).
+pub(crate) fn prune_slates_exempting(
+    conn: &Connection,
+    retention: usize,
+    minted: Option<&str>,
+) -> Result<()> {
+    match minted {
+        Some(minted) => {
+            conn.execute(
+                "DELETE FROM feedback_slates WHERE token <> ?1 AND token NOT IN \
+                 (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?2)",
+                rusqlite::params![minted, retention as i64],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM feedback_slates WHERE token NOT IN \
+                 (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?1)",
+                [retention as i64],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1114,7 +1139,7 @@ pub fn build_and_store_slate(
     if token.is_empty() {
         bail!("could not mint a unique slate token after 3 attempts");
     }
-    prune_slates(&tx, feedback.slate_retention)?;
+    prune_slates_exempting(&tx, feedback.slate_retention, Some(&token))?;
     tx.commit()?;
     Ok(StoredSlate { token, members })
 }
@@ -1526,10 +1551,30 @@ pub struct EventListing {
 /// the whole store).
 pub fn list_events(conn: &Connection) -> Result<Vec<EventListing>> {
     let events = load_events(conn)?;
+    // Resolve each event's display member by the event's OWN identity
+    // first (the event_updates pattern, TASK-103 review debt):
+    // record_feedback stamps every useful member of one call `chosen`
+    // in the shared payload, so a bare `find(chosen)` attributed every
+    // event of a multi-useful call to the FIRST chosen member's
+    // file/line/symbol and liveness.
+    fn resolve(event: &crate::feedback::FeedbackEvent) -> Option<&SlateMember> {
+        event
+            .features
+            .members
+            .iter()
+            .find(|m| m.chosen && m.identity == event.result_identity)
+            .or_else(|| {
+                event
+                    .features
+                    .members
+                    .iter()
+                    .find(|m| m.identity == event.result_identity)
+            })
+    }
     let mut files = std::collections::BTreeSet::new();
     let mut identities = std::collections::HashSet::new();
     for event in &events {
-        if let Some(member) = event.features.members.iter().find(|m| m.chosen) {
+        if let Some(member) = resolve(event) {
             files.insert(member.file.clone());
             identities.insert(member.identity.clone());
         }
@@ -1539,7 +1584,7 @@ pub fn list_events(conn: &Connection) -> Result<Vec<EventListing>> {
     Ok(events
         .into_iter()
         .map(|event| {
-            let member = event.features.members.iter().find(|m| m.chosen);
+            let member = resolve(&event);
             EventListing {
                 id: event.id,
                 live: member.is_none_or(|m| m.symbol.is_none() || live.contains(&m.identity)),
@@ -1953,6 +1998,50 @@ mod tests {
             .unwrap()
             .token;
         assert_ne!(a, b, "same query back-to-back still mints distinct tokens");
+        drop(dir);
+    }
+
+    #[test]
+    fn minted_slate_survives_its_own_prune_in_a_same_second_burst() {
+        // TASK-101 review debt: retention orders by second-resolution
+        // created_at with a token tie-break, so at the cap a fresh row
+        // with a lexicographically smaller token lost against every
+        // retained same-second row — the caller held a dead token. The
+        // minted token is exempt from its own prune; no sleeps needed.
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+        )]);
+        let mut feedback = test_feedback();
+        feedback.slate_retention = 2;
+
+        let _a = build_and_store_slate(&conn, "q", &ranked, &feedback)
+            .unwrap()
+            .token;
+        let _b = build_and_store_slate(&conn, "q", &ranked, &feedback)
+            .unwrap()
+            .token;
+        // The burst is same-second by construction (no sleeps); whether
+        // or not it is, the invariant under test is the same.
+        let c = build_and_store_slate(&conn, "q", &ranked, &feedback)
+            .unwrap()
+            .token;
+
+        let exists = |token: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM feedback_slates WHERE token = ?1",
+                [token],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        assert!(exists(&c), "the minted token must survive its own prune");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "retention still holds after the burst");
         drop(dir);
     }
 

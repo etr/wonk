@@ -132,14 +132,27 @@ pub enum Command {
 /// management modes stand alone. The six management flags are mutually
 /// exclusive with each other and with recording.
 #[derive(clap::Args, Debug)]
+#[command(
+    group = clap::ArgGroup::new("mode")
+        .multiple(false)
+        .args([
+            "weights",
+            "list",
+            "export",
+            "clear_events",
+            "clear_result",
+            "reset_weights",
+            "reset_weight",
+        ])
+)]
 pub struct FeedbackArgs {
     /// Slate token from the search output (`slate:` line or JSON field)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "mode")]
     pub slate: Option<String>,
 
     /// Stable id for your current session/conversation (distinct sessions
     /// are counted separately)
-    #[arg(long, requires = "slate")]
+    #[arg(long, requires = "slate", conflicts_with = "mode")]
     pub session: Option<String>,
 
     /// Results that were useful: 64-hex identities or 1-based ranks;
@@ -147,147 +160,47 @@ pub struct FeedbackArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        required_unless_present_any = [
-            "weights",
-            "list",
-            "export",
-            "reset_weights",
-            "reset_weight",
-            "clear_events",
-            "clear_result"
-        ],
-        requires = "session"
+        required_unless_present = "mode",
+        requires = "session",
+        conflicts_with = "mode"
     )]
     pub useful: Vec<String>,
 
     /// List every learned weight with its default, observation count,
     /// and session count instead of recording (TASK-102,
     /// PRD-FB-REQ-029/012)
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "slate",
-            "session",
-            "useful",
-            "list",
-            "export",
-            "reset_weights",
-            "reset_weight",
-            "clear_events",
-            "clear_result"
-        ]
-    )]
+    #[arg(long)]
     pub weights: bool,
 
     /// List recorded feedback events (identity, rank, session, liveness)
     /// instead of recording (TASK-103, PRD-FB-REQ-019)
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "weights",
-            "export",
-            "reset_weights",
-            "reset_weight",
-            "clear_events",
-            "clear_result",
-            "slate",
-            "session",
-            "useful"
-        ]
-    )]
+    #[arg(long)]
     pub list: bool,
 
     /// Dump the complete event store (features payloads included) as one
     /// JSON array to stdout instead of recording (TASK-103)
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "weights",
-            "list",
-            "reset_weights",
-            "reset_weight",
-            "clear_events",
-            "clear_result",
-            "slate",
-            "session",
-            "useful"
-        ]
-    )]
+    #[arg(long)]
     pub export: bool,
 
     /// Wipe EVERY recorded feedback event; learned weights are untouched
     /// (TASK-103, PRD-FB-REQ-013/019)
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "weights",
-            "list",
-            "export",
-            "reset_weights",
-            "reset_weight",
-            "clear_result",
-            "slate",
-            "session",
-            "useful"
-        ]
-    )]
+    #[arg(long)]
     pub clear_events: bool,
 
     /// Wipe one result's recorded events by its 64-hex identity;
     /// learned weights are untouched (TASK-103, PRD-FB-REQ-019)
-    #[arg(
-        long,
-        value_name = "IDENTITY",
-        conflicts_with_all = [
-            "weights",
-            "list",
-            "export",
-            "reset_weights",
-            "reset_weight",
-            "clear_events",
-            "slate",
-            "session",
-            "useful"
-        ]
-    )]
+    #[arg(long, value_name = "IDENTITY")]
     pub clear_result: Option<String>,
 
     /// Reset ALL learned weights to their configured defaults (every
     /// scope); the event history is untouched (TASK-103, PRD-FB-REQ-013)
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "weights",
-            "list",
-            "export",
-            "reset_weight",
-            "clear_events",
-            "clear_result",
-            "slate",
-            "session",
-            "useful"
-        ]
-    )]
+    #[arg(long)]
     pub reset_weights: bool,
 
     /// Reset ONE feature's learned weights to defaults (e.g.
     /// `path_character`), all of its scopes; the event history is
     /// untouched (TASK-103, PRD-FB-REQ-013)
-    #[arg(
-        long,
-        value_name = "FEATURE",
-        conflicts_with_all = [
-            "weights",
-            "list",
-            "export",
-            "reset_weights",
-            "clear_events",
-            "clear_result",
-            "slate",
-            "session",
-            "useful"
-        ]
-    )]
+    #[arg(long, value_name = "FEATURE")]
     pub reset_weight: Option<String>,
 }
 
