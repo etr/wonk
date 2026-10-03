@@ -31,7 +31,8 @@
    `--base` is accepted and silently ignored when --scope is not `compare`: `wonk review --scope all --base main` parses fine, then parse_change_scope (src/router.rs:1896) only reads base when scope == "compare", so the user's requested base never takes effect with no diagnostic. The arg help says 'required when --scope=compare' but the inverse is unenforced. (Behavior inherited verbatim from the pre-existing `wonk changes` path through the shared helper; the new review surface now exposes it too.)
    *Recommendation:* Either clap `requires_if("compare", base)`-style validation on ReviewArgs/ChangesArgs, or have parse_change_scope error when base.is_some() && scope != "compare" so the silent drop becomes a usage error.
 
-6. [ ] **code-quality-reviewer** | `src/impact.rs:353` | dead-code
+6. [x] **code-quality-reviewer** | `src/impact.rs:353` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (unreachable guard removed with justification).
    Unreachable guard in parse_hunk_header_sides: `if plus_pos <= minus_pos { return None; }`. plus_pos = minus_pos + line[minus_pos..].find('+')?, and the slice starts with '-' so the found offset is always >= 1; plus_pos is strictly greater than minus_pos whenever the ?-operator has not already returned None. The branch suggests a case that cannot occur.
    *Recommendation:* Delete the guard (the None-paths through find already reject non-hunk lines, covered by parse_hunk_header_sides_rejects_non_hunk_lines).
 
@@ -47,7 +48,8 @@
    Redundant function-local `use crate::types::FindingSeverity;` inside derive_verdict; the type is already imported in the module-level use list (line 24). Leftover from an earlier draft.
    *Recommendation:* Remove the inner use statement.
 
-10. [ ] **code-simplifier** | `bench/review_bench.rs:134` | dead-code
+10. [x] **code-simplifier** | `bench/review_bench.rs:134` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (clone dropped).
    `paired_deltas` is collected and then used exactly once — to clone into `paired` before percentiles; the original is never read again, so the intermediate vector and its clone are pure overhead in the bench harness.
    *Recommendation:* Collect directly into the mutable binding: `let mut paired: Vec<f64> = full_ms.iter().zip(&detect_ms).map(|(f, d)| f - d).collect();` and delete paired_deltas.
 
@@ -63,7 +65,8 @@
    The Removed branch of resolve_anchor uses `hunks.filter(|h| range_covers(...)).map(|_| cs.line)` — an Option-filter that discards the reference only to repackage cs.line, which reads as if the hunk were transformed when it is only being tested.
    *Recommendation:* Use the direct boolean form: `if hunks.is_some_and(|h| range_covers(&h.removed_ranges, cs.line)) { (Some(cs.line), AnchorMethod::OldSideLine) } else { (None, AnchorMethod::Unresolved) }` — matching the tier-1 check at line 79 that already uses is_some_and.
 
-14. [ ] **code-simplifier** | `src/review.rs:95` | dead-code
+14. [x] **code-simplifier** | `src/review.rs:95` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (local use removed).
    derive_verdict opens with a function-local `use crate::types::FindingSeverity;` even though FindingSeverity is already imported in the module-level use at line 24.
    *Recommendation:* Delete the function-local use; the body already resolves through the module import.
 

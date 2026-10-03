@@ -25,7 +25,8 @@
    aggregate_co_change clones both path strings on every accumulation (entry(file_a.clone()).or_default().entry(file_b.clone())) even when the keys already exist; at the default window of 500 and the bulk threshold of 50, one recompute can perform millions of avoidable String allocations (up to ~2450 ordered pairs per commit x 2 clones x 500 commits).
    *Recommendation:* Use the get_mut-then-insert-on-miss two-step for both map levels (or key the outer map by &str within the loop) so the clone happens only on first insert. Correctness is unaffected; recompute runs once per refresh, so this is polish, not a blocker.
 
-5. [ ] **code-simplifier** | `src/db.rs:239` | dead-code
+5. [x] **code-simplifier** | `src/db.rs:239` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (index dropped from schema + §5.2).
    `CREATE INDEX IF NOT EXISTS idx_co_change_a ON co_change(file_a, weight DESC)` serves no query the code executes. The only production reader (rerank.rs load_co_change_scores) runs `WHERE file_a IN (...)` fetching all three columns and folds the max in Rust — a lookup equally served by the table's PRIMARY KEY (file_a, file_b) — and neither the ORDER BY weight nor MAX(weight)-per-file shapes the comment describes exist anywhere (the only ORDER BYs on co_change are on file names in tests). The index roughly doubles index-maintenance work on every INSERT during full mines for zero read benefit; it is speculative schema (YAGNI).
    *Recommendation:* Either drop the index and its existence test (db.rs:1926-1933) and the sentence in the HISTORY_SQL comment claiming it serves the lookup, or keep it but rewrite the comment to state honestly that it is forward-looking for a top-1-per-file SQL query that does not exist yet. Dropping is behavior-preserving: no executed query plan depends on it.
 

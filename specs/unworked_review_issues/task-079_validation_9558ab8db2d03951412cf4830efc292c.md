@@ -46,7 +46,8 @@
    The distinct-file loop allocates an owned String for every result (`result.file.to_string_lossy().into_owned()`) before the `scores.contains_key(&file)` dedup check, so a file with many hits pays one allocation plus a hash lookup per hit; `insert` then does a second lookup per distinct file.
    *Recommendation:* Check with a borrow first — `if scores.contains_key(result.file.to_string_lossy().as_ref()) { continue; }` — and only build the owned key when actually inserting. `to_string_lossy` is deterministic, so keys match the second pass exactly; behavior unchanged, allocations drop from one-per-hit to one-per-distinct-file.
 
-10. [ ] **code-simplifier** | `src/bm25.rs:180` | dead-code
+10. [x] **code-simplifier** | `src/bm25.rs:180` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* addressed (defensive default kept and documented — the map is built over exactly these results' files).
    In the ranking pass, `scores.get(r.file.to_string_lossy().as_ref()).copied().unwrap_or(0.0)` has an unreachable fallback: the preceding loop over the same `results` slice inserts a score for every distinct result file with the same lossy key conversion, so `get` always hits. The `unwrap_or(0.0)` implies a 'file without a score' case that cannot occur, which misleads a maintainer into defending against it.
    *Recommendation:* Make the invariant explicit — `.expect("every result file was scored in the first pass")` — or restructure so the invariant is visible (e.g., a single pass that records (score, result) pairs alongside scoring). Either keeps output identical on the reachable domain while removing the phantom 0.0-score path.
 

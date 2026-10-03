@@ -30,7 +30,8 @@
    A lone leading base-URL interpolation normalizes to a parameter route and collides with unrelated single-param routes: `fetch(`${API_URL}`)` becomes `http::GET::/{p1}` (probe-verified), identical to `app.get('/:id')` → `http::GET::/{p1}`. Cross-repo matching would pair a bare-base fetch with any single-parameter provider. The behavior is deliberately pinned by `pipeline_lone_base_token_becomes_single_param_route` (src/contracts.rs:3134), but it is inconsistent with the analogous bare-authority case: `http://example.com` normalizes to `/`, not `/{p1}`.
    *Recommendation:* Normalize a lone leading interpolation token to `/` (like a bare authority) or return None for it, and update the pinning test; alternatively document why the parameter-route reading is intended.
 
-6. [ ] **code-quality-reviewer** | `src/contracts.rs:523` | correctness
+6. [x] **code-quality-reviewer** | `src/contracts.rs:523` | correctness
+   *Addressed (minors sweep, 2026-10-02):* fixed (router arm gated on path-like first arg; tests both ways).
    Framework-recognized branches skip the `is_path_like` gate entirely, and `JS_ROUTER_VARS` includes the single letter `r`. Probe-verified: `const r = redis.createClient(); r.get('user:1')` emits `http::GET::/user:1` at confidence 1.0 — a plausible receiver name (redis/rethink clients) defeats the noise gate purely by variable naming, while the same call on `cache` is filtered. The path-like gate only runs in the 0.5 ambiguous branch (`ambiguous_http`).
    *Recommendation:* Require `is_path_like` (or at least a leading `/`) on Direct path arguments in `emit_http`'s framework path as well, or drop `r` from JS_ROUTER_VARS. The gate is cheap and framework-literal routes always start with `/`.
 

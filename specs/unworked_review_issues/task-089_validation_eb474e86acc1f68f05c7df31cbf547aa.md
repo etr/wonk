@@ -37,7 +37,8 @@
    For tier-1/3 anchors, `std::fs::read_to_string(...).ok()` yields None for a non-UTF-8 (or unreadable) file, so every finding's identity in that file silently degrades to symbol-grain (no fifth component). This is self-consistent — tree-sitter symbol parsing fails on the same file too, so anchors would mostly be Unresolved anyway — but the degradation is undocumented on `anchored_line_text`/`finding_identity`, and symbol-grain identities are coarser than the REQ-013 contract for the affected file.
    *Recommendation:* Document the fallback on `finding_identity`/`anchored_line_text` (one line: unreadable/non-UTF-8 current file contributes no anchor text), or use `String::from_utf8_lossy` if preserving per-line identity on non-UTF-8 files matters.
 
-8. [ ] **code-quality-reviewer** | `src/router.rs:2004` | correctness
+8. [x] **code-quality-reviewer** | `src/router.rs:2004` | correctness
+   *Addressed (minors sweep, 2026-10-02):* fixed (clamped like every sibling flag).
    `--min-confidence` is passed raw into ReviewOptions with no sanitization, breaking the codebase's established pattern: every sibling command that takes the same flag clamps it via a `sanitize_confidence` helper (src/callgraph.rs:21, src/blast.rs:65, src/flows.rs:240, src/context.rs:31). `wonk review --min-confidence 5` silently drops every finding, `-1` silently keeps everything, and `NaN` (accepted by clap's f64 parser) behaves as no filter because `confidence < NaN` is always false.
    *Recommendation:* Apply the same clamp/reject semantics before building ReviewOptions in dispatch_review (or inside rank_filter_cap), so review's confidence floor is validated exactly like blast/flows/context.
 

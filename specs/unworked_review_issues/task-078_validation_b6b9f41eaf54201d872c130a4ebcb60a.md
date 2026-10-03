@@ -54,7 +54,8 @@
    The tokenizer-oracle comparison is implemented twice: assert_stats_match_disk's per-file body (read -> term_frequencies -> collect actual -> compare len -> per-term loop) is re-implemented inline in test_term_stats_and_files_row_same_transaction (lines 2019-2039), and both use a manual len-then-per-key loop instead of direct map equality.
    *Recommendation:* Extract a per-file helper `fn assert_file_stats_match(conn: &Connection, root: &Path, rel: &str)` used by both, and compare via `assert_eq!(actual, expected_i64_map)` after converting u32->i64 — shorter code and a full diff on failure instead of first-mismatch-only.
 
-12. [ ] **code-simplifier** | `src/pipeline.rs:3676` | dead-code
+12. [x] **code-simplifier** | `src/pipeline.rs:3676` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (helper returns (), median printed internally).
    bench_three_fresh_builds returns a sorted Vec<Duration> that no caller consumes (both #[ignore] bench tests discard the value); only the internal println of the median is used.
    *Recommendation:* Return () and keep the median println, or have a caller actually assert on the durations — an unused return value on a measurement helper is YAGNI.
 

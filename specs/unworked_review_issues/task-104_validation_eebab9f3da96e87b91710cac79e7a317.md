@@ -18,7 +18,8 @@
    Stored preference rows have no per-row inspection surface: list_learned (--weights) is weights-only, wonk status reports only a count (preference_count), --export covers events, and a gated-out or inert preference's identity/strength/session counts cannot be listed anywhere. This matches the task's declared surfaces (status count + --why row), so it is consistent with the frozen baseline, but it falls short of the legibility principle the weights channel set (PRD-FB-REQ-012's 'a claim a human can evaluate and reject' — here the only per-result kill is the all-or-nothing --reset-weights).
    *Recommendation:* Follow-up task, not a change to this one: extend the feedback management surface (e.g. wonk feedback --weights or a --preferences mode) to list stored result_preferences rows with strength, observations, sessions, and gate verdict, mirroring list_learned's gated-and-inert presentation.
 
-4. [ ] **code-simplifier** | `docs/commands.md:573` | docs
+4. [x] **code-simplifier** | `docs/commands.md:573` | docs
+   *Addressed (minors sweep, 2026-10-02):* wontfix by design (session evidence deliberately outlives influence — pinned by preference_sweep_retires_rows_below_the_floor; growth is proportional to the event store).
    The --clear-result row's parenthetical "(the per-result kill is `--reset-weights`)" reads as if --reset-weights were a per-result operation, but --reset-weights clears ALL preferences globally; there is no per-result preference kill. The configuration.md twin ("the per-result kill story is the reset") has the same opacity.
    *Recommendation:* Rephrase to name the actual behavior, e.g. "...is untouched (there is no per-result preference kill; `--reset-weights` clears every preference)".
 

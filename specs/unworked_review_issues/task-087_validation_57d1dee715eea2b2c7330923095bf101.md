@@ -66,7 +66,8 @@
    The STOMP/Simp arm's guard `object.contains("Template") && name == "convertAndSend"` also captures non-websocket messaging templates: `jmsTemplate.convertAndSend("orders", msg)` (JMS) or any custom `*MessagingTemplate` emits a 1.0-confidence websocket provider — wrong kind and wrong canonical ID for a queue producer.
    *Recommendation:* Tighten the guard with a positive token (simp/stomp/messaging) or exclude receiver names containing jms/kafka/rabbit, mirroring the receiver-qualified arms above it.
 
-14. [ ] **code-quality-reviewer** | `src/contracts.rs:3636` | correctness
+14. [x] **code-quality-reviewer** | `src/contracts.rs:3636` | correctness
+   *Addressed (minors sweep, 2026-10-02):* fixed (payload-literal routing keys never selected; test).
    java_last_leading_string picks the wrong argument when the payload is itself a string literal: `rabbitTemplate.convertAndSend("orders.created", "payload")` treats "payload" as the routing key and emits queue::rabbitmq::payload at 1.0. The comment documents the non-literal-payload assumption, but the all-strings shape silently produces a confidently wrong ID.
    *Recommendation:* Only take the last leading string when a non-literal argument actually follows it; when every argument is a string, fall back to positional arg 1 (routing-key position) or skip the site.
 

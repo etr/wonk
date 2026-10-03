@@ -74,7 +74,8 @@
    #[allow(clippy::too_many_arguments)] on fn metrics — the function takes two arguments and returns a tuple; the attribute is dead and reads as leftover from an earlier signature.
    *Recommendation:* Remove the attribute.
 
-17. [ ] **code-simplifier** | `src/feedback.rs:1168` | dead-code
+17. [x] **code-simplifier** | `src/feedback.rs:1168` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (deleted).
    The repair orphaned pub fn load_events_since: before 0d36908 its only caller was learn_pending (src/learning.rs:405 at 1f5077d); after the commit it has zero callers in src/ and tests/. The fix retrofitted its doc comment ('this remains the plain cursor') rather than removing it, keeping a dead public function alive on the lib surface.
    *Recommendation:* Delete load_events_since (load_events already covers the unfiltered full-table read the test at feedback.rs:2029 uses). If it is deliberately retained as public API for an anticipated cursor consumer, that is a YAGNI exception worth one sentence in the doc comment naming the consumer.
 
@@ -106,7 +107,8 @@
    run_feedback evaluates args.slate.as_deref().unwrap_or_default() twice (lines 2703 and 2721) — the clap requires-chain makes it always Some on this path, and the duplicated fallback reads as if None were expected.
    *Recommendation:* Bind let slate = args.slate.as_deref().unwrap_or_default(); once at the top of the recording branch and use it in both the record_feedback call and the summary line.
 
-25. [ ] **code-simplifier** | `tests/feedback_learning.rs:1212` | dead-code
+25. [x] **code-simplifier** | `tests/feedback_learning.rs:1212` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (stale allow removed).
    #[allow(clippy::too_many_arguments)] sits on fn metrics(step: f32, half_life_days: i64) -> ..., which takes two arguments and returns a tuple; the attribute is stale (presumably left from a version with more parameters). cargo clippy --all-targets -D warnings passes without it.
    *Recommendation:* Remove the allow attribute.
 

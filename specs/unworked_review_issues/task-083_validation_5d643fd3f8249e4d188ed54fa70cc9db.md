@@ -35,7 +35,8 @@
    The corrupt-row error branch in list_contracts (kind/role FromStr failure on stored rows, producing 'corrupt contract row {id}: ...') has no test; every seeded row in the query tests uses valid kind/role strings.
    *Recommendation:* Add one seeded row with kind='bogus' (or role='server') asserting the anyhow error message, pinning both the parse failure path and the diagnostic wording.
 
-7. [ ] **code-quality-reviewer** | `src/db.rs:394` | dead-code
+7. [x] **code-quality-reviewer** | `src/db.rs:394` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (wrapper deleted; apply_schema is the migration).
    ensure_contracts_table has no production caller: apply_schema (src/db.rs:270-271) already executes CONTRACTS_SQL on every open(), which is exactly how the pre-V5 migration test passes. The only references are its own unit test. The frozen baseline declares an 'ensure hook' as a core path, but as merged it is an unused public API whose migration purpose is already fulfilled elsewhere.
    *Recommendation:* Either wire it into the intended caller (e.g. the TASK-084 workspace/link path that may open connections outside open()) or remove it until that caller exists, keeping the ensure_* family (ensure_reach_table, ensure_doc_comment_column) reserved for hooks with real call sites.
 
@@ -51,7 +52,8 @@
    The repair's piped regression tests pin only --format json; the toon half of the structured exemption claimed in the new doc comments (output.rs:880, 918-921) has no piped-path test, even though the render_piped helper already parameterizes the format.
    *Recommendation:* Add a two-line sibling test render_piped(OutputFormat::Toon) asserting one newline-terminated row per line (serde_toon2::from_str per line), mirroring piped_json_rows_stay_newline_delimited.
 
-11. [ ] **code-simplifier** | `src/db.rs:394` | dead-code
+11. [x] **code-simplifier** | `src/db.rs:394` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (same).
    ensure_contracts_table has no production caller — the only calls are its own tests (src/db.rs:2063-2064); real migration happens exclusively in open() -> apply_schema() (src/db.rs:268-270), which its own doc comment describes as the actor. It mirrors the equally test-only ensure_term_stats_table precedent (unlike ensure_reach_table, which reach.rs calls in production), so it is consistent with the established pattern, but it is newly added test-only public surface.
    *Recommendation:* Either accept it explicitly as the ensure_term_stats_table-style public migration seam, or drop the function and keep the migration tests exercising open() directly (the migrates_pre_v5_db test already does). Do not add speculative callers.
 
