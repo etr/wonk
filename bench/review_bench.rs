@@ -16,6 +16,11 @@
 //!
 //! Run: cargo bench --bench review
 
+mod fixture_config;
+
+mod review_samples;
+use review_samples::{percentiles, phase_samples, verify_pairing};
+
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -32,6 +37,7 @@ const MID_HUBS: usize = 30;
 const SWEEPS: usize = 25;
 
 fn main() -> Result<()> {
+    verify_pairing();
     let repo = tempfile::tempdir()?;
     let root = repo.path();
 
@@ -46,7 +52,7 @@ fn main() -> Result<()> {
     git(root, &["commit", "-m", "base"])?;
     // The index now reflects the base state — the diff's old side.
     let build_start = Instant::now();
-    let stats = wonk::pipeline::build_index(root, true)?;
+    let stats = fixture_config::build_index(root, true)?;
     let build = build_start.elapsed();
     ensure!(
         stats.symbol_count > 55_000 && stats.symbol_count < 70_000,
@@ -124,15 +130,15 @@ fn main() -> Result<()> {
         wonk::impact::detect_changes_detail(&conn, &scope, root)?;
         detect_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
-    let (f50, f95, f99, f100) = percentiles(&mut full_ms);
-    let (d50, d95, d99, d100) = percentiles(&mut detect_ms);
+    let (f50, f95, f99, f100) = percentiles(&full_ms);
+    let (d50, d95, d99, d100) = percentiles(&detect_ms);
     // Two-phase split: paired per-iteration deltas (full_i - detect_i,
     // measured back to back in the same iteration), not subtracted
     // percentiles — those would be noise at this magnitude. Individual
-    // deltas can dip below zero from ordering effects; clamped for the
-    // summary, raw shape visible in the p50.
-    let mut paired_deltas: Vec<f64> = full_ms.iter().zip(&detect_ms).map(|(f, d)| f - d).collect();
-    let (r50, r95, r99, r100) = percentiles(&mut paired_deltas);
+    // deltas can dip below zero from ordering effects; preserve them in
+    // both the raw samples and the percentile summary.
+    let paired_deltas: Vec<f64> = phase_samples(&full_ms, &detect_ms);
+    let (r50, r95, r99, r100) = percentiles(&paired_deltas);
 
     ensure!(
         f95 < 2000.0,
@@ -154,7 +160,7 @@ fn main() -> Result<()> {
             "reach kill switch changed findings"
         );
     }
-    let (b50, b95, b99, b100) = percentiles(&mut bfs_ms);
+    let (b50, b95, b99, b100) = percentiles(&bfs_ms);
 
     println!("== review bench (TASK-085) ==");
     println!(
@@ -176,13 +182,24 @@ fn main() -> Result<()> {
         "  change detect:  p50 {d50:8.2}ms  p95 {d95:8.2}ms  p99 {d99:8.2}ms  p100 {d100:8.2}ms  (separate sweeps)"
     );
     println!(
-        "  blast+rules:    p50 {r50:8.2}ms  p95 {:8.2}ms  p99 {r99:8.2}ms  p100 {:8.2}ms  (paired per-iteration deltas)",
-        r95.max(0.0),
-        r100.max(0.0)
+        "  blast+rules:    p50 {r50:8.2}ms  p95 {r95:8.2}ms  p99 {r99:8.2}ms  p100 {r100:8.2}ms  (paired per-iteration deltas)"
     );
     println!(
         "reach disabled:   p50 {b50:8.2}ms  p95 {b95:8.2}ms  p99 {b99:8.2}ms  p100 {b100:8.2}ms  (ungated contrast, identical findings)"
     );
+    let samples = serde_json::json!({
+        "warmups": 1,
+        "samples": SWEEPS,
+        "full_ms": full_ms,
+        "detect_ms": detect_ms,
+        "paired_deltas_ms": phase_samples(&full_ms, &detect_ms),
+        "bfs_ms": bfs_ms,
+        "pairing": "full_i - detect_i before sorting; percentile calculations sort copies"
+    });
+    std::fs::write(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/review-samples.json"),
+        format!("{}\n", serde_json::to_string_pretty(&samples)?),
+    )?;
     Ok(())
 }
 
@@ -302,11 +319,4 @@ fn generate_repo(root: &Path) -> Result<()> {
         fs::write(root.join(format!("tests/x_{t}.rs")), src)?;
     }
     Ok(())
-}
-
-fn percentiles(samples: &mut [f64]) -> (f64, f64, f64, f64) {
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = samples.len();
-    let at = |q: f64| samples[((q * (n - 1) as f64).round()) as usize];
-    (at(0.50), at(0.95), at(0.99), at(1.0))
 }

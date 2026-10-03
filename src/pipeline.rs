@@ -110,19 +110,41 @@ pub fn build_index_with_progress(
     local: bool,
     progress: &Progress,
 ) -> Result<IndexStats> {
+    let config = crate::config::Config::load(Some(repo_root))?;
+    build_index_configured(repo_root, local, progress, &config)
+}
+
+/// Build with explicit configuration, without consulting process-global layers.
+pub fn build_index_with_config(
+    repo_root: &Path,
+    local: bool,
+    config: &crate::config::Config,
+) -> Result<IndexStats> {
+    build_index_configured(repo_root, local, &Progress::silent(), config)
+}
+
+fn build_index_configured(
+    repo_root: &Path,
+    local: bool,
+    progress: &Progress,
+    config: &crate::config::Config,
+) -> Result<IndexStats> {
+    build_index_configured_before_publish(repo_root, local, progress, config, || {})
+}
+
+fn build_index_configured_before_publish(
+    repo_root: &Path,
+    local: bool,
+    progress: &Progress,
+    config: &crate::config::Config,
+    before_publish: impl FnOnce(),
+) -> Result<IndexStats> {
     let start = Instant::now();
 
     // 1. Determine index path.
     let index_path = db::index_path_for(repo_root, local)?;
 
-    // 2. Open (or create) the database.
-    let conn = db::open(&index_path)?;
-
-    // 2b. Clear any existing data so fresh build is idempotent.
-    drop_all_data(&conn)?;
-
     // 3. Walk files (respecting config ignore patterns).
-    let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
     let paths = Walker::new(repo_root)
         .with_ignore_patterns(&config.ignore.patterns)
         .collect_paths();
@@ -140,6 +162,11 @@ pub fn build_index_with_progress(
             result
         })
         .collect();
+
+    before_publish();
+
+    // Parsing finishes before opening the writer connection or replacing any rows.
+    let conn = db::open(&index_path)?;
 
     // 5. Batch insert (reach table built in the same transaction when enabled).
     let reach_opts = if config.reach.enabled {
@@ -226,15 +253,6 @@ pub fn rebuild_index_with_progress(
     local: bool,
     progress: &Progress,
 ) -> Result<IndexStats> {
-    let index_path = db::index_path_for(repo_root, local)?;
-
-    // If the database exists, drop all data.
-    if index_path.exists() {
-        let conn = db::open(&index_path)?;
-        drop_all_data(&conn)?;
-        drop(conn);
-    }
-
     build_index_with_progress(repo_root, local, progress)
 }
 
@@ -246,13 +264,35 @@ pub fn rebuild_index_with_progress(
 ///
 /// Returns [`IndexStats`] reflecting what is now in the database.
 pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
+    let config = crate::config::Config::load(Some(repo_root))?;
+    incremental_update_configured(repo_root, local, &config)
+}
+
+/// Update with explicit configuration, without consulting process-global layers.
+pub fn incremental_update_with_config(
+    repo_root: &Path,
+    local: bool,
+    config: &crate::config::Config,
+) -> Result<IndexStats> {
+    incremental_update_configured(repo_root, local, config)
+}
+
+fn incremental_update_configured(
+    repo_root: &Path,
+    local: bool,
+    config: &crate::config::Config,
+) -> Result<IndexStats> {
     let start = Instant::now();
 
     let index_path = db::index_path_for(repo_root, local)?;
     let conn = db::open(&index_path)?;
 
+    // An upgraded corpus needs a complete generation, even when old hashes match.
+    if !db::bm25_generation_ready(&conn) {
+        return build_index_configured(repo_root, local, &Progress::silent(), config);
+    }
+
     // Walk current files on disk.
-    let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
     let on_disk: HashSet<String> = Walker::new(repo_root)
         .with_ignore_patterns(&config.ignore.patterns)
         .collect_paths()
@@ -1072,6 +1112,8 @@ fn batch_insert(
         .unchecked_transaction()
         .context("starting transaction")?;
 
+    clear_index_data(&tx)?;
+
     let mut total_syms = 0usize;
     let mut total_refs = 0usize;
     let mut caller_count = 0usize;
@@ -1278,6 +1320,10 @@ fn batch_insert(
     // Publish the corpus-stats summary for this whole batch (one
     // aggregate per build, replacing the per-query scan at search time).
     corpus_stats_recompute(&tx)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO bm25_meta (key, value) VALUES ('generation_ready', '1')",
+        [],
+    )?;
 
     tx.commit().context("committing transaction")?;
 
@@ -1811,10 +1857,14 @@ fn insert_contracts(
     Ok(inserted)
 }
 
-/// Drop all data from the main tables (used before rebuild).
-fn drop_all_data(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+/// Replace only index-derived data inside the publication transaction.
+/// Durable feedback and review suppressions survive rebuilds.
+fn clear_index_data(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
         "DELETE FROM embeddings;
+         DELETE FROM near_duplicates;
+         DELETE FROM symbol_shingles;
+         DELETE FROM summaries;
          DELETE FROM type_edges;
          DELETE FROM contracts;
          DELETE FROM symbol_topology;
@@ -1832,9 +1882,18 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM commit_files;
          DELETE FROM mined_commits;
          DELETE FROM history_meta;
-         DELETE FROM corpus_stats;",
+         DELETE FROM corpus_stats;
+         DELETE FROM bm25_meta;",
     )
     .context("clearing index data")?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn drop_all_data(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    clear_index_data(&tx)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1915,6 +1974,38 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn fixture_config(root: &Path) -> Result<crate::config::Config> {
+        crate::config::Config::load_with_paths(None, Some(root))
+    }
+
+    fn build_index(root: &Path, local: bool) -> Result<IndexStats> {
+        super::build_index_with_config(root, local, &fixture_config(root)?)
+    }
+
+    fn rebuild_index(root: &Path, local: bool) -> Result<IndexStats> {
+        build_index(root, local)
+    }
+
+    fn build_index_with_progress(
+        root: &Path,
+        local: bool,
+        progress: &Progress,
+    ) -> Result<IndexStats> {
+        super::build_index_configured(root, local, progress, &fixture_config(root)?)
+    }
+
+    fn rebuild_index_with_progress(
+        root: &Path,
+        local: bool,
+        progress: &Progress,
+    ) -> Result<IndexStats> {
+        build_index_with_progress(root, local, progress)
+    }
+
+    fn incremental_update(root: &Path, local: bool) -> Result<IndexStats> {
+        super::incremental_update_configured(root, local, &fixture_config(root)?)
+    }
 
     struct TwoDimProvider;
     struct FailingProvider;
@@ -2087,7 +2178,7 @@ class Component {
             "fn main() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n    let e = 5;\n}\n",
         )
         .unwrap();
-        let config = crate::config::Config::load(Some(root)).unwrap_or_default();
+        let config = fixture_config(root).unwrap();
         let opts = crate::contracts::ContractOptions::from(&config.contracts);
         assert!(reindex_file(&conn, &main, root, &opts).unwrap());
         assert_corpus_stats_matches_aggregate(&conn);
@@ -2117,7 +2208,7 @@ class Component {
 
         // Simulate a pre-summary legacy index: no row, then a mutation.
         conn.execute("DELETE FROM corpus_stats", []).unwrap();
-        let config = crate::config::Config::load(Some(root)).unwrap_or_default();
+        let config = fixture_config(root).unwrap();
         let opts = crate::contracts::ContractOptions::from(&config.contracts);
         let js = root.join("index.js");
         fs::write(&js, "function render() {\n    return 1;\n}\n").unwrap();
@@ -6344,5 +6435,111 @@ function unknown() { return mystery(); }
         print_bench_db_stats(&root);
 
         fs::remove_dir_all(root.join(".wonk")).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod audit_publication_tests {
+    use crate::{db, pipeline};
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn caller() { alpha(); }\n").unwrap();
+        dir
+    }
+    #[test]
+    fn audit_publication_and_daemon_fixtures_ignore_hostile_global_config() {
+        for config in [
+            "[reach]\nenabled=false\n[ignore]\npatterns=['*.rs']\n",
+            "invalid [ config",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir(home.path().join(".wonk")).unwrap();
+            std::fs::write(home.path().join(".wonk/config.toml"), config).unwrap();
+            for name in [
+                "pipeline::audit_publication_tests::full_rebuild_parses_before_replacement_and_publishes_wal_snapshot",
+                "daemon::tests::audit_g8_daemon_invalid_config_has_no_startup_side_effects",
+                "daemon::tests::audit_g8_valid_daemon_config_preserves_running_daemon_guard",
+                "daemon::tests::audit_g8_daemon_invalid_config_is_rejected_before_running_daemon_check",
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .env("HOME", home.path())
+                    .args(["--exact", name, "--nocapture"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{name}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+    #[test]
+    fn full_rebuild_parses_before_replacement_and_publishes_wal_snapshot() {
+        let dir = repo();
+        let config = crate::config::Config::load_with_paths(None, Some(dir.path())).unwrap();
+        pipeline::build_index_with_config(dir.path(), true, &config).unwrap();
+        let path = db::local_index_path(dir.path());
+        let conn = db::open(&path).unwrap();
+        let old = conn.unchecked_transaction().unwrap();
+        let count = old
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        let blocker = db::open_existing(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn replacement() {}\n").unwrap();
+        let progress = std::sync::Arc::new(crate::progress::Progress::silent());
+        let p = std::sync::Arc::clone(&progress);
+        let root = dir.path().to_owned();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            super::build_index_configured_before_publish(&root, true, &p, &config, || {
+                ready_tx.send(p.done()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        // This timeout detects a deadlock; it never samples partial progress.
+        let parsed = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(parsed, 2, "all files parsed at the pre-publication barrier");
+        assert_eq!(
+            old.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            count
+        );
+        assert!(
+            old.query_row("SELECT COUNT(*) FROM reach", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            old.query_row("SELECT COUNT(*) FROM symbols WHERE name='alpha'", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "paused WAL reader retains old complete generation after writer commit"
+        );
+        old.commit().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM symbols WHERE name='replacement'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            parsed, 2,
+            "all inputs must parse before waiting for replacement writer lock"
+        );
     }
 }

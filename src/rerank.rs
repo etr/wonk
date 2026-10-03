@@ -9,10 +9,8 @@
 //! SKIPPED entirely — it is never evaluated and it contributes nothing to
 //! the shared-context requirements, so zero-weight signals cost nothing.
 //!
-//! Grouping decision: the pipeline path buckets scored results by category
-//! in tier order (`ranker::bucket_by_category`) before the ONE shared
-//! dedup/group pass, so each category is emitted exactly once under any
-//! valid weight configuration.
+//! Groups are contiguous category runs in final score order. Repeated
+//! categories do not restore the legacy tier precedence.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1854,22 +1852,65 @@ pub(crate) fn prepare_context_with(
     sources: &ContextSources,
     hint: Option<&str>,
 ) -> SharedContext {
+    prepare_context_using(
+        reqs,
+        pattern,
+        results,
+        conn,
+        sources,
+        &ContextOverrides {
+            hint,
+            ..Default::default()
+        },
+    )
+}
+
+#[derive(Default)]
+struct ContextOverrides<'a> {
+    hint: Option<&'a str>,
+    disable_topology: bool,
+    disable_history: bool,
+    file_keys: Option<&'a HashMap<String, String>>,
+}
+
+fn prepare_context_using(
+    mut reqs: ContextReqs,
+    pattern: &str,
+    results: &[ClassifiedResult],
+    conn: Option<&Connection>,
+    sources: &ContextSources,
+    overrides: &ContextOverrides<'_>,
+) -> SharedContext {
+    if overrides.disable_topology {
+        reqs.symbol_topology = false;
+    }
+    if overrides.disable_history {
+        reqs.file_churn = false;
+        reqs.co_change = false;
+    }
     let mut ctx = SharedContext::default();
     let files = unique_result_files(results);
-    let file_keyed = reqs.symbol_hits
+    let file_keyed = reqs.path_class
+        || reqs.symbol_hits
         || reqs.lexical_scores
         || reqs.file_churn
         || reqs.co_change
         || reqs.symbol_topology
         || reqs.shingles;
     if file_keyed {
-        ctx.file_keys = resolve_file_keys(conn, &files);
+        ctx.file_keys = resolve_file_keys(conn, &files, overrides.file_keys);
     }
     if reqs.query_terms {
         ctx.terms = crate::tokenizer::tokenize(pattern);
     }
     if reqs.path_class {
-        ctx.path_class = classify_paths(&files, conn);
+        let mut canonical_files: Vec<String> = files
+            .iter()
+            .map(|file| ctx.file_keys.get(file).unwrap_or(file).clone())
+            .collect();
+        canonical_files.sort_unstable();
+        canonical_files.dedup();
+        ctx.path_class = classify_paths(&canonical_files, conn);
         alias_file_map(&mut ctx.path_class, &ctx.file_keys);
     }
     if reqs.symbol_hits
@@ -1940,10 +1981,10 @@ pub(crate) fn prepare_context_with(
     {
         ctx.shingles = load_shingle_sketches(conn, results, &ctx.file_keys);
     }
-    if let Some(hint) = hint {
+    if let Some(hint) = overrides.hint {
         ctx.working.hint = Some(hint.to_string());
         if let Some(conn) = conn {
-            ctx.working = load_working_context(conn, hint);
+            ctx.working = load_working_context(conn, hint, overrides);
         }
     }
     ctx
@@ -1961,6 +2002,14 @@ fn unique_result_files(results: &[ClassifiedResult]) -> Vec<String> {
     files
 }
 
+#[cfg(test)]
+thread_local! { static PATH_RESOLUTION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+fn record_path_resolution_visit() {
+    PATH_RESOLUTION_VISITS.with(|n| n.set(n.get() + 1));
+}
+
 /// Whether `suffix` is `path`'s tail at a path-separator boundary (or
 /// equal to it) — the shared shape behind both the canonical file keys
 /// and the feedback slate's path anchoring.
@@ -1971,17 +2020,63 @@ pub(crate) fn is_path_suffix(path: &str, suffix: &str) -> bool {
             && path[..path.len() - suffix.len()].ends_with('/'))
 }
 
-/// The one canonical-path resolution rule (TASK-105 review debt): the
-/// longest path-separator-boundary suffix of `as_seen` among `indexed`,
-/// ties to the lexicographically smallest — a total order. An exact
-/// `files.path` entry is always its own best match (no longer candidate
-/// can be a suffix of it). Behind the file-key fallback, the ranker's
-/// alias pass, and hint resolution.
+#[derive(Default)]
+struct SuffixNode<'a> {
+    children: HashMap<&'a str, usize>,
+    path: Option<&'a String>,
+}
+
+/// A batch resolver retaining the longest path-boundary suffix rule.
+/// Each indexed path and candidate is visited once by reverse components.
+pub(crate) struct PathSuffixIndex<'a> {
+    nodes: Vec<SuffixNode<'a>>,
+}
+
+impl<'a> PathSuffixIndex<'a> {
+    pub(crate) fn new(paths: &'a [String]) -> Self {
+        let mut index = Self {
+            nodes: vec![SuffixNode::default()],
+        };
+        for path in paths {
+            let mut node = 0;
+            for component in path.rsplit('/') {
+                #[cfg(test)]
+                record_path_resolution_visit();
+                node = if let Some(&child) = index.nodes[node].children.get(component) {
+                    child
+                } else {
+                    let child = index.nodes.len();
+                    index.nodes.push(SuffixNode::default());
+                    index.nodes[node].children.insert(component, child);
+                    child
+                };
+            }
+            index.nodes[node].path = Some(path);
+        }
+        index
+    }
+
+    pub(crate) fn resolve(&self, as_seen: &str) -> Option<&'a String> {
+        let mut node = 0;
+        let mut longest = None;
+        for component in as_seen.rsplit('/') {
+            #[cfg(test)]
+            record_path_resolution_visit();
+            let Some(&child) = self.nodes[node].children.get(component) else {
+                break;
+            };
+            node = child;
+            if let Some(path) = self.nodes[node].path {
+                longest = Some(path);
+            }
+        }
+        longest
+    }
+}
+
+/// One-off compatibility resolver; batched callers construct one index.
 pub(crate) fn longest_suffix_match<'a>(indexed: &'a [String], as_seen: &str) -> Option<&'a String> {
-    indexed
-        .iter()
-        .filter(|db| is_path_suffix(as_seen, db))
-        .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)))
+    PathSuffixIndex::new(indexed).resolve(as_seen)
 }
 
 /// Every indexed path (`files.path`), for the suffix-resolution
@@ -1997,27 +2092,36 @@ pub(crate) fn indexed_paths(conn: &Connection) -> Vec<String> {
     rows.flatten().collect()
 }
 
-/// Resolve the candidate file set once into canonical keys (TASK-105,
-/// D6): every result path as the search produced it → its repo-relative
-/// `files.path`. Identity whenever the exact `IN` lookup hits (the CLI
-/// shape); the ONE full `files` fallback scan runs only when some path
-/// went unresolved (the absolute-path MCP shape), matching each
-/// unresolved path to its longest path-separator-boundary suffix in the
-/// index (ties to the lexicographically smallest — a total order). Paths
-/// that resolve to nothing keep the identity mapping, so the loaders
-/// still query with the raw string and simply miss.
-fn resolve_file_keys(conn: Option<&Connection>, files: &[String]) -> HashMap<String, String> {
-    let mut keys: HashMap<String, String> = files.iter().map(|f| (f.clone(), f.clone())).collect();
+/// Normalize owned paths before exact lookup; only unresolved partial paths
+/// use the once-built reverse-component index. Unknown keys remain usable aliases.
+fn resolve_file_keys(
+    conn: Option<&Connection>,
+    files: &[String],
+    known: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut keys: HashMap<String, String> = files
+        .iter()
+        .map(|file| {
+            (
+                file.clone(),
+                known
+                    .and_then(|known| known.get(file))
+                    .unwrap_or(file)
+                    .clone(),
+            )
+        })
+        .collect();
     let Some(conn) = conn else {
         return keys;
     };
     if files.is_empty() {
         return keys;
     }
-
-    // Exact pass: a path that is literally `files.path` maps to itself.
-    let mut resolved: HashSet<&String> = HashSet::new();
-    for chunk in files.chunks(IN_CHUNK) {
+    let mut wanted: Vec<&String> = keys.values().collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut resolved = HashSet::new();
+    for chunk in wanted.chunks(IN_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!("SELECT path FROM files WHERE path IN ({placeholders})");
         let Ok(mut stmt) = conn.prepare(&sql) else {
@@ -2028,70 +2132,70 @@ fn resolve_file_keys(conn: Option<&Connection>, files: &[String]) -> HashMap<Str
         }) else {
             continue;
         };
-        for path in rows.flatten() {
-            if let Ok(idx) = files.binary_search(&path) {
-                resolved.insert(&files[idx]);
-            }
-        }
+        resolved.extend(rows.flatten());
     }
-
-    let unresolved: Vec<&String> = files.iter().filter(|f| !resolved.contains(f)).collect();
+    let unresolved: Vec<&String> = files
+        .iter()
+        .filter(|file| {
+            !resolved.contains(&keys[*file]) && known.is_none_or(|known| !known.contains_key(*file))
+        })
+        .collect();
     if unresolved.is_empty() {
         return keys;
     }
-
-    // One full scan serves every unresolved path (the
-    // `resolve_generated_shadowing` fallback precedent).
-    let indexed = indexed_paths(conn);
-    for as_seen in unresolved {
-        // The longest boundary-suffix is the most specific match; equal
-        // lengths break to the smallest string so the key is deterministic.
-        if let Some(db) = longest_suffix_match(&indexed, as_seen) {
-            keys.insert(as_seen.clone(), db.clone());
+    let paths = indexed_paths(conn);
+    let index = PathSuffixIndex::new(&paths);
+    for seen in unresolved {
+        if let Some(db) = index.resolve(seen) {
+            keys.insert(seen.clone(), db.clone());
         }
     }
     keys
 }
 
-/// Shadow every DB-keyed entry of a file-keyed map under its as-seen
-/// alias (TASK-105 D6 dual-keying), so accessors hit whichever key the
-/// caller holds — the DB path (features, canonical) or the result path
-/// (signals, as produced).
+/// Select the smallest alias deterministically in one pass over file keys.
+fn smallest_aliases(keys: &HashMap<String, String>) -> HashMap<&str, &str> {
+    let mut aliases: HashMap<&str, &str> = HashMap::new();
+    for (seen, db) in keys {
+        #[cfg(test)]
+        record_path_resolution_visit();
+        if seen != db {
+            aliases
+                .entry(db)
+                .and_modify(|alias| *alias = (*alias).min(seen.as_str()))
+                .or_insert(seen);
+        }
+    }
+    aliases
+}
+
 fn alias_file_map<V: Clone>(map: &mut HashMap<String, V>, keys: &HashMap<String, String>) {
-    let extra: Vec<(String, V)> = map
+    let aliases = smallest_aliases(keys);
+    let extra: Vec<_> = map
         .iter()
         .filter_map(|(db, value)| {
-            // Deterministic shadow (TASK-100/105 review debt): several
-            // as-seen paths can map to one DB key, and HashMap iteration
-            // order picked whichever alias came first per process — the
-            // lexicographically smallest is stable everywhere.
-            let as_seen = keys
-                .iter()
-                .filter(|(k, v)| *v == db && k != v)
-                .map(|(k, _)| k.as_str())
-                .min()?;
-            Some((as_seen.to_string(), value.clone()))
+            #[cfg(test)]
+            record_path_resolution_visit();
+            Some((aliases.get(db.as_str())?.to_string(), value.clone()))
         })
         .collect();
     map.extend(extra);
 }
 
-/// [`alias_file_map`] for position-keyed maps: the file component is
-/// re-keyed, the line rides along.
 fn alias_position_map<V: Clone>(
     map: &mut HashMap<(String, u64), V>,
     keys: &HashMap<String, String>,
 ) {
-    let extra: Vec<((String, u64), V)> = map
+    let aliases = smallest_aliases(keys);
+    let extra: Vec<_> = map
         .iter()
         .filter_map(|((db, line), value)| {
-            // Deterministic shadow — see alias_file_map.
-            let as_seen = keys
-                .iter()
-                .filter(|(k, v)| *v == db && k != v)
-                .map(|(k, _)| k.as_str())
-                .min()?;
-            Some(((as_seen.to_string(), *line), value.clone()))
+            #[cfg(test)]
+            record_path_resolution_visit();
+            Some((
+                (aliases.get(db.as_str())?.to_string(), *line),
+                value.clone(),
+            ))
         })
         .collect();
     map.extend(extra);
@@ -2103,12 +2207,24 @@ fn alias_position_map<V: Clone>(
 /// partners — a fixed statement set, bounded by `IN_CHUNK` and
 /// [`crate::history::CO_CHANGE_TOP_K`]. Every failure degrades to what
 /// already loaded, never an error.
-fn load_working_context(conn: &Connection, hint: &str) -> WorkingContext {
+fn load_working_context(
+    conn: &Connection,
+    hint: &str,
+    overrides: &ContextOverrides<'_>,
+) -> WorkingContext {
     let mut ctx = WorkingContext {
         hint: Some(hint.to_string()),
         ..WorkingContext::default()
     };
-    let Some(path) = resolve_hint_path(conn, hint) else {
+    let path = if let Some(path) = overrides.file_keys.and_then(|keys| keys.get(hint)) {
+        conn.query_row("SELECT path FROM files WHERE path=?1", [path], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+    } else {
+        resolve_hint_path(conn, hint)
+    };
+    let Some(path) = path else {
         return ctx;
     };
     ctx.path = Some(path.clone());
@@ -2117,12 +2233,16 @@ fn load_working_context(conn: &Connection, hint: &str) -> WorkingContext {
     // the DB path).
     let mut ids: Vec<i64> = Vec::new();
     let mut histogram: HashMap<i64, usize> = HashMap::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT s.id, t.community FROM symbols s \
-         LEFT JOIN symbol_topology t ON t.symbol_id = s.id WHERE s.file = ?1",
-    ) && let Ok(rows) = stmt.query_map([&path], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
-    }) {
+    let symbol_sql = if overrides.disable_topology {
+        "SELECT id, NULL FROM symbols WHERE file = ?1"
+    } else {
+        "SELECT s.id, t.community FROM symbols s LEFT JOIN symbol_topology t ON t.symbol_id = s.id WHERE s.file = ?1"
+    };
+    if let Ok(mut stmt) = conn.prepare(symbol_sql)
+        && let Ok(rows) = stmt.query_map([&path], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+    {
         for (id, community) in rows.flatten() {
             ids.push(id);
             if let Some(community) = community {
@@ -2172,9 +2292,10 @@ fn load_working_context(conn: &Connection, hint: &str) -> WorkingContext {
     }
 
     // Co-change partners of the hint file (probe + bounded read).
-    if conn
-        .query_row("SELECT 1 FROM co_change LIMIT 1", [], |_| Ok(()))
-        .is_ok()
+    if !overrides.disable_history
+        && conn
+            .query_row("SELECT 1 FROM co_change LIMIT 1", [], |_| Ok(()))
+            .is_ok()
         && let Ok(mut stmt) = conn.prepare(
             "SELECT file_b, weight FROM co_change WHERE file_a = ?1 \
              LIMIT ?2",
@@ -2779,13 +2900,13 @@ pub fn rerank_with_pairs(
 #[derive(Default)]
 struct ScoreExtras<'a> {
     extra_reqs: ContextReqs,
-    hint: Option<&'a str>,
     learned: Option<&'a crate::learning::ResolvedFeedback>,
     /// Whether `[feedback] author_features` records author-derived
     /// groups — threaded into the descriptive pass so the ONE shared
     /// extraction carries every author key the slate build's own
     /// configuration records.
     author_features: bool,
+    context_overrides: ContextOverrides<'a>,
 }
 
 /// The shared scoring body (TASK-105), additionally returning the
@@ -2845,7 +2966,14 @@ fn rerank_core(
         );
     }
     reqs = reqs.union(extras.extra_reqs);
-    let mut ctx = prepare_context_with(reqs, query.pattern, &results, conn, sources, extras.hint);
+    let mut ctx = prepare_context_using(
+        reqs,
+        query.pattern,
+        &results,
+        conn,
+        sources,
+        &extras.context_overrides,
+    );
 
     let mut scored: Vec<ScoredResult> = results
         .into_iter()
@@ -3043,6 +3171,12 @@ pub struct RankSettings {
     /// `false` (the default, REQ-017) wraps the legacy lexicographic sort;
     /// `true` runs the signal pipeline.
     pub use_pipeline: bool,
+    /// Selected repository root, for exact normalization of owned absolute paths.
+    pub repo_root: Option<std::path::PathBuf>,
+    /// Disabled history cannot be reactivated by a learned signal weight.
+    pub history_enabled: bool,
+    /// Disabled topology cannot be reactivated by a learned signal weight.
+    pub topology_enabled: bool,
     /// Signal weights for the pipeline path.
     pub weights: WeightTable,
     /// Query sources for shared-context preparation (BM25 constants and the
@@ -3086,6 +3220,9 @@ impl Default for RankSettings {
     fn default() -> Self {
         Self {
             use_pipeline: false,
+            repo_root: None,
+            history_enabled: true,
+            topology_enabled: true,
             weights: WeightTable::kind_dominant(),
             sources: ContextSources::default(),
             class_multipliers: ClassMultipliers::neutral(),
@@ -3126,6 +3263,9 @@ impl RankSettings {
         }
         Ok(Self {
             use_pipeline: rank.enabled,
+            repo_root: None,
+            history_enabled: true,
+            topology_enabled,
             weights,
             sources: ContextSources {
                 bm25: crate::bm25::Bm25Params::from(search),
@@ -3183,7 +3323,34 @@ pub fn rank_and_explain_classed(
     pattern: &str,
     settings: &RankSettings,
 ) -> RankedSearch {
-    let classified = crate::ranker::classify_results(results, conn);
+    let mut root_keys: HashMap<String, String> = settings
+        .repo_root
+        .as_ref()
+        .map(|root| {
+            results
+                .iter()
+                .filter_map(|result| {
+                    if !result.file.is_absolute() {
+                        return None;
+                    }
+                    let relative = result.file.strip_prefix(root).ok()?;
+                    Some((
+                        result.file.to_string_lossy().into_owned(),
+                        relative.to_string_lossy().into_owned(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let (Some(root), Some(hint)) = (&settings.repo_root, &settings.working_context) {
+        let path = Path::new(hint);
+        if path.is_absolute()
+            && let Ok(relative) = path.strip_prefix(root)
+        {
+            root_keys.insert(hint.clone(), relative.to_string_lossy().into_owned());
+        }
+    }
+    let classified = crate::ranker::classify_results_with_keys(results, conn, &root_keys);
     let ranked_class_pairs = if settings.use_pipeline {
         let class = settings
             .pinned_class
@@ -3200,11 +3367,25 @@ pub fn rank_and_explain_classed(
         } else {
             settings.learned.as_ref()
         };
-        let resolved = learned_ref.map(|table| table.resolve(class));
+        let resolved = learned_ref.map(|table| {
+            let mut resolved = table.resolve(class);
+            resolved.apply_feature_policy(settings.feedback_author_features);
+            resolved
+        });
         let mut effective = settings.class_multipliers.apply(&settings.weights, class);
         if let Some(resolved) = &resolved {
             for (name, weight) in &resolved.signals {
                 effective.weights.insert(name.clone(), *weight);
+            }
+        }
+        if !settings.history_enabled {
+            for name in ["churn", "co_change"] {
+                effective.weights.insert(name.to_string(), 0.0);
+            }
+        }
+        if !settings.topology_enabled {
+            for name in ["hub", "authority", "community"] {
+                effective.weights.insert(name.to_string(), 0.0);
             }
         }
         // Feedback capture widens the prepared slices beyond the active
@@ -3233,22 +3414,17 @@ pub fn rank_and_explain_classed(
             &settings.sources,
             ScoreExtras {
                 extra_reqs: widened,
-                hint: settings.working_context.as_deref(),
                 learned: resolved.as_ref(),
                 author_features: settings.feedback_author_features,
+                context_overrides: ContextOverrides {
+                    hint: settings.working_context.as_deref(),
+                    disable_topology: !settings.topology_enabled,
+                    disable_history: !settings.history_enabled,
+                    file_keys: Some(&root_keys),
+                },
             },
         );
-        // Score order interleaves categories under any non-kind-only
-        // weight table (group_by_category groups by adjacency); bucket
-        // into tier order first so every category is emitted exactly
-        // once. For kind-only positive weights this is the identity
-        // permutation, so equivalence with the legacy output is exact.
-        (
-            crate::ranker::bucket_by_category(scored),
-            Some(class),
-            near_duplicates,
-            ctx,
-        )
+        (scored, Some(class), near_duplicates, ctx)
     } else {
         let legacy = crate::ranker::rank_results(classified)
             .into_iter()
@@ -4761,13 +4937,8 @@ proximity, signature, churn, co_change, hub, authority, community",
     }
 
     #[test]
-    fn rank_and_explain_emits_each_category_once_under_interleaved_scores() {
-        // kind = 0.0 is a documented, valid config ("A weight of 0 skips
-        // the signal entirely", docs/configuration.md): the kind signal is
-        // never evaluated, every score is 0.0, and pipeline ordering falls
-        // to the (file, line) tie-breaks — interleaving categories. The
-        // grouped output must still emit each category EXACTLY once (tier
-        // order), never one group per adjacent run.
+    fn audit_f05_contiguous_groups_preserve_score_ties() {
+        // Equal scores use the global file/line tie-break, across categories.
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
         for file in ["src/a.rs", "src/c.rs"] {
@@ -4811,20 +4982,20 @@ proximity, signature, churn, co_change, hub, authority, community",
             vec![
                 ResultCategory::Definition,
                 ResultCategory::CallSite,
-                ResultCategory::Comment,
-            ],
-            "interleaved score order must not fragment category groups: {cats:?}"
+                ResultCategory::Definition,
+                ResultCategory::CallSite,
+                ResultCategory::Comment
+            ]
         );
-        // Within each bucket the score tie-break ((file, line)) order is
-        // preserved, not re-sorted.
-        let files = |items: &Vec<ScoredResult>| -> Vec<String> {
-            items
-                .iter()
-                .map(|s| s.classified.result.file.to_string_lossy().into_owned())
-                .collect()
-        };
-        assert_eq!(files(&groups[0].1), vec!["src/a.rs", "src/c.rs"]);
-        assert_eq!(files(&groups[1].1), vec!["src/b.rs", "src/d.rs"]);
+        let files: Vec<_> = groups
+            .iter()
+            .flat_map(|(_, items)| items.iter())
+            .map(|s| s.classified.result.file.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs", "src/e.rs"]
+        );
     }
 
     // -------------------------------------------------------------------
@@ -4870,6 +5041,11 @@ proximity, signature, churn, co_change, hub, authority, community",
         conn.execute(
             "INSERT INTO corpus_stats (id, n_docs, measured, total_lines) \
              SELECT 1, COUNT(*), COUNT(line_count), COALESCE(SUM(line_count), 0) FROM files",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO bm25_meta(key,value) VALUES ('generation_ready','1')",
             [],
         )
         .unwrap();
@@ -6301,14 +6477,15 @@ proximity, signature, churn, co_change, hub, authority, community",
         // Signals take no Connection (structurally impossible to issue
         // per-candidate SQL); this gate proves it empirically. Accounting
         // for the one-term query "alpha" over lexical_seeded_conn (no
-        // embedding rows): 8 statements total — 1 canonical file-keys
+        // embedding rows): 11 statements total — 1 canonical file-keys
         // resolution (TASK-105: the exact `files` IN pass; all candidates
         // repo-relative, so the fallback scan never runs) + 1 symbol-hit
         // symbols IN scan (the name-keyed caller-count scan runs only
         // when a candidate position lands on a symbol; this fixture's do
-        // not, so it is skipped) + 4 lexical (presence probe,
-        // corpus-stats summary read, 1 postings scan, document lengths —
-        // one IN chunk for any candidate set under 900 files) + 2
+        // not, so it is skipped) + 5 lexical (readiness probe,
+        // corpus-stats summary read, indexed DF count, candidate TF scan, document lengths —
+        // one IN chunk for any candidate set under 900 files) + 2 transaction
+        // controls (BEGIN and COMMIT hold all BM25 reads in one snapshot) + 2
         // embedding (stored vector spaces, position loader; the query
         // embed itself is in-process and SQL-free). query_terms and
         // path_class touch no SQL. The count must not move when the
@@ -6324,8 +6501,7 @@ proximity, signature, churn, co_change, hub, authority, community",
         let large = count_context_statements(&conn, &make(30));
 
         assert_eq!(small, large, "statement count must be O(1) in candidates");
-        assert!(large <= 10, "unexpected statements: {large}");
-        assert_eq!(large, 8, "documented statement accounting (see comment)");
+        assert_eq!(large, 11, "documented statement accounting (see comment)");
     }
 
     #[test]
@@ -6942,6 +7118,11 @@ proximity, signature, churn, co_change, hub, authority, community",
             )
             .unwrap();
         }
+        conn.execute(
+            "INSERT OR REPLACE INTO bm25_meta(key,value) VALUES ('generation_ready','1')",
+            [],
+        )
+        .unwrap();
         // Embeddings in the bundled provider's own space.
         let provider = crate::bundled_embedding::BundledProvider;
         use crate::embedding::EmbeddingProvider as _;
@@ -8475,6 +8656,367 @@ proximity, signature, churn, co_change, hub, authority, community",
         assert!(
             default.learned.is_none(),
             "the default carries no learned overlay"
+        );
+    }
+    #[test]
+    fn audit_f05_strong_call_site_precedes_weak_definition() {
+        let (_dir, conn) = seeded_conn();
+        let results = vec![
+            raw("src/main.rs", 10, "fn my_func() {}"),
+            raw("src/main.rs", 11, "my_func();"),
+        ];
+        let settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", -1.0)]),
+            ..Default::default()
+        };
+        let ranked = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
+        let flat: Vec<_> = ranked.groups.iter().flat_map(|(_, g)| g).collect();
+        assert_eq!(flat[0].classified.category, ResultCategory::CallSite);
+        assert!(flat[0].score > flat[1].score);
+        for row in flat {
+            assert_eq!(
+                row.score,
+                row.contributions.iter().map(|c| c.weighted).sum::<f32>()
+            );
+        }
+    }
+
+    #[test]
+    fn audit_f12_disabled_topology_survives_learned_overlay() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let rank = crate::config::RankConfig {
+            enabled: true,
+            weights: HashMap::from([("kind".to_string(), 1.0), ("hub".to_string(), 1.0)]),
+            class_multipliers: ClassMultipliers::neutral(),
+        };
+        let mut settings = RankSettings::from_config(
+            &rank,
+            &crate::config::SearchConfig::default(),
+            crate::embedding::EmbeddingProviderKind::Bundled,
+            None,
+            false,
+            0.85,
+        )
+        .unwrap();
+        settings.feedback_capture = true;
+        let results = vec![
+            raw("src/main.rs", 10, "fn my_func() {}"),
+            raw("src/other.rs", 1, "fn caller_a() {}"),
+        ];
+        let prior = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
+        settings.learned = Some(learned_of(vec![learned_evidence("hub", "", 1.4, 1.0)]));
+        let disabled = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
+        assert_eq!(
+            ranked_bits(&disabled),
+            ranked_bits(&prior),
+            "learned topology must not bypass the kill switch"
+        );
+        assert!(
+            disabled
+                .context
+                .topology_scores("src/main.rs", 10)
+                .is_none()
+        );
+        assert!(
+            disabled.context.churn_score("src/main.rs").is_some(),
+            "unrelated history capture survives"
+        );
+        assert!(disabled.context.symbol_hit("src/main.rs", 10).is_some());
+    }
+    #[test]
+    fn audit_f19_absolute_context_resolution_work_is_linear() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        let mut results = Vec::new();
+        for i in 0..64 {
+            let file = format!("src/module_{i}/unit.rs");
+            conn.execute(
+                "INSERT INTO files(path,language,hash,last_indexed) VALUES (?1,'rust','h',0)",
+                [&file],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO file_churn(file,score,last_ts,last_author,primary_author) VALUES (?1,1,0,NULL,NULL)", [&file]).unwrap();
+            results.push(classified(
+                &format!("/workspace/repo/{file}"),
+                1,
+                "gamma",
+                ResultCategory::Other,
+            ));
+        }
+        PATH_RESOLUTION_VISITS.with(|n| n.set(0));
+        let ctx = prepare_context(
+            ContextReqs::none().with_file_churn(),
+            "gamma",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        let visits = PATH_RESOLUTION_VISITS.with(|n| n.get());
+        for result in &results {
+            let seen = result.result.file.to_str().unwrap();
+            assert_eq!(
+                ctx.canonical_file(seen),
+                seen.strip_prefix("/workspace/repo/")
+            );
+            assert_eq!(ctx.churn_score(seen), Some(1.0));
+        }
+        assert!(
+            visits <= 64 * 20,
+            "path resolution must be linear in corpus and candidate components; observed {visits} visits"
+        );
+    }
+
+    #[test]
+    fn audit_f19_boundary_suffixes_choose_longest_indexed_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for file in [
+            "unit.rs",
+            "src/unit.rs",
+            "other/src/unit.rs",
+            "src/unité.rs",
+        ] {
+            conn.execute(
+                "INSERT INTO files(path,language,hash,last_indexed) VALUES (?1,'rust','h',0)",
+                [file],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO file_churn(file,score,last_ts,last_author,primary_author) VALUES (?1,1,0,NULL,NULL)", [file]).unwrap();
+        }
+        let cases = [
+            ("/root/other/src/unit.rs", "other/src/unit.rs"),
+            ("/root/src/unit.rs", "src/unit.rs"),
+            ("/root/not-src/unit.rs", "unit.rs"),
+            ("src/unit.rs", "src/unit.rs"),
+            ("/root/src/unité.rs", "src/unité.rs"),
+            ("/root/src/notunit.rs", "/root/src/notunit.rs"),
+        ];
+        let results: Vec<_> = cases
+            .iter()
+            .map(|(file, _)| classified(file, 1, "gamma", ResultCategory::Other))
+            .collect();
+        let ctx = prepare_context(
+            ContextReqs::none().with_file_churn(),
+            "gamma",
+            &results,
+            Some(&conn),
+            &ContextSources::default(),
+        );
+        for (seen, canonical) in cases {
+            assert_eq!(ctx.canonical_file(seen), Some(canonical));
+        }
+    }
+    #[test]
+    fn audit_f11_disabled_history_survives_capture_and_learned_overlay() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![
+            raw("src/main.rs", 10, "fn my_func() {}"),
+            raw("src/other.rs", 1, "fn caller_a() {}"),
+        ];
+        let learned = || {
+            learned_of(vec![
+                learned_evidence("churn", "", 1.4, 1.0),
+                learned_evidence("co_change", "", 1.2, 1.0),
+            ])
+        };
+        let enabled = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("kind", 1.0), ("churn", 1.0), ("co_change", 1.0)]),
+            feedback_capture: true,
+            learned: Some(learned()),
+            ..Default::default()
+        };
+        let populated = rank_and_explain_classed(&results, Some(&conn), "my_func", &enabled);
+        assert!(populated.context.churn_score("src/main.rs").is_some());
+        let disabled = RankSettings {
+            history_enabled: false,
+            ..enabled
+        };
+        let actual = rank_and_explain_classed(&results, Some(&conn), "my_func", &disabled);
+        let prior = RankSettings {
+            history_enabled: false,
+            weights: table(&[("kind", 1.0)]),
+            learned: None,
+            ..disabled
+        };
+        let expected = rank_and_explain_classed(&results, Some(&conn), "my_func", &prior);
+        assert_eq!(
+            ranked_bits(&actual),
+            ranked_bits(&expected),
+            "disabled history must contribute nothing after learning"
+        );
+        assert_eq!(actual.context.churn_score("src/main.rs"), None);
+        assert_eq!(actual.context.co_change_coupling("src/main.rs"), None);
+        assert!(actual.context.topology_scores("src/main.rs", 10).is_some());
+        assert!(actual.context.symbol_hit("src/main.rs", 10).is_some());
+    }
+
+    #[test]
+    fn audit_f19_root_owned_path_selects_exact_repository_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for (file, score, line) in [("src/unit.rs", 1.0, 1), ("repo/src/unit.rs", 9.0, 2)] {
+            conn.execute(
+                "INSERT INTO files(path,language,hash,last_indexed) VALUES (?1,'rust','h',0)",
+                [file],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO file_churn(file,score,last_ts,last_author,primary_author) VALUES (?1,?2,0,NULL,NULL)",rusqlite::params![file,score]).unwrap();
+            conn.execute("INSERT INTO symbols(name,kind,file,line,col,language) VALUES ('gamma','function',?1,?2,0,'rust')",rusqlite::params![file,line]).unwrap();
+        }
+        let root = std::path::PathBuf::from("/workspace/repo");
+        let absolute = root.join("src/unit.rs");
+        let settings = RankSettings {
+            use_pipeline: true,
+            repo_root: Some(root),
+            feedback_capture: true,
+            weights: table(&[("kind", 1.0)]),
+            ..Default::default()
+        };
+        let results = vec![raw(absolute.to_str().unwrap(), 1, "fn gamma() {}")];
+        let actual = rank_and_explain_classed(&results, Some(&conn), "gamma", &settings);
+        let seen = absolute.to_str().unwrap();
+        assert_eq!(
+            actual.context.canonical_file(seen),
+            Some("src/unit.rs"),
+            "root-owned file must not bind to a longer unrelated suffix"
+        );
+        assert_eq!(actual.context.churn_score(seen), Some(1.0));
+        assert_eq!(
+            actual.groups[0].1[0].classified.category,
+            ResultCategory::Definition
+        );
+        assert_eq!(
+            actual.groups[0].1[0].classified.result.file, absolute,
+            "preserve caller display path"
+        );
+    }
+
+    #[test]
+    fn audit_f12_disabled_topology_retains_hint_reach_context() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![raw("src/other.rs", 1, "fn caller_a() {}")];
+        let settings = RankSettings {
+            use_pipeline: true,
+            topology_enabled: false,
+            feedback_capture: true,
+            working_context: Some("src/main.rs".to_string()),
+            weights: table(&[("kind", 1.0)]),
+            ..Default::default()
+        };
+        let actual = rank_and_explain_classed(&results, Some(&conn), "caller_a", &settings);
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE file='src/other.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            actual.context.import_distance(id),
+            Some(2),
+            "topology disable must preserve independent reach evidence"
+        );
+        assert_eq!(actual.context.working_hint_community(), None);
+        assert_eq!(actual.context.co_change_partner("src/other.rs"), Some(4.0));
+    }
+    #[test]
+    fn audit_f19_owned_absolute_paths_use_repository_path_heuristics() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("index.db")).unwrap();
+        for file in ["src/unit.rs", "src/unit.generated.rs"] {
+            conn.execute(
+                "INSERT INTO files(path,language,hash,last_indexed) VALUES (?1,'rust','h',0)",
+                [file],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO symbols(name,kind,file,line,col,language) VALUES ('gamma','function',?1,1,0,'rust')",[file]).unwrap();
+        }
+        let root = std::path::PathBuf::from("/workspace/tests/repo");
+        let settings = RankSettings {
+            use_pipeline: true,
+            repo_root: Some(root.clone()),
+            weights: table(&[("kind", 1.0), ("path_character", 1.0)]),
+            ..Default::default()
+        };
+        let relative = vec![
+            raw("src/unit.rs", 1, "fn gamma() {}"),
+            raw("src/unit.generated.rs", 1, "fn gamma() {}"),
+        ];
+        let absolute: Vec<_> = relative
+            .iter()
+            .cloned()
+            .map(|mut result| {
+                result.file = root.join(result.file);
+                result
+            })
+            .collect();
+        let expected = rank_and_explain_classed(&relative, Some(&conn), "gamma", &settings);
+        let actual = rank_and_explain_classed(&absolute, Some(&conn), "gamma", &settings);
+        let contributions = |ranked: &RankedSearch| {
+            ranked
+                .groups
+                .iter()
+                .flat_map(|(_, g)| g)
+                .map(|row| {
+                    (
+                        row.classified.category,
+                        row.score,
+                        row.contributions.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            contributions(&actual),
+            contributions(&expected),
+            "repo root spelling cannot change category or generated-peer scoring"
+        );
+    }
+
+    #[test]
+    fn audit_author_policy_preserves_other_learned_features_and_capture_groups() {
+        let (_dir, conn) = descriptive_seeded_conn();
+        let results = vec![raw("src/main.rs", 10, "fn my_func() {}")];
+        let learned = || {
+            learned_of(vec![
+                learned_evidence("author:last_touched_by=Ada", "", 0.4, 0.0),
+                learned_evidence("path:src", "", 0.1, 0.0),
+            ])
+        };
+        let mut settings = RankSettings {
+            use_pipeline: true,
+            weights: table(&[("feedback", 1.0)]),
+            feedback_capture: true,
+            learned: Some(learned()),
+            ..Default::default()
+        };
+        let off = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
+        assert_eq!(off.groups[0].1[0].score, 0.1);
+        let off_groups = &off.context.feedback_extraction.as_ref().unwrap().groups
+            [&("src/main.rs".to_string(), 10)];
+        assert!(off_groups.author.is_empty());
+        assert!(!off_groups.path.is_empty());
+        assert!(!off_groups.history.is_empty());
+        settings.feedback_author_features = true;
+        let on = rank_and_explain_classed(&results, Some(&conn), "my_func", &settings);
+        assert_eq!(on.groups[0].1[0].score, 0.5);
+        assert!(
+            !on.context.feedback_extraction.as_ref().unwrap().groups
+                [&("src/main.rs".to_string(), 10)]
+                .author
+                .is_empty()
+        );
+        assert!(
+            settings
+                .learned
+                .as_ref()
+                .unwrap()
+                .evidence()
+                .iter()
+                .any(|row| row.feature.starts_with("author:")),
+            "stored author rows survive disabling and re-enabling"
         );
     }
 }

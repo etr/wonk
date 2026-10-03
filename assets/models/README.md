@@ -12,10 +12,10 @@ validates the container and decompresses it once per process; it performs no
 file reads or network requests.
 
 On an Apple M4, cold model initialization, inference, and SQLite storage for
-10,000 symbols took 0.605 seconds. The model selection, 25-query Recall@10,
+10,000 symbols took 0.605 seconds. The model selection, 25-query hit_rate@10,
 and exact delta from the opt-in `nomic-embed-text` tier are recorded in
 [`bench/semantic-quality.md`](../../bench/semantic-quality.md): both tiers
-measured 0.20 Recall@10 (0.0 percentage-point delta), while Ollama had higher
+measured 0.20 hit_rate@10 (0.0 percentage-point delta), while Ollama had higher
 MRR@10.
 
 Regenerate from previously verified upstream files:
@@ -32,3 +32,7 @@ python3 -m venv /tmp/wonk-model-pack
 
 The command output must exactly match `manifest.json`. CI does not download or
 regenerate the model.
+
+Standalone GitHub release binaries embed these model weights. Each release
+also includes `wonk-bundled-model-LICENSE.txt`, an exact copy of this directory's
+MIT notice naming Minish Lab. Keep that notice with redistributed binaries.

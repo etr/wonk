@@ -18,18 +18,20 @@
 //!
 //! Run: cargo bench --bench contracts
 
+mod fixture_config;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
+use fixture_config::build_index;
 use wonk::contracts::{
     ContractOptions, DocumentKind, extract_contracts, extract_document_contracts,
     scannable_document_kind,
 };
 use wonk::indexer::{self, Lang};
-use wonk::pipeline::build_index;
 
 const FILES_PER_LANG: usize = 25;
 const EXTRACT_ROUNDS: usize = 5;

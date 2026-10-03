@@ -280,6 +280,20 @@ impl IgnoreMatcher {
     }
 }
 
+// Keep root-relative filtering separate from event delivery. Native backends may
+// report a canonical spelling even when the caller registered an alias.
+fn relative_event_path<'a>(
+    path: &'a Path,
+    repo_root: &Path,
+    canonical_root: &Path,
+) -> Option<&'a Path> {
+    let relative = path
+        .strip_prefix(canonical_root)
+        .or_else(|_| path.strip_prefix(repo_root))
+        .ok()?;
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
+
 // ---------------------------------------------------------------------------
 // FileWatcher
 // ---------------------------------------------------------------------------
@@ -311,6 +325,10 @@ impl FileWatcher {
             crossbeam_channel::unbounded();
 
         let repo_root_buf = repo_root.to_path_buf();
+        let canonical_root = repo_root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing watched root {}", repo_root.display()))?;
+        let watched_root = canonical_root.clone();
 
         let mut debouncer = new_debouncer(
             Duration::from_millis(debounce_ms),
@@ -321,16 +339,22 @@ impl FileWatcher {
                         .filter_map(|ev| {
                             // Make the path relative to repo root for filtering,
                             // but keep the absolute path in the event.
-                            let rel = ev.path.strip_prefix(&repo_root_buf).unwrap_or(&ev.path);
+                            let rel =
+                                relative_event_path(&ev.path, &repo_root_buf, &canonical_root)?;
                             if !should_process(rel, &repo_root_buf) {
                                 return None;
                             }
                             // Check gitignore / wonkignore / config patterns.
-                            let is_dir = ev.path.is_dir();
-                            if ignore_matcher.is_ignored(&ev.path, is_dir) {
+                            let caller_path = repo_root_buf.join(rel);
+                            let is_dir = caller_path.is_dir();
+                            if ignore_matcher.is_ignored(&caller_path, is_dir) {
                                 return None;
                             }
-                            Some(classify_event(ev))
+                            let caller_event = DebouncedEvent {
+                                path: caller_path,
+                                kind: ev.kind,
+                            };
+                            Some(classify_event(&caller_event))
                         })
                         .collect();
 
@@ -344,7 +368,7 @@ impl FileWatcher {
 
         debouncer
             .watcher()
-            .watch(repo_root, RecursiveMode::Recursive)
+            .watch(&watched_root, RecursiveMode::Recursive)
             .with_context(|| format!("starting recursive watch on {}", repo_root.display()))?;
 
         Ok((
@@ -406,6 +430,38 @@ where
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn canonical_event_alias_is_relative_to_watched_root() {
+        let caller = Path::new("/var/tmp/.fixture");
+        let canonical = Path::new("/private/var/tmp/.fixture");
+        assert_eq!(
+            relative_event_path(
+                Path::new("/private/var/tmp/.fixture/src/main.rs"),
+                caller,
+                canonical
+            ),
+            Some(Path::new("src/main.rs"))
+        );
+        assert_eq!(
+            relative_event_path(
+                Path::new("/var/tmp/.fixture/src/main.rs"),
+                caller,
+                canonical
+            ),
+            Some(Path::new("src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn event_outside_watched_root_is_rejected_at_component_boundary() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            relative_event_path(Path::new("/repo-other/src.rs"), root, root),
+            None
+        );
+        assert_eq!(relative_event_path(root, root, root), None);
+    }
 
     // ---- should_process filtering tests ----
 

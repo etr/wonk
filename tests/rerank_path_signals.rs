@@ -62,6 +62,11 @@ fn insert_file(conn: &Connection, path: &str, line_count: i64) {
 
 fn insert_term(conn: &Connection, term: &str, file: &str, tf: i64) {
     conn.execute(
+        "INSERT OR REPLACE INTO bm25_meta(key,value) VALUES('generation_ready','1')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)",
         rusqlite::params![term, file, tf],
     )
@@ -361,7 +366,8 @@ fn signature_shaped_query_prefers_the_definition() {
 
     // The same candidates under a NAME-shaped query: the signal is inert —
     // every signature contribution is exactly 0 and every score is 0 (the
-    // emitted order is just the category bucketing, not this signal).
+    // emitted order follows the deterministic file/line tie-break, not
+    // a restored category precedence).
     let plain = rerank::rank_and_explain(
         &found,
         Some(&conn),
@@ -375,8 +381,8 @@ fn signature_shaped_query_prefers_the_definition() {
     assert_eq!(
         flat_plain,
         vec![
-            ("src/parse.rs".to_string(), 3),
             ("src/main.rs".to_string(), 8),
+            ("src/parse.rs".to_string(), 3),
         ],
         "name-shaped queries leave the signature signal inert"
     );

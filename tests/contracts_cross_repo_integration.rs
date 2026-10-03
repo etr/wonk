@@ -8,9 +8,11 @@
 //! resolution, and no persisted link rows. The perf criterion (AC 13) is
 //! covered at the library boundary in `contracts.rs`.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Build the binary path. In test mode, cargo puts it in target/debug/.
 fn wonk_bin() -> PathBuf {
@@ -76,7 +78,7 @@ fn indexed_repo(
         )
         .unwrap();
     }
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), &root)
         .env("HOME", &home.path)
         .current_dir(&root)
         .args(["init"])
@@ -98,7 +100,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), repo)
         .env("HOME", &home.path)
         .current_dir(repo)
         .args(args)
@@ -692,7 +694,7 @@ fn no_link_rows_persisted() {
 
 /// Minimal MCP stdio client for the two cross-repo tool checks.
 fn mcp_call(home: &RegistryHome, repo: &Path, method_args: serde_json::Value) -> serde_json::Value {
-    let mut child = Command::new(wonk_bin())
+    let mut child = common::command(wonk_bin(), repo)
         .env("HOME", &home.path)
         .current_dir(repo)
         .args(["mcp", "serve"])

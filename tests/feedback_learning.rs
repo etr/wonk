@@ -9,10 +9,11 @@
 //! file higher so the tests twin ranks FIRST pre-learning — feedback
 //! preferring the implementation is then a genuine rank-≥2 correction.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rusqlite::Connection;
 use serde_json::Value;
@@ -167,7 +168,7 @@ fn learning_repo(enabled: bool, extra_config: &str) -> (TempDir, PathBuf) {
         ),
     )
     .unwrap();
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
     (dir, root)
 }
 
@@ -189,7 +190,7 @@ fn wonk_bin() -> PathBuf {
 }
 
 fn run_wonk(root: &Path, args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), root)
         .arg("--quiet")
         .args(args)
         .current_dir(root)
@@ -974,12 +975,6 @@ fn new_feature_has_no_influence_until_evidence() {
     let learned = learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
         .unwrap()
         .expect("gated rows");
-    let before = flat_positions(&ranked_for(
-        &root,
-        &conn,
-        "crop_yield",
-        Some(learned.clone()),
-    ));
 
     // A brand-new trait file enters the index; its symbol:kind=trait key
     // appears in freshly recorded slates...
@@ -989,7 +984,17 @@ fn new_feature_has_no_influence_until_evidence() {
         "// A brand new abstraction.\npub trait Ledger {\n    fn balance(&self) -> f64;\n}\n",
     )
     .unwrap();
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
+    // Hold corpus statistics fixed for this causal comparison: adding a file
+    // legitimately changes BM25 N/avgdl and can change weighted result order.
+    // Only recording a never-observed descriptive feature varies below.
+    let before = flat_positions(&ranked_for(
+        &root,
+        &conn,
+        "crop_yield",
+        Some(learned.clone()),
+    ));
+    let evidence_before = learned_dump(&conn);
     let ranked = ranked_for(&root, &conn, "Ledger", None);
     let stored =
         feedback::build_and_store_slate(&conn, "Ledger", &ranked, &feedback_config(true)).unwrap();
@@ -1003,16 +1008,26 @@ fn new_feature_has_no_influence_until_evidence() {
         "the trait key entered the recorded set"
     );
 
-    // ...but the never-observed key has no row, so nothing changes: the
-    // crop_yield ranking is bit-identical to the pre-trait state.
+    // ...but capture alone supplies no observation or influence. Reload the
+    // actual learned state and compare exact order on the same corpus.
+    assert_eq!(
+        learned_dump(&conn),
+        evidence_before,
+        "recording a slate must not alter learned evidence"
+    );
+    let reloaded = learning::load_learned(&conn, &feedback_config(true), &fixture_weights(), 1000)
+        .unwrap()
+        .expect("existing gated rows survive capture");
+    assert_eq!(reloaded.evidence(), learned.evidence());
+    assert_eq!(reloaded.preferences(), learned.preferences());
     assert!(
-        learned
+        reloaded
             .evidence()
             .iter()
             .all(|row| !row.feature.starts_with("symbol:kind=trait")),
         "no trait rows were learned"
     );
-    let after = flat_positions(&ranked_for(&root, &conn, "crop_yield", Some(learned)));
+    let after = flat_positions(&ranked_for(&root, &conn, "crop_yield", Some(reloaded)));
     assert_eq!(after, before, "unseen features carry no influence");
     drop(conn);
     drop(dir);
@@ -2418,7 +2433,7 @@ fn materially_changed_result_loses_its_preference() {
     );
     assert_ne!(&changed, CROP_IMPL, "the fixture edit must apply");
     fs::write(root.join("src/crop/mod.rs"), changed).unwrap();
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
 
     // The row is still stored (it is history), but the recomputed identity
     // no longer matches: zero contribution, bit-identical index-only score.

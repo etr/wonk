@@ -120,18 +120,32 @@ pub fn term_contribution(tf: u64, doc_len: f32, avgdl: f32, idf: f32, k1: f32, b
 }
 
 /// Per-file BM25 scores for a set of candidate files, or `None` when
-/// scoring is unavailable (pre-V5 index, empty or dropped `term_stats`,
-/// degenerate corpus). This is the scoring core `rerank_lexical` sorts on
-/// top of and the TASK-093 lexical signal consumes; the math is shared so
+/// scoring is unavailable (incomplete statistics generation, dropped
+/// `term_stats`, or a degenerate corpus). This is the scoring core that
+/// `rerank_lexical` sorts on and the TASK-093 lexical signal consumes; the math is shared so
 /// the two paths can never drift apart.
 ///
 /// Every input file gets an entry: files without term_stats rows score
 /// exactly 0.0. An empty file set or a query with no tokens yields an
-/// empty map. Query cost is `2 + T + ceil(C/IN_CHUNK)` statements for T
-/// query terms and C distinct candidate files (presence probe, corpus
-/// stats, one postings scan per term, candidate-scoped document lengths)
-/// — independent of the corpus size.
+/// empty map. DF is counted in SQLite's term index; only candidate TF rows
+/// and lengths are transferred, in batches of at most `IN_CHUNK` files.
+/// Per-query memory scales with candidate files and query terms.
 pub fn file_bm25_scores(
+    conn: &Connection,
+    files: &std::collections::HashSet<String>,
+    query: &str,
+    params: Bm25Params,
+) -> Option<HashMap<String, f32>> {
+    if !conn.is_autocommit() || files.is_empty() {
+        return scores_in_snapshot(conn, files, query, params);
+    }
+    let tx = conn.unchecked_transaction().ok()?;
+    let scores = scores_in_snapshot(&tx, files, query, params);
+    tx.commit().ok()?;
+    scores
+}
+
+fn scores_in_snapshot(
     conn: &Connection,
     files: &std::collections::HashSet<String>,
     query: &str,
@@ -141,10 +155,9 @@ pub fn file_bm25_scores(
         return Some(HashMap::new());
     }
 
-    // Presence probe: an index built before TASK-078 (or a freshly opened
-    // but unpopulated one) has no rows here — signal the V4 fallback.
-    conn.query_row("SELECT 1 FROM term_stats LIMIT 1", [], |_| Ok(()))
-        .ok()?;
+    if !crate::db::bm25_generation_ready(conn) {
+        return None;
+    }
 
     let mut terms = crate::tokenizer::tokenize(query);
     terms.sort_unstable();
@@ -155,27 +168,40 @@ pub fn file_bm25_scores(
 
     let corpus = load_corpus_stats(conn)?;
 
-    // Postings per query term: tf by file. The postings map's size is df.
+    let mut wanted: Vec<&String> = files.iter().collect();
+    wanted.sort_unstable();
     let mut scored_terms: Vec<(f32, HashMap<String, u64>)> = Vec::new();
     for term in &terms {
-        let mut stmt = conn
-            .prepare("SELECT file, tf FROM term_stats WHERE term = ?1")
+        // The (term,file) primary key counts DF without transferring postings.
+        let df: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE term = ?1",
+                [term],
+                |row| row.get(0),
+            )
             .ok()?;
-        let rows = stmt
-            .query_map(rusqlite::params![term], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-            })
-            .ok()?;
+        if df == 0 {
+            continue;
+        }
         let mut tf_by_file = HashMap::new();
-        for row in rows {
-            let (file, tf) = row.ok()?;
-            tf_by_file.insert(file, tf);
+        for chunk in wanted.chunks(IN_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT file, tf FROM term_stats WHERE term = ? AND file IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql).ok()?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params_from_iter(std::iter::once(term).chain(chunk.iter().copied())),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+                )
+                .ok()?;
+            for row in rows {
+                let (file, tf) = row.ok()?;
+                tf_by_file.insert(file, tf);
+            }
         }
-        if tf_by_file.is_empty() {
-            continue; // df = 0: the term is absent from the corpus
-        }
-        let idf = idf(corpus.n_docs, tf_by_file.len() as u64);
-        scored_terms.push((idf, tf_by_file));
+        scored_terms.push((idf(corpus.n_docs, u64::try_from(df).ok()?), tf_by_file));
     }
 
     // Document lengths for exactly the candidate files, in IN_CHUNK
@@ -187,8 +213,6 @@ pub fn file_bm25_scores(
     // materialization produced, so scores are bitwise identical.
     let mut doc_len: HashMap<String, f32> = HashMap::new();
     {
-        let mut wanted: Vec<&String> = files.iter().collect();
-        wanted.sort_unstable();
         for chunk in wanted.chunks(IN_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let sql = format!("SELECT path, line_count FROM files WHERE path IN ({placeholders})");
@@ -223,8 +247,8 @@ pub fn file_bm25_scores(
 }
 
 /// Re-rank grep candidates by BM25 over `term_stats`, or `None` when
-/// scoring is unavailable (pre-V5 index, empty or dropped `term_stats`,
-/// degenerate corpus, query error). `None` means "keep the input order" —
+/// scoring is unavailable (incomplete statistics generation, dropped
+/// `term_stats`, degenerate corpus, or a query error). `None` means "keep the input order" —
 /// the V4 fallback — never an error.
 ///
 /// Empty results or a query with no tokens return the input unchanged.
@@ -448,6 +472,11 @@ mod tests {
     // -- rerank_lexical -------------------------------------------------------
 
     fn insert_term(conn: &Connection, term: &str, file: &str, tf: i64) {
+        conn.execute(
+            "INSERT OR REPLACE INTO bm25_meta (key,value) VALUES ('generation_ready','1')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)",
             rusqlite::params![term, file, tf],
@@ -847,6 +876,60 @@ mod tests {
         );
     }
 
+    type ScoreGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+    thread_local! {
+        static SCORE_GATE: std::cell::RefCell<Option<ScoreGate>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn pause_after_df(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Row(stmt) = event
+            && stmt.sql().starts_with("SELECT COUNT(*) FROM term_stats")
+            && let Some((ready, committed)) = SCORE_GATE.with(|gate| gate.borrow_mut().take())
+        {
+            ready.send(()).unwrap();
+            committed.recv().unwrap();
+        }
+    }
+
+    #[test]
+    fn bm25_score_reads_one_generation_during_concurrent_publication() {
+        let (dir, conn) = test_conn();
+        insert_file(&conn, "a.rs", Some(1));
+        insert_file(&conn, "b.rs", Some(1));
+        insert_term(&conn, "alpha", "a.rs", 1);
+        insert_term(&conn, "alpha", "b.rs", 1);
+        let files = files_set(&["a.rs"]);
+        let expected = file_bm25_scores(&conn, &files, "alpha", default_params()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        SCORE_GATE.with(|gate| *gate.borrow_mut() = Some((ready_tx, committed_rx)));
+        let path = dir.path().join("index.db");
+        let writer = std::thread::spawn(move || {
+            let conn = crate::db::open_existing(&path).unwrap();
+            ready_rx.recv().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute_batch(
+                "DELETE FROM term_stats;
+                UPDATE files SET line_count=20 WHERE path='a.rs';
+                UPDATE files SET line_count=3 WHERE path='b.rs';
+                INSERT INTO term_stats(term,file,tf) VALUES ('alpha','a.rs',9);",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            committed_tx.send(()).unwrap();
+        });
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
+            Some(pause_after_df),
+        );
+        let actual = file_bm25_scores(&conn, &files, "alpha", default_params()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            actual, expected,
+            "corpus, DF, TF and lengths must share the same WAL snapshot"
+        );
+    }
+
     // -- Benchmark (manual gate, run in release) ------------------------------
 
     /// Measure the warm-query cost of `rerank_lexical` on the TASK-078-style
@@ -910,7 +993,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_bench_corpus(root);
-        crate::pipeline::build_index(root, true).unwrap();
+        crate::pipeline::build_index_with_config(
+            root,
+            true,
+            &crate::config::Config::load_with_paths(None, Some(root)).unwrap(),
+        )
+        .unwrap();
         let index_path = crate::db::find_existing_index(root).unwrap();
         let conn = crate::db::open(&index_path).unwrap();
 

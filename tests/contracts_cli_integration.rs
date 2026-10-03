@@ -5,6 +5,8 @@
 //! confidence, within-repo orphans with no sibling repos, NDJSON output,
 //! and exit code 2 (usage) for unknown filter values.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -45,7 +47,7 @@ fn fixture_repo() -> tempfile::TempDir {
 }
 
 fn run_contracts(repo: &std::path::Path, extra: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(wonk_bin());
+    let mut cmd = common::command(wonk_bin(), repo);
     cmd.arg("--quiet")
         .arg("contracts")
         .args(extra)
@@ -128,4 +130,55 @@ fn contracts_unknown_kind_is_usage_error() {
     let (code, _stdout, stderr) = run_contracts(repo.path(), &["--kind", "rest"]);
     assert_eq!(code, 2, "stderr: {stderr}");
     assert!(stderr.contains("unknown contract kind"), "stderr: {stderr}");
+}
+
+#[test]
+fn fixture_defaults_are_isolated_from_hostile_global_contract_config() {
+    let hostile = tempfile::tempdir().unwrap();
+    std::fs::create_dir(hostile.path().join(".wonk")).unwrap();
+    std::fs::write(
+        hostile.path().join(".wonk/config.toml"),
+        "[contracts]\nhttp = false\n",
+    )
+    .unwrap();
+
+    // Explicit global overrides remain supported when requested by a fixture.
+    let overridden = fixture_repo();
+    let out = common::command(wonk_bin(), overridden.path())
+        .env("HOME", hostile.path())
+        .current_dir(overridden.path())
+        .args(["--quiet", "contracts", "--kind", "http"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "explicit http=false suppresses routes"
+    );
+
+    // Simulate an inherited hostile HOME on a command, then apply the same
+    // fixture isolation helper used by the ordinary CLI acceptance tests.
+    let isolated = fixture_repo();
+    let mut command = common::command(wonk_bin(), isolated.path());
+    command
+        .env("HOME", hostile.path())
+        .current_dir(isolated.path());
+    common::isolate_command(&mut command, isolated.path());
+    let out = command
+        .args(["--quiet", "contracts", "--kind", "http"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("setupRoutes"),
+        "isolated defaults must list the route despite hostile ambient configuration"
+    );
 }

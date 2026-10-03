@@ -255,17 +255,18 @@ pub(crate) fn load_symbols_by_file(
         None
     };
     if let Some(candidates) = candidates {
+        let suffixes = crate::rerank::PathSuffixIndex::new(&candidates);
+        let mut stmt = conn.prepare(
+            "SELECT id, file, line, end_line, name, kind, scope, signature, language \
+             FROM symbols WHERE file = ?1",
+        )?;
         for file in files {
             if map.contains_key(file) {
                 continue;
             }
-            let Some(resolved) = crate::rerank::longest_suffix_match(&candidates, file) else {
+            let Some(resolved) = suffixes.resolve(file) else {
                 continue;
             };
-            let mut stmt = conn.prepare(
-                "SELECT id, file, line, end_line, name, kind, scope, signature, language \
-                 FROM symbols WHERE file = ?1",
-            )?;
             let rows = stmt
                 .query_map([resolved.as_str()], symbol_row)?
                 .collect::<rusqlite::Result<Vec<SymbolRow>>>()?;
@@ -943,10 +944,10 @@ fn build_members(
     conn: &Connection,
     query: &str,
     ranked: &crate::rerank::RankedSearch,
+    selected: &[(&crate::rerank::ScoredResult, usize)],
     feedback: &crate::config::FeedbackConfig,
 ) -> Result<Vec<SlateMember>> {
-    let flat: Vec<&crate::rerank::ScoredResult> =
-        ranked.groups.iter().flat_map(|(_, g)| g.iter()).collect();
+    let flat: Vec<&crate::rerank::ScoredResult> = selected.iter().map(|(item, _)| *item).collect();
     // ONE extraction per query: when the descriptive pass ran, its
     // prepared bundle (symbol bulk-load + capped groups) is already on
     // the shared context, keyed exactly as this build resolves — same
@@ -1007,7 +1008,7 @@ fn build_members(
         );
         members.push(SlateMember {
             identity,
-            rank: idx + 1,
+            rank: selected[idx].1,
             chosen: false,
             file,
             line: result.line,
@@ -1020,12 +1021,12 @@ fn build_members(
     if shared.is_none() {
         apply_cardinality_cap(&mut extracted);
     }
-    for (member, mut groups) in members.iter_mut().zip(extracted) {
-        groups.signals = crate::output::WhyOutput::from_contributions(
-            member.score,
-            &flat[member.rank - 1].contributions,
-        )
-        .signals;
+    for ((member, mut groups), item) in members.iter_mut().zip(extracted).zip(&flat) {
+        if !feedback.author_features {
+            groups.author.clear();
+        }
+        groups.signals =
+            crate::output::WhyOutput::from_contributions(member.score, &item.contributions).signals;
         member.groups = groups;
     }
     Ok(members)
@@ -1063,7 +1064,7 @@ fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
     Ok(())
 }
 
-/// [`prune_slates`] with one token exempt from eviction: the slate minted
+/// [`prune_slates`] with one reserved slot for the slate minted
 /// by THIS very call (TASK-101 review debt). Retention orders by
 /// second-resolution created_at with a token tie-break, so in a
 /// same-second burst at the cap the fresh row could lose the tie-break
@@ -1074,12 +1075,15 @@ pub(crate) fn prune_slates_exempting(
     retention: usize,
     minted: Option<&str>,
 ) -> Result<()> {
+    if retention == 0 {
+        bail!("[feedback] slate_retention must be >= 1");
+    }
     match minted {
         Some(minted) => {
             conn.execute(
                 "DELETE FROM feedback_slates WHERE token <> ?1 AND token NOT IN \
-                 (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?2)",
-                rusqlite::params![minted, retention as i64],
+                 (SELECT token FROM feedback_slates WHERE token <> ?1 ORDER BY created_at DESC, token DESC LIMIT ?2)",
+                rusqlite::params![minted, i64::try_from(retention - 1)?],
             )?;
             Ok(())
         }
@@ -1097,11 +1101,16 @@ pub struct StoredSlate {
 }
 
 impl StoredSlate {
+    /// Identities in the exact persisted selection order, for O(R) zip stamping.
+    pub fn identities(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.members.iter().map(|member| member.identity.as_str())
+    }
+
     /// The recorded identity of the result at (file, line), if the slate
     /// captured one — the one place the (file, line) keying semantics
     /// live (TASK-101 review debt: the dispatch surfaces each built the
     /// same members map and repeated the same stamping dance). Linear
-    /// scan; slates are single-digit-member.
+    /// scan for compatibility; delivery stamping uses [`Self::identities`].
     pub fn identity_for(&self, file: &str, line: u64) -> Option<String> {
         self.members
             .iter()
@@ -1122,7 +1131,30 @@ pub fn build_and_store_slate(
     ranked: &crate::rerank::RankedSearch,
     feedback: &crate::config::FeedbackConfig,
 ) -> Result<StoredSlate> {
-    let members = build_members(conn, query, ranked, feedback)?;
+    let selected: Vec<_> = ranked
+        .groups
+        .iter()
+        .flat_map(|(_, group)| group.iter())
+        .enumerate()
+        .map(|(index, item)| (item, index + 1))
+        .collect();
+    build_and_store_selected_slate(conn, query, ranked, &selected, feedback)
+}
+
+/// Persist only the delivered rows, in selection order, retaining their
+/// displayed 1-based ranks. Callers select the page/budget before this API
+/// and stamp matching output rows by zipping [`StoredSlate::identities`].
+pub fn build_and_store_selected_slate(
+    conn: &Connection,
+    query: &str,
+    ranked: &crate::rerank::RankedSearch,
+    selected: &[(&crate::rerank::ScoredResult, usize)],
+    feedback: &crate::config::FeedbackConfig,
+) -> Result<StoredSlate> {
+    if feedback.slate_retention == 0 {
+        bail!("[feedback] slate_retention must be >= 1");
+    }
+    let members = build_members(conn, query, ranked, selected, feedback)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let query_class = ranked.query_class.map(|c| c.as_str().to_string());
     let members_json = serde_json::to_string(&members)?;
@@ -3842,5 +3874,229 @@ mod tests {
         let parsed: Vec<EventListing> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, listed);
         drop(dir);
+    }
+    #[test]
+    fn audit_retention_reserves_minted_slot_at_equal_time() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::ensure_feedback_tables(&conn).unwrap();
+        for token in ["f", "e", "0"] {
+            conn.execute("INSERT INTO feedback_slates(token, query, members, created_at) VALUES (?1, 'q', '[]', 100)", [token]).unwrap();
+        }
+        prune_slates_exempting(&conn, 2, Some("0")).unwrap();
+        let tokens = conn
+            .prepare("SELECT token FROM feedback_slates ORDER BY token")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            tokens,
+            vec!["0", "f"],
+            "minted survives and consumes one of the two slots"
+        );
+        conn.execute("INSERT INTO feedback_slates(token, query, members, created_at) VALUES ('e', 'q', '[]', 100)", []).unwrap();
+        prune_slates_exempting(&conn, 2, Some("f")).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "minted already inside cutoff still consumes exactly one slot"
+        );
+        prune_slates_exempting(&conn, 1, Some("f")).unwrap();
+        let tokens = conn
+            .prepare("SELECT token FROM feedback_slates")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(tokens, vec!["f"]);
+    }
+
+    #[test]
+    fn audit_capture_removes_author_from_reused_extraction() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let mut ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+        )]);
+        let groups = FeatureGroups {
+            author: BTreeMap::from([("primary".to_string(), "Ada".to_string())]),
+            history: BTreeMap::from([("churn".to_string(), "high".to_string())]),
+            path: BTreeMap::from([("lang".to_string(), "Rust".to_string())]),
+            ..FeatureGroups::default()
+        };
+        ranked.context.feedback_extraction = Some(std::sync::Arc::new(FeedbackExtraction {
+            symbols: load_symbols_by_file(&conn, &["nested.rs".to_string()]).unwrap(),
+            groups: HashMap::from([(("nested.rs".to_string(), 1), groups.clone())]),
+        }));
+        let off = build_and_store_slate(
+            &conn,
+            "guard",
+            &ranked,
+            &crate::config::FeedbackConfig {
+                author_features: false,
+                ..test_feedback()
+            },
+        )
+        .unwrap();
+        assert!(
+            off.members[0].groups.author.is_empty(),
+            "author switch must also govern reused groups"
+        );
+        assert_eq!(off.members[0].groups.history, groups.history);
+        assert_eq!(off.members[0].groups.path, groups.path);
+        let on = build_and_store_slate(
+            &conn,
+            "guard",
+            &ranked,
+            &crate::config::FeedbackConfig {
+                author_features: true,
+                ..test_feedback()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            on.members[0].groups.author, groups.author,
+            "reenable without deleting old evidence"
+        );
+        drop(dir);
+    }
+    #[test]
+    fn audit_selected_slate_persists_only_delivered_rows_and_ranks() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![
+                ("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9),
+                ("nested.rs", 3, "let doubled = x * 2;", 0.8),
+                ("nested.rs", 6, "helper_inner(a)", 0.7),
+            ],
+        )]);
+        let flat = &ranked.groups[0].1;
+        let slate = build_and_store_selected_slate(
+            &conn,
+            "guard",
+            &ranked,
+            &[(&flat[1], 8), (&flat[2], 9)],
+            &test_feedback(),
+        )
+        .unwrap();
+        let members = stored_members(&conn, &slate.token);
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members.iter().map(|m| (m.line, m.rank)).collect::<Vec<_>>(),
+            vec![(3, 8), (6, 9)]
+        );
+        assert_eq!(
+            slate.identities().collect::<Vec<_>>(),
+            members
+                .iter()
+                .map(|m| m.identity.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            members[0].groups.signals,
+            crate::output::WhyOutput::from_contributions(flat[1].score, &flat[1].contributions)
+                .signals
+        );
+        assert_eq!(
+            members[1].groups.signals,
+            crate::output::WhyOutput::from_contributions(flat[2].score, &flat[2].contributions)
+                .signals
+        );
+        assert!(
+            record_feedback(&conn, &slate.token, &["1".to_string()], "s1").is_err(),
+            "unseen rank cannot become useful feedback"
+        );
+        assert_eq!(
+            record_feedback(&conn, &slate.token, &["9".to_string()], "s2")
+                .unwrap()
+                .recorded,
+            1
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn audit_invalid_retention_rejects_without_minting() {
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+        )]);
+        let result = build_and_store_slate(
+            &conn,
+            "guard",
+            &ranked,
+            &crate::config::FeedbackConfig {
+                slate_retention: 0,
+                ..test_feedback()
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("slate_retention must be >= 1")
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(dir);
+    }
+    #[test]
+    fn audit_concurrent_mints_serialize_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slates.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE symbols(id INTEGER PRIMARY KEY,file TEXT,line INTEGER,end_line INTEGER,name TEXT,kind TEXT,scope TEXT,signature TEXT,language TEXT);").unwrap();
+        crate::db::ensure_feedback_tables(&conn).unwrap();
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Other,
+            vec![("a.rs", 1, "fn guard", 0.8)],
+        )]);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                let ranked = ranked.clone();
+                std::thread::spawn(move || {
+                    let conn = Connection::open(path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    barrier.wait();
+                    build_and_store_slate(
+                        &conn,
+                        "guard",
+                        &ranked,
+                        &crate::config::FeedbackConfig {
+                            slate_retention: 2,
+                            ..test_feedback()
+                        },
+                    )
+                    .unwrap()
+                    .token
+                })
+            })
+            .collect();
+        barrier.wait();
+        let minted: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let tokens = conn
+            .prepare("SELECT token FROM feedback_slates")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(tokens.len(), 2, "serialized mints never exceed retention");
+        assert!(tokens.iter().all(|token| minted.contains(token)));
     }
 }

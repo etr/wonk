@@ -161,7 +161,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // Exclude test/doc/example files unless --include-tests.
             // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
             if !include_tests {
-                results.retain(|r| !crate::ranker::is_test_file(&r.file));
+                results.retain(|r| {
+                    let relative = repo_root_for_config
+                        .as_deref()
+                        .and_then(|root| r.file.strip_prefix(root).ok())
+                        .unwrap_or(&r.file);
+                    !crate::ranker::is_test_file(relative)
+                });
             }
 
             if results.is_empty() {
@@ -301,6 +307,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // attached table inside the ranking seam —
                         // belt-and-suspenders (AR-039). The shared
                         // load_learned_best_effort owns the policy.
+                        settings.repo_root = repo_root_for_config.clone();
+                        settings.history_enabled = config.history.enabled;
                         settings.feedback_free = args.no_feedback;
                         settings.learned =
                             load_learned_best_effort(conn.as_ref(), &config, args.no_feedback);
@@ -317,15 +325,29 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             conn.as_ref(),
                             &ranked.near_duplicates,
                         );
-                        // Feedback slate capture (TASK-101): the same
-                        // best-effort contract — gated by [feedback]
-                        // enabled, a failure degrades with a warning.
-                        let stored_slate = record_slate_best_effort(
+                        let capture = config.feedback.enabled
+                            && ranked.query_class.is_some()
+                            && conn.is_some();
+                        let mut delivered = crate::delivery::select_search_page(
+                            &ranked,
+                            args.why,
+                            capture,
+                            |out| Ok(fmt.select_search_result(out)? == BudgetStatus::Written),
+                        )?;
+                        truncated += delivered.truncated;
+                        let selected = delivered.feedback_members();
+                        let stored_slate = record_selected_slate_best_effort(
                             conn.as_ref(),
                             &args.pattern,
                             &ranked,
+                            &selected,
                             &config.feedback,
                         );
+                        if let Some(slate) = &stored_slate {
+                            delivered.stamp(slate);
+                        } else {
+                            delivered.clear_feedback();
+                        }
                         // One class line per query, before any why lines
                         // (DR-038): a misclassification is diagnosable from
                         // the breakdown it produced. The `learned:` line
@@ -344,40 +366,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             }
                         }
 
-                        for (category, items) in &ranked.groups {
-                            if !suppress {
-                                output::print_category_header(ranker::category_header(*category));
+                        let mut last_category = None;
+                        for row in &delivered.rows {
+                            let category = row.item.classified.category;
+                            if !suppress && last_category != Some(category) {
+                                output::print_category_header(ranker::category_header(category));
+                                last_category = Some(category);
                             }
-                            for item in items {
-                                let mut out = SearchOutput::from_search_result(
-                                    &item.classified.result.file,
-                                    item.classified.result.line,
-                                    item.classified.result.col,
-                                    &item.classified.result.content,
-                                );
-                                out.annotation = item.classified.annotation.clone();
-                                out.query_class =
-                                    ranked.query_class.map(|c| c.as_str().to_string());
-                                if let Some(slate) = stored_slate.as_ref() {
-                                    out.slate = Some(slate.token.clone());
-                                    out.identity = slate.identity_for(
-                                        &item.classified.result.file.to_string_lossy(),
-                                        item.classified.result.line,
-                                    );
-                                }
-                                if args.why {
-                                    out.why = Some(crate::output::WhyOutput::from_contributions(
-                                        item.score,
-                                        &item.contributions,
-                                    ));
-                                }
-                                let status = fmt.format_search_result(&out)?;
-                                if status == BudgetStatus::Skipped {
-                                    truncated += 1;
-                                } else if args.why {
-                                    let why = out.why.as_ref().expect("set above");
-                                    output::print_why_line(&out.file, out.line, why);
-                                }
+                            fmt.format_selected_search_result(&row.output)?;
+                            if let Some(why) = &row.output.why {
+                                output::print_why_line(&row.output.file, row.output.line, why);
                             }
                         }
                         // Text mode: one trailing machine-cuttable line
@@ -1982,7 +1980,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // contracts, sibling consumers of those contracts append below
             // the depth tiers. Registry problems never fail blast — the
             // depth-tier result stands with a hint.
-            if let Err(e) = append_cross_repo_blast_tier(&conn, &args.symbol, &mut result) {
+            if let Err(e) = repo_root_for_config
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("no repository root found"))
+                .and_then(|root| {
+                    append_cross_repo_blast_tier(root, &conn, &args.symbol, &mut result)
+                })
+            {
                 output::print_hint(&format!("cross-repo impact not resolved: {e}"), suppress);
             }
 
@@ -2344,6 +2348,25 @@ pub(crate) struct ContractsPayload {
 }
 
 impl ContractsPayload {
+    /// Borrow the mode-selected rows, applying the same kind/role policy on both surfaces.
+    pub(crate) fn selected_rows(
+        &self,
+        filters: &ContractsQueryFilters,
+    ) -> Vec<&crate::contracts::ContractRow> {
+        if filters.links {
+            return Vec::new();
+        }
+        let rows = if filters.unused_providers {
+            &self.unused_providers
+        } else {
+            &self.rows
+        };
+        rows.iter()
+            .filter(|row| filters.kind.is_none_or(|kind| row.kind == kind))
+            .filter(|row| filters.role.is_none_or(|role| row.role == role))
+            .collect()
+    }
+
     /// Grep/NDJSON token for a row: `orphan`/`unscoped` on unmatched
     /// consumers only — linked consumers and providers stay 083-shaped.
     pub(crate) fn status_token(&self, row: &crate::contracts::ContractRow) -> Option<&'static str> {
@@ -2374,9 +2397,18 @@ pub(crate) fn build_contracts_payload(
     repos_dir: &std::path::Path,
     filters: &ContractsQueryFilters,
 ) -> Result<ContractsPayload> {
-    let declared = crate::config::Config::load(Some(repo_root))?
-        .contracts
-        .workspace;
+    let config = crate::config::Config::load(Some(repo_root))?;
+    build_contracts_payload_with_config(conn, repo_root, repos_dir, filters, &config)
+}
+
+pub(crate) fn build_contracts_payload_with_config(
+    conn: &Connection,
+    repo_root: &std::path::Path,
+    repos_dir: &std::path::Path,
+    filters: &ContractsQueryFilters,
+    config: &crate::config::Config,
+) -> Result<ContractsPayload> {
+    let declared = config.contracts.workspace.clone();
     let own_index = db::find_existing_index(repo_root)
         .ok_or_else(|| anyhow::anyhow!("no index found; run `wonk init` first"))?;
     let workspace = crate::contracts::workspace_status(repos_dir, repo_root, &own_index, &declared);
@@ -2430,27 +2462,33 @@ pub(crate) fn build_contracts_payload(
 
 /// Append the CrossRepo tier to a blast result when the target owns
 /// provider contracts with sibling consumers (PRD-CTR-REQ-010).
-fn append_cross_repo_blast_tier(
+pub(crate) fn append_cross_repo_blast_tier(
+    repo_root: &std::path::Path,
     conn: &Connection,
     symbol: &str,
     result: &mut crate::types::BlastAnalysis,
+) -> Result<()> {
+    let config = crate::config::Config::load(Some(repo_root))?;
+    append_cross_repo_blast_tier_with_config(repo_root, conn, symbol, result, &config)
+}
+
+pub(crate) fn append_cross_repo_blast_tier_with_config(
+    repo_root: &std::path::Path,
+    conn: &Connection,
+    symbol: &str,
+    result: &mut crate::types::BlastAnalysis,
+    config: &crate::config::Config,
 ) -> Result<()> {
     let provider_ids = crate::blast::provider_contract_ids(conn, symbol)?;
     if provider_ids.is_empty() {
         return Ok(());
     }
-    let repo_root = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| db::find_repo_root(&cwd).ok())
-        .ok_or_else(|| anyhow::anyhow!("no repository root found"))?;
     let Some(repos_dir) = crate::contracts::default_repos_dir() else {
         return Ok(());
     };
-    let declared = crate::config::Config::load(Some(&repo_root))
-        .map(|c| c.contracts.workspace)
-        .unwrap_or_default();
+    let declared = config.contracts.workspace.clone();
     let consumers = crate::blast::resolve_cross_repo_consumers(
-        &repo_root,
+        repo_root,
         conn,
         &declared,
         &repos_dir,
@@ -2552,20 +2590,7 @@ fn dispatch_contracts<W: io::Write>(
         return Ok(());
     }
 
-    let rows = if filters.unused_providers {
-        // --kind/--role apply on this mode too (TASK-084 review debt):
-        // the rows are providers by definition, so --role consumer
-        // selects nothing — the flags used to be silently ignored here.
-        payload
-            .unused_providers
-            .iter()
-            .filter(|row| kind.is_none_or(|k| row.kind == k))
-            .filter(|row| role.is_none_or(|r| row.role == r))
-            .cloned()
-            .collect()
-    } else {
-        payload.rows.clone()
-    };
+    let rows = payload.selected_rows(&filters);
 
     if rows.is_empty() {
         if filters.orphans {
@@ -2581,7 +2606,7 @@ fn dispatch_contracts<W: io::Write>(
         return Ok(());
     }
 
-    for row in &rows {
+    for row in rows {
         let mut out = output::ContractOutput::from(row);
         out.status = payload.status_token(row).map(str::to_string);
         fmt.format_contract(&out)?;
@@ -2600,6 +2625,7 @@ fn dispatch_contracts<W: io::Write>(
 /// search — the `record_pairs_best_effort` contract at the same call
 /// site. Returns the stored slate so rows can carry its token and
 /// identities.
+#[cfg(test)]
 pub(crate) fn record_slate_best_effort(
     conn: Option<&Connection>,
     query: &str,
@@ -2617,6 +2643,26 @@ pub(crate) fn record_slate_best_effort(
         Ok(stored) => Some(stored),
         Err(e) => {
             eprintln!("warn: could not record feedback slate: {e:#}");
+            None
+        }
+    }
+}
+
+pub(crate) fn record_selected_slate_best_effort(
+    conn: Option<&Connection>,
+    query: &str,
+    ranked: &crate::rerank::RankedSearch,
+    selected: &[(&crate::rerank::ScoredResult, usize)],
+    feedback: &crate::config::FeedbackConfig,
+) -> Option<crate::feedback::StoredSlate> {
+    if !feedback.enabled || ranked.query_class.is_none() || selected.is_empty() {
+        return None;
+    }
+    match crate::feedback::build_and_store_selected_slate(conn?, query, ranked, selected, feedback)
+    {
+        Ok(slate) => Some(slate),
+        Err(error) => {
+            eprintln!("warn: could not record feedback slate: {error:#}");
             None
         }
     }
@@ -2746,9 +2792,9 @@ fn run_feedback<W: io::Write>(
         fmt.writer_mut(),
         "recorded {} event(s) against slate {} (query {:?}, class {})",
         summary.recorded,
-        args.slate.as_deref().unwrap_or_default(),
+        output::escape_metadata(args.slate.as_deref().unwrap_or_default()),
         summary.query,
-        class
+        output::escape_metadata(class)
     )?;
     for event in &summary.events {
         let symbol = event.symbol.as_deref().unwrap_or("-");
@@ -2756,15 +2802,15 @@ fn run_feedback<W: io::Write>(
             fmt.writer_mut(),
             "rank {}  {}:{}  {}  [useful]",
             event.rank,
-            event.file,
+            output::escape_metadata(&event.file),
             event.line,
-            symbol
+            output::escape_metadata(symbol)
         )?;
         if !event.live {
             writeln!(
                 fmt.writer_mut(),
                 "note: {} no longer resolves in the index; the entry will not apply",
-                event.identity
+                output::escape_metadata(&event.identity)
             )?;
         }
     }
@@ -2848,7 +2894,12 @@ fn run_feedback_weights<W: io::Write>(
         };
         let mut line = format!(
             "{} [{}] {:.3} (default {:.3}) {} obs, {} sessions",
-            row.feature, scope, row.effective, row.default, row.observations, row.sessions
+            output::escape_metadata(&row.feature),
+            output::escape_metadata(scope),
+            row.effective,
+            row.default,
+            row.observations,
+            row.sessions
         );
         if !row.gated {
             line.push_str(" [below gate]");
@@ -2878,7 +2929,13 @@ fn run_feedback_list<W: io::Write>(
         let symbol = event.symbol.as_deref().unwrap_or("-");
         let mut line = format!(
             "#{} rank {}  {}:{}  {}  session {}  class {}",
-            event.id, event.rank, event.file, event.line, symbol, session, class
+            event.id,
+            event.rank,
+            output::escape_metadata(&event.file),
+            event.line,
+            output::escape_metadata(symbol),
+            output::escape_metadata(session),
+            output::escape_metadata(class)
         );
         if !event.live {
             line.push_str("  [retired]");
@@ -2934,7 +2991,8 @@ fn run_feedback_clear_result<W: io::Write>(
     }
     writeln!(
         fmt.writer_mut(),
-        "cleared {cleared} feedback event(s) for {identity}; learned weights untouched"
+        "cleared {cleared} feedback event(s) for {}; learned weights untouched",
+        output::escape_metadata(identity)
     )?;
     Ok(())
 }
@@ -2978,7 +3036,8 @@ fn run_feedback_reset_weight<W: io::Write>(
     }
     writeln!(
         fmt.writer_mut(),
-        "reset {reset} learned weight row(s) for {feature} to defaults; event history untouched"
+        "reset {reset} learned weight row(s) for {} to defaults; event history untouched",
+        output::escape_metadata(feature)
     )?;
     Ok(())
 }
@@ -8055,6 +8114,23 @@ mod tests {
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Json, false);
         run_feedback(conn, args, &learning_config(), &mut fmt, OutputFormat::Json).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn audit_g4_feedback_session_metadata_is_one_text_record() {
+        let (_dir, conn, token) = learning_repo_with_slate();
+        run_fb(
+            &conn,
+            &session_args(&token, "session\nforged\r\u{1b}[31m", "2"),
+        );
+        let mut args = mode_args();
+        args.list = true;
+        let out = run_fb(&conn, &args);
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(
+            !out.trim_end_matches('\n').chars().any(char::is_control),
+            "{out:?}"
+        );
     }
 
     #[test]

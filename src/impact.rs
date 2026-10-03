@@ -17,7 +17,8 @@ use crate::indexer;
 use crate::semantic;
 use crate::types::{
     ChangeAnalysis, ChangeAnalysisDetail, ChangeScope, ChangeType, ChangedSymbol, FileDiffHunks,
-    ImpactResult, SemanticResult, Symbol, SymbolKind, SymbolRef,
+    FileSnapshots, ImpactResult, SemanticResult, SourceSnapshot, Symbol, SymbolIdentity,
+    SymbolKind, SymbolRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -205,7 +206,7 @@ fn apply_scope_args(cmd: &mut Command, scope: &ChangeScope) -> Result<()> {
 /// - `Compare(ref)`: working tree vs the given ref
 pub fn detect_scoped_files(scope: &ChangeScope, repo_root: &Path) -> Result<Vec<String>> {
     let mut cmd = Command::new("git");
-    cmd.arg("diff").arg("--name-only");
+    cmd.arg("diff").arg("--no-renames").arg("--name-only");
     apply_scope_args(&mut cmd, scope)?;
 
     let output = cmd
@@ -280,7 +281,7 @@ pub fn get_diff_hunks_for_file(
     repo_root: &Path,
 ) -> Result<Vec<(usize, usize)>> {
     let mut cmd = Command::new("git");
-    cmd.arg("diff").arg("--unified=0");
+    cmd.arg("diff").arg("--no-renames").arg("--unified=0");
     apply_scope_args(&mut cmd, scope)?;
     cmd.arg("--").arg(file);
 
@@ -432,7 +433,7 @@ fn get_all_diff_hunks_sides(
     repo_root: &Path,
 ) -> Result<HashMap<String, FileDiffHunks>> {
     let mut cmd = Command::new("git");
-    cmd.arg("diff").arg("--unified=0");
+    cmd.arg("diff").arg("--no-renames").arg("--unified=0");
     apply_scope_args(&mut cmd, scope)?;
 
     let output = cmd
@@ -449,78 +450,130 @@ fn get_all_diff_hunks_sides(
     Ok(parse_all_diff_hunks_sides(&stdout))
 }
 
-/// Detect changed symbols using pre-loaded indexed symbols and file content.
-///
-/// Internal variant of [`detect_changed_symbols`] that avoids redundant SQLite
-/// queries and disk reads when the caller has already loaded this data.
-fn detect_changed_symbols_with(
-    conn: &Connection,
-    file: &str,
+/// Read a blob only after Git has confirmed membership, so absence is
+/// distinct from invalid refs, unmerged index entries, and read failures.
+fn read_git_snapshot(
     repo_root: &Path,
-    indexed_symbols: &[Symbol],
-) -> Result<Vec<ChangedSymbol>> {
-    let abs_path = repo_root.join(file);
-
-    // If file doesn't exist on disk, all indexed symbols are Removed.
-    if !abs_path.exists() {
-        return Ok(indexed_symbols
-            .iter()
-            .map(|s| make_changed(s, ChangeType::Removed))
-            .collect());
+    file: &str,
+    git_ref: Option<&str>,
+) -> Result<Option<String>> {
+    let listed = match git_ref {
+        Some(reference) => run_git_output(
+            repo_root,
+            &["ls-tree", "--name-only", reference, "--", file],
+        )?,
+        None => run_git_output(repo_root, &["ls-files", "--", file])?,
+    };
+    if listed.is_empty() {
+        return Ok(None);
     }
+    let object = format!("{}:{file}", git_ref.unwrap_or(""));
+    run_git_output(repo_root, &["show", &object]).map(Some)
+}
 
-    let content_str =
-        std::fs::read_to_string(&abs_path).with_context(|| format!("reading file {file}"))?;
+fn parse_snapshot(file: &str, source: Option<String>) -> Result<Option<SourceSnapshot>> {
+    source
+        .map(|source| {
+            let symbols = parse_file_to_symbols(file, &source)?;
+            Ok(SourceSnapshot { source, symbols })
+        })
+        .transpose()
+}
 
-    // Fast path: compare content hash against stored hash.
-    let current_hash = file_content_hash(content_str.as_bytes());
-    let stored_hash: Option<String> = conn
-        .query_row(
-            "SELECT hash FROM files WHERE path = ?1",
-            rusqlite::params![file],
-            |row| row.get(0),
-        )
-        .ok();
+/// Resolve both endpoints once, including anchors and suppression text.
+fn file_snapshots(scope: &ChangeScope, file: &str, repo_root: &Path) -> Result<FileSnapshots> {
+    validate_file_path(file)?;
+    let old_ref = match scope {
+        ChangeScope::Unstaged => None,
+        ChangeScope::Staged | ChangeScope::All => Some("HEAD"),
+        ChangeScope::Compare(reference) => {
+            validate_git_ref(reference)?;
+            Some(reference.as_str())
+        }
+    };
+    let old = read_git_snapshot(repo_root, file, old_ref)?;
+    let new = if *scope == ChangeScope::Staged {
+        read_git_snapshot(repo_root, file, None)?
+    } else {
+        match std::fs::read_to_string(repo_root.join(file)) {
+            Ok(source) => Some(source),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).with_context(|| format!("reading file {file}")),
+        }
+    };
+    Ok(FileSnapshots {
+        old: parse_snapshot(file, old)?,
+        new: parse_snapshot(file, new)?,
+    })
+}
 
-    if stored_hash.as_deref() == Some(current_hash.as_str()) {
-        return Ok(Vec::new());
+fn overlaps(symbol: &Symbol, ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(start, end)| symbol.line <= end && start <= symbol.end_line.unwrap_or(symbol.line))
+}
+
+/// Compare selected source endpoints, merging both hunk sides by scoped
+/// identity. Removed-side body edits still select the surviving NEW symbol.
+fn snapshot_changes(
+    snapshots: &FileSnapshots,
+    hunks: &FileDiffHunks,
+) -> (Vec<ChangedSymbol>, HashSet<SymbolIdentity>) {
+    let old_symbols = snapshots
+        .old
+        .as_ref()
+        .map(|s| s.symbols.as_slice())
+        .unwrap_or_default();
+    let new_symbols = snapshots
+        .new
+        .as_ref()
+        .map(|s| s.symbols.as_slice())
+        .unwrap_or_default();
+    let mut old_by_id: HashMap<SymbolIdentity, Vec<&Symbol>> = HashMap::new();
+    let mut new_by_id: HashMap<SymbolIdentity, Vec<&Symbol>> = HashMap::new();
+    for symbol in old_symbols {
+        old_by_id.entry(symbol.into()).or_default().push(symbol);
     }
-
-    let current_symbols = parse_file_to_symbols(file, &content_str)?;
-
-    // If file not in index at all, all current symbols are Added.
-    if stored_hash.is_none() && indexed_symbols.is_empty() {
-        return Ok(current_symbols
-            .iter()
-            .map(|s| make_changed(s, ChangeType::Added))
-            .collect());
+    for symbol in new_symbols {
+        new_by_id.entry(symbol.into()).or_default().push(symbol);
     }
-
-    // Build lookup maps by identity key.
-    let current_map: HashMap<SymbolKey, &Symbol> =
-        current_symbols.iter().map(|s| (symbol_key(s), s)).collect();
-    let indexed_map: HashMap<SymbolKey, &Symbol> =
-        indexed_symbols.iter().map(|s| (symbol_key(s), s)).collect();
-
     let mut changes = Vec::new();
-
-    for (key, sym) in &current_map {
-        if let Some(indexed_sym) = indexed_map.get(key) {
-            if sym.signature != indexed_sym.signature {
-                changes.push(make_changed(sym, ChangeType::Modified));
+    let mut signature_changed = HashSet::new();
+    for symbol in new_symbols {
+        let identity = SymbolIdentity::from(symbol);
+        match old_by_id.get(&identity) {
+            None => changes.push(make_changed(symbol, ChangeType::Added)),
+            Some(old) if old.len() == 1 && new_by_id[&identity].len() == 1 => {
+                let signature_differs = symbol.signature != old[0].signature;
+                if signature_differs {
+                    signature_changed.insert(identity);
+                }
+                if signature_differs
+                    || overlaps(symbol, &hunks.new_ranges)
+                    || overlaps(old[0], &hunks.removed_ranges)
+                {
+                    changes.push(make_changed(symbol, ChangeType::Modified));
+                }
             }
-        } else {
-            changes.push(make_changed(sym, ChangeType::Added));
+            // Ambiguous identities cannot be paired across line shifts.
+            // Retain a touched symbol for review, with an unresolved anchor.
+            Some(old)
+                if overlaps(symbol, &hunks.new_ranges)
+                    || old
+                        .iter()
+                        .any(|symbol| overlaps(symbol, &hunks.removed_ranges)) =>
+            {
+                changes.push(make_changed(symbol, ChangeType::Modified))
+            }
+            Some(_) => {}
         }
     }
-
-    for (key, sym) in &indexed_map {
-        if !current_map.contains_key(key) {
-            changes.push(make_changed(sym, ChangeType::Removed));
+    for symbol in old_symbols {
+        if !new_by_id.contains_key(&SymbolIdentity::from(symbol)) {
+            changes.push(make_changed(symbol, ChangeType::Removed));
         }
     }
-
-    Ok(changes)
+    (changes, signature_changed)
 }
 
 /// Parse file content with Tree-sitter and return extracted symbols.
@@ -607,19 +660,10 @@ pub fn parse_current_symbols(file: &str, repo_root: &Path) -> Result<Vec<Symbol>
 
 /// Detect all changed symbols across files for a given [`ChangeScope`].
 ///
-/// This is the main public entry point for scoped change detection.  It:
-/// 1. Discovers changed files via `git diff --name-only` with the appropriate flags.
-/// 2. Fetches all diff hunks in a single `git diff --unified=0` subprocess.
-/// 3. For each file that is a supported language:
-///    - Queries indexed symbols once and shares them for both hunk mapping
-///      and tree-sitter comparison (avoids duplicate SQLite queries).
-///    - Maps hunks to overlapping symbols (Modified).
-///    - Runs Tree-sitter re-parse for Added/Removed/signature-Modified.
-///    - Merges results with dedup (Tree-sitter results take priority).
-/// 4. Returns a [`ChangeAnalysis`] with all changed symbols.
-///
-/// Per-file errors (git diff, SQLite query, tree-sitter parse) are logged to
-/// stderr and the file is skipped rather than aborting the entire analysis.
+/// Reads Git's selected old/new snapshots and maps both hunk sides onto
+/// their own parsed spans. The index supplies graph evidence to downstream
+/// callers, not the source spans or signature-comparison baseline.
+/// Snapshot/diff failures propagate rather than yielding incomplete changes.
 pub fn detect_changes(
     conn: &Connection,
     scope: &ChangeScope,
@@ -632,76 +676,31 @@ pub fn detect_changes(
 /// ranges per file and the set of symbols whose signatures — not just bodies
 /// — changed (TASK-085, PRD-REV-REQ-012).
 ///
-/// Everything comes from the same single git subprocess and symbol merge as
+/// Everything comes from the same selected snapshots and symbol merge as
 /// [`detect_changes`]; `analysis` is byte-identical to what it returns.
 pub fn detect_changes_detail(
-    conn: &Connection,
+    _conn: &Connection,
     scope: &ChangeScope,
     repo_root: &Path,
 ) -> Result<ChangeAnalysisDetail> {
     let changed_files = detect_scoped_files(scope, repo_root)?;
-
-    // Single git subprocess for all hunks across all files.
-    let hunks = get_all_diff_hunks_sides(scope, repo_root).unwrap_or_else(|e| {
-        eprintln!("wonk: warning: failed to get diff hunks: {e}");
-        HashMap::new()
-    });
-
-    let mut all_changes: Vec<ChangedSymbol> = Vec::new();
-    let mut signature_changed: HashSet<(String, SymbolKind)> = HashSet::new();
-
-    for file in &changed_files {
-        // Skip files we can't parse (non-supported languages).
-        if indexer::detect_language(Path::new(file)).is_none() {
+    let hunks = get_all_diff_hunks_sides(scope, repo_root)?;
+    let mut all_changes = Vec::new();
+    let mut signature_changed = HashSet::new();
+    let mut snapshots = HashMap::new();
+    for file in changed_files {
+        if indexer::detect_language(Path::new(&file)).is_none() {
             continue;
         }
-
-        // Query indexed symbols once for both hunk mapping and tree-sitter comparison.
-        let indexed_symbols = match query_indexed_symbols(conn, file) {
-            Ok(syms) => syms,
-            Err(e) => {
-                eprintln!("wonk: warning: failed to query symbols for {file}: {e}");
-                continue;
-            }
-        };
-
-        // Step 1: Hunk-based detection (Modified symbols).
-        let file_hunks = hunks.get(file.as_str()).cloned().unwrap_or_default();
-        let hunk_modified = map_hunks_to_symbols(&indexed_symbols, &file_hunks.new_ranges, file);
-
-        // Step 2: Tree-sitter based detection (Added/Removed/Modified via signature
-        // diff), reusing the already-loaded indexed symbols.
-        let ts_changes = detect_changed_symbols_with(conn, file, repo_root, &indexed_symbols)
-            .unwrap_or_else(|e| {
-                eprintln!("wonk: warning: failed to detect changes for {file}: {e}");
-                Vec::new()
-            });
-
-        // Step 3: Merge with dedup. Tree-sitter results take priority because they
-        // have more precise change classification (signature-based Modified vs
-        // hunk-overlap Modified, plus Added/Removed).
-        let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
-
-        // Add tree-sitter results first (they have priority). A Modified here
-        // means the signature changed; record it before hunk-path results can
-        // blend in — dedup priority keeps the flag unshadowed.
-        for cs in &ts_changes {
-            if seen.insert((cs.name.clone(), cs.kind)) {
-                if cs.change_type == ChangeType::Modified {
-                    signature_changed.insert((cs.name.clone(), cs.kind));
-                }
-                all_changes.push(cs.clone());
-            }
-        }
-
-        // Add hunk-based Modified that weren't already covered by tree-sitter.
-        for cs in &hunk_modified {
-            if seen.insert((cs.name.clone(), cs.kind)) {
-                all_changes.push(cs.clone());
-            }
-        }
+        let endpoints = file_snapshots(scope, &file, repo_root)?;
+        let (changes, signatures) = snapshot_changes(
+            &endpoints,
+            hunks.get(&file).unwrap_or(&FileDiffHunks::default()),
+        );
+        all_changes.extend(changes);
+        signature_changed.extend(signatures);
+        snapshots.insert(file, endpoints);
     }
-
     Ok(ChangeAnalysisDetail {
         analysis: ChangeAnalysis {
             scope: scope.clone(),
@@ -709,6 +708,7 @@ pub fn detect_changes_detail(
         },
         hunks,
         signature_changed,
+        snapshots,
     })
 }
 
@@ -901,7 +901,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), source).unwrap();
 
-        pipeline::build_index(root, true).unwrap();
+        let config = crate::config::Config::load_with_paths(None, Some(root)).unwrap();
+        pipeline::build_index_with_config(root, true, &config).unwrap();
 
         let index_path = db::local_index_path(root);
         let conn = db::open_existing(&index_path).unwrap();
@@ -2253,7 +2254,8 @@ diff --git a/src/a.rs b/src/a.rs
             .unwrap();
 
         // Build the wonk index
-        pipeline::build_index(root, true).unwrap();
+        let config = crate::config::Config::load_with_paths(None, Some(root)).unwrap();
+        pipeline::build_index_with_config(root, true, &config).unwrap();
 
         let index_path = db::local_index_path(root);
         let conn = db::open_existing(&index_path).unwrap();
@@ -2474,14 +2476,16 @@ diff --git a/src/a.rs b/src/a.rs
         assert!(
             detail
                 .signature_changed
-                .contains(&("add".to_string(), SymbolKind::Function)),
+                .iter()
+                .any(|identity| identity.name == "add" && identity.kind == SymbolKind::Function),
             "signature change must be flagged: {:?}",
             detail.signature_changed
         );
         assert!(
             !detail
                 .signature_changed
-                .contains(&("inc".to_string(), SymbolKind::Function)),
+                .iter()
+                .any(|identity| identity.name == "inc" && identity.kind == SymbolKind::Function),
             "body-only modification must not be flagged: {:?}",
             detail.signature_changed
         );

@@ -14,13 +14,13 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import math
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import numpy as np
+from semantic_metrics import summarize
 
 
 def load_chunks(path: Path) -> list[dict[str, object]]:
@@ -100,25 +100,6 @@ def first_relevant_rank(
     return None
 
 
-def summarize(ranks: Iterable[int | None]) -> dict[str, float]:
-    values = list(ranks)
-    total = len(values)
-    metrics = {
-        f"recall@{cutoff}": sum(
-            rank is not None and rank <= cutoff for rank in values
-        )
-        / total
-        for cutoff in (1, 5, 10)
-    }
-    metrics["mrr@10"] = (
-        sum(1.0 / rank for rank in values if rank is not None and rank <= 10) / total
-    )
-    metrics["ndcg@10"] = (
-        sum(1.0 / math.log2(rank + 1) for rank in values if rank is not None and rank <= 10)
-        / total
-    )
-    return metrics
-
 
 def evaluate(
     corpus: dict[str, object],
@@ -194,7 +175,8 @@ def main() -> None:
             raise SystemExit(f"{query['id']}: unresolved judgments: {missing}")
 
     results = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "metric_semantics": "first_relevant_rank_only",
         "corpus_queries": len(corpus["queries"]),
         "repository_revisions": corpus["repositories"],
         "models": {},

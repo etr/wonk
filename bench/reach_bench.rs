@@ -26,6 +26,8 @@
 //! Results are recorded in bench/reach-results.md. Not a pass/fail gate
 //! beyond the latency asserts. Run: cargo bench --bench reach.
 
+mod fixture_config;
+
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -60,7 +62,7 @@ fn main() -> Result<()> {
     // 1. Structural build with reach disabled (V4 baseline cost).
     fs::write(wonk_dir.join("config.toml"), "[reach]\nenabled = false\n")?;
     let t0 = Instant::now();
-    let stats = wonk::pipeline::build_index(root, true)?;
+    let stats = fixture_config::build_index(root, true)?;
     let build_no_reach = t0.elapsed();
     ensure!(
         stats.symbol_count > 55_000 && stats.symbol_count < 70_000,
@@ -72,7 +74,7 @@ fn main() -> Result<()> {
     //    precomputation cost.
     fs::remove_file(wonk_dir.join("config.toml"))?;
     let t1 = Instant::now();
-    wonk::pipeline::build_index(root, true)?;
+    fixture_config::build_index(root, true)?;
     let build_with_reach = t1.elapsed();
 
     let index_path = db::local_index_path(root);

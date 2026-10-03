@@ -133,6 +133,10 @@ CREATE TABLE IF NOT EXISTS term_stats (
     PRIMARY KEY (term, file)
 );
 CREATE INDEX IF NOT EXISTS idx_term_stats_file ON term_stats(file);
+CREATE TABLE IF NOT EXISTS bm25_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 // Precomputed upstream reachability (TASK-080, DR-034). One row per
@@ -323,7 +327,7 @@ CREATE INDEX IF NOT EXISTS idx_near_duplicates_b ON near_duplicates(symbol_id_b)
 // query-time processes only; the indexer never touches them.
 const FEEDBACK_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS feedback_events (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     result_identity TEXT NOT NULL,   -- content-anchored, survives re-index (PRD-FB-REQ-005)
     query_class TEXT,                -- class at query time; enables per-class learning (PRD-FB-REQ-008)
     chosen_rank INTEGER NOT NULL,    -- rank of the useful result; rank 1 yields no update (PRD-FB-REQ-009)
@@ -510,8 +514,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     ensure_topology_columns(conn)?;
     conn.execute_batch(DUPLICATES_SQL)
         .context("creating duplicate tables")?;
-    conn.execute_batch(FEEDBACK_SQL)
-        .context("creating feedback tables")?;
+    ensure_feedback_tables(conn)?;
     conn.execute_batch(SUMMARIES_SQL)
         .context("creating summaries table")?;
     conn.execute_batch(FTS_SQL)
@@ -658,7 +661,78 @@ pub fn ensure_duplicate_tables(conn: &Connection) -> Result<()> {
 pub fn ensure_feedback_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(FEEDBACK_SQL)
         .context("creating feedback tables (migration)")?;
+    migrate_feedback_event_ids(conn)?;
     Ok(())
+}
+
+fn feedback_ids_are_monotonic(conn: &Connection) -> Result<bool> {
+    let ddl: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='feedback_events'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(ddl.to_ascii_uppercase().contains("AUTOINCREMENT"))
+}
+
+fn migrate_feedback_event_ids(conn: &Connection) -> Result<()> {
+    if feedback_ids_are_monotonic(conn)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // A competing opener may have completed the upgrade while we waited.
+    if feedback_ids_are_monotonic(&tx)? {
+        return Ok(());
+    }
+    let objects: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT sql FROM sqlite_master WHERE tbl_name='feedback_events' \
+             AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY name",
+        )?;
+        stmt.query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let highest: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(id),0) FROM feedback_events",
+        [],
+        |row| row.get(0),
+    )?;
+    let sequence = highest.max(crate::learning::read_watermark(&tx)?);
+    let table_end = FEEDBACK_SQL.find("\n);").expect("feedback table DDL") + 3;
+    let create = FEEDBACK_SQL[..table_end].replace(
+        "CREATE TABLE IF NOT EXISTS feedback_events",
+        "CREATE TABLE feedback_events_migration",
+    );
+    tx.execute_batch(&create)?;
+    tx.execute_batch(
+        "INSERT INTO feedback_events_migration SELECT * FROM feedback_events;
+         DROP TABLE feedback_events;
+         ALTER TABLE feedback_events_migration RENAME TO feedback_events;",
+    )?;
+    for sql in objects {
+        tx.execute_batch(&sql)?;
+    }
+    tx.execute(
+        "DELETE FROM sqlite_sequence WHERE name='feedback_events'",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO sqlite_sequence(name,seq) VALUES ('feedback_events',?1)",
+        [sequence],
+    )?;
+    tx.commit()
+        .context("publishing monotonic feedback event IDs")?;
+    Ok(())
+}
+
+/// True only after complete corpus term statistics have been published.
+/// Single-file writes never upgrade a legacy index's readiness.
+pub fn bm25_generation_ready(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value = '1' FROM bm25_meta WHERE key = 'generation_ready'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
 }
 
 /// Ensure the `confidence` column exists on the `references` table.

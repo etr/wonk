@@ -7,6 +7,8 @@
 //! - The file watcher ignores events from nested worktrees
 //! - Each worktree gets an independent index
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -204,7 +206,7 @@ fn req_003_parent_index_excludes_nested_worktree_files() {
     );
 
     // Build index from the parent repo root (local mode).
-    wonk::pipeline::build_index(&fix.parent_root, true).unwrap();
+    common::build_index(&fix.parent_root, true).unwrap();
 
     // Open the parent's index and check file paths.
     let index_path = wonk::db::local_index_path(&fix.parent_root);
@@ -269,8 +271,8 @@ fn req_005_separate_indexes_per_worktree() {
     let fix = SiblingFixture::new();
 
     // Build indexes for both (local mode).
-    let parent_stats = wonk::pipeline::build_index(&fix.parent_root, true).unwrap();
-    let wt_stats = wonk::pipeline::build_index(&fix.worktree_root, true).unwrap();
+    let parent_stats = common::build_index(&fix.parent_root, true).unwrap();
+    let wt_stats = common::build_index(&fix.worktree_root, true).unwrap();
 
     assert!(
         parent_stats.file_count > 0,

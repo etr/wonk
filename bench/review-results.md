@@ -1,6 +1,6 @@
 # Review engine measurement (TASK-085)
 
-Recorded: 2026-09-29 · `cargo bench --bench review` (bench profile, optimized)
+Recorded: 2026-10-02 · `cargo bench --bench review` (bench profile, optimized)
 
 ## Machine
 
@@ -30,10 +30,10 @@ one addition with an empty radius.
 
 | configuration | p50 | p95 | p99 | p100 |
 |---|---|---|---|---|
-| reach enabled (gated) | 47.80 ms | 52.70 ms | 56.51 ms | 56.51 ms |
-| reach disabled (ungated contrast) | 45.83 ms | 52.43 ms | 67.73 ms | 67.73 ms |
+| reach enabled (gated) | 121.41 ms | 126.66 ms | 131.25 ms | 131.25 ms |
+| reach disabled (ungated contrast) | 122.09 ms | 125.88 ms | 128.90 ms | 128.90 ms |
 
-Gate: **p95 = 52.70 ms < 2 s** with reach enabled — ~38x headroom against
+Gate: **p95 = 126.66 ms < 2 s** with reach enabled — 15.8x headroom against
 the PRD-REV acceptance criterion. Percentile stated explicitly (reach-bench
 precedent: never gate an unstated percentile).
 
@@ -41,15 +41,25 @@ precedent: never gate an unstated percentile).
 
 | phase | p50 | p95 | p99 | p100 |
 |---|---|---|---|---|
-| change detection (`detect_changes_detail`, separate sweeps) | 42.46 ms | 45.95 ms | 48.77 ms | 48.77 ms |
-| blast + rules (paired per-iteration deltas, full − detect) | 5.54 ms | 6.75 ms | 7.75 ms | 7.75 ms |
+| change detection (`detect_changes_detail`, separate sweeps) | 121.00 ms | 123.56 ms | 126.18 ms | 126.18 ms |
+| blast + rules (paired per-iteration deltas, full − detect) | 0.47 ms | 7.54 ms | 8.78 ms | 8.78 ms |
 
-Change detection dominates: two `git diff` subprocesses plus tree-sitter
-re-parse of the 8 touched ~200-symbol files. Blast + rules (up to two
-`analyze_blast` calls per candidate symbol — table path for rule A context,
-live BFS for the rule-B with-tests question) is ~13% of the run.
+Change detection loads the selected old Git blob and selected new endpoint,
+parses both snapshots at their own line coordinates, and reuses that metadata
+in review. The full-review and detection calls are timed back to back on the
+same iteration. Percentiles sort copies, preserving the raw pairing in
+[`review-samples.json`](review-samples.json). The paired delta is a difference
+between two timed operations, rather than a separately instrumented phase:
+five of 25 deltas are negative (minimum -4.60ms) from scheduling/cache noise.
+Negative samples are retained, and no isolated blast/rules percentage is inferred.
+
+Conditions: Apple M4, 16 GiB RAM, macOS 26.3.1 arm64, Rust 1.97.1; optimized
+bench profile. One untimed full-review correctness pass precedes 25 paired
+full/detection samples, then 25 reach-disabled contrast samples. The source/Cargo
+gate excludes other Rust workloads; no claim is made that all host processes
+were idle. Fixture config uses defaults plus the explicit repository layer.
 
 ## Other timings (ungated)
 
-- repo generation: 34.81 ms; index build (60k symbols, reach on): 2.23 s;
-  diff application: 1.64 ms.
+- repo generation: 50.02 ms; index build (60k symbols, reach on): 3.58 s;
+  diff application: 1.41 ms.

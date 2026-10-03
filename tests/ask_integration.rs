@@ -3,6 +3,8 @@
 //! The default-provider test is fully offline. The opt-in Ollama test remains
 //! ignored so CI does not require an external service.
 
+mod common;
+
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener};
@@ -24,7 +26,7 @@ fn wonk_bin() -> std::path::PathBuf {
 }
 
 fn offline_command(bin: &std::path::Path, repo: &std::path::Path) -> Command {
-    let mut command = Command::new(bin);
+    let mut command = common::command(bin, repo);
     command
         .current_dir(repo)
         .env("HTTP_PROXY", "http://127.0.0.1:1")
@@ -339,7 +341,7 @@ fn validate_token(token: &str) -> bool {
         .unwrap();
 
     // Build index with embeddings.
-    let init = Command::new(&bin)
+    let init = common::command(&bin, tmp.path())
         .arg("init")
         .current_dir(tmp.path())
         .stdout(Stdio::null())
@@ -349,7 +351,7 @@ fn validate_token(token: &str) -> bool {
     assert!(init.success(), "wonk init with configured Ollama failed");
 
     // Run `wonk ask` with JSON output.
-    let output = Command::new(&bin)
+    let output = common::command(&bin, tmp.path())
         .args(["ask", "authentication", "--format", "json"])
         .current_dir(tmp.path())
         .stdout(Stdio::piped())
@@ -573,7 +575,7 @@ fn mock_routed_command(
     repo: &std::path::Path,
     proxy: SocketAddr,
 ) -> Command {
-    let mut command = Command::new(bin);
+    let mut command = common::command(bin, repo);
     let proxy = format!("http://{proxy}");
     command
         .current_dir(repo)

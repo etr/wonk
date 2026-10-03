@@ -1328,6 +1328,14 @@ pub(crate) fn assert_table_equivalent_to_bfs(conn: &Connection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn build_index(
+        root: &std::path::Path,
+        local: bool,
+    ) -> anyhow::Result<crate::pipeline::IndexStats> {
+        let config = crate::config::Config::load_with_paths(None, Some(root))?;
+        crate::pipeline::build_index_with_config(root, local, &config)
+    }
+
     use crate::db;
     use std::fs;
     use std::sync::Arc;
@@ -3532,7 +3540,7 @@ mod tests {
         let base = "fn hello() { world(); }\nfn world() { 42 }\n";
         fs::write(&lib, base).unwrap();
 
-        crate::pipeline::build_index(&root, true).unwrap();
+        build_index(&root, true).unwrap();
         let index_path = db::local_index_path(&root);
 
         // The toggle comment shifts line numbers, so the stable expectation
@@ -3617,11 +3625,7 @@ mod tests {
         );
     }
 
-    /// Variant B — full rebuild loop: the writer rebuilds the whole index
-    /// while a reader answers per snapshot. A table answer must be the full
-    /// expected set; the only window where the table may be absent is the
-    /// one where the symbols themselves are gone (rules out partial
-    /// publication of reach rows ahead of or behind the symbols).
+    /// Public full rebuilds retain a complete graph in every WAL snapshot.
     #[test]
     fn concurrency_reader_never_observes_partial_publication_during_rebuild() {
         let dir = TempDir::new().unwrap();
@@ -3640,7 +3644,7 @@ mod tests {
             fs::write(root.join(path), content).unwrap();
         }
 
-        crate::pipeline::build_index(&root, true).unwrap();
+        build_index(&root, true).unwrap();
         let index_path = db::local_index_path(&root);
 
         let expected = {
@@ -3658,7 +3662,7 @@ mod tests {
         let writer_root = root.clone();
         let writer = std::thread::spawn(move || {
             for _ in 0..10 {
-                crate::pipeline::build_index(&writer_root, true).unwrap();
+                build_index(&writer_root, true).unwrap();
             }
         });
 
@@ -3683,9 +3687,8 @@ mod tests {
                         crate::blast::analyze_blast(&tx, "two", &bfs_options(3, false)).unwrap();
                     assert_eq!(bfs, expected, "table ≡ BFS on the same snapshot");
                 } else {
-                    assert_eq!(
-                        symbols, 0,
-                        "absent table is allowed only inside the empty drop window"
+                    panic!(
+                        "reach table is unavailable during an atomic full rebuild (symbols={symbols})"
                     );
                 }
                 tx.commit().unwrap();

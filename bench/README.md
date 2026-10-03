@@ -73,3 +73,27 @@ at all).
 To measure feedback's *effect* on ranking you must opt in explicitly:
 `learning::load_learned` the gated rows and pass the table as
 `RankSettings::learned` with `feedback_free: false`.
+
+## Audit remediation scaling
+
+`cargo bench --bench audit_scaling` exercises the actual ranking path resolver,
+BM25 scorer, RPC join, path normalizer, 11-repo workspace resolver, and
+budgeted MCP feedback delivery at the controlled scales documented in
+[audit-scaling-results.md](audit-scaling-results.md). It warms each case three
+times and reports 25 samples with p50/p95, assertions on returned counts and
+candidate-bounded posting transfers, and Rust allocation requests. The 100ms
+workspace and 10ms BM25 gates run in this optimized benchmark, not ordinary tests.
+
+Model-free metric labeling self-check:
+
+```sh
+python3 -m unittest discover -s bench -p test_semantic_metrics.py
+```
+
+The review pairing self-check is called by the actual review benchmark. It can
+also run independently:
+
+```sh
+rustc --edition=2024 --test bench/review_samples.rs -o /tmp/wonk-review-samples
+/tmp/wonk-review-samples
+```

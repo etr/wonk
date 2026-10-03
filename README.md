@@ -121,6 +121,9 @@ Wonk pre-indexes your codebase with Tree-sitter so it understands code structure
 
 ## Installation
 
+Standalone release downloads include `wonk-bundled-model-LICENSE.txt`, the
+MIT notice for the embedded Minish Lab model. Keep it with redistributed binaries.
+
 ### curl (Linux / macOS)
 
 ```sh
@@ -298,7 +301,7 @@ The default `bundled` provider is fully offline and needs no configuration.
 It uses the MIT-licensed `potion-code-16M-v2` model at 256 dimensions, packed
 to 6,518,611 bytes with row-wise q4 quantization. On an Apple M4 it embedded
 and stored 10,000 symbols from a cold start in 0.605 seconds. On the measured
-25-query corpus its Recall@10 was 0.20, identical to `nomic-embed-text`
+25-query corpus its hit_rate@10 was 0.20, identical to `nomic-embed-text`
 (0.00 absolute / 0.0 percentage-point delta); Ollama produced stronger
 early-rank MRR@10 (0.1080 versus 0.0480).
 
@@ -316,7 +319,7 @@ the bundled provider with a stderr warning instead of failing — the fallback
 never crosses a mismatched vector space, which always blocks with the re-embed
 command above. `wonk status` reports the active provider, the stored provider,
 and the stored dimension. See the
-[measured 25-query quality bake-off](bench/semantic-quality.md) for Recall@10
+[measured 25-query quality bake-off](bench/semantic-quality.md) for hit_rate@10
 and the exact delta against `nomic-embed-text`.
 
 ## Configuration

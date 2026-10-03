@@ -7,6 +7,8 @@
 //! `text_search` path — so equivalence is asserted over the same data the
 //! BM25 suite freezes.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 
@@ -14,7 +16,6 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 use wonk::config::Config;
 use wonk::db;
-use wonk::pipeline;
 use wonk::ranker::{self, ClassifiedResult, ResultCategory};
 use wonk::rerank::{self, RankSettings, WeightTable};
 use wonk::search::{self, SearchResult};
@@ -52,7 +53,7 @@ fn setup_indexed_corpus() -> (TempDir, Connection) {
     let root = dir.path();
     copy_dir(Path::new(FIXTURE), root);
     fs::create_dir(root.join(".git")).unwrap();
-    pipeline::build_index(root, true).unwrap();
+    common::build_index(root, true).unwrap();
     let index_path = db::find_existing_index(root).expect("fixture index to exist");
     let conn = db::open(&index_path).unwrap();
     (dir, conn)
@@ -358,7 +359,7 @@ fn cli_why_stdout_is_byte_identical_to_default_smart_run() {
     fs::write(root.join(".wonk/config.toml"), "[rank]\nenabled = true\n").unwrap();
 
     let run = |extra: &[&str]| {
-        let mut cmd = std::process::Command::new(bin);
+        let mut cmd = common::command(bin, root);
         cmd.current_dir(root)
             .env("HOME", home.path())
             .arg("search")
@@ -432,7 +433,7 @@ fn cli_query_class_alone_implies_smart_ranked_mode() {
     let bin = env!("CARGO_BIN_EXE_wonk");
 
     let run = |args: &[&str]| {
-        let mut cmd = std::process::Command::new(bin);
+        let mut cmd = common::command(bin, root);
         cmd.current_dir(root)
             .env("HOME", home.path())
             .arg("search")
@@ -477,7 +478,7 @@ fn cli_pipeline_rows_record_query_class_and_legacy_rows_do_not() {
             fs::create_dir_all(root.join(".wonk")).unwrap();
             fs::write(root.join(".wonk/config.toml"), text).unwrap();
         }
-        let mut cmd = std::process::Command::new(bin);
+        let mut cmd = common::command(bin, root);
         cmd.current_dir(root).env("HOME", home.path()).args([
             "--quiet", "--budget",
             // No truncation: the --why rows are much larger serialized,
@@ -542,7 +543,7 @@ fn cli_pipeline_rows_record_query_class_and_legacy_rows_do_not() {
     // --why: exactly one `query-class:` line on stderr BEFORE the why
     // lines, and stdout rows unchanged apart from the why breakdown the
     // flag asks for (structured rows have always carried it).
-    let mut cmd = std::process::Command::new(bin);
+    let mut cmd = common::command(bin, root);
     cmd.current_dir(root).env("HOME", home.path()).args([
         "--quiet", "--budget", "1000000", "search", "cache", "--smart", "--why", "--format", "json",
     ]);
@@ -610,7 +611,7 @@ fn cli_why_alone_implies_smart_ranked_mode() {
     let bin = env!("CARGO_BIN_EXE_wonk");
 
     let run = |args: &[&str]| {
-        let mut cmd = std::process::Command::new(bin);
+        let mut cmd = common::command(bin, root);
         cmd.current_dir(root)
             .env("HOME", home.path())
             .arg("search")
