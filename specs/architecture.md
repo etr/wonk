@@ -195,7 +195,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 | History Signals [V5] | Mine bounded git history for change frequency and co-change coupling | `history.rs` (git CLI, recency weighting, bulk-commit exclusion) |
 | Topology Signals [V5] | Hub/authority scoring and community detection over the call graph | `topology.rs` (bounded iteration, cadence recompute) |
 | Near-Duplicate Similarity [V5] | Lexical shingle signatures; demote repeated content within a response | Extends indexer.rs + rerank.rs (`symbol_shingles`) |
-| Usage Feedback Loop [V5] | Capture caller-reported usefulness; bounded, decaying, per-repo ranking signal | `feedback.rs` (MCP tool, CLI, `feedback` table) |
+| Usage Feedback Loop [V5] | Capture caller-reported usefulness; bounded, decaying, per-repo ranking signal | `feedback.rs` (capture, identities, slate/event store) + `learning.rs` (contrastive weight learning, per-result preferences, MCP tool, CLI) |
 
 ---
 
@@ -1087,7 +1087,11 @@ Key technology choices: Rust for single static binary distribution and native Tr
 
 **Responsibility:** Capture caller-reported result usefulness and convert it into bounded, per-repository adjustments to ranking signal weights.
 
-**Technology:** New `feedback.rs`; extends `mcp.rs` (tool) and `rerank.rs` (weight source). No new crates.
+**Technology:** New `feedback.rs` (capture: slates, identities, event
+store) and new `learning.rs` (the learning half: contrastive
+`learned_weights`, session-gated per-result preferences, the gated
+query-path overlay); extends `mcp.rs` (tools) and `rerank.rs` (weight
+source + `feedback`/`preference` contribution rows). No new crates.
 
 **Interfaces:**
 - Exposes: `wonk_feedback` MCP tool, `wonk feedback` CLI, learned weight overrides and per-result preferences to `rerank.rs`
@@ -2953,7 +2957,7 @@ GitHub Actions workflow:
 **Rationale:** Framing feedback as a keying problem — which was the initial approach — is what makes it hard; the sparsity is inherent to memorizing over queries, and no key resolves it. Learning criteria instead makes the data dense, makes generalization correct rather than approximate, and eliminates the feature's worst failure mode outright: with no per-item score to raise, a result cannot participate in its own promotion. The featurization this requires already exists, since the rerank pipeline retains per-signal contributions for explanation, so the learning input and the explanation output are the same vector. Explicit reporting is chosen over inference because wonk cannot verify an inference. The per-result layer survives only because weight learning genuinely cannot express repository-specific knowledge like "auth questions mean this type here", and it is gated behind multi-session confirmation and capped below the weight mechanism precisely because it reintroduces, in small and bounded form, the failure mode Option 2 has by default.
 
 **Consequences:**
-- `feedback.rs`, `feedback_events` and `learned_weights` tables, `wonk_feedback` MCP tool, `wonk feedback` CLI
+- `feedback.rs` (capture: `feedback_events`, slates, identities) and `learning.rs` (learning: `learned_weights`, `result_preferences`, the gated overlay), `wonk_feedback` MCP tool, `wonk feedback` CLI
 - The reporting interface carries the returned slate and ranks, not just the chosen result — contrastive credit assignment requires it (PRD-FB-REQ-002)
 - Events where the useful result was already ranked first produce no update, removing most presentation bias with a single condition (PRD-FB-REQ-009, AR-042)
 - Influence is bounded as maximum deviation from default weights and decays toward them
@@ -3138,7 +3142,8 @@ src/
   rerank.rs          # [V5] Signal pipeline — weighted scoring, query classification, per-signal explain
   history.rs         # [V5] Git history mining — churn, co-change coupling, bulk-commit exclusion
   topology.rs        # [V5] Hub/authority + community detection over the call graph, cadence recompute
-  feedback.rs        # [V5] Caller-reported usefulness — capture, decay, bounded ranking signal
+  feedback.rs        # [V5] Caller-reported usefulness — capture, identities, slate/event store
+  learning.rs        # [V5] Contrastive weight learning + per-result preferences, gated overlay
 ```
 
 V5 also extends existing modules rather than adding new ones where the change is contained: `embedding.rs` gains the `EmbeddingProvider` trait and bundled model; `search.rs`/`ranker.rs` gain BM25 scoring; `indexer.rs`/`pipeline.rs` gain contract extraction inside the existing parse pass; `blast.rs` gains cross-repo contract tiers; `mcp.rs` gains `wonk_contracts` and `wonk_review`.

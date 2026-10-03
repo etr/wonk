@@ -576,6 +576,31 @@ fn unused_providers_flag_gated() {
         "gated report lists only the unused row: {unused_out}"
     );
     assert!(lines[0].contains("http::GET::/v1/metrics"), "{lines:?}");
+
+    // --kind/--role apply on the unused-providers mode too (TASK-084
+    // review debt): a kind filter selects within the unused rows, and
+    // --role consumer — definitionally empty for providers — yields the
+    // empty hint instead of the unfiltered rows.
+    let (code, kind_out, _stderr) = contracts_quiet(
+        &home,
+        &own.root,
+        &["--unused-providers", "--kind", "queue"],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        !kind_out.contains("http::GET::/v1/metrics"),
+        "kind filter must apply: {kind_out}"
+    );
+    let (code, role_out, _stderr) = contracts_quiet(
+        &home,
+        &own.root,
+        &["--unused-providers", "--role", "consumer"],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        !role_out.contains("http::GET::"),
+        "role=consumer selects no providers: {role_out}"
+    );
 }
 
 // -- AC 14: nothing persisted -----------------------------------------------------------

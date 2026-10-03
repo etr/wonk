@@ -612,17 +612,18 @@ age. Inspect what the repository has learned with `wonk feedback
 
 ```
 $ wonk feedback --weights
-kind [overall] 1.000 (default 1.000) 24 obs, 24 sessions
+kind [overall] 1.000 (default 1.000) 24 obs, 24 sessions [below gate]
 path_character [overall] 0.150 (default 0.100) 40 obs, 40 sessions
 path:tests [overall] -0.400 (default 0.000) 40 obs, 40 sessions
-lexical [overall] 0.340 (default 0.400) 12 obs, 12 sessions [below gate]
+lexical [overall] 0.380 (default 0.400) 6 obs, 2 sessions [below gate]
 ```
 
 `[overall]` is the all-queries scope; `[symbol]`/`[path]`/`[signature]`
 rows carry the per-query-class adjustments. The effective value is
 decayed to now, so an untouched row drifts back toward its default
 visibly. `[below gate]` marks rows that have not cleared
-`learn_min_observations` across `learn_min_sessions` distinct sessions —
+`learn_min_observations` across `learn_min_sessions` distinct sessions,
+or whose effective value still sits at the default —
 legible evidence, no ranking influence. `--format json` emits the rows
 as objects (`feature`, `query_class`, `effective`, `default`,
 `observations`, `sessions`, `gated`). Under `--why`, a live search also

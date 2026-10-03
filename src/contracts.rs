@@ -4431,19 +4431,41 @@ fn java_string_literals(value: Node) -> Vec<Node> {
 /// Last string literal among the call's leading arguments — the routing
 /// key sits directly before the non-literal payload
 /// (`convertAndSend(exchange, routingKey, payload)`).
+/// The routing-key/topic argument of a Rabbit `convertAndSend`-style
+/// call: the last leading string literal before the non-literal payload
+/// — and, when the payload is ITSELF a string literal (the leading run
+/// reaches the end of the arguments), the second-to-last literal, never
+/// the payload (TASK-087 review debt:
+/// `convertAndSend("orders.created", "payload")` used to emit the queue
+/// under `"payload"`, corrupting the canonical id).
 fn java_last_leading_string(args: Node) -> Option<Node> {
-    let mut last = None;
+    let mut leading: Vec<Node> = Vec::new();
+    let mut ended_at_non_literal = false;
     for j in 0..args.named_child_count() {
         let Some(arg) = args.named_child(j as u32).map(unwrap_argument) else {
+            ended_at_non_literal = true;
             break;
         };
         if arg.kind() == "string_literal" {
-            last = Some(arg);
+            leading.push(arg);
         } else {
+            ended_at_non_literal = true;
             break;
         }
     }
-    last
+    if leading.is_empty() {
+        return None;
+    }
+    if ended_at_non_literal || leading.len() == 1 {
+        // The payload is non-literal (or there is only the addressing
+        // literal): the last leading literal IS the routing key.
+        leading.pop()
+    } else {
+        // Every argument is a string literal, so the FINAL one is the
+        // payload itself — the routing key is the one before it.
+        let n = leading.len();
+        Some(leading.remove(n - 2))
+    }
 }
 
 /// Java RestTemplate-style client method verbs. Only the unambiguous
@@ -8721,6 +8743,21 @@ class Orders {
         let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
         assert_eq!(c.role, ContractRole::Consumer);
         assert_eq!(c.confidence, CONFIDENCE_FRAMEWORK);
+    }
+
+    #[test]
+    fn java_rabbit_convert_and_send_with_literal_payload() {
+        // TASK-087 review debt: when the payload is itself a string
+        // literal, the routing key is the literal BEFORE it — the old
+        // last-leading rule emitted the queue under the payload string.
+        let src = "void publish() {\n    rabbitTemplate.convertAndSend(\"orders.created\", \"payload\");\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert!(
+            find(&cands, "queue::rabbitmq::payload").is_none(),
+            "the payload literal must not name the queue: {cands:?}"
+        );
+        assert_eq!(c.role, ContractRole::Consumer);
     }
 
     #[test]
