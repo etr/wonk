@@ -6,15 +6,15 @@
 //! `[rank.weights] novelty`, plus one binary-level `wonk duplicates` run.
 //! Each test pins one acceptance criterion of the task end to end.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
 use tempfile::TempDir;
 use wonk::db;
-use wonk::pipeline;
 use wonk::rerank::{self, RankSettings};
 use wonk::search::{self, SearchResult};
 
@@ -52,7 +52,7 @@ fn duplicates_repo() -> (TempDir, Connection) {
     fs::write(root.join("m1.rs"), DISTINCT_A).unwrap();
     fs::write(root.join("m2.rs"), DISTINCT_B).unwrap();
     write_rank_config(root, 0.8);
-    pipeline::build_index(root, true).unwrap();
+    common::build_index(root, true).unwrap();
     let index_path = db::find_existing_index(root).expect("fixture index to exist");
     let conn = db::open(&index_path).unwrap();
     (dir, conn)
@@ -72,7 +72,7 @@ fn getters_repo() -> (TempDir, Connection) {
         .unwrap();
     }
     write_rank_config(root, 0.8);
-    pipeline::build_index(root, true).unwrap();
+    common::build_index(root, true).unwrap();
     let index_path = db::find_existing_index(root).expect("fixture index to exist");
     let conn = db::open(&index_path).unwrap();
     (dir, conn)
@@ -88,7 +88,8 @@ fn write_rank_config(root: &Path, novelty: f32) {
 }
 
 fn settings_for(root: &Path) -> RankSettings {
-    let config = wonk::config::Config::load(Some(root)).expect("fixture config loads");
+    let config =
+        wonk::config::Config::load_with_paths(None, Some(root)).expect("fixture config loads");
     RankSettings::from_config(
         &config.rank,
         &config.search,
@@ -370,7 +371,7 @@ fn req003_real_cli_search_records_pairs_end_to_end() {
 
     // The REAL CLI search dispatch must record the pairs its novelty
     // pass surfaced (REQ-003) — not just the library helper.
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), root)
         .arg("--quiet")
         .arg("search")
         .arg("created")
@@ -407,7 +408,7 @@ fn wonk_bin() -> PathBuf {
 }
 
 fn run_duplicates(repo: &Path, extra: &[&str]) -> (i32, String) {
-    let mut cmd = Command::new(wonk_bin());
+    let mut cmd = common::command(wonk_bin(), repo);
     cmd.arg("--quiet")
         .arg("duplicates")
         .args(extra)
@@ -472,10 +473,10 @@ fn duplicates_notes_bounded_recorded_pairs() {
     for i in 1..=12 {
         fs::write(root.join(format!("a{i}.rs")), COPY_HANDLER).unwrap();
     }
-    pipeline::build_index(root, true).unwrap();
+    common::build_index(root, true).unwrap();
 
     // No --quiet: the truncation note rides stderr like every hint.
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), root)
         .arg("duplicates")
         .current_dir(root)
         .output()

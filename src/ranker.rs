@@ -203,16 +203,16 @@ impl IndexLookup {
     /// `files.path` — longest path-separator-boundary suffix, ties to the
     /// lexicographically smallest — via ONE bounded `files` scan. Empty
     /// when nothing missed or nothing resolves. The match rule itself is
-    /// rerank::longest_suffix_match, shared with the file-key fallback
-    /// and hint resolution (TASK-105 review debt).
+    /// rerank::PathSuffixIndex, shared with file-key and hint resolution.
     fn resolve_aliases(conn: &Connection, missed: &[&str]) -> HashMap<String, String> {
         let mut aliases = HashMap::new();
         if missed.is_empty() {
             return aliases;
         }
         let indexed = crate::rerank::indexed_paths(conn);
+        let index = crate::rerank::PathSuffixIndex::new(&indexed);
         for as_seen in missed {
-            if let Some(db) = crate::rerank::longest_suffix_match(&indexed, as_seen) {
+            if let Some(db) = index.resolve(as_seen) {
                 aliases.insert(as_seen.to_string(), db.clone());
             }
         }
@@ -377,10 +377,21 @@ pub fn classify_results(
     results: &[SearchResult],
     conn: Option<&Connection>,
 ) -> Vec<ClassifiedResult> {
+    classify_results_with_keys(results, conn, &HashMap::new())
+}
+
+pub(crate) fn classify_results_with_keys(
+    results: &[SearchResult],
+    conn: Option<&Connection>,
+    keys: &HashMap<String, String>,
+) -> Vec<ClassifiedResult> {
     let index = conn.map(|c| {
         let files: HashSet<&str> = results
             .iter()
-            .map(|r| r.file.to_str().unwrap_or(""))
+            .map(|r| {
+                let file = r.file.to_str().unwrap_or("");
+                keys.get(file).map(String::as_str).unwrap_or(file)
+            })
             .collect();
         IndexLookup::load(c, &files)
     });
@@ -391,7 +402,11 @@ pub fn classify_results(
             let file_str = r.file.to_string_lossy();
             let line_i64 = r.line as i64;
 
-            let category = classify_one(&file_str, line_i64, &r.content, &r.file, index.as_ref());
+            let key = keys
+                .get(file_str.as_ref())
+                .map(String::as_str)
+                .unwrap_or(&file_str);
+            let category = classify_one(key, line_i64, &r.content, Path::new(key), index.as_ref());
 
             ClassifiedResult {
                 result: r.clone(),
@@ -547,50 +562,6 @@ pub(crate) fn group_by_category<T: GroupedItem>(results: Vec<T>) -> Vec<(ResultC
     }
 
     groups
-}
-
-/// Reorder items into category-major (tier) order while preserving each
-/// category's internal order: Definition, CallSite, Import, Other,
-/// Comment, Test; empty categories drop out.
-///
-/// [`group_by_category`] groups by ADJACENCY, a precondition the legacy
-/// lexicographic sort satisfies by construction. The rerank pipeline
-/// sorts by score, which interleaves categories under any non-kind-only
-/// weight configuration (e.g. `kind = 0.0`), so the pipeline path funnels
-/// its output through this bucketing first — keeping grouping in ONE
-/// shared implementation while emitting each category exactly once.
-pub(crate) fn bucket_by_category<T: GroupedItem>(results: Vec<T>) -> Vec<T> {
-    let mut definitions = Vec::new();
-    let mut call_sites = Vec::new();
-    let mut imports = Vec::new();
-    let mut others = Vec::new();
-    let mut comments = Vec::new();
-    let mut tests = Vec::new();
-    for r in results {
-        match r.category() {
-            ResultCategory::Definition => definitions.push(r),
-            ResultCategory::CallSite => call_sites.push(r),
-            ResultCategory::Import => imports.push(r),
-            ResultCategory::Other => others.push(r),
-            ResultCategory::Comment => comments.push(r),
-            ResultCategory::Test => tests.push(r),
-        }
-    }
-    let mut out = Vec::with_capacity(
-        definitions.len()
-            + call_sites.len()
-            + imports.len()
-            + others.len()
-            + comments.len()
-            + tests.len(),
-    );
-    out.append(&mut definitions);
-    out.append(&mut call_sites);
-    out.append(&mut imports);
-    out.append(&mut others);
-    out.append(&mut comments);
-    out.append(&mut tests);
-    out
 }
 
 /// Map a category to its display header string.

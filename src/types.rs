@@ -218,7 +218,7 @@ impl fmt::Display for ChangeType {
     }
 }
 
-/// A symbol that changed between the current file on disk and the indexed version.
+/// A changed symbol at its selected source endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedSymbol {
     /// The symbol name.
@@ -227,7 +227,7 @@ pub struct ChangedSymbol {
     pub kind: SymbolKind,
     /// Path of the source file (relative to repo root).
     pub file: String,
-    /// 1-based line number (current for Added/Modified, last indexed for Removed).
+    /// 1-based endpoint line (new for Added/Modified, old for Removed).
     pub line: usize,
     /// What kind of change was detected.
     pub change_type: ChangeType,
@@ -867,23 +867,82 @@ pub struct FileDiffHunks {
     pub removed_lines: HashMap<usize, String>,
 }
 
-/// Scoped change analysis plus the diff detail review needs: old-side hunk
-/// ranges (so findings about removed code can be anchored to where the code
-/// was) and the set of symbols whose signatures — not just bodies — changed
-/// (TASK-085).
-///
-/// Produced by the same single git subprocess as [`ChangeAnalysis`];
-/// `analysis` is byte-identical to what `detect_changes` returns.
+/// File- and scope-qualified identity, independent of source line shifts.
+/// Internal analysis metadata; no output schema serializes this type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SymbolIdentity {
+    pub file: String,
+    pub name: String,
+    pub kind: SymbolKind,
+    pub scope: Option<String>,
+}
+
+impl From<&Symbol> for SymbolIdentity {
+    fn from(symbol: &Symbol) -> Self {
+        Self {
+            file: symbol.file.clone(),
+            name: symbol.name.clone(),
+            kind: symbol.kind,
+            scope: symbol.scope.clone(),
+        }
+    }
+}
+
+/// Parsed source at one selected Git comparison endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSnapshot {
+    pub source: String,
+    pub symbols: Vec<Symbol>,
+}
+
+/// Absent endpoints represent added/deleted files, not an empty parsed file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileSnapshots {
+    pub old: Option<SourceSnapshot>,
+    pub new: Option<SourceSnapshot>,
+}
+
+impl FileSnapshots {
+    /// Resolve exactly at the endpoint that produced the ChangedSymbol.
+    /// Coordinates here are snapshot-local, never stale graph-index lines.
+    pub fn changed_symbol(&self, changed: &ChangedSymbol) -> Option<&Symbol> {
+        let snapshot = if changed.change_type == ChangeType::Removed {
+            self.old.as_ref()
+        } else {
+            self.new.as_ref()
+        }?;
+        let mut matches = snapshot.symbols.iter().filter(|symbol| {
+            symbol.name == changed.name
+                && symbol.kind == changed.kind
+                && symbol.line == changed.line
+        });
+        let symbol = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        (snapshot
+            .symbols
+            .iter()
+            .filter(|candidate| {
+                candidate.file == symbol.file
+                    && candidate.name == symbol.name
+                    && candidate.kind == symbol.kind
+                    && candidate.scope == symbol.scope
+            })
+            .count()
+            == 1)
+            .then_some(symbol)
+    }
+}
+
+/// Scoped changes and their source endpoints. Graph-index IDs remain useful
+/// for callers/blast, but cannot substitute for selected source coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeAnalysisDetail {
-    /// The standard change analysis (unchanged wire shape).
     pub analysis: ChangeAnalysis,
-    /// Per-file diff hunks keyed by file path (b-side), carrying both sides.
     pub hunks: HashMap<String, FileDiffHunks>,
-    /// `(name, kind)` pairs of symbols classified `Modified` because their
-    /// signature changed (tree-sitter path), as opposed to body-only
-    /// hunk-overlap modifications.
-    pub signature_changed: HashSet<(String, SymbolKind)>,
+    pub signature_changed: HashSet<SymbolIdentity>,
+    pub snapshots: HashMap<String, FileSnapshots>,
 }
 
 // ---------------------------------------------------------------------------

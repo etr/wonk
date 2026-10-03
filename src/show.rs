@@ -339,13 +339,33 @@ fn elide_window(
         let (_, _, ctx) = entry.as_ref()?;
         return Some(ctx.render(content, line, end));
     }
-    let lang = crate::indexer::detect_language(Path::new(file))?;
-    let mut parser = crate::indexer::try_get_parser(lang).ok()?;
-    let tree = parser.parse(content, None)?;
-    let ctx = crate::elide::ElisionCtx::derive(&tree, content, lang, mode);
-    let rendered = ctx.render(content, line, end);
-    tree_cache.insert(file.to_string(), Some((tree, lang, ctx)));
-    Some(rendered)
+    let derived = (|| {
+        let lang = crate::indexer::detect_language(Path::new(file))
+            .ok_or(crate::elide::NotElided::UnsupportedLanguage)?;
+        let mut parser = crate::indexer::try_get_parser(lang)
+            .map_err(|_| crate::elide::NotElided::GrammarUnavailable)?;
+        let tree = parser
+            .parse(content, None)
+            .ok_or(crate::elide::NotElided::ParseFailure)?;
+        let ctx = crate::elide::ElisionCtx::derive(&tree, content, lang, mode)?;
+        Ok::<_, crate::elide::NotElided>((tree, lang, ctx))
+    })();
+    match derived {
+        Ok(entry) => {
+            let rendered = entry.2.render(content, line, end);
+            tree_cache.insert(file.to_string(), Some(entry));
+            Some(rendered)
+        }
+        Err(reason) => {
+            output::print_warning(&format!(
+                "elision not applied for {}: {}",
+                output::escape_metadata(file),
+                reason.as_str()
+            ));
+            tree_cache.insert(file.to_string(), None);
+            None
+        }
+    }
 }
 
 /// Query child symbol signatures using a pre-prepared statement.
@@ -418,6 +438,20 @@ mod tests {
             signatures_only: false,
             elide: None,
         }
+    }
+
+    #[test]
+    fn audit_g8_cached_show_rejects_malformed_file_once() {
+        let source = "pub fn target() {\n    let value = ;\n    work();\n}\n";
+        let mut cache = HashMap::new();
+        let result = elide_window(&mut cache, "target.rs", source, 1, 4, Some(Mode::Bodies));
+        assert!(result.is_none(), "parser recovery must signal not applied");
+        assert_eq!(extract_lines(source, 1, 4), source.trim_end_matches('\n'));
+        assert!(
+            cache.contains_key("target.rs"),
+            "cache parse failure for remaining spans"
+        );
+        assert!(elide_window(&mut cache, "target.rs", source, 2, 3, Some(Mode::Bodies)).is_none());
     }
 
     #[test]

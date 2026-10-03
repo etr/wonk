@@ -49,6 +49,11 @@ name = "rank_latency"
 path = "bench/rank_latency_bench.rs"
 harness = false
 
+[[bench]]
+name = "audit_scaling"
+path = "bench/audit_scaling_bench.rs"
+harness = false
+
 [dependencies]
 # CLI parsing
 clap = { version = "4.5", features = ["derive"] }

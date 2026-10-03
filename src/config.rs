@@ -128,6 +128,27 @@ impl Default for ReachConfig {
     }
 }
 
+/// Protective work ceilings; defaults remain well below these limits.
+pub const MAX_HISTORY_WINDOW: usize = 10_000;
+pub const MAX_HISTORY_COMMIT_FILES: usize = 200;
+pub const MAX_TOPOLOGY_ITERATIONS: usize = 100;
+pub const MAX_TOPOLOGY_COMMUNITY_PASSES: usize = 100;
+
+fn validate_work_limit(
+    section: &str,
+    key: &str,
+    value: usize,
+    min: usize,
+    max: usize,
+) -> Result<()> {
+    if !(min..=max).contains(&value) {
+        anyhow::bail!(
+            "[{section}] {key} must be in {min}..={max} (got {value}): reduce this setting to bound processing work"
+        );
+    }
+    Ok(())
+}
+
 /// Bounded history-mining settings (TASK-096, OQ-017).
 ///
 /// `window` is the number of newest commits mined; its cost scales with
@@ -149,6 +170,19 @@ pub struct HistoryConfig {
     /// load error — every commit would be bulk, which is mining-off in
     /// disguise.
     pub max_commit_files: usize,
+}
+
+impl HistoryConfig {
+    pub(crate) fn validate_work_limits(&self) -> Result<()> {
+        validate_work_limit("history", "window", self.window, 1, MAX_HISTORY_WINDOW)?;
+        validate_work_limit(
+            "history",
+            "max_commit_files",
+            self.max_commit_files,
+            2,
+            MAX_HISTORY_COMMIT_FILES,
+        )
+    }
 }
 
 impl Default for HistoryConfig {
@@ -191,6 +225,25 @@ pub struct TopologyConfig {
     pub interval: u64,
     /// Seconds after `topology_meta.last_computed` before scores are stale.
     pub stale_after: u64,
+}
+
+impl TopologyConfig {
+    pub(crate) fn validate_work_limits(&self) -> Result<()> {
+        validate_work_limit(
+            "topology",
+            "iterations",
+            self.iterations,
+            1,
+            MAX_TOPOLOGY_ITERATIONS,
+        )?;
+        validate_work_limit(
+            "topology",
+            "community_passes",
+            self.community_passes,
+            1,
+            MAX_TOPOLOGY_COMMUNITY_PASSES,
+        )
+    }
 }
 
 impl Default for TopologyConfig {
@@ -786,18 +839,7 @@ impl Config {
             if let Some(v) = history.max_commit_files {
                 self.history.max_commit_files = v;
             }
-            if self.history.window == 0 {
-                anyhow::bail!(
-                    "[history] window must be >= 1 (got 0): an empty window mines nothing"
-                );
-            }
-            if self.history.max_commit_files < 2 {
-                anyhow::bail!(
-                    "[history] max_commit_files must be >= 2 (got {}): every commit would \
-                     be bulk and no coupling could ever be derived",
-                    self.history.max_commit_files
-                );
-            }
+            self.history.validate_work_limits()?;
         }
         if let Some(topology) = overlay.topology {
             if let Some(v) = topology.enabled {
@@ -815,18 +857,7 @@ impl Config {
             if let Some(v) = topology.stale_after {
                 self.topology.stale_after = v;
             }
-            if self.topology.iterations == 0 {
-                anyhow::bail!(
-                    "[topology] iterations must be >= 1 (got 0): zero iterations scores \
-                     nothing"
-                );
-            }
-            if self.topology.community_passes == 0 {
-                anyhow::bail!(
-                    "[topology] community_passes must be >= 1 (got 0): zero passes \
-                     assigns every symbol to its own community"
-                );
-            }
+            self.topology.validate_work_limits()?;
             if self.topology.interval == 0 {
                 anyhow::bail!(
                     "[topology] interval must be >= 1 second (got 0): a zero interval \
@@ -1047,7 +1078,16 @@ impl Config {
     /// on top of defaults.
     pub fn load(repo_root: Option<&Path>) -> Result<Config> {
         let global_dir = home_dir().map(|h| h.join(".wonk"));
-        let (config, warnings) = Self::load_with_warnings(global_dir.as_deref(), repo_root)?;
+        Self::load_with_paths(global_dir.as_deref(), repo_root)
+    }
+
+    /// Load defaults and explicit config layers without consulting HOME.
+    ///
+    /// `global_dir` contains `config.toml`; `repo_root` contains
+    /// `.wonk/config.toml`. Missing files are ignored, and repo keys override
+    /// global keys, exactly as in [`Config::load`].
+    pub fn load_with_paths(global_dir: Option<&Path>, repo_root: Option<&Path>) -> Result<Config> {
+        let (config, warnings) = Self::load_with_warnings(global_dir, repo_root)?;
         for warning in &warnings {
             crate::output::print_warning(warning);
         }
@@ -1151,6 +1191,62 @@ mod tests {
         /// Load config, also returning the collected layer warnings.
         fn load_with_warnings(&self) -> Result<(Config, Vec<String>)> {
             Config::load_with_warnings(Some(&self.global_path), self.repo_path.as_deref())
+        }
+    }
+
+    #[test]
+    fn audit_g8_work_ceilings_reject_excessive_global_and_repo_config() {
+        for (section, key, ceiling) in [
+            ("history", "window", 10_000usize),
+            ("history", "max_commit_files", 200),
+            ("topology", "iterations", 100),
+            ("topology", "community_passes", 100),
+        ] {
+            for repo_layer in [false, true] {
+                for value in [ceiling + 1, i64::MAX as usize] {
+                    let mut env = TestEnv::new();
+                    let text = format!("[{section}]\n{key} = {value}\n");
+                    if repo_layer {
+                        env.create_repo();
+                        env.write_repo_config(&text);
+                    } else {
+                        env.write_global_config(&text);
+                    }
+                    let result = env.load();
+                    assert!(
+                        result.is_err(),
+                        "{section}.{key}={value} must reject in repo_layer={repo_layer}"
+                    );
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        error.contains(key),
+                        "actionable error identifies setting: {error}"
+                    );
+                    assert!(
+                        error.contains(&ceiling.to_string()),
+                        "actionable error identifies ceiling: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audit_g8_work_ceilings_accept_boundary_in_each_layer() {
+        for repo_layer in [false, true] {
+            let mut env = TestEnv::new();
+            let text = "[history]\nwindow=10000\nmax_commit_files=200\n[topology]\niterations=100\ncommunity_passes=100\n";
+            if repo_layer {
+                env.create_repo();
+                env.write_repo_config(text);
+            } else {
+                env.write_global_config(text);
+            }
+            let config = env.load().unwrap();
+            assert_eq!(config.history.window, 10000);
+            assert_eq!(config.history.max_commit_files, 200);
+            assert_eq!(config.topology.iterations, 100);
+            assert_eq!(config.topology.community_passes, 100);
         }
     }
 

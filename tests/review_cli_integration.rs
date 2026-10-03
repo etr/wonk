@@ -8,6 +8,8 @@
 //! to end, and the cross-repo rule end to end against an isolated
 //! `$HOME/.wonk/repos` registry.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -77,7 +79,7 @@ fn indexed_repo() -> tempfile::TempDir {
     git(root, &["add", "."]);
     git(root, &["commit", "-m", "initial"]);
 
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), root)
         .arg("--quiet")
         .arg("init")
         .current_dir(root)
@@ -92,7 +94,7 @@ fn indexed_repo() -> tempfile::TempDir {
 }
 
 fn run_review(repo: &std::path::Path, extra: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(wonk_bin());
+    let mut cmd = common::command(wonk_bin(), repo);
     cmd.arg("--quiet")
         .arg("--format")
         .arg("json")
@@ -253,7 +255,7 @@ fn indexed_workspace_repo(
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "initial"]);
 
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), &root)
         .env("HOME", home)
         .arg("--quiet")
         .arg("init")
@@ -289,7 +291,7 @@ fn cross_repo_review_names_consuming_repo_end_to_end() {
     // sibling repo consumes the provided contract.
     std::fs::write(root.join("src/routes.js"), CROSS_REPO_ROUTES_EDITED).unwrap();
 
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), &root)
         .env("HOME", home.path())
         .arg("--quiet")
         .arg("--format")
@@ -339,7 +341,7 @@ fn indexed_repo_three_fns() -> tempfile::TempDir {
     git(root, &["add", "."]);
     git(root, &["commit", "-m", "initial"]);
 
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), root)
         .arg("--quiet")
         .arg("init")
         .current_dir(root)
@@ -365,7 +367,7 @@ const THREE_FNS_USED_DELETED: &str =
 /// Run a `review suppress` subcommand without --format/--quiet so the
 /// confirmation hints land on stderr (structured formats suppress them).
 fn run_suppress(repo: &std::path::Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(wonk_bin());
+    let mut cmd = common::command(wonk_bin(), repo);
     cmd.args(args).current_dir(repo);
     let out = cmd.output().unwrap();
     (

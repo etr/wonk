@@ -19,6 +19,23 @@ use crate::types::ShowResult;
 // Output format
 // ---------------------------------------------------------------------------
 
+/// Escape repository/user metadata that must remain one terminal text record.
+/// Structured output serializes the original value; source bodies stay untouched.
+pub fn escape_metadata(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(escaped)
+}
+
 /// Output format selection for CLI and MCP results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -141,7 +158,11 @@ pub fn format_why_line(
             )
         })
         .collect();
-    format!("why: {file}:{line} total={total:.4} [{}]", parts.join(" "))
+    format!(
+        "why: {}:{line} total={total:.4} [{}]",
+        escape_metadata(file),
+        parts.join(" ")
+    )
 }
 
 /// Emit a rendered `--why` line to stderr. Not TTY-gated and never mixed
@@ -177,7 +198,11 @@ pub fn format_learned_line(rows: &[crate::learning::FeedbackEvidence]) -> String
         .map(|row| {
             format!(
                 "{} {:.3} (default {:.3}, {} obs/{} sessions)",
-                row.feature, row.effective, row.default, row.observations, row.sessions
+                escape_metadata(&row.feature),
+                row.effective,
+                row.default,
+                row.observations,
+                row.sessions
             )
         })
         .collect();
@@ -1374,15 +1399,12 @@ impl<W: Write> Formatter<W> {
         self.budget.as_ref().map(|b| b.remaining() * 4)
     }
 
-    /// Render a formatting closure to a temporary buffer, check the budget,
-    /// and write to the real writer only if the budget allows.
+    /// Render to a temporary buffer with the active format, color and highlight.
     ///
     /// The closure receives a `Formatter` backed by a temporary `Vec<u8>` with
     /// the same `json`/`color`/`highlight` settings as `self`.
     ///
-    /// **Note:** This is only called when a budget is active. When no budget is
-    /// set, callers should use the fast path that writes directly to `self`.
-    fn budgeted_write<F>(&mut self, render: F) -> std::io::Result<BudgetStatus>
+    fn render_buffer<F>(&mut self, render: F) -> std::io::Result<Vec<u8>>
     where
         F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<()>,
     {
@@ -1404,11 +1426,37 @@ impl<W: Write> Formatter<W> {
             result?;
         }
 
+        Ok(buf)
+    }
+
+    fn budgeted_write<F>(&mut self, render: F) -> std::io::Result<BudgetStatus>
+    where
+        F: FnOnce(&mut Formatter<&mut Vec<u8>>) -> std::io::Result<()>,
+    {
+        let buf = self.render_buffer(render)?;
         let status = self.check_budget_bytes(&buf);
         if status == BudgetStatus::Written {
             self.emit(&buf)?;
         }
         Ok(status)
+    }
+
+    /// Reserve the exact rendered row cost before a feedback slate is stored.
+    pub fn select_search_result(&mut self, result: &SearchOutput) -> std::io::Result<BudgetStatus> {
+        if !self.has_budget() {
+            return Ok(BudgetStatus::Written);
+        }
+        let bytes = self.render_buffer(|fmt| Self::render_search_result(fmt, result))?;
+        Ok(self.check_budget_bytes(&bytes))
+    }
+
+    /// Emit a previously selected row, without making a second budget decision.
+    pub fn format_selected_search_result(&mut self, result: &SearchOutput) -> std::io::Result<()> {
+        if !self.has_budget() {
+            return Self::render_search_result(self, result);
+        }
+        let bytes = self.render_buffer(|fmt| Self::render_search_result(fmt, result))?;
+        self.emit(&bytes)
     }
 
     /// Serialize a value to the active structured format (JSON or TOON).
@@ -1431,6 +1479,7 @@ impl<W: Write> Formatter<W> {
 
     /// Write a file path, colorized if color is enabled.
     fn write_file(&mut self, path: &str) -> std::io::Result<()> {
+        let path = escape_metadata(path);
         if self.color {
             write!(self.writer, "{}{}{}", color::FILE, path, color::RESET)
         } else {
@@ -1492,7 +1541,7 @@ impl<W: Write> Formatter<W> {
             fmt.write_sep()?;
             fmt.write_content(&result.content)?;
             if let Some(ref ann) = result.annotation {
-                write!(fmt.writer, "  {ann}")?;
+                write!(fmt.writer, "  {}", escape_metadata(ann))?;
             }
             writeln!(fmt.writer)
         }
@@ -1857,10 +1906,12 @@ impl<W: Write> Formatter<W> {
             write!(
                 fmt.writer,
                 "{} rule={} file={}",
-                out.identity, out.rule, out.file
+                escape_metadata(&out.identity),
+                escape_metadata(&out.rule),
+                escape_metadata(&out.file)
             )?;
             if let Some(ref note) = out.note {
-                write!(fmt.writer, " note={note}")?;
+                write!(fmt.writer, " note={}", escape_metadata(note))?;
             }
             writeln!(fmt.writer)
         }
@@ -1879,13 +1930,18 @@ impl<W: Write> Formatter<W> {
             fmt.write_sep()?;
             fmt.write_line_no(out.line)?;
             fmt.write_sep()?;
-            write!(fmt.writer, "{} role={}", out.canonical_id, out.role)?;
+            write!(
+                fmt.writer,
+                "{} role={}",
+                escape_metadata(&out.canonical_id),
+                escape_metadata(&out.role)
+            )?;
             if let Some(ref symbol) = out.symbol {
-                write!(fmt.writer, " symbol={symbol}")?;
+                write!(fmt.writer, " symbol={}", escape_metadata(symbol))?;
             }
             write!(fmt.writer, " confidence={:.1}", out.confidence)?;
             if let Some(ref status) = out.status {
-                write!(fmt.writer, " status={status}")?;
+                write!(fmt.writer, " status={}", escape_metadata(status))?;
             }
             writeln!(fmt.writer)
         }
@@ -1913,14 +1969,14 @@ impl<W: Write> Formatter<W> {
             write!(
                 fmt.writer,
                 "{}:{}:{} {} role=provider <-> {}:{}:{} role=consumer basis={}",
-                out.provider.repo,
-                out.provider.file,
+                escape_metadata(&out.provider.repo),
+                escape_metadata(&out.provider.file),
                 out.provider.line,
-                out.provider.canonical_id,
-                out.consumer.repo,
-                out.consumer.file,
+                escape_metadata(&out.provider.canonical_id),
+                escape_metadata(&out.consumer.repo),
+                escape_metadata(&out.consumer.file),
                 out.consumer.line,
-                out.basis
+                escape_metadata(&out.basis)
             )?;
             writeln!(fmt.writer)
         }
@@ -2368,23 +2424,23 @@ impl<W: Write> Formatter<W> {
                 Some(line) => writeln!(
                     fmt.writer,
                     "{}:{} [{}] {}: {}",
-                    f.file,
+                    escape_metadata(&f.file),
                     line,
-                    f.severity.to_uppercase(),
-                    f.kind,
-                    f.message
+                    escape_metadata(&f.severity.to_uppercase()),
+                    escape_metadata(&f.kind),
+                    escape_metadata(&f.message)
                 )?,
                 None => writeln!(
                     fmt.writer,
                     "{} [{}] [unanchored] {}: {}",
-                    f.file,
-                    f.severity.to_uppercase(),
-                    f.kind,
-                    f.message
+                    escape_metadata(&f.file),
+                    escape_metadata(&f.severity.to_uppercase()),
+                    escape_metadata(&f.kind),
+                    escape_metadata(&f.message)
                 )?,
             }
         }
-        writeln!(fmt.writer, "verdict: {}", out.verdict)
+        writeln!(fmt.writer, "verdict: {}", escape_metadata(&out.verdict))
     }
 
     /// Format a `wonk context` result (one or more symbol contexts).
@@ -2567,6 +2623,7 @@ fn write_highlighted<W: Write>(writer: &mut W, content: &str, re: &Regex) -> std
 /// that parse stdout as structured results.
 pub fn print_hint(msg: &str, suppress: bool) {
     use std::io::IsTerminal;
+    let msg = escape_metadata(msg);
     if suppress {
         // In piped mode, suppress entirely — agents parse stdout as results.
         if std::io::stdout().is_terminal() {
@@ -2628,7 +2685,7 @@ pub fn print_category_header(header: &str) {
 
 /// Print an error message to stderr.
 pub fn print_error(msg: &str) {
-    eprintln!("error: {msg}");
+    eprintln!("error: {}", escape_metadata(msg));
 }
 
 /// The single-line form of a stderr warning.
@@ -2636,7 +2693,7 @@ pub fn print_error(msg: &str) {
 /// Pure so tests can pin the exact prefix `wonk` emits for degraded-mode
 /// warnings (integration tests grep stderr for it).
 pub fn warning_line(msg: &str) -> String {
-    format!("warning: {msg}")
+    format!("warning: {}", escape_metadata(msg))
 }
 
 /// Print a warning to stderr. Never suppressed: stderr does not pollute
@@ -5967,6 +6024,103 @@ mod tests {
         assert!(
             !json.contains("\"note\""),
             "an absent note is omitted, got {json}"
+        );
+    }
+
+    #[test]
+    fn audit_g4_hex_metadata_budget_reservation_bounds_actual_rendering() {
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            let mut placeholder =
+                SearchOutput::from_search_result(Path::new("a.rs"), 1, 1, "gamma()");
+            placeholder.slate = Some("0".repeat(16));
+            placeholder.identity = Some("0".repeat(64));
+            let reserved = render(format, |fmt| fmt.format_search_result(&placeholder));
+            let limit = crate::budget::estimate_tokens(&reserved);
+            for hex in ["0", "a", "9", "f"] {
+                let mut output = Vec::new();
+                let mut fmt = Formatter::new(&mut output, format, false);
+                fmt.set_budget(limit);
+                assert_eq!(
+                    fmt.select_search_result(&placeholder).unwrap(),
+                    BudgetStatus::Written
+                );
+                let mut actual = placeholder.clone();
+                actual.slate = Some(hex.repeat(16));
+                actual.identity = Some(hex.repeat(64));
+                fmt.format_selected_search_result(&actual).unwrap();
+                assert!(
+                    crate::budget::estimate_tokens_from_len(output.len()) <= limit,
+                    "actual {format:?} metadata fits reserved bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audit_g4_suppression_metadata_is_one_text_record() {
+        let out = SuppressionOutput {
+            identity: "id".into(),
+            rule: "rule".into(),
+            file: "src/lib.rs".into(),
+            note: Some("reason\nforged\r\u{1b}[31m\u{7} café".into()),
+            created_at: 0,
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_suppression(&out));
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "metadata cannot forge records: {text:?}"
+        );
+        assert!(
+            !text.trim_end_matches('\n').chars().any(char::is_control),
+            "{text:?}"
+        );
+        let json = render(OutputFormat::Json, |fmt| fmt.format_suppression(&out));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["note"], out.note.unwrap());
+    }
+
+    #[test]
+    fn audit_g4_contract_metadata_is_one_text_record() {
+        let out = ContractOutput {
+            kind: "http".into(),
+            role: "provider".into(),
+            canonical_id: "http::GET::/a\nb\r\u{1b}[31m\u{7}é".into(),
+            file: "routes.js".into(),
+            line: 1,
+            confidence: 1.0,
+            symbol: None,
+            status: None,
+        };
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_contract(&out));
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "metadata cannot forge records: {text:?}"
+        );
+        assert!(
+            !text.trim_end_matches('\n').chars().any(char::is_control),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn audit_g4_review_metadata_preserves_record_boundaries() {
+        let mut out = review_output_fixture(Some(1));
+        out.findings[0].message = "contract from repo\nforged\r\u{1b}[31m".into();
+        let text = render(OutputFormat::Grep, |fmt| fmt.format_review(&out));
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "one finding plus verdict: {text:?}"
+        );
+        assert!(
+            !text
+                .trim_end_matches('\n')
+                .replace('\n', "")
+                .chars()
+                .any(char::is_control),
+            "{text:?}"
         );
     }
 

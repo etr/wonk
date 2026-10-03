@@ -1,3 +1,5 @@
+mod fixture_config;
+
 use std::fmt::Write as _;
 use std::fs;
 use std::time::Instant;
@@ -23,7 +25,7 @@ fn main() -> Result<()> {
     fs::write(repository.path().join("handlers.rs"), source)?;
 
     let structural_start = Instant::now();
-    let index_stats = wonk::pipeline::build_index(repository.path(), true)?;
+    let index_stats = fixture_config::build_index(repository.path(), true)?;
     ensure!(
         index_stats.symbol_count == SYMBOL_COUNT,
         "expected {SYMBOL_COUNT} symbols, indexed {}",

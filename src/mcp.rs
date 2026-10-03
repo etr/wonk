@@ -68,7 +68,7 @@ fn embedding_provider_for(
 /// from, so tool arms can re-plan (degrade) after a mid-query disconnect.
 fn plan_query_provider(
     conn: &rusqlite::Connection,
-    repo_root: &Path,
+    configured: crate::embedding::EmbeddingProviderKind,
 ) -> Result<
     (
         Box<dyn crate::embedding::EmbeddingProvider>,
@@ -76,10 +76,6 @@ fn plan_query_provider(
     ),
     CallToolResult,
 > {
-    let configured = match embedding_provider_kind_for(repo_root, None) {
-        Ok(kind) => kind,
-        Err(error) => return Err(CallToolResult::error(error)),
-    };
     let plan = match crate::embedding::plan_query_provider(conn, configured) {
         Ok(plan) => plan,
         Err(error) => return Err(CallToolResult::error(format!("{error}"))),
@@ -525,7 +521,7 @@ fn tool_definitions() -> &'static Vec<Tool> {
             },
             Tool {
                 name: "wonk_feedback",
-                description: "Report which search results were useful. Call ONCE per search you are giving feedback on: pass the slate token from the search results and the identities (or 1-based ranks) of the useful results. The full ranked slate is recorded from wonk's own search state. Requires [feedback] enabled = true in .wonk/config.toml.",
+                description: "Report which search results were useful. Call ONCE per search you are giving feedback on: pass the slate token from the search results and the identities (or 1-based ranks) of the useful results. The returned page is recorded from wonk's own search state. Requires [feedback] enabled = true in .wonk/config.toml.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1486,12 +1482,18 @@ fn discover_repos(repos_dir: &Path) -> Vec<RepoEntry> {
 struct McpServer {
     router: QueryRouter,
     registry: RepoRegistry,
+    config_global_dir: Option<PathBuf>,
 }
 
 impl McpServer {
     fn new(repo_root: PathBuf, registry: RepoRegistry) -> Self {
         let router = QueryRouter::new(Some(repo_root), false);
-        Self { router, registry }
+        Self {
+            router,
+            registry,
+            config_global_dir: crate::contracts::default_repos_dir()
+                .and_then(|dir| dir.parent().map(Path::to_path_buf)),
+        }
     }
 
     /// Resolve which repo connection and root to use for a tool call.
@@ -1610,6 +1612,7 @@ impl McpServer {
     // -- Tool handlers -------------------------------------------------------
 
     fn tool_search(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let query = match require_str(&args, "query") {
             Ok(q) => q,
             Err(e) => return e,
@@ -1702,7 +1705,10 @@ impl McpServer {
 
         // TASK-094 keep: the include_tests user opt-out — an exclusion, never a ranking demotion (the graded path signal only orders).
         if !include_tests {
-            results.retain(|r| !ranker::is_test_file(&r.file));
+            results.retain(|r| {
+                let relative = r.file.strip_prefix(&repo_root).unwrap_or(&r.file);
+                !ranker::is_test_file(relative)
+            });
         }
 
         // Optional working-context hint (TASK-105, PRD-FB-REQ-027):
@@ -1717,7 +1723,10 @@ impl McpServer {
         // TASK-092 — rows are unchanged either way. [feedback] enabled
         // opts the search into the pipeline (TASK-101): a legacy-path
         // slate carries no contributions to learn from.
-        let config = match crate::config::Config::load(Some(&repo_root)) {
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
             Ok(c) => c,
             Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
         };
@@ -1746,6 +1755,8 @@ impl McpServer {
         // Learned weights (TASK-102): the gated overlay — ONE read,
         // best-effort (a missing table is silent; other errors warn),
         // through the shared AR-039 policy seam.
+        settings.repo_root = Some(repo_root.clone());
+        settings.history_enabled = config.history.enabled;
         settings.feedback_free = no_feedback;
         settings.learned =
             crate::router::load_learned_best_effort(ranker_conn, &config, no_feedback);
@@ -1754,54 +1765,30 @@ impl McpServer {
         // Best-effort REQ-003 memo: persist the pairs the novelty pass
         // compared anyway; a failure degrades, never fails the tool call.
         crate::shingles::record_pairs_best_effort(ranker_conn, &ranked.near_duplicates);
-        // Feedback slate capture (TASK-101): best-effort, gated by
-        // [feedback] enabled; rows carry the token and identities.
-        let stored_slate =
-            crate::router::record_slate_best_effort(ranker_conn, &query, &ranked, &config.feedback);
-
-        let mut budget = budget_limit.map(|limit| {
-            if let Some(p) = page {
-                TokenBudget::new_with_skip(limit, p.saturating_sub(1) * limit)
-            } else {
-                TokenBudget::new(limit)
-            }
-        });
-        let mut outputs: Vec<SearchOutput> = Vec::new();
-        let mut truncated = 0usize;
-
-        for (_category, items) in &ranked.groups {
-            for item in items {
-                let mut out = SearchOutput::from_search_result(
-                    &item.classified.result.file,
-                    item.classified.result.line,
-                    item.classified.result.col,
-                    &item.classified.result.content,
-                );
-                out.annotation = item.classified.annotation.clone();
-                out.query_class = ranked.query_class.map(|c| c.as_str().to_string());
-                if let Some(slate) = stored_slate.as_ref() {
-                    out.slate = Some(slate.token.clone());
-                    out.identity = slate.identity_for(
-                        &item.classified.result.file.to_string_lossy(),
-                        item.classified.result.line,
-                    );
+        let capture =
+            config.feedback.enabled && ranked.query_class.is_some() && ranker_conn.is_some();
+        let mut delivered =
+            match crate::delivery::select_mcp_search_page(&ranked, budget_limit, page, capture) {
+                Ok(page) => page,
+                Err(error) => {
+                    return CallToolResult::error(format!("search rendering failed: {error}"));
                 }
-
-                if let Some(ref mut b) = budget {
-                    let estimate = (out.file.len() + out.content.len() + 20) / 4;
-                    if b.remaining() < estimate {
-                        truncated += 1;
-                        continue;
-                    }
-                    let serialized = serde_json::to_string(&out).unwrap_or_default();
-                    if !b.try_consume(&serialized) {
-                        truncated += 1;
-                        continue;
-                    }
-                }
-                outputs.push(out);
-            }
+            };
+        let selected = delivered.feedback_members();
+        let stored_slate = crate::router::record_selected_slate_best_effort(
+            ranker_conn,
+            &query,
+            &ranked,
+            &selected,
+            &config.feedback,
+        );
+        if let Some(slate) = &stored_slate {
+            delivered.stamp(slate);
+        } else {
+            delivered.clear_feedback();
         }
+        let truncated = delivered.truncated;
+        let outputs: Vec<SearchOutput> = delivered.rows.into_iter().map(|row| row.output).collect();
 
         if truncated > 0 || page.is_some_and(|p| p > 1) {
             let shown = outputs.len();
@@ -1833,6 +1820,7 @@ impl McpServer {
     /// store — the call passes only the slate token, the useful
     /// identities/ranks, and a session id.
     fn tool_feedback(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let slate = match require_str(&args, "slate") {
             Ok(s) => s,
             Err(e) => return e,
@@ -1858,7 +1846,10 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let config = match crate::config::Config::load(Some(&repo_root)) {
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
             Ok(c) => c,
             Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
         };
@@ -2145,6 +2136,7 @@ impl McpServer {
     }
 
     fn tool_status(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let format = extract_format(&args);
         // Workspace membership (TASK-084) resolves first — its inputs are
         // plain paths, so the registry borrow below stays exclusive.
@@ -2155,11 +2147,16 @@ impl McpServer {
             },
             None => self.router.repo_root().to_path_buf(),
         };
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
+            Ok(config) => config,
+            Err(error) => return CallToolResult::error(format!("config load failed: {error}")),
+        };
         let workspace = crate::contracts::default_repos_dir().and_then(|repos| {
             let index = db::find_existing_index(&repo_root)?;
-            let declared = crate::config::Config::load(Some(&repo_root))
-                .map(|c| c.contracts.workspace)
-                .unwrap_or_default();
+            let declared = config.contracts.workspace.clone();
             Some(crate::contracts::workspace_status(
                 &repos, &repo_root, &index, &declared,
             ))
@@ -2177,14 +2174,10 @@ impl McpServer {
         } else {
             self.router.conn()
         };
-        let configured = match embedding_provider_kind_for(self.router.repo_root(), None) {
-            Ok(kind) => kind,
-            Err(error) => return CallToolResult::error(error),
-        };
+        let configured = crate::embedding::resolve_provider_kind(None, config.embedding.provider);
         // The topology config rides along for the staleness marker
         // (TASK-098); the full config also carries the feedback state
         // (TASK-103).
-        let config = crate::config::Config::load(Some(self.router.repo_root())).unwrap_or_default();
         let info = crate::router::query_status_info(
             conn,
             configured,
@@ -2845,6 +2838,7 @@ impl McpServer {
     }
 
     fn tool_blast(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let symbol = match require_str(&args, "symbol") {
             Ok(s) => s,
             Err(e) => return e,
@@ -2882,9 +2876,14 @@ impl McpServer {
 
         let min_confidence: Option<f64> = args.get("min_confidence").and_then(|v| v.as_f64());
 
-        let use_reach = crate::config::Config::load(Some(&repo_root))
-            .map(|c| c.reach.enabled)
-            .unwrap_or(true);
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
+            Ok(config) => config,
+            Err(error) => return CallToolResult::error(format!("config load failed: {error}")),
+        };
+        let use_reach = config.reach.enabled;
 
         let options = crate::blast::BlastOptions {
             depth,
@@ -2898,24 +2897,13 @@ impl McpServer {
             Ok(mut analysis) => {
                 // Cross-repo tier (TASK-084): degrade silently on registry
                 // problems — blast's depth tiers never depend on the registry.
-                let provider_ids =
-                    crate::blast::provider_contract_ids(conn, &symbol).unwrap_or_default();
-                if !provider_ids.is_empty()
-                    && let Some(repos_dir) = crate::contracts::default_repos_dir()
-                {
-                    let declared = crate::config::Config::load(Some(&repo_root))
-                        .map(|c| c.contracts.workspace)
-                        .unwrap_or_default();
-                    if let Ok(consumers) = crate::blast::resolve_cross_repo_consumers(
-                        &repo_root,
-                        conn,
-                        &declared,
-                        &repos_dir,
-                        &provider_ids,
-                    ) {
-                        crate::blast::append_cross_repo_tier(&mut analysis, consumers);
-                    }
-                }
+                let _ = crate::router::append_cross_repo_blast_tier_with_config(
+                    &repo_root,
+                    conn,
+                    &symbol,
+                    &mut analysis,
+                    &config,
+                );
                 let out = crate::output::BlastOutput::from(&analysis);
                 format_result(&out, format)
             }
@@ -2924,6 +2912,7 @@ impl McpServer {
     }
 
     fn tool_contracts(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let kind = match args.get("kind").and_then(|v| v.as_str()) {
             Some(k) => match k.parse::<crate::types::ContractKind>() {
                 Ok(k) => Some(k),
@@ -2962,20 +2951,22 @@ impl McpServer {
             orphans,
             unused_providers,
         };
-        let payload =
-            match crate::router::build_contracts_payload(conn, &repo_root, &repos_dir, &filters) {
-                Ok(p) => p,
-                Err(e) => return CallToolResult::error(format!("contracts query failed: {e}")),
-            };
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
+            Ok(config) => config,
+            Err(error) => return CallToolResult::error(format!("config load failed: {error}")),
+        };
+        let payload = match crate::router::build_contracts_payload_with_config(
+            conn, &repo_root, &repos_dir, &filters, &config,
+        ) {
+            Ok(p) => p,
+            Err(e) => return CallToolResult::error(format!("contracts query failed: {e}")),
+        };
 
         // Same row selection the CLI prints: links mode empties the row set.
-        let source_rows: Vec<&crate::contracts::ContractRow> = if links {
-            Vec::new()
-        } else if unused_providers {
-            payload.unused_providers.iter().collect()
-        } else {
-            payload.rows.iter().collect()
-        };
+        let source_rows = payload.selected_rows(&filters);
         let contracts: Vec<crate::output::ContractOutput> = source_rows
             .iter()
             .map(|row| {
@@ -3032,6 +3023,7 @@ impl McpServer {
     }
 
     fn tool_review(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let (conn, repo_root) = match self.resolve_repo(&args) {
             Ok(r) => r,
             Err(e) => return e,
@@ -3056,7 +3048,10 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("{e:#}")),
         };
 
-        let config = match crate::config::Config::load(Some(&repo_root)) {
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
             Ok(c) => c,
             Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
         };
@@ -3169,6 +3164,7 @@ impl McpServer {
     }
 
     fn tool_changes(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let (conn, repo_root) = match self.resolve_repo(&args) {
             Ok(r) => r,
             Err(e) => return e,
@@ -3195,6 +3191,14 @@ impl McpServer {
             .and_then(|v| v.as_f64())
             .map(clamp_confidence);
 
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
+            Ok(config) => config,
+            Err(error) => return CallToolResult::error(format!("config load failed: {error}")),
+        };
+
         // Detect changes.
         let analysis = match crate::impact::detect_changes(conn, &scope, &repo_root) {
             Ok(a) => a,
@@ -3210,9 +3214,7 @@ impl McpServer {
                 blast,
                 flows,
                 min_confidence,
-                reach_enabled: crate::config::Config::load(Some(&repo_root))
-                    .map(|c| c.reach.enabled)
-                    .unwrap_or(true),
+                reach_enabled: config.reach.enabled,
             },
             |_| {},
         ) {
@@ -3339,6 +3341,7 @@ impl McpServer {
     }
 
     fn tool_ask(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let query = match require_str(&args, "query") {
             Ok(q) => q,
             Err(e) => return e,
@@ -3353,7 +3356,18 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (provider, configured) = match plan_query_provider(conn, &repo_root) {
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                return CallToolResult::error(format!(
+                    "failed to load embedding configuration: {error:#}"
+                ));
+            }
+        };
+        let (provider, configured) = match plan_query_provider(conn, config.embedding.provider) {
             Ok(resolved) => resolved,
             Err(e) => return e,
         };
@@ -3443,14 +3457,6 @@ impl McpServer {
             // (pre-V5 index), in which case the list passes through in walk
             // order; the MCP surface has no hint channel, so the fallback is
             // silent.
-            let config = match crate::config::Config::load(Some(&repo_root)) {
-                Ok(c) => c,
-                Err(e) => {
-                    return CallToolResult::error(format!(
-                        "failed to load search configuration: {e:#}"
-                    ));
-                }
-            };
             let ranked = crate::bm25::rerank_lexical(
                 conn,
                 &structural_results,
@@ -3516,6 +3522,7 @@ impl McpServer {
     }
 
     fn tool_cluster(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let path = match require_str(&args, "path") {
             Ok(p) => p,
             Err(e) => return e,
@@ -3527,7 +3534,18 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (provider, _configured) = match plan_query_provider(conn, &repo_root) {
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                return CallToolResult::error(format!(
+                    "failed to load embedding configuration: {error:#}"
+                ));
+            }
+        };
+        let (provider, _configured) = match plan_query_provider(conn, config.embedding.provider) {
             Ok(resolved) => resolved,
             Err(e) => return e,
         };
@@ -3585,6 +3603,7 @@ impl McpServer {
     }
 
     fn tool_impact(&mut self, args: Value) -> CallToolResult {
+        let config_global_dir = self.config_global_dir.clone();
         let file = match require_str(&args, "file") {
             Ok(f) => f,
             Err(e) => return e,
@@ -3596,7 +3615,18 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (provider, _configured) = match plan_query_provider(conn, &repo_root) {
+        let config = match crate::config::Config::load_with_paths(
+            config_global_dir.as_deref(),
+            Some(&repo_root),
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                return CallToolResult::error(format!(
+                    "failed to load embedding configuration: {error:#}"
+                ));
+            }
+        };
+        let (provider, _configured) = match plan_query_provider(conn, config.embedding.provider) {
             Ok(resolved) => resolved,
             Err(e) => return e,
         };
@@ -3988,10 +4018,39 @@ fn write_response(stdout: &mut impl Write, resp: &Response) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn build_fixture_index(root: &Path, local: bool) -> Result<crate::pipeline::IndexStats> {
+        let config = crate::config::Config::load_with_paths(None, Some(root))?;
+        pipeline::build_index_with_config(root, local, &config)
+    }
+
+    #[test]
+    fn audit_g4_mcp_fixture_defaults_and_explicit_global_override_are_distinct() {
+        let (_dir, mut server) = contracts_server();
+        let global = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            global.path().join("config.toml"),
+            "[reach]\nenabled='invalid'\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({"name": "wonk_search", "arguments": {"repo": "own-api", "query": "users"}});
+        let defaults = server.handle_tools_call(&args);
+        assert!(
+            !defaults["isError"].as_bool().unwrap_or(false),
+            "explicit fixture defaults ignore unrelated global layers: {defaults}"
+        );
+        server.config_global_dir = Some(global.path().to_path_buf());
+        let override_result = server.handle_tools_call(&args);
+        assert!(
+            override_result["isError"].as_bool().unwrap_or(false),
+            "intentional explicit global layer remains supported: {override_result}"
+        );
+    }
+
     /// Create a test server with no index.  Uses a non-existent path so the
     /// router cannot accidentally discover the real repo's index.
     fn test_server() -> McpServer {
         McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some("/nonexistent/test/repo".into()), false),
             registry: RepoRegistry::new(Vec::new()),
         }
@@ -4081,7 +4140,7 @@ mod tests {
         let repos_dir = dir.path().join("repos");
         let hash_dir = repos_dir.join(crate::db::repo_hash(&repo_dir));
         std::fs::create_dir_all(&hash_dir).unwrap();
-        pipeline::build_index(&repo_dir, true).unwrap();
+        build_fixture_index(&repo_dir, true).unwrap();
         std::fs::copy(repo_dir.join(".wonk/index.db"), hash_dir.join("index.db")).unwrap();
         db::write_meta(
             &hash_dir.join("index.db"),
@@ -4096,6 +4155,7 @@ mod tests {
 
         let entries = discover_repos(&repos_dir);
         let server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(None, false),
             registry: RepoRegistry::new(entries),
         };
@@ -4173,7 +4233,7 @@ mod tests {
         let repos_dir = dir.path().join("repos");
         let hash_dir = repos_dir.join(crate::db::repo_hash(&repo_dir));
         std::fs::create_dir_all(&hash_dir).unwrap();
-        pipeline::build_index(&repo_dir, true).unwrap();
+        build_fixture_index(&repo_dir, true).unwrap();
         std::fs::copy(repo_dir.join(".wonk/index.db"), hash_dir.join("index.db")).unwrap();
         db::write_meta(
             &hash_dir.join("index.db"),
@@ -4185,6 +4245,7 @@ mod tests {
 
         let entries = discover_repos(&repos_dir);
         let server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(None, false),
             registry: RepoRegistry::new(entries),
         };
@@ -4217,6 +4278,30 @@ mod tests {
         );
         assert_eq!(parsed["workspace"]["effective"][0], "own-api");
         assert!(parsed["links"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_g4_contracts_unused_provider_filters_share_cli_semantics() {
+        let (_dir, mut server) = contracts_server();
+        for extra in [
+            serde_json::json!({"kind": "env"}),
+            serde_json::json!({"role": "consumer"}),
+        ] {
+            let mut args = serde_json::json!({"repo": "own-api", "unused_providers": true});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = server.handle_tools_call(
+                &serde_json::json!({"name": "wonk_contracts", "arguments": args}),
+            );
+            assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+            let parsed: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert!(
+                parsed["contracts"].as_array().unwrap().is_empty(),
+                "unused-provider filter must match CLI: {parsed}"
+            );
+        }
     }
 
     #[test]
@@ -4449,7 +4534,6 @@ mod tests {
         }
 
         // wonk_show honors elide=salience on a real indexed repo.
-        use crate::pipeline;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
         let root = dir.path();
@@ -4460,8 +4544,9 @@ mod tests {
             "fn process(n: u32) -> u32 {\n    let mut t = n;\n    while t < 10 {\n        t += 1;\n    }\n    t\n}\n",
         )
         .unwrap();
-        pipeline::build_index(root, true).unwrap();
+        build_fixture_index(root, true).unwrap();
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(root.to_path_buf()), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -4533,7 +4618,6 @@ mod tests {
 
     #[test]
     fn tool_show_budget_truncates() {
-        use crate::pipeline;
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
@@ -4546,8 +4630,9 @@ mod tests {
         )
         .unwrap();
 
-        pipeline::build_index(root, true).unwrap();
+        build_fixture_index(root, true).unwrap();
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(root.to_path_buf()), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -4761,6 +4846,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
 
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(root.to_path_buf()), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -4778,7 +4864,6 @@ mod tests {
 
     #[test]
     fn tool_summary_with_indexed_repo() {
-        use crate::pipeline;
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
@@ -4787,9 +4872,10 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn hello() {}\nfn world() {}\n").unwrap();
 
-        pipeline::build_index(root, true).unwrap();
+        build_fixture_index(root, true).unwrap();
 
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(root.to_path_buf()), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -4808,7 +4894,6 @@ mod tests {
 
     #[test]
     fn tool_summary_outline_detail() {
-        use crate::pipeline;
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
@@ -4817,9 +4902,10 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn hello() {}\n").unwrap();
 
-        pipeline::build_index(root, true).unwrap();
+        build_fixture_index(root, true).unwrap();
 
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(root.to_path_buf()), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -4839,7 +4925,6 @@ mod tests {
 
     #[test]
     fn tool_summary_with_depth() {
-        use crate::pipeline;
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
@@ -4849,9 +4934,10 @@ mod tests {
         std::fs::write(root.join("src/a.rs"), "fn alpha() {}\n").unwrap();
         std::fs::write(root.join("src/sub/b.rs"), "fn beta() {}\n").unwrap();
 
-        pipeline::build_index(root, true).unwrap();
+        build_fixture_index(root, true).unwrap();
 
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(root.to_path_buf()), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -5259,9 +5345,10 @@ mod tests {
         std::fs::create_dir(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn hello() {}\n").unwrap();
-        pipeline::build_index(root, true).unwrap();
+        build_fixture_index(root, true).unwrap();
 
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(root.to_path_buf()), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -5305,6 +5392,7 @@ mod tests {
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(None, false),
             registry: RepoRegistry::new(entries),
         };
@@ -5358,7 +5446,7 @@ mod tests {
         std::fs::create_dir_all(&hash_dir).unwrap();
 
         // First build a local index, then copy db + write meta to the repos dir.
-        pipeline::build_index(&repo_dir, true).unwrap();
+        build_fixture_index(&repo_dir, true).unwrap();
         let local_db = repo_dir.join(".wonk/index.db");
         let central_db = hash_dir.join("index.db");
         std::fs::copy(&local_db, &central_db).unwrap();
@@ -5366,6 +5454,7 @@ mod tests {
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(None, false),
             registry: RepoRegistry::new(entries),
         };
@@ -5398,7 +5487,7 @@ mod tests {
         std::fs::create_dir_all(primary_dir.join(".git")).unwrap();
         std::fs::create_dir_all(primary_dir.join("src")).unwrap();
         std::fs::write(primary_dir.join("src/lib.rs"), "fn primary_func() {}\n").unwrap();
-        pipeline::build_index(&primary_dir, true).unwrap();
+        build_fixture_index(&primary_dir, true).unwrap();
 
         // Other repo
         let other_dir = dir.path().join("other-project");
@@ -5409,7 +5498,7 @@ mod tests {
             "fn other_func() {}\nstruct OtherStruct {}\n",
         )
         .unwrap();
-        pipeline::build_index(&other_dir, true).unwrap();
+        build_fixture_index(&other_dir, true).unwrap();
 
         // Copy other repo's index to central repos dir.
         let repos_dir = dir.path().join("repos");
@@ -5429,6 +5518,7 @@ mod tests {
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
             registry: RepoRegistry::new(entries),
         };
@@ -5466,6 +5556,7 @@ mod tests {
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
             registry: RepoRegistry::new(entries),
         };
@@ -5487,6 +5578,7 @@ mod tests {
 
         let entries = discover_repos(&repos_dir);
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(primary_dir.to_path_buf()), true),
             registry: RepoRegistry::new(entries),
         };
@@ -5547,8 +5639,9 @@ mod tests {
             "export function alpha() { return 42; }\n",
         )
         .unwrap();
-        pipeline::build_index(root, true).unwrap();
+        build_fixture_index(root, true).unwrap();
         let server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(root.to_path_buf()), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -5871,6 +5964,7 @@ mod tests {
     fn embedding_provider_for_rejects_invalid_mcp_provider() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(dir.path().to_path_buf()), false),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -5983,8 +6077,9 @@ mod tests {
             format!("[feedback]\nenabled = {enabled}\n"),
         )
         .unwrap();
-        pipeline::build_index(&repo_dir, true).unwrap();
+        build_fixture_index(&repo_dir, true).unwrap();
         let server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(repo_dir), true),
             registry: RepoRegistry::new(Vec::new()),
         };
@@ -6028,6 +6123,137 @@ mod tests {
         assert!(
             tool.description.contains("ONCE per search"),
             "the one-call contract is part of the tool description"
+        );
+    }
+
+    #[test]
+    fn audit_g4_search_slate_matches_budgeted_delivery_and_page_ranks() {
+        let (_dir, mut server) = feedback_server(true);
+        let root = server.router.repo_root().to_path_buf();
+        for n in 0..40 {
+            std::fs::write(
+                root.join(format!("gamma{n:02}.rs")),
+                format!("pub fn gamma_{n:02}() {{}} // {}\n", "x".repeat(300)),
+            )
+            .unwrap();
+        }
+        build_fixture_index(&root, true).unwrap();
+        server.router = QueryRouter::new(Some(root.clone()), true);
+        for (budget, page) in [(None, 1), (Some(500), 1), (Some(500), 2)] {
+            let mut args = serde_json::json!({"query": "gamma", "format": "json", "page": page});
+            if let Some(limit) = budget {
+                args["budget"] = serde_json::json!(limit);
+            }
+            let result = server
+                .handle_tools_call(&serde_json::json!({"name": "wonk_search", "arguments": args}));
+            assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+            let parsed: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            let rows = parsed
+                .as_array()
+                .or_else(|| parsed["results"].as_array())
+                .unwrap();
+            assert!(!rows.is_empty(), "{parsed}");
+            let token = rows[0]["slate"].as_str().unwrap();
+            let raw: String = server
+                .router
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT members FROM feedback_slates WHERE token=?1",
+                    [token],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let members: Vec<Value> = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                members.len(),
+                rows.len(),
+                "only returned rows belong to slate"
+            );
+            for (row, member) in rows.iter().zip(&members) {
+                assert_eq!(row["file"], member["file"]);
+                assert_eq!(row["line"], member["line"]);
+                assert_eq!(row["identity"], member["identity"]);
+            }
+            let used: usize = rows
+                .iter()
+                .map(|row| crate::budget::estimate_tokens(&serde_json::to_string(row).unwrap()))
+                .sum();
+            assert!(
+                used <= budget.unwrap_or(4000),
+                "actual serialized rows fit budget: {used}"
+            );
+            if page == 2 {
+                assert!(members[0]["rank"].as_u64().unwrap() > 1);
+            }
+        }
+    }
+
+    #[test]
+    fn audit_g4_failed_capture_returns_unstamped_search_rows() {
+        let (_dir, mut server) = feedback_server(true);
+        server
+            .router
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TABLE feedback_slates;")
+            .unwrap();
+        let result = server.handle_tools_call(&serde_json::json!({"name": "wonk_search", "arguments": {"query": "login_handler", "format": "json"}}));
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let rows: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(!rows.as_array().unwrap().is_empty());
+        assert!(
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row.get("slate").is_none() && row.get("identity").is_none())
+        );
+    }
+
+    #[test]
+    fn audit_g4_no_matches_does_not_record_an_empty_slate() {
+        let (_dir, mut server) = feedback_server(true);
+        let result = server.handle_tools_call(&serde_json::json!({"name": "wonk_search", "arguments": {"query": "absent_unique_value_9387", "format": "json"}}));
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        assert_eq!(feedback_slates_count(&server), 0);
+    }
+
+    #[test]
+    fn audit_g4_mcp_invalid_config_remains_an_error() {
+        let (_dir, mut server) = feedback_server(true);
+        let root = server.router.repo_root().to_path_buf();
+        std::fs::write(
+            root.join(".wonk/config.toml"),
+            "[reach]\nenabled='invalid'\n",
+        )
+        .unwrap();
+        for name in ["wonk_blast", "wonk_status"] {
+            let result = server.handle_tools_call(
+                &serde_json::json!({"name": name, "arguments": {"symbol": "login_handler"}}),
+            );
+            assert!(
+                result["isError"].as_bool().unwrap_or(false),
+                "invalid configuration must surface for {name}: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_g4_search_empty_delivery_records_no_slate() {
+        let (_dir, mut server) = feedback_server(true);
+        let result = server.handle_tools_call(&serde_json::json!({
+            "name": "wonk_search", "arguments": {"query": "login_handler", "budget": 1, "format": "json"}
+        }));
+        assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+        let parsed: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(parsed["results"].as_array().unwrap().is_empty(), "{parsed}");
+        assert_eq!(
+            feedback_slates_count(&server),
+            0,
+            "unseen results must never enter a feedback slate"
         );
     }
 
@@ -6202,8 +6428,9 @@ mod tests {
             "[feedback]\nenabled = true\n\n[rank]\nenabled = true\n\n[rank.weights]\nfeedback = 0.35\n",
         )
         .unwrap();
-        pipeline::build_index(&repo_dir, true).unwrap();
+        build_fixture_index(&repo_dir, true).unwrap();
         let server = McpServer {
+            config_global_dir: None,
             router: QueryRouter::new(Some(repo_dir), true),
             registry: RepoRegistry::new(Vec::new()),
         };

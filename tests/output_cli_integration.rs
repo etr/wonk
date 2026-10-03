@@ -5,6 +5,8 @@
 //! serialized row per newline-terminated line — even though piped grep
 //! output collapses same-file rows with ` ; `.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -51,7 +53,7 @@ fn fixture_repo() -> tempfile::TempDir {
 #[test]
 fn search_piped_json_is_newline_delimited() {
     let repo = fixture_repo();
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), repo.path())
         .arg("--quiet")
         .arg("search")
         .arg("needle")
@@ -88,4 +90,52 @@ fn search_piped_json_is_newline_delimited() {
         files.iter().all(|f| f == "src/lib.rs"),
         "both matches come from the same file: {files:?}"
     );
+}
+
+#[test]
+fn show_malformed_source_keeps_raw_payload_when_elision_requested() {
+    let repo = fixture_repo();
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn target() {\n    let value = ;\n    work();\n}\n",
+    )
+    .unwrap();
+    let init = common::command(wonk_bin(), repo.path())
+        .args(["init", "--local"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let show = |elide: bool| {
+        let mut command = common::command(wonk_bin(), repo.path());
+        command.args(["show", "target", "--format", "json"]);
+        if elide {
+            command.arg("--elide=bodies");
+        }
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let row: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        (row, String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (raw, _) = show(false);
+    let (fallback, warning) = show(true);
+    assert_eq!(
+        fallback["source"], raw["source"],
+        "malformed source must be byte-identical to ordinary show"
+    );
+    assert!(
+        fallback["source"]
+            .as_str()
+            .unwrap()
+            .contains("let value = ;")
+    );
+    assert!(warning.contains("elision not applied"), "{warning}");
+    assert!(warning.contains("parse failure"), "{warning}");
 }

@@ -64,6 +64,11 @@ fn insert_file(conn: &Connection, path: &str, line_count: i64) {
 
 fn insert_term(conn: &Connection, term: &str, file: &str, tf: i64) {
     conn.execute(
+        "INSERT OR REPLACE INTO bm25_meta(key,value) VALUES('generation_ready','1')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO term_stats (term, file, tf) VALUES (?1, ?2, ?3)",
         rusqlite::params![term, file, tf],
     )

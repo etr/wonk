@@ -6,10 +6,12 @@
 //! plus library-level checks for the read APIs. Each test pins one
 //! acceptance criterion of the task.
 
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
 use rusqlite::Connection;
 use serde_json::Value;
@@ -70,7 +72,7 @@ fn feedback_repo(enabled: bool, extra_config: &str) -> (TempDir, PathBuf) {
         format!("[feedback]\nenabled = {enabled}\n{extra_config}"),
     )
     .unwrap();
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
     (dir, root)
 }
 
@@ -92,7 +94,7 @@ fn wonk_bin() -> PathBuf {
 }
 
 fn run_wonk(root: &Path, args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), root)
         .arg("--quiet")
         .args(args)
         .current_dir(root)
@@ -134,7 +136,7 @@ fn json_rows(stdout: &str) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 
 fn spawn_mcp(root: &Path, home: &Path) -> Child {
-    Command::new(wonk_bin())
+    common::command(wonk_bin(), root)
         .args(["mcp", "serve"])
         .current_dir(root)
         .env("HOME", home)
@@ -468,10 +470,10 @@ fn reindex_survival_and_retirement() {
         PARSE_PY.replace("CACHE[", "GLOBALS["),
     )
     .unwrap();
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
     let body_only = AUTH_RS.replace("Token::sign(raw)", "Token::sign(raw.clone())");
     fs::write(root.join("src/auth.rs"), body_only).unwrap();
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
     let conn = open_index(&root);
     assert!(
         feedback::live_identities(&conn, &files, &queried).contains(&identity),
@@ -481,7 +483,7 @@ fn reindex_survival_and_retirement() {
     // Signature edit (rename a parameter): the identity retires.
     let reparam = AUTH_RS.replace("user: &User", "owner: &User");
     fs::write(root.join("src/auth.rs"), reparam).unwrap();
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
     let conn = open_index(&root);
     assert!(
         !feedback::live_identities(&conn, &files, &queried).contains(&identity),
@@ -675,7 +677,7 @@ fn default_config_writes_nothing() {
     assert_eq!(count(&conn, "feedback_slates"), 0, "default writes nothing");
 
     // The feedback call refuses with the enable hint.
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), &root)
         .args([
             "feedback",
             "--slate",
@@ -795,7 +797,7 @@ fn never_transmitted_local_only() {
     let home = dir.path().join("isolated-home");
     fs::create_dir_all(&home).unwrap();
 
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), &root)
         .arg("--quiet")
         .arg("search")
         .arg("session_token")
@@ -806,7 +808,7 @@ fn never_transmitted_local_only() {
     assert_eq!(out.status.code(), Some(0));
     let token = slate_line_of(&String::from_utf8_lossy(&out.stdout));
 
-    let out = Command::new(wonk_bin())
+    let out = common::command(wonk_bin(), &root)
         .args([
             "--quiet",
             "feedback",
@@ -996,7 +998,7 @@ fn high_cardinality_authors_collapse_into_overflow_in_stored_slate() {
         )
         .unwrap();
     }
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
     {
         let conn = open_index(&root);
         for i in 0..40 {
@@ -1282,7 +1284,7 @@ fn absolute_path_slate_build_is_fixed_cost_not_per_file() {
         )
         .unwrap();
     }
-    wonk::pipeline::build_index(&root, true).unwrap();
+    common::build_index(&root, true).unwrap();
     let conn = open_index(&root);
 
     let three = slate_build_statement_count(&root, &conn, "abs_query_0[0-2]_target");

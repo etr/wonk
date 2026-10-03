@@ -554,13 +554,16 @@ fn learn_pending_bounded(
     }
     crate::db::ensure_feedback_tables(conn)?;
     let params = LearnParams::from_config(feedback, weights);
-    let mut watermark = read_watermark(conn)?;
     loop {
-        let (frontier, events) = crate::feedback::load_learning_chunk(conn, watermark, chunk)?;
+        // Acquire the writer reservation before reading replay state. Every
+        // chunk observes the cursor committed by any competing learner.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let watermark = read_watermark(&tx)?;
+        let (frontier, events) = crate::feedback::load_learning_chunk(&tx, watermark, chunk)?;
         if frontier <= watermark {
             break;
         }
-        let tx = conn.unchecked_transaction()?;
         for event in &events {
             let updates = event_updates(event, &params);
             if updates.is_empty() {
@@ -579,7 +582,6 @@ fn learn_pending_bounded(
         // exactly the watermark an unchunked replay would write.
         write_watermark(&tx, frontier)?;
         tx.commit()?;
-        watermark = frontier;
     }
     // Retire decayed-out preferences on every learn pass — bounded table,
     // interactive frequency (the `prune_slates` precedent).
@@ -707,6 +709,19 @@ pub struct ResolvedFeedback {
     pub evidence: Vec<FeedbackEvidence>,
     /// The `load_learned` instant (the descriptive pass's clock).
     pub loaded_at: i64,
+}
+
+impl ResolvedFeedback {
+    /// Apply feature exclusion after class resolution. Stored evidence is
+    /// retained, so reenabling author features needs no destructive reset.
+    pub fn apply_feature_policy(&mut self, author_features: bool) {
+        if !author_features {
+            self.descriptive
+                .retain(|key, _| !key.starts_with("author:"));
+            self.evidence
+                .retain(|row| !row.feature.starts_with("author:"));
+        }
+    }
 }
 
 /// One raw `learned_weights` row as stored.
@@ -960,9 +975,8 @@ fn canonical_key(ctx: &crate::rerank::SharedContext, as_seen: &std::path::Path) 
 /// the shared context, cardinality cap included), so the keys a
 /// candidate matches here are the keys the slate recorded there — and
 /// it IS that extraction: the prepared bundle this pass returns (symbol
-/// map + capped groups, `author_features` widened to the union of the
-/// configuration's switch and the learned `author:` keys so neither
-/// consumer's observable key set shrinks) rides the shared context for
+/// map + capped groups honoring the configured `author_features` switch)
+/// rides the shared context for
 /// the slate build to reuse — the heaviest per-query feedback work runs
 /// once, not twice. `resolved.loaded_at` is the extraction clock
 /// (determinism).
@@ -991,16 +1005,7 @@ pub(crate) fn apply_feedback_contribution(
         ctx,
         now: std::time::SystemTime::UNIX_EPOCH
             + std::time::Duration::from_secs(resolved.loaded_at.max(0) as u64),
-        // Author data is extracted when the configuration records it OR
-        // some `author:` key was learned: the pass's own contribution
-        // never changes (an `author:` key can only match when one was
-        // learned), and the slate build — reusing this extraction —
-        // keeps every key its configuration records.
-        author_features: author_features
-            || resolved
-                .descriptive
-                .keys()
-                .any(|key| key.starts_with("author:")),
+        author_features,
     };
 
     let mut extracted = Vec::with_capacity(scored.len());
@@ -2658,5 +2663,261 @@ mod tests {
         let deviation =
             current_deviation(&plain, &FeedbackConfig::default(), &weights, 1000).unwrap();
         assert_eq!(deviation, 0.0);
+    }
+    type ReplayGate = (
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    thread_local! {
+        static AUDIT_REPLAY_GATE: std::cell::RefCell<Option<ReplayGate>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn audit_pause_frontier(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && sql.starts_with("SELECT MAX(id)")
+        {
+            AUDIT_REPLAY_GATE.with(|gate| {
+                if let Some((ready, resume)) = gate.borrow_mut().take() {
+                    ready.send(()).unwrap();
+                    resume.recv().unwrap();
+                }
+            });
+        }
+    }
+
+    fn audit_concurrent_wal_replay(event_count: i64, chunk: i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feedback.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        crate::db::ensure_feedback_tables(&conn).unwrap();
+        for id in 1..=event_count {
+            insert_event(&conn, id, None, &format!("session-{id}"), 1.0, 0.0);
+        }
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let learner_path = path.clone();
+        let first = std::thread::spawn(move || {
+            let conn = Connection::open(learner_path).unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            AUDIT_REPLAY_GATE.with(|gate| *gate.borrow_mut() = Some((ready_tx, resume_rx)));
+            conn.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(audit_pause_frontier),
+            );
+            learn_pending_bounded(&conn, &enabled_config(), &default_weights(), 1000, chunk)
+                .unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let concurrent = learn_pending(&conn, &enabled_config(), &default_weights(), 1000);
+        resume_tx.send(()).unwrap();
+        first.join().unwrap();
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let rows = learned_rows(&conn);
+        assert_eq!(
+            rows[0].3, event_count,
+            "concurrent learners must not duplicate observation evidence"
+        );
+        assert_eq!(rows[0].4, event_count);
+        assert!(
+            (rows[0].2 - (0.6 + 0.02 * event_count as f32)).abs() < 1e-6,
+            "exactly one configured 0.02 step per event: {}",
+            rows[0].2
+        );
+        let error = concurrent.unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy),
+            "competing writer must report SQLITE_BUSY, not another failure: {error}"
+        );
+        assert_eq!(read_watermark(&conn).unwrap(), event_count);
+    }
+
+    #[test]
+    fn audit_wal_learners_apply_each_event_once() {
+        audit_concurrent_wal_replay(1, LEARN_CHUNK_EVENTS);
+    }
+
+    #[test]
+    fn audit_wal_chunks_preserve_cursor_and_exact_evidence() {
+        audit_concurrent_wal_replay(5, 2);
+    }
+
+    #[test]
+    fn audit_author_disable_preserves_other_descriptive_influence() {
+        let conn = symbols_conn();
+        let ctx = crate::rerank::SharedContext {
+            churn: crate::rerank::ChurnContext {
+                scores: HashMap::from([("src/a.rs".to_string(), 1.0)]),
+                last_author: HashMap::from([("src/a.rs".to_string(), Some("Ada".to_string()))]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resolved = ResolvedFeedback {
+            descriptive: BTreeMap::from([
+                ("author:last_touched_by=Ada".to_string(), 0.4),
+                ("path:src".to_string(), 0.1),
+            ]),
+            loaded_at: 1000,
+            ..Default::default()
+        };
+        let mut off = vec![scored_of("src/a.rs", 1, "fn mint")];
+        let prepared = apply_feedback_contribution(
+            &mut off,
+            &ctx,
+            &resolved,
+            &crate::rerank::QueryInfo { pattern: "mint" },
+            &conn,
+            1.0,
+            false,
+        )
+        .unwrap();
+        assert!(
+            (off[0].score - 0.1).abs() < 1e-6,
+            "author disabled but path feature remains: {}",
+            off[0].score
+        );
+        assert!(
+            prepared
+                .groups
+                .values()
+                .all(|groups| groups.author.is_empty())
+        );
+        let mut on = vec![scored_of("src/a.rs", 1, "fn mint")];
+        apply_feedback_contribution(
+            &mut on,
+            &ctx,
+            &resolved,
+            &crate::rerank::QueryInfo { pattern: "mint" },
+            &conn,
+            1.0,
+            true,
+        )
+        .unwrap();
+        assert!(
+            (on[0].score - 0.5).abs() < 1e-6,
+            "reenable same learned evidence"
+        );
+    }
+    #[test]
+    fn audit_event_clears_preserve_learning_and_monotonic_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let conn = Connection::open(&path).unwrap();
+        crate::db::ensure_feedback_tables(&conn).unwrap();
+        // Use the real slate and feedback insertion APIs, not explicit event IDs.
+        let mut useful = member(2, false, groups_with_signals(&[("path_character", 1.0)]));
+        let alt = member(1, false, groups_with_signals(&[("path_character", 0.0)]));
+        useful.identity = "chosen-main".to_string();
+        let members = vec![alt, useful];
+        conn.execute("INSERT INTO feedback_slates(token,query,members,created_at) VALUES ('real','q',?1,1000)", [serde_json::to_string(&members).unwrap()]).unwrap();
+        crate::feedback::record_feedback(&conn, "real", &["2".to_string()], "s1").unwrap();
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let first_id = read_watermark(&conn).unwrap();
+        assert_eq!(crate::feedback::clear_events(&conn).unwrap(), 1);
+        assert_eq!(
+            read_watermark(&conn).unwrap(),
+            first_id,
+            "event deletion does not reset learning"
+        );
+        assert_eq!(learned_rows(&conn)[0].3, 1);
+        crate::feedback::record_feedback(&conn, "real", &["2".to_string()], "s2").unwrap();
+        let new_id = crate::feedback::load_events(&conn).unwrap()[0].id;
+        assert!(new_id > first_id, "clearing all must not reuse an event id");
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        assert_eq!(learned_rows(&conn)[0].3, 2);
+        // The retained event belongs to a different identity than the highest tail.
+        let mut tail_members = members;
+        tail_members[1].identity = "chosen-tail".to_string();
+        conn.execute("INSERT INTO feedback_slates(token,query,members,created_at) VALUES ('tail','q',?1,1000)", [serde_json::to_string(&tail_members).unwrap()]).unwrap();
+        crate::feedback::record_feedback(&conn, "tail", &["2".to_string()], "s3").unwrap();
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let highest = read_watermark(&conn).unwrap();
+        assert_eq!(
+            crate::feedback::clear_result_events(&conn, "chosen-tail").unwrap(),
+            1
+        );
+        assert_eq!(crate::feedback::load_events(&conn).unwrap().len(), 1);
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        crate::db::ensure_feedback_tables(&conn).unwrap();
+        crate::feedback::record_feedback(&conn, "real", &["2".to_string()], "s4").unwrap();
+        let events = crate::feedback::load_events(&conn).unwrap();
+        assert!(
+            events.last().unwrap().id > highest,
+            "highest-tail clear stays monotonic after reopen"
+        );
+        learn_pending(&conn, &enabled_config(), &default_weights(), 1000).unwrap();
+        let rows = learned_rows(&conn);
+        assert_eq!(
+            rows[0].3, 4,
+            "new event counted; retained old event not replayed"
+        );
+        assert_eq!(rows[0].4, 4);
+    }
+
+    #[test]
+    fn audit_replay_fault_rolls_back_cursor_and_all_evidence() {
+        let conn = learning_conn();
+        insert_event(&conn, 1, None, "s1", 1.0, 0.0);
+        conn.execute_batch("CREATE TRIGGER abort_preference BEFORE INSERT ON result_preferences BEGIN SELECT RAISE(ABORT, 'injected preference failure'); END;").unwrap();
+        assert!(learn_pending(&conn, &enabled_config(), &default_weights(), 1000).is_err());
+        assert_eq!(read_watermark(&conn).unwrap(), 0);
+        assert!(learned_rows(&conn).is_empty());
+        for table in [
+            "learned_weight_sessions",
+            "result_preference_sessions",
+            "result_preferences",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "no partial evidence in {table}");
+        }
+        conn.execute_batch("DROP TRIGGER abort_preference;")
+            .unwrap();
+        learn_pending_bounded(&conn, &enabled_config(), &default_weights(), 1000, 1).unwrap();
+        assert_eq!(learned_rows(&conn)[0].3, 1);
+        assert_eq!(read_watermark(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn audit_author_policy_preserves_stored_rows_and_reenable() {
+        let conn = learning_conn();
+        for (feature, weight) in [("author:last_touched_by=Ada", 0.4), ("path:src", 0.1)] {
+            conn.execute("INSERT INTO learned_weights(feature,query_class,weight,observations,sessions,updated_at) VALUES (?1,'',?2,20,10,1000)",rusqlite::params![feature,weight]).unwrap();
+        }
+        let config = FeedbackConfig {
+            author_features: false,
+            ..enabled_config()
+        };
+        let table = load_learned(&conn, &config, &default_weights(), 1000)
+            .unwrap()
+            .unwrap();
+        let mut off = table.resolve(crate::rerank::QueryClass::Symbol);
+        off.apply_feature_policy(false);
+        assert_eq!(
+            off.descriptive,
+            BTreeMap::from([("path:src".to_string(), 0.1)])
+        );
+        assert!(
+            off.evidence
+                .iter()
+                .all(|row| !row.feature.starts_with("author:"))
+        );
+        let mut on = table.resolve(crate::rerank::QueryClass::Symbol);
+        on.apply_feature_policy(true);
+        assert_eq!(on.descriptive.get("author:last_touched_by=Ada"), Some(&0.4));
+        assert_eq!(
+            learned_rows(&conn).len(),
+            2,
+            "policy does not destroy evidence"
+        );
     }
 }

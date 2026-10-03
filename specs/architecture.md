@@ -915,7 +915,7 @@ Key technology choices: Rust for single static binary distribution and native Tr
 - **Index-time statistics (PRD-BM25-REQ-001/005):** Document frequency per term and per-document term frequency/length are written during the existing indexing transaction. The daemon's incremental path updates statistics for the changed file only — deletions decrement, inserts increment, keeping totals correct without a global recount.
 - **Scoring (PRD-BM25-REQ-002/003):** Standard BM25 with `k1 = 1.2`, `b = 0.75`, both config-overridable. Scoring operates on the candidate set grep already produced; it re-ranks rather than re-searches, so the added cost is arithmetic only (< 10ms).
 - **Fusion (PRD-BM25-REQ-004):** `fuse_rrf()` (DR-027) is unchanged — it consumes ranked lists and is indifferent to how the lexical list was ranked. This is why BM25 is a contained change: it improves the *input* to a fusion algorithm that already exists.
-- **Graceful degradation (PRD-BM25-REQ-006):** Absent `term_stats` (pre-V5 index) falls back to V4 ranking and emits a re-index hint — the same pattern used for `caller_id` in AR-010.
+- **Graceful degradation (PRD-BM25-REQ-006):** Missing statistics or an absent/unready `bm25_meta.generation_ready` marker falls back to V4 ranking and emits a re-index hint, including partial corpora with incidental `term_stats` rows. A complete build/update publishes the marker atomically with the corpus; editing one file in a legacy corpus cannot declare it ready — the same fallback pattern used for `caller_id` in AR-010.
 
 **Related Requirements:** PRD-BM25-REQ-001 through PRD-BM25-REQ-006
 
@@ -1302,7 +1302,7 @@ CREATE TABLE IF NOT EXISTS near_duplicates (
 -- The slate is required: credit assignment is contrastive, comparing the chosen result's signal
 -- contributions against those of the alternatives that were returned and passed over.
 CREATE TABLE IF NOT EXISTS feedback_events (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     result_identity TEXT NOT NULL,   -- content-anchored, survives re-index (PRD-FB-REQ-005)
     query_class TEXT,                -- class at query time; enables per-class learning (PRD-FB-REQ-008)
     chosen_rank INTEGER NOT NULL,    -- rank of the useful result; rank 1 yields no update (PRD-FB-REQ-009)
@@ -1312,6 +1312,11 @@ CREATE TABLE IF NOT EXISTS feedback_events (
     session TEXT,                    -- distinct-session counting (PRD-FB-REQ-015, PRD-FB-REQ-016)
     created_at INTEGER NOT NULL
 );
+
+-- Legacy feedback tables migrate transactionally, retaining rows and indexes.
+-- The migration sequence floor is max(highest retained event ID,
+-- learned_meta.event_watermark). AUTOINCREMENT preserves that floor through
+-- later retention/deletion, so new events remain beyond the replay cursor.
 
 -- [V5] TASK-101: the ranked search path persists the slate it is about to show (every
 -- result's identity, rank, and signal-contribution vector), so the feedback call
@@ -1389,6 +1394,13 @@ CREATE TABLE IF NOT EXISTS term_stats (
     tf INTEGER NOT NULL,         -- term frequency within the file
     PRIMARY KEY (term, file)
 );
+
+-- Complete-corpus readiness, published atomically with symbols, reach and term statistics.
+CREATE TABLE IF NOT EXISTS bm25_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+); -- generation_ready = '1' only after a complete generation is published.
+
 
 -- Indexes
 CREATE INDEX idx_symbols_name ON symbols(name);
@@ -2677,7 +2689,7 @@ GitHub Actions workflow:
 - New `term_stats` table populated in the existing indexing transaction; daemon updates it per changed file (increment on insert, decrement on delete)
 - `search.bm25_k1` (1.2) and `search.bm25_b` (0.75) added to configuration
 - `ranker.rs::fuse_rrf()` is unchanged; only its lexical input improves
-- Pre-V5 indexes lacking `term_stats` fall back to V4 ranking with a re-index hint, matching the AR-010 pattern
+- Indexes lacking complete `term_stats` or `bm25_meta.generation_ready = '1'` fall back to V4 ranking with a re-index hint, including partial generations with incidental term rows. A complete build/update publishes the readiness marker in the same transaction as the corpus, matching the AR-010 pattern
 - A ranking regression suite is required to demonstrate the precision@10 gain claimed in the PRD acceptance criteria
 
 ---
@@ -3024,7 +3036,7 @@ GitHub Actions workflow:
 | AR-016 | Multi-repo name collisions — multiple repos with same directory name cause ambiguous `repo` parameter matches | L | Return error listing all matches with full paths; user can disambiguate | Eng |
 | AR-017 | Contract normalization correctness — cross-language matching depends entirely on producing identical canonical IDs from different framework syntaxes; one normalization gap silently breaks linking | H | Single normalization function with an exhaustive per-framework test matrix; orphan-consumer output doubles as a detector for normalization misses (DR-031) | Eng |
 | AR-018 | Contract detection false positives — string-literal heuristics may classify unrelated strings as topics or routes | M | Confidence scoring (1.0 framework-recognized, 0.5 heuristic); low-confidence filtering pending OQ-011 calibration | Eng |
-| AR-019 | Bundled embedding quality below Ollama tier — semantic recall may regress for users who never opted into Ollama but relied on defaults | M | Completed 25-query bake-off selected `potion-code-16M-v2` q4; exact Recall@10 and Ollama delta are recorded in [`bench/semantic-quality.md`](../bench/semantic-quality.md); Ollama stays one config line away (DR-032, OQ-009) | Eng |
+| AR-019 | Bundled embedding quality below Ollama tier — semantic recall may regress for users who never opted into Ollama but relied on defaults | M | Completed 25-query bake-off selected `potion-code-16M-v2` q4; exact hit_rate@10 and Ollama delta are recorded in [`bench/semantic-quality.md`](../bench/semantic-quality.md); Ollama stays one config line away (DR-032, OQ-009) | Eng |
 | AR-020 | Reach index size on dense call graphs — depth-3 materialization can approach O(symbols × reach) | M | Per-symbol fan-out cap; `reach.enabled = false` escape hatch; measure on a large repo before defaults freeze (OQ-012, DR-034) | Eng |
 | AR-021 | Reach incremental-maintenance correctness — predecessor recomputation on cyclic graphs is the most error-prone part of V5 | H | BFS remains the correctness reference; mandatory test asserting reach-lookup ≡ BFS at equal depth after edit sequences; stale-flag falls back to BFS rather than serving wrong data | Eng |
 | AR-022 | Review verdict over-blocking — a BLOCK verdict that fires on safe changes trains users to ignore it | M | Only breaking changes with live callers block; coverage and cross-repo findings warn; rule families independently disable-able pending OQ-013 validation against real PRs | Eng |

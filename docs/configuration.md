@@ -201,11 +201,17 @@ mark it stale, never serve wrong rows.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `window` | `500` | Number of newest commits to mine; `0` is a hard configuration error naming the key |
-| `max_commit_files` | `50` | Bulk-commit exclusion for co-change coupling: a commit touching strictly more files than this contributes no coupling (it still counts for churn and still bounds the window); `< 2` is a hard error |
+| `window` | `500` | Number of newest commits to mine; valid range `1..=10,000`, otherwise a hard configuration error naming the key |
+| `max_commit_files` | `50` | Bulk-commit exclusion for co-change coupling: a commit touching strictly more files than this contributes no coupling (it still counts for churn and still bounds the window); valid range `2..=200`, otherwise a hard error |
 | `enabled` | `true` | Kill switch: `false` skips mining entirely (PRD-HIST-REQ-008) |
 
-Mining cost is proportional to the window, never repo age. The churn and
+Mining cost is proportional to the window, never repo age. History also
+preflights a conservative maximum of 250,000 transient ordered co-change
+pairs across the mined commits, independently of the stored top-K table.
+A conservative estimate above either 250,000 ordered-pair occurrences or
+64 MiB of transient map storage fails refresh with an explicit warning and
+failed refresh outcome, preserving existing history instead of publishing
+inexact partial coupling scores. The churn and
 co-change signals default to weight `0` under `[rank] weights` — ranking
 is unchanged until a weight is set explicitly.
 
@@ -214,8 +220,8 @@ is unchanged until a weight is set explicitly.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `true` | Kill switch: `false` skips the pass and zeroes both signal weights (PRD-TOPO-REQ-008) |
-| `iterations` | `20` | Exact number of HITS power-method iterations per recompute; `0` is a hard error |
-| `community_passes` | `30` | Label-propagation sweep cap for community detection; `0` is a hard error |
+| `iterations` | `20` | Exact number of HITS power-method iterations per recompute; valid range `1..=100`, otherwise a hard error |
+| `community_passes` | `30` | Label-propagation sweep cap for community detection; valid range `1..=100`, otherwise a hard error |
 | `interval` | `3600` | Minimum seconds between daemon-triggered recomputes; `0` is a hard error |
 | `stale_after` | `86400` | Seconds after which served scores are flagged stale in `wonk status`; `0` is a hard error |
 
@@ -240,9 +246,9 @@ their stored values. Both signals default to weight `0` under
 | `prefer_min_sessions` | `3` | Distinct confirming sessions a single RESULT needs before its per-result preference activates (TASK-104, PRD-FB-REQ-016). Must be `>= 2` — a value of `1` would let one session repeating feedback promote its own pick, the exact rich-get-richer loop DR-042 removed (AR-036), so it is a hard configuration error |
 
 Usage-feedback capture (TASK-101): when enabled, every ranked search
-persists its slate — the full ranked result list, each entry carrying a
-content-anchored identity and the per-signal contributions `--why`
-renders — and `wonk feedback` (or the `wonk_feedback` MCP tool) reports
+persists its slate — only the page members delivered within the caller’s
+output budget, each carrying its displayed rank, content-anchored identity
+and the per-signal contributions `--why` renders — and `wonk feedback` (or the `wonk_feedback` MCP tool) reports
 which results were useful against that slate by token. Everything stays
 in the per-repo index DB; there is no telemetry path. The section layers
 per field like every other (per-repo over global over default), and

@@ -10,6 +10,8 @@
 //!
 //! Run: `cargo bench --bench rank_tune -- --verbose`
 
+mod fixture_config;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -56,7 +58,7 @@ fn setup() -> Result<(TempDir, Connection)> {
     let root = dir.path();
     copy_dir(Path::new(CORPUS), root);
     fs::create_dir(root.join(".git"))?;
-    pipeline::build_index(root, true)?;
+    fixture_config::build_index(root, true)?;
     let index_path = db::find_existing_index(root).context("fixture index")?;
     let conn = db::open(&index_path)?;
     let provider = wonk::embedding::BundledProvider;

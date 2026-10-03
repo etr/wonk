@@ -269,6 +269,42 @@ pub struct CoChangeRow {
     pub weight: f32,
 }
 
+/// Independent transient limits, checked before allocating pair maps.
+/// Pair work counts all eligible occurrences, conservatively including
+/// repeated pairs. The byte estimate includes both path strings and map overhead.
+pub const MAX_CO_CHANGE_PAIR_WORK: usize = 250_000;
+pub const MAX_CO_CHANGE_ESTIMATED_BYTES: usize = 64 * 1024 * 1024;
+const CO_CHANGE_BYTES_PER_PAIR: usize = 192;
+
+fn check_co_change_budget(rows: &[MinedCommit], max_commit_files: usize) -> Result<()> {
+    let mut pair_work = 0usize;
+    let mut estimated_bytes = 0usize;
+    for commit in rows {
+        let count = commit.files.len();
+        if count > max_commit_files {
+            continue;
+        }
+        let partners = count.saturating_sub(1);
+        let pairs = count.saturating_mul(partners);
+        let path_bytes = commit
+            .files
+            .iter()
+            .fold(0usize, |sum, file| sum.saturating_add(file.len()));
+        pair_work = pair_work.saturating_add(pairs);
+        estimated_bytes = estimated_bytes.saturating_add(
+            pairs
+                .saturating_mul(CO_CHANGE_BYTES_PER_PAIR)
+                .saturating_add(path_bytes.saturating_mul(partners).saturating_mul(2)),
+        );
+        if pair_work > MAX_CO_CHANGE_PAIR_WORK || estimated_bytes > MAX_CO_CHANGE_ESTIMATED_BYTES {
+            anyhow::bail!(
+                "co-change aggregation skipped: transient work budget exceeded ({pair_work} ordered pairs, {estimated_bytes} estimated bytes; limits {MAX_CO_CHANGE_PAIR_WORK} pairs / {MAX_CO_CHANGE_ESTIMATED_BYTES} bytes); reduce [history] window or max_commit_files"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The age-weighted co-occurrence aggregate (TASK-097, PRD-HIST-REQ-004/005):
 /// `weight(a, b) = sum(age_weight(ts))` over the retained commits touching
 /// BOTH `a` and `b`, using the same [`age_weight`] machinery as churn — so
@@ -279,13 +315,16 @@ pub struct CoChangeRow {
 /// and vendored imports would otherwise couple everything to everything.
 /// It still feeds churn and still bounds the window. Rows are summed
 /// newest-first as given; every ordered pair `a != b` is accumulated, which
-/// makes the aggregate symmetric by construction.
+/// makes the aggregate symmetric by construction. Requests exceeding the
+/// independent transient work or estimated byte limits return an explicit
+/// error before any pair map is allocated; no partial scores are produced.
 pub fn aggregate_co_change(
     rows: &[MinedCommit],
     head_ts: i64,
     span: i64,
     max_commit_files: usize,
-) -> HashMap<String, HashMap<String, f32>> {
+) -> Result<HashMap<String, HashMap<String, f32>>> {
+    check_co_change_budget(rows, max_commit_files)?;
     let mut weights: HashMap<String, HashMap<String, f32>> = HashMap::new();
     for commit in rows {
         if commit.files.len() > max_commit_files {
@@ -305,7 +344,7 @@ pub fn aggregate_co_change(
             }
         }
     }
-    weights
+    Ok(weights)
 }
 
 /// Retain each `file_a`'s `top_k` strongest partners (weight DESC,
@@ -361,6 +400,17 @@ pub struct MiningOptions {
     pub max_commit_files: usize,
 }
 
+impl MiningOptions {
+    fn validate_work_limits(&self) -> Result<()> {
+        crate::config::HistoryConfig {
+            window: self.window,
+            max_commit_files: self.max_commit_files,
+            enabled: true,
+        }
+        .validate_work_limits()
+    }
+}
+
 impl From<&crate::config::HistoryConfig> for MiningOptions {
     fn from(config: &crate::config::HistoryConfig) -> Self {
         Self {
@@ -413,6 +463,7 @@ fn current_head(repo_root: &Path) -> Option<String> {
 /// Mine the newest `opts.window` commits of HEAD history into the history
 /// tables, replacing any previous mine.
 pub fn mine_full(conn: &Connection, repo_root: &Path, opts: &MiningOptions) -> Result<()> {
+    opts.validate_work_limits()?;
     let head = current_head(repo_root);
     let commits = parse_git_log(&git_log(repo_root, opts.window, None)?);
 
@@ -457,7 +508,10 @@ pub fn refresh(conn: &Connection, repo_root: &Path, opts: &MiningOptions) -> Ref
     // Failed with the previous data retained (PRD-HIST-REQ-008) — the
     // Result wrapper only ever returned Ok, so callers' error arms were
     // dead code (TASK-096 review debt).
-    match refresh_inner(conn, repo_root, opts) {
+    match opts
+        .validate_work_limits()
+        .and_then(|_| refresh_inner(conn, repo_root, opts))
+    {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("wonk: history refresh failed, keeping previous data: {e:#}");
@@ -623,7 +677,7 @@ fn recompute_history_aggregates(conn: &Connection, opts: &MiningOptions) -> Resu
     let churn = aggregate_churn(&commits, head_ts, span);
     let file_history = aggregate_file_history(&commits, head_ts, span);
     let co_change = top_k_per_file(
-        &aggregate_co_change(&commits, head_ts, span, opts.max_commit_files),
+        &aggregate_co_change(&commits, head_ts, span, opts.max_commit_files)?,
         CO_CHANGE_TOP_K,
     );
 
@@ -664,7 +718,7 @@ pub enum RefreshOutcome {
     Unchanged,
     /// `n` new commits were folded in and the aggregate recomputed.
     Refreshed(usize),
-    /// Git failed; previous data retained (PRD-HIST-REQ-008).
+    /// Git, configuration, or work budget failed; previous exact data retained.
     Failed,
 }
 
@@ -754,6 +808,154 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn audit_g8_co_change_budget_boundary_and_bulk_exclusion() {
+        let mut rows: Vec<_> = (0..102)
+            .map(|i| MinedCommit {
+                id: format!("commit-{i}"),
+                ts: 100,
+                author: None,
+                files: (0..50).map(|j| format!("c{i}/f{j}")).collect(),
+            })
+            .collect();
+        rows.extend((0..50).map(|i| commit(&format!("pair-{i}"), 100, &["a", "b"])));
+        assert!(
+            check_co_change_budget(&rows, 50).is_ok(),
+            "exactly 250000 conservative pair occurrences is allowed"
+        );
+        rows.push(commit("one-more", 100, &["a", "b"]));
+        assert!(check_co_change_budget(&rows, 50).is_err());
+        rows.iter_mut()
+            .for_each(|c| c.files.push("bulk".to_string()));
+        assert!(
+            check_co_change_budget(&rows, 2).is_ok(),
+            "bulk exclusions do not spend pair work"
+        );
+    }
+
+    #[test]
+    fn audit_g8_co_change_byte_budget_is_independent_of_pair_count() {
+        let rows: Vec<_> = (0..2)
+            .map(|i| MinedCommit {
+                id: format!("commit-{i}"),
+                ts: 100,
+                author: None,
+                files: (0..200)
+                    .map(|j| format!("{}/{i}/{j}", "x".repeat(512)))
+                    .collect(),
+            })
+            .collect();
+        let pair_work: usize = rows
+            .iter()
+            .map(|row| row.files.len() * (row.files.len() - 1))
+            .sum();
+        assert!(pair_work < MAX_CO_CHANGE_PAIR_WORK);
+        let error = format!("{:#}", aggregate_co_change(&rows, 100, 0, 200).unwrap_err());
+        assert!(
+            error.contains("estimated bytes"),
+            "long paths exhaust the independent byte estimate: {error}"
+        );
+    }
+
+    #[test]
+    fn audit_g8_public_mining_and_refresh_budget_failure_preserve_previous_data() {
+        let prefix = (0..4)
+            .map(|i| format!("{}{i}", "d".repeat(128)))
+            .collect::<Vec<_>>()
+            .join("/");
+        let owned: Vec<Vec<String>> = (0..2)
+            .map(|i| (0..200).map(|j| format!("{prefix}/c{i}/f{j}.rs")).collect())
+            .collect();
+        let first: Vec<&str> = owned[0].iter().map(String::as_str).collect();
+        let (dir, conn) = make_history_repo_groups(&[(first.as_slice(), 100)]);
+        let options = MiningOptions {
+            window: 500,
+            max_commit_files: 200,
+        };
+        mine_full(&conn, dir.path(), &options).unwrap();
+        let before_pairs = co_change_rows(&conn);
+        let before_head = mined_head(&conn);
+        let before_count = mined_count(&conn);
+        for file in &owned[1] {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "second group\n").unwrap();
+        }
+        let source_dir = format!("{prefix}/c1");
+        let added = Command::new("git")
+            .args(["add", "--", &source_dir])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(added.status.success());
+        let committed = Command::new("git")
+            .args(["commit", "-m", "second group"])
+            .env("GIT_AUTHOR_DATE", "@101 +0000")
+            .env("GIT_COMMITTER_DATE", "@101 +0000")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(committed.status.success());
+        let error = format!("{:#}", mine_full(&conn, dir.path(), &options).unwrap_err());
+        assert!(error.contains("co-change aggregation skipped"));
+        assert_eq!(co_change_rows(&conn), before_pairs);
+        assert_eq!(mined_head(&conn), before_head);
+        assert_eq!(mined_count(&conn), before_count);
+        assert_eq!(refresh(&conn, dir.path(), &options), RefreshOutcome::Failed);
+        assert_eq!(co_change_rows(&conn), before_pairs);
+        assert_eq!(mined_head(&conn), before_head);
+        assert_eq!(mined_count(&conn), before_count);
+    }
+
+    #[test]
+    fn audit_g8_disjoint_commit_pairs_reject_before_publishing_inexact_scores() {
+        let dir = TempDir::new().unwrap();
+        let conn = crate::db::open(&dir.path().join("history.db")).unwrap();
+        conn.execute(
+            "INSERT INTO co_change(file_a,file_b,weight) VALUES ('old.rs','other.rs',0.75)",
+            [],
+        )
+        .unwrap();
+        let rows: Vec<_> = (0..103)
+            .map(|i| MinedCommit {
+                id: format!("commit-{i}"),
+                ts: 100 + i,
+                author: None,
+                files: (0..50).map(|j| format!("commit-{i}/file-{j}.rs")).collect(),
+            })
+            .collect();
+        insert_commits(&conn, &rows).unwrap();
+        let before = co_change_rows(&conn);
+        let result = recompute_history_aggregates(&conn, &opts(500));
+        assert!(
+            result.is_err(),
+            "103 individually valid 50-file commits need 252350 ordered pairs before top-K pruning"
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("co-change"));
+        assert_eq!(
+            co_change_rows(&conn),
+            before,
+            "rejected work must not publish approximate scores"
+        );
+    }
+
+    #[test]
+    fn audit_g8_history_options_reject_excess_before_git_work() {
+        let (dir, conn) = make_history_repo(&[("src/a.rs", 100)]);
+        mine_full(&conn, dir.path(), &opts(500)).unwrap();
+        let before = mined_head(&conn);
+        let result = mine_full(&conn, dir.path(), &opts(10_001));
+        assert!(
+            result.is_err(),
+            "direct library call must enforce same work ceiling as config"
+        );
+        assert_eq!(mined_head(&conn), before);
+        assert_eq!(
+            refresh(&conn, dir.path(), &opts(10_001)),
+            RefreshOutcome::Failed
+        );
     }
 
     #[test]
@@ -1557,7 +1759,7 @@ mod tests {
             commit("b", 50, &["handler.rs", "serializer.rs"]),
             commit("c", 50, &["handler.rs", "loner.rs"]),
         ];
-        let weights = aggregate_co_change(&rows, 100, 50, 50);
+        let weights = aggregate_co_change(&rows, 100, 50, 50).unwrap();
 
         // Only the newest commit weighs 1.0; the ts=50 commits weigh 0.0.
         assert!((weights["handler.rs"]["serializer.rs"] - 1.0).abs() < 1e-6);
@@ -1572,7 +1774,7 @@ mod tests {
     #[test]
     fn aggregate_co_change_solo_commit_yields_no_pairs() {
         let rows = vec![commit("a", 100, &["one.rs"]), commit("b", 50, &[])];
-        let weights = aggregate_co_change(&rows, 100, 50, 50);
+        let weights = aggregate_co_change(&rows, 100, 50, 50).unwrap();
         assert!(weights.is_empty(), "got {weights:?}");
     }
 
@@ -1582,7 +1784,7 @@ mod tests {
         // commit_files primary key rules it out in practice) must not
         // create a self-coupling.
         let rows = vec![commit("a", 100, &["x.rs", "x.rs"])];
-        let weights = aggregate_co_change(&rows, 100, 50, 50);
+        let weights = aggregate_co_change(&rows, 100, 50, 50).unwrap();
         assert!(weights.is_empty(), "got {weights:?}");
     }
 
@@ -1592,7 +1794,7 @@ mod tests {
             commit("at", 100, &["a.rs", "b.rs", "c.rs"]),
             commit("over", 50, &["a.rs", "b.rs", "d.rs", "e.rs"]),
         ];
-        let weights = aggregate_co_change(&rows, 100, 50, 3);
+        let weights = aggregate_co_change(&rows, 100, 50, 3).unwrap();
 
         // Exactly-at-threshold contributes (span: weights 1.0 and 0.0).
         assert!((weights["a.rs"]["b.rs"] - 1.0).abs() < 1e-6);

@@ -11,6 +11,8 @@
 //! the tuned defaults beat the legacy ordering on this set, with no class
 //! regressing, and the previous ordering stays reachable by config.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,7 +75,7 @@ fn setup_labeled_corpus() -> (TempDir, Connection) {
     let root = dir.path();
     copy_dir(Path::new(CORPUS), root);
     fs::create_dir(root.join(".git")).unwrap();
-    pipeline::build_index(root, true).unwrap();
+    common::build_index(root, true).unwrap();
     let index_path = db::find_existing_index(root).expect("fixture index to exist");
     let conn = db::open(&index_path).unwrap();
     let provider = wonk::embedding::BundledProvider;

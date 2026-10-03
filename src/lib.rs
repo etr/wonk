@@ -11,6 +11,7 @@ pub mod context;
 pub mod contracts;
 pub mod daemon;
 pub mod db;
+pub mod delivery;
 pub mod elide;
 pub mod embedding;
 pub mod errors;

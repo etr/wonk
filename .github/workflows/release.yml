@@ -102,6 +102,7 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
+          cp assets/models/LICENSE release/wonk-bundled-model-LICENSE.txt
           ls -lh release/
 
       - name: Create GitHub Release

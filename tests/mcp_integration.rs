@@ -6,6 +6,8 @@
 //! tests/ask_integration.rs) so the configured Ollama is deterministically
 //! unreachable.
 
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -62,7 +64,7 @@ fn mcp_server_initialize_and_list_tools() {
         .status()
         .unwrap();
 
-    let mut child = Command::new(&bin)
+    let mut child = common::command(&bin, tmp.path())
         .args(["mcp", "serve"])
         .current_dir(tmp.path())
         .stdin(Stdio::piped())
@@ -185,7 +187,7 @@ fn mcp_server_initialize_and_list_tools() {
 
 /// Offline command (proxy-pinned, no Ollama) rooted at `dir`.
 fn offline_command(bin: &Path, dir: &Path) -> Command {
-    let mut command = Command::new(bin);
+    let mut command = common::command(bin, dir);
     command
         .current_dir(dir)
         .env("HTTP_PROXY", "http://127.0.0.1:1")
@@ -931,4 +933,71 @@ fn mcp_search_invalid_rank_weights_is_tool_error() {
         "error must list the valid signal names: {text}"
     );
     session.finish();
+}
+
+#[test]
+fn mcp_show_malformed_source_keeps_raw_payload_and_warns() {
+    let bin = wonk_bin();
+    let repo = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    std::fs::write(
+        repo.path().join("target.rs"),
+        "pub fn target() {\n    let value = ;\n    work();\n}\n",
+    )
+    .unwrap();
+    let init = offline_command(&bin, repo.path())
+        .env("HOME", home.path())
+        .args(["init"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let mut child = spawn_offline_mcp_server(&bin, repo.path(), home.path());
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let init = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}),
+    );
+    assert!(init["error"].is_null(), "{init}");
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wonk_show","arguments":{"name":"target"}}}),
+    );
+    let fallback = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wonk_show","arguments":{"name":"target","elide":"bodies"}}}),
+    );
+    assert_ne!(raw["result"]["isError"], true, "{raw}");
+    assert_ne!(fallback["result"]["isError"], true, "{fallback}");
+    assert_eq!(
+        fallback["result"]["content"], raw["result"]["content"],
+        "MCP source payload must remain byte-identical"
+    );
+    assert!(
+        fallback["result"]["content"]
+            .to_string()
+            .contains("let value = ;"),
+        "{fallback}"
+    );
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    let mut warning = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut warning)
+        .unwrap();
+    assert!(
+        warning.contains("elision not applied") && warning.contains("parse failure"),
+        "{warning}"
+    );
 }

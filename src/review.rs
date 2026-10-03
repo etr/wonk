@@ -10,10 +10,9 @@
 //! durable `review_suppressions` table (REQ-014), and every produced finding
 //! is either kept or dropped for exactly one counted reason (REQ-015).
 //!
-//! Index currency caveat (inherited V4 semantics): the index must reflect
-//! the base state of the diff. Re-indexing mid-diff (auto-indexing the
-//! current tree) empties the diff and fakes an APPROVE, which is why the
-//! review dispatch never auto-initializes an index.
+//! Caller/blast evidence still requires an index reflecting the diff base.
+//! Source identity, spans and signature comparisons come from the selected
+//! Git snapshots even when graph evidence has different coordinates.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -26,7 +25,8 @@ use crate::blast::{self, BlastOptions};
 use crate::impact;
 use crate::types::{
     AnchorMethod, BlastAffectedSymbol, BlastAnalysis, BlastDirection, BlastSeverity, ChangeScope,
-    ChangedSymbol, FileDiffHunks, Finding, FindingSeverity, ReviewVerdict, Symbol, SymbolRef,
+    ChangedSymbol, FileDiffHunks, Finding, FindingSeverity, ReviewVerdict, Symbol, SymbolIdentity,
+    SymbolRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,17 +47,17 @@ fn range_covers(ranges: &[(usize, usize)], line: usize) -> bool {
 /// file; for [`AnchorMethod::OldSideLine`] it refers to the PRE-change file
 /// (where the symbol used to live).
 ///
-/// The hunk-path `ChangedSymbol::line` is the INDEXED (stale) line, so tier 3
-/// deliberately re-resolves the symbol's line from the current file instead
-/// of trusting it.
+/// Changed-symbol coordinates belong to the selected source endpoint.
+/// Duplicate names must match that exact location; ambiguous matches remain
+/// unresolved rather than selecting another method.
 pub fn resolve_anchor(
     cs: &ChangedSymbol,
     hunks: Option<&FileDiffHunks>,
     current_symbols: Option<&[Symbol]>,
 ) -> (Option<usize>, AnchorMethod) {
     if cs.change_type == crate::types::ChangeType::Removed {
-        // Tier 2: the index reflects the diff's base state, so the indexed
-        // line is an old-side line. Anchor only if this diff's removed
+        // A removed symbol belongs to the selected old snapshot.
+        // Anchor only if this diff's removed
         // ranges actually cover it; otherwise an honest no-line beats a
         // wrong line.
         return match hunks
@@ -69,13 +69,20 @@ pub fn resolve_anchor(
         };
     }
 
-    // Re-resolve the symbol's start line in the post-change file: the
-    // indexed line is stale after insertions above the symbol.
+    // The selected new snapshot supplies post-change coordinates.
     let Some(cur_line) = current_symbols.and_then(|syms| {
-        syms.iter()
+        let matches: Vec<&Symbol> = syms
+            .iter()
             .filter(|s| s.name == cs.name && s.kind == cs.kind)
-            .map(|s| s.line)
-            .min()
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].line);
+        }
+        // Exact coordinates from the selected endpoint distinguish scopes.
+        // Otherwise no arbitrary earliest-name fallback is safe.
+        let mut exact = matches.iter().filter(|s| s.line == cs.line);
+        let symbol = exact.next()?;
+        exact.next().is_none().then_some(symbol.line)
     }) else {
         return (None, AnchorMethod::Unresolved);
     };
@@ -428,12 +435,20 @@ pub fn finding_identity(
 /// identities are minted for engine output. Rules push `identity:
 /// String::new()`; the anchor text side is a run-review concern the rules
 /// never see.
-fn stamp_identity(mut finding: Finding, cs: &ChangedSymbol, anchor_text: Option<&str>) -> Finding {
+fn stamp_identity(
+    mut finding: Finding,
+    cs: &ChangedSymbol,
+    symbol: Option<&Symbol>,
+    anchor_text: Option<&str>,
+) -> Finding {
+    let qualified = symbol
+        .and_then(|s| s.scope.as_ref())
+        .map(|scope| format!("{scope}::{}", cs.name));
     finding.identity = finding_identity(
         &finding.rule,
         &finding.kind,
         &finding.file,
-        &cs.name,
+        qualified.as_deref().unwrap_or(&cs.name),
         anchor_text,
     );
     finding
@@ -891,10 +906,23 @@ pub fn run_review(
         .map(|c| (c.name.clone(), c.kind, c.file.clone()))
         .collect();
 
-    // Per-file cache of current-file symbols for tier-3 re-resolution.
-    let mut current_cache: HashMap<String, Option<Vec<Symbol>>> = HashMap::new();
-    // Per-file cache of current-file LINES — the tier 1/3 anchor-text side.
-    let mut current_lines_cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    let source_lines: HashMap<&str, (Vec<&str>, Vec<&str>)> = detail
+        .snapshots
+        .iter()
+        .map(|(file, snapshots)| {
+            let old = snapshots
+                .old
+                .as_ref()
+                .map(|s| s.source.lines().collect())
+                .unwrap_or_default();
+            let new = snapshots
+                .new
+                .as_ref()
+                .map(|s| s.source.lines().collect())
+                .unwrap_or_default();
+            (file.as_str(), (old, new))
+        })
+        .collect();
 
     // Outer = attempted (None until the first rule-C candidate with
     // provider contracts); inner = the resolution, None when it failed.
@@ -902,12 +930,15 @@ pub fn run_review(
     let mut cross_repo_inputs_warning = false;
 
     for cs in &detail.analysis.changed_symbols {
+        let snapshots = detail.snapshots.get(&cs.file);
+        let selected_symbol = snapshots.and_then(|s| s.changed_symbol(cs));
+        let identity = selected_symbol.map(SymbolIdentity::from);
         let rule_a_candidate = options.breaking_change
             && (cs.change_type == crate::types::ChangeType::Removed
                 || (cs.change_type == crate::types::ChangeType::Modified
-                    && detail
-                        .signature_changed
-                        .contains(&(cs.name.clone(), cs.kind))));
+                    && identity
+                        .as_ref()
+                        .is_some_and(|identity| detail.signature_changed.contains(identity))));
         // TASK-094 keep: review semantics — test symbols sit outside review
         // scope; this is not a ranking demotion.
         let rule_b_candidate = options.coverage_gap
@@ -954,37 +985,28 @@ pub fn run_review(
             None
         };
 
-        if !current_cache.contains_key(&cs.file) {
-            // A deleted file has nothing to re-resolve; Removed symbols
-            // anchor from the old side and never need this.
-            let parsed = impact::parse_current_symbols(&cs.file, repo_root).ok();
-            current_cache.insert(cs.file.clone(), parsed);
-        }
-        let current_symbols = current_cache.get(&cs.file).and_then(|opt| opt.as_deref());
-        if !current_lines_cache.contains_key(&cs.file) {
-            let lines = std::fs::read_to_string(repo_root.join(&cs.file))
-                .ok()
-                .map(|s| s.lines().map(str::to_string).collect::<Vec<_>>());
-            current_lines_cache.insert(cs.file.clone(), lines);
-        }
-        let current_lines = current_lines_cache
-            .get(&cs.file)
-            .and_then(|opt| opt.as_deref());
-        let (line, anchor_method) = resolve_anchor(cs, detail.hunks.get(&cs.file), current_symbols);
-        // Anchor text is resolved once per symbol: the side the anchor
-        // resolved against, feeding the identity stamped at the push seam.
-        let anchor_text = anchored_line_text(
-            anchor_method,
-            line,
-            detail.hunks.get(&cs.file),
-            current_lines,
-        );
+        let current_symbols = snapshots
+            .and_then(|s| s.new.as_ref())
+            .map(|s| s.symbols.as_slice());
+        let (line, anchor_method) = if selected_symbol.is_some() {
+            resolve_anchor(cs, detail.hunks.get(&cs.file), current_symbols)
+        } else {
+            (None, AnchorMethod::Unresolved)
+        };
+        let anchor_text = source_lines.get(cs.file.as_str()).and_then(|(old, new)| {
+            let lines = match anchor_method {
+                AnchorMethod::Unresolved => return None,
+                AnchorMethod::OldSideLine => old,
+                AnchorMethod::NewSideHunk | AnchorMethod::PostChangeFile => new,
+            };
+            line.and_then(|line| lines.get(line.checked_sub(1)?).copied())
+        });
 
         if rule_a_candidate
             && let Some(ref context) = context
             && let Some(finding) = rule_breaking_change(cs, context, &removed, line, anchor_method)
         {
-            findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
+            findings.push(stamp_identity(finding, cs, selected_symbol, anchor_text));
         }
 
         if rule_b_candidate && let Some(ref context) = context {
@@ -1003,7 +1025,7 @@ pub fn run_review(
                     if let Some(finding) =
                         rule_coverage_gap(cs, &with_tests, context, line, anchor_method)
                     {
-                        findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
+                        findings.push(stamp_identity(finding, cs, selected_symbol, anchor_text));
                     }
                 }
                 Err(e) => warnings.push(format!(
@@ -1034,7 +1056,12 @@ pub fn run_review(
                             && let Some(finding) =
                                 rule_cross_repo(cs, &ids, resolution, line, anchor_method)
                         {
-                            findings.push(stamp_identity(finding, cs, anchor_text.as_deref()));
+                            findings.push(stamp_identity(
+                                finding,
+                                cs,
+                                selected_symbol,
+                                anchor_text,
+                            ));
                         }
                     }
                     Err(e) => warnings.push(format!(
@@ -1628,12 +1655,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_anchor_prefers_lowest_current_line_on_duplicate_names() {
+    fn resolve_anchor_ambiguous_duplicate_names_are_unresolved() {
         let cs = changed(ChangeType::Modified, 1);
         let cur = vec![current_symbol(30), current_symbol(12)];
         assert_eq!(
             resolve_anchor(&cs, None, Some(&cur)),
-            (Some(12), AnchorMethod::PostChangeFile)
+            (None, AnchorMethod::Unresolved)
         );
     }
 
@@ -1896,7 +1923,8 @@ mod tests {
             .output()
             .unwrap();
 
-        crate::pipeline::build_index(root, true).unwrap();
+        let config = crate::config::Config::load_with_paths(None, Some(root)).unwrap();
+        crate::pipeline::build_index_with_config(root, true, &config).unwrap();
         let index_path = crate::db::local_index_path(root);
         let conn = crate::db::open_existing(&index_path).unwrap();
         (dir, conn)
@@ -2243,7 +2271,8 @@ mod tests {
     fn commit_and_reindex(root: &Path) {
         git_cmd(root, &["add", "."]);
         git_cmd(root, &["commit", "-m", "update"]);
-        crate::pipeline::build_index(root, true).unwrap();
+        let config = crate::config::Config::load_with_paths(None, Some(root)).unwrap();
+        crate::pipeline::build_index_with_config(root, true, &config).unwrap();
     }
 
     fn coverage_gap_of(result: &ReviewResult) -> &Finding {
@@ -2527,7 +2556,7 @@ mod tests {
         )]);
         let root = dir.path();
 
-        std::fs::write(root.join("src/lib.rs"), "pub fn g() -> i32 { 0 }\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn g() -> i32 { f() }\n").unwrap();
 
         let result = run_review(
             &conn,
@@ -2542,6 +2571,40 @@ mod tests {
             result.findings.iter().all(|f| f.kind != "coverage-gap"),
             "removed symbols must not raise coverage gaps, got: {:?}",
             result.findings
+        );
+        assert_eq!(result.verdict, ReviewVerdict::Block);
+    }
+
+    #[test]
+    fn rule_b_reports_changed_surviving_caller_body_after_removal() {
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\n",
+        )]);
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn g() -> i32 { 0 }\n").unwrap();
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            dir.path(),
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let gap = coverage_gap_of(&result);
+        assert!(
+            gap.message.contains("function `g` changed"),
+            "{:?}",
+            result.findings
+        );
+        assert_eq!(gap.line, Some(1));
+        assert_eq!(gap.anchor_method, AnchorMethod::NewSideHunk);
+        assert_eq!(
+            result
+                .findings
+                .iter()
+                .filter(|finding| finding.kind == "coverage-gap")
+                .count(),
+            1
         );
         assert_eq!(result.verdict, ReviewVerdict::Block);
     }
@@ -2759,11 +2822,9 @@ mod tests {
     // -- extra fixtures ----------------------------------------------------------
 
     #[test]
-    fn stale_index_relocation_yields_unresolved_anchor_not_wrong_line() {
-        // Index built at commit A; commit B relocates the fn without
-        // re-indexing; then the fn is deleted. The stale indexed line no
-        // longer falls inside this diff's removed ranges, so the finding is
-        // emitted without a line rather than pointing at the wrong one.
+    fn stale_index_relocation_anchors_to_selected_old_snapshot() {
+        // The graph index stays at A, but the old Git source endpoint at B
+        // proves the relocated function's actual removal coordinates.
         if !git_available() {
             return;
         }
@@ -2811,10 +2872,18 @@ mod tests {
             .iter()
             .find(|f| f.kind == "breaking-change")
             .expect("breaking-change finding must still be emitted");
-        assert_eq!(finding.anchor_method, AnchorMethod::Unresolved);
-        assert_eq!(finding.line, None);
-        // Identity is stamped even when the anchor did not resolve — the
-        // suppression key space covers unanchored findings too.
+        assert_eq!(finding.anchor_method, AnchorMethod::OldSideLine);
+        assert_eq!(finding.line, Some(32));
+        assert_eq!(
+            finding.identity,
+            finding_identity(
+                "breaking-change/removed-symbol-with-callers",
+                "breaking-change",
+                "src/lib.rs",
+                "relocated",
+                Some("pub fn relocated() {}"),
+            )
+        );
         assert_stable_identity(finding);
     }
 
@@ -2998,7 +3067,8 @@ mod tests {
             format!("[contracts]\nworkspace = \"{workspace}\"\n"),
         )
         .unwrap();
-        crate::pipeline::build_index(&root, true).unwrap();
+        let config = crate::config::Config::load_with_paths(None, Some(&root)).unwrap();
+        crate::pipeline::build_index_with_config(&root, true, &config).unwrap();
         let dest = repos_dir.join(crate::db::repo_hash(&root));
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::copy(root.join(".wonk/index.db"), dest.join("index.db")).unwrap();
@@ -3058,7 +3128,8 @@ mod tests {
             .output()
             .unwrap();
 
-        crate::pipeline::build_index(&root, true).unwrap();
+        let config = crate::config::Config::load_with_paths(None, Some(&root)).unwrap();
+        crate::pipeline::build_index_with_config(&root, true, &config).unwrap();
         let dest = repos_dir.join(crate::db::repo_hash(&root));
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::copy(root.join(".wonk/index.db"), dest.join("index.db")).unwrap();

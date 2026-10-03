@@ -280,6 +280,12 @@ fn detect_communities(graph: &TopologyGraph, passes: usize) -> Vec<i64> {
 /// previous rows and stamping `last_computed` — the full-build and
 /// `wonk update` path, run unconditionally when enabled.
 pub fn recompute(conn: &Connection, opts: &TopologyOptions) -> Result<()> {
+    crate::config::TopologyConfig {
+        iterations: opts.iterations,
+        community_passes: opts.community_passes,
+        ..Default::default()
+    }
+    .validate_work_limits()?;
     let graph = load_graph(conn)?;
     let (hub, auth) = hits(&graph, opts.iterations);
     let community = detect_communities(&graph, opts.community_passes);
@@ -508,6 +514,22 @@ mod tests {
         insert_ref(conn, "core", Some(orchestrator));
         insert_ref(conn, "leaf", Some(orchestrator));
         insert_ref(conn, "leaf", Some(single_caller));
+    }
+
+    #[test]
+    fn audit_g8_topology_options_reject_excess_before_loading_graph() {
+        let (_dir, conn) = db();
+        for invalid in [opts(101, 30), opts(20, 101)] {
+            let result = recompute(&conn, &invalid);
+            assert!(
+                result.is_err(),
+                "direct library options must enforce graph-pass ceiling"
+            );
+            assert!(
+                last_computed(&conn).is_none(),
+                "invalid work must not stamp scores"
+            );
+        }
     }
 
     #[test]

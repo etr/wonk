@@ -12,6 +12,8 @@
 //! `RankSettings` here loads a learned table, so accumulated feedback
 //! cannot confirm itself through the frozen goldens.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 
@@ -19,7 +21,6 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 use wonk::bm25::{self, Bm25Params};
 use wonk::db;
-use wonk::pipeline;
 use wonk::ranker;
 use wonk::search::{self, SearchResult};
 
@@ -94,7 +95,7 @@ fn setup_indexed_corpus() -> (TempDir, Connection) {
     let root = dir.path();
     copy_dir(Path::new(FIXTURE), root);
     fs::create_dir(root.join(".git")).unwrap();
-    pipeline::build_index(root, true).unwrap();
+    common::build_index(root, true).unwrap();
     let index_path = db::find_existing_index(root).expect("fixture index to exist");
     let conn = db::open(&index_path).unwrap();
     (dir, conn)
@@ -345,8 +346,13 @@ fn pre_v5_index_falls_back_without_error() {
     let (dir, conn) = setup_indexed_corpus();
     let root = dir.path();
 
-    // Simulate a pre-V5 index: statistics exist for nothing.
+    assert!(db::bm25_generation_ready(&conn));
+    // A legacy index has no complete-generation marker. Empty term stats alone
+    // also describe a valid, fully indexed zero-term corpus.
     conn.execute("DELETE FROM term_stats", []).unwrap();
+    conn.execute("DELETE FROM bm25_meta WHERE key = 'generation_ready'", [])
+        .unwrap();
+    assert!(!db::bm25_generation_ready(&conn));
 
     let found = candidates(root, "cache");
     assert!(
@@ -357,4 +363,15 @@ fn pre_v5_index_falls_back_without_error() {
     // The untouched list still fuses cleanly — the V5 behavior on fallback.
     let fused = ranker::fuse_rrf(&found, &[], 60.0);
     assert_eq!(fused.len(), found.len());
+    let mut before: Vec<_> = found
+        .iter()
+        .map(|r| (r.file.to_string_lossy().into_owned(), r.line))
+        .collect();
+    let mut after: Vec<_> = fused.iter().map(|r| (r.file.clone(), r.line)).collect();
+    before.sort();
+    after.sort();
+    assert_eq!(
+        after, before,
+        "fallback fusion must preserve every candidate"
+    );
 }

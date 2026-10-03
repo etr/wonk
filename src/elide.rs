@@ -60,8 +60,8 @@ pub fn elide_tree(
     language: Lang,
     mode: Mode,
 ) -> Result<String, NotElided> {
-    let ranges = collect_body_ranges(tree, source, language, mode);
-    Ok(rebuild(source, &ranges))
+    let ctx = ElisionCtx::derive(tree, source, language, mode)?;
+    Ok(rebuild(source, &ctx.ranges))
 }
 
 /// Parse `source` and elide function bodies inside a 1-based inclusive line
@@ -100,7 +100,7 @@ pub fn elide_span_tree(
     start_line: usize,
     end_line: usize,
 ) -> Result<String, NotElided> {
-    let ctx = ElisionCtx::derive(tree, source, language, mode);
+    let ctx = ElisionCtx::derive(tree, source, language, mode)?;
     Ok(ctx.render(source, start_line, end_line))
 }
 
@@ -118,11 +118,21 @@ pub struct ElisionCtx {
 }
 
 impl ElisionCtx {
-    pub fn derive(tree: &Tree, source: &str, language: Lang, mode: Mode) -> Self {
-        ElisionCtx {
+    /// Reject recovery trees before collecting any ranges. Tree-sitter's
+    /// error cost covers both ERROR nodes and inserted missing nodes.
+    pub fn derive(
+        tree: &Tree,
+        source: &str,
+        language: Lang,
+        mode: Mode,
+    ) -> Result<Self, NotElided> {
+        if tree.root_node().has_error() {
+            return Err(NotElided::ParseFailure);
+        }
+        Ok(ElisionCtx {
             ranges: collect_body_ranges(tree, source, language, mode),
             starts: line_starts(source),
-        }
+        })
     }
 
     /// Render the `start_line..=end_line` window under the derived
@@ -142,9 +152,9 @@ impl ElisionCtx {
 /// retaining nothing. A `matches!` (not a slice scan): this test runs once
 /// per visited node and the walker visits tens of thousands of them.
 ///
-/// This membership test is the walker's only kind operation: unknown and
-/// ERROR kinds answer `false`, so an unrecognized construct degrades to a
-/// counted gap, never a failure.
+/// This membership test is the walker's only kind operation: unknown kinds
+/// answer `false`, so an unrecognized construct degrades to a counted gap.
+/// Recovery trees are rejected before reaching the walker.
 pub fn is_control_flow_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -548,6 +558,24 @@ mod tests {
     use crate::indexer::get_parser;
 
     #[test]
+    fn audit_g8_malformed_source_falls_back_without_eliding() {
+        for source in [
+            "pub fn target() {\n    let value = ;\n    work();\n}\n",
+            "pub fn target() {\n    let value = 1;\n    work();\n",
+        ] {
+            for mode in [Mode::Bodies, Mode::Salience] {
+                let result = elide(source, Some(Lang::Rust), mode);
+                assert_eq!(result, Err(NotElided::ParseFailure));
+                assert_eq!(result.unwrap_or_else(|_| source.to_string()), source);
+                assert_eq!(
+                    elide_span(source, Some(Lang::Rust), mode, 1, 4),
+                    Err(NotElided::ParseFailure)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn control_flow_kind_probe_matrix() {
         // Pins the real grammar names behind CONTROL_FLOW_KINDS (the union is
         // safe, but a misspelled entry would silently retain nothing): every
@@ -791,10 +819,9 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_and_error_kinds_never_fail() {
-        // The walker's only kind operation is a membership test: unknown and
-        // ERROR kinds answer false, so garbage input degrades to counted gaps
-        // (or no elision at all), never a panic or an Err.
+    fn unrecognized_kinds_are_inert_and_recovery_trees_fall_back() {
+        // PHP may accept this as opaque text outside its opening tag; every
+        // grammar that reports recovery must instead signal not applied.
         let garbage = "@@ {{{ def !!! ???\n\x00total nonsense )))\n";
         for lang in [
             Lang::TypeScript,
@@ -813,21 +840,11 @@ mod tests {
             let mut parser = get_parser(lang);
             if let Some(tree) = parser.parse(garbage, None) {
                 for mode in [Mode::Bodies, Mode::Salience] {
-                    let out = elide_tree(&tree, garbage, lang, mode).unwrap();
-                    let stub_total: usize = out
-                        .lines()
-                        .filter(|l| l.contains("lines elided"))
-                        .map(|l| {
-                            l.split_whitespace()
-                                .find_map(|t| t.parse::<usize>().ok())
-                                .unwrap_or(0)
-                        })
-                        .sum();
-                    let retained = out.lines().filter(|l| !l.contains("lines elided")).count();
-                    assert!(
-                        stub_total + retained <= garbage.lines().count() + 1,
-                        "{lang:?} {mode:?}: garbage input must not invent lines"
-                    );
+                    let result = elide_tree(&tree, garbage, lang, mode);
+                    if tree.root_node().has_error() {
+                        assert_eq!(result, Err(NotElided::ParseFailure), "{lang:?} {mode:?}");
+                    }
+                    assert_eq!(result.unwrap_or_else(|_| garbage.to_string()), garbage);
                 }
             }
         }

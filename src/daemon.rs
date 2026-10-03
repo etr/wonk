@@ -366,6 +366,8 @@ pub(crate) fn coalesce_file_batches(
 /// 7. Runs the event loop (placeholder: waits for SIGTERM).
 /// 8. On shutdown: cleans up PID file.
 pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
+    // Validate before daemonization and every startup write.
+    let config = crate::config::Config::load(Some(repo_root))?;
     let index_path = db::index_path_for(repo_root, local)?;
     let index_dir = index_path
         .parent()
@@ -405,7 +407,6 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
     let embed_shutdown = Arc::clone(&shutdown);
     let embed_index_path = index_path.clone();
     let embed_repo_root = repo_root.to_path_buf();
-    let config = crate::config::Config::load(Some(repo_root)).unwrap_or_default();
     let embedding_kind = config.embedding.provider;
     let contract_opts = crate::contracts::ContractOptions::from(&config.contracts);
     let history = config.history;
@@ -811,6 +812,98 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
+
+    fn isolated_startup_child(name: &str) -> bool {
+        if std::env::var("WONK_DAEMON_BOUNDARY_CHILD").as_deref() == Ok(name) {
+            return false;
+        }
+        let home = TempDir::new().unwrap();
+        let output = process::Command::new(std::env::current_exe().unwrap())
+            .env("HOME", home.path())
+            .env("WONK_DAEMON_BOUNDARY_CHILD", name)
+            .args(["--exact", name, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn audit_g8_daemon_invalid_config_has_no_startup_side_effects() {
+        if isolated_startup_child(
+            "daemon::tests::audit_g8_daemon_invalid_config_has_no_startup_side_effects",
+        ) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".wonk")).unwrap();
+        fs::write(
+            dir.path().join(".wonk/config.toml"),
+            "[history]\nwindow=10001\n",
+        )
+        .unwrap();
+        let index_path = db::local_index_path(dir.path());
+        let error = format!("{:#}", spawn_daemon(dir.path(), true).unwrap_err());
+        assert!(error.contains("[history] window"));
+        assert!(!index_path.exists());
+        assert!(!pid_file_path(index_path.parent().unwrap()).exists());
+    }
+
+    #[test]
+    fn audit_g8_valid_daemon_config_preserves_running_daemon_guard() {
+        if isolated_startup_child(
+            "daemon::tests::audit_g8_valid_daemon_config_preserves_running_daemon_guard",
+        ) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let index_path = db::local_index_path(dir.path());
+        let index_dir = index_path.parent().unwrap();
+        fs::create_dir_all(index_dir).unwrap();
+        fs::write(
+            dir.path().join(".wonk/config.toml"),
+            "[history]\nwindow=500\n",
+        )
+        .unwrap();
+        write_pid(index_dir).unwrap();
+        let error = format!("{:#}", spawn_daemon(dir.path(), true).unwrap_err());
+        assert!(error.contains("daemon is already running"));
+        assert!(!index_path.exists());
+    }
+
+    #[test]
+    fn audit_g8_daemon_invalid_config_is_rejected_before_running_daemon_check() {
+        if isolated_startup_child(
+            "daemon::tests::audit_g8_daemon_invalid_config_is_rejected_before_running_daemon_check",
+        ) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".wonk")).unwrap();
+        fs::write(
+            root.join(".wonk/config.toml"),
+            "[topology]\niterations=101\n",
+        )
+        .unwrap();
+        let index_path = db::local_index_path(root);
+        let index_dir = index_path.parent().unwrap();
+        fs::create_dir_all(index_dir).unwrap();
+        write_pid(index_dir).unwrap();
+        let before = fs::read(pid_file_path(index_dir)).unwrap();
+        let error = format!("{:#}", spawn_daemon(root, true).unwrap_err());
+        assert!(
+            error.contains("[topology] iterations"),
+            "validate invalid config before daemon side effects: {error}"
+        );
+        assert_eq!(fs::read(pid_file_path(index_dir)).unwrap(), before);
+        assert!(!index_path.exists());
+    }
 
     #[test]
     fn test_pid_file_path() {
