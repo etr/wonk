@@ -4,3 +4,4 @@ bench/repos/
 bench/results/
 __pycache__/
 .groundwork-plans/
+.debug/

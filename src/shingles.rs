@@ -170,8 +170,10 @@ pub fn encode_sketch(sketch: &[u32]) -> Vec<u8> {
 /// Decode a little-endian u32 blob back into a sketch. A trailing partial
 /// word (corrupt row) is ignored rather than propagated.
 pub fn decode_sketch(blob: &[u8]) -> Vec<u32> {
-    blob.chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect()
 }
 
