@@ -652,43 +652,51 @@ fn spawn_mock_ollama_embed_model_not_found() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock ollama");
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
+        // One thread per connection: the client's connection pool can
+        // open a socket it then leaves idle, and a sequential accept
+        // loop would block inside read_request_head on that idle socket
+        // while the real next request waits behind it — a mutual 0%-CPU
+        // hang. Serving concurrently makes an idle connection harmless.
         for stream in listener.incoming() {
-            let mut stream = match stream {
+            let stream = match stream {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let mut head = read_request_head(&mut stream);
-            if request_method(&head) == "CONNECT" {
-                // Complete the proxy tunnel handshake.
-                let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
-                let _ = stream.flush();
-                head = read_request_head(&mut stream);
-            }
-            match request_method(&head).as_str() {
-                // Health probe: the server is healthy.
-                "GET" => {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
-                    );
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut head = read_request_head(&mut stream);
+                if request_method(&head) == "CONNECT" {
+                    // Complete the proxy tunnel handshake.
+                    let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
                     let _ = stream.flush();
+                    head = read_request_head(&mut stream);
                 }
-                // Embedding request: healthy server, broken model. Drain the
-                // request body first so closing this socket never RSTs the
-                // response away from the still-reading client.
-                "POST" => {
-                    let mut request_body = vec![0u8; request_content_length(&head)];
-                    let _ = stream.read_exact(&mut request_body);
-                    let body = br#"{"error":"model not found"}"#;
-                    let response = format!(
-                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.write_all(body);
-                    let _ = stream.flush();
+                match request_method(&head).as_str() {
+                    // Health probe: the server is healthy.
+                    "GET" => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        );
+                        let _ = stream.flush();
+                    }
+                    // Embedding request: healthy server, broken model. Drain the
+                    // request body first so closing this socket never RSTs the
+                    // response away from the still-reading client.
+                    "POST" => {
+                        let mut request_body = vec![0u8; request_content_length(&head)];
+                        let _ = stream.read_exact(&mut request_body);
+                        let body = br#"{"error":"model not found"}"#;
+                        let response = format!(
+                            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(body);
+                        let _ = stream.flush();
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
+            });
         }
     });
     addr
