@@ -131,9 +131,8 @@ fn main() -> Result<()> {
     // percentiles — those would be noise at this magnitude. Individual
     // deltas can dip below zero from ordering effects; clamped for the
     // summary, raw shape visible in the p50.
-    let paired_deltas: Vec<f64> = full_ms.iter().zip(&detect_ms).map(|(f, d)| f - d).collect();
-    let mut paired = paired_deltas.clone();
-    let (r50, r95, r99, r100) = percentiles(&mut paired);
+    let mut paired_deltas: Vec<f64> = full_ms.iter().zip(&detect_ms).map(|(f, d)| f - d).collect();
+    let (r50, r95, r99, r100) = percentiles(&mut paired_deltas);
 
     ensure!(
         f95 < 2000.0,

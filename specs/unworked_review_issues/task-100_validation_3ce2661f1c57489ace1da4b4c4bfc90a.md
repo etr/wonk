@@ -30,11 +30,13 @@
    The pair recorder's degradation paths have no direct tests: record_near_duplicate_pairs' skip branches (a position no longer resolving to a symbol at lines 248-250, a==b after resolution at lines 251-253) and record_pairs_best_effort's write-failure eprintln branch (line 273) are exactly the guarantees the doc comments lean on ('a memo must never fail a search'), yet no test exercises them.
    *Recommendation:* Add unit tests: a pair whose (file, line) matches no symbol is silently skipped; a pair whose two positions resolve to the same symbol id is skipped; and (optionally, via an unwritable/locked connection) that record_pairs_best_effort returns without panicking on write failure.
 
-7. [ ] **code-quality-reviewer** | `src/shingles.rs:401` | correctness
+7. [x] **code-quality-reviewer** | `src/shingles.rs:401` | correctness
+   *Addressed (minors sweep, 2026-10-02):* fixed (pairs sorted before the f32 fold).
    sweep_near_duplicates' mean_similarity is summed in HashMap iteration order: `for (&(i, _), &sim) in &qualifying` iterates a std HashMap (RandomState, per-process seed), so the f32 summation order feeding `component_sims`/`mean_similarity` (lines 401-404, 415-417) can vary run to run in the last ulp. The module doc at lines 299-302 claims 'Deterministic end to end ... no HashMap iteration order feeds the output', but mean_similarity is printed output (`wonk duplicates` prints mean-sim). Practically invisible at the {:.2} output precision, yet the claim and the code disagree in principle.
    *Recommendation:* Either accumulate the per-component similarities in a deterministic order (iterate `qualifying` sorted by (i, j) key, or sort each component's sims vec before summing), or soften the doc comment to say the group membership and ordering are deterministic while mean-sim float summation may vary within output precision.
 
-8. [ ] **code-simplifier** | `src/db.rs:462` | dead-code
+8. [x] **code-simplifier** | `src/db.rs:462` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* moot (has a production read-path caller in run_duplicates).
    `ensure_duplicate_tables` has no production caller: `db::open` → `apply_schema` already executes DUPLICATES_SQL on every open, which covers the documented migration case (an index created before TASK-100), so the only invocations are the two idempotence assertions in db.rs tests. It follows the equally production-uncalled `ensure_history_tables`/`ensure_topology_tables` precedent (unlike `ensure_summaries_table`, which router/mcp/llm do call).
    *Recommendation:* Either wire it into the path that actually opens pre-existing indexes for the duplicates command (or drop it), or leave it as documented migration API — but note that as a family, three of the four ensure_* helpers are now test-only surface. Not blocking: it mirrors an established precedent.
 
@@ -66,7 +68,8 @@
    The threshold validity predicate `!t.is_finite() || t <= 0.0 || t > 1.0` and the (0, 1] range rationale are duplicated between `Config::apply` (config.rs:763, with the zero-flags-everything / above-one-flags-nothing explanation) and the CLI override check in dispatch_duplicates (router.rs:2527, with a shorter message). The two copies can drift — e.g. a future tightening of one bound but not the other.
    *Recommendation:* Extract a shared validator (e.g. `DuplicateConfig::validate_threshold(t) -> Result<(), String>` or a const `is_valid_threshold` predicate in shingles.rs next to the threshold-consuming code) and call it from both the config overlay application and the CLI override check.
 
-16. [ ] **code-simplifier** | `src/shingles.rs:366` | dead-code
+16. [x] **code-simplifier** | `src/shingles.rs:366` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (unreachable dedup dropped, noted in place).
    `members.dedup()` after the bucket-member sort appears unreachable for well-formed data: bucket keys come from `bucket_keys`, which takes the first BUCKET_KEY_COUNT entries of a sketch that `body_signature` already sorted and deduped, so the keys are distinct and an entry index lands in any given bucket at most once — there is nothing for dedup to remove. (It would only fire on a corrupt DB blob whose decoded sketch contains repeated values, since `decode_sketch` does not re-dedup.)
    *Recommendation:* Either remove the dedup, or — if it is deliberate defense against corrupt blobs, consistent with `decode_sketch`'s documented trailing-partial-word tolerance — add the one-line comment saying so. Silence reads as an accident today.
 

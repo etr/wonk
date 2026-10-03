@@ -1177,6 +1177,15 @@ impl<'a> Extractor<'a> {
                 if JS_PROVIDER_VERBS.contains(&prop)
                     && (self.ctx.is_router_var(recv) || JS_ROUTER_VARS.contains(&recv))
                     && let Some(arg) = first_arg
+                    // The noise gate the ambiguous arm already applies
+                    // (TASK-082 review debt): `JS_ROUTER_VARS` includes
+                    // the single letter `r`, so `redis`-style clients
+                    // named `r` used to emit `http::GET::user:1` providers
+                    // at full confidence for non-path arguments.
+                    && matches!(
+                        self.path_arg(arg),
+                        Some(PathArg::Direct(ref s)) if is_path_like(s)
+                    )
                 {
                     for mount_prefix in self.ctx.effective_prefixes(recv) {
                         self.emit_http(
@@ -4431,19 +4440,41 @@ fn java_string_literals(value: Node) -> Vec<Node> {
 /// Last string literal among the call's leading arguments — the routing
 /// key sits directly before the non-literal payload
 /// (`convertAndSend(exchange, routingKey, payload)`).
+/// The routing-key/topic argument of a Rabbit `convertAndSend`-style
+/// call: the last leading string literal before the non-literal payload
+/// — and, when the payload is ITSELF a string literal (the leading run
+/// reaches the end of the arguments), the second-to-last literal, never
+/// the payload (TASK-087 review debt:
+/// `convertAndSend("orders.created", "payload")` used to emit the queue
+/// under `"payload"`, corrupting the canonical id).
 fn java_last_leading_string(args: Node) -> Option<Node> {
-    let mut last = None;
+    let mut leading: Vec<Node> = Vec::new();
+    let mut ended_at_non_literal = false;
     for j in 0..args.named_child_count() {
         let Some(arg) = args.named_child(j as u32).map(unwrap_argument) else {
+            ended_at_non_literal = true;
             break;
         };
         if arg.kind() == "string_literal" {
-            last = Some(arg);
+            leading.push(arg);
         } else {
+            ended_at_non_literal = true;
             break;
         }
     }
-    last
+    if leading.is_empty() {
+        return None;
+    }
+    if ended_at_non_literal || leading.len() == 1 {
+        // The payload is non-literal (or there is only the addressing
+        // literal): the last leading literal IS the routing key.
+        leading.pop()
+    } else {
+        // Every argument is a string literal, so the FINAL one is the
+        // payload itself — the routing key is the one before it.
+        let n = leading.len();
+        Some(leading.remove(n - 2))
+    }
 }
 
 /// Java RestTemplate-style client method verbs. Only the unambiguous
@@ -6083,11 +6114,11 @@ pub fn canonical_rpc_join(scopes: &[RpcJoinScope]) -> Vec<RpcJoin> {
     }
 
     // Participants, with their scope index for deterministic tie-breaks.
-    let mut providers: Vec<(usize, usize, String, &ContractCandidate)> = Vec::new();
-    let mut consumers: Vec<(usize, usize, String, &ContractCandidate)> = Vec::new();
+    let mut providers: Vec<(usize, String, &ContractCandidate)> = Vec::new();
+    let mut consumers: Vec<(usize, String, &ContractCandidate)> = Vec::new();
     for (si, scope) in scopes.iter().enumerate() {
         let ws = normalize_workspace_id(&scope.workspace);
-        for (ci, cand) in scope.candidates.iter().enumerate() {
+        for cand in scope.candidates.iter() {
             if !is_rpc_family(cand.kind) {
                 continue;
             }
@@ -6107,16 +6138,16 @@ pub fn canonical_rpc_join(scopes: &[RpcJoinScope]) -> Vec<RpcJoin> {
             } else {
                 &mut consumers
             };
-            slot.push((si, ci, ws.clone(), cand));
+            slot.push((si, ws.clone(), cand));
         }
     }
 
     let mut joins = Vec::new();
-    for (csi, _cci, cws, consumer) in &consumers {
+    for (csi, cws, consumer) in &consumers {
         // Best provider: method-level before service-level, then the lowest
         // (scope, candidate) index.
         let mut best: Option<(u8, &ContractCandidate, usize, RpcMatchBasis)> = None;
-        for (psi, _pci, pws, provider) in &providers {
+        for (psi, pws, provider) in &providers {
             if pws != cws {
                 continue;
             }
@@ -6344,7 +6375,6 @@ pub struct SiblingRepo {
     /// Short repo name (last path component).
     pub name: String,
     /// Absolute path to the sibling's repository root.
-    pub repo_path: std::path::PathBuf,
     /// Absolute path to the sibling's `index.db`.
     pub index_path: std::path::PathBuf,
     /// Normalized effective workspaces (stored declared set, or the
@@ -6376,7 +6406,6 @@ pub fn scan_registry(
         }
         members.push(SiblingRepo {
             name: scope.repo_name,
-            repo_path,
             index_path,
             workspaces: scope.effective,
         });
@@ -6421,8 +6450,6 @@ impl SiblingConnections {
 
 /// The registry directory the CLI and MCP resolve links against:
 /// `$HOME/.wonk/repos`. `None` when no home directory exists.
-// First production consumer is the CLI/MCP wiring (TASK-084 phase 5).
-#[allow(dead_code)]
 pub(crate) fn default_repos_dir() -> Option<std::path::PathBuf> {
     crate::config::home_dir().map(|h| h.join(".wonk").join("repos"))
 }
@@ -8724,6 +8751,21 @@ class Orders {
     }
 
     #[test]
+    fn java_rabbit_convert_and_send_with_literal_payload() {
+        // TASK-087 review debt: when the payload is itself a string
+        // literal, the routing key is the literal BEFORE it — the old
+        // last-leading rule emitted the queue under the payload string.
+        let src = "void publish() {\n    rabbitTemplate.convertAndSend(\"orders.created\", \"payload\");\n}\n";
+        let cands = extract(Lang::Java, src);
+        let c = find(&cands, "queue::rabbitmq::orders.created").expect("contract not found");
+        assert!(
+            find(&cands, "queue::rabbitmq::payload").is_none(),
+            "the payload literal must not name the queue: {cands:?}"
+        );
+        assert_eq!(c.role, ContractRole::Consumer);
+    }
+
+    #[test]
     fn java_rabbit_template_send() {
         let src = "void publish() {\n    rabbitTemplate.send(\"orders.created\", msg);\n}\n";
         let cands = extract(Lang::Java, src);
@@ -9186,6 +9228,25 @@ void cfg(void) {
     }
 
     // -- ambiguity rules: 0.5 heuristic + path-like noise gate (step 7) -------
+
+    #[test]
+    fn single_letter_router_var_needs_a_path_like_route() {
+        // TASK-082 review debt: `JS_ROUTER_VARS` includes `r`, so a redis
+        // client bound to `r` used to emit `http::GET::user:1` providers
+        // at full confidence — the router arm now carries the same
+        // path-likeness gate as the ambiguous arm.
+        let src =
+            "const r = require('redis').createClient();\nr.get('user:1', cb);\nr.set('k', 'v');\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 0, "got {cands:?}");
+        // A genuine router named `r` with a path-like route still emits.
+        let src = "const r = express.Router();\nr.get('/orders', h);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert!(
+            find(&cands, "http::GET::/orders").is_some(),
+            "got {cands:?}"
+        );
+    }
 
     #[test]
     fn cache_like_receiver_is_not_a_contract() {

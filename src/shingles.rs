@@ -403,7 +403,8 @@ pub fn sweep_near_duplicates_capped(
                 .then(ma.line.cmp(&mb.line))
                 .then(entries[a].symbol_id.cmp(&entries[b].symbol_id))
         });
-        members.dedup();
+        // (No dedup needed: one entry per symbol id, and the sort above
+        // makes equal keys adjacent anyway.)
         if members.len() > max_bucket_members {
             members.truncate(max_bucket_members);
             truncated_buckets += 1;
@@ -438,7 +439,13 @@ pub fn sweep_near_duplicates_capped(
         let root = uf_find(&mut parent, idx);
         component_members.entry(root).or_default().push(idx);
     }
-    for (&(i, _), &sim) in &qualifying {
+    // Deterministic summation (TASK-100 review debt): f32 addition is
+    // not associative and HashMap iteration order varies per process —
+    // sort the pairs so each group's mean_similarity is bit-stable.
+    let mut qualifying_pairs: Vec<((usize, usize), f32)> =
+        qualifying.iter().map(|(&k, &v)| (k, v)).collect();
+    qualifying_pairs.sort_unstable_by_key(|((i, j), _)| (*i, *j));
+    for ((i, _), sim) in qualifying_pairs {
         let root = uf_find(&mut parent, i);
         component_sims.entry(root).or_default().push(sim);
     }

@@ -254,10 +254,12 @@ pub fn rerank_lexical(
         .cloned()
         .map(|r| {
             (
+                // The map above is built over exactly these results'
+                // distinct files, so the lookup always hits.
                 scores
                     .get(r.file.to_string_lossy().as_ref())
                     .copied()
-                    .unwrap_or(0.0),
+                    .unwrap_or_default(),
                 r,
             )
         })

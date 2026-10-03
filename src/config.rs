@@ -295,7 +295,7 @@ impl Default for FeedbackConfig {
 ///
 /// Per-family booleans rather than a rules list: each family layers
 /// independently, and a noisy rule can be silenced alone pending OQ-013
-/// calibration. All default to enabled (cross-repo arrives TASK-086).
+/// calibration. All default to enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewConfig {
     /// Rule family A: breaking change.

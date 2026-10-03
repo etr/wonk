@@ -2006,7 +2006,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             dispatch_duplicates(args, &mut fmt, suppress)?;
         }
         Command::Feedback(args) => {
-            dispatch_feedback(args, &mut fmt, suppress, format)?;
+            dispatch_feedback(args, &mut fmt, format)?;
         }
         Command::Review(args) => {
             dispatch_review(args, &mut fmt, suppress)?;
@@ -2150,7 +2150,18 @@ fn dispatch_review<W: io::Write>(
     //    REQ-015 filter knobs from the CLI (default off = today's report).
     let config = crate::config::Config::load(Some(&repo_root))?;
     let options = crate::review::ReviewOptions {
-        min_confidence: args.min_confidence,
+        // The REQ-015 floor, sanitized exactly like every sibling
+        // --min-confidence flag: NaN/infinity clamp to 0.0 (no filter),
+        // finite values clamp into [0, 1] (TASK-089 review debt —
+        // --min-confidence 5 used to pass through raw and drop every
+        // finding silently).
+        min_confidence: args.min_confidence.map(|c| {
+            if c.is_nan() || c.is_infinite() {
+                0.0
+            } else {
+                c.clamp(0.0, 1.0)
+            }
+        }),
         min_severity: args.min_severity,
         kinds: args.kind,
         max_findings: args.max_findings,
@@ -2542,7 +2553,16 @@ fn dispatch_contracts<W: io::Write>(
     }
 
     let rows = if filters.unused_providers {
-        payload.unused_providers.clone()
+        // --kind/--role apply on this mode too (TASK-084 review debt):
+        // the rows are providers by definition, so --role consumer
+        // selects nothing — the flags used to be silently ignored here.
+        payload
+            .unused_providers
+            .iter()
+            .filter(|row| kind.is_none_or(|k| row.kind == k))
+            .filter(|row| role.is_none_or(|r| row.role == r))
+            .cloned()
+            .collect()
     } else {
         payload.rows.clone()
     };
@@ -2638,7 +2658,6 @@ fn dispatch_duplicates<W: io::Write>(
 fn dispatch_feedback<W: io::Write>(
     args: crate::cli::FeedbackArgs,
     fmt: &mut Formatter<W>,
-    suppress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let repo_root = std::env::current_dir()
@@ -2673,7 +2692,7 @@ fn dispatch_feedback<W: io::Write>(
         );
     }
 
-    run_feedback(&conn, &args, &config, fmt, suppress, format)
+    run_feedback(&conn, &args, &config, fmt, format)
 }
 
 /// Record feedback and print the summary. Split from
@@ -2684,7 +2703,6 @@ fn run_feedback<W: io::Write>(
     args: &crate::cli::FeedbackArgs,
     config: &crate::config::Config,
     fmt: &mut Formatter<W>,
-    _suppress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     if args.weights {
@@ -7781,15 +7799,7 @@ mod tests {
     fn run_fb(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
         let mut buf = Vec::new();
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
-        run_feedback(
-            conn,
-            args,
-            &learning_config(),
-            &mut fmt,
-            true,
-            OutputFormat::Grep,
-        )
-        .unwrap();
+        run_feedback(conn, args, &learning_config(), &mut fmt, OutputFormat::Grep).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -7845,7 +7855,6 @@ mod tests {
             &feedback_args("deadbeefdeadbeef", &["1"]),
             &learning_config(),
             &mut fmt,
-            true,
             OutputFormat::Grep,
         )
         .unwrap_err()
@@ -7972,7 +7981,6 @@ mod tests {
             &args,
             &learning_config(),
             &mut fmt,
-            true,
             OutputFormat::Grep,
         )
         .unwrap();
@@ -8005,7 +8013,6 @@ mod tests {
             &args,
             &learning_config(),
             &mut fmt,
-            true,
             OutputFormat::Json,
         )
         .unwrap();
@@ -8046,15 +8053,7 @@ mod tests {
     fn run_fb_json(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
         let mut buf = Vec::new();
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Json, false);
-        run_feedback(
-            conn,
-            args,
-            &learning_config(),
-            &mut fmt,
-            true,
-            OutputFormat::Json,
-        )
-        .unwrap();
+        run_feedback(conn, args, &learning_config(), &mut fmt, OutputFormat::Json).unwrap();
         String::from_utf8(buf).unwrap()
     }
 

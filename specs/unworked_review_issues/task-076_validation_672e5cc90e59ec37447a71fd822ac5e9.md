@@ -53,7 +53,8 @@
    The bundled dimension is a bare literal `256` in `BundledProvider::dim()`, inconsistent with the codebase's established pattern `pub const OLLAMA_DIM: usize = 768` used by the legacy provider (src/embedding.rs:34, referenced at :243). The literal is also repeated in bench/bundled_embedding_bench.rs:59 and tests/ask_integration.rs:118.
    *Recommendation:* Introduce `pub const BUNDLED_DIM: usize = 256;` alongside OLLAMA_DIM (or in bundled_embedding.rs) and use it in `dim()` and the bench assertion. Leave test/bench literal assertions as-is where they intentionally pin the value (a test comparing against the same constant would pass tautologically); the constant is for the provider implementation and cross-file metadata checks.
 
-12. [ ] **code-simplifier** | `src/bundled_embedding.rs:66` | dead-code
+12. [x] **code-simplifier** | `src/bundled_embedding.rs:66` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (infallible conversion documented; guarded branch removed).
    In `read_u32`, the `try_into().map_err(|_| unavailable("invalid integer field"))` branch is unreachable: `bytes.get(offset..offset + 4)` returns `Some` only for an exactly-4-byte slice, so the `TryInto<[u8; 4]>` conversion cannot fail. The dead second error message also misleads readers into thinking there are two failure modes.
    *Recommendation:* Collapse to a single failure path, e.g. `bytes.get(offset..offset + 4).and_then(|f| f.try_into().ok()).map(u32::from_le_bytes).ok_or_else(|| unavailable("truncated header"))`. Behavior is identical because the eliminated branch could never execute.
 

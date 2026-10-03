@@ -46,7 +46,8 @@
    ac4c_rule_c_related_folds_like_blast_cross_repo_tier verifies consumer-set parity via resolve_cross_repo_consumers, but recomputes the SymbolRef mapping inline (duplicating the production mapping code in rule_cross_repo), so the folding assertion partially tests the mapping against itself rather than against blast's actual tier output.
    *Recommendation:* Run blast::analyze_blast on the provider symbol and derive the expected related set from the emitted CrossRepo tier (mapped to SymbolRef), making the never-disagree assertion end-to-end.
 
-10. [ ] **code-simplifier** | `/Users/etr/progs/wonk/.worktrees/TASK-086/src/config.rs:129` | dead-code
+10. [x] **code-simplifier** | `/Users/etr/progs/wonk/.worktrees/TASK-086/src/config.rs:129` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (comment updated).
    Stale future-tense comment: 'All default to enabled (cross-repo arrives TASK-086).' The cross-repo family IS added by this very diff (the `cross_repo` field sits four lines below), so the parenthetical describes work that has already landed and now reads as an unfulfilled promise. Related: src/review.rs:1 still opens the module with '//! Diff-scoped review engine (TASK-085).' although the module now carries rule family C.
    *Recommendation:* Drop the parenthetical ('All three default to enabled; a noisy family can be silenced alone pending OQ-013 calibration.') and widen the module header to '(TASK-085, TASK-086)'. Comment-only, no behavior.
 
@@ -58,7 +59,8 @@
    CrossRepoInputs::discover re-loads the repo Config (`Config::load(Some(repo_root))`, review.rs:168) to read `contracts.workspace`, although both callers (router.rs:1991, mcp.rs:2796) loaded the same Config immediately before calling it. Every review run parses config.toml twice for one value.
    *Recommendation:* Have discover take the already-loaded config — `pub fn discover(config: &Config) -> Option<Self>` reading `config.contracts.workspace` (or fold into the `discover_if_enabled` helper from finding 1). Note this also makes the fail-soft `.unwrap_or_default()` on a second load impossible to diverge from the caller's loaded view.
 
-13. [ ] **code-simplifier** | `/Users/etr/progs/wonk/.worktrees/TASK-086/src/review.rs:1667` | dead-code
+13. [x] **code-simplifier** | `/Users/etr/progs/wonk/.worktrees/TASK-086/src/review.rs:1667` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (comment cites the real helper).
    The ac1 test's opening comment cites `make_cross_repo_review_setup` — a function that exists nowhere in the codebase (the actual analogues are `make_cross_repo_review_repo`/`registered_sibling` in this module and blast.rs's `registered_contract_repo`). Worse, both of its claims are false for the code below it: the helpers DO return the provider repo root, and nothing is 'rebuilt inline' — the test simply calls the two helpers. A reader will grep for a phantom function and distrust the setup.
    *Recommendation:* Rewrite the comment to state the real fact (or delete it): e.g. 'Body edit keeps the signature intact: siblings depend on behavior, so rule C must still warn.' Comment-only.
 

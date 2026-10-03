@@ -124,8 +124,6 @@ pub fn anchored_line_text(
 /// Derive the verdict mechanically from findings: any blocking → BLOCK, any
 /// warning → REVIEW, else APPROVE. Pure — the only verdict path.
 pub fn derive_verdict(findings: &[Finding]) -> ReviewVerdict {
-    use crate::types::FindingSeverity;
-
     if findings
         .iter()
         .any(|f| f.severity == FindingSeverity::Blocking)
@@ -3074,7 +3072,7 @@ mod tests {
         if !git_available() {
             return;
         }
-        // Rebuild the setup inline: make_cross_repo_review_setup cannot
+        // Rebuild the setup inline: make_cross_repo_review_repo cannot
         // return the provider repo (it owns three TempDirs), and the test
         // must edit the provider's working tree.
         let repos_dir = TempDir::new().unwrap();

@@ -225,8 +225,9 @@ CREATE INDEX IF NOT EXISTS idx_review_suppressions_rule ON review_suppressions(r
 //
 // `co_change` (TASK-097) is the age-weighted file-coupling aggregate: one
 // row per DIRECTED pair, at most top-K per `file_a`, so storage stays
-// linear in files rather than quadratic; `idx_co_change_a` serves the
-// per-file strongest-coupling lookup the rerank signal folds.
+// linear in files rather than quadratic (the rerank loader queries by
+// `file_a` through the PK's leading column; a separate index served no
+// executed query — removed in the dead-code sweep).
 //
 // TASK-105 adds the author/recency columns: `mined_commits.author` (the
 // `%an` field) and the per-file `last_ts`/`last_author`/`primary_author`
@@ -261,7 +262,6 @@ CREATE TABLE IF NOT EXISTS co_change (
     weight REAL NOT NULL,
     PRIMARY KEY (file_a, file_b)
 );
-CREATE INDEX IF NOT EXISTS idx_co_change_a ON co_change(file_a, weight DESC);
 "#;
 
 // Global graph topology (TASK-098, DR-040): hub and authority scores per
@@ -473,6 +473,14 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Test-only handle to the full schema/migration pass that every
+/// [`open`] runs — cross-module tests use it on hand-built connections
+/// (the per-feature `ensure_*` wrappers it replaced were redundant).
+#[cfg(test)]
+pub(crate) fn apply_schema_for_tests(conn: &Connection) -> Result<()> {
+    apply_schema(conn)
+}
+
 fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)
         .context("creating base tables and indexes")?;
@@ -560,20 +568,8 @@ pub fn ensure_summaries_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the TASK-096/097 history tables exist (`file_churn`,
-/// `mined_commits`, `commit_files`, `history_meta`, `co_change`), plus
-/// the TASK-105 author/recency columns on pre-TASK-105 indexes (the
-/// `ensure_embedding_metadata_columns` precedent: PRAGMA table_info +
-/// ALTER). Safe to call on databases that already have the shape.
-pub fn ensure_history_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(HISTORY_SQL)
-        .context("creating history tables (migration)")?;
-    ensure_history_columns(conn)?;
-    Ok(())
-}
-
 /// Add the TASK-105 author/recency columns to history tables created
-/// before them: `mined_commits.author`, `file_churn.last_ts`,
+/// before them (run by `apply_schema` on every open): `mined_commits.author`, `file_churn.last_ts`,
 /// `file_churn.last_author`, `file_churn.primary_author`. Existing rows
 /// backfill NULL — the features stay omitted until the next mine.
 fn ensure_history_columns(conn: &Connection) -> Result<()> {
@@ -603,21 +599,8 @@ fn ensure_history_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the TASK-098 topology tables exist (`symbol_topology`,
-/// `topology_meta`), plus the TASK-105 fan-degree columns on
-/// pre-TASK-105 indexes.
-///
-/// Handles schema migration for indexes created before graph-topology
-/// scoring: safe to call on databases that already have the tables.
-pub fn ensure_topology_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(TOPOLOGY_SQL)
-        .context("creating topology tables (migration)")?;
-    ensure_topology_columns(conn)?;
-    Ok(())
-}
-
 /// Add the TASK-105 fan-degree columns to a `symbol_topology` table created
-/// before them. Existing rows backfill NULL — the graph features stay
+/// before them (run by `apply_schema` on every open). Existing rows backfill NULL — the graph features stay
 /// omitted until the next topology recompute.
 fn ensure_topology_columns(conn: &Connection) -> Result<()> {
     add_missing_columns(
@@ -735,18 +718,6 @@ pub fn ensure_term_stats_table(conn: &Connection) -> Result<()> {
 pub fn ensure_reach_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(REACH_SQL)
         .context("creating reach tables (migration)")?;
-    Ok(())
-}
-
-/// Ensure the `contracts` table exists, creating it if missing.
-///
-/// Handles schema migration for pre-V5 indexes created before contract
-/// storage (TASK-083) was added. Existing databases gain the empty table
-/// (plus indexes) on the next `open`; safe to call repeatedly (uses
-/// `CREATE TABLE IF NOT EXISTS`).
-pub fn ensure_contracts_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(CONTRACTS_SQL)
-        .context("creating contracts table (migration)")?;
     Ok(())
 }
 
@@ -2202,15 +2173,6 @@ mod tests {
                 "mined_commits"
             ]
         );
-        // The (file_a, weight DESC) index rides along with the table.
-        let indexes: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_co_change_a'")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        assert_eq!(indexes, vec!["idx_co_change_a"]);
     }
 
     #[test]
@@ -2224,9 +2186,11 @@ mod tests {
         conn.execute_batch(SCHEMA_SQL).unwrap();
         assert!(history_table_names(&conn).is_empty());
 
-        // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
-        ensure_history_tables(&conn).unwrap();
-        ensure_history_tables(&conn).unwrap();
+        // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent
+        // (the wrappers this test used were redundant with apply_schema,
+        // which every open() runs; dead-code sweep 2026-10-02).
+        apply_schema(&conn).unwrap();
+        apply_schema(&conn).unwrap();
         assert_eq!(history_table_names(&conn).len(), 5);
     }
 
@@ -2258,8 +2222,8 @@ mod tests {
         .unwrap();
 
         // Migrate, then migrate again — the ALTERs are guarded by PRAGMA.
-        ensure_history_tables(&conn).unwrap();
-        ensure_history_tables(&conn).unwrap();
+        apply_schema(&conn).unwrap();
+        apply_schema(&conn).unwrap();
 
         assert!(table_columns(&conn, "file_churn").contains(&"last_ts".to_string()));
         assert!(table_columns(&conn, "file_churn").contains(&"last_author".to_string()));
@@ -2324,8 +2288,8 @@ mod tests {
         assert!(topology_table_names(&conn).is_empty());
 
         // Migrate, then migrate again — CREATE IF NOT EXISTS is idempotent.
-        ensure_topology_tables(&conn).unwrap();
-        ensure_topology_tables(&conn).unwrap();
+        apply_schema(&conn).unwrap();
+        apply_schema(&conn).unwrap();
         assert_eq!(topology_table_names(&conn).len(), 2);
     }
 
@@ -3028,9 +2992,9 @@ mod tests {
             "open() should migrate the empty contracts table in"
         );
 
-        // Idempotent: a second run on a migrated DB succeeds.
-        ensure_contracts_table(&conn).unwrap();
-        ensure_contracts_table(&conn).unwrap();
+        // Idempotent: a second schema pass on a migrated DB succeeds.
+        apply_schema(&conn).unwrap();
+        apply_schema(&conn).unwrap();
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='contracts'",

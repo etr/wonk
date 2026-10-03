@@ -70,11 +70,9 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, EmbeddingError> {
     let value = bytes
         .get(offset..offset + 4)
         .ok_or_else(|| unavailable("truncated header"))?;
-    Ok(u32::from_le_bytes(
-        value
-            .try_into()
-            .map_err(|_| unavailable("invalid integer field"))?,
-    ))
+    // get(offset..offset + 4) above yields exactly four bytes, so the
+    // array conversion is infallible.
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
 }
 
 fn checked_slice(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Vec<u8>, EmbeddingError> {

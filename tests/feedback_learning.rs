@@ -1468,7 +1468,6 @@ mod tuning {
     /// (c) sign flips of effective − default in the noisy stream,
     /// (d) days for the stale stream to fall back under 25% of bound,
     /// (e) bound violations across every stream (must be 0).
-    #[allow(clippy::too_many_arguments)]
     fn metrics(step: f32, half_life: i64) -> (usize, f32, usize, f32, usize) {
         let consistent = trajectory("consistent", step, half_life);
         let noisy = trajectory("noisy", step, half_life);

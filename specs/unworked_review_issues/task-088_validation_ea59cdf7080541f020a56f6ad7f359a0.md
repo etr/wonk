@@ -79,7 +79,8 @@
    strip_proto_comments binds `let bytes: Vec<char> = line.chars().collect();` — the variable is a Vec<char>, not bytes, and the mismatch actively misleads in a function whose whole point is character-level scanning.
    *Recommendation:* Rename to `chars` (and `c` stays fine for the element).
 
-18. [ ] **code-simplifier** | `src/contracts.rs:5997` | dead-code
+18. [x] **code-simplifier** | `src/contracts.rs:5997` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (unused tuple positions dropped).
    The participant tuples in canonical_rpc_join carry candidate-index fields that are never read — `_pci` in the providers loop (6030) and `_cci` in the consumers loop (6026) are underscore-acknowledged dead weight; only the scope index (psi/csi) and the normalized workspace are used.
    *Recommendation:* Drop the candidate-index element from both Vec types (or replace the 4-tuples with a small struct carrying scope_idx, workspace, candidate), keeping the documented tie-break inputs only.
 

@@ -48,7 +48,8 @@
    table_fresh() conflates a missing meta row with a failed read: the built_depth query's error is swallowed with .ok(), so a genuine DB error (corruption, I/O) while reach_meta exists returns Ok(false), the repair is skipped, and no stale marker is ever set — a fresh-but-wrong table could then be served because lookups only check the stale marker.
    *Recommendation:* Distinguish QueryReturnedNoRows (legitimately unbuilt -> Ok(false)) from other rusqlite errors (propagate with context), matching how finish_file_edit surfaces the same read at src/reach.rs:447-455.
 
-10. [ ] **code-quality-reviewer** | `src/reach.rs:559` | dead-code
+10. [x] **code-quality-reviewer** | `src/reach.rs:559` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (guards removed).
    The `if chunk.is_empty() { continue; }` guards in canonical_ids_for_names (559), sources_targeting_names (587), and names_for_ids (612) are unreachable: Slice::chunks never yields an empty chunk.
    *Recommendation:* Remove the three guards, or if defensive intent is wanted, debug_assert!(!chunk.is_empty()) — but plain removal is simpler.
 
@@ -64,7 +65,8 @@
    `apply_delete` (lines 2455-2476) repeats `apply_edit`'s three DELETE statements verbatim; behaviorally it is exactly `apply_edit(conn, file, &spec(vec![], vec![], vec![]))` (empty spec inserts nothing, so the begin -> delete -> finish -> commit sequence is identical). Two copies of the delete sequence must stay mirroring production `delete_file_data` in lockstep.
    *Recommendation:* Keep the documentary name but delegate: `fn apply_delete(conn: &Connection, file: &str) -> ReachRepairStats { apply_edit(conn, file, &spec(vec![], vec![], vec![])) }` with the existing 'Simulate delete_file_data' doc comment. One copy of the delete sequence remains, and the name still says what the test means (DAMP is preserved; only the mechanics are deduplicated).
 
-14. [ ] **code-simplifier** | `src/reach.rs:319` | dead-code
+14. [x] **code-simplifier** | `src/reach.rs:319` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (field + accumulation removed).
    `ReachRepairStats::rows_deleted` (field declaration line 319, accumulation lines 436-440, return line 497) has no readers: pipeline.rs discards the stats entirely (`if let Err(e) = ...`), and no test asserts `rows_deleted` (the other three fields are each asserted). Commit ccd2c88 deliberately documents its semantics, so the intent is debug observability — but as written the field and its accumulator are dead code.
    *Recommendation:* Either make it live by asserting it where its semantics are already explained in a comment (repair_adds_and_removes_rows_for_caller_edits, where the repair's own delete count is documented as 0 after the FK cascade), or drop the field and the accumulator. Do not change what is counted — the doc comment's cascade caveat is accurate and worth keeping whichever way.
 
@@ -72,7 +74,8 @@
    The IN-list placeholder scaffolding `vec!["?"; chunk.len()].join(", ")` is repeated at four chunked-SQL call sites (lines 438, 562, 590, 615), each pairing it with the same `format!` + prepare + query_map shape.
    *Recommendation:* A one-line helper beside `IN_CHUNK`, e.g. `fn placeholders(n: usize) -> String { vec!["?"; n].join(", ") }`, used by all four sites. Low value individually, but it names the chunking idiom once for the next reader.
 
-16. [ ] **code-simplifier** | `src/reach.rs:559` | dead-code
+16. [x] **code-simplifier** | `src/reach.rs:559` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (guards removed).
    The `if chunk.is_empty() { continue; }` guards at lines 559, 587, and 612 are unreachable: `slice::chunks` never yields an empty chunk (an empty input produces zero iterations, a non-empty input produces non-empty chunks). The delete loop in `finish_file_edit` (line 437) correctly omits the guard, confirming within this same diff that it is unneeded — an internal inconsistency that reads as if the helper loops had a different contract than the delete loop.
    *Recommendation:* Delete the three two-line guards; the loops over `names.chunks(IN_CHUNK)` are then uniform with the delete loop at line 437.
 

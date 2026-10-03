@@ -58,7 +58,8 @@
    The MCP pin-parse error hand-writes the valid-class list ("invalid query_class '{v}' (valid: symbol, path, signature, conceptual)"), duplicating the list already maintained by QueryClass's FromStr error ("unknown query class '{s}' (known: symbol, path, signature, conceptual)", src/rerank.rs:1002-1004) — two hand-maintained copies in the same diff, plus the tools/list schema enum (src/mcp.rs:474) as a third. The ParseError is discarded and rewritten. Additionally the doubly-nested match (match on args.get, then on as_str().map(parse)) can be flattened.
    *Recommendation:* Surface the FromStr error for unparseable strings (Some(Err(e)) => return CallToolResult::error(e)) and keep the hand-written message only for non-string JSON values; the integration test asserts only that the four valid names appear, which both messages satisfy. Optionally single-source the list (a const or iteration over as_str) so the schema enum, FromStr error, and MCP error cannot drift.
 
-13. [ ] **code-simplifier** | `tests/rank_rollout.rs:286` | dead-code
+13. [x] **code-simplifier** | `tests/rank_rollout.rs:286` | dead-code
+   *Addressed (minors sweep, 2026-10-02):* fixed (redundant assignment removed).
    In previous_ordering_reachable_by_config, the RankConfig is constructed with `enabled: false` in the struct literal (line 283) and then `disabled.enabled = false;` (line 286) sets the same field to the same value again, forcing `let mut` for no reason. The double assignment reads as if the initializer might have been something else.
    *Recommendation:* Delete the `disabled.enabled = false;` statement and drop the `mut` from the binding — the struct literal already expresses the escape hatch.
 

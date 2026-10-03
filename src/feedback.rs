@@ -359,7 +359,23 @@ const SCORE_HIGH_BELOW: f32 = 0.75;
 /// diversity, so it fires only on pathological sets.
 const CATEGORICAL_CAP: usize = 32;
 /// The shared overflow label every beyond-cap categorical value wears.
+/// A genuine ancestor directory named exactly `__overflow__` is escaped
+/// at record time (see [`escape_overflow_colliding_ancestor`]) so a real
+/// feature can never collide with the sentinel (TASK-105 review debt).
 const OVERFLOW_LABEL: &str = "__overflow__";
+
+/// Ancestors are directory prefixes, so one named exactly like the
+/// overflow label would collide with the shared beyond-cap presence
+/// key. Escape only that one shape — every normal name records
+/// verbatim, and the escape is stripped nowhere (the escaped key is
+/// simply its own distinct feature).
+fn escape_overflow_colliding_ancestor(ancestor: &str) -> String {
+    if ancestor == OVERFLOW_LABEL {
+        format!("{OVERFLOW_LABEL}=")
+    } else {
+        ancestor.to_string()
+    }
+}
 
 /// Body-size bucket (lines). `tiny` < 8 < `small` < 30 < `medium` < 100 <
 /// `large` < 400 <= `huge`.
@@ -542,7 +558,10 @@ pub(crate) fn extract_groups(
 
     // -- path (PRD-FB-REQ-021/022) -------------------------------------------
     for ancestor in ancestor_dirs(canonical) {
-        groups.path.insert(ancestor, "1".to_string());
+        groups.path.insert(
+            escape_overflow_colliding_ancestor(&ancestor),
+            "1".to_string(),
+        );
     }
     let class = ctx
         .path_class(canonical)
@@ -1035,8 +1054,13 @@ fn slate_token(query: &str, nanos: u128, members: &[SlateMember], nonce: u32) ->
 
 /// Prune `feedback_slates` to the newest `retention` rows (LRU by
 /// `created_at`, token breaking ties deterministically).
-pub fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
-    prune_slates_exempting(conn, retention, None)
+fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
+    conn.execute(
+        "DELETE FROM feedback_slates WHERE token NOT IN \
+         (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?1)",
+        [retention as i64],
+    )?;
+    Ok(())
 }
 
 /// [`prune_slates`] with one token exempt from eviction: the slate minted
@@ -1057,16 +1081,10 @@ pub(crate) fn prune_slates_exempting(
                  (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?2)",
                 rusqlite::params![minted, retention as i64],
             )?;
+            Ok(())
         }
-        None => {
-            conn.execute(
-                "DELETE FROM feedback_slates WHERE token NOT IN \
-                 (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?1)",
-                [retention as i64],
-            )?;
-        }
+        None => prune_slates(conn, retention),
     }
-    Ok(())
 }
 
 /// A persisted slate: the token echoed to the caller plus the members,
@@ -1225,20 +1243,6 @@ pub fn load_events(conn: &Connection) -> Result<Vec<FeedbackEvent>> {
     )?;
     let events = stmt
         .query_map([], event_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(events)
-}
-
-/// Load feedback events with `id > since`, oldest first — the full
-/// event-table tail. The chunked learning replay uses
-/// [`load_learning_chunk`] instead; this remains the plain cursor.
-pub fn load_events_since(conn: &Connection, since: i64) -> Result<Vec<FeedbackEvent>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, result_identity, query_class, chosen_rank, features, useful, session, \
-         created_at FROM feedback_events WHERE id > ?1 ORDER BY id",
-    )?;
-    let events = stmt
-        .query_map([since], event_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(events)
 }
@@ -2242,6 +2246,24 @@ mod tests {
             "mid-batch failure wrote nothing"
         );
         drop(dir);
+    }
+
+    #[test]
+    fn overflow_named_directory_is_escaped_not_colliding() {
+        // TASK-105 review debt: a genuine top-level directory named
+        // exactly like the categorical-cap sentinel must not collide
+        // with the shared beyond-cap presence key.
+        assert_eq!(
+            escape_overflow_colliding_ancestor("__overflow__"),
+            "__overflow__="
+        );
+        assert_eq!(escape_overflow_colliding_ancestor("src/auth"), "src/auth");
+        // Nested same-named directories never carried the bare key and
+        // stay verbatim.
+        assert_eq!(
+            escape_overflow_colliding_ancestor("src/__overflow__"),
+            "src/__overflow__"
+        );
     }
 
     #[test]

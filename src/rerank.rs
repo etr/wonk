@@ -2061,8 +2061,16 @@ fn alias_file_map<V: Clone>(map: &mut HashMap<String, V>, keys: &HashMap<String,
     let extra: Vec<(String, V)> = map
         .iter()
         .filter_map(|(db, value)| {
-            let as_seen = keys.iter().find(|(k, v)| *v == db && k != v)?;
-            Some((as_seen.0.clone(), value.clone()))
+            // Deterministic shadow (TASK-100/105 review debt): several
+            // as-seen paths can map to one DB key, and HashMap iteration
+            // order picked whichever alias came first per process — the
+            // lexicographically smallest is stable everywhere.
+            let as_seen = keys
+                .iter()
+                .filter(|(k, v)| *v == db && k != v)
+                .map(|(k, _)| k.as_str())
+                .min()?;
+            Some((as_seen.to_string(), value.clone()))
         })
         .collect();
     map.extend(extra);
@@ -2077,8 +2085,13 @@ fn alias_position_map<V: Clone>(
     let extra: Vec<((String, u64), V)> = map
         .iter()
         .filter_map(|((db, line), value)| {
-            let as_seen = keys.iter().find(|(k, v)| *v == db && k != v)?;
-            Some(((as_seen.0.clone(), *line), value.clone()))
+            // Deterministic shadow — see alias_file_map.
+            let as_seen = keys
+                .iter()
+                .filter(|(k, v)| *v == db && k != v)
+                .map(|(k, _)| k.as_str())
+                .min()?;
+            Some(((as_seen.to_string(), *line), value.clone()))
         })
         .collect();
     map.extend(extra);

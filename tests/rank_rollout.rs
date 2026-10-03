@@ -293,11 +293,10 @@ fn previous_ordering_reachable_by_config() {
     // legacy ordering file-for-file, whatever the tuned defaults are.
     let (dir, conn) = setup_labeled_corpus();
     let labels = load_labels();
-    let mut disabled = wonk::config::RankConfig {
+    let disabled = wonk::config::RankConfig {
         enabled: false,
         ..tuned_rank_config()
     };
-    disabled.enabled = false;
     let escape = RankSettings::from_config(
         &disabled,
         &wonk::config::SearchConfig::default(),
