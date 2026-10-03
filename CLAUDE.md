@@ -53,10 +53,17 @@ CLI (clap) → Router → { SQLite index | grep search } → Ranker → Budget �
 | `watcher.rs` | Filesystem event classification and debouncing via `notify` |
 | `config.rs` | Layered TOML config: built-in defaults → `~/.wonk/config.toml` → `<repo>/.wonk/config.toml` |
 | `context.rs` | Unified symbol context — aggregates definition, callers, importers, type users, callees, imports, flow participation, and children from type_edges into a single `SymbolContext` response |
-| `blast.rs` | Blast radius analysis — depth-annotated BFS from a target symbol, severity tiers (WILL BREAK / LIKELY AFFECTED / MAY NEED TESTING), risk level assessment, inheritance integration via type_edges, test file exclusion |
+| `blast.rs` | Blast radius analysis — depth-annotated BFS from a target symbol, severity tiers (WILL BREAK / LIKELY AFFECTED / MAY NEED TESTING), risk level assessment, inheritance integration via type_edges, test file exclusion; qualifying upstream queries are answered from the precomputed reach table by default with BFS as the fallback beyond the built depth or when the table is stale/disabled |
 | `callgraph.rs` | Call graph traversal — BFS callers/callees expansion and callpath shortest-path finder via caller_id JOIN, cycle detection via visited HashSet, depth cap enforcement |
 | `flows.rs` | Entry point detection and flow tracing — SQL anti-join for functions/methods with no indexed callers, forward BFS callee expansion with depth/branching/min-confidence controls |
-| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes 18 query tools for AI coding assistants; multi-repo support via optional `repo` parameter and lazy-loaded connections |
+| `reach.rs` | Precomputed upstream reachability — bounded-depth reach table built inside the index transaction, name-keyed BFS mirroring blast's traversal, per-source fan-out cap with truncation markers, stale/absent-table BFS fallback, and the edge-eligibility predicate shared with blast (AR-021) |
+| `history.rs` | Bounded git-history mining — one `git log` pass over the newest N commits into per-commit detail, aggregate churn + co-change tables recomputed from that detail, watermark-driven refresh (`wonk update` authoritative, daemon best-effort) |
+| `topology.rs` | Symbol-graph topology — deterministic HITS hub/authority + label-propagation communities recomputed on update and at the daemon interval; read-only staleness helpers (the query path never recomputes) |
+| `contracts.rs` | Service-contract detection across 12 languages (HTTP routes/clients, env, queues, websocket, jobs, gRPC, GraphQL, OpenAPI) + cross-repo workspace link resolution |
+| `review.rs` | Diff-scoped review engine — rule families A (breaking change), B (coverage gap), C (cross-repo contract impact), D (suppressions), blast-radius-driven with confidence/severity filters |
+| `feedback.rs` | Usage-feedback capture — slate recording of ranked-search result features, result identities (content-anchored, SHA-256), event store with prune/retention |
+| `learning.rs` | Contrastive weight learning — bounded, decaying learned_weights over signal names and flattened descriptive features, session/observation gates, watermark-driven chunked replay, gated query-path overlay, per-result preferences |
+| `mcp.rs` | MCP server — JSON-RPC 2.0 over stdio, exposes the query tools for AI coding assistants; multi-repo support via optional `repo` parameter and lazy-loaded connections |
 | `budget.rs` | Token budget tracking (~4 chars/token heuristic) |
 
 ### Key Design Decisions

@@ -26,3 +26,26 @@ summed over all 40 labeled queries per iteration.
 
 The gate in REQ-016 is per warm query; the recorded mean is the sum over
 the whole 40-query labeled set per iteration, a strictly harsher measure.
+
+### Cold-start disclosure (review debt, 2026-10-02)
+
+The REQ-017 default flip puts `semantic = 0.3` in the active default
+weights, so a one-shot CLI `wonk search` on the Smart path decodes the
+6.5MB bundled model artifact once per process (zstd decompress + unpack
++ `StaticModel::from_bytes`) before the first query. The warm-query
+numbers above exclude it by construction (the bench warms untimed);
+REQ-016 is scoped to warm queries, and the long-lived surfaces (daemon,
+MCP server) amortize the decode across their lifetime.
+
+Measured on this host (Apple Silicon, release binary, two-function
+fixture, `/usr/bin/time -p`, 3 runs each): default-on smart search
+70-80 ms wall vs 15-20 ms with `[rank] enabled = false` — a ~60 ms
+cold-start delta dominated by the decode. On the TASK-095 session's
+larger fixture corpora the recorded delta was ~290-515 ms (303-545 ms
+mean vs 15-31 ms); absolute numbers scale with corpus and host.
+
+Mitigation path if one-shot CLI cold start matters: persist the decoded
+model as a memory-mappable artifact under `~/.wonk` (versioned by model
+id) so subsequent processes mmap instead of decode. Not implemented:
+the daemon and MCP server are the intended steady-state surfaces, and
+`[rank] enabled = false` restores the fast legacy path for scripting.

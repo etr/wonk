@@ -6,15 +6,18 @@
 
 ## Major
 
-1. [ ] **code-quality-reviewer** | `src/feedback.rs:1500` | correctness
+1. [x] **code-quality-reviewer** | `src/feedback.rs:1500` | correctness
+   *Addressed (majors sweep, 2026-10-02):* fixed (identity-first list_events).
    list_events resolves each event's display member with `event.features.members.iter().find(|m| m.chosen)`, but record_feedback (src/feedback.rs:1327-1352) stamps ALL useful members of one call as `chosen` in the single shared features payload written into every event row of that call. For a feedback call reporting two or more useful results, every event after the first shows the FIRST chosen member's file/line/symbol and computes liveness against that member's identity, while the `identity` and `rank` fields carry the event's own result — internally inconsistent `wonk feedback --list` output (e.g. 'rank 3 <file-of-rank-2>:<line>') and a potentially wrong `[retired]` marker, on the exact PRD-FB-REQ-019 legibility surface this task adds. No test records multiple useful results in one call and then lists, so the path is untested.
    *Recommendation:* Resolve the member by identity first — mirror learning.rs:197's event_updates pattern: `.find(|m| m.chosen && m.identity == event.result_identity).or_else(|| members.iter().find(|m| m.identity == event.result_identity))` — and build the files/identities sets for the live_identities call from each event's own resolved member.
 
-2. [ ] **code-simplifier** | `src/cli.rs:166` | patterns
+2. [x] **code-simplifier** | `src/cli.rs:166` | patterns
+   *Addressed (majors sweep, 2026-10-02):* fixed (ArgGroup mode).
    The seven standalone modes of FeedbackArgs each carry a nine-entry `conflicts_with_all` list (~90 lines total) expressing one invariant: the modes are pairwise exclusive and disjoint from the recording triple. The lists are verified symmetric today (no bug), but adding an eighth mode requires editing eight hand-maintained lists (every other mode's list plus `required_unless_present_any` on `useful`), and a missed entry silently permits a nonsense combination.
    *Recommendation:* Declare the exclusivity once with a clap ArgGroup on the struct — `#[command(group = clap::ArgGroup::new("mode").multiple(false).args(["weights", "list", "export", "clear_events", "clear_result", "reset_weights", "reset_weight"]))]` — then replace each mode's `conflicts_with_all` with nothing, change `slate`/`session`/`useful` to `conflicts_with = "mode"`, and simplify `useful`'s `required_unless_present_any = [7 ids]` to `required_unless_present = "mode"` (group ids are valid conflict/requirement targets in clap 4). Same accepted/rejected argument sets, stated one place instead of eight.
 
-3. [ ] **code-simplifier** | `src/mcp.rs:1703` | patterns
+3. [x] **code-simplifier** | `src/mcp.rs:1703` | patterns
+   *Addressed (majors sweep, 2026-10-02):* fixed (shared load seam).
    The AR-039 learned-load policy ('skip the load when no_feedback AND strip an attached table at the ranking seam, best-effort with a warning') is implemented twice in different shapes: router.rs:296-315 guards with `config.feedback.enabled && !args.no_feedback` and calls the private `system_secs()` helper, while mcp.rs:1703-1727 wraps an if/else around the same load and re-inlines the `systemTime::now()...unwrap_or(0)` timestamp router.rs:2788 already abstracts. This materially extends the known TASK-102 unworked finding (learned-load wiring duplicated across router.rs/mcp.rs beside a shared write-side helper): the task touched both sites and deepened the duplicated policy rather than extracting it, so the belt-and-suspenders contract must now be kept in sync in two places.
    *Recommendation:* Extract one read-side helper beside the existing write-side one, e.g. `learning::load_learned_best_effort(conn: Option<&Connection>, feedback: &FeedbackConfig, weights: &HashMap<String, f32>, no_feedback: bool, now: i64) -> Option<LearnedTable>` that folds the no_feedback skip, the enabled gate, and the warn-and-None error path; both dispatch sites reduce to `settings.feedback_free = no_feedback; settings.learned = load_learned_best_effort(...);`. Behavior-preserving: both sites' current semantics (enabled gate, conn-None skip, warn on error, timestamp fallback) are the union the helper implements.
 

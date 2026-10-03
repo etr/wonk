@@ -519,14 +519,43 @@ const INDEX_TABLES: &[&str] = &[
 fn no_index_writes_on_query_path() {
     let (dir, root) = feedback_repo(true, "");
 
-    let (code, stdout, stderr) = run_wonk(&root, &["search", "session_token"]);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    let token = slate_line_of(&stdout);
-
+    // LEG 1 — the SEARCH process (the primary query path; TASK-101
+    // review debt: the old test snapshotted only AFTER the search, so a
+    // ranked search writing index data passed silently). Every index
+    // table is swept before/after; the near_duplicates best-effort memo
+    // is the one documented query-path write outside the feedback
+    // tables and is excluded explicitly.
     let before: Vec<(String, i64)> = {
         let conn = open_index(&root);
         INDEX_TABLES
             .iter()
+            .filter(|t| **t != "near_duplicates")
+            .map(|t| (t.to_string(), count(&conn, t)))
+            .collect()
+    };
+
+    let (code, stdout, stderr) = run_wonk(&root, &["search", "session_token"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let token = slate_line_of(&stdout);
+
+    {
+        let conn = open_index(&root);
+        for (table, rows) in &before {
+            assert_eq!(
+                count(&conn, table),
+                *rows,
+                "search wrote to index table {table}"
+            );
+        }
+    }
+
+    // LEG 2 — the FEEDBACK call: the same sweep around the recording
+    // process.
+    let before: Vec<(String, i64)> = {
+        let conn = open_index(&root);
+        INDEX_TABLES
+            .iter()
+            .filter(|t| **t != "near_duplicates")
             .map(|t| (t.to_string(), count(&conn, t)))
             .collect()
     };

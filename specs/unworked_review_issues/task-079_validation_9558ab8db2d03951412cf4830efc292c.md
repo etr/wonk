@@ -6,11 +6,13 @@
 
 ## Major
 
-1. [ ] **code-simplifier** | `src/bm25.rs:140` | efficiency
+1. [x] **code-simplifier** | `src/bm25.rs:140` | efficiency
+   *Addressed (majors sweep, 2026-10-02):* fixed (candidate-scoped doc lengths).
    rerank_lexical materializes the entire `files` table into the `doc_len` HashMap on every query, but only the distinct candidate files are ever looked up (line 163). Cost scales with corpus size (paths + f32 per indexed file per query) instead of with the candidate set, in the interactive scoring path.
    *Recommendation:* Filter the query to candidate files with a bulk `IN (...)` clause over the distinct result paths — exactly the pattern `ranker::IndexLookup::load` (src/ranker.rs:117-143) already establishes for this access shape. Behavior is identical: files absent from the filtered query still take the `unwrap_or(corpus.avg_doc_len)` neutral fallback, same as files missing from the index today. Note `load_corpus_stats` keeps its own full scan (AVG), so only the HashMap materialization is avoidable.
 
-2. [ ] **performance-reviewer** | `src/bm25.rs:142` | algorithmic-complexity
+2. [x] **performance-reviewer** | `src/bm25.rs:142` | algorithmic-complexity
+   *Addressed (majors sweep, 2026-10-02):* fixed (O(1) corpus stats).
    Per-query cost includes two full scans of the `files` table that scale with total indexed files, not with the candidate set: (a) `SELECT COUNT(*), AVG(line_count) FROM files` in `load_corpus_stats` (src/bm25.rs:52) and (b) `SELECT path, line_count FROM files` to build the doc-length HashMap (src/bm25.rs:142). Measured on a synthetic 100k-row `files` table with wonk's exact schema: the COUNT+AVG aggregate alone costs ~8-9ms warm (pure SQLite, CLI-timed), and the doc-len scan adds SQLite traversal plus per-row decode, a Rust String allocation per path, and a HashMap insert (~10-25ms at 100k rows; ~2-5ms combined at 10k files). The bench corpus has only 300 files, so the #[ignore] gate structurally cannot observe this component and the verified <10ms medians do not carry to large repos. The doc comment at src/bm25.rs:91 also understates the work as '2 + T statements' — it is 3 + T (probe, corpus stats, T postings, doc-len scan). Memory-wise the doc-len map holds every indexed path transiently per query (~10-15MB at 100k files).
    *Recommendation:* Restrict the doc-length lookup to the distinct candidate files: collect distinct `result.file` keys and issue `SELECT path, line_count FROM files WHERE path IN (...)` (files.path is the PRIMARY KEY, so this is a bounded set of index seeks; chunk the IN list for >32k variables or use a temp table). For corpus stats, persist n_docs/avg_doc_len at index time (a one-row summary table or the existing meta KV updated by build_index/incremental_update) instead of aggregating per query — note the router opens a fresh Connection per search, so in-process memoization would not help the CLI path. Re-run the bench with a large-files fixture (e.g. 50k files) to re-validate the <10ms criterion under the fixed shape.
 

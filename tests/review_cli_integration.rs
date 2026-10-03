@@ -129,6 +129,40 @@ fn review_json_smoke_reports_findings_and_verdict_with_exit_zero() {
 }
 
 #[test]
+fn review_config_toml_disables_rule_families() {
+    // TASK-085 review debt (AR-022): the [review] config keys must reach
+    // ReviewOptions through dispatch_review — a miswired gate would pass
+    // every unit test, since only run_review options were exercised.
+    let repo = indexed_repo();
+    let root = repo.path();
+
+    // Working tree deletes used(), keeps caller: a rule-A candidate.
+    std::fs::write(root.join("src/lib.rs"), "pub fn caller() { used(); }\n").unwrap();
+
+    // Without config: the finding blocks.
+    let (code, stdout, _) = run_review(root, &[]);
+    assert_eq!(code, 0);
+    let (_, verdict) = parse_review_ndjson(&stdout);
+    assert_eq!(verdict["verdict"], "BLOCK");
+
+    // With [review] breaking_change = false: the same diff approves.
+    std::fs::create_dir_all(root.join(".wonk")).unwrap();
+    std::fs::write(
+        root.join(".wonk/config.toml"),
+        "[review]\nbreaking_change = false\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_review(root, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let (findings, verdict) = parse_review_ndjson(&stdout);
+    assert_eq!(verdict["verdict"], "APPROVE", "stdout: {stdout}");
+    assert!(
+        findings.iter().all(|f| f["kind"] != "breaking-change"),
+        "the disabled family must drop its findings: {findings:?}"
+    );
+}
+
+#[test]
 fn review_without_index_errors_instead_of_auto_indexing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

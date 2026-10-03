@@ -28,14 +28,19 @@ use crate::router::QueryRouter;
 use crate::search;
 use crate::types::Symbol;
 
+/// Resolve the provider kind for a tool invocation: the optional
+/// caller-supplied override, else the repo's configured provider.
+///
+/// Parsing and selection live in `crate::embedding`
+/// ([`EmbeddingProviderKind::parse`] + [`resolve_provider_kind`]) so the
+/// CLI and MCP transports share one provider-selection implementation;
+/// only the JSON-RPC error conversion stays here.
 fn embedding_provider_kind_for(
     repo_root: &Path,
     invocation: Option<&str>,
 ) -> Result<crate::embedding::EmbeddingProviderKind, String> {
     let invocation = match invocation {
-        Some("bundled") => Some(crate::embedding::EmbeddingProviderKind::Bundled),
-        Some("ollama") => Some(crate::embedding::EmbeddingProviderKind::Ollama),
-        Some(other) => return Err(format!("invalid embedding provider: {other}")),
+        Some(name) => Some(crate::embedding::EmbeddingProviderKind::parse(name)?),
         None => None,
     };
     let config = crate::config::Config::load(Some(repo_root))
@@ -58,10 +63,19 @@ fn embedding_provider_for(
 /// stored vector spaces: an unreachable configured Ollama degrades to the
 /// bundled provider with a stderr warning, while a mismatched stored space
 /// errors with the re-embed command — the same contract as `wonk ask`.
+///
+/// Returns the provider together with the configured kind it was resolved
+/// from, so tool arms can re-plan (degrade) after a mid-query disconnect.
 fn plan_query_provider(
     conn: &rusqlite::Connection,
     repo_root: &Path,
-) -> Result<Box<dyn crate::embedding::EmbeddingProvider>, CallToolResult> {
+) -> Result<
+    (
+        Box<dyn crate::embedding::EmbeddingProvider>,
+        crate::embedding::EmbeddingProviderKind,
+    ),
+    CallToolResult,
+> {
     let configured = match embedding_provider_kind_for(repo_root, None) {
         Ok(kind) => kind,
         Err(error) => return Err(CallToolResult::error(error)),
@@ -71,9 +85,31 @@ fn plan_query_provider(
         Err(error) => return Err(CallToolResult::error(format!("{error}"))),
     };
     if let Some(warning) = plan.fallback_warning {
-        eprintln!("warning: {warning}");
+        crate::output::print_warning(warning);
     }
-    Ok(plan.provider)
+    Ok((plan.provider, configured))
+}
+
+/// Mid-query disconnect handling for the semantic tool arms: re-plan with
+/// the configured provider dead and degrade to the bundled provider with
+/// the same warning `wonk ask` prints, or surface the re-embed instruction
+/// as a tool error when the stored vectors make the fallback unsafe
+/// (mirrors the router's `degrade_after_disconnect`).
+fn degrade_after_disconnect(
+    conn: &rusqlite::Connection,
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>, CallToolResult> {
+    match crate::embedding::fallback_after_disconnect(conn, configured) {
+        Ok(fallback) => {
+            crate::output::print_warning(
+                fallback
+                    .fallback_warning
+                    .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
+            );
+            Ok(fallback.provider)
+        }
+        Err(error) => Err(CallToolResult::error(format!("{error}"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,24 +1743,12 @@ impl McpServer {
             .get("no_feedback")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        settings.feedback_free = no_feedback;
         // Learned weights (TASK-102): the gated overlay — ONE read,
-        // best-effort (a missing table is silent; other errors warn).
-        settings.learned = if no_feedback {
-            None
-        } else {
-            ranker_conn.and_then(|conn| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_secs() as i64)
-                    .unwrap_or(0);
-                crate::learning::load_learned(conn, &config.feedback, &config.rank.weights, now)
-                    .unwrap_or_else(|e| {
-                        eprintln!("wonk: learned-weight load failed: {e:#}");
-                        None
-                    })
-            })
-        };
+        // best-effort (a missing table is silent; other errors warn),
+        // through the shared AR-039 policy seam.
+        settings.feedback_free = no_feedback;
+        settings.learned =
+            crate::router::load_learned_best_effort(ranker_conn, &config, no_feedback);
         let ranked =
             crate::rerank::rank_and_explain_classed(&results, ranker_conn, &query, &settings);
         // Best-effort REQ-003 memo: persist the pairs the novelty pass
@@ -1734,15 +1758,6 @@ impl McpServer {
         // [feedback] enabled; rows carry the token and identities.
         let stored_slate =
             crate::router::record_slate_best_effort(ranker_conn, &query, &ranked, &config.feedback);
-        let identity_of = stored_slate
-            .as_ref()
-            .map(|s| {
-                s.members
-                    .iter()
-                    .map(|m| ((m.file.clone(), m.line), m.identity.clone()))
-                    .collect::<std::collections::HashMap<_, _>>()
-            })
-            .unwrap_or_default();
 
         let mut budget = budget_limit.map(|limit| {
             if let Some(p) = page {
@@ -1766,12 +1781,10 @@ impl McpServer {
                 out.query_class = ranked.query_class.map(|c| c.as_str().to_string());
                 if let Some(slate) = stored_slate.as_ref() {
                     out.slate = Some(slate.token.clone());
-                    out.identity = identity_of
-                        .get(&(
-                            item.classified.result.file.to_string_lossy().into_owned(),
-                            item.classified.result.line,
-                        ))
-                        .cloned();
+                    out.identity = slate.identity_for(
+                        &item.classified.result.file.to_string_lossy(),
+                        item.classified.result.line,
+                    );
                 }
 
                 if let Some(ref mut b) = budget {
@@ -3029,33 +3042,18 @@ impl McpServer {
             Err(e) => return CallToolResult::error(e),
         };
 
-        // Scope parsing mirrors tool_changes, plus `since` as sugar for
-        // compare+base (the CLI's --since).
+        // Scope resolution through the shared seam (TASK-086 review
+        // debt): the router's parse — including the base-ref validation
+        // this copy used to skip — plus `since` sugar.
         let scope_str = args
             .get("scope")
             .and_then(|v| v.as_str())
             .unwrap_or("unstaged");
-        let (scope_str, base) = match args.get("since").and_then(|v| v.as_str()) {
-            Some(since) => ("compare".to_string(), Some(since.to_string())),
-            None => (
-                scope_str.to_string(),
-                args.get("base").and_then(|v| v.as_str()).map(String::from),
-            ),
-        };
-        let scope = if scope_str == "compare" {
-            match base {
-                Some(b) => crate::types::ChangeScope::Compare(b),
-                None => {
-                    return CallToolResult::error(
-                        "'base' is required when scope=compare (or use 'since')".into(),
-                    );
-                }
-            }
-        } else {
-            match scope_str.parse::<crate::types::ChangeScope>() {
-                Ok(s) => s,
-                Err(e) => return CallToolResult::error(e),
-            }
+        let since = args.get("since").and_then(|v| v.as_str());
+        let base = args.get("base").and_then(|v| v.as_str());
+        let scope = match crate::router::resolve_scope_args(scope_str, base, since) {
+            Ok(s) => s,
+            Err(e) => return CallToolResult::error(format!("{e:#}")),
         };
 
         let config = match crate::config::Config::load(Some(&repo_root)) {
@@ -3063,18 +3061,10 @@ impl McpServer {
             Err(e) => return CallToolResult::error(format!("config load failed: {e}")),
         };
         let options = crate::review::ReviewOptions {
-            breaking_change: config.review.breaking_change,
-            coverage_gap: config.review.coverage_gap,
-            cross_repo: config.review.cross_repo,
-            reach_enabled: config.reach.enabled,
             elide,
-            ..crate::review::ReviewOptions::default()
+            ..crate::review::ReviewOptions::from_config(&config)
         };
-        let cross_repo = config
-            .review
-            .cross_repo
-            .then(|| crate::review::CrossRepoInputs::discover(&repo_root))
-            .flatten();
+        let cross_repo = crate::review::CrossRepoInputs::discover_if_enabled(&config, &repo_root);
 
         match crate::review::run_review(conn, &scope, &repo_root, &options, cross_repo.as_ref()) {
             Ok(result) => {
@@ -3186,24 +3176,16 @@ impl McpServer {
 
         let format = extract_format(&args);
 
-        // Parse scope.
+        // Parse scope through the shared seam (TASK-086 review debt) —
+        // including the base-ref validation this copy used to skip.
         let scope_str = args
             .get("scope")
             .and_then(|v| v.as_str())
             .unwrap_or("unstaged");
-        let scope = if scope_str == "compare" {
-            let base = match args.get("base").and_then(|v| v.as_str()) {
-                Some(b) => b.to_string(),
-                None => {
-                    return CallToolResult::error("'base' is required when scope=compare".into());
-                }
-            };
-            crate::types::ChangeScope::Compare(base)
-        } else {
-            match scope_str.parse::<crate::types::ChangeScope>() {
-                Ok(s) => s,
-                Err(e) => return CallToolResult::error(e),
-            }
+        let base = args.get("base").and_then(|v| v.as_str());
+        let scope = match crate::router::resolve_scope_args(scope_str, base, None) {
+            Ok(s) => s,
+            Err(e) => return CallToolResult::error(format!("{e:#}")),
         };
 
         let blast = args.get("blast").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -3371,8 +3353,8 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match plan_query_provider(conn, &repo_root) {
-            Ok(provider) => provider,
+        let (provider, configured) = match plan_query_provider(conn, &repo_root) {
+            Ok(resolved) => resolved,
             Err(e) => return e,
         };
 
@@ -3411,6 +3393,22 @@ impl McpServer {
 
         let mut query_vec = match provider.embed_single(&query) {
             Ok(v) => v,
+            Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
+                // Ollama died between the plan-time health probe and the
+                // query embed: degrade to the bundled provider with the same
+                // warning `wonk ask` prints, or surface the mismatch with
+                // its re-embed command as a tool error — never a hard
+                // transport failure.
+                match degrade_after_disconnect(conn, configured) {
+                    Ok(fallback) => match fallback.embed_single(&query) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return CallToolResult::error(format!("embedding query failed: {e}"));
+                        }
+                    },
+                    Err(e) => return e,
+                }
+            }
             Err(e) => return CallToolResult::error(format!("embedding query failed: {e}")),
         };
         crate::embedding::normalize(&mut query_vec);
@@ -3529,8 +3527,8 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match plan_query_provider(conn, &repo_root) {
-            Ok(provider) => provider,
+        let (provider, _configured) = match plan_query_provider(conn, &repo_root) {
+            Ok(resolved) => resolved,
             Err(e) => return e,
         };
 
@@ -3598,8 +3596,8 @@ impl McpServer {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let provider = match plan_query_provider(conn, &repo_root) {
-            Ok(provider) => provider,
+        let (provider, _configured) = match plan_query_provider(conn, &repo_root) {
+            Ok(resolved) => resolved,
             Err(e) => return e,
         };
 
@@ -5885,6 +5883,70 @@ mod tests {
         assert_eq!(
             result["content"][0]["text"],
             "invalid embedding provider: remote"
+        );
+    }
+
+    // -- degrade_after_disconnect (mid-query disconnect fallback) -----------
+
+    /// In-memory DB whose embeddings table holds the given vector-space rows.
+    fn mcp_space_db(entries: &[(&str, i64)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                symbol_id INTEGER NOT NULL,
+                file TEXT NOT NULL, chunk_text TEXT NOT NULL, vector BLOB NOT NULL,
+                stale INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                provider TEXT NOT NULL, dim INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for (i, (provider, dim)) in entries.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO embeddings
+                    (symbol_id, file, chunk_text, vector, created_at, provider, dim)
+                 VALUES (?1, 'a.rs', 'chunk', x'00', 1000, ?2, ?3)",
+                rusqlite::params![i as i64 + 1, provider, *dim],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn degrade_after_disconnect_bundled_space_degrades_with_warning() {
+        // The provider died mid-query over a bundled-compatible index: the
+        // re-plan degrades to the bundled provider (the warning itself is
+        // printed by the helper; embedding.rs pins its exact text).
+        let conn = mcp_space_db(&[("bundled", 256), ("bundled", 256)]);
+        let provider =
+            degrade_after_disconnect(&conn, crate::embedding::EmbeddingProviderKind::Ollama)
+                .map_err(|error| format!("should degrade over a bundled index, got {error:?}"))
+                .unwrap();
+        assert_eq!(provider.name(), "bundled");
+        assert_eq!(provider.dim(), 256);
+    }
+
+    #[test]
+    fn degrade_after_disconnect_foreign_space_returns_tool_error() {
+        // Stored vectors in the ollama space: the fallback must refuse and
+        // surface the mismatch with the exact re-embed command as a tool
+        // error, mirroring the CLI arm.
+        let conn = mcp_space_db(&[("ollama", 768)]);
+        let result =
+            degrade_after_disconnect(&conn, crate::embedding::EmbeddingProviderKind::Ollama);
+        let error = result
+            .err()
+            .expect("foreign-space stored vectors must block the fallback");
+        let serialized = serde_json::to_value(&error).unwrap();
+        assert_eq!(serialized["isError"], true);
+        let message = serialized["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(message.contains("vector space mismatch"), "got: {message}");
+        assert!(
+            message.contains("wonk update --force --provider bundled"),
+            "got: {message}"
         );
     }
 

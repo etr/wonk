@@ -35,6 +35,22 @@ rrf_k = 60.0                  # Reciprocal Rank Fusion constant K
 bm25_k1 = 1.2                # BM25 term-frequency saturation strength
 bm25_b = 0.75                # BM25 length-normalization strength
 
+[reach]                       # Precomputed upstream reachability (TASK-080)
+depth = 3                     # Depth the reach table is materialized to
+enabled = true                # Kill switch: false restores exact V4 behavior
+
+[history]                     # Bounded git-history mining (TASK-096)
+window = 500                  # Number of newest commits mined
+max_commit_files = 50         # Commits touching strictly more files contribute no co-change
+enabled = true                # Kill switch: false skips mining entirely
+
+[topology]                    # Symbol-graph hub/authority + communities (TASK-098)
+iterations = 20               # Exact HITS power-method iterations per recompute
+community_passes = 30         # Label-propagation sweep cap
+interval = 3600               # Minimum seconds between daemon recomputes
+stale_after = 86400           # Seconds after which served scores flag as stale
+enabled = true                # Kill switch: false zeroes both signal weights
+
 [feedback]                    # Usage-feedback capture (default off)
 enabled = false               # Kill switch: no slates recorded, no feedback accepted
 slate_retention = 64          # Most recent slates kept per repo
@@ -168,6 +184,47 @@ pass (see `[rank] weights.novelty`), the `near_duplicates` pairs
 recorded best-effort after each ranked search, and `wonk duplicates`
 reporting (which also takes a one-off `--threshold` override).
 
+**`[reach]`**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `depth` | `3` | Depth to which the upstream-reachability table is materialized during index build; clamped to the blast depth cap at the use site |
+| `enabled` | `true` | Kill switch: `false` skips the table build and restores exact V4 behavior (PRD-REACH-REQ-006) |
+
+Qualifying upstream blast queries are answered from the precomputed table
+by default, with live BFS as the fallback beyond the built depth or when
+the table is stale/disabled. Indexing builds the table inside the index
+transaction with a per-source fan-out cap; incremental edits repair it or
+mark it stale, never serve wrong rows.
+
+**`[history]`**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `window` | `500` | Number of newest commits to mine; `0` is a hard configuration error naming the key |
+| `max_commit_files` | `50` | Bulk-commit exclusion for co-change coupling: a commit touching strictly more files than this contributes no coupling (it still counts for churn and still bounds the window); `< 2` is a hard error |
+| `enabled` | `true` | Kill switch: `false` skips mining entirely (PRD-HIST-REQ-008) |
+
+Mining cost is proportional to the window, never repo age. The churn and
+co-change signals default to weight `0` under `[rank] weights` — ranking
+is unchanged until a weight is set explicitly.
+
+**`[topology]`**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Kill switch: `false` skips the pass and zeroes both signal weights (PRD-TOPO-REQ-008) |
+| `iterations` | `20` | Exact number of HITS power-method iterations per recompute; `0` is a hard error |
+| `community_passes` | `30` | Label-propagation sweep cap for community detection; `0` is a hard error |
+| `interval` | `3600` | Minimum seconds between daemon-triggered recomputes; `0` is a hard error |
+| `stale_after` | `86400` | Seconds after which served scores are flagged stale in `wonk status`; `0` is a hard error |
+
+Hub/authority scores and communities recompute on `wonk update` and, at
+the interval cadence, in the daemon. The query path never recomputes —
+a stale table reports as stale and the hub/authority signals simply carry
+their stored values. Both signals default to weight `0` under
+`[rank] weights`.
+
 **`[feedback]`**
 
 | Key | Default | Description |
@@ -276,7 +333,7 @@ written.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `provider` | `"bundled"` | Embedding provider: offline bundled model, or opt-in `"ollama"` using `nomic-embed-text` |
+| `provider` | `"bundled"` | Embedding provider: offline bundled model, or opt-in `"ollama"` using `nomic-embed-text`. The bundled model decodes to ~62 MiB resident per process (~97 MiB peak during decode) — see bench/bundled-embedding-results.md |
 
 Provider selection follows the normal configuration precedence: per-repo
 configuration overrides global configuration, which overrides the built-in

@@ -6,7 +6,8 @@
 
 ## Major
 
-1. [ ] **code-simplifier** | `src/mcp.rs:1758` | code-structure
+1. [x] **code-simplifier** | `src/mcp.rs:1758` | code-structure
+   *Addressed (majors sweep, 2026-10-02):* fixed (compare_path_character shared).
    The graded path-character sort closure — `values.get(&x.file).copied().unwrap_or(1.0)` then `b_value.partial_cmp(&a_value).unwrap_or(Ordering::Equal)` — is copy-pasted at three sites: mcp.rs:1758-1764 (wonk_sym), router.rs:3751-3757 (query_symbols_db_with_filters), and show.rs:166-176 (non-exact show sort). The comments at each site claim 'the ONE graded path-character demotion', yet the two policy decisions it embeds (missing entry defaults to 1.0, never a demotion; NaN compares Equal) must now be kept in sync by hand in three modules, and a fourth sort site would copy them again.
    *Recommendation:* Hoist the comparator into rerank.rs next to `path_character_values`, e.g. `pub fn compare_path_character(values: &HashMap<String, f32>, a: &str, b: &str) -> std::cmp::Ordering`, and have each site call `r.sort_by(|a, b| rerank::compare_path_character(&values, &a.file, &b.file))` (show.rs keeps its exact-name key via `.then_with`). Behavior-preserving: same defaults, same NaN handling, same stable sort.
 

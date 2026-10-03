@@ -6,15 +6,18 @@
 
 ## Major
 
-1. [ ] **code-quality-reviewer** | `src/review.rs:357` | correctness
+1. [x] **code-quality-reviewer** | `src/review.rs:357` | correctness
+   *Addressed (majors sweep, 2026-10-02):* fixed ((name,kind,file) key + test).
    Rule A's same-diff-removed-caller filter keys on (name, kind) only. The `removed` HashSet (lines 357-363) is matched against blast-radius callers at line 214 without file or scope, so a live caller that merely shares name+kind with ANY unrelated removed symbol in the diff is dropped as 'dead code'. With common method names (run/apply/new/fmt as Method across different types, since SymbolKind does not encode the receiver) this under-reports callers, and if it is the only surviving caller the BLOCK finding disappears entirely, flipping the verdict. The intended dead-code case (helper + its caller deleted together, test rule_a_removal_with_all_callers_removed_is_not_blocking) usually lives in the same or a known file, so the coarse key is not required to implement it.
    *Recommendation:* Key the removed set on (name, kind, file): ChangedSymbol.file and BlastAffectedSymbol.file are both old-side/indexed paths for removed code, so they compare cleanly, and the dead-code test still passes. Note the blast-output side already carries s.file. If cross-file dead-code removal (helper and caller in different files) must keep working, at least document the name-collision hazard next to the filter.
 
-2. [ ] **code-simplifier** | `src/review.rs:256` | patterns
+2. [x] **code-simplifier** | `src/review.rs:256` | patterns
+   *Addressed (majors sweep, 2026-10-02):* fixed (From<&BlastAffectedSymbol>).
    The BlastAffectedSymbol-to-SymbolRef four-field mapping (name/kind/file/line clone) is hand-rolled four times in one file: rule_breaking_change's `related` (lines 256-264), rule_coverage_gap's `related` (lines 321-331), and twice in tests (symbol_refs_of at 1041-1053, and inlined again in ac4a_rule_a_related_equals_standalone_blast_output at 1095-1110 even though symbol_refs_of already exists beside it).
    *Recommendation:* Add `impl From<&BlastAffectedSymbol> for SymbolRef` in src/types.rs next to the existing `impl From<&ChangedSymbol> for SymbolRef` (types.rs line 273), then use `.map(SymbolRef::from)` at each site. This shares only the field mapping; the two rule functions stay fully separate, preserving the declared TASK-089 per-rule-suppression assumption.
 
-3. [ ] **test-quality-reviewer** | `/Users/etr/progs/wonk/.worktrees/TASK-085/src/review.rs:1254` | missing-test
+3. [x] **test-quality-reviewer** | `/Users/etr/progs/wonk/.worktrees/TASK-085/src/review.rs:1254` | missing-test
+   *Addressed (majors sweep, 2026-10-02):* fixed (rule-B disable + config-wiring tests).
    AR-022 requires each rule family to be independently disable-able, but only family A is verified: `rules_independently_disableable` disables `breaking_change` and asserts empty findings/approve. No test anywhere sets `ReviewOptions { coverage_gap: false, .. }` through `run_review`, and no test wires a `[review]` config file through `dispatch_review` into `ReviewOptions` (the CLI integration tests run with default config only, and `rules_independently_disableable` constructs options directly). If `dispatch_review` (src/router.rs, ReviewOptions construction) miswired `coverage_gap: config.review.breaking_change`, or the rule-B gate at src/review.rs:375 regressed, the entire suite would still pass.
    *Recommendation:* Add one fixture test mirroring `rules_independently_disableable` with `coverage_gap: false` (a would-be coverage-gap diff must yield no coverage findings and verdict APPROVE), and one CLI integration test that writes `<repo>/.wonk/config.toml` with `[review] coverage_gap = false` (and ideally `breaking_change = false`) and asserts the warnings disappear from the JSON output — that pins both the option gate and the config-to-options wiring.
 

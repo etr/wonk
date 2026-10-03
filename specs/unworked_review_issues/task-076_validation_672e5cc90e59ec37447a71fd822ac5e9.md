@@ -6,7 +6,8 @@
 
 ## Major
 
-1. [ ] **performance-reviewer** | `src/bundled_embedding.rs:187` | memory-allocation
+1. [x] **performance-reviewer** | `src/bundled_embedding.rs:187` | memory-allocation
+   *Addressed (majors sweep, 2026-10-02):* fixed (footprint quantified in bench/bundled-embedding-results.md + docs).
    The declared assumption says the decompressed model's memory footprint is 'acceptable (quantify it)', but nothing in the diff quantifies it, and the actual footprint is far larger than the artifact: model2vec-rs 0.2.1 `StaticModel::from_bytes` (model.rs:181) expands the I8 tensor into a dense owned `Vec<f32>` of rows*dim = 63,457*256*4 B = ~62 MiB, held for the process lifetime (a ~8x blow-up over the 9.4 MB unpacked artifact and ~10x over the 6.5 MB blob). Peak transient RSS during decode is ~97 MiB (unpacked 9.4 MB + checked_slice section copies ~9.4 MB + safetensors_bytes output ~16.5 MB + the 62 MiB f32 expansion, all live simultaneously). This applies per process, including the daemon (src/daemon.rs:422), which keeps the model resident indefinitely.
    *Recommendation:* Add a peak/steady RSS measurement to bench/bundled_embedding_bench.rs (e.g. read /proc/self/status or mach_task_basic_info around decode and after build_embeddings) and record it in bench/bundled-embedding-results.md, plus a documented ~65-100 MiB figure in docs/configuration.md. If the footprint matters for the daemon, evaluate keeping the packed q4 rows and applying the per-row scale during pooling (the math already applies `weights` at pool time in model2vec-rs pool_ids, so a custom i8-with-scale pooling would drop the matrix to ~16 MiB), or the `from_borrowed`/f16 path; otherwise document the accepted cost.
 

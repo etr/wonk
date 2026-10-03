@@ -289,14 +289,12 @@ pub fn incremental_update(repo_root: &Path, local: bool) -> Result<IndexStats> {
     // Refresh the history window after the file loop (TASK-096). Best-effort:
     // Failed already warned inside refresh; Skipped/Unchanged stay silent
     // (PRD-HIST-REQ-007/008).
-    if config.history.enabled
-        && let Err(e) = crate::history::refresh(
+    if config.history.enabled {
+        crate::history::refresh(
             &conn,
             repo_root,
             &crate::history::MiningOptions::from(&config.history),
-        )
-    {
-        eprintln!("wonk: history refresh failed: {e:#}");
+        );
     }
 
     // Recompute graph topology after the file loop (TASK-098). `wonk
@@ -605,17 +603,11 @@ pub fn process_events(
 // Internals — incremental helpers
 // ---------------------------------------------------------------------------
 
-/// Delete all data for a single file (symbols, references, file row) in a
-/// single transaction.
-fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
-    let tx = conn
-        .unchecked_transaction()
-        .context("starting delete transaction")?;
-
-    // Capture the reach table's pre-delete view of this file before any
-    // rows go away (TASK-081, PRD-REACH-REQ-005).
-    let scope = crate::reach::begin_file_edit(&tx, rel_path)?;
-
+/// The per-file DELETE set shared by the delete and upsert paths (TASK-078
+/// review debt): every table keyed by file must be cleared in BOTH, so
+/// the set lives exactly once here. `files` itself is the caller's
+/// business — delete removes the row, upsert replaces it.
+fn delete_file_rows(tx: &rusqlite::Transaction<'_>, rel_path: &str) -> Result<()> {
     // Delete type edges before symbols (explicit, mirrors references/imports pattern).
     tx.execute(
         "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
@@ -643,21 +635,59 @@ fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
         "DELETE FROM term_stats WHERE file = ?1",
         rusqlite::params![rel_path],
     )?;
+    Ok(())
+}
+
+/// Incrementally repair the reach rows an edit touched, degrading on
+/// failure: mark the table stale in the SAME transaction and commit
+/// anyway — reach is a cache, and a stale table falls back to BFS
+/// rather than serving wrong data (PRD-REACH-REQ-007). The REQ-007
+/// protocol lives exactly once, not as one hand-synced copy per path
+/// (TASK-081 review debt).
+fn finish_reach_edit(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &crate::reach::FileEditScope,
+    rel_path: &str,
+) -> Result<()> {
+    if let Err(e) = crate::reach::finish_file_edit(tx, scope) {
+        crate::reach::mark_stale(tx)?;
+        eprintln!(
+            "warn: incremental reach repair failed for {rel_path}: {e:#}; \
+             table marked stale, queries fall back to BFS"
+        );
+    }
+    Ok(())
+}
+
+/// Delete all data for a single file (symbols, references, file row) in a
+/// single transaction.
+fn delete_file_data(conn: &Connection, rel_path: &str) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("starting delete transaction")?;
+
+    // Capture the reach table's pre-delete view of this file before any
+    // rows go away (TASK-081, PRD-REACH-REQ-005).
+    let scope = crate::reach::begin_file_edit(&tx, rel_path)?;
+
+    // Subtract this file's contribution from the corpus-stats summary
+    // while its row (and line_count) is still readable; a legacy index
+    // with no summary row heals by recomputing after the delete.
+    let summary_present = corpus_stats_present(&tx)?;
+    if summary_present {
+        corpus_stats_remove_file(&tx, rel_path)?;
+    }
+
+    delete_file_rows(&tx, rel_path)?;
     tx.execute(
         "DELETE FROM files WHERE path = ?1",
         rusqlite::params![rel_path],
     )?;
 
-    // Incrementally repair the reach rows this deletion touched. On
-    // failure, degrade: mark the table stale in this same transaction and
-    // commit anyway — reach is a cache, and a stale table falls back to
-    // BFS rather than serving wrong data (PRD-REACH-REQ-007).
-    if let Err(e) = crate::reach::finish_file_edit(&tx, &scope) {
-        crate::reach::mark_stale(&tx)?;
-        eprintln!(
-            "warn: incremental reach repair failed for {rel_path}: {e:#}; \
-             table marked stale, queries fall back to BFS"
-        );
+    finish_reach_edit(&tx, &scope, rel_path)?;
+
+    if !summary_present {
+        corpus_stats_recompute(&tx)?;
     }
 
     tx.commit().context("committing delete transaction")?;
@@ -681,35 +711,16 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     // reverse-target predecessors that only exist pre-delete.
     let scope = crate::reach::begin_file_edit(&tx, &result.rel_path)?;
 
-    // Delete old type edges, symbols, references, and imports for this file.
-    // type_edges has ON DELETE CASCADE from symbols, but we delete explicitly
-    // for clarity and to mirror the pattern used for references and imports.
-    tx.execute(
-        "DELETE FROM type_edges WHERE child_id IN (SELECT id FROM symbols WHERE file = ?1)",
-        rusqlite::params![result.rel_path],
-    )?;
-    // Contracts are cleared and rewritten per file on re-index; the symbol
-    // cascade misses NULL-symbol_id rows (documents, top-level sites).
-    tx.execute(
-        "DELETE FROM contracts WHERE file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM symbols WHERE file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM \"references\" WHERE file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM file_imports WHERE source_file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM term_stats WHERE file = ?1",
-        rusqlite::params![result.rel_path],
-    )?;
+    delete_file_rows(&tx, &result.rel_path)?;
+
+    // Subtract the file's previous contribution from the corpus-stats
+    // summary while the old row (and its line_count) is still readable;
+    // a legacy index with no summary row heals by recomputing after the
+    // upsert instead of adjusting.
+    let summary_present = corpus_stats_present(&tx)?;
+    if summary_present {
+        corpus_stats_remove_file(&tx, &result.rel_path)?;
+    }
 
     // Upsert file metadata.
     tx.execute(
@@ -724,6 +735,13 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
             result.symbols.len() as i64,
         ],
     )?;
+
+    // Add the new row's contribution to the summary (or heal it).
+    if summary_present {
+        corpus_stats_add_file(&tx, Some(result.line_count as i64))?;
+    } else {
+        corpus_stats_recompute(&tx)?;
+    }
 
     // Insert new symbols and build a name -> id map for caller_id resolution.
     let mut caller_map: HashMap<&str, i64> = HashMap::new();
@@ -848,18 +866,9 @@ fn upsert_file_data(conn: &Connection, result: &FileResult) -> Result<()> {
     insert_contracts(&tx, &result.rel_path, &result.contracts, Some(&caller_map))?;
 
     // Incrementally repair the reach rows this edit touched (the same
-    // traversal the full build runs, over the affected source set). On
-    // failure, degrade: mark the table stale in this same transaction and
-    // commit anyway — reach is a cache, and a stale table falls back to
-    // BFS rather than serving wrong data (PRD-REACH-REQ-007).
-    if let Err(e) = crate::reach::finish_file_edit(&tx, &scope) {
-        crate::reach::mark_stale(&tx)?;
-        eprintln!(
-            "warn: incremental reach repair failed for {}: {e:#}; \
-             table marked stale, queries fall back to BFS",
-            result.rel_path
-        );
-    }
+    // traversal the full build runs, over the affected source set); the
+    // degrade protocol lives in finish_reach_edit.
+    finish_reach_edit(&tx, &scope, &result.rel_path)?;
 
     tx.commit().context("committing upsert transaction")?;
     Ok(())
@@ -1266,6 +1275,10 @@ fn batch_insert(
         crate::reach::build_reach(&tx, opts)?;
     }
 
+    // Publish the corpus-stats summary for this whole batch (one
+    // aggregate per build, replacing the per-query scan at search time).
+    corpus_stats_recompute(&tx)?;
+
     tx.commit().context("committing transaction")?;
 
     Ok((
@@ -1324,6 +1337,30 @@ fn handle_embed_interruption(msg: &str, policy: EmbedErrorPolicy, silent: bool) 
     }
 }
 
+/// Handle an Ollama-unreachable interruption according to the error policy.
+///
+/// The FailFast bail carries the typed [`EmbeddingError::OllamaUnreachable`]
+/// (not a formatted string) so callers — the ask path's embedding-build
+/// fallback — can distinguish an actual disconnect from other build
+/// failures (model not found, storage, chunking) by matching the error's
+/// root cause. SkipPartial behaves like [`handle_embed_interruption`]: log
+/// `msg` and let the caller keep its partial results.
+fn handle_unreachable_interruption(
+    msg: &str,
+    policy: EmbedErrorPolicy,
+    silent: bool,
+) -> Result<()> {
+    match policy {
+        EmbedErrorPolicy::FailFast => Err(anyhow::Error::new(EmbeddingError::OllamaUnreachable)),
+        EmbedErrorPolicy::SkipPartial => {
+            if !silent {
+                eprintln!("{msg}");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Retry a failed batch by embedding each text individually.
 ///
 /// When a batch fails with a context-length error, this function retries each
@@ -1360,7 +1397,7 @@ fn embed_batch_individually(
                 }
             }
             Err(EmbeddingError::OllamaUnreachable) => {
-                handle_embed_interruption(
+                handle_unreachable_interruption(
                     "Ollama became unreachable during individual retry",
                     policy,
                     silent,
@@ -1410,7 +1447,7 @@ fn embed_chunks(
                 let msg = format!(
                     "Ollama became unreachable after embedding {embedded}/{total} symbols."
                 );
-                handle_embed_interruption(&msg, policy, silent)?;
+                handle_unreachable_interruption(&msg, policy, silent)?;
                 break;
             }
             Err(ref e) if embedding::is_context_length_error(e) => {
@@ -1607,9 +1644,11 @@ pub fn build_missing_embeddings(
 
     // Health check — bail before starting the expensive batch-embed loop.
     // Unlike build_embeddings we return Err so the caller can decide how to
-    // degrade (query-time fallback to the bundled provider).
+    // degrade (query-time fallback to the bundled provider). The bail is
+    // typed as `EmbeddingError::OllamaUnreachable` so the caller can tell a
+    // disconnect from other build failures by matching the error root cause.
     if !provider.is_healthy() {
-        anyhow::bail!("{}", embedding::OLLAMA_UNREACHABLE_MSG);
+        return Err(anyhow::Error::new(EmbeddingError::OllamaUnreachable));
     }
 
     let embedded = embed_chunks(
@@ -1792,9 +1831,78 @@ fn drop_all_data(conn: &Connection) -> Result<()> {
          DELETE FROM co_change;
          DELETE FROM commit_files;
          DELETE FROM mined_commits;
-         DELETE FROM history_meta;",
+         DELETE FROM history_meta;
+         DELETE FROM corpus_stats;",
     )
     .context("clearing index data")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Corpus-stats summary maintenance (TASK-079 review)
+// ---------------------------------------------------------------------------
+
+// Maintain the one-row `corpus_stats` summary the BM25 reader loads in
+// O(1) instead of a per-query `COUNT`/`AVG` full scan of `files`. The
+// invariant — the row always equals `COUNT(*)`, `COUNT(line_count)`,
+// `SUM(line_count)` over `files` — is kept inside the three functions
+// that mutate `files` (`batch_insert`, `upsert_file_data`,
+// `delete_file_data`), each within its own transaction, so every caller
+// (full build, incremental update, watcher events) maintains it for free.
+// `AVG` reconstructs as `total_lines / measured`, bitwise-identical to
+// the SQLite aggregate (one f64 division of the same integers); a reader
+// that finds no row falls back to the aggregate, so the summary can only
+// ever save the scan, never change a score.
+
+/// Whether the summary row exists (absent on indexes built before it).
+fn corpus_stats_present(conn: &Connection) -> Result<bool> {
+    let present: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM corpus_stats)", [], |row| {
+            row.get(0)
+        })
+        .context("checking corpus stats summary")?;
+    Ok(present)
+}
+
+/// Recompute the summary wholesale — the batch/full-build path, and the
+/// heal for a legacy index whose first mutation finds no row yet.
+fn corpus_stats_recompute(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO corpus_stats (id, n_docs, measured, total_lines) \
+         SELECT 1, COUNT(*), COUNT(line_count), COALESCE(SUM(line_count), 0) FROM files",
+        [],
+    )
+    .context("refreshing corpus stats summary")?;
+    Ok(())
+}
+
+/// Subtract one file's contribution from the summary. MUST run inside the
+/// same transaction as, and before, that file's `files` row disappears
+/// (delete or `INSERT OR REPLACE`); no-op when the path has no row.
+fn corpus_stats_remove_file(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE corpus_stats SET \
+           n_docs = n_docs - 1, \
+           measured = measured - (SELECT line_count IS NOT NULL FROM files WHERE path = ?1), \
+           total_lines = total_lines \
+             - COALESCE((SELECT line_count FROM files WHERE path = ?1), 0) \
+         WHERE EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+        rusqlite::params![path],
+    )
+    .context("adjusting corpus stats summary")?;
+    Ok(())
+}
+
+/// Add one file's contribution after its `files` row is written.
+fn corpus_stats_add_file(conn: &Connection, line_count: Option<i64>) -> Result<()> {
+    conn.execute(
+        "UPDATE corpus_stats SET \
+           n_docs = n_docs + 1, \
+           measured = measured + (?1 IS NOT NULL), \
+           total_lines = total_lines + COALESCE(?1, 0)",
+        rusqlite::params![line_count],
+    )
+    .context("adjusting corpus stats summary")?;
     Ok(())
 }
 
@@ -1936,6 +2044,90 @@ class Component {
         let stats = build_index(dir.path(), true).unwrap();
         // 2 HTTP providers + 1 env consumer; util.txt contributes nothing.
         assert_eq!(stats.contract_count, 3, "got {stats:?}");
+    }
+
+    // -- corpus-stats summary (TASK-079 review) --------------------------------
+
+    /// The summary row the BM25 reader loads in O(1) must always equal the
+    /// COUNT/COUNT/SUM aggregate over `files`.
+    fn assert_corpus_stats_matches_aggregate(conn: &Connection) {
+        let summary: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT n_docs, measured, total_lines FROM corpus_stats WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("corpus_stats summary row must exist");
+        let aggregate: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(line_count), COALESCE(SUM(line_count), 0) FROM files",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            summary, aggregate,
+            "corpus_stats summary must match the files aggregate"
+        );
+    }
+
+    #[test]
+    fn corpus_stats_summary_matches_aggregate_across_mutation_paths() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let conn = db::open(&db::local_index_path(root)).unwrap();
+        assert_corpus_stats_matches_aggregate(&conn);
+
+        // Modified file with a different line count -> the upsert path
+        // (subtract old contribution, add the new one).
+        let main = root.join("src/main.rs");
+        fs::write(
+            &main,
+            "fn main() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n    let e = 5;\n}\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::load(Some(root)).unwrap_or_default();
+        let opts = crate::contracts::ContractOptions::from(&config.contracts);
+        assert!(reindex_file(&conn, &main, root, &opts).unwrap());
+        assert_corpus_stats_matches_aggregate(&conn);
+
+        // Re-upsert the same file (unchanged content is skipped by hash,
+        // so rewrite again to force a second replace over an existing row).
+        fs::write(
+            &main,
+            "fn main() {\n    let a = 1;\n}\nfn extra() -> u32 {\n    7\n}\n",
+        )
+        .unwrap();
+        assert!(reindex_file(&conn, &main, root, &opts).unwrap());
+        assert_corpus_stats_matches_aggregate(&conn);
+
+        // Deleted file -> the delete path.
+        let py = root.join("app.py");
+        remove_file(&conn, &py, root).unwrap();
+        assert_corpus_stats_matches_aggregate(&conn);
+    }
+
+    #[test]
+    fn corpus_stats_summary_heals_on_first_mutation_of_legacy_index() {
+        let dir = make_test_repo();
+        let root = dir.path();
+        build_index(root, true).unwrap();
+        let conn = db::open(&db::local_index_path(root)).unwrap();
+
+        // Simulate a pre-summary legacy index: no row, then a mutation.
+        conn.execute("DELETE FROM corpus_stats", []).unwrap();
+        let config = crate::config::Config::load(Some(root)).unwrap_or_default();
+        let opts = crate::contracts::ContractOptions::from(&config.contracts);
+        let js = root.join("index.js");
+        fs::write(&js, "function render() {\n    return 1;\n}\n").unwrap();
+        assert!(reindex_file(&conn, &js, root, &opts).unwrap());
+        assert_corpus_stats_matches_aggregate(&conn);
+
+        // And the delete path heals too.
+        conn.execute("DELETE FROM corpus_stats", []).unwrap();
+        remove_file(&conn, &js, root).unwrap();
+        assert_corpus_stats_matches_aggregate(&conn);
     }
 
     // -- shingle signatures (TASK-100) -----------------------------------------
@@ -4247,6 +4439,100 @@ fn extra() -> i32 {
                 "tf for '{term}'"
             );
         }
+    }
+
+    #[test]
+    fn test_term_stats_failure_rolls_back_whole_upsert() {
+        // TASK-078 review debt: the UTF-8 twin above fails at READ time,
+        // before any transaction, so it cannot pin the criterion "stats
+        // written in the same transaction as symbol rows" (AR-024). A
+        // trigger failing INSIDE the upsert transaction can: the whole
+        // write must roll back, not partially land.
+        let (dir, conn) = setup_indexed_repo();
+        let root = dir.path();
+
+        let before = (
+            conn.query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        );
+
+        conn.execute(
+            "CREATE TRIGGER term_stats_boom BEFORE INSERT ON term_stats \
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            [],
+        )
+        .unwrap();
+
+        let mut modified = fs::read_to_string(root.join("lib.rs")).unwrap();
+        modified.push_str("\nfn injected_after_boom() {}\n");
+        fs::write(root.join("lib.rs"), modified).unwrap();
+
+        let result = reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        );
+        assert!(result.is_err(), "the trigger must abort the re-index");
+
+        let after = (
+            conn.query_row("SELECT hash FROM files WHERE path = 'lib.rs'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM term_stats WHERE file = 'lib.rs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            after, before,
+            "rollback, not partial write: files/symbols/term_stats keep their pre-edit state"
+        );
+
+        // Drop the trigger: the same re-index now succeeds and the new
+        // content lands — the abort was the only thing standing in the way.
+        conn.execute("DROP TRIGGER term_stats_boom", []).unwrap();
+        reindex_file(
+            &conn,
+            &root.join("lib.rs"),
+            root,
+            &crate::contracts::ContractOptions::default(),
+        )
+        .unwrap();
+        let injected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file = 'lib.rs' AND name = 'injected_after_boom'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            injected, 1,
+            "the post-fix re-index must land the new symbol"
+        );
     }
 
     #[test]

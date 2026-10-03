@@ -261,9 +261,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     SearchMode::Smart(_) => {
                         // Ranked mode: classify, then either the legacy
                         // lexicographic sort or the signal pipeline, then the
-                        // shared dedup/group with headers. REQ-017: the
-                        // pipeline is config-gated and off by default;
-                        // --why opts in for this invocation.
+                        // shared dedup/group with headers. REQ-017
+                        // (default flipped in TASK-095): the tuned pipeline
+                        // is ON by default; `[rank] enabled = false`
+                        // restores the legacy ordering; `--why`
+                        // additionally forces the pipeline for this
+                        // invocation.
                         use crate::ranker;
 
                         // Defense in depth: config load already rejected
@@ -293,26 +296,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         // joins the settings — ONE read, best-effort like
                         // the slate recording (a missing table is silent;
                         // other errors warn and disable the overlay).
-                        // --no-feedback (TASK-103, PRD-FB-REQ-017) skips
-                        // the load outright; the flag ALSO strips any
+                        // --no-feedback (TASK-103, PRD-FB-REQ-017)
+                        // skips the load outright and ALSO strips any
                         // attached table inside the ranking seam —
-                        // belt-and-suspenders (AR-039).
+                        // belt-and-suspenders (AR-039). The shared
+                        // load_learned_best_effort owns the policy.
                         settings.feedback_free = args.no_feedback;
-                        if config.feedback.enabled
-                            && !args.no_feedback
-                            && let Some(index_conn) = conn.as_ref()
-                        {
-                            settings.learned = crate::learning::load_learned(
-                                index_conn,
-                                &config.feedback,
-                                &config.rank.weights,
-                                system_secs(),
-                            )
-                            .unwrap_or_else(|e| {
-                                eprintln!("wonk: learned-weight load failed: {e:#}");
-                                None
-                            });
-                        }
+                        settings.learned =
+                            load_learned_best_effort(conn.as_ref(), &config, args.no_feedback);
                         let ranked = crate::rerank::rank_and_explain_classed(
                             &results,
                             conn.as_ref(),
@@ -335,15 +326,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                             &ranked,
                             &config.feedback,
                         );
-                        let identity_of = stored_slate
-                            .as_ref()
-                            .map(|s| {
-                                s.members
-                                    .iter()
-                                    .map(|m| ((m.file.clone(), m.line), m.identity.clone()))
-                                    .collect::<std::collections::HashMap<_, _>>()
-                            })
-                            .unwrap_or_default();
                         // One class line per query, before any why lines
                         // (DR-038): a misclassification is diagnosable from
                         // the breakdown it produced. The `learned:` line
@@ -378,16 +360,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                                     ranked.query_class.map(|c| c.as_str().to_string());
                                 if let Some(slate) = stored_slate.as_ref() {
                                     out.slate = Some(slate.token.clone());
-                                    out.identity = identity_of
-                                        .get(&(
-                                            item.classified
-                                                .result
-                                                .file
-                                                .to_string_lossy()
-                                                .into_owned(),
-                                            item.classified.result.line,
-                                        ))
-                                        .cloned();
+                                    out.identity = slate.identity_for(
+                                        &item.classified.result.file.to_string_lossy(),
+                                        item.classified.result.line,
+                                    );
                                 }
                                 if args.why {
                                     out.why = Some(crate::output::WhyOutput::from_contributions(
@@ -862,11 +838,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // with a warning (PRD-EMB-REQ-009), while a stored space that
             // disagrees with the resolved provider blocks with a re-embed
             // command (PRD-EMB-REQ-005).
-            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
-            if let Some(warning) = plan.fallback_warning {
-                output::print_warning(warning);
-            }
-            let mut provider = plan.provider;
+            let mut provider = resolve_query_provider(&conn, config.embedding.provider)?;
 
             // Validate --from/--to files exist in the index before computing
             // reachability (fail fast with a clear error).
@@ -926,20 +898,27 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     }
                     Err(e) => {
                         // A configured Ollama that dies mid-build degrades to
-                        // the bundled provider instead of failing the query.
-                        if config.embedding.provider
-                            == crate::embedding::EmbeddingProviderKind::Ollama
-                        {
-                            let fallback = crate::embedding::fallback_after_disconnect(
-                                &conn,
-                                config.embedding.provider,
-                            )?;
-                            output::print_warning(
-                                fallback
-                                    .fallback_warning
-                                    .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
-                            );
-                            provider = fallback.provider;
+                        // the bundled provider instead of failing the query —
+                        // but only on an actual disconnect. The pipeline types
+                        // its unreachability bails (the pre-flight health
+                        // check and the mid-batch interruption) as
+                        // EmbeddingError::OllamaUnreachable; any other build
+                        // failure (model not found, storage, chunking) stays
+                        // visible instead of masquerading as an unreachable
+                        // provider.
+                        let disconnected = e.chain().any(|cause| {
+                            matches!(
+                                <dyn std::error::Error>::downcast_ref::<
+                                    crate::errors::EmbeddingError,
+                                >(cause),
+                                Some(crate::errors::EmbeddingError::OllamaUnreachable)
+                            )
+                        });
+                        if disconnected {
+                            // Re-plan with the provider dead: degrade to the
+                            // bundled provider, or surface the re-embed
+                            // instruction when the stored space refuses.
+                            provider = degrade_after_disconnect(&conn, config.embedding.provider)?;
                         } else {
                             output::print_error(&format!("embedding build failed: {e:#}"));
                             return Ok(());
@@ -969,16 +948,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
                     // Ollama died between the health check and the query
                     // embed: re-plan and degrade if the stored space allows.
-                    let fallback = crate::embedding::fallback_after_disconnect(
-                        &conn,
-                        config.embedding.provider,
-                    )?;
-                    output::print_warning(
-                        fallback
-                            .fallback_warning
-                            .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
-                    );
-                    fallback.provider.embed_single(&args.query)?
+                    degrade_after_disconnect(&conn, config.embedding.provider)?
+                        .embed_single(&args.query)?
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1227,11 +1198,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 }
             };
 
-            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
-            if let Some(warning) = plan.fallback_warning {
-                output::print_warning(warning);
-            }
-            let provider = plan.provider;
+            let provider = resolve_query_provider(&conn, config.embedding.provider)?;
 
             // Normalize path: strip leading "./", normalize "." to empty.
             let prefix = args.path.strip_prefix("./").unwrap_or(&args.path);
@@ -1321,11 +1288,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     }
                 };
 
-            let plan = crate::embedding::plan_query_provider(&conn, config.embedding.provider)?;
-            if let Some(warning) = plan.fallback_warning {
-                output::print_warning(warning);
-            }
-            let provider = plan.provider;
+            let provider = resolve_query_provider(&conn, config.embedding.provider)?;
 
             // Determine files to analyze.
             let files: Vec<String> = if let Some(ref since) = args.since {
@@ -2068,7 +2031,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
 /// Parse a scope string plus optional base ref into a [`ChangeScope`]
 /// (REQ-008 verbatim parsing; compare requires and validates the base ref).
-fn parse_change_scope(scope: &str, base: Option<&str>) -> Result<crate::types::ChangeScope> {
+pub(crate) fn parse_change_scope(
+    scope: &str,
+    base: Option<&str>,
+) -> Result<crate::types::ChangeScope> {
     use crate::types::ChangeScope;
 
     if scope == "compare" {
@@ -2080,6 +2046,22 @@ fn parse_change_scope(scope: &str, base: Option<&str>) -> Result<crate::types::C
     scope
         .parse::<ChangeScope>()
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The `since`-as-compare+base sugar on top of [`parse_change_scope`] —
+/// the one scope-resolution seam for every dispatch surface (CLI
+/// `dispatch_review`, MCP `tool_review`/`tool_changes`; TASK-086 review
+/// debt: four hand-rolled copies had drifted in error wording and the
+/// MCP copies skipped the base-ref validation entirely).
+pub(crate) fn resolve_scope_args(
+    scope: &str,
+    base: Option<&str>,
+    since: Option<&str>,
+) -> Result<crate::types::ChangeScope> {
+    match since {
+        Some(s) => parse_change_scope("compare", Some(s)),
+        None => parse_change_scope(scope, base),
+    }
 }
 
 fn dispatch_changes<W: io::Write>(
@@ -2162,35 +2144,23 @@ fn dispatch_review<W: io::Write>(
         })?;
 
     // 2. --since <ref> is sugar for --scope=compare --base=<ref>.
-    let (scope_str, base) = match &args.since {
-        Some(since) => ("compare".to_string(), Some(since.clone())),
-        None => (args.scope.clone(), args.base.clone()),
-    };
-    let scope = parse_change_scope(&scope_str, base.as_deref())?;
+    let scope = resolve_scope_args(&args.scope, args.base.as_deref(), args.since.as_deref())?;
 
     // 3. Load [review] rule switches, the [reach] kill switch, and the
     //    REQ-015 filter knobs from the CLI (default off = today's report).
     let config = crate::config::Config::load(Some(&repo_root))?;
     let options = crate::review::ReviewOptions {
-        breaking_change: config.review.breaking_change,
-        coverage_gap: config.review.coverage_gap,
-        cross_repo: config.review.cross_repo,
-        reach_enabled: config.reach.enabled,
         min_confidence: args.min_confidence,
         min_severity: args.min_severity,
         kinds: args.kind,
         max_findings: args.max_findings,
         elide: args.elide.map(Into::into),
-        ..crate::review::ReviewOptions::default()
+        ..crate::review::ReviewOptions::from_config(&config)
     };
 
     // Cross-repo inputs resolved once here — run_review never touches
     // $HOME itself, and a disabled rule C passes no inputs at all.
-    let cross_repo = config
-        .review
-        .cross_repo
-        .then(|| crate::review::CrossRepoInputs::discover(&repo_root))
-        .flatten();
+    let cross_repo = crate::review::CrossRepoInputs::discover_if_enabled(&config, &repo_root);
 
     // 4. Run the review. The verdict is data: exit code stays 0 — a
     // non-zero exit would force piping consumers to treat REVIEW (the
@@ -2800,6 +2770,28 @@ pub(crate) fn learn_pending_best_effort(conn: &Connection, config: &crate::confi
     {
         eprintln!("wonk: feedback learning deferred: {e:#}");
     }
+}
+
+/// The read side of the feedback-learning seam (TASK-102/103 review
+/// debt): one gated, best-effort learned-overlay load shared by both
+/// dispatch surfaces — the AR-039 policy (skip the load when
+/// no_feedback; warn and degrade to None on failure) lives exactly
+/// once, mirroring its write-side sibling [`learn_pending_best_effort`].
+pub(crate) fn load_learned_best_effort(
+    conn: Option<&Connection>,
+    config: &crate::config::Config,
+    no_feedback: bool,
+) -> Option<crate::learning::LearnedTable> {
+    if no_feedback || !config.feedback.enabled {
+        return None;
+    }
+    conn.and_then(|conn| {
+        crate::learning::load_learned(conn, &config.feedback, &config.rank.weights, system_secs())
+            .unwrap_or_else(|e| {
+                eprintln!("wonk: learned-weight load failed: {e:#}");
+                None
+            })
+    })
 }
 
 /// `wonk feedback --weights` (TASK-102, PRD-FB-REQ-029/012): every
@@ -3422,6 +3414,47 @@ fn is_query_command(cmd: &Command) -> bool {
 // Semantic blending helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve the provider for a semantic query and surface the degraded-mode
+/// warning.
+///
+/// Single wiring for the ask/cluster/impact arms and
+/// [`fetch_semantic_results`]: plans via
+/// [`crate::embedding::plan_query_provider`] — an unreachable configured
+/// Ollama degrades to the bundled provider (PRD-EMB-REQ-009) and a stored
+/// space that disagrees with the resolved provider blocks with a re-embed
+/// command (PRD-EMB-REQ-005) — and prints the fallback warning when the
+/// plan degraded.
+fn resolve_query_provider(
+    conn: &Connection,
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>> {
+    let plan = crate::embedding::plan_query_provider(conn, configured)?;
+    if let Some(warning) = plan.fallback_warning {
+        output::print_warning(warning);
+    }
+    Ok(plan.provider)
+}
+
+/// Re-plan after the configured provider died mid-query.
+///
+/// Degrades to the bundled provider with the fallback warning, or — when
+/// the stored vectors make the fallback unsafe — propagates the re-embed
+/// instruction via `?`. This is the single home of the warning default:
+/// every caller reaches here only with the provider configured as Ollama,
+/// for which a degrading plan always carries the warning.
+fn degrade_after_disconnect(
+    conn: &Connection,
+    configured: crate::embedding::EmbeddingProviderKind,
+) -> Result<Box<dyn crate::embedding::EmbeddingProvider>> {
+    let fallback = crate::embedding::fallback_after_disconnect(conn, configured)?;
+    output::print_warning(
+        fallback
+            .fallback_warning
+            .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
+    );
+    Ok(fallback.provider)
+}
+
 /// Fetch semantic search results without formatting them.
 ///
 /// Returns the resolved semantic results, or an empty Vec on graceful
@@ -3443,11 +3476,7 @@ fn fetch_semantic_results(
     // Resolve the query provider against the stored spaces: unreachable
     // configured Ollama degrades to bundled with a warning; a mismatched
     // stored space blocks with a re-embed command.
-    let plan = crate::embedding::plan_query_provider(conn, configured)?;
-    if let Some(warning) = plan.fallback_warning {
-        output::print_warning(warning);
-    }
-    let provider = plan.provider;
+    let provider = resolve_query_provider(conn, configured)?;
 
     let all_embeddings = match crate::embedding::load_all_embeddings(conn, provider.as_ref()) {
         Ok(e) if !e.is_empty() => e,
@@ -3475,13 +3504,7 @@ fn fetch_semantic_results(
         Err(crate::errors::EmbeddingError::OllamaUnreachable) => {
             // Mid-query disconnect: degrade when the stored space allows it,
             // otherwise surface the re-embed instruction.
-            let fallback = crate::embedding::fallback_after_disconnect(conn, configured)?;
-            output::print_warning(
-                fallback
-                    .fallback_warning
-                    .unwrap_or(crate::embedding::BUNDLED_FALLBACK_WARNING),
-            );
-            fallback.provider.embed_single(pattern)?
+            degrade_after_disconnect(conn, configured)?.embed_single(pattern)?
         }
         Err(e) => return Err(e.into()),
     };
@@ -3630,6 +3653,22 @@ pub struct TopologyStatus {
     pub stale: bool,
     /// Whether the `[topology]` pass is enabled.
     pub enabled: bool,
+}
+
+impl TopologyStatus {
+    /// The empty/never-computed status for a given enabled flag — the
+    /// one literal the production fallback and every test StatusInfo
+    /// construction share (TASK-099 review debt: nine hand-maintained
+    /// copies had to be edited in lockstep when `communities` landed).
+    pub fn empty(enabled: bool) -> Self {
+        TopologyStatus {
+            scored: 0,
+            communities: 0,
+            last_computed: None,
+            stale: false,
+            enabled,
+        }
+    }
 }
 
 /// Format status info as a human-readable string for stderr output.
@@ -3792,13 +3831,7 @@ pub fn query_status_info(
             workspaces,
             workspace_declared,
             workspace_comembers,
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: topology_config.enabled,
-            },
+            topology: TopologyStatus::empty(topology_config.enabled),
             feedback: feedback_status(None, feedback_config, rank_weights, system_secs()),
         };
     };
@@ -4475,16 +4508,11 @@ pub fn query_symbols_db_with_filters(
     // local test-path heuristic): ordinary source files sort before
     // barrels/module entries, type declarations, shims, examples, and
     // tests. Stable, so equal ladder values keep the row order; generated
-    // files demote only with an index-verified hand-written peer.
+    // files demote only with an index-verified hand-written peer. The
+    // shared comparator owns the missing-entry and NaN policies.
     let files: Vec<String> = results.iter().map(|s| s.file.clone()).collect();
     let values = crate::rerank::path_character_values(&files, Some(conn));
-    results.sort_by(|a, b| {
-        let a_value = values.get(&a.file).copied().unwrap_or(1.0);
-        let b_value = values.get(&b.file).copied().unwrap_or(1.0);
-        b_value
-            .partial_cmp(&a_value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(|a, b| crate::rerank::compare_path_character(&values, &a.file, &b.file));
 
     Ok(results)
 }
@@ -6624,13 +6652,7 @@ mod tests {
             workspaces: vec!["payments".to_string(), "platform".to_string()],
             workspace_declared: true,
             workspace_comembers: vec!["repoB".to_string(), "repoC".to_string()],
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6662,13 +6684,7 @@ mod tests {
             workspaces: vec!["lone-api".to_string()],
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6700,13 +6716,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6742,13 +6752,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6777,13 +6781,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6817,13 +6815,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6854,13 +6846,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,
@@ -6889,13 +6875,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_declared: false,
             workspace_comembers: Vec::new(),
-            topology: TopologyStatus {
-                scored: 0,
-                communities: 0,
-                last_computed: None,
-                stale: false,
-                enabled: true,
-            },
+            topology: TopologyStatus::empty(true),
             feedback: FeedbackStatus {
                 enabled: false,
                 events: 0,

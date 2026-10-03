@@ -521,15 +521,9 @@ pub(crate) fn finish_file_edit(
 
     // The table self-describes: repair runs at the recorded built depth
     // under the default fan-out cap. No config plumbing.
-    let built: usize = tx
-        .query_row(
-            "SELECT value FROM reach_meta WHERE key = ?1",
-            rusqlite::params![META_BUILT_DEPTH],
-            |row| row.get::<_, String>(0),
-        )
-        .context("reading built_depth for repair")?
-        .parse()
-        .context("parsing built_depth for repair")?;
+    let built = read_reach_meta(tx)?
+        .built
+        .context("reading built_depth for repair")?;
     let opts = ReachBuildOptions {
         depth: built,
         max_targets: DEFAULT_MAX_TARGETS_PER_SOURCE,
@@ -577,16 +571,29 @@ pub(crate) fn finish_file_edit(
     })
 }
 
-/// Whether the reach table can be incrementally repaired: present, built
-/// (numeric `built_depth`), and not stale.
-fn table_fresh(conn: &Connection) -> Result<bool> {
+/// What the reach meta says, read once: the parsed `built_depth` and the
+/// stale marker (a missing table is `built: None`, never an error). The
+/// freshness verdict — "incrementally repairable / answerable" — is
+/// `built.is_some() && !stale`, shared verbatim by the repair side
+/// (table_fresh, finish_file_edit) and the lookup side
+/// (lookup_upstream_impl), which previously hand-rolled three variants
+/// of the same subtle sequence (TASK-081 review debt).
+struct ReachMeta {
+    built: Option<usize>,
+    stale: bool,
+}
+
+fn read_reach_meta(conn: &Connection) -> Result<ReachMeta> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reach'",
         [],
         |row| row.get(0),
     )?;
     if exists == 0 {
-        return Ok(false);
+        return Ok(ReachMeta {
+            built: None,
+            stale: false,
+        });
     }
     let built: Option<String> = conn
         .query_row(
@@ -595,15 +602,23 @@ fn table_fresh(conn: &Connection) -> Result<bool> {
             |row| row.get(0),
         )
         .ok();
-    if built.and_then(|v| v.parse::<usize>().ok()).is_none() {
-        return Ok(false);
-    }
+    let built = built.and_then(|v| v.parse::<usize>().ok());
     let stale: i64 = conn.query_row(
         "SELECT COUNT(*) FROM reach_meta WHERE key = ?1",
         rusqlite::params![META_STALE],
         |row| row.get(0),
     )?;
-    Ok(stale == 0)
+    Ok(ReachMeta {
+        built,
+        stale: stale > 0,
+    })
+}
+
+/// Whether the reach table can be incrementally repaired: present, built
+/// (numeric `built_depth`), and not stale.
+fn table_fresh(conn: &Connection) -> Result<bool> {
+    let meta = read_reach_meta(conn)?;
+    Ok(meta.built.is_some() && !meta.stale)
 }
 
 /// Names whose candidate lists or symbol sets a file edit can change: the
@@ -1069,8 +1084,20 @@ pub fn build_reach(
     let mut names: Vec<&String> = graph.by_name.keys().collect();
     names.sort();
 
-    let mut rows: Vec<(i64, i64, i64, f64)> = Vec::new();
-    let mut truncated_sources: Vec<i64> = Vec::new();
+    // The previous contents leave FIRST, inside the caller's transaction
+    // (atomicity is the transaction's, not a buffer's), so each source's
+    // rows stream straight into the table instead of accumulating the
+    // whole build on the heap — a dense adversarial repo could otherwise
+    // buffer #sources x max_targets rows (~1.6GB at 100k symbols) before
+    // the first write (TASK-080 review debt, CWE-400). Physical row
+    // order is name-then-target within this build — the same order the
+    // incremental repair writes, and every reader sorts or sets-compares.
+    tx.execute("DELETE FROM reach", [])?;
+    tx.execute("DELETE FROM reach_truncated", [])?;
+    tx.execute("DELETE FROM reach_meta", [])?;
+
+    let mut rows_written = 0usize;
+    let mut truncated_sources = 0usize;
     let mut sources = 0usize;
 
     let mut candidates = GraphCandidates::new(&graph);
@@ -1080,32 +1107,21 @@ pub fn build_reach(
         };
         sources += 1;
 
-        let (source_rows, truncated) = compute_source_rows(&mut candidates, name, opts)?;
+        let (mut source_rows, truncated) = compute_source_rows(&mut candidates, name, opts)?;
         if truncated {
-            truncated_sources.push(source_id);
+            truncated_sources += 1;
+            tx.execute(
+                "INSERT OR REPLACE INTO reach_truncated (source_id) VALUES (?1)",
+                rusqlite::params![source_id],
+            )?;
         }
-        rows.extend(
-            source_rows
-                .into_iter()
-                .map(|(target_id, min_depth, confidence)| {
-                    (source_id, target_id, min_depth, confidence)
-                }),
-        );
-    }
-
-    // Phase 3: replace previous contents inside the caller's transaction.
-    tx.execute("DELETE FROM reach", [])?;
-    tx.execute("DELETE FROM reach_truncated", [])?;
-    tx.execute("DELETE FROM reach_meta", [])?;
-
-    rows.sort_unstable_by_key(|r| (r.0, r.1));
-    write_reach_rows(tx, &rows)?;
-
-    for source_id in &truncated_sources {
-        tx.execute(
-            "INSERT OR REPLACE INTO reach_truncated (source_id) VALUES (?1)",
-            rusqlite::params![source_id],
-        )?;
+        source_rows.sort_unstable_by_key(|r| r.0);
+        let rows: Vec<(i64, i64, i64, f64)> = source_rows
+            .into_iter()
+            .map(|(target_id, min_depth, confidence)| (source_id, target_id, min_depth, confidence))
+            .collect();
+        rows_written += rows.len();
+        write_reach_rows(tx, &rows)?;
     }
 
     tx.execute(
@@ -1115,8 +1131,8 @@ pub fn build_reach(
 
     Ok(ReachBuildStats {
         sources,
-        rows: rows.len(),
-        truncated_sources: truncated_sources.len(),
+        rows: rows_written,
+        truncated_sources,
     })
 }
 
@@ -1158,35 +1174,17 @@ pub(crate) fn lookup_upstream_impl(
     symbol: &str,
     depth: usize,
 ) -> Result<Option<ReachAnswer>> {
-    // Pre-V5 index: no reach tables at all — nothing to answer from.
-    let table_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reach'",
-        [],
-        |row| row.get(0),
-    )?;
-    if table_exists == 0 {
-        return Ok(None);
-    }
-
-    let built: Option<String> = conn
-        .query_row(
-            "SELECT value FROM reach_meta WHERE key = ?1",
-            rusqlite::params![META_BUILT_DEPTH],
-            |row| row.get(0),
-        )
-        .ok();
-    let Some(built) = built.and_then(|v| v.parse::<usize>().ok()) else {
+    // Pre-V5 index or not-yet-built/stale table: nothing to answer from
+    // (the shared freshness core; the depth sufficiency check is this
+    // call site's own).
+    let meta = read_reach_meta(conn)?;
+    let Some(built) = meta.built else {
         return Ok(None);
     };
     if built < depth {
         return Ok(None);
     }
-    let stale: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM reach_meta WHERE key = ?1",
-        rusqlite::params![META_STALE],
-        |row| row.get(0),
-    )?;
-    if stale > 0 {
+    if meta.stale {
         return Ok(None);
     }
 
@@ -3307,6 +3305,77 @@ mod tests {
         );
         assert!(!is_stale(&conn), "finish itself must not mark stale");
         assert_eq!(built_depth(&conn).as_deref(), Some("3"));
+    }
+
+    /// TASK-081 review debt: the FINISH-side budget guard needs a shape
+    /// the begin-side fast path cannot catch — a tiny pre-edit affected
+    /// set whose post-edit predecessor expansion (sources whose recorded
+    /// reach rows target the edited name) blows past the budget.
+    /// Mutation-verified gap: with the finish guard physically deleted,
+    /// every other budget test still passed. The shape: seed → mid → 30
+    /// leaves — the edited file touches 2 names, but all 30 leaves'
+    /// reach rows target `seed`, so the rebuild set is 2 + 30 > budget.
+    #[test]
+    fn finish_guard_refuses_when_predecessor_expansion_blows_the_budget() {
+        let (_dir, conn) = make_db();
+        let leaves = MAX_INCREMENTAL_REPAIR_SOURCES + 5;
+        apply_edit(
+            &conn,
+            "src/seed.rs",
+            &spec(
+                vec![("seed", "function")],
+                vec![("mid", Some("seed"), 0.9)],
+                vec![],
+            ),
+        );
+        let mid_refs: Vec<(String, Option<String>, f64)> = (0..leaves)
+            .map(|i| (format!("f{i}"), Some("mid".to_string()), 0.9))
+            .collect();
+        apply_edit(
+            &conn,
+            "src/mid.rs",
+            &FileSpec {
+                symbols: vec![("mid".to_string(), "function".to_string())],
+                refs: mid_refs,
+                type_edges: vec![],
+            },
+        );
+        let leaf_names: Vec<String> = (0..leaves).map(|i| format!("f{i}")).collect();
+        for (i, name) in leaf_names.iter().enumerate() {
+            apply_edit(
+                &conn,
+                &format!("src/f{i}.rs"),
+                &spec(vec![(name.as_str(), "function")], vec![], vec![]),
+            );
+        }
+        build(&conn, 3, DEFAULT_MAX_TARGETS_PER_SOURCE);
+        let before = snapshot_reach(&conn);
+        assert!(!before.0.is_empty(), "fixture sanity: reach rows exist");
+
+        // Rename seed: the edited file's own names stay tiny (a_pre =
+        // ["seed", "mid"]), but every leaf's reach rows target `seed`,
+        // so predecessor expansion crosses the budget — only the
+        // finish-side guard can refuse this.
+        let err = apply_edit_result(
+            &conn,
+            "src/seed.rs",
+            &spec(
+                vec![("seed2", "function")],
+                vec![("mid", Some("seed2"), 0.9)],
+                vec![],
+            ),
+        )
+        .expect_err("predecessor expansion over the budget must be refused");
+        assert!(
+            err.to_string().contains("work budget"),
+            "guard must fail for the budget reason, got: {err:#}"
+        );
+        assert_eq!(
+            snapshot_reach(&conn),
+            before,
+            "a refused repair must not add, remove, or rekey any row"
+        );
+        assert!(!is_stale(&conn), "finish itself must not mark stale");
     }
 
     /// The boundary is inclusive: a rebuild set of exactly

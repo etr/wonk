@@ -29,3 +29,23 @@ without network access.
 | Requirement | < 60 s |
 
 Result: **PASS**, with 59.395 seconds of headroom on the measured machine.
+
+## Memory footprint (review debt, 2026-10-02)
+
+The 6.5 MB zstd artifact expands well beyond its size once decoded
+(quantified per the declared assumption; model2vec-rs 0.2.1
+`StaticModel::from_bytes` materializes the i8 tensor as a dense owned
+f32 matrix):
+
+- Steady state, per process holding the model: ~62 MiB resident
+  (63,457 rows x 256 dim x 4 B) — ~10x the 6.5 MB blob, ~8x the 9.4 MB
+  unpacked artifact. The daemon holds it indefinitely; one-shot CLI
+  processes hold it for their lifetime.
+- Peak transient RSS during decode: ~97 MiB (unpacked artifact +
+  safetensors section copies + serialized buffer + the f32 expansion,
+  all live simultaneously), settling back to the ~62 MiB steady state.
+
+Accepted cost for the offline no-dependency default. If the daemon's
+footprint ever matters, the identified path is pooling directly over
+the packed q4 rows with per-row scale applied at pool time (~16 MiB
+matrix) or an f16 `from_borrowed` decode.

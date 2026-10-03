@@ -6,11 +6,13 @@
 
 ## Major
 
-1. [ ] **code-simplifier** | `src/pipeline.rs:529` | code-structure
+1. [x] **code-simplifier** | `src/pipeline.rs:529` | code-structure
+   *Addressed (majors sweep, 2026-10-02):* fixed (delete_file_rows).
    upsert_file_data (lines 529-548) and delete_file_data (lines 485-504) now contain five identical DELETE statements (type_edges, symbols, references, file_imports, term_stats). This diff added the term_stats DELETE to both blocks, extending the duplication so every future per-file table must be edited in two places in lockstep.
    *Recommendation:* Extract a helper such as `fn delete_file_rows(tx: &rusqlite::Transaction, rel_path: &str) -> Result<()>` holding the five shared DELETEs; delete_file_data calls it then deletes the files row, upsert_file_data calls it then does the INSERT OR REPLACE. Behavior-preserving and keeps each new table a one-place edit.
 
-2. [ ] **test-quality-reviewer** | `/Users/etr/progs/wonk/.worktrees/TASK-078/src/pipeline.rs:1995` | missing-test
+2. [x] **test-quality-reviewer** | `/Users/etr/progs/wonk/.worktrees/TASK-078/src/pipeline.rs:1995` | missing-test
+   *Addressed (majors sweep, 2026-10-02):* fixed (trigger-based atomicity test).
    test_term_stats_and_files_row_same_transaction claims to pin the acceptance criterion 'stats written in same transaction as symbol rows', but the injected failure (invalid UTF-8) triggers at fs::read_to_string in reindex_file (pipeline.rs:318), before any transaction starts. The test would still pass if insert_term_stats were moved outside the upsert_file_data transaction into its own commit, so the criterion and the AR-024 mitigation ('statistics updated inside the same transaction as the file's symbol/reference rows') are not actually enforced by any test.
    *Recommendation:* Inject a failure inside the transaction instead: create a temp trigger (CREATE TRIGGER boom BEFORE INSERT ON term_stats BEGIN SELECT RAISE(ABORT, 'boom'); END), call reindex_file on a modified file, and assert that files/symbols/term_stats for that file are all unchanged (rollback, not partial write). Drop the trigger and verify a normal reindex then succeeds. Keep the UTF-8 test as a pre-write-failure case if desired.
 

@@ -238,24 +238,40 @@ pub(crate) fn load_symbols_by_file(
             map.entry(symbol.file.clone()).or_default().push(symbol);
         }
     }
-    for file in files {
-        if map.contains_key(file) {
-            continue;
-        }
-        // Suffix resolution: `symbols.file` is a path-separator-boundary
-        // suffix of the requested (possibly absolute) path.
-        let sql = "SELECT id, file, line, end_line, name, kind, scope, signature, language \
-                   FROM symbols WHERE ?1 LIKE '%' || file";
-        let mut stmt = conn.prepare(sql)?;
+    // Suffix resolution for the files the exact IN lookup missed: the
+    // one shared longest-suffix rule resolves each requested (possibly
+    // absolute) path to its single DB file first (TASK-101 review debt:
+    // nested same-named files made the old collect-from-every-match form
+    // anchor identities on the WRONG file's symbols), and the per-file
+    // fallback statements are prepared once for the whole loop (one scan
+    // per unresolved file was also re-preparing the statement per file).
+    let candidates: Option<Vec<String>> = if files.iter().any(|f| !map.contains_key(f)) {
+        let mut stmt = conn.prepare("SELECT DISTINCT file FROM symbols")?;
         let rows = stmt
-            .query_map([file], symbol_row)?
-            .collect::<rusqlite::Result<Vec<SymbolRow>>>()?;
-        let matched: Vec<SymbolRow> = rows
-            .into_iter()
-            .filter(|r| crate::rerank::is_path_suffix(file, &r.file))
-            .collect();
-        if !matched.is_empty() {
-            map.insert(file.clone(), matched);
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Some(rows)
+    } else {
+        None
+    };
+    if let Some(candidates) = candidates {
+        for file in files {
+            if map.contains_key(file) {
+                continue;
+            }
+            let Some(resolved) = crate::rerank::longest_suffix_match(&candidates, file) else {
+                continue;
+            };
+            let mut stmt = conn.prepare(
+                "SELECT id, file, line, end_line, name, kind, scope, signature, language \
+                 FROM symbols WHERE file = ?1",
+            )?;
+            let rows = stmt
+                .query_map([resolved.as_str()], symbol_row)?
+                .collect::<rusqlite::Result<Vec<SymbolRow>>>()?;
+            if !rows.is_empty() {
+                map.insert(file.clone(), rows);
+            }
         }
     }
     Ok(map)
@@ -1020,11 +1036,36 @@ fn slate_token(query: &str, nanos: u128, members: &[SlateMember], nonce: u32) ->
 /// Prune `feedback_slates` to the newest `retention` rows (LRU by
 /// `created_at`, token breaking ties deterministically).
 pub fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
-    conn.execute(
-        "DELETE FROM feedback_slates WHERE token NOT IN \
-         (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?1)",
-        [retention as i64],
-    )?;
+    prune_slates_exempting(conn, retention, None)
+}
+
+/// [`prune_slates`] with one token exempt from eviction: the slate minted
+/// by THIS very call (TASK-101 review debt). Retention orders by
+/// second-resolution created_at with a token tie-break, so in a
+/// same-second burst at the cap the fresh row could lose the tie-break
+/// against every retained row — and the caller would hand back a token
+/// its own prune just deleted ('slate not found' on the next feedback).
+pub(crate) fn prune_slates_exempting(
+    conn: &Connection,
+    retention: usize,
+    minted: Option<&str>,
+) -> Result<()> {
+    match minted {
+        Some(minted) => {
+            conn.execute(
+                "DELETE FROM feedback_slates WHERE token <> ?1 AND token NOT IN \
+                 (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?2)",
+                rusqlite::params![minted, retention as i64],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM feedback_slates WHERE token NOT IN \
+                 (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?1)",
+                [retention as i64],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1035,6 +1076,20 @@ pub fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
 pub struct StoredSlate {
     pub token: String,
     pub members: Vec<SlateMember>,
+}
+
+impl StoredSlate {
+    /// The recorded identity of the result at (file, line), if the slate
+    /// captured one — the one place the (file, line) keying semantics
+    /// live (TASK-101 review debt: the dispatch surfaces each built the
+    /// same members map and repeated the same stamping dance). Linear
+    /// scan; slates are single-digit-member.
+    pub fn identity_for(&self, file: &str, line: u64) -> Option<String> {
+        self.members
+            .iter()
+            .find(|m| m.file == file && m.line == line)
+            .map(|m| m.identity.clone())
+    }
 }
 
 /// Build the slate for `ranked` and persist it as one `feedback_slates`
@@ -1084,7 +1139,7 @@ pub fn build_and_store_slate(
     if token.is_empty() {
         bail!("could not mint a unique slate token after 3 attempts");
     }
-    prune_slates(&tx, feedback.slate_retention)?;
+    prune_slates_exempting(&tx, feedback.slate_retention, Some(&token))?;
     tx.commit()?;
     Ok(StoredSlate { token, members })
 }
@@ -1496,10 +1551,30 @@ pub struct EventListing {
 /// the whole store).
 pub fn list_events(conn: &Connection) -> Result<Vec<EventListing>> {
     let events = load_events(conn)?;
+    // Resolve each event's display member by the event's OWN identity
+    // first (the event_updates pattern, TASK-103 review debt):
+    // record_feedback stamps every useful member of one call `chosen`
+    // in the shared payload, so a bare `find(chosen)` attributed every
+    // event of a multi-useful call to the FIRST chosen member's
+    // file/line/symbol and liveness.
+    fn resolve(event: &crate::feedback::FeedbackEvent) -> Option<&SlateMember> {
+        event
+            .features
+            .members
+            .iter()
+            .find(|m| m.chosen && m.identity == event.result_identity)
+            .or_else(|| {
+                event
+                    .features
+                    .members
+                    .iter()
+                    .find(|m| m.identity == event.result_identity)
+            })
+    }
     let mut files = std::collections::BTreeSet::new();
     let mut identities = std::collections::HashSet::new();
     for event in &events {
-        if let Some(member) = event.features.members.iter().find(|m| m.chosen) {
+        if let Some(member) = resolve(event) {
             files.insert(member.file.clone());
             identities.insert(member.identity.clone());
         }
@@ -1509,7 +1584,7 @@ pub fn list_events(conn: &Connection) -> Result<Vec<EventListing>> {
     Ok(events
         .into_iter()
         .map(|event| {
-            let member = event.features.members.iter().find(|m| m.chosen);
+            let member = resolve(&event);
             EventListing {
                 id: event.id,
                 live: member.is_none_or(|m| m.symbol.is_none() || live.contains(&m.identity)),
@@ -1644,6 +1719,31 @@ mod tests {
         let index_path = crate::db::find_existing_index(root).unwrap();
         let conn = crate::db::open(&index_path).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn suffix_fallback_resolves_nested_same_named_files_to_the_longest_match() {
+        // TASK-101 review debt: with symbols rows for both src/auth.rs and
+        // other/src/auth.rs, an absolute requested path under other/ is a
+        // boundary suffix of BOTH — the fallback used to mix both files'
+        // symbols into one identity anchor. It now resolves to the single
+        // longest-matching DB file first.
+        let (dir, conn) = seeded_conn(&[
+            ("src/auth.rs", "pub fn login() {}\n"),
+            ("other/src/auth.rs", "pub fn login(x: u32) {}\n"),
+        ]);
+        let root = dir.path();
+        let requested = root
+            .join("other/src/auth.rs")
+            .to_string_lossy()
+            .into_owned();
+        let map = load_symbols_by_file(&conn, std::slice::from_ref(&requested)).unwrap();
+        let rows = map.get(&requested).expect("suffix fallback must resolve");
+        assert!(
+            rows.iter().all(|r| r.file == "other/src/auth.rs"),
+            "only the longest-matching file's symbols: {rows:?}"
+        );
+        drop(dir);
     }
 
     /// One synthetic hit: (file, line, content, score).
@@ -1923,6 +2023,50 @@ mod tests {
             .unwrap()
             .token;
         assert_ne!(a, b, "same query back-to-back still mints distinct tokens");
+        drop(dir);
+    }
+
+    #[test]
+    fn minted_slate_survives_its_own_prune_in_a_same_second_burst() {
+        // TASK-101 review debt: retention orders by second-resolution
+        // created_at with a token tie-break, so at the cap a fresh row
+        // with a lexicographically smaller token lost against every
+        // retained same-second row — the caller held a dead token. The
+        // minted token is exempt from its own prune; no sleeps needed.
+        let (dir, conn) = seeded_conn(&[("nested.rs", NESTED_SRC)]);
+        let ranked = ranked_search(vec![(
+            crate::ranker::ResultCategory::Definition,
+            vec![("nested.rs", 1, "pub fn outer_guard(a: u32) -> u32 {", 0.9)],
+        )]);
+        let mut feedback = test_feedback();
+        feedback.slate_retention = 2;
+
+        let _a = build_and_store_slate(&conn, "q", &ranked, &feedback)
+            .unwrap()
+            .token;
+        let _b = build_and_store_slate(&conn, "q", &ranked, &feedback)
+            .unwrap()
+            .token;
+        // The burst is same-second by construction (no sleeps); whether
+        // or not it is, the invariant under test is the same.
+        let c = build_and_store_slate(&conn, "q", &ranked, &feedback)
+            .unwrap()
+            .token;
+
+        let exists = |token: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM feedback_slates WHERE token = ?1",
+                [token],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        assert!(exists(&c), "the minted token must survive its own prune");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feedback_slates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "retention still holds after the burst");
         drop(dir);
     }
 

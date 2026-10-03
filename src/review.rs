@@ -197,6 +197,23 @@ impl Default for ReviewOptions {
     }
 }
 
+impl ReviewOptions {
+    /// The config-derived rule switches shared verbatim by both dispatch
+    /// surfaces (CLI `dispatch_review`, MCP `tool_review` — TASK-086
+    /// review debt: the block was duplicated and a fourth rule family
+    /// would have had to be wired in two places). Caller-only knobs (CLI
+    /// filter flags, MCP elide) spread over the result.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            breaking_change: config.review.breaking_change,
+            coverage_gap: config.review.coverage_gap,
+            cross_repo: config.review.cross_repo,
+            reach_enabled: config.reach.enabled,
+            ..Self::default()
+        }
+    }
+}
+
 /// Explicit cross-repo inputs for a review run (TASK-086).
 ///
 /// The registry directory is a parameter, never re-derived from `$HOME`
@@ -226,6 +243,18 @@ impl CrossRepoInputs {
             declared,
             repos_dir,
         })
+    }
+
+    /// [`Self::discover`] gated on the `[review] cross_repo` switch —
+    /// the idiom both dispatch surfaces (CLI dispatch_review, MCP
+    /// tool_review) used inline (TASK-086 review debt). A disabled rule
+    /// C passes no inputs at all.
+    pub fn discover_if_enabled(config: &crate::config::Config, repo_root: &Path) -> Option<Self> {
+        config
+            .review
+            .cross_repo
+            .then(|| Self::discover(repo_root))
+            .flatten()
     }
 }
 
@@ -569,7 +598,7 @@ fn format_caller_names(names: &[&str]) -> String {
 fn rule_breaking_change(
     cs: &ChangedSymbol,
     context: &BlastAnalysis,
-    removed: &HashSet<(String, crate::types::SymbolKind)>,
+    removed: &HashSet<(String, crate::types::SymbolKind, String)>,
     line: Option<usize>,
     anchor_method: AnchorMethod,
 ) -> Option<Finding> {
@@ -580,7 +609,7 @@ fn rule_breaking_change(
         .map(|t| {
             t.symbols
                 .iter()
-                .filter(|s| !removed.contains(&(s.name.clone(), s.kind)))
+                .filter(|s| !removed.contains(&(s.name.clone(), s.kind, s.file.clone())))
                 .collect()
         })
         .unwrap_or_default();
@@ -629,15 +658,7 @@ fn rule_breaking_change(
         rule: rule.into(),
         message,
         identity: String::new(),
-        related: surviving
-            .iter()
-            .map(|s| SymbolRef {
-                name: s.name.clone(),
-                kind: s.kind,
-                file: s.file.clone(),
-                line: s.line,
-            })
-            .collect(),
+        related: surviving.iter().map(|&s| SymbolRef::from(s)).collect(),
     })
 }
 
@@ -701,12 +722,7 @@ fn rule_coverage_gap(
             .tiers
             .iter()
             .flat_map(|t| t.symbols.iter())
-            .map(|s| SymbolRef {
-                name: s.name.clone(),
-                kind: s.kind,
-                file: s.file.clone(),
-                line: s.line,
-            })
+            .map(SymbolRef::from)
             .collect(),
     })
 }
@@ -864,12 +880,17 @@ pub fn run_review(
     let suppressed = suppressed_identities(conn)?;
 
     // Callers removed in this same diff are dead code, not breakage.
-    let removed: HashSet<(String, crate::types::SymbolKind)> = detail
+    // Keyed on (name, kind, FILE): a live caller that merely shares
+    // name+kind with an unrelated removed symbol (common method names —
+    // run/apply/new — since SymbolKind encodes no receiver) must not be
+    // dropped as dead code; both sides carry old-side indexed paths
+    // (TASK-085 review debt).
+    let removed: HashSet<(String, crate::types::SymbolKind, String)> = detail
         .analysis
         .changed_symbols
         .iter()
         .filter(|c| c.change_type == crate::types::ChangeType::Removed)
-        .map(|c| (c.name.clone(), c.kind))
+        .map(|c| (c.name.clone(), c.kind, c.file.clone()))
         .collect();
 
     // Per-file cache of current-file symbols for tier-3 re-resolution.
@@ -2050,6 +2071,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn same_name_kind_in_another_file_is_not_dead_code() {
+        // TASK-085 review debt: the removed-caller filter keyed on
+        // (name, kind) only, so a LIVE caller sharing name+kind with an
+        // unrelated removed symbol was dropped as dead code — and when it
+        // was the only surviving caller, the BLOCK finding vanished.
+        // Keying on (name, kind, file) keeps it.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[
+            (
+                "src/lib.rs",
+                "pub fn run() {}\n\npub fn live_caller() { run(); }\n",
+            ),
+            (
+                "src/other.rs",
+                "pub fn run() {}\n\npub fn dead_caller() { run(); }\n",
+            ),
+        ]);
+        let root = dir.path();
+
+        // Delete other.rs entirely: `run`+`dead_caller` there are dead
+        // code, but lib.rs's `run` and its LIVE caller `live_caller`
+        // share the name — the filter must not drop them.
+        std::fs::remove_file(root.join("src/other.rs")).unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+
+        let removed_run = result.findings.iter().any(|f| {
+            f.kind == "breaking-change"
+                && f.rule.contains("removed-symbol-with-callers")
+                && f.message.contains("run")
+        });
+        assert!(
+            removed_run,
+            "the live caller of the removed `run` must still block, got: {:?}",
+            result.findings
+        );
+    }
+
     // -- rule B: coverage gap (PRD-REV-REQ-007) ----------------------------------
 
     #[test]
@@ -2551,12 +2620,7 @@ mod tests {
             .tiers
             .iter()
             .flat_map(|t| t.symbols.iter())
-            .map(|s| SymbolRef {
-                name: s.name.clone(),
-                kind: s.kind,
-                file: s.file.clone(),
-                line: s.line,
-            })
+            .map(SymbolRef::from)
             .collect()
     }
 
@@ -2605,17 +2669,7 @@ mod tests {
             .tiers
             .iter()
             .find(|t| t.severity == BlastSeverity::WillBreak)
-            .map(|t| {
-                t.symbols
-                    .iter()
-                    .map(|s| SymbolRef {
-                        name: s.name.clone(),
-                        kind: s.kind,
-                        file: s.file.clone(),
-                        line: s.line,
-                    })
-                    .collect()
-            })
+            .map(|t| t.symbols.iter().map(SymbolRef::from).collect())
             .unwrap_or_default();
         assert_eq!(finding.related, will_break);
     }
@@ -2795,6 +2849,61 @@ mod tests {
             result.findings
         );
         assert_eq!(result.verdict, ReviewVerdict::Approve);
+    }
+
+    #[test]
+    fn rule_b_independently_disableable() {
+        // TASK-085 review debt (AR-022): only family A's disable path was
+        // verified — a miswired coverage_gap gate would pass the suite
+        // silently. A would-be coverage-gap diff under
+        // `coverage_gap: false` must yield no coverage findings.
+        if !git_available() {
+            return;
+        }
+        let (dir, conn) = make_review_repo(&[(
+            "src/lib.rs",
+            "pub fn f() -> i32 { 1 }\npub fn g() -> i32 { f() }\n",
+        )]);
+        let root = dir.path();
+        // Body edit with no test coverage anywhere: a rule-B candidate.
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn f() -> i32 { 2 }\npub fn g() -> i32 { f() }\n",
+        )
+        .unwrap();
+
+        let result = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions {
+                coverage_gap: false,
+                ..ReviewOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.findings.iter().all(|f| f.kind != "coverage-gap"),
+            "rule B disabled must drop its findings, got: {:?}",
+            result.findings
+        );
+        assert_eq!(result.verdict, ReviewVerdict::Approve);
+
+        // The same diff with the rule on must produce the finding — the
+        // fixture is a real candidate, not an empty one.
+        let enabled = run_review(
+            &conn,
+            &ChangeScope::Unstaged,
+            root,
+            &ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            enabled.findings.iter().any(|f| f.kind == "coverage-gap"),
+            "fixture sanity: the enabled run must find the coverage gap"
+        );
     }
 
     #[test]

@@ -509,14 +509,12 @@ pub fn spawn_daemon(repo_root: &Path, local: bool) -> Result<()> {
                 // Caveat: a bare `git commit` emits no file events, so a
                 // commit-only change refreshes on the NEXT observed batch;
                 // `wonk update` remains the authoritative refresh path.
-                if history.enabled
-                    && let Err(e) = crate::history::refresh(
+                if history.enabled {
+                    crate::history::refresh(
                         &conn,
                         &repo_root_buf,
                         &crate::history::MiningOptions::from(&history),
-                    )
-                {
-                    eprintln!("wonk: history refresh failed: {e:#}");
+                    );
                 }
                 // Topology recompute, gated by the interval since the last
                 // run (TASK-098, PRD-TOPO-REQ-006): event batches can

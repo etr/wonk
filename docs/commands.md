@@ -400,6 +400,11 @@ wonk review --scope compare --base main
 | `--scope <scope>` | `unstaged` (default), `staged`, `all`, or `compare` |
 | `--base <ref>` | Base git ref (required when `--scope=compare`) |
 | `--since <ref>` | Sugar for `--scope=compare --base=<ref>` |
+| `--min-confidence <F>` | Drop findings whose confidence is below this floor (0.0-1.0) |
+| `--min-severity <tier>` | Drop findings below this tier (`blocking`\|`warning`\|`note`) |
+| `--kind <kind>` | Keep only these finding categories (`breaking-change`, `coverage-gap`, `cross-repo`); repeatable or comma-separated |
+| `--max-findings <N>` | Keep at most N findings, worst-first; the rest are counted in the verdict line's `over_cap` |
+| `--elide [mode]` | Elide function bodies from source output (`bodies`\|`salience`; bare = salience) — inert on the finding payload today |
 
 Grep output — one line per finding plus a verdict line:
 
@@ -411,6 +416,22 @@ verdict: REVIEW
 
 Unanchored findings (no honest line could be determined) print `[unanchored]`
 in place of `file:line` and are still emitted.
+
+#### `wonk review suppress` — durable suppressions
+
+Retired finding identities are consulted before a finding is kept, so an
+accepted-and-suppressed finding never re-fires (PRD-REV-REQ-014).
+Suppression is by stable finding identity (the `identity` field of a
+JSON finding line) — re-indentation and line moves cannot dodge it, and
+any token change re-fires it.
+
+```
+wonk review suppress list                     # newest first
+wonk review suppress list --rule breaking-change/removed-symbol-with-callers
+wonk review suppress add <identity> --rule <rule> --note "vetted in #1234"
+wonk review suppress remove <identity>...     # by identity
+wonk review suppress remove --rule <rule>     # or every suppression of a rule
+```
 
 `--format json` is NDJSON: one independently-parseable line per finding plus
 exactly one final verdict line — a clean diff still emits the verdict line.

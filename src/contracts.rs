@@ -267,19 +267,25 @@ impl RouterContext {
             .map(|(_, var)| var.as_str())
     }
 
-    /// Concatenated prefix for a router variable: mount paths first, then
-    /// the variable's own binding.
-    fn effective_prefix(&self, var: &str) -> String {
-        let mut prefix = String::new();
-        if let Some(mount_paths) = self.mounts.get(var) {
-            for m in mount_paths {
-                prefix.push_str(m);
+    /// Every prefix a router variable is reachable under: ONE PER MOUNT
+    /// PATH — a router mounted under several prefixes serves each of
+    /// them, not their concatenation (`app.use('/v1', r)` +
+    /// `app.use('/v2', r)` + `r.get('/users')` yields /v1/users AND
+    /// /v2/users — TASK-082 review debt) — each joined with the
+    /// variable's own binding, de-duplicated in first-seen order. A
+    /// binding-only variable yields its single binding; an unbound
+    /// variable yields one empty prefix so consumers keep today's
+    /// behavior.
+    fn effective_prefixes(&self, var: &str) -> Vec<String> {
+        let binding = self.bindings.get(var).cloned().unwrap_or_default();
+        let mut out: Vec<String> = match self.mounts.get(var) {
+            Some(mounts) if !mounts.is_empty() => {
+                mounts.iter().map(|m| format!("{m}{binding}")).collect()
             }
-        }
-        if let Some(b) = self.bindings.get(var) {
-            prefix.push_str(b);
-        }
-        prefix
+            _ => vec![binding],
+        };
+        out.dedup();
+        out
     }
 }
 
@@ -1172,16 +1178,17 @@ impl<'a> Extractor<'a> {
                     && (self.ctx.is_router_var(recv) || JS_ROUTER_VARS.contains(&recv))
                     && let Some(arg) = first_arg
                 {
-                    let mount_prefix = self.ctx.effective_prefix(recv);
-                    self.emit_http(
-                        node,
-                        arg,
-                        ContractRole::Provider,
-                        prop,
-                        &join_raw(prefix, &mount_prefix),
-                        CONFIDENCE_FRAMEWORK,
-                        None,
-                    );
+                    for mount_prefix in self.ctx.effective_prefixes(recv) {
+                        self.emit_http(
+                            node,
+                            arg,
+                            ContractRole::Provider,
+                            prop,
+                            &join_raw(prefix, &mount_prefix),
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
                 } else if JS_CONSUMER_RECEIVERS.contains(&recv)
                     && JS_CONSUMER_VERBS.contains(&prop)
                     && let Some(arg) = first_arg
@@ -1236,9 +1243,7 @@ impl<'a> Extractor<'a> {
         let first = positional_arg(args, 0);
         match prop {
             _ if ws_receiver && matches!(prop, "emit" | "send") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_ws(
                         node,
                         t,
@@ -1273,9 +1278,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             "emit" => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_ws(
                         node,
                         t,
@@ -1299,22 +1302,20 @@ impl<'a> Extractor<'a> {
     /// the enclosing function; BullMQ-style queue adds are 0.5 consumers
     /// (generic `add` verb).
     fn js_job_call(&mut self, node: Node, recv: &str, prop: &str, args: Node) {
-        let recv_lower = recv.to_lowercase();
+        // The lowercase receiver is needed only by the three job verbs;
+        // every other member call (.map/.then/.push/…) falls through here
+        // and must not pay the allocation (TASK-087 review debt).
+        let recv_lower = matches!(prop, "schedule" | "define" | "add")
+            .then(|| recv.to_lowercase())
+            .unwrap_or_default();
         let first = positional_arg(args, 0);
         match prop {
             "schedule" if recv == "cron" || recv_lower.contains("cron") => {
-                let (name, name_node) =
-                    match positional_arg(args, 1).filter(|cb| cb.kind() == "identifier") {
-                        Some(cb) => (node_text(Some(cb), self.src).to_string(), cb),
-                        None => {
-                            let Some(own) =
-                                crate::indexer::find_enclosing_function(node, self.src, self.lang)
-                            else {
-                                return;
-                            };
-                            (own, node)
-                        }
-                    };
+                let Some((name, name_node)) =
+                    self.job_name_from_callback(node, positional_arg(args, 1))
+                else {
+                    return;
+                };
                 self.emit_job(
                     node,
                     name_node,
@@ -1325,9 +1326,7 @@ impl<'a> Extractor<'a> {
                 );
             }
             "define" if recv_lower.contains("agenda") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_job(
                         node,
                         t,
@@ -1339,9 +1338,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             "add" if recv == "q" || recv_lower.contains("queue") || recv_lower.contains("bull") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_job(
                         node,
                         t,
@@ -1366,26 +1363,20 @@ impl<'a> Extractor<'a> {
         match prop {
             "sendToQueue" => {
                 // amqplib: sendToQueue(queue, content)
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(node, t, &raw, cons, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
                 }
             }
             "publish" if argc >= 3 => {
                 // amqplib: publish(exchange, routingKey, content)
-                if let Some(t) = positional_arg(args, 1)
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(positional_arg(args, 1)) {
                     self.emit_queue(node, t, &raw, cons, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
                 }
             }
             "consume" => {
                 // amqplib: consume(queue, callback) — the only idiomatic
                 // `.consume` in JS clients.
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(node, t, &raw, prov, "rabbitmq", CONFIDENCE_FRAMEWORK, None);
                 }
             }
@@ -1596,16 +1587,17 @@ impl<'a> Extractor<'a> {
                 "get" | "post" | "put" | "patch" | "delete" if is_router => attr,
                 _ => continue,
             };
-            let mount_prefix = self.ctx.effective_prefix(recv);
-            self.emit_http(
-                call,
-                path_node,
-                ContractRole::Provider,
-                verb,
-                &join_raw(prefix, &mount_prefix),
-                CONFIDENCE_FRAMEWORK,
-                owning.as_deref(),
-            );
+            for mount_prefix in self.ctx.effective_prefixes(recv) {
+                self.emit_http(
+                    call,
+                    path_node,
+                    ContractRole::Provider,
+                    verb,
+                    &join_raw(prefix, &mount_prefix),
+                    CONFIDENCE_FRAMEWORK,
+                    owning.as_deref(),
+                );
+            }
         }
         prefix.to_string()
     }
@@ -1669,9 +1661,7 @@ impl<'a> Extractor<'a> {
                     // -- queue (TASK-087, DR-031) --------------------------------
                     // confluent-kafka: producer.produce('topic', value=…).
                     (_, "produce") => {
-                        if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1687,9 +1677,7 @@ impl<'a> Extractor<'a> {
                     (_, "basic_publish") => {
                         let t = kwarg_string_node(args, "routing_key", self.src)
                             .or_else(|| positional_arg(args, 1));
-                        if let Some(t) = t
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(t) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1704,9 +1692,7 @@ impl<'a> Extractor<'a> {
                     // pika: basic_consume(queue=…) else positional 1.
                     (_, "basic_consume") => {
                         let t = kwarg_string_node(args, "queue", self.src).or(first);
-                        if let Some(t) = t
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(t) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1720,9 +1706,7 @@ impl<'a> Extractor<'a> {
                     }
                     // nats-py: nc.publish(subj, payload) / nc.subscribe(subj).
                     (_, "publish") if matches!(recv, "nc" | "nats") => {
-                        if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1735,9 +1719,7 @@ impl<'a> Extractor<'a> {
                         }
                     }
                     (_, "subscribe") if matches!(recv, "nc" | "nats") => {
-                        if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -1771,9 +1753,7 @@ impl<'a> Extractor<'a> {
                     // celery_app.send_task('orders.sync', …) — dispatch by
                     // name.
                     (_, "send_task") => {
-                        if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_job(
                                 node,
                                 t,
@@ -1787,17 +1767,10 @@ impl<'a> Extractor<'a> {
                     // scheduler.add_job(fn, …): the function (or the
                     // enclosing one) names the schedule.
                     (_, "add_job") if recv.to_lowercase().contains("sched") => {
-                        let target = positional_arg(args, 0).filter(|n| n.kind() == "identifier");
-                        let (name, name_node) = match target {
-                            Some(id) => (node_text(Some(id), self.src).to_string(), id),
-                            None => {
-                                let Some(own) = crate::indexer::find_enclosing_function(
-                                    node, self.src, self.lang,
-                                ) else {
-                                    return;
-                                };
-                                (own, node)
-                            }
+                        let Some((name, name_node)) =
+                            self.job_name_from_callback(node, positional_arg(args, 0))
+                        else {
+                            return;
                         };
                         self.emit_job(
                             node,
@@ -2104,9 +2077,7 @@ impl<'a> Extractor<'a> {
                                 CONFIDENCE_FRAMEWORK,
                                 None,
                             );
-                        } else if let Some(t) = first
-                            && let Some(raw) = self.topic_arg(t)
-                        {
+                        } else if let Some((t, raw)) = self.topic_at(first) {
                             self.emit_queue(
                                 node,
                                 t,
@@ -2208,16 +2179,18 @@ impl<'a> Extractor<'a> {
             // gin/chi-style registration: uppercase verb + handler arg.
             _ if GO_PROVIDER_VERBS.contains(&meth) && argc >= 2 => {
                 if let Some(arg) = first {
-                    let pfx = join_raw(prefix, &self.ctx.effective_prefix(recv));
-                    self.emit_http(
-                        node,
-                        arg,
-                        ContractRole::Provider,
-                        meth,
-                        &pfx,
-                        CONFIDENCE_FRAMEWORK,
-                        None,
-                    );
+                    for mount_prefix in self.ctx.effective_prefixes(recv) {
+                        let pfx = join_raw(prefix, &mount_prefix);
+                        self.emit_http(
+                            node,
+                            arg,
+                            ContractRole::Provider,
+                            meth,
+                            &pfx,
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
                 }
             }
             (_, "HandleFunc") | (_, "Handle") if argc >= 2 => {
@@ -2269,9 +2242,7 @@ impl<'a> Extractor<'a> {
             // PublishWithContext(ctx, exchange, key, msg, ...) has >= 4 args
             // with the routing key at position 2.
             (_, "PublishWithContext") if argc >= 4 => {
-                if let Some(t) = positional_arg(args, 2)
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(positional_arg(args, 2)) {
                     self.emit_queue(
                         node,
                         t,
@@ -2284,9 +2255,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, "PublishWithContext") if argc == 3 => {
-                if let Some(t) = positional_arg(args, 1)
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(positional_arg(args, 1)) {
                     self.emit_queue(
                         node,
                         t,
@@ -2299,9 +2268,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, m) if m.starts_with("Publish") && m != "PublishWithContext" && argc >= 3 => {
-                if let Some(t) = positional_arg(args, 1)
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(positional_arg(args, 1)) {
                     self.emit_queue(
                         node,
                         t,
@@ -2314,9 +2281,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, "Publish") if argc == 2 => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2329,9 +2294,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, "Subscribe") | (_, "QueueSubscribe") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2344,9 +2307,7 @@ impl<'a> Extractor<'a> {
                 }
             }
             (_, "Consume") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2360,9 +2321,7 @@ impl<'a> Extractor<'a> {
             }
             // sarama: ConsumePartition(topic, partition, offset).
             (_, "ConsumePartition") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2376,9 +2335,7 @@ impl<'a> Extractor<'a> {
             }
             // sarama: producer.SendMessage(&ProducerMessage{Topic: "…"}).
             (_, "SendMessage") => {
-                if let Some(t) = first
-                    && let Some(raw) = self.topic_arg(t)
-                {
+                if let Some((t, raw)) = self.topic_at(first) {
                     self.emit_queue(
                         node,
                         t,
@@ -2393,18 +2350,11 @@ impl<'a> Extractor<'a> {
             // TASK-087 job: robfig/cron c.AddFunc(spec, fn)/AddJob — the
             // scheduled function names the job, else the enclosing one.
             (_, "AddFunc") | (_, "AddJob") => {
-                let (name, name_node) =
-                    match positional_arg(args, 1).filter(|n| n.kind() == "identifier") {
-                        Some(id) => (node_text(Some(id), self.src).to_string(), id),
-                        None => {
-                            let Some(own) =
-                                crate::indexer::find_enclosing_function(node, self.src, self.lang)
-                            else {
-                                return;
-                            };
-                            (own, node)
-                        }
-                    };
+                let Some((name, name_node)) =
+                    self.job_name_from_callback(node, positional_arg(args, 1))
+                else {
+                    return;
+                };
                 self.emit_job(
                     node,
                     name_node,
@@ -2532,16 +2482,19 @@ impl<'a> Extractor<'a> {
                     let verb = positional_arg(args, 1)
                         .and_then(|handler| rust_handler_verb(handler, self.src))
                         .unwrap_or("ANY");
-                    let route_prefix = self.rust_receiver_prefix(func.child_by_field_name("value"));
-                    self.emit_http(
-                        node,
-                        arg,
-                        ContractRole::Provider,
-                        verb,
-                        &join_raw(prefix, &route_prefix),
-                        CONFIDENCE_FRAMEWORK,
-                        None,
-                    );
+                    for route_prefix in
+                        self.rust_receiver_prefixes(func.child_by_field_name("value"))
+                    {
+                        self.emit_http(
+                            node,
+                            arg,
+                            ContractRole::Provider,
+                            verb,
+                            &join_raw(prefix, &route_prefix),
+                            CONFIDENCE_FRAMEWORK,
+                            None,
+                        );
+                    }
                 } else if let Some(verb) = canonical_verb(field) {
                     let value = func.child_by_field_name("value");
                     let root = rust_chain_root(value);
@@ -2654,17 +2607,18 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// Prefix carried by a `.route` receiver: inline `web::scope("/p")`
-    /// chain segments, plus the prefix of the variable whose initializer
-    /// the chain belongs to (Axum `let user_routes = Router::new()…`).
-    fn rust_receiver_prefix(&self, recv: Option<Node>) -> String {
-        // A bound variable (`api.route(…)`) carries its own prefix.
+    /// Prefixes carried by a `.route` receiver: inline `web::scope("/p")`
+    /// chain segments, plus every prefix of the variable whose
+    /// initializer the chain belongs to (Axum `let user_routes =
+    /// Router::new()…`) — one per mount (TASK-082 review debt).
+    fn rust_receiver_prefixes(&self, recv: Option<Node>) -> Vec<String> {
+        // A bound variable (`api.route(…)`) carries its own prefixes.
         if let Some(r) = recv
             && r.kind() == "identifier"
         {
-            return self.ctx.effective_prefix(node_text(Some(r), self.src));
+            return self.ctx.effective_prefixes(node_text(Some(r), self.src));
         }
-        let mut prefix = String::new();
+        let mut scope_prefix = String::new();
         let mut current = recv;
         let mut last = recv;
         let mut depth = 0;
@@ -2695,7 +2649,7 @@ impl<'a> Extractor<'a> {
                 && path_node.kind() == "string_literal"
             {
                 append_segment(
-                    &mut prefix,
+                    &mut scope_prefix,
                     &render_string_node(path_node, self.src, self.lang),
                 );
             }
@@ -2705,9 +2659,14 @@ impl<'a> Extractor<'a> {
         if let Some(root) = current.or(last)
             && let Some(var) = self.ctx.var_for_range(root.start_byte())
         {
-            prefix.push_str(&self.ctx.effective_prefix(var));
+            return self
+                .ctx
+                .effective_prefixes(var)
+                .into_iter()
+                .map(|p| format!("{scope_prefix}{p}"))
+                .collect();
         }
-        prefix
+        vec![scope_prefix]
     }
 
     /// `env!("X")` — macro_invocation children carry no field names.
@@ -2954,12 +2913,14 @@ impl<'a> Extractor<'a> {
             return;
         }
         // Queue template producers (DR-031: publishing initiates, so these
-        // are the consumer side).
-        let object_lower = object.to_lowercase();
+        // are the consumer side). The lowercase is computed only behind the
+        // name gate — nearly every member call falls through here (TASK-087
+        // review debt).
+        let object_lower = matches!(name, "send" | "convertAndSend")
+            .then(|| object.to_lowercase())
+            .unwrap_or_default();
         if object_lower.contains("kafka") && name == "send" {
-            if let Some(t) = first
-                && let Some(raw) = self.topic_arg(t)
-            {
+            if let Some((t, raw)) = self.topic_at(first) {
                 self.emit_queue(
                     node,
                     t,
@@ -2975,9 +2936,7 @@ impl<'a> Extractor<'a> {
         if object_lower.contains("rabbit") && matches!(name, "send" | "convertAndSend") {
             // The routing key is the last leading string literal — the
             // argument just before the non-literal payload.
-            if let Some(t) = java_last_leading_string(args)
-                && let Some(raw) = self.topic_arg(t)
-            {
+            if let Some((t, raw)) = self.topic_at(java_last_leading_string(args)) {
                 self.emit_queue(
                     node,
                     t,
@@ -2994,9 +2953,7 @@ impl<'a> Extractor<'a> {
         // (checked after the rabbit arm — `rabbitTemplate` also contains
         // "Template").
         if object.contains("Template") && name == "convertAndSend" {
-            if let Some(t) = first
-                && let Some(raw) = self.topic_arg(t)
-            {
+            if let Some((t, raw)) = self.topic_at(first) {
                 self.emit_ws(
                     node,
                     t,
@@ -3008,7 +2965,8 @@ impl<'a> Extractor<'a> {
             }
             return;
         }
-        if let Some(verb) = java_client_verb(name)
+        if let Some(verb) =
+            java_client_verb(name).or_else(|| java_generic_client_verb(name, object))
             && let Some(arg) = first
         {
             self.emit_http(
@@ -3754,6 +3712,35 @@ impl<'a> Extractor<'a> {
         });
     }
 
+    /// The job-name fallback shared by `cron.schedule`,
+    /// `scheduler.add_job`, and gocron `AddFunc`/`AddJob` (TASK-087
+    /// review debt): the callback identifier names the job, else the
+    /// enclosing function does; no name anywhere means no job contract.
+    fn job_name_from_callback(
+        &self,
+        node: Node<'a>,
+        cb: Option<Node<'a>>,
+    ) -> Option<(String, Node<'a>)> {
+        match cb.filter(|cb| cb.kind() == "identifier") {
+            Some(id) => Some((node_text(Some(id), self.src).to_string(), id)),
+            None => {
+                let own = crate::indexer::find_enclosing_function(node, self.src, self.lang)?;
+                Some((own, node))
+            }
+        }
+    }
+
+    /// The topic argument and its rendered string, paired once
+    /// (TASK-087 review debt): every emitter needs both — the node for
+    /// line attribution, the string for the canonical id — and the
+    /// hand-rolled pairing drifted across ~25 matcher arms before this
+    /// existed.
+    fn topic_at(&self, arg: Option<Node<'a>>) -> Option<(Node<'a>, String)> {
+        let t = arg?;
+        let raw = self.topic_arg(t)?;
+        Some((t, raw))
+    }
+
     /// Render the topic-bearing literal of a call argument, per language.
     ///
     /// Returns `None` for non-literals, multi-literal containers, and
@@ -4459,16 +4446,34 @@ fn java_last_leading_string(args: Node) -> Option<Node> {
     last
 }
 
-/// Java RestTemplate-style client method verbs.
+/// Java RestTemplate-style client method verbs. Only the unambiguous
+/// `*ForObject`/`*ForEntity` family is receiver-independent.
 fn java_client_verb(name: &str) -> Option<&'static str> {
     match name {
         "getForObject" | "getForEntity" => Some("get"),
         "postForObject" | "postForEntity" => Some("post"),
-        "put" => Some("put"),
-        "delete" => Some("delete"),
-        "exchange" | "execute" => Some("ANY"),
         _ => None,
     }
+}
+
+/// The generic Java verbs (`put`/`delete`/`exchange`/`execute`) are
+/// client calls only on an HTTP-looking receiver — `Map.put` and
+/// repository deletes are ubiquitous otherwise, and Java uniquely
+/// bypassed the receiver allowlist every other language applies
+/// (TASK-082 review debt).
+fn java_generic_client_verb(name: &str, object: &str) -> Option<&'static str> {
+    let verb = match name {
+        "put" => "put",
+        "delete" => "delete",
+        "exchange" | "execute" => "ANY",
+        _ => return None,
+    };
+    let object_lower = object.to_lowercase();
+    (object_lower.contains("resttemplate")
+        || object_lower.contains("httpclient")
+        || object_lower.contains("webclient")
+        || object_lower.contains("client"))
+    .then_some(verb)
 }
 
 /// First entry of the `methods: ['GET']` named argument of a PHP attribute.
@@ -4574,7 +4579,9 @@ fn template_content(node: Node, src: &[u8]) -> String {
 /// the caller.
 fn concat_literal(node: Node, src: &[u8], lang: Lang, leaf_kinds: &[&str]) -> Option<PathArg> {
     let mut literals = Vec::new();
-    collect_string_leaves(node, src, lang, leaf_kinds, &mut literals);
+    if !collect_string_leaves(node, src, lang, leaf_kinds, &mut literals, 0) {
+        return None;
+    }
     if literals.len() == 1 && is_path_like(&literals[0]) {
         Some(PathArg::Concat(literals.into_iter().next()?))
     } else {
@@ -4582,24 +4589,40 @@ fn concat_literal(node: Node, src: &[u8], lang: Lang, leaf_kinds: &[&str]) -> Op
     }
 }
 
+/// Deepest concatenation chain we will walk. A left-nested chain of ~10k
+/// terms (bundled/minified JS, well under 100KB) overflows the thread
+/// stack one frame per binary-expression level, so the walk is bounded
+/// (TASK-087 review debt, PRD-CTR threat model).
+const MAX_CONCAT_DEPTH: u32 = 256;
+
+/// Collect the string literals of a concatenation tree. Returns false
+/// when the depth cap tripped — the leaf set is then partial, so the
+/// caller must treat the literal as unresolvable rather than act on it.
 fn collect_string_leaves(
     node: Node,
     src: &[u8],
     lang: Lang,
     leaf_kinds: &[&str],
     out: &mut Vec<String>,
-) {
+    depth: u32,
+) -> bool {
+    if depth > MAX_CONCAT_DEPTH {
+        return false;
+    }
     if leaf_kinds.contains(&node.kind()) {
         out.push(render_string_node(node, src, lang));
-        return;
+        return true;
     }
     if node.kind().starts_with("binary") {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                collect_string_leaves(child, src, lang, leaf_kinds, out);
+            if let Some(child) = node.child(i as u32)
+                && !collect_string_leaves(child, src, lang, leaf_kinds, out, depth + 1)
+            {
+                return false;
             }
         }
     }
+    true
 }
 
 /// Render any language's string node to its content. Content children are
@@ -5803,17 +5826,27 @@ fn skip_balanced(s: &str, open: char, close: char) -> Option<&str> {
 
 /// Depth-0 field names of a selection-set body (the text after the opening
 /// `{`). Field arguments, nested selection sets, aliases (`alias: field`
-/// reports `field`), and spreads (`...name`) are skipped.
+/// reports `field`), directives (`@include`), spreads (`...F` and
+/// `... F`), and inline-fragment type conditions (`... on T`) are
+/// skipped.
 fn top_level_fields(body: &str) -> Vec<String> {
     let chars: Vec<char> = body.chars().collect();
     let mut fields = Vec::new();
     let mut depth = 0i32;
     let mut i = 0usize;
+    // The last significant (non-whitespace) character and whether the
+    // previous depth-0 token was the `on` of a spread — together they
+    // recognize tight/spaced spreads, directives, and inline-fragment
+    // type conditions so none of them emit phantom fields (TASK-088
+    // review debt).
+    let mut last_sig = '\0';
+    let mut after_spread_on = false;
     while i < chars.len() {
         let c = chars[i];
         match c {
             '{' => {
                 depth += 1;
+                last_sig = '{';
                 i += 1;
             }
             '}' => {
@@ -5821,6 +5854,7 @@ fn top_level_fields(body: &str) -> Vec<String> {
                 if depth < 0 {
                     break;
                 }
+                last_sig = '}';
                 i += 1;
             }
             '(' => {
@@ -5837,17 +5871,22 @@ fn top_level_fields(body: &str) -> Vec<String> {
                         break;
                     }
                 }
+                last_sig = ')';
             }
             _ if depth == 0 && (c.is_ascii_alphanumeric() || c == '_') => {
                 let start = i;
                 while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                     i += 1;
                 }
-                let is_spread = start > 0 && chars[start - 1] == '.';
-                if is_spread {
+                let name: String = chars[start..i].iter().collect();
+                let spread = last_sig == '.';
+                let directive = last_sig == '@';
+                let type_condition = after_spread_on;
+                after_spread_on = spread && name == "on";
+                last_sig = chars[i - 1];
+                if spread || directive || type_condition {
                     continue;
                 }
-                let name: String = chars[start..i].iter().collect();
                 // Alias? `alias: field` — the next identifier is the field.
                 let mut j = i;
                 while j < chars.len() && chars[j].is_whitespace() {
@@ -5859,6 +5898,9 @@ fn top_level_fields(body: &str) -> Vec<String> {
                 fields.push(name);
             }
             _ => {
+                if !c.is_whitespace() {
+                    last_sig = c;
+                }
                 i += 1;
             }
         }
@@ -8564,6 +8606,42 @@ class Client {
     }
 
     #[test]
+    fn java_generic_verbs_need_a_client_receiver() {
+        // TASK-082 review debt: `cache.put`/`repository.delete` are not
+        // HTTP consumers at full confidence — the generic verbs fire only
+        // on an HTTP-looking receiver, matching every other language's
+        // allowlist.
+        let src = "\
+class A {
+    void f() {
+        cache.put(\"/users/1\", u);
+        repository.delete(\"/users/1\");
+        map.execute(\"/things\");
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 0, "got {cands:?}");
+    }
+
+    #[test]
+    fn java_webclient_generic_verbs_are_consumers() {
+        let src = "\
+class A {
+    void f() {
+        webClient.put(\"/users/1\");
+        restTemplate.delete(\"/users/1\");
+    }
+}
+";
+        let cands = extract(Lang::Java, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "http::PUT::/users/1").is_some());
+        assert!(find(&cands, "http::DELETE::/users/1").is_some());
+        assert!(cands.iter().all(|c| c.role == ContractRole::Consumer));
+    }
+
+    #[test]
     fn java_env() {
         let src = "\
 class Client {
@@ -9151,6 +9229,22 @@ void cfg(void) {
     }
 
     #[test]
+    fn concat_adversarial_depth_is_bounded_not_crashing() {
+        // TASK-087 review debt: a left-nested ~10k-term concat chain
+        // (bundled/minified JS) used to overflow the thread stack one
+        // frame per binary-expression level. The capped walk must return
+        // no candidates, not crash, and never act on a partial leaf set.
+        let mut src = String::from("const r = await fetch(");
+        src.push_str("'/users'");
+        for i in 0..10_000 {
+            src.push_str(&format!(" + seg{i}"));
+        }
+        src.push_str(");\n");
+        let cands = extract(Lang::JavaScript, &src);
+        assert_eq!(cands.len(), 0, "got {cands:?}");
+    }
+
+    #[test]
     fn python_unknown_receiver_ambiguity() {
         let src = "def load():
     a = store.get('/items')
@@ -9247,6 +9341,32 @@ router.get('/users/:id', getUser);
         assert!(
             find(&cands, "http::GET::/v1/users/{p1}").is_some(),
             "got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn express_router_mounted_twice_serves_each_prefix() {
+        // TASK-082 review debt: a router mounted under several prefixes
+        // serves EACH — two contracts — not the concatenation
+        // (/v1/v2/users was the old, wrong output).
+        let src = "const app = express();
+const router = express.Router();
+app.use('/v1', router);
+app.use('/v2', router);
+router.get('/users', h);
+";
+        let cands = extract(Lang::JavaScript, src);
+        assert!(
+            find(&cands, "http::GET::/v1/users").is_some(),
+            "got {cands:?}"
+        );
+        assert!(
+            find(&cands, "http::GET::/v2/users").is_some(),
+            "got {cands:?}"
+        );
+        assert!(
+            find(&cands, "http::GET::/v1/v2/users").is_none(),
+            "concatenated mount leaked: {cands:?}"
         );
     }
 
@@ -10670,6 +10790,53 @@ server.addService(user.UserService.service, { getUser: handler });
     }
 
     #[test]
+    fn graphql_parse_alias_reports_the_field_not_the_alias() {
+        // TASK-088 review debt: the alias skip had zero coverage —
+        // deleting it used to pass the suite silently.
+        let ops = parse_graphql_operation("query { u: user posts }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "user".to_string()),
+                    ("Query".to_string(), "posts".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn graphql_parse_tight_and_spaced_spreads_are_skipped() {
+        let tight = parse_graphql_operation("query Q { ...UserFields posts }");
+        assert_eq!(
+            tight.as_deref(),
+            Some(&[("Query".to_string(), "posts".to_string())][..])
+        );
+        let spaced = parse_graphql_operation("query Q { ... UserFields posts }");
+        assert_eq!(
+            spaced.as_deref(),
+            Some(&[("Query".to_string(), "posts".to_string())][..])
+        );
+    }
+
+    #[test]
+    fn graphql_parse_inline_fragment_and_directives_emit_no_phantoms() {
+        // `... on User` and `@include` used to leak `on`, `User`, and
+        // `include` as phantom depth-0 fields (TASK-088 review debt).
+        let ops =
+            parse_graphql_operation("query Q { ... on User { id } user @include(if: $x) posts }");
+        assert_eq!(
+            ops.as_deref(),
+            Some(
+                &[
+                    ("Query".to_string(), "user".to_string()),
+                    ("Query".to_string(), "posts".to_string())
+                ][..]
+            )
+        );
+    }
+
+    #[test]
     fn graphql_parse_non_operation_rejected() {
         assert!(parse_graphql_operation("SELECT * FROM users").is_none());
         assert!(parse_graphql_operation("").is_none());
@@ -10775,6 +10942,18 @@ const resolvers = {
         assert_eq!(user.role, ContractRole::Consumer);
         assert_eq!(user.line, 2);
         assert!(find(&cands, "graphql::Mutation::deleteUser").is_some());
+    }
+
+    #[test]
+    fn graphql_js_gql_fragment_alias_directive_no_phantoms() {
+        // TASK-088 review debt, through extract(): aliases report the
+        // field, spreads and inline fragments and directives emit
+        // nothing.
+        let src = "const Q = gql`query { u: user ...UserFields ... on User { id } posts @include(if: $x) }`;\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 2, "got {cands:?}");
+        assert!(find(&cands, "graphql::Query::user").is_some());
+        assert!(find(&cands, "graphql::Query::posts").is_some());
     }
 
     #[test]

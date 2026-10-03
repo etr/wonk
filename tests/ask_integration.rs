@@ -552,6 +552,21 @@ fn request_method(request: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/// The Content-Length of a raw HTTP request head (0 when absent).
+fn request_content_length(head: &[u8]) -> usize {
+    String::from_utf8_lossy(head)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
 /// Offline command whose ollama traffic is routed through the mock.
 fn mock_routed_command(
     bin: &std::path::Path,
@@ -623,6 +638,134 @@ fn ask_degrades_to_bundled_when_ollama_dies_mid_build() {
     assert!(
         output.stdout.is_empty(),
         "no structured results are possible on this path, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// A stand-in Ollama that is healthy but broken for embeddings: every health
+/// probe (`GET /` → 200 OK) succeeds, while `/api/embed` answers with an
+/// error response ("model not found"). The embedding layer classifies this
+/// as `EmbeddingError::OllamaError`, not unreachability, so the ask path
+/// must surface the real build error instead of masquerading it as a
+/// disconnect and silently degrading to the bundled provider.
+fn spawn_mock_ollama_embed_model_not_found() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock ollama");
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        // One thread per connection: the client's connection pool can
+        // open a socket it then leaves idle, and a sequential accept
+        // loop would block inside read_request_head on that idle socket
+        // while the real next request waits behind it — a mutual 0%-CPU
+        // hang. Serving concurrently makes an idle connection harmless.
+        for stream in listener.incoming() {
+            let stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                // Belt: no mock thread may block forever — a stalled or
+                // half-sent request (pool speculation, interrupted body)
+                // errors out after the timeout instead of wedging the
+                // connection and, through it, the client.
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut head = read_request_head(&mut stream);
+                if request_method(&head) == "CONNECT" {
+                    // Complete the proxy tunnel handshake.
+                    let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                    let _ = stream.flush();
+                    head = read_request_head(&mut stream);
+                }
+                match request_method(&head).as_str() {
+                    // Health probe: the server is healthy.
+                    "GET" => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        );
+                        let _ = stream.flush();
+                    }
+                    // Embedding request: healthy server, broken model. Drain the
+                    // request body first so closing this socket never RSTs the
+                    // response away from the still-reading client.
+                    "POST" => {
+                        // Tolerant drain: read up to Content-Length but
+                        // stop on EOF/timeout — read_exact would block
+                        // forever on a body that never completes.
+                        let mut remaining = request_content_length(&head);
+                        let mut buf = [0u8; 8192];
+                        while remaining > 0 {
+                            match stream.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => remaining -= n.min(remaining),
+                            }
+                        }
+                        let body = br#"{"error":"model not found"}"#;
+                        let response = format!(
+                            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(body);
+                        let _ = stream.flush();
+                    }
+                    _ => {}
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// A healthy Ollama whose embed endpoint fails with a non-unreachable error
+/// (here: `model not found`) must keep the real cause visible on the ask
+/// path: the embedding-build fallback is reserved for actual disconnects,
+/// so StorageFailed/model-not-found style failures are printed as build
+/// errors rather than swallowed into the disconnect warning.
+#[test]
+fn ask_build_failure_other_than_unreachable_surfaces_real_error() {
+    let bin = wonk_bin();
+    assert!(bin.exists(), "wonk binary not found at {}", bin.display());
+    let tmp = indexed_bundled_repo(&bin);
+
+    // Drop every stored vector but keep the symbols: the plan resolves
+    // against an empty table (Active: ollama), and `wonk ask` must build
+    // the missing embeddings through the configured provider — whose embed
+    // endpoint answers with `model not found`.
+    let conn = rusqlite::Connection::open(tmp.path().join(".wonk/index.db")).unwrap();
+    conn.execute("DELETE FROM embeddings", []).unwrap();
+    drop(conn);
+
+    fs::create_dir_all(tmp.path().join(".wonk")).unwrap();
+    fs::write(
+        tmp.path().join(".wonk/config.toml"),
+        "[embedding]\nprovider = \"ollama\"\n",
+    )
+    .unwrap();
+
+    let mock = spawn_mock_ollama_embed_model_not_found();
+    let output = mock_routed_command(&bin, tmp.path(), mock)
+        .args(["ask", "authentication", "--format", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("embedding build failed"),
+        "expected the real build error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("model not found"),
+        "expected the underlying Ollama error to stay visible, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("falling back to the bundled provider"),
+        "a non-unreachable failure must not masquerade as a disconnect: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no structured results on a failed build, got: {}",
         String::from_utf8_lossy(&output.stdout)
     );
 }

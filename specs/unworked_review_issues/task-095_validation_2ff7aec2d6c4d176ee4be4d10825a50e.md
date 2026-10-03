@@ -6,11 +6,13 @@
 
 ## Major
 
-1. [ ] **code-quality-reviewer** | `/Users/etr/progs/wonk/.worktrees/TASK-095/src/router.rs:259` | readability
+1. [x] **code-quality-reviewer** | `/Users/etr/progs/wonk/.worktrees/TASK-095/src/router.rs:259` | readability
+   *Addressed (majors sweep, 2026-10-02):* fixed (comment rewritten).
    Stale comment in the Smart-mode branch: "REQ-017: the pipeline is config-gated and off by default; --why opts in for this invocation." This task flips RankConfig::default().enabled to true (src/config.rs:228), so the comment now states the opposite of the shipped default in the exact code path that routes every `wonk search`. A maintainer reading the ranked-mode branch would conclude the legacy path is the default.
    *Recommendation:* Rewrite the comment to reflect the flipped default, e.g. "REQ-017 (flipped in TASK-095): the tuned pipeline is on by default; [rank] enabled = false restores the legacy ordering; --why additionally forces the pipeline for this invocation."
 
-2. [ ] **performance-reviewer** | `src/config.rs:228` | missing-caching
+2. [x] **performance-reviewer** | `src/config.rs:228` | missing-caching
+   *Addressed (majors sweep, 2026-10-02):* fixed (cold-start disclosed + measured; mitigation path recorded).
    The REQ-017 default flip puts semantic 0.3 in the active default weights, so every smart search now calls BundledProvider::model() (src/bundled_embedding.rs:26-31) which lazily decodes the 6.5MB zstd model artifact (zstd decompress + per-nibble unpack loop + safetensors buffer build + StaticModel::from_bytes) once per PROCESS. The latency bench excludes this via its untimed warm pass, and REQ-016 is scoped to warm queries, so the AC is technically satisfied - but a CLI `wonk search` is a one-shot process, so the decode is paid on effectively every invocation. Measured on this host (cold process, release binary, fixture corpus): tuned-default smart searches took 303-545ms mean vs 15-31ms with `[rank] enabled = false` (a ~290-515ms added wall-clock delta; `search --why` 227ms vs `--raw` 13ms; the pre-existing `ask` path shows the same ~380ms profile). detect_search_mode (src/router.rs:44) auto-upgrades any plain query with symbol hits to Smart, so the common case pays it, not just --smart. Non-semantic paths measured ~13-15ms, confirming decode (not per-query inference) dominates.
    *Recommendation:* Mitigate the per-process decode: (a) persist the decoded model as a memory-mappable artifact (e.g. cache under ~/.wonk) so subsequent processes mmap instead of decode, and/or (b) trim decode work - safetensors_bytes builds an intermediate Vec<u8> that StaticModel::from_bytes then re-parses, and the nibble loop pushes per byte; (c) at minimum, disclose cold-start numbers in bench/rank-latency-results.md next to the warm evidence and consider whether the CLI surface should ship default-on while MCP/daemon (long-lived, actually warm) does.
 

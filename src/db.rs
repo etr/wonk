@@ -57,6 +57,22 @@ CREATE TABLE IF NOT EXISTS daemon_status (
     updated_at INTEGER NOT NULL
 );
 
+-- O(1) corpus summary for BM25 (TASK-079 review): `n_docs` = COUNT(*),
+-- `measured` = COUNT(line_count) (the non-NULL rows AVG averages over),
+-- `total_lines` = SUM(line_count). Exactly one row (id = 1), maintained
+-- transactionally by the pipeline's `files`-mutating helpers; AVG
+-- reconstructs as total_lines/measured, bitwise-identical to the SQLite
+-- aggregate (both are one IEEE f64 division of the same integers).
+-- Readers fall back to the aggregate when the row is absent (pre-summary
+-- indexes, hand-seeded fixtures), so a missing or stale row can only cost
+-- speed, never correctness of the scores.
+CREATE TABLE IF NOT EXISTS corpus_stats (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    n_docs INTEGER NOT NULL,
+    measured INTEGER NOT NULL,
+    total_lines INTEGER NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);

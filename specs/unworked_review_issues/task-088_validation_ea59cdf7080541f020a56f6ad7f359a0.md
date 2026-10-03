@@ -6,15 +6,18 @@
 
 ## Major
 
-1. [ ] **code-quality-reviewer** | `src/contracts.rs:5799` | correctness
+1. [x] **code-quality-reviewer** | `src/contracts.rs:5799` | correctness
+   *Addressed (majors sweep, 2026-10-02):* fixed (spread/directive/type-condition skip).
    top_level_fields emits phantom depth-0 fields for common, valid GraphQL operations: an inline fragment `... on User { id }` yields phantom consumers `graphql::Query::on` and `graphql::Query::User`; a spaced fragment spread `... UserFields` yields phantom `graphql::Query::UserFields` (only the tight `...UserFields` form is skipped, contradicting the doc comment 'spreads (`...name`) are skipped'); a depth-0 directive `user @include(if: $x)` yields phantom `graphql::Query::include`. Verified by tracing the algorithm against these inputs. These become false graphql consumer candidates at CONFIDENCE_FRAMEWORK 1.0, and no test covers fragments or directives in the mini-parser.
    *Recommendation:* When scanning an identifier at depth 0, look back past whitespace for a preceding '.' or '@' (or track the last significant character while scanning) and skip such identifiers; special-case the `on` keyword after a spread. Add tests for `... on Type`, `... Frag`, `...Frag`, and `@include`/`@skip` on depth-0 fields.
 
-2. [ ] **test-quality-reviewer** | `src/contracts.rs:5799` | missing-test
+2. [x] **test-quality-reviewer** | `src/contracts.rs:5799` | missing-test
+   *Addressed (majors sweep, 2026-10-02):* fixed (alias/spread/extract tests).
    CARRIED from iteration 1 (unworked, outside the repair envelope — remains actionable): the alias and spread branches of top_level_fields (src/contracts.rs:5799-5811) still have zero test coverage; no graphql_parse_* test string contains an `alias: field` shape or a `...spread` fragment, so deleting the alias skip or the is_spread check passes the suite silently. Confirmed unchanged at HEAD (repair commit 2a253b2 touched neither these branches nor their tests).
    *Recommendation:* Add `query { u: user posts }` expecting ["user", "posts"] and `query Q { ...UserFields posts }` expecting ["posts"] to the graphql_parse tests, and exercise once through extract() via a gql template.
 
-3. [ ] **test-quality-reviewer** | `src/contracts.rs:9834` | missing-test
+3. [x] **test-quality-reviewer** | `src/contracts.rs:9834` | missing-test
+   *Addressed (majors sweep, 2026-10-02):* fixed (same).
    The alias and spread branches of top_level_fields (src/contracts.rs:5799-5811) have zero test coverage: no graphql_parse_* test string contains an `alias: field` shape or a `...spread` fragment, yet the frozen validation baseline explicitly claims 'aliases/spreads' among the tested parse surfaces. Deleting the alias skip (`if chars[j] == ':' { continue; }`) or the `is_spread` check passes the entire suite silently. Real-world GraphQL queries ubiquitously use aliases and fragment spreads, so a regression here would emit wrong field names or false consumer contracts with no failing test.
    *Recommendation:* Add two cases to the graphql_parse tests: `query { u: user posts }` must yield fields ["user", "posts"] (alias skipped, real field reported), and `query Q { ...UserFields posts }` must yield ["posts"] (spread fragment skipped). Also cover them once through extract() via a gql`` template so emit_graphql_ops is exercised with the same input.
 

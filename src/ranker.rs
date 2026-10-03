@@ -143,10 +143,29 @@ impl IndexLookup {
             &file_params,
         );
 
+        // Only paths the index has never seen under their as-seen
+        // spelling (the absolute/`./`-prefixed MCP shape) enter the alias
+        // fallback: a cheap exact `files.path` existence check first, so
+        // a result file that exists verbatim but has no symbols
+        // (markdown, config) does not trigger the full `files` scan for
+        // nothing — an exact present path is always its own best
+        // suffix match (TASK-105 review debt).
+        let mut exact_present: HashSet<String> = HashSet::new();
+        if let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT path FROM files WHERE path IN ({in_clause})"
+        )) && let Ok(rows) = stmt
+            .query_map(rusqlite::params_from_iter(file_params.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+        {
+            for path in rows.flatten() {
+                exact_present.insert(path);
+            }
+        }
         let missed: Vec<&str> = files
             .iter()
             .copied()
-            .filter(|f| !definitions.contains_key(*f) && !references.contains_key(*f))
+            .filter(|f| !exact_present.contains(*f))
             .collect();
         let aliases = Self::resolve_aliases(conn, &missed);
         if !aliases.is_empty() {
@@ -183,25 +202,17 @@ impl IndexLookup {
     /// Map each missed result path to its canonical repo-relative
     /// `files.path` — longest path-separator-boundary suffix, ties to the
     /// lexicographically smallest — via ONE bounded `files` scan. Empty
-    /// when nothing missed or nothing resolves.
+    /// when nothing missed or nothing resolves. The match rule itself is
+    /// rerank::longest_suffix_match, shared with the file-key fallback
+    /// and hint resolution (TASK-105 review debt).
     fn resolve_aliases(conn: &Connection, missed: &[&str]) -> HashMap<String, String> {
         let mut aliases = HashMap::new();
         if missed.is_empty() {
             return aliases;
         }
-        let Ok(mut stmt) = conn.prepare("SELECT path FROM files") else {
-            return aliases;
-        };
-        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-            return aliases;
-        };
-        let indexed: Vec<String> = rows.flatten().collect();
+        let indexed = crate::rerank::indexed_paths(conn);
         for as_seen in missed {
-            let best = indexed
-                .iter()
-                .filter(|db| crate::rerank::is_path_suffix(as_seen, db))
-                .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)));
-            if let Some(db) = best {
+            if let Some(db) = crate::rerank::longest_suffix_match(&indexed, as_seen) {
                 aliases.insert(as_seen.to_string(), db.clone());
             }
         }
