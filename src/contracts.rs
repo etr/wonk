@@ -1177,6 +1177,15 @@ impl<'a> Extractor<'a> {
                 if JS_PROVIDER_VERBS.contains(&prop)
                     && (self.ctx.is_router_var(recv) || JS_ROUTER_VARS.contains(&recv))
                     && let Some(arg) = first_arg
+                    // The noise gate the ambiguous arm already applies
+                    // (TASK-082 review debt): `JS_ROUTER_VARS` includes
+                    // the single letter `r`, so `redis`-style clients
+                    // named `r` used to emit `http::GET::user:1` providers
+                    // at full confidence for non-path arguments.
+                    && matches!(
+                        self.path_arg(arg),
+                        Some(PathArg::Direct(ref s)) if is_path_like(s)
+                    )
                 {
                     for mount_prefix in self.ctx.effective_prefixes(recv) {
                         self.emit_http(
@@ -9223,6 +9232,25 @@ void cfg(void) {
     }
 
     // -- ambiguity rules: 0.5 heuristic + path-like noise gate (step 7) -------
+
+    #[test]
+    fn single_letter_router_var_needs_a_path_like_route() {
+        // TASK-082 review debt: `JS_ROUTER_VARS` includes `r`, so a redis
+        // client bound to `r` used to emit `http::GET::user:1` providers
+        // at full confidence — the router arm now carries the same
+        // path-likeness gate as the ambiguous arm.
+        let src =
+            "const r = require('redis').createClient();\nr.get('user:1', cb);\nr.set('k', 'v');\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert_eq!(cands.len(), 0, "got {cands:?}");
+        // A genuine router named `r` with a path-like route still emits.
+        let src = "const r = express.Router();\nr.get('/orders', h);\n";
+        let cands = extract(Lang::JavaScript, src);
+        assert!(
+            find(&cands, "http::GET::/orders").is_some(),
+            "got {cands:?}"
+        );
+    }
 
     #[test]
     fn cache_like_receiver_is_not_a_contract() {

@@ -206,15 +206,27 @@ pub(crate) fn compute_source_rows(
     let mut recorded = 0usize;
     let mut truncated = false;
 
-    // Fan-out cap first: `false` means the cap was hit and the whole
-    // traversal must halt; the recorded rows are a deterministic BFS prefix.
+    // Cap check AFTER the eligibility and visited filters (TASK-080
+    // review debt): a candidate that could never record (ineligible, or
+    // an already-visited (name, file)) must not trip the truncation
+    // marker — a traversal that merely ENDS at exactly the cap has a
+    // complete answer, and marking it truncated would push lookups to
+    // BFS for nothing. `false` still means the cap was hit by a
+    // recordable candidate and the whole traversal must halt; the
+    // recorded rows are a deterministic BFS prefix either way.
     let mut record = |bfs: &mut NameBfs, cand: &ReachCandidate, depth: usize| -> bool {
+        if !edge_eligible(&cand.file, cand.confidence, &filter) {
+            return true;
+        }
+        if bfs
+            .visited
+            .contains(&(cand.name.clone(), cand.file.clone()))
+        {
+            return true;
+        }
         if recorded == opts.max_targets {
             truncated = true;
             return false;
-        }
-        if !edge_eligible(&cand.file, cand.confidence, &filter) {
-            return true;
         }
         if bfs.admit(&cand.name, &cand.file, depth, opts.depth) {
             rows.push((cand.id, depth as i64, cand.confidence));
@@ -1734,6 +1746,31 @@ mod tests {
             "natural fit at cap is not truncation"
         );
         assert!(reach_rows(&conn, target).len() == 2);
+    }
+
+    #[test]
+    fn build_at_cap_with_trailing_ineligible_not_marked() {
+        // TASK-080 review debt: the cap check used to run BEFORE the
+        // eligibility filter, so a traversal that merely ended at
+        // exactly the cap with only ineligible candidates left still
+        // tripped the truncation marker — a complete answer pushed
+        // lookups to BFS for nothing.
+        let (_dir, conn) = make_db();
+        let target = insert_symbol(&conn, "hub", "function", "src/a.rs", 1);
+        let c0 = insert_symbol(&conn, "c0", "function", "src/f0.rs", 1);
+        let c1 = insert_symbol(&conn, "c1", "function", "src/f1.rs", 1);
+        let t0 = insert_symbol(&conn, "t0", "function", "tests/t0.rs", 1);
+        insert_ref(&conn, "hub", Some(c0), 0.9);
+        insert_ref(&conn, "hub", Some(c1), 0.9);
+        insert_ref(&conn, "hub", Some(t0), 0.9);
+
+        let stats = build(&conn, 3, 2);
+
+        assert_eq!(
+            stats.truncated_sources, 0,
+            "trailing ineligible candidates are not truncation"
+        );
+        assert_eq!(reach_rows(&conn, target).len(), 2);
     }
 
     #[test]
