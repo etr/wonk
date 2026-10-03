@@ -357,7 +357,6 @@ pub(crate) struct ReachRepairStats {
     /// cascade already removed when the edited file's symbol rows died are
     /// not counted — the behavioral guarantee is the row set, not this
     /// number.)
-    pub(crate) rows_deleted: usize,
     /// Reach rows written.
     pub(crate) rows_written: usize,
     /// True when the repair was skipped: absent, never-built, or stale
@@ -522,11 +521,10 @@ pub(crate) fn finish_file_edit(
     affected_ids.sort_unstable();
     affected_ids.dedup();
 
-    let mut rows_deleted = 0usize;
     for chunk in affected_ids.chunks(IN_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!("DELETE FROM reach WHERE source_id IN ({placeholders})");
-        rows_deleted += tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+        tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
         let sql = format!("DELETE FROM reach_truncated WHERE source_id IN ({placeholders})");
         tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
     }
@@ -577,7 +575,6 @@ pub(crate) fn finish_file_edit(
 
     Ok(ReachRepairStats {
         rebuilt_sources,
-        rows_deleted,
         rows_written: rows.len(),
         skipped: false,
     })
@@ -660,9 +657,6 @@ fn affected_names(conn: &Connection, rel_path: &str) -> Result<Vec<String>> {
 fn canonical_ids_for_names(conn: &Connection, names: &[String]) -> Result<HashMap<String, i64>> {
     let mut ids = HashMap::new();
     for chunk in names.chunks(IN_CHUNK) {
-        if chunk.is_empty() {
-            continue;
-        }
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!(
             "SELECT name, MIN(id) FROM symbols \
@@ -688,9 +682,6 @@ fn canonical_ids_for_names(conn: &Connection, names: &[String]) -> Result<HashMa
 fn sources_targeting_names(conn: &Connection, names: &[String]) -> Result<Vec<i64>> {
     let mut ids = Vec::new();
     for chunk in names.chunks(IN_CHUNK) {
-        if chunk.is_empty() {
-            continue;
-        }
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!(
             "SELECT DISTINCT source_id FROM reach \
@@ -713,9 +704,6 @@ fn sources_targeting_names(conn: &Connection, names: &[String]) -> Result<Vec<i6
 fn names_for_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for chunk in ids.chunks(IN_CHUNK) {
-        if chunk.is_empty() {
-            continue;
-        }
         let placeholders = vec!["?"; chunk.len()].join(", ");
         let sql = format!("SELECT DISTINCT name FROM symbols WHERE id IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;

@@ -1406,7 +1406,6 @@ CREATE INDEX idx_contracts_file ON contracts(file);                     -- [V5] 
 CREATE INDEX idx_reach_source_depth ON reach(source_id, min_depth);     -- [V5] depth-bounded blast lookup
 CREATE INDEX idx_reach_target ON reach(target_id);                      -- [V5] predecessor recompute on re-index
 CREATE INDEX idx_term_stats_term ON term_stats(term);                   -- [V5] BM25 document-frequency lookup
-CREATE INDEX idx_co_change_a ON co_change(file_a, weight DESC);         -- [V5] top-K coupling lookup
 CREATE INDEX idx_topology_community ON symbol_topology(community);      -- [V5] community-membership signal
 CREATE INDEX idx_near_duplicates_b ON near_duplicates(symbol_id_b);     -- [V5] reverse-direction pair lookup
 CREATE INDEX idx_feedback_identity ON feedback_events(result_identity); -- [V5] per-result gating + retirement

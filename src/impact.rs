@@ -337,10 +337,9 @@ fn parse_hunk_side(range_str: &str) -> Option<(usize, usize)> {
 /// side ranges, or `None` if the line is not a hunk header.
 fn parse_hunk_header_sides(line: &str) -> Option<HunkSides> {
     let minus_pos = line.find('-')?;
+    // find returns an offset into the '-'-starting slice, so plus_pos is
+    // always strictly greater than minus_pos — no guard needed.
     let plus_pos = minus_pos + line[minus_pos..].find('+')?;
-    if plus_pos <= minus_pos {
-        return None;
-    }
 
     Some(HunkSides {
         old: parse_hunk_side(&line[minus_pos + 1..plus_pos]),

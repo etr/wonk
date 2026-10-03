@@ -6114,11 +6114,11 @@ pub fn canonical_rpc_join(scopes: &[RpcJoinScope]) -> Vec<RpcJoin> {
     }
 
     // Participants, with their scope index for deterministic tie-breaks.
-    let mut providers: Vec<(usize, usize, String, &ContractCandidate)> = Vec::new();
-    let mut consumers: Vec<(usize, usize, String, &ContractCandidate)> = Vec::new();
+    let mut providers: Vec<(usize, String, &ContractCandidate)> = Vec::new();
+    let mut consumers: Vec<(usize, String, &ContractCandidate)> = Vec::new();
     for (si, scope) in scopes.iter().enumerate() {
         let ws = normalize_workspace_id(&scope.workspace);
-        for (ci, cand) in scope.candidates.iter().enumerate() {
+        for cand in scope.candidates.iter() {
             if !is_rpc_family(cand.kind) {
                 continue;
             }
@@ -6138,16 +6138,16 @@ pub fn canonical_rpc_join(scopes: &[RpcJoinScope]) -> Vec<RpcJoin> {
             } else {
                 &mut consumers
             };
-            slot.push((si, ci, ws.clone(), cand));
+            slot.push((si, ws.clone(), cand));
         }
     }
 
     let mut joins = Vec::new();
-    for (csi, _cci, cws, consumer) in &consumers {
+    for (csi, cws, consumer) in &consumers {
         // Best provider: method-level before service-level, then the lowest
         // (scope, candidate) index.
         let mut best: Option<(u8, &ContractCandidate, usize, RpcMatchBasis)> = None;
-        for (psi, _pci, pws, provider) in &providers {
+        for (psi, pws, provider) in &providers {
             if pws != cws {
                 continue;
             }
@@ -6375,7 +6375,6 @@ pub struct SiblingRepo {
     /// Short repo name (last path component).
     pub name: String,
     /// Absolute path to the sibling's repository root.
-    pub repo_path: std::path::PathBuf,
     /// Absolute path to the sibling's `index.db`.
     pub index_path: std::path::PathBuf,
     /// Normalized effective workspaces (stored declared set, or the
@@ -6407,7 +6406,6 @@ pub fn scan_registry(
         }
         members.push(SiblingRepo {
             name: scope.repo_name,
-            repo_path,
             index_path,
             workspaces: scope.effective,
         });
@@ -6452,8 +6450,6 @@ impl SiblingConnections {
 
 /// The registry directory the CLI and MCP resolve links against:
 /// `$HOME/.wonk/repos`. `None` when no home directory exists.
-// First production consumer is the CLI/MCP wiring (TASK-084 phase 5).
-#[allow(dead_code)]
 pub(crate) fn default_repos_dir() -> Option<std::path::PathBuf> {
     crate::config::home_dir().map(|h| h.join(".wonk").join("repos"))
 }

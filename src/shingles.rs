@@ -403,7 +403,8 @@ pub fn sweep_near_duplicates_capped(
                 .then(ma.line.cmp(&mb.line))
                 .then(entries[a].symbol_id.cmp(&entries[b].symbol_id))
         });
-        members.dedup();
+        // (No dedup needed: one entry per symbol id, and the sort above
+        // makes equal keys adjacent anyway.)
         if members.len() > max_bucket_members {
             members.truncate(max_bucket_members);
             truncated_buckets += 1;

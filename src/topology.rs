@@ -1081,8 +1081,10 @@ mod tests {
         )
         .unwrap();
 
-        crate::db::ensure_topology_tables(&conn).unwrap();
-        crate::db::ensure_topology_tables(&conn).unwrap();
+        // The migration runs on every open()/apply_schema; run it twice
+        // to pin idempotency (the old wrapper was redundant).
+        crate::db::apply_schema_for_tests(&conn).unwrap();
+        crate::db::apply_schema_for_tests(&conn).unwrap();
 
         // The migration adds the columns and backfills NULL — the degrees
         // reappear only after the next recompute.

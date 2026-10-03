@@ -6269,8 +6269,8 @@ function unknown() { return mystery(); }
     }
 
     /// Run `build_index` three times on a fresh database, printing per-run
-    /// elapsed and the median.  Returns the sorted durations.
-    fn bench_three_fresh_builds(root: &Path) -> Vec<std::time::Duration> {
+    /// elapsed and the median.
+    fn bench_three_fresh_builds(root: &Path) {
         let mut durations = Vec::new();
         for run in 0..3 {
             let index_dir = root.join(".wonk");
@@ -6291,7 +6291,6 @@ function unknown() { return mystery(); }
         }
         durations.sort();
         println!("bench median: {:?}", durations[1]);
-        durations
     }
 
     /// Print the built index's DB size and `term_stats` row count.

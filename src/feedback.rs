@@ -1054,8 +1054,13 @@ fn slate_token(query: &str, nanos: u128, members: &[SlateMember], nonce: u32) ->
 
 /// Prune `feedback_slates` to the newest `retention` rows (LRU by
 /// `created_at`, token breaking ties deterministically).
-pub fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
-    prune_slates_exempting(conn, retention, None)
+fn prune_slates(conn: &Connection, retention: usize) -> Result<()> {
+    conn.execute(
+        "DELETE FROM feedback_slates WHERE token NOT IN \
+         (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?1)",
+        [retention as i64],
+    )?;
+    Ok(())
 }
 
 /// [`prune_slates`] with one token exempt from eviction: the slate minted
@@ -1076,16 +1081,10 @@ pub(crate) fn prune_slates_exempting(
                  (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?2)",
                 rusqlite::params![minted, retention as i64],
             )?;
+            Ok(())
         }
-        None => {
-            conn.execute(
-                "DELETE FROM feedback_slates WHERE token NOT IN \
-                 (SELECT token FROM feedback_slates ORDER BY created_at DESC, token DESC LIMIT ?1)",
-                [retention as i64],
-            )?;
-        }
+        None => prune_slates(conn, retention),
     }
-    Ok(())
 }
 
 /// A persisted slate: the token echoed to the caller plus the members,
@@ -1244,20 +1243,6 @@ pub fn load_events(conn: &Connection) -> Result<Vec<FeedbackEvent>> {
     )?;
     let events = stmt
         .query_map([], event_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(events)
-}
-
-/// Load feedback events with `id > since`, oldest first — the full
-/// event-table tail. The chunked learning replay uses
-/// [`load_learning_chunk`] instead; this remains the plain cursor.
-pub fn load_events_since(conn: &Connection, since: i64) -> Result<Vec<FeedbackEvent>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, result_identity, query_class, chosen_rank, features, useful, session, \
-         created_at FROM feedback_events WHERE id > ?1 ORDER BY id",
-    )?;
-    let events = stmt
-        .query_map([since], event_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(events)
 }

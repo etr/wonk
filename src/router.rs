@@ -2006,7 +2006,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             dispatch_duplicates(args, &mut fmt, suppress)?;
         }
         Command::Feedback(args) => {
-            dispatch_feedback(args, &mut fmt, suppress, format)?;
+            dispatch_feedback(args, &mut fmt, format)?;
         }
         Command::Review(args) => {
             dispatch_review(args, &mut fmt, suppress)?;
@@ -2658,7 +2658,6 @@ fn dispatch_duplicates<W: io::Write>(
 fn dispatch_feedback<W: io::Write>(
     args: crate::cli::FeedbackArgs,
     fmt: &mut Formatter<W>,
-    suppress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let repo_root = std::env::current_dir()
@@ -2693,7 +2692,7 @@ fn dispatch_feedback<W: io::Write>(
         );
     }
 
-    run_feedback(&conn, &args, &config, fmt, suppress, format)
+    run_feedback(&conn, &args, &config, fmt, format)
 }
 
 /// Record feedback and print the summary. Split from
@@ -2704,7 +2703,6 @@ fn run_feedback<W: io::Write>(
     args: &crate::cli::FeedbackArgs,
     config: &crate::config::Config,
     fmt: &mut Formatter<W>,
-    _suppress: bool,
     format: OutputFormat,
 ) -> Result<()> {
     if args.weights {
@@ -7801,15 +7799,7 @@ mod tests {
     fn run_fb(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
         let mut buf = Vec::new();
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Grep, false);
-        run_feedback(
-            conn,
-            args,
-            &learning_config(),
-            &mut fmt,
-            true,
-            OutputFormat::Grep,
-        )
-        .unwrap();
+        run_feedback(conn, args, &learning_config(), &mut fmt, OutputFormat::Grep).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -7865,7 +7855,6 @@ mod tests {
             &feedback_args("deadbeefdeadbeef", &["1"]),
             &learning_config(),
             &mut fmt,
-            true,
             OutputFormat::Grep,
         )
         .unwrap_err()
@@ -7992,7 +7981,6 @@ mod tests {
             &args,
             &learning_config(),
             &mut fmt,
-            true,
             OutputFormat::Grep,
         )
         .unwrap();
@@ -8025,7 +8013,6 @@ mod tests {
             &args,
             &learning_config(),
             &mut fmt,
-            true,
             OutputFormat::Json,
         )
         .unwrap();
@@ -8066,15 +8053,7 @@ mod tests {
     fn run_fb_json(conn: &Connection, args: &crate::cli::FeedbackArgs) -> String {
         let mut buf = Vec::new();
         let mut fmt = output::Formatter::new(&mut buf, OutputFormat::Json, false);
-        run_feedback(
-            conn,
-            args,
-            &learning_config(),
-            &mut fmt,
-            true,
-            OutputFormat::Json,
-        )
-        .unwrap();
+        run_feedback(conn, args, &learning_config(), &mut fmt, OutputFormat::Json).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
