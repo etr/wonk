@@ -664,6 +664,12 @@ fn spawn_mock_ollama_embed_model_not_found() -> SocketAddr {
             };
             std::thread::spawn(move || {
                 let mut stream = stream;
+                // Belt: no mock thread may block forever — a stalled or
+                // half-sent request (pool speculation, interrupted body)
+                // errors out after the timeout instead of wedging the
+                // connection and, through it, the client.
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
                 let mut head = read_request_head(&mut stream);
                 if request_method(&head) == "CONNECT" {
                     // Complete the proxy tunnel handshake.
@@ -683,8 +689,17 @@ fn spawn_mock_ollama_embed_model_not_found() -> SocketAddr {
                     // request body first so closing this socket never RSTs the
                     // response away from the still-reading client.
                     "POST" => {
-                        let mut request_body = vec![0u8; request_content_length(&head)];
-                        let _ = stream.read_exact(&mut request_body);
+                        // Tolerant drain: read up to Content-Length but
+                        // stop on EOF/timeout — read_exact would block
+                        // forever on a body that never completes.
+                        let mut remaining = request_content_length(&head);
+                        let mut buf = [0u8; 8192];
+                        while remaining > 0 {
+                            match stream.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => remaining -= n.min(remaining),
+                            }
+                        }
                         let body = br#"{"error":"model not found"}"#;
                         let response = format!(
                             "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
